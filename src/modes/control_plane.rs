@@ -228,7 +228,7 @@ async fn run_cp_grpc_tls_accept_loop(
 /// Resolve which namespaces the CP polling loop should load on each tick.
 ///
 /// `Single(ns)` / `Set({ns, ...})` return the explicit list directly; `All`
-/// dynamically discovers namespaces from `db.list_namespaces()` so the CP
+/// dynamically discovers namespaces from authoritative primary reads so the CP
 /// picks up new tenants without a restart. Returns at least one namespace
 /// — when `All` is configured but the database is empty, we still load the
 /// gateway's `FERRUM_NAMESPACE` so the admin API works on a fresh cluster.
@@ -243,14 +243,14 @@ async fn resolve_polled_namespaces(
         return explicit;
     }
     // CpScope::All — discover dynamically.
-    match db.list_namespaces().await {
+    match db.list_namespaces_authoritative().await {
         Ok(ns) => merge_discovered_namespaces(ns, retain_on_success, fallback),
         Err(e) => {
             let retained = previous_on_error.unwrap_or(retain_on_success);
             let ns = normalize_namespace_list(retained);
             if !ns.is_empty() {
                 warn!(
-                    "CP scope=All: list_namespaces() failed ({}); keeping previous {} namespace(s): [{}]",
+                    "CP scope=All: authoritative namespace discovery failed ({}); keeping previous {} namespace(s): [{}]",
                     e,
                     ns.len(),
                     ns.join(", ")
@@ -258,7 +258,7 @@ async fn resolve_polled_namespaces(
                 ns
             } else {
                 warn!(
-                    "CP scope=All: list_namespaces() failed ({}); falling back to FERRUM_NAMESPACE='{}'",
+                    "CP scope=All: authoritative namespace discovery failed ({}); falling back to FERRUM_NAMESPACE='{}'",
                     e, fallback
                 );
                 vec![fallback.to_string()]
@@ -1280,6 +1280,7 @@ pub async fn run(
         let mut last_replica_ips: Option<Vec<IpAddr>> = None;
         let mut force_full_reload = false;
         let mut last_polled_namespaces = initial_polled_namespaces;
+        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
         // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
@@ -1329,54 +1330,6 @@ pub async fn run(
                             }
                         } else {
                             last_db_ips = Some(ips);
-                        }
-                    }
-
-                    if let Some(ref replica_url) = replica_url_for_reconnect {
-                        if !db_poll.read_replica_available() {
-                            if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
-                                let safe_error =
-                                    db_backend::redact_error_text(&e, &[replica_url]);
-                                warn!(
-                                    "Read replica unavailable; admin-read replica reconnect attempt failed for {}: {}",
-                                    db_backend::redact_url(replica_url),
-                                    safe_error
-                                );
-                            }
-                        } else if let Some(ref replica_hostname) = replica_hostname
-                            && let Ok(ips) = dns_cache_for_poll
-                                .resolve_all(replica_hostname, None, None)
-                                .await
-                        {
-                            let needs_reconnect = match &last_replica_ips {
-                                Some(prev) => {
-                                    let mut prev_sorted = prev.clone();
-                                    prev_sorted.sort();
-                                    let mut cur_sorted = ips.clone();
-                                    cur_sorted.sort();
-                                    prev_sorted != cur_sorted
-                                }
-                                None => false,
-                            };
-                            if needs_reconnect {
-                                info!(
-                                    "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting admin-read replica pool",
-                                    replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
-                                );
-                                if let Err(e) =
-                                    db_poll.reconnect_read_replica(replica_url).await
-                                {
-                                    let safe_error =
-                                        db_backend::redact_error_text(&e, &[replica_url]);
-                                    error!(
-                                        "Failed to reconnect admin-read replica pool after DNS change for '{}' ({}): {}",
-                                        replica_hostname,
-                                        db_backend::redact_url(replica_url),
-                                        safe_error
-                                    );
-                                }
-                            }
-                            last_replica_ips = Some(ips);
                         }
                     }
 
@@ -1448,10 +1401,10 @@ pub async fn run(
                     } else if let Some(since) = last_poll_at {
                         // Resolve the polled namespace list. For `Single`
                         // / `Set` this is the explicit list (no DB call).
-                        // For `All`, list_namespaces() runs once per tick
-                        // — bounded cost vs. the per-resource queries that
-                        // dominate poll time. Snapshot the current config
-                        // for per-namespace deletion routing.
+                        // For `All`, authoritative namespace discovery runs
+                        // once per tick — bounded cost vs. the per-resource
+                        // queries that dominate poll time. Snapshot the current
+                        // config for per-namespace deletion routing.
                         let current_snapshot = config_poll.load_full();
                         let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
@@ -1494,6 +1447,17 @@ pub async fn run(
                                     {
                                         Ok(GatewayTrustBundlePoll::Unchanged) => {
                                             last_poll_at = Some(result.poll_timestamp);
+                                            if let Some(ref replica_url) = replica_url_for_reconnect {
+                                                crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                                                    db_poll.clone(),
+                                                    Some(replica_url.as_str()),
+                                                    replica_hostname.as_deref(),
+                                                    &dns_cache_for_poll,
+                                                    &mut last_replica_ips,
+                                                    replica_reconnect_in_flight.clone(),
+                                                )
+                                                .await;
+                                            }
                                             continue;
                                         }
                                         Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
@@ -1538,6 +1502,17 @@ pub async fn run(
                                             source_trust_bundles;
                                     }
                                     last_poll_at = Some(result.poll_timestamp);
+                                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                                            db_poll.clone(),
+                                            Some(replica_url.as_str()),
+                                            replica_hostname.as_deref(),
+                                            &dns_cache_for_poll,
+                                            &mut last_replica_ips,
+                                            replica_reconnect_in_flight.clone(),
+                                        )
+                                        .await;
+                                    }
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
@@ -1790,6 +1765,18 @@ pub async fn run(
                                 }
                             }
                         }
+                    }
+
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                            db_poll.clone(),
+                            Some(replica_url.as_str()),
+                            replica_hostname.as_deref(),
+                            &dns_cache_for_poll,
+                            &mut last_replica_ips,
+                            replica_reconnect_in_flight.clone(),
+                        )
+                        .await;
                     }
                 }
                 _ = cp_poll_shutdown.changed() => {

@@ -496,8 +496,16 @@ pub trait DatabaseBackend: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
+
+    /// Return all distinct namespaces using the authoritative primary read path.
+    ///
+    /// Runtime config polling uses this when `FERRUM_CP_NAMESPACES=*` so namespace
+    /// discovery cannot lag behind primary resource reads.
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces().await
+    }
 
     // -----------------------------------------------------------------------
     // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC

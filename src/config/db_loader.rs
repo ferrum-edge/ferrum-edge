@@ -4124,7 +4124,7 @@ impl DatabaseStore {
         self.read_replica_url.is_some()
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     pub async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
         let source = self.admin_read_pool().source;
         match self.list_namespaces_from_admin_read().await {
@@ -4142,14 +4142,23 @@ impl DatabaseStore {
         }
     }
 
+    /// Return all distinct namespaces from the authoritative primary pool.
+    pub async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces_from_pool(self.pool()).await
+    }
+
     async fn list_namespaces_from_admin_read(&self) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces_from_pool(self.rpool()).await
+    }
+
+    async fn list_namespaces_from_pool(&self, pool: AnyPool) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
         let sql = "SELECT DISTINCT namespace FROM proxies \
                    UNION SELECT DISTINCT namespace FROM consumers \
                    UNION SELECT DISTINCT namespace FROM plugin_configs \
                    UNION SELECT DISTINCT namespace FROM upstreams \
                    ORDER BY 1";
-        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.rpool()).await?;
+        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
         for row in rows {
             if let Ok(ns) = row.try_get::<String, _>("namespace") {
@@ -5940,6 +5949,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::list_namespaces(self).await
+    }
+
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        DatabaseStore::list_namespaces_authoritative(self).await
     }
 
     async fn submit_api_spec_bundle(

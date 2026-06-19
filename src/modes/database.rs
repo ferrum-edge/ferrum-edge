@@ -1014,6 +1014,7 @@ pub async fn run(
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
         let mut last_replica_ips: Option<Vec<IpAddr>> = None;
         let mut force_full_reload = false;
+        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
         // Seed incremental state from the initial config load
         let initial_config = proxy_state_poll.current_config();
@@ -1072,54 +1073,6 @@ pub async fn run(
                             }
                         } else {
                             last_db_ips = Some(ips);
-                        }
-                    }
-
-                    if let Some(ref replica_url) = replica_url_for_reconnect {
-                        if !db_poll.read_replica_available() {
-                            if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
-                                let safe_error =
-                                    db_backend::redact_error_text(&e, &[replica_url]);
-                                warn!(
-                                    "Read replica unavailable; admin-read replica reconnect attempt failed for {}: {}",
-                                    db_backend::redact_url(replica_url),
-                                    safe_error
-                                );
-                            }
-                        } else if let Some(ref replica_hostname) = replica_hostname
-                            && let Ok(ips) = dns_cache_for_poll
-                                .resolve_all(replica_hostname, None, None)
-                                .await
-                        {
-                            let needs_reconnect = match &last_replica_ips {
-                                Some(prev) => {
-                                    let mut prev_sorted = prev.clone();
-                                    prev_sorted.sort();
-                                    let mut cur_sorted = ips.clone();
-                                    cur_sorted.sort();
-                                    prev_sorted != cur_sorted
-                                }
-                                None => false,
-                            };
-                            if needs_reconnect {
-                                info!(
-                                    "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting admin-read replica pool",
-                                    replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
-                                );
-                                if let Err(e) =
-                                    db_poll.reconnect_read_replica(replica_url).await
-                                {
-                                    let safe_error =
-                                        db_backend::redact_error_text(&e, &[replica_url]);
-                                    error!(
-                                        "Failed to reconnect admin-read replica pool after DNS change for '{}' ({}): {}",
-                                        replica_hostname,
-                                        db_backend::redact_url(replica_url),
-                                        safe_error
-                                    );
-                                }
-                            }
-                            last_replica_ips = Some(ips);
                         }
                     }
 
@@ -1345,6 +1298,18 @@ pub async fn run(
                                 );
                             }
                         }
+                    }
+
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                            db_poll.clone(),
+                            Some(replica_url.as_str()),
+                            replica_hostname.as_deref(),
+                            &dns_cache_for_poll,
+                            &mut last_replica_ips,
+                            replica_reconnect_in_flight.clone(),
+                        )
+                        .await;
                     }
                 }
                 _ = poll_shutdown.changed() => {

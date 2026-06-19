@@ -3136,6 +3136,10 @@ mod inner {
             Ok(result)
         }
 
+        async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+            self.list_namespaces().await
+        }
+
         // -------------------------------------------------------------------
         // ApiSpec operations — admin-only.
         //
