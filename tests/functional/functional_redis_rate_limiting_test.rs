@@ -86,6 +86,48 @@ async fn delete_redis_keys_by_prefix(prefix: &str) {
     let _ = reader.read(&mut buf).await;
 }
 
+async fn redis_key_count_by_prefix(prefix: &str) -> usize {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:6379").await else {
+        return 0;
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = reader;
+    let mut buf = vec![0u8; 8192];
+
+    // SELECT 15
+    if writer
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n")
+        .await
+        .is_err()
+    {
+        return 0;
+    }
+    let _ = reader.read(&mut buf).await;
+
+    let pattern = format!("{}*", prefix);
+    let lua_script = format!("return #redis.call('KEYS','{}')", pattern);
+    let lua_len = lua_script.len();
+    let cmd = format!(
+        "*3\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n0\r\n",
+        lua_len, lua_script
+    );
+    if writer.write_all(cmd.as_bytes()).await.is_err() {
+        return 0;
+    }
+    buf.fill(0);
+    let Ok(n) = reader.read(&mut buf).await else {
+        return 0;
+    };
+    let response = String::from_utf8_lossy(&buf[..n]);
+    response
+        .strip_prefix(':')
+        .and_then(|value| value.split("\r\n").next())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 // ============================================================================
 // Test Harness (Database mode with Redis rate limiting)
 // ============================================================================
@@ -1421,10 +1463,18 @@ plugin_configs:
             .await
     });
 
-    let deadline = SystemTime::now() + Duration::from_secs(2);
-    while backend_hits.load(Ordering::SeqCst) == 0 {
+    let inflight_prefix = format!("{unique_prefix}:inflight:");
+    let deadline = SystemTime::now() + Duration::from_secs(5);
+    loop {
+        let backend_started = backend_hits.load(Ordering::SeqCst) > 0;
+        let redis_lock_visible = redis_key_count_by_prefix(&inflight_prefix).await > 0;
+        if backend_started && redis_lock_visible {
+            break;
+        }
         if SystemTime::now() >= deadline {
-            panic!("first request did not reach backend before Redis in-flight assertion");
+            panic!(
+                "first request did not hold Redis in-flight lock before assertion: backend_started={backend_started}, redis_lock_visible={redis_lock_visible}"
+            );
         }
         sleep(Duration::from_millis(25)).await;
     }
@@ -1443,7 +1493,7 @@ plugin_configs:
         "peer gateway should see Redis in-flight conflict"
     );
 
-    release_backend.notify_waiters();
+    release_backend.notify_one();
     let first = first
         .await
         .expect("first request task panicked")
