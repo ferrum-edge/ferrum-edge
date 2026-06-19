@@ -1277,7 +1277,8 @@ pub async fn run(
 
         // Track the last known set of resolved IPs for the DB hostname.
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
-        let mut last_replica_ips: Option<Vec<IpAddr>> = None;
+        let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
+            Arc::new(tokio::sync::Mutex::new(None));
         let mut force_full_reload = false;
         let mut last_polled_namespaces = initial_polled_namespaces;
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
@@ -1331,6 +1332,18 @@ pub async fn run(
                         } else {
                             last_db_ips = Some(ips);
                         }
+                    }
+
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                            db_poll.clone(),
+                            Some(replica_url.as_str()),
+                            replica_hostname.as_deref(),
+                            &dns_cache_for_poll,
+                            last_replica_ips.clone(),
+                            replica_reconnect_in_flight.clone(),
+                        )
+                        .await;
                     }
 
                     if force_full_reload {
@@ -1447,17 +1460,6 @@ pub async fn run(
                                     {
                                         Ok(GatewayTrustBundlePoll::Unchanged) => {
                                             last_poll_at = Some(result.poll_timestamp);
-                                            if let Some(ref replica_url) = replica_url_for_reconnect {
-                                                crate::modes::schedule_admin_read_replica_reconnect_if_needed(
-                                                    db_poll.clone(),
-                                                    Some(replica_url.as_str()),
-                                                    replica_hostname.as_deref(),
-                                                    &dns_cache_for_poll,
-                                                    &mut last_replica_ips,
-                                                    replica_reconnect_in_flight.clone(),
-                                                )
-                                                .await;
-                                            }
                                             continue;
                                         }
                                         Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
@@ -1502,17 +1504,6 @@ pub async fn run(
                                             source_trust_bundles;
                                     }
                                     last_poll_at = Some(result.poll_timestamp);
-                                    if let Some(ref replica_url) = replica_url_for_reconnect {
-                                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
-                                            db_poll.clone(),
-                                            Some(replica_url.as_str()),
-                                            replica_hostname.as_deref(),
-                                            &dns_cache_for_poll,
-                                            &mut last_replica_ips,
-                                            replica_reconnect_in_flight.clone(),
-                                        )
-                                        .await;
-                                    }
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
@@ -1767,17 +1758,6 @@ pub async fn run(
                         }
                     }
 
-                    if let Some(ref replica_url) = replica_url_for_reconnect {
-                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
-                            db_poll.clone(),
-                            Some(replica_url.as_str()),
-                            replica_hostname.as_deref(),
-                            &dns_cache_for_poll,
-                            &mut last_replica_ips,
-                            replica_reconnect_in_flight.clone(),
-                        )
-                        .await;
-                    }
                 }
                 _ = cp_poll_shutdown.changed() => {
                     info!("CP database polling shutting down");

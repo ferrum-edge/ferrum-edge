@@ -1012,7 +1012,8 @@ pub async fn run(
         // Track the last known set of resolved IPs for the DB hostname.
         // Initialized lazily on the first successful resolution.
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
-        let mut last_replica_ips: Option<Vec<IpAddr>> = None;
+        let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
+            Arc::new(tokio::sync::Mutex::new(None));
         let mut force_full_reload = false;
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
@@ -1306,7 +1307,7 @@ pub async fn run(
                             Some(replica_url.as_str()),
                             replica_hostname.as_deref(),
                             &dns_cache_for_poll,
-                            &mut last_replica_ips,
+                            last_replica_ips.clone(),
                             replica_reconnect_in_flight.clone(),
                         )
                         .await;
