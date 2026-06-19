@@ -9,6 +9,7 @@ use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 struct LegacyAuthorizePlugin;
@@ -269,8 +270,8 @@ fn test_removed_security_plugin_fails_closed() {
             Err(e) => e,
         };
         // PluginCache::new wraps per-plugin errors into an aggregate string
-        // ("Gateway startup aborted: N security plugin(s) failed config
-        // validation") and emits the per-plugin "Removed security plugin ..."
+        // ("Gateway startup aborted: N plugin config(s) failed validation")
+        // and emits the per-plugin "Removed security plugin ..."
         // message via `error!` (visible in test logs but not the returned
         // string). The wrapper format is the load-bearing fail-closed signal
         // for callers; the specific plugin name is preserved in the log
@@ -286,6 +287,128 @@ fn test_removed_security_plugin_fails_closed() {
             "expected aborted/rejected wrapper around the security failure for {plugin_name}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn test_unknown_enabled_plugin_rejects_initial_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "unknown-1",
+            "unknown_enforcer",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+
+    let err = match PluginCache::new(&config) {
+        Ok(_) => panic!("unknown enabled plugin must fail closed"),
+        Err(err) => err,
+    };
+    assert!(err.contains("Unknown enabled plugin"), "{err}");
+    assert!(err.contains("unknown_enforcer"), "{err}");
+    assert!(err.contains("unknown-1"), "{err}");
+}
+
+#[test]
+fn test_disabled_unknown_plugin_is_ignored() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["disabled-unknown"])],
+        vec![make_plugin_config(
+            "disabled-unknown",
+            "unknown_enforcer",
+            PluginScope::Proxy,
+            Some("p1"),
+            false,
+        )],
+    );
+
+    let cache = PluginCache::new(&config).expect("disabled unknown plugin should be ignored");
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "disabled plugin configs must not be instantiated"
+    );
+}
+
+#[test]
+fn test_registered_custom_plugin_is_resolved_before_unknown_rejection() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": "custom-ok"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+
+    let cache = PluginCache::new(&config).expect("registered custom plugin should be accepted");
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "example_plugin");
+}
+
+#[test]
+fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![make_plugin_config(
+            "pc1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let pre_rebuild = cache.get_plugins("p1");
+    assert_eq!(pre_rebuild[0].name(), "stdout_logging");
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc2"])],
+        vec![make_plugin_config_with_json(
+            "pc2",
+            "body_validator",
+            json!({}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let err = cache
+        .rebuild(&config2)
+        .expect_err("malformed body_validator must reject reload");
+    assert!(err.contains("body_validator"), "{err}");
+    assert!(err.contains("pc2"), "{err}");
+    assert!(err.contains("proxy_id=p1"), "{err}");
+
+    let post_failure = cache.get_plugins("p1");
+    assert_eq!(post_failure.len(), 1);
+    assert_eq!(post_failure[0].name(), "stdout_logging");
+    assert_eq!(pre_rebuild[0].name(), "stdout_logging");
+
+    let config3 = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "g2",
+            "transaction_debugger",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    cache
+        .rebuild(&config3)
+        .expect("valid reload after a rejection should replace cache");
+    let post_success = cache.get_plugins("p1");
+    assert_eq!(post_success.len(), 1);
+    assert_eq!(post_success[0].name(), "transaction_debugger");
 }
 
 #[test]
@@ -531,7 +654,7 @@ fn test_proxy_count() {
 fn test_request_body_buffering_upper_bound_is_config_sensitive() {
     let config = make_config(
         vec![
-            make_proxy("graphql-empty", "/gql-empty", vec!["graphql-empty-plugin"]),
+            make_proxy("cors-no-body", "/cors", vec!["cors-no-body-plugin"]),
             make_proxy(
                 "graphql-guarded",
                 "/gql-guarded",
@@ -546,12 +669,12 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
         ],
         vec![
             PluginConfig {
-                id: "graphql-empty-plugin".to_string(),
+                id: "cors-no-body-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
-                plugin_name: "graphql".to_string(),
-                config: json!({}),
+                plugin_name: "cors".to_string(),
+                config: json!({"origins": ["*"]}),
                 scope: PluginScope::Proxy,
-                proxy_id: Some("graphql-empty".to_string()),
+                proxy_id: Some("cors-no-body".to_string()),
                 enabled: true,
                 priority_override: None,
                 api_spec_id: None,
@@ -602,7 +725,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
 
     let cache = PluginCache::new(&config).unwrap();
 
-    assert!(!cache.requires_request_body_buffering("graphql-empty"));
+    assert!(!cache.requires_request_body_buffering("cors-no-body"));
     assert!(cache.requires_request_body_buffering("graphql-guarded"));
     assert!(!cache.requires_request_body_buffering("response-only"));
     assert!(cache.requires_request_body_buffering("request-xml"));
@@ -970,6 +1093,9 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
         result.is_err(),
         "apply_delta should reject invalid security plugin config"
     );
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
 #[test]
@@ -996,6 +1122,86 @@ fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
         .expect("invalid WAF config should be rejected");
     assert!(err.contains("waf"));
     assert!(err.contains("max_scan_bytes"));
+}
+
+#[test]
+fn test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![make_plugin_config(
+            "pc1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc2"])],
+        vec![make_plugin_config_with_json(
+            "pc2",
+            "request_size_limiting",
+            json!({"max_bytes": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    let err = cache
+        .apply_delta(&config2, &proxy_ids, &[], false)
+        .expect_err("malformed request_size_limiting must reject delta reload");
+    assert!(err.contains("request_size_limiting"), "{err}");
+    assert!(err.contains("pc2"), "{err}");
+    assert!(err.contains("proxy_id=p1"), "{err}");
+
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[test]
+fn test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![make_plugin_config(
+            "pc1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc2"])],
+        vec![make_plugin_config(
+            "pc2",
+            "unknown_enforcer",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    let err = cache
+        .apply_delta(&config2, &proxy_ids, &[], false)
+        .expect_err("unknown enabled plugin must reject delta reload");
+    assert!(err.contains("unknown_enforcer"), "{err}");
+    assert!(err.contains("pc2"), "{err}");
+    assert!(err.contains("proxy_id=p1"), "{err}");
+
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
 #[test]
@@ -2097,6 +2303,127 @@ fn test_priority_override_delegates_request_buffering_refinement() {
         !plugins[0].should_buffer_request_body(&ctx),
         "priority override wrapper must preserve plugin-specific GET buffering skip"
     );
+}
+
+#[tokio::test]
+async fn test_priority_override_delegates_context_response_body_transform() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "compression",
+        json!({"min_content_length": 10, "algorithms": ["gzip"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(100);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "compression");
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].needs_later_response_strong_etag());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+
+    let mut request_headers = HashMap::new();
+    request_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugins[0]
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
+    assert!(
+        !request_headers.contains_key("accept-encoding"),
+        "compression should strip Accept-Encoding before proxying"
+    );
+
+    let body = r#"{"users":[{"name":"alice","email":"alice@example.com","role":"admin"},{"name":"bob","email":"bob@example.com","role":"user"},{"name":"charlie","email":"charlie@example.com","role":"user"},{"name":"dave","email":"dave@example.com","role":"moderator"},{"name":"eve","email":"eve@example.com","role":"user"},{"name":"frank","email":"frank@example.com","role":"admin"}]}"#.as_bytes();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert("content-length".to_string(), body.len().to_string());
+    assert!(
+        plugins[0]
+            .should_release_response_body_for_later_strong_etag(&ctx, 200, &response_headers,)
+    );
+
+    plugins[0]
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+
+    let compressed = plugins[0]
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await
+        .expect("priority override wrapper should forward the context-aware transform");
+
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
+    assert_eq!(decompressed, body);
+}
+
+#[test]
+fn test_priority_override_delegates_response_header_refinement_hooks() {
+    let mut transformer_config = make_plugin_config_with_json(
+        "rt1",
+        "response_transformer",
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "Content-Type",
+                "value": "application/json"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    transformer_config.priority_override = Some(100);
+    let mut security_config = make_plugin_config_with_json(
+        "sh1",
+        "security_headers",
+        json!({"set": {"Cache-Control": "no-transform", "ETag": "\"late\""}}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    security_config.priority_override = Some(200);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt1", "sh1"])],
+        vec![transformer_config, security_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+    let response_headers = HashMap::new();
+
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].name(), "response_transformer");
+    assert!(plugins[0].may_modify_response_content_type(&ctx, Some("application/octet-stream")));
+    assert_eq!(plugins[1].name(), "security_headers");
+    assert!(plugins[1].may_add_response_cache_control_no_transform(&ctx, &response_headers));
+    assert!(plugins[1].may_add_response_strong_etag(&ctx, &response_headers));
 }
 
 #[test]

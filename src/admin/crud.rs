@@ -11,6 +11,7 @@ use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult};
+use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
     first_effective_mesh_transport_conflict_with_mesh, mesh_transport_retry_conflict_message,
@@ -145,7 +146,14 @@ pub(crate) trait AdminResource:
         )
     }
 
+    fn allow_cached_read_fallback(_error: &anyhow::Error) -> bool {
+        true
+    }
+
     async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>>;
+    async fn db_get_for_write(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        Self::db_get(db, id).await
+    }
     async fn db_list(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -203,6 +211,9 @@ pub(crate) async fn handle_list<R: AdminResource>(
                 return Ok(super::json_response(StatusCode::OK, &body));
             }
             Err(error) => {
+                if !R::allow_cached_read_fallback(&error) {
+                    return Ok(R::map_precheck_db_error(&error));
+                }
                 tracing::warn!(
                     "Database unavailable for list {}, falling back to cached config: {}",
                     R::RESOURCE_NAME,
@@ -247,6 +258,9 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 return Ok(not_found_response::<R>());
             }
             Err(error) => {
+                if !R::allow_cached_read_fallback(&error) {
+                    return Ok(R::map_precheck_db_error(&error));
+                }
                 tracing::warn!(
                     "Database unavailable for get {}, falling back to cached config: {}",
                     R::RESOURCE_NAME,
@@ -315,7 +329,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     };
     let db = db_arc.as_ref();
 
-    let existing = match R::db_get(db, id).await {
+    let existing = match R::db_get_for_write(db, id).await {
         Ok(Some(resource)) if resource.namespace() != namespace => {
             return Ok(not_found_response::<R>());
         }
@@ -1678,6 +1692,14 @@ impl AdminResource for Proxy {
         db.get_proxy(id).await
     }
 
+    fn allow_cached_read_fallback(error: &anyhow::Error) -> bool {
+        !is_proxy_plugin_association_load_error(error)
+    }
+
+    async fn db_get_for_write(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        db.get_proxy_for_write(id).await
+    }
+
     async fn db_list(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -2128,7 +2150,7 @@ async fn handle_write<R: AdminResource>(
 
     let existing = match action {
         WriteAction::Create => None,
-        WriteAction::Update { id } => match R::db_get(db, id).await {
+        WriteAction::Update { id } => match R::db_get_for_write(db, id).await {
             Ok(Some(existing)) if existing.namespace() != namespace => {
                 return Ok(not_found_response::<R>());
             }

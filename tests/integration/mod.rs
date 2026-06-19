@@ -22,6 +22,7 @@ mod cp_dp_grpc_tests;
 mod cp_multi_namespace_tests;
 mod db_incremental_poll_tests;
 mod db_offline_bootstrap_tests;
+mod db_proxy_plugin_association_fail_closed_tests;
 mod deferred_log_tests;
 mod dtls_integration_tests;
 mod frontend_tls_live_reload_tests;

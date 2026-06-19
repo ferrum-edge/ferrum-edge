@@ -9,8 +9,9 @@ restriction with three coordinated changes:
    namespaces the CP serves.
 2. Per-namespace **broadcast partitioning** in the CP gRPC server so each
    DP only ever receives its own namespace's config.
-3. An optional **JWT tenancy claim** (`ns`) that pins which namespaces a
-   token bearer is authorised to subscribe to, independent of the CP scope.
+3. A **JWT tenancy claim** (`ns`) that pins which namespaces a token bearer
+   is authorised to subscribe to, independent of the CP scope. The claim is
+   automatically required for `Set` and `All` scopes.
 
 This document is the operator guide for adopting it. The pre-T2-A
 single-namespace deployment path is the default and remains byte-identical
@@ -21,7 +22,7 @@ when neither new env var is set.
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = back-compat single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
-| `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` JWT must carry an `ns` claim authorising the subscribe namespace; tokens without it are rejected. |
+| `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every CP/DP configuration JWT must carry an `ns` claim. This remains optional only for `Single` scope; `Set` and `All` scopes require `ns` claims automatically even when this flag is `false`. |
 
 Both vars live in `[cp_dp]` of `ferrum.conf` next to
 `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the
@@ -43,10 +44,8 @@ CP startup logs (`CP mode: serving N namespaces: [...]`).
 
 - **`All`** — cluster-wide. CP discovers namespaces from the database on
   every poll tick (`list_namespaces()`), so new tenants are picked up
-  automatically. Combine with `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true` for
-  meaningful tenancy isolation; otherwise any DP that knows the shared
-  CP/DP JWT secret can subscribe to any tenant by changing its
-  `FERRUM_NAMESPACE`.
+  automatically. Because this is multi-tenant, every configuration surface
+  requires an authenticated `ns` claim before serialising a snapshot.
 
 Whitespace is trimmed; duplicates are deduplicated; `*` cannot be combined
 with explicit entries (validation error).
@@ -82,9 +81,8 @@ to 32) to keep the per-namespace channel small.
 
 ## JWT tenancy claim
 
-DP `ConfigSync.Subscribe` and mesh `MeshConfigSync.MeshSubscribe` JWTs may
-carry an optional `ns` claim that pins which namespaces the bearer is
-authorised to subscribe to. The claim accepts:
+DP, native mesh, and xDS configuration JWTs carry an `ns` claim that pins
+which namespaces the bearer is authorised to subscribe to. The claim accepts:
 
 - a single string: `"ns": "prod"`
 - an array of strings: `"ns": ["prod","staging"]`
@@ -95,13 +93,13 @@ The CP authorisation order is:
    `FERRUM_CP_DP_GRPC_JWT_SECRET`, `iss == FERRUM_CP_DP_GRPC_JWT_ISSUER`,
    `exp`/`iat` present, `exp` not expired.
 
-2. **`ns` claim presence policy** (T2-A): when
-   `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true` and the token has no `ns`
-   claim, reject with `PERMISSION_DENIED`. When the policy is `false`
-   (default) and there is no claim, skip to step 4.
+2. **`ns` claim presence policy**: when the CP scope is `Set` or `All`, or
+   when `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`, a token with no `ns`
+   claim is rejected with `PERMISSION_DENIED`. Missing claims remain
+   compatible only for `Single` scope with the flag unset.
 
-3. **`ns` claim authorisation** (T2-A): if the token has an `ns` claim and
-   the requested DP namespace is NOT in it, reject with
+3. **`ns` claim authorisation**: if the token has an `ns` claim and the
+   requested namespace is NOT in it, reject with
    `PERMISSION_DENIED`. This is the most-restrictive gate — even if the CP
    scope would otherwise allow the namespace, a restrictive claim wins.
 
@@ -109,13 +107,21 @@ The CP authorisation order is:
    covered by `FERRUM_CP_NAMESPACES` (or `FERRUM_NAMESPACE` in
    single-namespace mode), reject with `FAILED_PRECONDITION`.
 
+Malformed `ns` claims are rejected as authentication failures. Empty
+strings, non-string values, or arrays containing non-strings are not treated
+as "missing" because that would let ambiguous tokens fall back to legacy
+single-namespace compatibility.
+
 Self-minted DP tokens (the `connect_and_subscribe` path in
 `src/grpc/dp_client.rs`) and native mesh-client tokens
 (`src/modes/mesh/config_consumer/native_client.rs`) embed a single-string
 `ns` claim from the process' own `FERRUM_NAMESPACE`, so data planes and mesh
 nodes continue to work out of the box even when the CP runs with
 `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`. Operator-minted tokens that should
-grant access to multiple namespaces should embed the claim as an array.
+grant access to multiple namespaces should embed the claim as an array. xDS
+ADS has no explicit namespace request field, so multi-tenant xDS accepts only
+a single-namespace `ns` claim; a multi-namespace xDS token is ambiguous and
+is rejected.
 
 ## Migration steps
 
@@ -128,36 +134,62 @@ grant access to multiple namespaces should embed the claim as an array.
    byte-identical to the pre-T2-A path; verify via the existing
    single-namespace CP smoke tests.
 
-3. **Expand scope incrementally**: set `FERRUM_CP_NAMESPACES="ns-a,ns-b"`
-   on one CP at a time. The CP startup log will print the resolved scope.
-   DPs in `ns-b` (previously rejected) can now subscribe; existing `ns-a`
-   subscribers continue to receive only `ns-a` config.
+3. **Mint tenant-scoped CP/DP tokens**: confirm every DP or mesh node that
+   will talk to a multi-namespace CP presents an `ns` claim. Prefer one
+   credential per tenant, or an asymmetric token issuer with tenant-scoped
+   subjects, over one fleet-wide HS256 secret. If you must keep the shared
+   HS256 secret during migration, keep token TTLs short and use `ns` claims.
 
-4. **(Optional) Switch to `*`**: once you're comfortable with the explicit
+4. **Expand scope incrementally**: set `FERRUM_CP_NAMESPACES="ns-a,ns-b"`
+   on one CP at a time. The CP startup log will print the resolved scope.
+   DPs whose tokens carry matching `ns` claims can now subscribe; missing
+   or wrong claims fail before snapshot serialisation.
+
+5. **(Optional) Switch to `*`**: once you're comfortable with the explicit
    set, set `FERRUM_CP_NAMESPACES=*` so new namespaces are picked up
    automatically. Required for `helm install`-style provisioning where the
    CP doesn't know the tenant list ahead of time.
 
-5. **(Optional) Tighten tenancy**: deploy operator-minted DP tokens with
-   `ns` claims, then set `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`. This
-   prevents a compromised DP for tenant A from subscribing to tenant B by
-   changing only its `FERRUM_NAMESPACE` value.
+6. **(Optional) Tighten single-namespace CPs**: set
+   `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true` on single-namespace CPs after
+   all DPs carry `ns` claims. Multi-namespace CPs already enforce this
+   automatically.
 
-6. **Decommission per-namespace CP fleet**: once the multi-namespace CP is
+7. **Decommission per-namespace CP fleet**: once the multi-namespace CP is
    serving all tenants, drain DPs from the old CPs and tear them down.
 
-## What is out of scope for T2-A
+## Threat model and validation evidence
 
-- xDS ADS continues to use the legacy single-namespace path. Native
-  `MeshConfigSync.MeshSubscribe` shares the ConfigSync CP-scope and `ns`
-  claim admission gates, but still uses one CP-wide mesh update channel and
-  computes each subscriber's namespace slice from the current config shadow.
-  xDS multi-namespace support is tracked separately.
-- Per-namespace gateway trust bundles. The CP currently loads
-  `load_gateway_trust_bundles` from `FERRUM_NAMESPACE` only; multi-tenant
-  CPs share the same trust material across all served namespaces. Splitting
-  this is straightforward but deferred to a follow-up so this PR stays
-  reviewable.
-- K8s controller's broadcast hook (`start_k8s_controller(... update_tx ...)`).
-  It still consumes the back-compat single sender; T2-B will revisit
-  alongside the K8s controller default-on flip.
+The attacker is a compromised tenant A DP, mesh node, or xDS client that
+knows a valid CP/DP JWT signing secret and tries to receive tenant B data by
+changing local environment, subscription request namespace, xDS node
+metadata, reconnect timing, resume resource versions, or failover target.
+The attacker must not receive tenant B gateway resources, mesh resources, or
+trust material on the wire.
+
+Pre-fix validation was run at commit
+`1252246777bdaa8fcbe6b401ffdc9020d7f71e11`. A temporary SQLite CP database
+was seeded with tenant-tagged proxies, consumers, and plugin markers for
+`tenant-a` and `tenant-b`; CP startup was exercised with
+`FERRUM_CP_NAMESPACES=tenant-a,tenant-b` and `FERRUM_CP_NAMESPACES=*` while
+`FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` was unset. Existing integration tests
+confirmed that `Set` and `All` scopes accepted a shared no-claim JWT and
+returned whichever namespace was requested. Source review also found that
+native `MeshConfigSync`, xDS ADS, K8s controller broadcasts, and gateway
+trust bundles were not consistently namespace-authorised.
+
+Post-fix CI gates this with `tests/integration/cp_multi_namespace_tests.rs`:
+missing, malformed, wrong, and ambiguous claims fail before the first
+snapshot; tenant A mesh wire JSON contains only tenant A services; and
+multi-tenant trust bundle side channels serialise as `null`.
+
+## Protocol matrix
+
+| Surface | Authenticated namespace source | Multi-namespace behaviour |
+|---|---|---|
+| `ConfigSync.Subscribe` | `SubscribeRequest.namespace` authorised by JWT `ns` | Missing/wrong/malformed claims fail before initial snapshot serialisation. Full snapshots, deltas, lag recovery, and K8s-triggered broadcasts are namespace-filtered. |
+| `ConfigSync.GetFullConfig` | `FullConfigRequest.namespace` authorised by JWT `ns` | Same authorisation and filtering as `Subscribe`; wrong claims fail before response serialisation. |
+| Native `MeshConfigSync.MeshSubscribe` | `MeshSubscribeRequest.namespace` authorised by JWT `ns` | Same authorisation as ConfigSync. Full, delta, and lag recovery slices are built from a namespace-filtered config. |
+| xDS ADS | Single namespace from JWT `ns` | Multi-tenant streams require exactly one `ns` value because ADS has no namespace request field. Node metadata and resume resource versions cannot change tenant identity. |
+| Kubernetes controller broadcast | Reconciled config namespaces | ConfigSync broadcasts fan out via `NamespaceBroadcasts`; each namespace is serialised independently. |
+| Gateway trust bundles | Single-namespace CP only | Top-level gateway trust bundles and mesh trust bundles are withheld in `Set` and `All` scopes until a namespaced trust-bundle store is available. |

@@ -553,17 +553,32 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
 pub struct XdsNodeMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_spiffe_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waypoint_name: Option<String>,
 }
 
 /// Encode `Node.metadata` bytes for an outgoing DP request. Returns empty when
 /// there is nothing to carry, matching the prior no-metadata wire shape.
 pub fn encode_node_metadata(workload_spiffe_id: Option<&str>) -> Vec<u8> {
-    match workload_spiffe_id {
-        Some(spiffe) if !spiffe.is_empty() => serde_json::to_vec(&XdsNodeMetadata {
-            workload_spiffe_id: Some(spiffe.to_string()),
-        })
-        .unwrap_or_default(),
-        _ => Vec::new(),
+    encode_node_metadata_with_waypoint(workload_spiffe_id, None)
+}
+
+pub fn encode_node_metadata_with_waypoint(
+    workload_spiffe_id: Option<&str>,
+    waypoint_name: Option<&str>,
+) -> Vec<u8> {
+    let metadata = XdsNodeMetadata {
+        workload_spiffe_id: workload_spiffe_id
+            .filter(|spiffe| !spiffe.is_empty())
+            .map(ToString::to_string),
+        waypoint_name: waypoint_name
+            .filter(|name| !name.trim().is_empty())
+            .map(ToString::to_string),
+    };
+    if metadata.workload_spiffe_id.is_none() && metadata.waypoint_name.is_none() {
+        Vec::new()
+    } else {
+        serde_json::to_vec(&metadata).unwrap_or_default()
     }
 }
 
@@ -672,16 +687,16 @@ mod tests {
     #[test]
     fn node_metadata_round_trips_workload_spiffe() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let bytes = encode_node_metadata(Some(spiffe));
+        let bytes = encode_node_metadata_with_waypoint(Some(spiffe), Some("waypoint"));
         assert!(!bytes.is_empty());
-        assert_eq!(
-            decode_node_metadata(&bytes).workload_spiffe_id.as_deref(),
-            Some(spiffe)
-        );
+        let metadata = decode_node_metadata(&bytes);
+        assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
+        assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
         // Absent / empty identity encodes to empty bytes (prior no-metadata
         // wire shape) and decodes to no identity.
         assert!(encode_node_metadata(None).is_empty());
         assert!(encode_node_metadata(Some("")).is_empty());
+        assert!(encode_node_metadata_with_waypoint(None, Some(" \t")).is_empty());
         assert_eq!(decode_node_metadata(&[]).workload_spiffe_id, None);
         // Malformed metadata never errors/panics — it is advisory, so it
         // decodes to no identity rather than rejecting the stream.

@@ -174,7 +174,7 @@ pub async fn start_admin_listener(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls(addr, state, shutdown, None).await
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None).await
 }
 
 /// Start the Admin API listener with optional TLS support.
@@ -184,8 +184,23 @@ pub async fn start_admin_listener_with_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
+}
+
+/// Start the Admin API listener with optional TLS support and signal readiness
+/// after the TCP socket binds successfully.
+pub async fn start_admin_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
     serve_admin_on_listener(listener, state, shutdown, tls_config).await
 }
 
@@ -201,8 +216,23 @@ pub async fn start_admin_listener_with_dynamic_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
 ) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_dynamic_tls_and_signal(addr, state, shutdown, tls_slot, None).await
+}
+
+/// Start the Admin API HTTPS listener with a hot-swappable frontend TLS slot
+/// and signal readiness after the TCP socket binds successfully.
+pub async fn start_admin_listener_with_dynamic_tls_and_signal(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
     serve_admin_on_listener_with_dynamic_tls(listener, state, shutdown, tls_slot).await
 }
 
@@ -3351,8 +3381,14 @@ async fn handle_batch_create(
                         }
                     }
                     PluginScope::ProxyGroup => {
-                        // ProxyGroup plugins have no proxy_id — any proxy can
-                        // reference them via its plugins association list.
+                        if plugin_config.proxy_id.is_some() {
+                            validation_errors.push(format!(
+                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                proxy.id,
+                                plugin_config.id,
+                                plugin_config.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
                 },
                 None => unresolved.push(assoc.clone()),

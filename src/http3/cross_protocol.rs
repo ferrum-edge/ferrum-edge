@@ -1913,15 +1913,12 @@ where
         return Ok(outcome);
     }
 
-    // Capture the original range decision before `after_proxy` rewrites the
+    // Capture original response invariants before `after_proxy` rewrites the
     // headers below. On this H3 cross-protocol path the body is later either
-    // streamed or buffered (range responses stream — see the refine call
-    // below), so a `response_transformer` (ordering 4000) that strips
-    // `Content-Range` ahead of `compression` (4050) would otherwise let
-    // compression mislabel a streamed range body `Content-Encoding` (its
-    // buffered-only `transform_response_body` never runs) or compress a
-    // buffered partial body. `compression.after_proxy` honors this marker.
-    crate::http3::server::stamp_h3_range_response_metadata(ctx, status, &response_headers);
+    // streamed or buffered, so a response transformer that strips `Content-Range`
+    // or `Cache-Control` ahead of compression would otherwise let compression
+    // mislabel or rewrite a representation it must preserve.
+    crate::http3::server::stamp_h3_original_response_metadata(ctx, status, &response_headers);
 
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
@@ -2066,7 +2063,8 @@ where
 
             for plugin in plugins {
                 if let Some(transformed) = plugin
-                    .transform_response_body(
+                    .transform_response_body_with_context(
+                        &mut *ctx,
                         &response_body,
                         content_type_of(&response_headers),
                         &response_headers,
@@ -2862,7 +2860,8 @@ where
             // headers after reconciliation below.
             for plugin in plugins.iter() {
                 if let Some(transformed) = plugin
-                    .transform_response_body(
+                    .transform_response_body_with_context(
+                        &mut *ctx,
                         &response_body,
                         content_type_of(&plugin_response_headers),
                         &plugin_response_headers,

@@ -6208,15 +6208,12 @@ components:
           description: >-
             Plugin-specific JSON configuration. Validated on create/update and
             again when the plugin is instantiated at config reload time.
-            Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
-            oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
-            mtls_auth, access_control,
-            tcp_connection_throttle, adaptive_concurrency, ip_restriction, waf, security_headers, mesh_authz, opa,
-            mesh_outbound_registry, openapi_validator, ai_semantic_firewall, mcp_gateway, a2a_gateway) are validation-fatal: invalid config blocks
+            Enabled plugin configs are validation-fatal when the plugin cache is
+            built: unknown plugin names or invalid plugin-specific config block
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
-            prior good config). Non-security plugins with invalid config are
-            logged and skipped instead. See
+            prior good config). Disabled plugin configs are not instantiated.
+            See
             `PluginConfigs` section for per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
@@ -12088,7 +12085,7 @@ components:
 
     CompressionConfig:
       type: object
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression."
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression."
       properties:
         algorithms:
           type: array
@@ -12107,10 +12104,6 @@ components:
           items:
             type: string
           description: "Content-type whitelist. Defaults to 10 common text/application types"
-        disable_on_etag:
-          type: boolean
-          default: false
-          description: "Skip compression when the response has an ETag header"
         remove_accept_encoding:
           type: boolean
           default: true

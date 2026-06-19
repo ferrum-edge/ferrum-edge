@@ -6,7 +6,7 @@
 //! path) — the back-compat path is intentionally re-exercised here under
 //! the new scope abstraction to prove the byte-identical guarantee.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,12 @@ use tonic::transport::Server;
 
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
+use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
+use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
+use ferrum_edge::identity::TrustDomain;
+use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService, TrustBundle, TrustBundleSet};
+use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-multi-ns-2026-jeremyjpj";
 const TEST_ISSUER: &str = "ferrum-edge-cp-dp";
@@ -111,6 +117,45 @@ fn proxy_in(id: &str, namespace: &str) -> Proxy {
     }
 }
 
+fn test_trust_bundles() -> TrustBundleSet {
+    TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
+            x509_authorities: vec!["AQIDBA==".to_string()],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: Vec::new(),
+    }
+}
+
+fn mesh_service(name: &str, namespace: &str) -> MeshService {
+    MeshService {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        ports: Vec::new(),
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::new(),
+        cluster_ips: Vec::new(),
+    }
+}
+
+fn multi_tenant_mesh_config() -> GatewayConfig {
+    GatewayConfig {
+        version: "1".to_string(),
+        loaded_at: Utc::now(),
+        mesh: Some(Box::new(MeshConfig {
+            services: vec![
+                mesh_service("svc-tenant-a", "tenant-a"),
+                mesh_service("svc-tenant-b", "tenant-b"),
+            ],
+            trust_bundles: Some(test_trust_bundles()),
+            ..MeshConfig::default()
+        })),
+        ..Default::default()
+    }
+}
+
 /// Boot a CP gRPC server with an explicit `CpScope` and the
 /// `cp_require_namespace_claim` knob.
 async fn start_cp_with_scope(
@@ -166,6 +211,95 @@ macro_rules! connect_with_token {
             },
         )
     }};
+}
+
+macro_rules! connect_mesh_with_token {
+    ($addr:expr, $token:expr) => {{
+        let token_meta: tonic::metadata::MetadataValue<_> =
+            format!("Bearer {}", $token).parse().unwrap();
+        let channel = tonic::transport::Channel::from_shared(format!("http://{}", $addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        )
+    }};
+}
+
+async fn start_mesh_with_scope(
+    config: GatewayConfig,
+    scope: CpScope,
+    require_ns_claim: bool,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let cfg_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, _tx) = MeshGrpcServer::builder(cfg_arc, TEST_JWT_SECRET.to_string())
+        .channel_capacity(64)
+        .registry(Arc::new(MeshNodeRegistry::new()))
+        .expected_issuer(TEST_ISSUER.to_string())
+        .namespace("tenant-a".to_string())
+        .scope(scope)
+        .require_ns_claim(require_ns_claim)
+        .build();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("mesh gRPC server failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+async fn start_xds_with_scope(
+    config: GatewayConfig,
+    scope: CpScope,
+    require_ns_claim: bool,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let cfg_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (_cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TEST_JWT_SECRET.to_string())
+        .channel_capacity(64)
+        .scope(scope.clone())
+        .require_ns_claim(require_ns_claim)
+        .build();
+    let server = XdsAdsServer::new(
+        cfg_arc,
+        update_tx,
+        TEST_JWT_SECRET.to_string(),
+        TEST_ISSUER.to_string(),
+        "tenant-a".to_string(),
+        32,
+    )
+    .with_scope(scope)
+    .with_require_namespace_claim(require_ns_claim);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("xDS server failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, handle)
 }
 
 // ── Back-compat: single-namespace CP behaves identically ──────────────────
@@ -248,7 +382,7 @@ async fn back_compat_single_scope_rejects_mismatched_namespace() {
 
 // ── Multi-tenant: per-namespace broadcast partitioning ────────────────────
 
-/// `CpScope::Set({prod,staging})` accepts subscribers in either namespace,
+/// `CpScope::Set({prod,staging})` accepts claimed subscribers in either namespace,
 /// rejects subscribers in unlisted namespaces, AND a delta written into one
 /// namespace is invisible to subscribers in the other namespace.
 #[tokio::test(flavor = "multi_thread")]
@@ -268,7 +402,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     let (addr, handle) = start_cp_with_scope(cfg, CpScope::Set(set), false).await;
 
     // Subscribe DP in prod.
-    let prod_token = mint_token_with_ns("dp-prod", None);
+    let prod_token = mint_token_with_ns("dp-prod", Some(json!("prod")));
     let mut prod_client = connect_with_token!(addr, prod_token);
     let prod_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-prod".to_string(),
@@ -292,7 +426,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     }
 
     // Subscribe DP in staging.
-    let staging_token = mint_token_with_ns("dp-staging", None);
+    let staging_token = mint_token_with_ns("dp-staging", Some(json!("staging")));
     let mut staging_client = connect_with_token!(addr, staging_token);
     let staging_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-staging".to_string(),
@@ -318,7 +452,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     assert_eq!(staging_cfg.proxies[0].namespace, "staging");
 
     // Subscribe DP in a namespace NOT in the CP scope — must be rejected.
-    let dev_token = mint_token_with_ns("dp-dev", None);
+    let dev_token = mint_token_with_ns("dp-dev", Some(json!("dev")));
     let mut dev_client = connect_with_token!(addr, dev_token);
     let dev_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-dev".to_string(),
@@ -351,7 +485,7 @@ async fn multi_ns_all_scope_filters_initial_snapshot_per_subscriber() {
         ("dp-b", "ns-b", "p-b"),
         ("dp-c", "ns-c", "p-c"),
     ] {
-        let token = mint_token_with_ns(node_id, None);
+        let token = mint_token_with_ns(node_id, Some(json!(ns)));
         let mut client = connect_with_token!(addr, token);
         let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
             node_id: node_id.to_string(),
@@ -373,6 +507,195 @@ async fn multi_ns_all_scope_filters_initial_snapshot_per_subscriber() {
         );
         assert_eq!(snap.proxies[0].id, expected_proxy);
         assert_eq!(snap.proxies[0].namespace, ns);
+    }
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_ns_set_scope_rejects_token_without_ns_by_default() {
+    let cfg = GatewayConfig {
+        version: "1".to_string(),
+        loaded_at: Utc::now(),
+        ..Default::default()
+    };
+    let mut set = HashSet::new();
+    set.insert("prod".to_string());
+    set.insert("staging".to_string());
+    let (addr, handle) = start_cp_with_scope(cfg, CpScope::Set(set), false).await;
+
+    let token = mint_token_with_ns("dp-no-claim", None);
+    let mut client = connect_with_token!(addr, token);
+    let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "dp-no-claim".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "prod".to_string(),
+    });
+    let err = client.subscribe(req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("Multi-namespace"));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_ns_rejects_malformed_ns_claim_before_snapshot() {
+    let cfg = GatewayConfig {
+        version: "1".to_string(),
+        loaded_at: Utc::now(),
+        proxies: vec![proxy_in("p-prod", "prod")],
+        ..Default::default()
+    };
+    let (addr, handle) = start_cp_with_scope(cfg, CpScope::All, false).await;
+
+    let token = mint_token_with_ns("dp-bad-claim", Some(json!(42)));
+    let mut client = connect_with_token!(addr, token);
+    let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "dp-bad-claim".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "prod".to_string(),
+    });
+    let err = client.subscribe(req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert!(err.message().contains("ns"));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_ns_trust_bundles_are_not_sent_to_tenant_side_channel() {
+    let cfg = GatewayConfig {
+        version: "1".to_string(),
+        loaded_at: Utc::now(),
+        proxies: vec![proxy_in("p-prod", "prod")],
+        trust_bundles: Some(Box::new(test_trust_bundles())),
+        ..Default::default()
+    };
+    let mut set = HashSet::new();
+    set.insert("prod".to_string());
+    set.insert("staging".to_string());
+    let (addr, handle) = start_cp_with_scope(cfg, CpScope::Set(set), false).await;
+
+    let token = mint_token_with_ns("dp-prod", Some(json!("prod")));
+    let mut client = connect_with_token!(addr, token);
+    let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "dp-prod".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "prod".to_string(),
+    });
+    let mut stream = client.subscribe(req).await.unwrap().into_inner();
+    let first = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.trust_bundles_json, "null");
+    let snap: GatewayConfig = serde_json::from_str(&first.config_json).unwrap();
+    assert!(snap.trust_bundles.is_none());
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_mesh_subscribe_filters_tenant_slice_and_trust_material() {
+    let mut set = HashSet::new();
+    set.insert("tenant-a".to_string());
+    set.insert("tenant-b".to_string());
+    let (addr, handle) =
+        start_mesh_with_scope(multi_tenant_mesh_config(), CpScope::Set(set), false).await;
+
+    let token = mint_token_with_ns("mesh-tenant-a", Some(json!("tenant-a")));
+    let mut client = connect_mesh_with_token!(addr, token);
+    let req = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-tenant-a".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "tenant-a".to_string(),
+        workload_spiffe_id: String::new(),
+        labels: HashMap::new(),
+        waypoint_name: String::new(),
+    });
+    let mut stream = client.mesh_subscribe(req).await.unwrap().into_inner();
+    let first = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let slice: MeshSlice = serde_json::from_str(&first.mesh_slice_json).unwrap();
+    assert_eq!(slice.namespace, "tenant-a");
+    assert_eq!(slice.services.len(), 1);
+    assert_eq!(slice.services[0].name, "svc-tenant-a");
+    assert!(slice.trust_bundles.is_none());
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_mesh_subscribe_rejects_missing_claim_in_multi_scope() {
+    let mut set = HashSet::new();
+    set.insert("tenant-a".to_string());
+    set.insert("tenant-b".to_string());
+    let (addr, handle) =
+        start_mesh_with_scope(multi_tenant_mesh_config(), CpScope::Set(set), false).await;
+
+    let token = mint_token_with_ns("mesh-no-claim", None);
+    let mut client = connect_mesh_with_token!(addr, token);
+    let req = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: "mesh-no-claim".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "tenant-a".to_string(),
+        workload_spiffe_id: String::new(),
+        labels: HashMap::new(),
+        waypoint_name: String::new(),
+    });
+    let err = client.mesh_subscribe(req).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xds_rejects_missing_and_ambiguous_namespace_claims_in_multi_scope() {
+    let mut set = HashSet::new();
+    set.insert("tenant-a".to_string());
+    set.insert("tenant-b".to_string());
+    let (addr, handle) =
+        start_xds_with_scope(multi_tenant_mesh_config(), CpScope::Set(set), false).await;
+
+    for (node_id, token) in [
+        ("xds-no-claim", mint_token_with_ns("xds-no-claim", None)),
+        (
+            "xds-ambiguous",
+            mint_token_with_ns("xds-ambiguous", Some(json!(["tenant-a", "tenant-b"]))),
+        ),
+    ] {
+        let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client =
+            ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient::new(
+                channel,
+            );
+        let requests = tokio_stream::iter(vec![ferrum_edge::xds::proto::DiscoveryRequest {
+            version_info: String::new(),
+            node: Some(ferrum_edge::xds::proto::Node {
+                id: node_id.to_string(),
+                cluster: String::new(),
+                metadata: Vec::new(),
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            response_nonce: String::new(),
+            error_detail: None,
+        }]);
+        let mut request = tonic::Request::new(requests);
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        let err = client
+            .stream_aggregated_resources(request)
+            .await
+            .expect_err("xDS must reject before opening stream");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     handle.abort();
@@ -529,7 +852,7 @@ async fn get_full_config_filters_to_dp_namespace() {
     set.insert("staging".to_string());
     let (addr, handle) = start_cp_with_scope(cfg, CpScope::Set(set), false).await;
 
-    let token = mint_token_with_ns("dp-prod", None);
+    let token = mint_token_with_ns("dp-prod", Some(json!("prod")));
     let mut client = connect_with_token!(addr, token);
 
     let req = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {

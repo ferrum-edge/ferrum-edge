@@ -2868,14 +2868,14 @@ async fn post_proxy_plugin_association_to_about_to_insert_plugin_succeeds() {
 // ============================================================================
 /// See admin_db_api_specs_tests.rs for the full DB-layer test. This handler-
 /// level test verifies the end-to-end invariant: after a PUT that replaces the
-/// spec-owned plugin, a manually-added association (global plugin) still causes
-/// the proxy to run that plugin at runtime.
+/// spec-owned plugin, a manually-added association (proxy-group plugin) still
+/// causes the proxy to run that plugin at runtime.
 ///
 /// The proxy.updated_at behaviour is tested at the DB layer. Here we verify
-/// the proxy still exists and the global plugin association is visible via
+/// the proxy still exists and the proxy-group plugin association is visible via
 /// `get_proxy`.
 #[tokio::test]
-async fn put_keeps_manually_added_global_plugin_association() {
+async fn put_keeps_manually_added_proxy_group_plugin_association() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
@@ -2904,23 +2904,23 @@ async fn put_keeps_manually_added_global_plugin_association() {
     );
     let spec_id = post_body["id"].as_str().unwrap().to_string();
 
-    // Manually create a global plugin and add it to the proxy (simulates operator
-    // associating a shared rate-limit plugin after spec creation).
-    let global_plugin_id = uid("global");
-    let global_plugin: ferrum_edge::config::types::PluginConfig =
+    // Manually create a proxy-group plugin and add it to the proxy (simulates
+    // an operator associating a shared rate-limit plugin after spec creation).
+    let manual_plugin_id = uid("proxy-group");
+    let manual_plugin: ferrum_edge::config::types::PluginConfig =
         serde_json::from_value(serde_json::json!({
-            "id": global_plugin_id,
+            "id": manual_plugin_id,
             "namespace": "ferrum",
             "plugin_name": "cors",
-            "scope": "global",
+            "scope": "proxy_group",
             "config": {},
             "enabled": true
         }))
-        .expect("global plugin deserialization");
+        .expect("proxy-group plugin deserialization");
     store
-        .create_plugin_config(&global_plugin)
+        .create_plugin_config(&manual_plugin)
         .await
-        .expect("create global plugin");
+        .expect("create proxy-group plugin");
 
     // Insert the proxy-plugin junction row manually.
     use ferrum_edge::config::types::PluginAssociation;
@@ -2931,7 +2931,7 @@ async fn put_keeps_manually_added_global_plugin_association() {
             .expect("get_proxy")
             .expect("proxy exists");
         p.plugins.push(PluginAssociation {
-            plugin_config_id: global_plugin_id.clone(),
+            plugin_config_id: manual_plugin_id.clone(),
         });
         p
     };
@@ -2966,7 +2966,7 @@ async fn put_keeps_manually_added_global_plugin_association() {
         "PUT must succeed; body: {put_body}"
     );
 
-    // The global plugin must still be associated with the proxy.
+    // The proxy-group plugin must still be associated with the proxy.
     let proxy_after = store
         .get_proxy(&proxy_id)
         .await
@@ -2978,8 +2978,8 @@ async fn put_keeps_manually_added_global_plugin_association() {
         .map(|a| a.plugin_config_id.as_str())
         .collect();
     assert!(
-        plugin_ids.contains(&global_plugin_id.as_str()),
-        "global plugin association must be preserved after PUT; found: {:?}",
+        plugin_ids.contains(&manual_plugin_id.as_str()),
+        "proxy-group plugin association must be preserved after PUT; found: {:?}",
         plugin_ids
     );
 }

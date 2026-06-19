@@ -9,10 +9,10 @@
 //! re-fetch them, leaving permanent divergence between DB and in-memory
 //! config.
 //!
-//! These tests assert the three [`IncrementalApplyOutcome`] variants are
+//! These tests assert the three [`ConfigApplyOutcome`] variants are
 //! returned correctly, and simulate a `last_poll_at` update logic identical
 //! to the polling loop in `src/modes/database.rs` to verify the cursor only
-//! advances on `Applied`/`NoChanges`, never on `Rejected`.
+//! advances on `Applied`/`Unchanged`, never on `Rejected`.
 
 use std::collections::HashMap;
 
@@ -24,7 +24,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::proxy::{IncrementalApplyOutcome, ProxyState};
+use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
 /// Minimal test proxy with safe defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
@@ -322,13 +322,47 @@ fn delta_with_proxy(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> Incr
     }
 }
 
-/// Empty incremental result returns `NoChanges` so the polling loop can still
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_empty_candidate_returns_unchanged() {
+    let state = empty_proxy_state();
+    let outcome = state.update_config(GatewayConfig::default());
+    assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
+    assert!(
+        state.config.load().proxies.is_empty(),
+        "unchanged full candidate must not mutate runtime config"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_rejected_candidate_reports_rejected() {
+    let state = empty_proxy_state();
+
+    let mut p1 = test_proxy("p1", "/dup");
+    let mut p2 = test_proxy("p2", "/dup");
+    p1.hosts = vec![];
+    p2.hosts = vec![];
+
+    let candidate = GatewayConfig {
+        proxies: vec![p1, p2],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let outcome = state.update_config(candidate);
+
+    assert!(matches!(outcome, ConfigApplyOutcome::Rejected { .. }));
+    assert!(
+        state.config.load().proxies.is_empty(),
+        "rejected full candidate must not mutate runtime config"
+    );
+}
+
+/// Empty incremental result returns `Unchanged` so the polling loop can still
 /// advance `last_poll_at` (no work to retry).
 #[tokio::test(flavor = "multi_thread")]
-async fn apply_incremental_empty_result_returns_no_changes() {
+async fn apply_incremental_empty_result_returns_unchanged() {
     let state = empty_proxy_state();
     let result = state.apply_incremental(empty_delta_at(Utc::now())).await;
-    assert_eq!(result, IncrementalApplyOutcome::NoChanges);
+    assert_eq!(result, ConfigApplyOutcome::Unchanged);
 }
 
 /// A valid incremental result returns `Applied` and the config is patched.
@@ -340,7 +374,7 @@ async fn apply_incremental_valid_changes_returns_applied() {
     let delta = delta_with_proxy(test_proxy("p1", "/api/v1"), Utc::now());
     let result = state.apply_incremental(delta).await;
 
-    assert_eq!(result, IncrementalApplyOutcome::Applied);
+    assert_eq!(result, ConfigApplyOutcome::Applied);
     let cfg = state.config.load();
     assert_eq!(cfg.proxies.len(), 1);
     assert_eq!(cfg.proxies[0].id, "p1");
@@ -389,7 +423,7 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
     };
 
     let result = state.apply_incremental(delta).await;
-    assert_eq!(result, IncrementalApplyOutcome::Applied);
+    assert_eq!(result, ConfigApplyOutcome::Applied);
 
     let cfg = state.config.load();
     assert_eq!(cfg.loaded_at, poll_timestamp);
@@ -448,7 +482,7 @@ async fn apply_incremental_rejected_returns_rejected_variant() {
     };
 
     let result = state.apply_incremental(delta).await;
-    assert_eq!(result, IncrementalApplyOutcome::Rejected);
+    assert!(matches!(result, ConfigApplyOutcome::Rejected { .. }));
 
     // Critical: the in-memory config must remain unchanged on rejection.
     assert!(
@@ -460,7 +494,7 @@ async fn apply_incremental_rejected_returns_rejected_variant() {
 /// Reproduces the polling-loop cursor logic from `src/modes/database.rs` and
 /// asserts that:
 ///   - `Applied` advances `last_poll_at`.
-///   - `NoChanges` advances `last_poll_at`.
+///   - `Unchanged` advances `last_poll_at`.
 ///   - `Rejected` leaves `last_poll_at` unchanged (so the next poll's
 ///     `since` parameter equals the prior `last_poll_at`, meaning the
 ///     rejected rows will be re-fetched).
@@ -470,7 +504,7 @@ async fn apply_incremental_rejected_returns_rejected_variant() {
 /// resource whose `updated_at` was older than that one-second window, so the
 /// rejected row silently disappeared from the gateway's view of the DB.
 #[tokio::test(flavor = "multi_thread")]
-async fn polling_cursor_only_advances_on_applied_or_no_changes() {
+async fn polling_cursor_only_advances_on_applied_or_unchanged() {
     let state = empty_proxy_state();
 
     // ------ Cycle 1: rejected delta. ------
@@ -495,13 +529,13 @@ async fn polling_cursor_only_advances_on_applied_or_no_changes() {
     };
 
     let outcome = state.apply_incremental(rejected_delta).await;
-    assert_eq!(outcome, IncrementalApplyOutcome::Rejected);
-    // Mirror the polling loop: advance only on Applied or NoChanges.
+    assert!(matches!(outcome, ConfigApplyOutcome::Rejected { .. }));
+    // Mirror the polling loop: advance only on Applied or Unchanged.
     match outcome {
-        IncrementalApplyOutcome::Applied | IncrementalApplyOutcome::NoChanges => {
+        ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
             last_poll_at = Some(rejected_ts);
         }
-        IncrementalApplyOutcome::Rejected => { /* intentionally do not advance */ }
+        ConfigApplyOutcome::Rejected { .. } => { /* intentionally do not advance */ }
     }
     assert_eq!(
         last_poll_at,
@@ -514,29 +548,29 @@ async fn polling_cursor_only_advances_on_applied_or_no_changes() {
     // ------ Cycle 2: empty delta. ------
     let empty_ts = Utc::now();
     let outcome = state.apply_incremental(empty_delta_at(empty_ts)).await;
-    assert_eq!(outcome, IncrementalApplyOutcome::NoChanges);
+    assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
     match outcome {
-        IncrementalApplyOutcome::Applied | IncrementalApplyOutcome::NoChanges => {
+        ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
             last_poll_at = Some(empty_ts);
         }
-        IncrementalApplyOutcome::Rejected => {}
+        ConfigApplyOutcome::Rejected { .. } => {}
     }
     assert_eq!(
         last_poll_at,
         Some(empty_ts),
-        "NoChanges must advance last_poll_at — there is no work to retry"
+        "Unchanged must advance last_poll_at — there is no work to retry"
     );
 
     // ------ Cycle 3: applied delta. ------
     let applied_ts = Utc::now();
     let applied_delta = delta_with_proxy(test_proxy("p3", "/api/v3"), applied_ts);
     let outcome = state.apply_incremental(applied_delta).await;
-    assert_eq!(outcome, IncrementalApplyOutcome::Applied);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
     match outcome {
-        IncrementalApplyOutcome::Applied | IncrementalApplyOutcome::NoChanges => {
+        ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
             last_poll_at = Some(applied_ts);
         }
-        IncrementalApplyOutcome::Rejected => {}
+        ConfigApplyOutcome::Rejected { .. } => {}
     }
     assert_eq!(
         last_poll_at,
@@ -752,7 +786,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
         poll_timestamp: Utc::now(),
     };
     let outcome = state.apply_incremental(delta).await;
-    assert_eq!(outcome, IncrementalApplyOutcome::Applied);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
     state
         .stream_listener_manager

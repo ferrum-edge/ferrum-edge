@@ -14,7 +14,7 @@ use super::common::{
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer,
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer_and_namespace,
 };
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
@@ -65,14 +65,16 @@ type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 struct AdsAuth {
     jwt_secret: GrpcJwtSecret,
     node_id: String,
+    namespace: String,
 }
 
 impl AdsAuth {
     fn bearer_token(&self) -> Result<BearerToken, tonic::Status> {
-        let auth_token = generate_dp_jwt_with_issuer(
+        let auth_token = generate_dp_jwt_with_issuer_and_namespace(
             self.jwt_secret.as_str(),
             &self.node_id,
             self.jwt_secret.issuer(),
+            Some(&self.namespace),
         )
         .map_err(|e| tonic::Status::unauthenticated(format!("failed to mint xDS JWT: {e}")))?;
         format!("Bearer {auth_token}").parse().map_err(|e| {
@@ -149,13 +151,17 @@ impl ClientSubscriptionState {
         node_id: &str,
         cluster: &str,
         workload_spiffe_id: Option<&str>,
+        waypoint_name: Option<&str>,
     ) -> Vec<DiscoveryRequest> {
         // Carry the workload SPIFFE in `Node.metadata` so a Ferrum CP can
         // identify this workload even when `node_id` is a hostname (the common
         // default). The CP needs it to compute Sidecar-aware narrowing and the
         // un-narrowed local-inbound-service view; without it a restrictive
         // Sidecar would narrow the local service out of the ECDS carriers.
-        let node_metadata = crate::xds::carrier::encode_node_metadata(workload_spiffe_id);
+        let node_metadata = crate::xds::carrier::encode_node_metadata_with_waypoint(
+            workload_spiffe_id,
+            waypoint_name,
+        );
         INITIAL_TYPE_URL_ORDER
             .iter()
             .map(|type_url| {
@@ -709,6 +715,7 @@ async fn connect_ads(
     let auth = AdsAuth {
         jwt_secret: jwt_secret.clone(),
         node_id: config.node_id.clone(),
+        namespace: config.namespace.clone(),
     };
     let consumer = XdsConfigConsumer::new(config.clone(), state);
 
@@ -764,6 +771,7 @@ async fn run_ads_stream_with_auth(
         &config.node_id,
         &config.cluster,
         config.workload_spiffe_id.as_deref(),
+        config.waypoint_name.as_deref(),
     ) {
         tx.send(request)
             .await
@@ -2067,7 +2075,7 @@ mod tests {
     #[test]
     fn initial_requests_are_ordered_cds_first() {
         let requests =
-            ClientSubscriptionState::new().build_initial_requests("node-a", "default", None);
+            ClientSubscriptionState::new().build_initial_requests("node-a", "default", None, None);
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -2103,16 +2111,15 @@ mod tests {
             "host-1",
             "default",
             Some(spiffe),
+            Some("waypoint"),
         );
         let node = requests[0].node.as_ref().expect("node present");
-        assert_eq!(
-            crate::xds::carrier::decode_node_metadata(&node.metadata)
-                .workload_spiffe_id
-                .as_deref(),
-            Some(spiffe)
-        );
+        let metadata = crate::xds::carrier::decode_node_metadata(&node.metadata);
+        assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
+        assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
         // Without a workload SPIFFE, metadata stays empty (prior wire shape).
-        let none = ClientSubscriptionState::new().build_initial_requests("host-1", "default", None);
+        let none =
+            ClientSubscriptionState::new().build_initial_requests("host-1", "default", None, None);
         assert!(none[0].node.as_ref().unwrap().metadata.is_empty());
     }
 
@@ -2193,7 +2200,7 @@ mod tests {
         state.record_response(CDS_TYPE_URL, "v1", "n1");
         state.mark_acked(CDS_TYPE_URL);
 
-        let requests = state.build_initial_requests("node-a", "default", None);
+        let requests = state.build_initial_requests("node-a", "default", None, None);
         let cds = requests
             .iter()
             .find(|request| request.type_url == CDS_TYPE_URL)
@@ -2234,7 +2241,7 @@ mod tests {
         assert!(
             state
                 .subscriptions
-                .build_initial_requests("node-a", "default", None)
+                .build_initial_requests("node-a", "default", None, None)
                 .iter()
                 .all(|request| request.version_info.is_empty())
         );
@@ -3206,7 +3213,7 @@ mod tests {
         state.reset_for_new_stream();
         let initial = state
             .subscriptions
-            .build_initial_requests("node-a", "default", None);
+            .build_initial_requests("node-a", "default", None, None);
         let cds = initial
             .iter()
             .find(|r| r.type_url == CDS_TYPE_URL)

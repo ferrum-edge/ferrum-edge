@@ -537,6 +537,7 @@ impl MeshMtlsConnectionPool {
     /// capability probe: a slice-declared sidecar peer speaks mesh-mTLS by
     /// construction. Fail-closed: a missing gateway SVID errors before the dial,
     /// and the dial PINS `expected_peer`.
+    #[allow(dead_code)]
     pub async fn open_datagram_tunnel(
         &self,
         proxy: &Proxy,

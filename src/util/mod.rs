@@ -5,4 +5,5 @@
 pub mod accept_backoff;
 pub mod backoff;
 pub mod body_limit;
+pub mod http_headers;
 pub mod sharding;
