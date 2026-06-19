@@ -654,7 +654,7 @@ fn test_proxy_count() {
 fn test_request_body_buffering_upper_bound_is_config_sensitive() {
     let config = make_config(
         vec![
-            make_proxy("graphql-empty", "/gql-empty", vec!["graphql-empty-plugin"]),
+            make_proxy("cors-no-body", "/cors", vec!["cors-no-body-plugin"]),
             make_proxy(
                 "graphql-guarded",
                 "/gql-guarded",
@@ -669,12 +669,12 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
         ],
         vec![
             PluginConfig {
-                id: "graphql-empty-plugin".to_string(),
+                id: "cors-no-body-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
-                plugin_name: "graphql".to_string(),
-                config: json!({}),
+                plugin_name: "cors".to_string(),
+                config: json!({"origins": ["*"]}),
                 scope: PluginScope::Proxy,
-                proxy_id: Some("graphql-empty".to_string()),
+                proxy_id: Some("cors-no-body".to_string()),
                 enabled: true,
                 priority_override: None,
                 api_spec_id: None,
@@ -725,7 +725,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
 
     let cache = PluginCache::new(&config).unwrap();
 
-    assert!(!cache.requires_request_body_buffering("graphql-empty"));
+    assert!(!cache.requires_request_body_buffering("cors-no-body"));
     assert!(cache.requires_request_body_buffering("graphql-guarded"));
     assert!(!cache.requires_request_body_buffering("response-only"));
     assert!(cache.requires_request_body_buffering("request-xml"));

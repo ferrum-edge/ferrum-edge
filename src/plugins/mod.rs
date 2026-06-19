@@ -3235,6 +3235,7 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
 ///
 /// Validation failures for these plugins are fatal at startup — the gateway
 /// refuses to start rather than serving traffic without the intended security.
+#[allow(dead_code)]
 pub fn is_security_plugin(name: &str) -> bool {
     matches!(
         name,
