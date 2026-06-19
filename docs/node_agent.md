@@ -290,6 +290,8 @@ The mesh control plane is not changed by node-level degradation: slice apply, `m
 
 The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PORT` unless that port is set to `0`. Node-agent mode does not start an HTTPS admin listener yet, even when `FERRUM_ADMIN_HTTPS_PORT` is set.
 
+The Helm chart sets `nodeAgent.admin.port` to `19090` by default. The binary default remains `9000`, but the chart uses a different host-network port so an ambient NodeWaypoint proxy and node-agent can run on the same node without an admin listener collision.
+
 `/metrics` is unauthenticated, matching the rest of Ferrum's Prometheus surface. To prevent an opt-in to `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` from accidentally exposing unauthenticated `/metrics` and `/health` to the network, the node-agent admin listener defaults to loopback (`127.0.0.1`) when **none** of the following operator signals are configured:
 
 - `FERRUM_ADMIN_BIND_ADDRESS` is set explicitly (any value, including `0.0.0.0` if intentional), or

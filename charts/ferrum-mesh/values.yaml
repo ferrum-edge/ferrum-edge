@@ -224,7 +224,9 @@ nodeAgent:
     # listener without exposing unauthenticated metrics on the cluster network.
     enabled: true
     bindAddress: 127.0.0.1
-    port: 9000
+    # Non-conflicting with the ambient mesh admin listener's binary default
+    # (9000) when both DaemonSets run on the host network.
+    port: 19090
   # Default to fail because the published Ferrum image is distroless and does
   # not include /bin/sh, iptables, or ip6tables. Set to `iptables` only when
   # running a custom node-agent image that provides those binaries.

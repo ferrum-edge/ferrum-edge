@@ -443,7 +443,7 @@ namespace:
 
 | Port | Protocol | Endpoint | Auth | Notes |
 |---|---|---|---|---|
-| `$FERRUM_ADMIN_HTTP_PORT` (default `9000`) | TCP / HTTP | `/metrics`, `/health`, `/overload` | Unauthenticated | Disabled unless `FERRUM_NODE_AGENT_ADMIN_ENABLED=true`. When enabled, defaults to `127.0.0.1` unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set — see [`docs/node_agent.md`](node_agent.md). |
+| `$FERRUM_ADMIN_HTTP_PORT` (binary default `9000`; Helm `nodeAgent.admin.port` default `19090`) | TCP / HTTP | `/metrics`, `/health`, `/overload` | Unauthenticated | Disabled unless `FERRUM_NODE_AGENT_ADMIN_ENABLED=true`. When enabled, defaults to `127.0.0.1` unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set — see [`docs/node_agent.md`](node_agent.md). |
 | n/a | n/a | No gRPC, no DP↔CP listener, no proxy listener | — | The node agent is not a proxy and does not accept business traffic. |
 
 Because the agent runs in the host network namespace, "binding to

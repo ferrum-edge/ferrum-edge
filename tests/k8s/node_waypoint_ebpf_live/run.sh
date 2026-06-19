@@ -17,6 +17,7 @@ REQUIRE_DUAL_STACK="${FERRUM_LIVE_REQUIRE_DUAL_STACK:-false}"
 DOCKER_NODE_EVIDENCE="${FERRUM_LIVE_DOCKER_NODE_EVIDENCE:-false}"
 NODE_WAYPOINT_REGISTRY_DIR="${FERRUM_LIVE_NODE_WAYPOINT_REGISTRY_DIR:-/run/ferrum/node-waypoint-pods}"
 AMBIENT_ADMIN_PORT="${FERRUM_LIVE_AMBIENT_ADMIN_PORT:-19010}"
+NODE_AGENT_ADMIN_PORT="${FERRUM_LIVE_NODE_AGENT_ADMIN_PORT:-19090}"
 ADMIN_JWT_SECRET="${FERRUM_LIVE_ADMIN_JWT_SECRET:-ferrum-edge-node-waypoint-live-admin-secret}"
 ADMIN_JWT_ISSUER="${FERRUM_LIVE_ADMIN_JWT_ISSUER:-ferrum-edge}"
 RESULTS_DIR="$ROOT_DIR/target/node-waypoint-ebpf-live"
@@ -69,6 +70,7 @@ render_chart_assertions() {
     --set nodeAgent.enabled=true \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   local ebpf_count
   ebpf_count="$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)"
@@ -107,9 +109,10 @@ render_chart_assertions() {
     exit 1
   fi
   if ! grep -q "FERRUM_ADMIN_HTTP_PORT" <<<"$rendered" ||
-    ! grep -q "value: \"$AMBIENT_ADMIN_PORT\"" <<<"$rendered"; then
-    echo "NodeWaypoint eBPF render did not set a distinct ambient admin port" >&2
-    grep -nE 'name: ferrum-mesh-(ambient|node-agent)|FERRUM_ADMIN_HTTP_PORT|value: "?(9000|19010)"?' <<<"$rendered" >&2 || true
+    ! grep -q "value: \"$AMBIENT_ADMIN_PORT\"" <<<"$rendered" ||
+    ! grep -q "value: \"$NODE_AGENT_ADMIN_PORT\"" <<<"$rendered"; then
+    echo "NodeWaypoint eBPF render did not set distinct ambient and node-agent admin ports" >&2
+    grep -nE "name: ferrum-mesh-(ambient|node-agent)|FERRUM_ADMIN_HTTP_PORT|value: \"?(9000|$AMBIENT_ADMIN_PORT|$NODE_AGENT_ADMIN_PORT)\"?" <<<"$rendered" >&2 || true
     exit 1
   fi
   if [[ "$(grep -c "name: bpf-fs" <<<"$rendered" || true)" -lt 4 ]] ||
@@ -130,12 +133,26 @@ render_chart_assertions() {
     --set nodeAgent.enabled=true \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node-waypoint \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
     ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
     [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]]; then
     echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases" >&2
     grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  if ! helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-default-admin-port-render.out 2>&1; then
+    echo "NodeWaypoint render rejected the non-conflicting default node-agent admin port" >&2
+    cat /tmp/ferrum-node-waypoint-default-admin-port-render.out >&2 || true
     exit 1
   fi
 
@@ -146,7 +163,8 @@ render_chart_assertions() {
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
     --set nodeAgent.enabled=true \
     --set nodeAgent.captureMode=ebpf \
-    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-admin-port-render.out 2>&1; then
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string nodeAgent.admin.port=9000 >/tmp/ferrum-node-waypoint-admin-port-render.out 2>&1; then
     echo "NodeWaypoint render accepted ambient and node-agent host-network admin port collision" >&2
     cat /tmp/ferrum-node-waypoint-admin-port-render.out >&2 || true
     exit 1
@@ -252,6 +270,7 @@ install_ferrum() {
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set nodeAgent.enabled=true \
     --set nodeAgent.captureMode=ebpf \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR" \
@@ -278,7 +297,7 @@ collect_node_agent_metrics() {
     local pf_log="$out_dir/$pod-port-forward.log"
     local pf_pid
     idx=$((idx + 1))
-    kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:9000" >"$pf_log" 2>&1 &
+    kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$NODE_AGENT_ADMIN_PORT" >"$pf_log" 2>&1 &
     pf_pid=$!
     for _ in $(seq 1 20); do
       if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
@@ -301,7 +320,7 @@ assert_node_agent_ready_metric() {
   local pod pf_pid metrics_file
   pod="$(first_pod_for "$MESH_NS" 'app.kubernetes.io/name=ferrum-mesh-node-agent')"
   metrics_file="$(mktemp)"
-  kubectl -n "$MESH_NS" port-forward "pod/$pod" 19000:9000 >/tmp/ferrum-node-agent-port-forward.log 2>&1 &
+  kubectl -n "$MESH_NS" port-forward "pod/$pod" "19000:$NODE_AGENT_ADMIN_PORT" >/tmp/ferrum-node-agent-port-forward.log 2>&1 &
   pf_pid=$!
   local fetched=false
   for _ in $(seq 1 20); do

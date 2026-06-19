@@ -5,13 +5,14 @@
   controllers can roll back individually. See docs/node_agent_security.md.
 */ -}}
 {{- $sec := .Values.nodeAgent.security | default dict -}}
+{{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $addPerfmon := true -}}
 {{- if hasKey $sec "addCapPerfmon" }}{{ $addPerfmon = get $sec "addCapPerfmon" }}{{ end -}}
 {{- $dropSysAdmin := false -}}
 {{- if hasKey $sec "dropCapSysAdmin" }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
 {{- $caps := list "BPF" "NET_ADMIN" -}}
 {{- if $addPerfmon }}{{ $caps = append $caps "PERFMON" }}{{ end -}}
-{{- if or (not $dropSysAdmin) (eq (lower (toString .Values.nodeAgent.proxyMode)) "node_waypoint") }}{{ $caps = append $caps "SYS_ADMIN" }}{{ end -}}
+{{- if or (not $dropSysAdmin) (eq $nodeAgentProxyMode "node_waypoint") }}{{ $caps = append $caps "SYS_ADMIN" }}{{ end -}}
 {{- $readOnlyRoot := true -}}
 {{- if hasKey $sec "readOnlyRootFilesystem" }}{{ $readOnlyRoot = get $sec "readOnlyRootFilesystem" }}{{ end -}}
 {{- $allowEsc := false -}}
@@ -40,7 +41,6 @@
 {{- $nodeAgentImageTag = printf "%s-ebpf" $nodeAgentImageTag -}}
 {{- end -}}
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
-{{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
