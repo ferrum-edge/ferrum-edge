@@ -1198,15 +1198,21 @@ impl PluginCache {
                                         );
                                     }
                                 }
-                                // Remove only GLOBAL plugins of the same name
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                // Remove only GLOBAL plugins of the same name.
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
+                            }
                             Err(e) => {
                                 error!(proxy_id = %proxy.id, "Config reload: {}", e);
                                 plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e));
@@ -1221,10 +1227,7 @@ impl PluginCache {
                 if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
                     if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
                         let plugin = Arc::clone(&existing.plugin);
-                        merged.retain(|p| {
-                            p.name() != plugin.name()
-                                || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
-                        });
+                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
                     } else {
                         match try_create_plugin(pc, &self.http_client) {
@@ -1236,14 +1239,20 @@ impl PluginCache {
                                         config: (*pc).clone(),
                                     },
                                 );
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
+                            }
                             Err(e) => {
                                 error!(
                                     proxy_id = %proxy.id,

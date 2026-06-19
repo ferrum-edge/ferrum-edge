@@ -1546,6 +1546,130 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
     );
 }
 
+#[test]
+fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![make_plugin_config(
+            "global-stdout",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["bad-stdout"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![
+            make_plugin_config(
+                "global-stdout",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config_with_json(
+                "bad-stdout",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let delta = ConfigDelta::compute(&config1, &config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+
+    cache
+        .apply_delta(
+            &config2,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-scoped optional plugin must shadow the same-name global on delta reload"
+    );
+    assert_eq!(
+        cache.get_plugins("p2").len(),
+        1,
+        "unrelated proxies keep the global plugin"
+    );
+}
+
+#[test]
+fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![make_plugin_config(
+            "global-stdout",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["bad-group"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![
+            make_plugin_config(
+                "global-stdout",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config_with_json(
+                "bad-group",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::ProxyGroup,
+                None,
+            ),
+        ],
+    );
+    let delta = ConfigDelta::compute(&config1, &config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+
+    cache
+        .apply_delta(
+            &config2,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-group optional plugin must shadow the same-name global on delta reload"
+    );
+    assert_eq!(
+        cache.get_plugins("p2").len(),
+        1,
+        "unrelated proxies keep the global plugin"
+    );
+}
+
 // ---- Protocol-filtered plugin lookup tests ----
 
 fn make_plugin_config_with_json(
