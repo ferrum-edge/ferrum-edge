@@ -53,6 +53,7 @@ struct PluginConfigRef {
 }
 
 type ProxyPluginAssociations = HashMap<String, Vec<PluginAssociation>>;
+type PluginConfigRefs = HashMap<String, PluginConfigRef>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConsumerCredentialIndexEntry {
@@ -975,9 +976,15 @@ impl DatabaseStore {
         operation: &str,
         proxy: &Proxy,
     ) -> Result<(), anyhow::Error> {
-        let errors = self
-            .validate_loaded_proxy_plugin_associations(&proxy.id, &proxy.namespace, &proxy.plugins)
+        let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(std::slice::from_ref(proxy));
+        let plugin_refs = self
+            .load_plugin_config_refs(&plugin_config_ids, &proxy.namespace)
             .await?;
+        let errors = Self::validate_loaded_proxy_plugin_associations_with_refs(
+            &proxy.id,
+            &proxy.plugins,
+            &plugin_refs,
+        );
         if errors.is_empty() {
             return Ok(());
         }
@@ -989,6 +996,89 @@ impl DatabaseStore {
             proxy.namespace,
             errors.join("; ")
         ))
+    }
+
+    async fn reject_invalid_loaded_proxy_plugin_association_page(
+        &self,
+        operation: &str,
+        namespace: &str,
+        proxies: &[Proxy],
+    ) -> Result<(), anyhow::Error> {
+        let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(proxies);
+        let plugin_refs = self
+            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, false)
+            .await?;
+        let mut errors = Vec::new();
+        for proxy in proxies {
+            errors.extend(Self::validate_loaded_proxy_plugin_associations_with_refs(
+                &proxy.id,
+                &proxy.plugins,
+                &plugin_refs,
+            ));
+        }
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
+            operation,
+            namespace,
+            errors.join("; ")
+        ))
+    }
+
+    fn loaded_proxy_plugin_config_ids(proxies: &[Proxy]) -> Vec<String> {
+        let mut requested_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for proxy in proxies {
+            for assoc in &proxy.plugins {
+                if seen_ids.insert(assoc.plugin_config_id.as_str()) {
+                    requested_ids.push(assoc.plugin_config_id.clone());
+                }
+            }
+        }
+        requested_ids
+    }
+
+    fn validate_loaded_proxy_plugin_associations_with_refs(
+        proxy_id: &str,
+        associations: &[PluginAssociation],
+        plugin_refs: &PluginConfigRefs,
+    ) -> Vec<String> {
+        let mut seen_assoc_ids: HashSet<&str> = HashSet::new();
+        let mut errors = Vec::new();
+
+        for assoc in associations {
+            if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
+                errors.push(format!(
+                    "Proxy '{}' references plugin_config '{}' more than once",
+                    proxy_id, assoc.plugin_config_id
+                ));
+            } else {
+                match plugin_refs.get(assoc.plugin_config_id.as_str()) {
+                    Some(plugin) => match plugin.scope {
+                        PluginScope::Global | PluginScope::ProxyGroup => {}
+                        PluginScope::Proxy => {
+                            if plugin.proxy_id.as_deref() != Some(proxy_id) {
+                                errors.push(format!(
+                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    proxy_id,
+                                    plugin.id,
+                                    plugin.proxy_id.as_deref().unwrap_or("<none>")
+                                ));
+                            }
+                        }
+                    },
+                    None => errors.push(format!(
+                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        proxy_id, assoc.plugin_config_id
+                    )),
+                }
+            }
+        }
+
+        errors
     }
 
     fn reject_invalid_gateway_plugin_references(
@@ -1003,60 +1093,6 @@ impl DatabaseStore {
             ));
         }
         Ok(())
-    }
-
-    async fn validate_loaded_proxy_plugin_associations(
-        &self,
-        proxy_id: &str,
-        namespace: &str,
-        associations: &[PluginAssociation],
-    ) -> Result<Vec<String>, anyhow::Error> {
-        if associations.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut requested_ids = Vec::with_capacity(associations.len());
-        let mut seen_assoc_ids: HashSet<&str> = HashSet::new();
-        let mut errors = Vec::new();
-
-        for assoc in associations {
-            if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
-                errors.push(format!(
-                    "Proxy '{}' references plugin_config '{}' more than once",
-                    proxy_id, assoc.plugin_config_id
-                ));
-            } else {
-                requested_ids.push(assoc.plugin_config_id.clone());
-            }
-        }
-
-        let plugin_refs = self
-            .load_plugin_config_refs(&requested_ids, namespace)
-            .await?;
-
-        for assoc in associations {
-            match plugin_refs.get(assoc.plugin_config_id.as_str()) {
-                Some(plugin) => match plugin.scope {
-                    PluginScope::Global | PluginScope::ProxyGroup => {}
-                    PluginScope::Proxy => {
-                        if plugin.proxy_id.as_deref() != Some(proxy_id) {
-                            errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
-                                proxy_id,
-                                plugin.id,
-                                plugin.proxy_id.as_deref().unwrap_or("<none>")
-                            ));
-                        }
-                    }
-                },
-                None => errors.push(format!(
-                    "Proxy '{}' references non-existent plugin_config '{}'",
-                    proxy_id, assoc.plugin_config_id
-                )),
-            }
-        }
-
-        Ok(errors)
     }
 
     /// Load the full gateway configuration from the database.
@@ -1081,10 +1117,10 @@ impl DatabaseStore {
             ..Default::default()
         };
 
+        ValidationPipeline::new(&mut config).normalize_fields().run()?;
         Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
         ValidationPipeline::new(&mut config)
-            .normalize_fields()
             .resolve_upstream_tls()
             .validate_all_fields_with_ip_policy(
                 self.cert_expiry_warning_days,
@@ -2089,14 +2125,18 @@ impl DatabaseStore {
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
             let mut proxy = row_to_proxy(&row, id, plugins)?;
             proxy.normalize_fields();
-            self.reject_invalid_loaded_proxy_plugin_associations("list_proxies_paginated", &proxy)
-                .await?;
             proxies.push(proxy);
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(
             "list_proxies_paginated",
             &plugins_by_proxy,
         )?;
+        self.reject_invalid_loaded_proxy_plugin_association_page(
+            "list_proxies_paginated",
+            namespace,
+            &proxies,
+        )
+        .await?;
 
         self.check_slow_query("list_proxies_paginated", start);
         Ok(PaginatedResult {
@@ -3049,10 +3089,25 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
-    ) -> Result<std::collections::HashMap<String, PluginConfigRef>, anyhow::Error> {
+    ) -> Result<PluginConfigRefs, anyhow::Error> {
+        self.load_plugin_config_refs_from_pool(ids, namespace, true)
+            .await
+    }
+
+    async fn load_plugin_config_refs_from_pool(
+        &self,
+        ids: &[String],
+        namespace: &str,
+        use_primary: bool,
+    ) -> Result<PluginConfigRefs, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let pool = if use_primary {
+            self.pool()
+        } else {
+            self.rpool()
+        };
 
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
@@ -3068,7 +3123,7 @@ impl DatabaseStore {
             query = query.bind(id);
         }
 
-        let rows = query.fetch_all(&self.pool()).await?;
+        let rows = query.fetch_all(&pool).await?;
         let mut plugin_refs = std::collections::HashMap::with_capacity(rows.len());
         for row in rows {
             let id: String = row.try_get("id")?;
