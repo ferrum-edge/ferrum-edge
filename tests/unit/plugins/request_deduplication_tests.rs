@@ -1268,7 +1268,7 @@ async fn test_reused_key_different_client_trace_headers_conflicts() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+    assert_fingerprint_conflict(result);
 }
 
 #[tokio::test]
