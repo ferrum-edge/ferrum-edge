@@ -3351,8 +3351,14 @@ async fn handle_batch_create(
                         }
                     }
                     PluginScope::ProxyGroup => {
-                        // ProxyGroup plugins have no proxy_id — any proxy can
-                        // reference them via its plugins association list.
+                        if plugin_config.proxy_id.is_some() {
+                            validation_errors.push(format!(
+                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                proxy.id,
+                                plugin_config.id,
+                                plugin_config.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
                 },
                 None => unresolved.push(assoc.clone()),

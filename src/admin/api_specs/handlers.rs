@@ -866,7 +866,7 @@ async fn assign_ids_for_put(
     }
 
     // Load the existing proxy to get upstream_id and created_at.
-    let existing_proxy = match db.get_proxy(&existing_spec.proxy_id).await {
+    let existing_proxy = match db.get_proxy_for_write(&existing_spec.proxy_id).await {
         Ok(Some(p)) => Some(p),
         Ok(None) => None,
         Err(e) => return Err(classify_db_error(e)),
@@ -2420,7 +2420,7 @@ pub async fn handle_put_api_spec(
     // Use the *stored* upstream_id — NOT the bundle's post-assignment
     // upstream.id, which can be operator-changed.
     let existing_proxy_row: Option<crate::config::types::Proxy> =
-        match db.get_proxy(&existing_spec.proxy_id).await {
+        match db.get_proxy_for_write(&existing_spec.proxy_id).await {
             Ok(p) => p,
             Err(e) => return Ok(error_response(classify_db_error(e))),
         };

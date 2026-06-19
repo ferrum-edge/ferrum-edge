@@ -343,3 +343,94 @@ async fn admin_proxy_reads_reject_global_plugin_associations() {
     assert!(list_message.contains("plugin-global"));
     assert!(!list_message.contains("X-Global-Key"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_proxy_reads_reject_proxy_group_plugin_with_proxy_id() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+
+    let ts = Utc::now().to_rfc3339();
+    let pool = store.pool();
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'ferrum', 'key_auth', ?, 'proxy_group', ?, 1, ?, ?)",
+    )
+    .bind("plugin-group-corrupt")
+    .bind(r#"{"key_location":"header:X-Group-Key"}"#)
+    .bind("proxy-1")
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("proxy-group plugin insert must succeed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind("proxy-1")
+        .bind("plugin-group-corrupt")
+        .execute(&pool)
+        .await
+        .expect("proxy-group association insert must succeed");
+
+    let get_message = error_text(store.get_proxy("proxy-1").await);
+    assert_association_error_context(&get_message, "get_proxy");
+    assert!(get_message.contains("plugin-group-corrupt"));
+    assert!(!get_message.contains("X-Group-Key"));
+
+    let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
+    assert_association_error_context(&list_message, "list_proxies_paginated");
+    assert!(list_message.contains("plugin-group-corrupt"));
+    assert!(!list_message.contains("X-Group-Key"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_write_precheck_can_repair_invalid_associations() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+
+    let ts = Utc::now().to_rfc3339();
+    let pool = store.pool();
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, 'ferrum', 'key_auth', ?, 'global', ?, 1, ?, ?)",
+    )
+    .bind("plugin-global")
+    .bind(r#"{"key_location":"header:X-Global-Key"}"#)
+    .bind(Option::<String>::None)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("global plugin insert must succeed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind("proxy-1")
+        .bind("plugin-global")
+        .execute(&pool)
+        .await
+        .expect("global association insert must succeed");
+
+    let read_message = error_text(store.get_proxy("proxy-1").await);
+    assert_association_error_context(&read_message, "get_proxy");
+    assert!(read_message.contains("plugin-global"));
+
+    let mut repair_proxy = store
+        .get_proxy_for_write("proxy-1")
+        .await
+        .expect("write precheck get must succeed")
+        .expect("proxy must exist");
+    repair_proxy
+        .plugins
+        .retain(|assoc| assoc.plugin_config_id != "plugin-global");
+    store
+        .update_proxy(&repair_proxy)
+        .await
+        .expect("update should repair proxy_plugins rows");
+
+    let repaired = store
+        .get_proxy("proxy-1")
+        .await
+        .expect("repaired proxy read must succeed")
+        .expect("proxy must still exist");
+    assert_eq!(repaired.plugins.len(), 1);
+    assert_eq!(repaired.plugins[0].plugin_config_id, "plugin-1");
+}

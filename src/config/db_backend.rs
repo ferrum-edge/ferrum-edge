@@ -247,6 +247,12 @@ pub trait DatabaseBackend: Send + Sync {
     async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
     async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error>;
     async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
+    /// Load an existing proxy for write prechecks/audit without rejecting
+    /// repairable proxy-plugin reference corruption. Backends that store
+    /// associations inline can use the normal read path.
+    async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        self.get_proxy(id).await
+    }
     /// Check whether a proxy with the given ID exists in `namespace`.
     /// Returns `true` only when the row is in the requested namespace, so
     /// admin-side reference checks cannot be satisfied by a row that lives

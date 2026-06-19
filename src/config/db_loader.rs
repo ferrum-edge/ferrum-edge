@@ -55,6 +55,31 @@ struct PluginConfigRef {
 type ProxyPluginAssociations = HashMap<String, Vec<PluginAssociation>>;
 type PluginConfigRefs = HashMap<String, PluginConfigRef>;
 
+#[derive(Debug)]
+pub(crate) struct ProxyPluginAssociationLoadError {
+    message: String,
+}
+
+impl ProxyPluginAssociationLoadError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl std::fmt::Display for ProxyPluginAssociationLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProxyPluginAssociationLoadError {}
+
+pub(crate) fn is_proxy_plugin_association_load_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProxyPluginAssociationLoadError>()
+        .is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConsumerCredentialIndexEntry {
     credential_type: &'static str,
@@ -814,19 +839,20 @@ impl DatabaseStore {
         namespace: Option<&str>,
         source: impl std::fmt::Display,
     ) -> anyhow::Error {
-        match namespace {
-            Some(namespace) => anyhow::anyhow!(
+        let message = match namespace {
+            Some(namespace) => format!(
                 "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
                 operation,
                 namespace,
                 source
             ),
-            None => anyhow::anyhow!(
+            None => format!(
                 "operation={} resource=proxy_plugins: failed to query proxy/plugin associations: {}",
                 operation,
                 source
             ),
-        }
+        };
+        anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
     }
 
     fn proxy_plugin_association_proxy_id(
@@ -834,11 +860,11 @@ impl DatabaseStore {
         operation: &str,
     ) -> Result<String, anyhow::Error> {
         row.try_get::<String, _>("proxy_id").map_err(|e| {
-            anyhow::anyhow!(
+            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
                 "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
                 operation,
                 e
-            )
+            )))
         })
     }
 
@@ -848,12 +874,12 @@ impl DatabaseStore {
         proxy_id: &str,
     ) -> Result<String, anyhow::Error> {
         row.try_get::<String, _>("plugin_config_id").map_err(|e| {
-            anyhow::anyhow!(
+            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
                 "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
                 operation,
                 proxy_id,
                 e
-            )
+            )))
         })
     }
 
@@ -877,11 +903,11 @@ impl DatabaseStore {
         associations: &ProxyPluginAssociations,
     ) -> Result<(), anyhow::Error> {
         if let Some(proxy_id) = associations.keys().next() {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
                 "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
                 operation,
                 proxy_id
-            ));
+            ))));
         }
         Ok(())
     }
@@ -969,13 +995,13 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        Err(anyhow::anyhow!(
+        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
             "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
             operation,
             proxy.id,
             proxy.namespace,
             errors.join("; ")
-        ))
+        ))))
     }
 
     async fn reject_invalid_loaded_proxy_plugin_association_page(
@@ -1000,12 +1026,12 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        Err(anyhow::anyhow!(
+        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
             "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
             operation,
             namespace,
             errors.join("; ")
-        ))
+        ))))
     }
 
     fn loaded_proxy_plugin_config_ids(proxies: &[Proxy]) -> Vec<String> {
@@ -1044,7 +1070,16 @@ impl DatabaseStore {
                                 proxy_id, plugin.id
                             ));
                         }
-                        PluginScope::ProxyGroup => {}
+                        PluginScope::ProxyGroup => {
+                            if plugin.proxy_id.is_some() {
+                                errors.push(format!(
+                                    "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                    proxy_id,
+                                    plugin.id,
+                                    plugin.proxy_id.as_deref().unwrap_or("<none>")
+                                ));
+                            }
+                        }
                         PluginScope::Proxy => {
                             if plugin.proxy_id.as_deref() != Some(proxy_id) {
                                 errors.push(format!(
@@ -1072,11 +1107,11 @@ impl DatabaseStore {
         config: &GatewayConfig,
     ) -> Result<(), anyhow::Error> {
         if let Err(errors) = config.validate_plugin_references() {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
                 "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
                 operation,
                 errors.join("; ")
-            ));
+            ))));
         }
         Ok(())
     }
@@ -1757,6 +1792,29 @@ impl DatabaseStore {
 
     pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
         let start = Instant::now();
+        let proxy = self.load_proxy_with_associations(id, "get_proxy").await?;
+        if let Some(proxy) = proxy.as_ref() {
+            self.reject_invalid_loaded_proxy_plugin_associations("get_proxy", proxy)
+                .await?;
+        }
+        self.check_slow_query("get_proxy", start);
+        Ok(proxy)
+    }
+
+    pub async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        let start = Instant::now();
+        let proxy = self
+            .load_proxy_with_associations(id, "get_proxy_for_write")
+            .await?;
+        self.check_slow_query("get_proxy_for_write", start);
+        Ok(proxy)
+    }
+
+    async fn load_proxy_with_associations(
+        &self,
+        id: &str,
+        operation: &str,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool())
@@ -1769,16 +1827,13 @@ impl DatabaseStore {
 
         let proxy_ids = [id.to_string()];
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_proxy_ids(&proxy_ids, "get_proxy", true)
+            .load_proxy_plugin_associations_for_proxy_ids(&proxy_ids, operation, true)
             .await?;
         let plugins = plugins_by_proxy.remove(id).unwrap_or_default();
-        Self::ensure_no_unmatched_proxy_plugin_associations("get_proxy", &plugins_by_proxy)?;
+        Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
 
         let mut proxy = row_to_proxy(&row, id.to_string(), plugins)?;
         proxy.normalize_fields();
-        self.reject_invalid_loaded_proxy_plugin_associations("get_proxy", &proxy)
-            .await?;
-        self.check_slow_query("get_proxy", start);
         Ok(Some(proxy))
     }
 
@@ -2817,8 +2872,14 @@ impl DatabaseStore {
                         }
                     }
                     PluginScope::ProxyGroup => {
-                        // ProxyGroup plugins have no proxy_id — any proxy can
-                        // reference them via its plugins association list.
+                        if plugin.proxy_id.is_some() {
+                            errors.push(format!(
+                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                proxy_id,
+                                plugin.id,
+                                plugin.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
                 },
                 None => errors.push(format!(
@@ -3121,12 +3182,15 @@ impl DatabaseStore {
                     "proxy_group" => PluginScope::ProxyGroup,
                     _ => PluginScope::Global,
                 };
+                let proxy_id = row
+                    .try_get::<Option<String>, _>("proxy_id")?
+                    .filter(|id| !id.trim().is_empty());
                 plugin_refs.insert(
                     id.clone(),
                     PluginConfigRef {
                         id,
                         scope,
-                        proxy_id: row.try_get("proxy_id").ok(),
+                        proxy_id,
                     },
                 );
             }
@@ -5338,6 +5402,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
         DatabaseStore::get_proxy(self, id).await
+    }
+
+    async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        DatabaseStore::get_proxy_for_write(self, id).await
     }
 
     async fn check_proxy_exists(

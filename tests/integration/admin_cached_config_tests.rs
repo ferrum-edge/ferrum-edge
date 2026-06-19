@@ -1297,10 +1297,20 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
     let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .expect("Failed to connect to test database");
-    let state = AdminState {
+    let state = db_admin_state(tc, db, None);
+    (state, temp_dir)
+}
+
+fn db_admin_state(
+    tc: &TestConfig,
+    db: DatabaseStore,
+    cached_config: Option<GatewayConfig>,
+) -> AdminState {
+    AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: create_test_jwt_manager(tc),
-        cached_config: None,
+        cached_config: cached_config
+            .map(|config| Arc::new(ArcSwap::new(Arc::new(config)))),
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
@@ -1322,8 +1332,7 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
         backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
-    };
-    (state, temp_dir)
+    }
 }
 
 async fn admin_post(base_url: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
@@ -2972,6 +2981,85 @@ async fn test_cached_config_reflects_upstream_updates() {
 // ============================================================================
 // Proxy & Consumer CRUD with Real SQLite DB (extended coverage)
 // ============================================================================
+
+#[tokio::test]
+async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("invalid_assoc.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let ts = Utc::now().to_rfc3339();
+    let pool = db.pool();
+
+    sqlx::query(
+        "INSERT INTO proxies \
+         (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, created_at, updated_at) \
+         VALUES ('proxy-1', 'ferrum', 'db proxy', '[]', '/api/v1', 'http', 'db.example.com', 8080, ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("proxy insert must succeed");
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES ('global-invalid', 'ferrum', 'cors', '{}', 'global', NULL, 1, ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("global plugin insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES ('proxy-1', 'global-invalid')",
+    )
+    .execute(&pool)
+    .await
+    .expect("invalid association insert must succeed");
+
+    let state = db_admin_state(&tc, db, Some(create_test_gateway_config()));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, data_source) = admin_get(&base_url, "/proxies/proxy-1", &token).await;
+    assert_eq!(
+        status, 503,
+        "invalid association should not fall back to cached proxy: {body:?}"
+    );
+    assert_eq!(data_source, None);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("global-invalid")
+                && message.contains("resource=proxy_plugins")),
+        "error should identify the invalid association safely: {body:?}"
+    );
+
+    let repaired = json!({
+        "id": "proxy-1",
+        "name": "repaired proxy",
+        "listen_path": "/api/v1",
+        "backend_scheme": "http",
+        "backend_host": "repaired.example.com",
+        "backend_port": 8081,
+        "strip_listen_path": true
+    });
+    let (status, body) = admin_put(&base_url, "/proxies/proxy-1", &token, &repaired).await;
+    assert_eq!(
+        status, 200,
+        "PUT without the invalid association should repair proxy_plugins: {body:?}"
+    );
+
+    let (status, body, data_source) = admin_get(&base_url, "/proxies/proxy-1", &token).await;
+    assert_eq!(status, 200, "repaired proxy should read from DB: {body:?}");
+    assert_eq!(data_source, None);
+    assert_eq!(body["backend_host"], "repaired.example.com");
+    assert_eq!(body["plugins"].as_array().map(|plugins| plugins.len()), Some(0));
+}
 
 #[tokio::test]
 async fn test_proxy_crud_create_update_delete() {
