@@ -321,6 +321,25 @@ fn crd_watch_namespaces(
     }
 }
 
+fn gateway_api_data_plane_status_watch_namespaces(
+    namespaces: &[String],
+    data_plane_service_namespace: Option<&str>,
+) -> Vec<String> {
+    if namespaces.is_empty() {
+        return Vec::new();
+    }
+    let mut status_namespaces = namespaces.to_vec();
+    if let Some(namespace) = data_plane_service_namespace
+        && !namespace.is_empty()
+        && !status_namespaces
+            .iter()
+            .any(|existing| existing == namespace)
+    {
+        status_namespaces.push(namespace.to_string());
+    }
+    status_namespaces
+}
+
 fn build_apis_for_resource(
     client: &Client,
     ar: &ApiResource,
@@ -359,6 +378,7 @@ pub async fn start_crd_watchers(
     selection: WatcherSelection,
     namespaces: Vec<String>,
     istio_root_namespace: String,
+    gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
@@ -552,10 +572,14 @@ pub async fn start_crd_watchers(
         );
     }
     if selection.watch_gateway_api_data_plane_service {
+        let status_namespaces = gateway_api_data_plane_status_watch_namespaces(
+            &namespaces,
+            gateway_api_data_plane_service_namespace.as_deref(),
+        );
         core_watch_plan.extend(
             GATEWAY_API_DATA_PLANE_STATUS_RESOURCES
                 .iter()
-                .map(|resource| (resource, namespaces.clone())),
+                .map(|resource| (resource, status_namespaces.clone())),
         );
     }
     if selection.watch_mesh_config {
@@ -705,12 +729,14 @@ pub async fn start_crd_watchers(
     handles
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_crd_reprobe_task(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
     namespaces: Vec<String>,
     istio_root_namespace: String,
+    gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -735,6 +761,7 @@ pub fn spawn_crd_reprobe_task(
                         selection,
                         namespaces.clone(),
                         istio_root_namespace.clone(),
+                        gateway_api_data_plane_service_namespace.clone(),
                         shutdown.clone(),
                     ).await;
                     // New handles run independently; we don't need to track
@@ -808,6 +835,22 @@ mod tests {
         assert_eq!(
             crd_watch_namespaces(http_route, &["default".to_string()], "istio-system"),
             vec!["default".to_string()]
+        );
+    }
+
+    #[test]
+    fn data_plane_status_watch_namespaces_include_configured_service_namespace() {
+        assert_eq!(
+            gateway_api_data_plane_status_watch_namespaces(&["routes".to_string()], Some("ferrum")),
+            vec!["routes".to_string(), "ferrum".to_string()]
+        );
+        assert_eq!(
+            gateway_api_data_plane_status_watch_namespaces(&["ferrum".to_string()], Some("ferrum")),
+            vec!["ferrum".to_string()]
+        );
+        assert!(
+            gateway_api_data_plane_status_watch_namespaces(&[], Some("ferrum")).is_empty(),
+            "empty watch namespace list keeps Api::all semantics"
         );
     }
 

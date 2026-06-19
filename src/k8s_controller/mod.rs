@@ -126,6 +126,9 @@ pub async fn start_k8s_controller(
         watch_mesh_config: controller_config.watch_istio && controller_config.watch_mesh_config,
     };
     let istio_root_namespace = controller_config.istio_root_namespace.clone();
+    let gateway_api_data_plane_service_namespace = controller_config
+        .gateway_api_data_plane_service_namespace
+        .clone();
 
     let watcher_handles = start_crd_watchers(
         client.clone(),
@@ -133,6 +136,7 @@ pub async fn start_k8s_controller(
         watcher_selection,
         controller_config.watch_namespaces.clone(),
         istio_root_namespace.clone(),
+        gateway_api_data_plane_service_namespace.clone(),
         shutdown.clone(),
     )
     .await;
@@ -188,6 +192,7 @@ pub async fn start_k8s_controller(
         watcher_selection,
         controller_config.watch_namespaces,
         istio_root_namespace,
+        gateway_api_data_plane_service_namespace,
         shutdown,
         Duration::from_secs(300),
     );

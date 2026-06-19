@@ -355,6 +355,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    let cp_frontend_tls_materialized = Arc::new(AtomicBool::new(false));
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -428,7 +429,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 .is_none_or(|r| r.load(Ordering::Acquire));
         let result = if should_race_primary {
             tokio::select! {
-                res = connect_and_subscribe_with_startup_ready(
+                res = connect_and_subscribe_with_startup_ready_inner(
                     cp_url,
                     &jwt_secret,
                     &node_id,
@@ -439,6 +440,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     connection_state.as_ref(),
                     is_primary,
                     frontend_tls_slot.as_ref(),
+                    cp_frontend_tls_materialized.clone(),
                 ) => res,
                 _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
                     info!(
@@ -463,7 +465,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             }
         } else {
             tokio::select! {
-                res = connect_and_subscribe_with_startup_ready(
+                res = connect_and_subscribe_with_startup_ready_inner(
                     cp_url,
                     &jwt_secret,
                     &node_id,
@@ -474,6 +476,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     connection_state.as_ref(),
                     is_primary,
                     frontend_tls_slot.as_ref(),
+                    cp_frontend_tls_materialized.clone(),
                 ) => res,
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
@@ -702,30 +705,31 @@ fn apply_gateway_trust_bundle_update(
     }
 }
 
-async fn apply_frontend_tls_snapshot(
+enum FrontendTlsSnapshotUpdate {
+    Unchanged,
+    Clear,
+    Replace {
+        tls_config: Arc<rustls::ServerConfig>,
+        cert_source: String,
+    },
+}
+
+fn stage_frontend_tls_snapshot(
     config: &GatewayConfig,
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
-    cp_frontend_tls_materialized: &mut bool,
-) -> Result<(), anyhow::Error> {
+    cp_frontend_tls_materialized: &AtomicBool,
+) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
     match (
         config.frontend_tls_cert_path.as_deref(),
         config.frontend_tls_key_path.as_deref(),
     ) {
         (None, None) => {
-            if *cp_frontend_tls_materialized && let Some(slot) = frontend_tls_slot {
-                let had_tls = slot.load_full().as_ref().is_some();
-                slot.store(Arc::new(None));
-                proxy_state
-                    .stream_listener_manager
-                    .set_frontend_tls_config(None)
-                    .await;
-                if had_tls {
-                    info!("Cleared CP-delivered Gateway frontend TLS material");
-                }
+            if cp_frontend_tls_materialized.load(Ordering::Acquire) {
+                Ok(FrontendTlsSnapshotUpdate::Clear)
+            } else {
+                Ok(FrontendTlsSnapshotUpdate::Unchanged)
             }
-            *cp_frontend_tls_materialized = false;
-            Ok(())
         }
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!(
@@ -733,7 +737,7 @@ async fn apply_frontend_tls_snapshot(
             );
         }
         (Some(cert_path), Some(key_path)) => {
-            let Some(slot) = frontend_tls_slot else {
+            if frontend_tls_slot.is_none() {
                 anyhow::bail!(
                     "frontend TLS material was provided by CP but this DP did not start an HTTPS listener"
                 );
@@ -772,17 +776,52 @@ async fn apply_frontend_tls_snapshot(
                 crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
             }
 
-            slot.store(Arc::new(Some(tls_config.clone())));
-            proxy_state
-                .stream_listener_manager
-                .set_frontend_tls_config(Some(tls_config))
-                .await;
-            *cp_frontend_tls_materialized = true;
-            info!(
-                cert_source = %cert_path,
-                "Applied CP-delivered Gateway frontend TLS material"
-            );
-            Ok(())
+            Ok(FrontendTlsSnapshotUpdate::Replace {
+                tls_config,
+                cert_source: cert_path.to_string(),
+            })
+        }
+    }
+}
+
+async fn commit_frontend_tls_snapshot(
+    update: FrontendTlsSnapshotUpdate,
+    proxy_state: &ProxyState,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    cp_frontend_tls_materialized: &AtomicBool,
+) {
+    match update {
+        FrontendTlsSnapshotUpdate::Unchanged => {}
+        FrontendTlsSnapshotUpdate::Clear => {
+            if let Some(slot) = frontend_tls_slot {
+                let had_tls = slot.load_full().as_ref().is_some();
+                slot.store(Arc::new(None));
+                proxy_state
+                    .stream_listener_manager
+                    .set_frontend_tls_config(None)
+                    .await;
+                if had_tls {
+                    info!("Cleared CP-delivered Gateway frontend TLS material");
+                }
+            }
+            cp_frontend_tls_materialized.store(false, Ordering::Release);
+        }
+        FrontendTlsSnapshotUpdate::Replace {
+            tls_config,
+            cert_source,
+        } => {
+            if let Some(slot) = frontend_tls_slot {
+                slot.store(Arc::new(Some(tls_config.clone())));
+                proxy_state
+                    .stream_listener_manager
+                    .set_frontend_tls_config(Some(tls_config))
+                    .await;
+                cp_frontend_tls_materialized.store(true, Ordering::Release);
+                info!(
+                    cert_source = %cert_source,
+                    "Applied CP-delivered Gateway frontend TLS material"
+                );
+            }
         }
     }
 }
@@ -824,6 +863,36 @@ pub async fn connect_and_subscribe_with_startup_ready(
     connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
     is_primary: bool,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+) -> Result<(), anyhow::Error> {
+    connect_and_subscribe_with_startup_ready_inner(
+        cp_url,
+        jwt_secret,
+        node_id,
+        proxy_state,
+        tls_config,
+        startup_ready,
+        namespace,
+        connection_state,
+        is_primary,
+        frontend_tls_slot,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_and_subscribe_with_startup_ready_inner(
+    cp_url: &str,
+    jwt_secret: &GrpcJwtSecret,
+    node_id: &str,
+    proxy_state: &ProxyState,
+    tls_config: Option<&DpGrpcTlsConfig>,
+    startup_ready: Option<Arc<AtomicBool>>,
+    namespace: &str,
+    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
+    is_primary: bool,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    cp_frontend_tls_materialized: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -893,7 +962,6 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
     let mut stream = client.subscribe(request).await?.into_inner();
     let mut initial_snapshot_applied = startup_ready.is_none();
-    let mut cp_frontend_tls_materialized = false;
 
     // Mark connected
     if let Some(cs) = connection_state {
@@ -1028,20 +1096,30 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             );
                             continue;
                         }
-                        if let Err(error) = apply_frontend_tls_snapshot(
+                        let frontend_tls_update = match stage_frontend_tls_snapshot(
                             &config,
                             proxy_state,
                             frontend_tls_slot,
-                            &mut cp_frontend_tls_materialized,
-                        )
-                        .await
-                        {
-                            error!("CP config rejected — {}", error);
-                            error!("Ignoring config update with unusable frontend TLS material");
-                            continue;
-                        }
+                            cp_frontend_tls_materialized.as_ref(),
+                        ) {
+                            Ok(update) => update,
+                            Err(error) => {
+                                error!("CP config rejected — {}", error);
+                                error!(
+                                    "Ignoring config update with unusable frontend TLS material"
+                                );
+                                continue;
+                            }
+                        };
                         match proxy_state.update_config(config) {
                             ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                                commit_frontend_tls_snapshot(
+                                    frontend_tls_update,
+                                    proxy_state,
+                                    frontend_tls_slot,
+                                    cp_frontend_tls_materialized.as_ref(),
+                                )
+                                .await;
                                 apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,

@@ -1729,7 +1729,7 @@ fn build_redirect_response(
             .map(String::as_str)
     });
     let authority = authority.map(|authority| match redirect.port {
-        Some(port) => authority_with_port(authority, port),
+        Some(port) => authority_with_redirect_port(authority, port, scheme),
         None => authority.to_string(),
     });
     let path = redirect
@@ -1783,6 +1783,33 @@ fn authority_with_port(authority: &str, port: u16) -> String {
         return format!("{host}:{port}");
     }
     format!("{authority}:{port}")
+}
+
+fn authority_with_redirect_port(authority: &str, port: u16, scheme: &str) -> String {
+    if redirect_port_is_scheme_default(port, scheme) {
+        return authority_without_port(authority);
+    }
+    authority_with_port(authority, port)
+}
+
+fn redirect_port_is_scheme_default(port: u16, scheme: &str) -> bool {
+    (port == 80 && scheme.eq_ignore_ascii_case("http"))
+        || (port == 443 && scheme.eq_ignore_ascii_case("https"))
+}
+
+fn authority_without_port(authority: &str) -> String {
+    if let Some(bracketed_end) = authority.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let end = bracketed_end + 1;
+        return authority[..=end].to_string();
+    }
+    if authority.matches(':').count() == 1
+        && let Some((host, existing_port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && existing_port.parse::<u16>().is_ok()
+    {
+        return host.to_string();
+    }
+    authority.to_string()
 }
 
 /// Apply the per-rule fault action when the rule matched. Returns `Some` to
@@ -5257,6 +5284,28 @@ mod tests {
                 assert_eq!(
                     headers.get("location").map(String::as_str),
                     Some("https://site.example.com:8443/keep/me")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_scheme_default_port_strips_existing_request_port() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https", "port": 443}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        let mut headers = HashMap::from([("host".to_string(), "site.example.com:80".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com/keep/me")
                 );
             }
             other => panic!("expected redirect Reject, got {other:?}"),

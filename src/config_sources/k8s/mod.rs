@@ -347,6 +347,7 @@ pub(crate) struct K8sAccumulator {
     /// The nested shape lets `lookup_service_port` borrow `&str` arguments
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
+    service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
@@ -377,6 +378,7 @@ impl K8sAccumulator {
             proxy_sources: HashMap::new(),
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
+            service_ports: HashMap::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
@@ -410,6 +412,13 @@ impl K8sAccumulator {
             .is_some_and(|services| services.contains_key(service))
     }
 
+    pub(crate) fn service_port_exists(&self, namespace: &str, service: &str, port: u16) -> bool {
+        self.service_ports
+            .get(namespace)
+            .and_then(|services| services.get(service))
+            .is_some_and(|ports| ports.contains(&port))
+    }
+
     pub(crate) fn has_observed_services(&self) -> bool {
         !self.service_port_names.is_empty()
     }
@@ -426,6 +435,10 @@ impl K8sAccumulator {
 
     pub(crate) fn secret_is_valid_tls_certificate(&self, namespace: &str, name: &str) -> bool {
         core::secret_is_valid_tls_certificate(self, namespace, name)
+    }
+
+    pub(crate) fn secret_tls_material_digest(&self, namespace: &str, name: &str) -> Option<&str> {
+        core::secret_tls_material_digest(self, namespace, name)
     }
 
     fn observe_namespace(&mut self, namespace: &str) {
@@ -782,20 +795,25 @@ pub(crate) fn collect_service(
         .map(|arr| arr.as_slice())
         .unwrap_or(&[]);
     let mut port_names: HashMap<String, u16> = HashMap::new();
+    let mut port_numbers: HashSet<u16> = HashSet::new();
     for port_entry in ports {
-        let Some(name) = string_field(port_entry, "name") else {
-            continue;
-        };
         let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
             continue;
         };
         let port = port_from_u64(object, raw, "Service.spec.ports[].port")?;
-        port_names.insert(name.to_string(), port);
+        port_numbers.insert(port);
+        if let Some(name) = string_field(port_entry, "name") {
+            port_names.insert(name.to_string(), port);
+        }
     }
     acc.service_port_names
         .entry(object.metadata.namespace.clone())
         .or_default()
         .insert(object.metadata.name.clone(), port_names);
+    acc.service_ports
+        .entry(object.metadata.namespace.clone())
+        .or_default()
+        .insert(object.metadata.name.clone(), port_numbers);
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding

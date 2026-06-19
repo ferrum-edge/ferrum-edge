@@ -791,9 +791,7 @@ fn merge_k8s_translation(
     merged
         .plugin_configs
         .extend(k8s_config.plugin_configs.clone());
-    merged.frontend_tls_cert_path = k8s_config.frontend_tls_cert_path.clone();
-    merged.frontend_tls_key_path = k8s_config.frontend_tls_key_path.clone();
-    merged.frontend_tls_source_namespace = k8s_config.frontend_tls_source_namespace.clone();
+    merge_k8s_frontend_tls(&mut merged, k8s_config);
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -805,6 +803,23 @@ fn merge_k8s_translation(
 
     merged.normalize_fields();
     merged
+}
+
+fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
+    let k8s_supplies_tls =
+        k8s_config.frontend_tls_cert_path.is_some() || k8s_config.frontend_tls_key_path.is_some();
+    if k8s_supplies_tls {
+        merged.frontend_tls_cert_path = k8s_config.frontend_tls_cert_path.clone();
+        merged.frontend_tls_key_path = k8s_config.frontend_tls_key_path.clone();
+        merged.frontend_tls_source_namespace = k8s_config.frontend_tls_source_namespace.clone();
+        return;
+    }
+
+    if merged.frontend_tls_source_namespace.is_some() {
+        merged.frontend_tls_cert_path = None;
+        merged.frontend_tls_key_path = None;
+        merged.frontend_tls_source_namespace = None;
+    }
 }
 
 fn has_any_prefix(id: &str, prefixes: &[&str]) -> bool {
@@ -1357,6 +1372,77 @@ mod tests {
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));
+    }
+
+    #[test]
+    fn merge_k8s_translation_preserves_operator_frontend_tls_when_k8s_has_none() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("/etc/ferrum/operator.crt".to_string()),
+            frontend_tls_key_path: Some("/etc/ferrum/operator.key".to_string()),
+            frontend_tls_source_namespace: None,
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig::default();
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(
+            merged.frontend_tls_cert_path.as_deref(),
+            Some("/etc/ferrum/operator.crt")
+        );
+        assert_eq!(
+            merged.frontend_tls_key_path.as_deref(),
+            Some("/etc/ferrum/operator.key")
+        );
+        assert_eq!(merged.frontend_tls_source_namespace, None);
+    }
+
+    #[test]
+    fn merge_k8s_translation_clears_stale_gateway_frontend_tls_when_k8s_has_none() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt?sha256=old".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key?sha256=old".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig::default();
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(merged.frontend_tls_cert_path, None);
+        assert_eq!(merged.frontend_tls_key_path, None);
+        assert_eq!(merged.frontend_tls_source_namespace, None);
+    }
+
+    #[test]
+    fn merge_k8s_translation_replaces_operator_frontend_tls_when_k8s_supplies_gateway_tls() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("/etc/ferrum/operator.crt".to_string()),
+            frontend_tls_key_path: Some("/etc/ferrum/operator.key".to_string()),
+            frontend_tls_source_namespace: None,
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt?sha256=new".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key?sha256=new".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            ..GatewayConfig::default()
+        };
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(
+            merged.frontend_tls_cert_path.as_deref(),
+            Some("k8s://default/cert#tls.crt?sha256=new")
+        );
+        assert_eq!(
+            merged.frontend_tls_key_path.as_deref(),
+            Some("k8s://default/cert#tls.key?sha256=new")
+        );
+        assert_eq!(
+            merged.frontend_tls_source_namespace.as_deref(),
+            Some("default")
+        );
     }
 
     #[test]

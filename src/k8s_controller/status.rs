@@ -309,6 +309,12 @@ impl ListenerReferenceStatus {
         reason: "InvalidCertificateRef",
         message: "Ferrum could not resolve this listener certificateRef",
     };
+
+    const UNSUPPORTED_CERTIFICATE_REFS: Self = Self {
+        resolved: false,
+        reason: "UnsupportedValue",
+        message: "Ferrum currently supports one Gateway TLS certificateRef per data plane",
+    };
 }
 
 fn gateway_reference_status(objects: &[K8sObject], gateway: &K8sObject) -> ListenerReferenceStatus {
@@ -372,7 +378,101 @@ fn listener_reference_status(
         }
     }
 
+    if listener_is_terminating_tls(listener)
+        && gateway_has_multiple_distinct_tls_certificate_refs(objects, gateway)
+    {
+        return ListenerReferenceStatus::UNSUPPORTED_CERTIFICATE_REFS;
+    }
+
     ListenerReferenceStatus::RESOLVED
+}
+
+fn listener_is_terminating_tls(listener: &Value) -> bool {
+    let Some(protocol) = listener.get("protocol").and_then(Value::as_str) else {
+        return false;
+    };
+    if !protocol.eq_ignore_ascii_case("HTTPS") && !protocol.eq_ignore_ascii_case("TLS") {
+        return false;
+    }
+    listener
+        .get("tls")
+        .and_then(|tls| tls.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("Terminate")
+        .eq_ignore_ascii_case("Terminate")
+}
+
+fn gateway_has_multiple_distinct_tls_certificate_refs(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+) -> bool {
+    let Some(listeners) = gateway.spec.get("listeners").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut selected: Option<(String, String)> = None;
+    for identity in listeners
+        .iter()
+        .filter(|listener| listener_is_terminating_tls(listener))
+        .flat_map(|listener| listener_tls_certificate_ref_identities(objects, gateway, listener))
+    {
+        if selected
+            .as_ref()
+            .is_some_and(|existing| existing != &identity)
+        {
+            return true;
+        }
+        selected.get_or_insert(identity);
+    }
+    false
+}
+
+fn listener_tls_certificate_ref_identities(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+    listener: &Value,
+) -> Vec<(String, String)> {
+    listener
+        .get("tls")
+        .and_then(|tls| tls.get("certificateRefs"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|certificate_ref| {
+            let group = certificate_ref
+                .get("group")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let kind = certificate_ref
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Secret");
+            if !group.is_empty() || kind != "Secret" {
+                return None;
+            }
+            let name = certificate_ref.get("name").and_then(Value::as_str)?;
+            let namespace = certificate_ref
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(&gateway.metadata.namespace);
+            if namespace != gateway.metadata.namespace
+                && !reference_grant_allows_secret(
+                    objects,
+                    &gateway.metadata.namespace,
+                    namespace,
+                    name,
+                )
+            {
+                return None;
+            }
+            let secret = objects.iter().find(|object| {
+                object.kind == "Secret"
+                    && object.metadata.namespace == namespace
+                    && object.metadata.name == name
+            })?;
+            secret_is_valid_tls_certificate(secret)
+                .then(|| (namespace.to_string(), name.to_string()))
+        })
+        .collect()
 }
 
 fn reference_grant_allows_secret(
@@ -1873,19 +1973,45 @@ fn route_unresolved_backend_ref_reason(
         {
             return Some("RefNotPermitted");
         }
-        if services_observed
-            && let Some(backend_name) = backend_name
-            && !objects.iter().any(|object| {
-                object.kind == "Service"
-                    && object.metadata.namespace == backend_namespace
-                    && object.metadata.name == backend_name
-            })
-        {
-            return Some("BackendNotFound");
+        if services_observed && let Some(backend_name) = backend_name {
+            if !service_exists(objects, backend_namespace, backend_name) {
+                return Some("BackendNotFound");
+            }
+            let backend_port = backend_ref
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .unwrap_or(if route.kind == "GRPCRoute" { 50051 } else { 80 });
+            if !service_has_port(objects, backend_namespace, backend_name, backend_port) {
+                return Some("BackendNotFound");
+            }
         }
     }
 
     None
+}
+
+fn service_exists(objects: &[K8sObject], namespace: &str, name: &str) -> bool {
+    objects.iter().any(|object| {
+        object.kind == "Service"
+            && object.metadata.namespace == namespace
+            && object.metadata.name == name
+    })
+}
+
+fn service_has_port(objects: &[K8sObject], namespace: &str, name: &str, port: u16) -> bool {
+    objects
+        .iter()
+        .find(|object| {
+            object.kind == "Service"
+                && object.metadata.namespace == namespace
+                && object.metadata.name == name
+        })
+        .and_then(|service| service.spec.get("ports"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|entry| entry.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
 }
 
 fn reference_grant_allows_backend_ref(
@@ -2760,6 +2886,52 @@ mod tests {
     }
 
     #[test]
+    fn gateway_listener_status_reports_multiple_certificate_refs_unsupported() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https-a",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "certificate-a"}]}
+                    },
+                    {
+                        "name": "https-b",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                    }
+                ]
+            }),
+        );
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(&[gateway_class, gateway, secret_a, secret_b], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("UnsupportedValue")
+        );
+        let listeners = gateway_update.status["listeners"].as_array().unwrap();
+        let listener = listener_status_by_name(listeners, "https-a");
+        let listener_conditions = listener["conditions"].as_array().unwrap();
+        assert_condition(listener_conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(listener_conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("UnsupportedValue")
+        );
+    }
+
+    #[test]
     fn gateway_api_data_plane_service_ready_requires_ready_endpoint_slice_endpoint() {
         let mut endpoint_slice = object(
             "EndpointSlice",
@@ -3124,6 +3296,44 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("InvalidKind")
+        );
+    }
+
+    #[test]
+    fn route_status_reports_unresolved_backend_ref_to_missing_service_port() {
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "backendRefs": [{
+                        "name": "api",
+                        "port": 9090
+                    }]
+                }]
+            }),
+        );
+        let service = object(
+            "Service",
+            "api",
+            json!({
+                "ports": [{"name": "http", "port": 8080}]
+            }),
+        );
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let updates = plan_status_updates(&[gateway_class, gateway, route, service], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "ResolvedRefs", "False");
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("BackendNotFound")
         );
     }
 

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::types::BackendScheme;
+use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
@@ -91,6 +91,15 @@ struct RouteBackendResolution {
     invalid: Option<InvalidBackendRefReason>,
     invalid_weight: u32,
     valid_weight: u32,
+}
+
+enum GatewayFrontendTlsSelection {
+    None,
+    Single {
+        cert_source: String,
+        key_source: String,
+    },
+    UnsupportedMultiple,
 }
 
 struct RouteBackendGroup {
@@ -232,8 +241,19 @@ pub(super) fn collect_gateway_listener_policy(
 }
 
 fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) {
-    let Some((cert_source, key_source)) = gateway_frontend_tls_sources(acc, object) else {
-        return;
+    let (cert_source, key_source) = match gateway_frontend_tls_sources(acc, object) {
+        GatewayFrontendTlsSelection::Single {
+            cert_source,
+            key_source,
+        } => (cert_source, key_source),
+        GatewayFrontendTlsSelection::UnsupportedMultiple => {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} has multiple distinct TLS certificateRefs, but Ferrum currently supports one frontend TLS certificate per data plane; leaving listener references unresolved",
+                object.metadata.namespace, object.metadata.name
+            ));
+            return;
+        }
+        GatewayFrontendTlsSelection::None => return,
     };
 
     match (
@@ -270,13 +290,32 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
 fn gateway_frontend_tls_sources(
     acc: &K8sAccumulator,
     object: &K8sObject,
-) -> Option<(String, String)> {
-    let listeners = object.spec.get("listeners")?.as_array()?;
-    listeners
+) -> GatewayFrontendTlsSelection {
+    let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
+        return GatewayFrontendTlsSelection::None;
+    };
+    let mut selected: Option<(String, String)> = None;
+    for sources in listeners
         .iter()
         .filter(|listener| listener_is_terminating_tls(listener))
-        .filter_map(|listener| listener_frontend_tls_sources(acc, object, listener))
-        .next()
+        .flat_map(|listener| listener_frontend_tls_sources(acc, object, listener))
+    {
+        if selected
+            .as_ref()
+            .is_some_and(|existing| existing != &sources)
+        {
+            return GatewayFrontendTlsSelection::UnsupportedMultiple;
+        }
+        selected.get_or_insert(sources);
+    }
+    selected
+        .map(
+            |(cert_source, key_source)| GatewayFrontendTlsSelection::Single {
+                cert_source,
+                key_source,
+            },
+        )
+        .unwrap_or(GatewayFrontendTlsSelection::None)
 }
 
 fn listener_is_terminating_tls(listener: &Value) -> bool {
@@ -298,7 +337,7 @@ fn listener_frontend_tls_sources(
     acc: &K8sAccumulator,
     object: &K8sObject,
     listener: &Value,
-) -> Option<(String, String)> {
+) -> Vec<(String, String)> {
     listener
         .get("tls")
         .and_then(|tls| tls.get("certificateRefs"))
@@ -306,7 +345,7 @@ fn listener_frontend_tls_sources(
         .into_iter()
         .flatten()
         .filter_map(|reference| gateway_tls_secret_ref(acc, object, reference))
-        .next()
+        .collect()
 }
 
 fn gateway_tls_secret_ref(
@@ -337,9 +376,10 @@ fn gateway_tls_secret_ref(
     if !acc.secret_is_valid_tls_certificate(namespace, name) {
         return None;
     }
+    let digest = acc.secret_tls_material_digest(namespace, name)?;
     Some((
-        format!("k8s://{namespace}/{name}#tls.crt"),
-        format!("k8s://{namespace}/{name}#tls.key"),
+        format!("k8s://{namespace}/{name}#tls.crt?sha256={digest}"),
+        format!("k8s://{namespace}/{name}#tls.key?sha256={digest}"),
     ))
 }
 
@@ -2138,13 +2178,14 @@ fn gateway_request_redirect_value(
         };
         let mut out = serde_json::Map::new();
 
-        if let Some(scheme) = redirect.get("scheme").and_then(Value::as_str)
+        let redirect_scheme = redirect.get("scheme").and_then(Value::as_str);
+        if let Some(scheme) = redirect_scheme
             && !scheme.is_empty()
         {
             out.insert("scheme".to_string(), Value::String(scheme.to_string()));
         }
 
-        let redirect_port = gateway_redirect_port(object, redirect)?;
+        let redirect_port = gateway_redirect_port(object, redirect, redirect_scheme)?;
         let authority = redirect
             .get("hostname")
             .and_then(Value::as_str)
@@ -2205,9 +2246,10 @@ fn gateway_request_redirect_value(
 fn gateway_redirect_port(
     object: &K8sObject,
     redirect: &serde_json::Map<String, Value>,
+    redirect_scheme: Option<&str>,
 ) -> Result<Option<u16>, K8sTranslateError> {
     let Some(port) = redirect.get("port") else {
-        return Ok(None);
+        return Ok(default_port_for_scheme(redirect_scheme));
     };
     let Some(port) = port.as_u64() else {
         return Err(invalid_resource(
@@ -2222,6 +2264,14 @@ fn gateway_redirect_port(
         ));
     }
     Ok(Some(port as u16))
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
+    }
 }
 
 fn gateway_redirect_path(redirect: &serde_json::Map<String, Value>) -> Option<(&str, bool)> {
@@ -2454,11 +2504,6 @@ fn route_backends(
                 }
                 Err(error) => return Err(error),
             };
-        if acc.has_observed_services() && !acc.service_exists(&backend_namespace, backend_name) {
-            invalid.get_or_insert(InvalidBackendRefReason::BackendNotFound);
-            invalid_weight = invalid_weight.saturating_add(weight);
-            continue;
-        }
         let backend_port =
             optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
                 if object.kind == "GRPCRoute" {
@@ -2467,6 +2512,14 @@ fn route_backends(
                     80
                 },
             );
+        if acc.has_observed_services()
+            && (!acc.service_exists(&backend_namespace, backend_name)
+                || !acc.service_port_exists(&backend_namespace, backend_name, backend_port))
+        {
+            invalid.get_or_insert(InvalidBackendRefReason::BackendNotFound);
+            invalid_weight = invalid_weight.saturating_add(weight);
+            continue;
+        }
         valid_weight = valid_weight.saturating_add(weight);
         let endpoint_backends = acc.endpoint_route_backends_for_service(
             &backend_namespace,
@@ -2556,6 +2609,7 @@ fn flatten_route_backend_groups(groups: Vec<RouteBackendGroup>) -> Vec<RouteBack
             }
         }
     }
+    normalize_backend_weights_to_target_limit(&mut flattened);
     flattened
 }
 
@@ -2573,6 +2627,26 @@ fn distributed_backend_weight(total_weight: u32, count: usize, index: usize) -> 
     let base = total_weight / count;
     let remainder = total_weight % count;
     base + u32::from(u32::try_from(index).is_ok_and(|idx| idx < remainder))
+}
+
+fn normalize_backend_weights_to_target_limit(backends: &mut [RouteBackend]) {
+    let max_weight = backends
+        .iter()
+        .map(|backend| backend.weight)
+        .max()
+        .unwrap_or(0);
+    if max_weight <= MAX_TARGET_WEIGHT {
+        return;
+    }
+    for backend in backends {
+        if backend.weight == 0 {
+            continue;
+        }
+        let normalized = (u64::from(backend.weight) * u64::from(MAX_TARGET_WEIGHT)
+            / u64::from(max_weight))
+        .max(1);
+        backend.weight = u32::try_from(normalized).unwrap_or(MAX_TARGET_WEIGHT);
+    }
 }
 
 fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
@@ -2605,6 +2679,7 @@ fn l4_route_proxies(
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
+    ensure_l4_parent_refs_are_same_namespace(object)?;
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -2659,6 +2734,27 @@ fn l4_route_proxies(
         }));
     }
     Ok(proxies)
+}
+
+fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for parent_ref in parent_refs {
+        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        if group == "gateway.networking.k8s.io" && kind == "Gateway" {
+            let parent_namespace =
+                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+            if parent_namespace != object.metadata.namespace {
+                return Err(invalid_resource(
+                    object,
+                    "TCPRoute/TLSRoute cross-namespace parentRefs are not supported by Ferrum yet",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn checked_backend_namespace(
@@ -2913,13 +3009,19 @@ mod tests {
         let secret = tls_secret("gateway-cert", "default", true);
         let result =
             translate_k8s_objects(&[gateway, secret], options()).expect("translation succeeds");
-        assert_eq!(
-            result.config.frontend_tls_cert_path.as_deref(),
-            Some("k8s://default/gateway-cert#tls.crt")
+        assert!(
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/gateway-cert#tls.crt?sha256="))
         );
-        assert_eq!(
-            result.config.frontend_tls_key_path.as_deref(),
-            Some("k8s://default/gateway-cert#tls.key")
+        assert!(
+            result
+                .config
+                .frontend_tls_key_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/gateway-cert#tls.key?sha256="))
         );
         assert_eq!(
             result.config.frontend_tls_source_namespace.as_deref(),
@@ -3004,17 +3106,95 @@ mod tests {
             options().with_source_namespaces(vec!["default".to_string(), "certs".to_string()]),
         )
         .expect("translation succeeds");
-        assert_eq!(
-            with_grant.config.frontend_tls_cert_path.as_deref(),
-            Some("k8s://certs/gateway-cert#tls.crt")
+        assert!(
+            with_grant
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://certs/gateway-cert#tls.crt?sha256="))
         );
-        assert_eq!(
-            with_grant.config.frontend_tls_key_path.as_deref(),
-            Some("k8s://certs/gateway-cert#tls.key")
+        assert!(
+            with_grant
+                .config
+                .frontend_tls_key_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://certs/gateway-cert#tls.key?sha256="))
         );
         assert_eq!(
             with_grant.config.frontend_tls_source_namespace.as_deref(),
             Some("default")
+        );
+    }
+
+    #[test]
+    fn gateway_tls_secret_data_changes_frontend_tls_source_digest() {
+        use base64::Engine as _;
+
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "gateway-cert"}]}
+                }]
+            }),
+        );
+        let original = tls_secret("gateway-cert", "default", true);
+        let mut rotated = tls_secret("gateway-cert", "default", true);
+        rotated.spec["data"]["tls.crt"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD
+                .encode("-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n")
+        );
+
+        let original_result =
+            translate_k8s_objects(&[gateway.clone(), original], options()).expect("original");
+        let rotated_result =
+            translate_k8s_objects(&[gateway, rotated], options()).expect("rotated");
+
+        assert_ne!(
+            original_result.config.frontend_tls_cert_path,
+            rotated_result.config.frontend_tls_cert_path,
+            "Secret data changes must alter the stable source string so CP broadcasts a snapshot"
+        );
+    }
+
+    #[test]
+    fn gateway_multiple_distinct_certificate_refs_are_not_silently_collapsed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https-a",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "gateway-cert-a"}]}
+                    },
+                    {
+                        "name": "https-b",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "gateway-cert-b"}]}
+                    }
+                ]
+            }),
+        );
+        let cert_a = tls_secret("gateway-cert-a", "default", true);
+        let cert_b = tls_secret("gateway-cert-b", "default", true);
+
+        let result =
+            translate_k8s_objects(&[gateway, cert_a, cert_b], options()).expect("translation");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multiple distinct TLS certificateRefs"))
         );
     }
 
@@ -3972,6 +4152,85 @@ mod tests {
     }
 
     #[test]
+    fn http_route_endpoint_expansion_normalizes_scaled_weights_under_target_limit() {
+        let manual = core_service(
+            "manual",
+            serde_json::json!({
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let manual_slice = endpoint_slice_for_service(
+            "manual",
+            vec![
+                serde_json::json!({
+                    "addresses": ["10.1.0.31"],
+                    "conditions": {"ready": true}
+                }),
+                serde_json::json!({
+                    "addresses": ["10.1.0.32"],
+                    "conditions": {"ready": true}
+                }),
+            ],
+        );
+        let direct = core_service(
+            "direct",
+            serde_json::json!({
+                "clusterIP": "10.96.0.30",
+                "selector": {"app": "direct"},
+                "ports": [{"port": 8080}]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/weighted"}}],
+                    "backendRefs": [
+                        {"name": "direct", "port": 8080, "weight": 90},
+                        {"name": "manual", "port": 8080, "weight": 10}
+                    ]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[manual, manual_slice, direct, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("mixed endpoint and service backends should translate");
+
+        let upstream = result.config.upstreams.first().expect("weighted upstream");
+        assert!(
+            upstream
+                .targets
+                .iter()
+                .all(|target| target.weight <= MAX_TARGET_WEIGHT),
+            "scaled Gateway API weights must remain within Ferrum's upstream target limit"
+        );
+        let expanded_total: u32 = upstream
+            .targets
+            .iter()
+            .filter(|target| target.host.starts_with("10.1.0."))
+            .map(|target| target.weight)
+            .sum();
+        let direct_weight = upstream
+            .targets
+            .iter()
+            .find(|target| target.host == "direct.default.svc.cluster.local")
+            .map(|target| target.weight)
+            .expect("direct service target");
+        let ratio = f64::from(direct_weight) / f64::from(expanded_total);
+        assert!(
+            (ratio - 9.0).abs() < 0.02,
+            "normalized weights should preserve the 90:10 backendRef ratio, got {ratio}"
+        );
+    }
+
+    #[test]
     fn http_route_creates_proxy_per_match() {
         let result = translate_k8s_objects(
             &[object(
@@ -4275,6 +4534,43 @@ mod tests {
         assert!(
             redirect.get("authority").is_none(),
             "port-only redirect must preserve the request host at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_request_redirect_scheme_derives_default_port() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/secure"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "scheme": "https",
+                                "statusCode": 301
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["scheme"], "https");
+        assert_eq!(redirect["port"], 443);
+        assert!(
+            redirect.get("authority").is_none(),
+            "scheme-derived port must still preserve the request host at the DP"
         );
     }
 
@@ -5032,6 +5328,49 @@ mod tests {
     }
 
     #[test]
+    fn tcp_route_rejects_cross_namespace_parent_ref_until_l4_parent_materialization_exists() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 5432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "TCPRoute"}]
+                    }
+                }]
+            }),
+        );
+        gateway.metadata.namespace = "infra".to_string();
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "namespace": "infra"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(
+            &[gateway, route],
+            options().with_source_namespaces(vec!["default".to_string(), "infra".to_string()]),
+        )
+        .expect_err("cross-namespace L4 parentRefs should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("cross-namespace parentRefs are not supported")
+        );
+    }
+
+    #[test]
     fn tcp_route_skips_zero_weight_backend_refs() {
         let result = translate_k8s_objects(
             &[object(
@@ -5170,6 +5509,29 @@ mod tests {
             &result,
             "Gateway API backendRef is not permitted by ReferenceGrant",
         );
+    }
+
+    #[test]
+    fn existing_service_with_missing_backend_ref_port_materializes_fail_closed_route() {
+        let service = core_service(
+            "api",
+            serde_json::json!({
+                "ports": [{"name": "http", "port": 8080}]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 9090}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[service, route], options())
+            .expect("missing Service port should translate to invalid backend behavior");
+
+        assert_invalid_backend_fault_route(&result, "Gateway API backendRef Service was not found");
     }
 
     #[test]

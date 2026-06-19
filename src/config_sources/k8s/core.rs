@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
@@ -53,6 +54,7 @@ struct CoreService {
 #[derive(Debug)]
 struct CoreSecret {
     valid_tls_certificate: bool,
+    tls_material_digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -392,6 +394,16 @@ pub(super) fn secret_is_valid_tls_certificate(
         .is_some_and(|secret| secret.valid_tls_certificate)
 }
 
+pub(super) fn secret_tls_material_digest<'a>(
+    acc: &'a K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> Option<&'a str> {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .and_then(|secret| secret.tls_material_digest.as_deref())
+}
+
 fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
     let Some(key) = K8sServiceKey::new(
         object.metadata.namespace.clone(),
@@ -399,12 +411,27 @@ fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
     ) else {
         return;
     };
+    let valid_tls_certificate = secret_object_is_valid_tls_certificate(object);
     acc.core.secrets.insert(
         key,
         CoreSecret {
-            valid_tls_certificate: secret_object_is_valid_tls_certificate(object),
+            valid_tls_certificate,
+            tls_material_digest: valid_tls_certificate
+                .then(|| secret_tls_material_digest_for_object(object))
+                .flatten(),
         },
     );
+}
+
+fn secret_tls_material_digest_for_object(secret: &K8sObject) -> Option<String> {
+    let data = secret.spec.get("data").and_then(Value::as_object)?;
+    let cert = data.get("tls.crt").and_then(Value::as_str)?;
+    let key = data.get("tls.key").and_then(Value::as_str)?;
+    let mut digest = Sha256::new();
+    digest.update(cert.as_bytes());
+    digest.update([0]);
+    digest.update(key.as_bytes());
+    Some(hex::encode(digest.finalize()))
 }
 
 fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
