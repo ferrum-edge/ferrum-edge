@@ -1060,7 +1060,7 @@ impl ResponseCaching {
         response_time_wall: DateTime<Utc>,
     ) -> Duration {
         let apparent_age = header_value(response_headers, "date")
-            .and_then(|date| parse_http_date(date))
+            .and_then(parse_http_date)
             .map(|date| duration_since_http_date(response_time_wall, date))
             .unwrap_or_default();
 
