@@ -1383,7 +1383,8 @@ impl RouterCache {
         table: Arc<HostRouteTable>,
         generation: u64,
     ) {
-        self.route_snapshot.store(Arc::new(RouteSnapshot { table, generation }));
+        self.route_snapshot
+            .store(Arc::new(RouteSnapshot { table, generation }));
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
