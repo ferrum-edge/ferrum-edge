@@ -353,6 +353,26 @@ async fn test_cache_control_no_transform_disables_compression() {
 }
 
 #[tokio::test]
+async fn test_mixed_case_cache_control_no_transform_disables_compression() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("Cache-Control".to_string(), "no-transform".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("Cache-Control").unwrap(), "no-transform");
+}
+
+#[tokio::test]
 async fn test_original_no_transform_marker_disables_compression_when_header_removed() {
     let plugin = make_plugin(json!({}));
     let mut ctx = make_ctx(Some("gzip"));
@@ -1016,6 +1036,36 @@ async fn test_transform_response_body_compresses_when_encoding_already_committed
     decoder
         .read_to_end(&mut decompressed)
         .expect("output must be valid gzip");
+    assert_eq!(decompressed, original);
+}
+
+#[tokio::test]
+async fn test_transform_response_body_uses_final_supported_content_encoding() {
+    let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(None);
+    mark_response_algorithm(&mut ctx, "br");
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let original = b"compressible body after final header rewrite";
+    let compressed = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            original,
+            Some("application/json"),
+            &resp_headers,
+        )
+        .await
+        .expect("gateway-committed encoding should follow the final supported header");
+
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .expect("output must be valid gzip after final header rewrite");
     assert_eq!(decompressed, original);
 }
 
@@ -1744,6 +1794,40 @@ async fn test_original_request_no_transform_marker_restores_header_and_preserves
     assert!(
         transformed.is_none(),
         "original Cache-Control: no-transform must leave the compressed request body intact"
+    );
+}
+
+#[tokio::test]
+async fn test_request_no_transform_metadata_skips_context_aware_decode_without_header() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"request body that would normally decompress";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    ctx.metadata.insert(
+        "compression:request_no_transform".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    let transformed = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &compressed,
+            Some("application/octet-stream"),
+            &headers,
+        )
+        .await;
+    assert!(
+        transformed.is_none(),
+        "request no-transform metadata must leave gzip bytes intact even if the header was removed"
     );
 }
 

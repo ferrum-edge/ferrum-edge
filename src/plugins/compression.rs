@@ -681,6 +681,10 @@ impl Plugin for CompressionPlugin {
         true
     }
 
+    fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        true
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
@@ -960,6 +964,24 @@ impl Plugin for CompressionPlugin {
         }
     }
 
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+        {
+            return None;
+        }
+        self.transform_request_body(body, content_type, request_headers)
+            .await
+    }
+
     async fn transform_response_body(
         &self,
         _body: &[u8],
@@ -981,18 +1003,19 @@ impl Plugin for CompressionPlugin {
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // The algorithm decision was made in `after_proxy` and recorded in
-        // request metadata. If the backend already sent Content-Encoding,
-        // leave it intact instead of double-compressing an origin-encoded body
-        // that happened to be buffered for another plugin.
+        // request metadata. Its presence proves the gateway, not the origin,
+        // committed a response encoding. Encode according to the final
+        // Content-Encoding header so a later supported header rewrite (for
+        // example `br` -> `gzip`) still leaves headers and body consistent.
         let encoding = response_headers.get("content-encoding")?;
-        if ctx
-            .metadata
-            .get(RESPONSE_ALGORITHM_METADATA_KEY)
-            .map(String::as_str)
-            != Some(encoding.as_str())
-        {
+        ctx.metadata.get(RESPONSE_ALGORITHM_METADATA_KEY)?;
+        let encoding = if encoding.eq_ignore_ascii_case("gzip") {
+            "gzip"
+        } else if encoding.eq_ignore_ascii_case("br") {
+            "br"
+        } else {
             return None;
-        }
+        };
 
         // Once `after_proxy` set `Content-Encoding`, the response is committed
         // to that encoding. We MUST NOT short-circuit here on body size — doing

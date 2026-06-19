@@ -31,7 +31,10 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
-use crate::proxy::headers::{is_backend_request_strip_header, parse_connection_listed_headers};
+use crate::proxy::headers::{
+    is_backend_request_strip_header, is_backend_response_strip_header,
+    parse_connection_listed_headers,
+};
 use crate::tls::backend::{
     BackendSvidGeneration, SvidGenerationMatcher, append_backend_tls_pool_key_fields,
     append_optional_pool_key_component, append_pool_key_component,
@@ -407,6 +410,42 @@ fn connection_listed_headers_if_present(headers: &http::HeaderMap) -> Vec<http::
     } else {
         Vec::new()
     }
+}
+
+fn collect_h3_response_headers(source: &http::HeaderMap) -> HashMap<String, String> {
+    let mut headers: HashMap<String, String> = HashMap::with_capacity(source.keys_len());
+    // RFC 9110 §7.6.1: snapshot the Connection-listed names before
+    // iterating so any header NAMED in `Connection` is also skipped during
+    // collection. Hyper rejects `Connection` on H2/H3 frames (RFC 9114 §4.2),
+    // so this is typically empty for native H3 backends; the snapshot exists
+    // for defence in depth.
+    let connection_listed = connection_listed_headers_if_present(source);
+    for (name, value) in source {
+        if is_backend_response_strip_header(name.as_str()) {
+            continue;
+        }
+        // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
+        if connection_listed.iter().any(|n| n == name) {
+            continue;
+        }
+        if let Ok(value_str) = value.to_str() {
+            let sep = if name == http::header::SET_COOKIE {
+                "\n"
+            } else {
+                ", "
+            };
+            match headers.get_mut(name.as_str()) {
+                Some(existing) => {
+                    existing.push_str(sep);
+                    existing.push_str(value_str);
+                }
+                None => {
+                    headers.insert(name.as_str().to_string(), value_str.to_string());
+                }
+            }
+        }
+    }
+    headers
 }
 
 /// Whether `e` is a connection-level graceful-close signal that may legally
@@ -1855,29 +1894,7 @@ impl Http3ConnectionPool {
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            // Skip hop-by-hop headers during collection (avoids allocating
-            // String keys that would be immediately removed by the caller).
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         let content_length: Option<u64> = response_headers
             .get("content-length")
@@ -1973,29 +1990,7 @@ impl Http3ConnectionPool {
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            // Skip hop-by-hop headers during collection (avoids allocating
-            // String keys that would be immediately removed by the caller).
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         Ok(H3StreamingResponse {
             status,
@@ -2103,29 +2098,7 @@ impl Http3ConnectionPool {
                 .await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            // Skip hop-by-hop headers during collection (avoids allocating
-            // String keys that would be immediately removed by the caller).
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         Ok(H3StreamingResponse {
             status,
@@ -2221,27 +2194,7 @@ impl Http3ConnectionPool {
                 .await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         Ok(H3StreamingResponse {
             status,
@@ -2987,12 +2940,7 @@ impl Http3Client {
         let status = response.status().as_u16();
 
         // Collect response headers
-        let mut response_headers = std::collections::HashMap::new();
-        for (name, value) in response.headers() {
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         // Collect response body
         let content_length: Option<u64> = response_headers
@@ -3095,6 +3043,36 @@ mod h3_pool_error_tests {
     //! functional test in `tests/functional/`.
 
     use super::*;
+
+    #[test]
+    fn collect_h3_response_headers_matches_h1_h2_folding() {
+        let mut source = http::HeaderMap::new();
+        source.append(
+            "cache-control",
+            http::HeaderValue::from_static("no-transform"),
+        );
+        source.append(
+            "cache-control",
+            http::HeaderValue::from_static("max-age=60"),
+        );
+        source.append("set-cookie", http::HeaderValue::from_static("session=a"));
+        source.append("set-cookie", http::HeaderValue::from_static("theme=dark"));
+        source.insert("connection", http::HeaderValue::from_static("x-hop"));
+        source.insert("x-hop", http::HeaderValue::from_static("strip-me"));
+
+        let headers = collect_h3_response_headers(&source);
+
+        assert_eq!(
+            headers.get("cache-control").map(String::as_str),
+            Some("no-transform, max-age=60")
+        );
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("session=a\ntheme=dark")
+        );
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-hop"));
+    }
 
     #[test]
     fn pre_wire_marks_request_not_committed() {

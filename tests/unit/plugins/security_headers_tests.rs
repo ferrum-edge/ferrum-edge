@@ -77,15 +77,15 @@ fn security_headers_is_a_security_plugin() {
 }
 
 #[test]
-fn may_add_no_transform_accounts_for_removed_cache_control() {
+fn may_add_no_transform_reports_conservative_capability() {
     let mut headers = HashMap::from([("cache-control".to_string(), "max-age=60".to_string())]);
     let ctx = ctx();
-    let no_remove = SecurityHeaders::new(&json!({
+    let set_only = SecurityHeaders::new(&json!({
         "override_existing": false,
         "set": { "Cache-Control": "no-transform" }
     }))
     .unwrap();
-    assert!(!no_remove.may_add_response_cache_control_no_transform(&ctx, &headers));
+    assert!(set_only.may_add_response_cache_control_no_transform(&ctx, &headers));
 
     let remove_then_set = SecurityHeaders::new(&json!({
         "override_existing": false,

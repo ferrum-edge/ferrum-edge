@@ -2410,6 +2410,33 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Applies this plugin's deterministic `after_proxy` response-header
+    /// mutations to a simulated header map.
+    ///
+    /// The proxy uses this for preflight decisions that need to reason about
+    /// later header hooks without actually running plugin side effects early.
+    /// Implementations MUST keep this pure with respect to the real request:
+    /// the caller passes a cloned context when mutation is needed to mirror
+    /// runtime consumption of route overrides.
+    fn simulate_after_proxy_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
+    /// Returns `true` when this plugin reads
+    /// `ferrum:later_no_transform_response` from request metadata before
+    /// committing response headers.
+    ///
+    /// The proxy uses this to avoid simulating later response-header hooks for
+    /// plugins that cannot act on the result. Compression is the built-in
+    /// consumer because it must not commit `Content-Encoding` before a later
+    /// hook marks the final representation `Cache-Control: no-transform`.
+    fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin should also run its `after_proxy`
     /// header decoration logic for gateway-generated rejection responses.
     ///
@@ -3205,7 +3232,6 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
     }
 }
 
-/// List of all available plugin names (built-in + custom).
 /// Returns true if the named plugin is security-critical.
 ///
 /// Validation failures for these plugins are fatal at startup — the gateway
@@ -3248,87 +3274,96 @@ pub fn is_removed_security_plugin(name: &str) -> bool {
     matches!(name, "oauth2_auth" | "semantic_ai_firewall")
 }
 
+/// Names handled by the built-in plugin factory, excluding build-time custom
+/// plugins.
+pub const BUILTIN_PLUGIN_NAMES: &[&str] = &[
+    "transaction_log_schema",
+    "stdout_logging",
+    "http_logging",
+    "tcp_logging",
+    "kafka_logging",
+    "ws_logging",
+    "transaction_debugger",
+    "jwks_auth",
+    "oauth2_introspection",
+    "oidc_relying_party",
+    "jwt_auth",
+    "key_auth",
+    "basic_auth",
+    "ldap_auth",
+    "hmac_auth",
+    "mtls_auth",
+    "spiffe_identity",
+    "mesh_authz",
+    "opa",
+    "mesh_outbound_registry",
+    "compression",
+    "cors",
+    "security_headers",
+    "access_control",
+    "tcp_connection_throttle",
+    "adaptive_concurrency",
+    "ip_restriction",
+    "bot_detection",
+    "correlation_id",
+    "request_transformer",
+    "response_transformer",
+    "mesh_route_dispatch",
+    "graphql",
+    "grpc_method_router",
+    "grpc_deadline",
+    "grpc_web",
+    "rate_limiting",
+    "request_size_limiting",
+    "waf",
+    "response_size_limiting",
+    "body_validator",
+    "openapi_validator",
+    "request_termination",
+    "response_caching",
+    "response_mock",
+    "serverless_function",
+    "prometheus_metrics",
+    "proxy_alerts",
+    "otel_tracing",
+    "ai_token_metrics",
+    "ai_request_guard",
+    "ai_rate_limiter",
+    "ai_prompt_shield",
+    "ai_semantic_firewall",
+    "ai_response_guard",
+    "ai_semantic_cache",
+    "ai_federation",
+    "mcp_gateway",
+    "a2a_gateway",
+    "ws_message_size_limiting",
+    "ws_frame_logging",
+    "ws_rate_limiting",
+    "udp_rate_limiting",
+    "udp_logging",
+    "statsd_logging",
+    "loki_logging",
+    "sse",
+    "request_mirror",
+    "load_testing",
+    "geo_restriction",
+    "request_deduplication",
+    "soap_ws_security",
+    "spec_expose",
+    "api_chargeback",
+    "api_chargeback_sink",
+    "workload_metrics",
+    "__mesh_bpf_metrics",
+    "fault_injection",
+];
+
+/// Returns true when `name` is handled by the built-in plugin factory.
+pub fn is_builtin_plugin_name(name: &str) -> bool {
+    BUILTIN_PLUGIN_NAMES.contains(&name)
+}
+
 pub fn available_plugins() -> Vec<&'static str> {
-    let mut plugins = vec![
-        "transaction_log_schema",
-        "stdout_logging",
-        "http_logging",
-        "tcp_logging",
-        "kafka_logging",
-        "ws_logging",
-        "transaction_debugger",
-        "jwks_auth",
-        "oauth2_introspection",
-        "oidc_relying_party",
-        "jwt_auth",
-        "key_auth",
-        "basic_auth",
-        "ldap_auth",
-        "hmac_auth",
-        "mtls_auth",
-        "spiffe_identity",
-        "mesh_authz",
-        "opa",
-        "mesh_outbound_registry",
-        "compression",
-        "cors",
-        "security_headers",
-        "access_control",
-        "tcp_connection_throttle",
-        "adaptive_concurrency",
-        "ip_restriction",
-        "bot_detection",
-        "correlation_id",
-        "request_transformer",
-        "response_transformer",
-        "mesh_route_dispatch",
-        "graphql",
-        "grpc_method_router",
-        "grpc_deadline",
-        "grpc_web",
-        "rate_limiting",
-        "request_size_limiting",
-        "waf",
-        "response_size_limiting",
-        "body_validator",
-        "openapi_validator",
-        "request_termination",
-        "response_caching",
-        "response_mock",
-        "serverless_function",
-        "prometheus_metrics",
-        "proxy_alerts",
-        "otel_tracing",
-        "ai_token_metrics",
-        "ai_request_guard",
-        "ai_rate_limiter",
-        "ai_prompt_shield",
-        "ai_semantic_firewall",
-        "ai_response_guard",
-        "ai_semantic_cache",
-        "ai_federation",
-        "mcp_gateway",
-        "a2a_gateway",
-        "ws_message_size_limiting",
-        "ws_frame_logging",
-        "ws_rate_limiting",
-        "udp_rate_limiting",
-        "udp_logging",
-        "statsd_logging",
-        "loki_logging",
-        "sse",
-        "request_mirror",
-        "load_testing",
-        "geo_restriction",
-        "request_deduplication",
-        "soap_ws_security",
-        "spec_expose",
-        "api_chargeback",
-        "api_chargeback_sink",
-        "workload_metrics",
-        "__mesh_bpf_metrics",
-        "fault_injection",
-    ];
+    let mut plugins = BUILTIN_PLUGIN_NAMES.to_vec();
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins
 }

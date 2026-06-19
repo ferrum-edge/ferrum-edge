@@ -44,7 +44,14 @@ pub(crate) fn headers_have_cache_control_directive(
     headers: &HashMap<String, String>,
     directive: &str,
 ) -> bool {
-    headers
+    if headers
         .get("cache-control")
         .is_some_and(|value| cache_control_has_directive(value, directive))
+    {
+        return true;
+    }
+
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("cache-control") && cache_control_has_directive(value, directive)
+    })
 }

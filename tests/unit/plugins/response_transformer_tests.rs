@@ -788,10 +788,10 @@ async fn test_response_transformer_header_only_rules_never_buffer() {
 }
 
 #[test]
-fn test_response_transformer_no_transform_preflight_simulates_rule_order() {
+fn test_response_transformer_no_transform_preflight_reports_conservative_capability() {
     let ctx = make_ctx();
     let headers = HashMap::from([("cache-control".to_string(), "max-age=60".to_string())]);
-    let no_remove = ResponseTransformer::new(&json!({
+    let add_only = ResponseTransformer::new(&json!({
         "rules": [{
             "operation": "add",
             "target": "header",
@@ -800,7 +800,7 @@ fn test_response_transformer_no_transform_preflight_simulates_rule_order() {
         }]
     }))
     .unwrap();
-    assert!(!no_remove.may_add_response_cache_control_no_transform(&ctx, &headers));
+    assert!(add_only.may_add_response_cache_control_no_transform(&ctx, &headers));
 
     let remove_then_add = ResponseTransformer::new(&json!({
         "rules": [
