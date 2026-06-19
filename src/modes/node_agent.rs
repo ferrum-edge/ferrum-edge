@@ -39,9 +39,9 @@ use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
     IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
-    NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_READY,
-    NODE_AGENT_CAPTURE_STATE_UNAVAILABLE, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState,
-    PodInfo,
+    NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+    NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE, NodeAgentMetrics,
+    NodeAgentProxyMode, PodAttachmentState, PodInfo,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
@@ -547,7 +547,7 @@ async fn run_with_backend(
                             // Also drop owned failure snapshots for pods that
                             // vanished across the relist; otherwise the retry
                             // loop replays them indefinitely (see helper docs).
-                            prune_failed_enrollments_from_relist(&pod_states, &seen);
+                            prune_failed_enrollments_from_relist(&pod_states, &metrics, &seen);
                         }
                         startup_ready.store(true, Ordering::Release);
                         info!("Node agent initial pod sync complete; /health now reports ready");
@@ -638,8 +638,31 @@ fn watcher_init_stale_uids(
 ///
 /// Records are scoped by the `pod_states` key prefix so a sibling node-agent
 /// runtime (or, under `cargo test`, another test's pods) is never pruned.
+fn has_failed_pod_enrollments(pod_states: &DashMap<String, PodAttachmentState>) -> bool {
+    if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
+        return false;
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    FAILED_POD_ENROLLMENT_ATTEMPTS
+        .iter()
+        .any(|entry| entry.key().starts_with(&key_prefix))
+}
+
+fn clear_partial_capture_state_if_recovered(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+) {
+    if !has_failed_pod_enrollments(pod_states)
+        && metrics.snapshot().capture_state == NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+    {
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+    }
+}
+
 fn prune_failed_enrollments_from_relist(
     pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
     seen: &HashSet<String>,
 ) {
     if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
@@ -659,6 +682,7 @@ fn prune_failed_enrollments_from_relist(
     for state_key in stale_keys {
         forget_failed_pod_enrollment(&state_key);
     }
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
 fn mark_relist_seen_from_cni_add(
@@ -1886,6 +1910,7 @@ fn handle_pod_added(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
         // succeeded (programs attached, pod-IP + identity written), so a failed
@@ -2284,6 +2309,7 @@ pub fn handle_pod_removed(
 ) {
     let state_key = pod_state_key(pod_states, pod_uid);
     forget_pod_enrollment_attempt(&state_key);
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -4442,6 +4468,10 @@ mod tests {
             "transiently-failed pod must not be inserted into pod_states"
         );
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
         assert!(
             FAILED_POD_ENROLLMENT_ATTEMPTS
@@ -4463,6 +4493,11 @@ mod tests {
             "pod must enroll once the transient failure clears and the retry runs"
         );
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY,
+            "successful retry should clear a recovered partial-attach state"
+        );
         assert!(
             !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&state_key),
             "successful re-drive must clear the failed-enrollment record"
@@ -4552,11 +4587,15 @@ mod tests {
         let stays_key = pod_state_key(&pod_states, "stays-uid");
         assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key));
         assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
 
         // Relist saw `stays-uid` but not `gone-uid`.
         let mut seen = HashSet::new();
         seen.insert("stays-uid".to_string());
-        prune_failed_enrollments_from_relist(&pod_states, &seen);
+        prune_failed_enrollments_from_relist(&pod_states, &metrics, &seen);
 
         assert!(
             !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key),
@@ -4565,6 +4604,23 @@ mod tests {
         assert!(
             FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key),
             "failed record for a pod still present in the relist must be retained for retry"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+            "remaining failed enrollment should keep the node marked partially attached"
+        );
+
+        seen.clear();
+        prune_failed_enrollments_from_relist(&pod_states, &metrics, &seen);
+        assert!(
+            !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key),
+            "second relist with no failed pods seen should prune the last failed record"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY,
+            "pruning the last failed enrollment should clear the recovered partial state"
         );
 
         // Clean up the global between tests sharing this static.

@@ -40,9 +40,10 @@
 {{- $nodeAgentImageTag = printf "%s-ebpf" $nodeAgentImageTag -}}
 {{- end -}}
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
-{{- $nodeWaypointRegistryEnabled := eq (lower (toString .Values.nodeAgent.proxyMode)) "node_waypoint" -}}
+{{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
+{{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
-{{- $ambientTopology := lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")) -}}
+{{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
 {{- if $nodeWaypointRegistryEnabled -}}
 {{- if ne (lower (toString .Values.nodeAgent.captureMode)) "ebpf" -}}
 {{- fail "nodeAgent.proxyMode=node_waypoint requires nodeAgent.captureMode=ebpf" -}}
@@ -139,7 +140,7 @@ spec:
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.nodeAgent.captureMode | quote }}
             - name: FERRUM_NODE_AGENT_PROXY_MODE
-              value: {{ .Values.nodeAgent.proxyMode | quote }}
+              value: {{ $nodeAgentProxyMode | quote }}
             - name: FERRUM_MESH_PROXY_UID
               value: {{ .Values.nodeAgent.proxyUid | quote }}
             - name: FERRUM_MESH_CAPTURE_INCLUDE_CIDRS

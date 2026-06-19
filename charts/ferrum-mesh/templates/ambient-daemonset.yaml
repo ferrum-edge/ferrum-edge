@@ -2,9 +2,9 @@
 {{- $ambientImageRepository := toString .Values.image.repository -}}
 {{- $ambientImageTag := toString .Values.image.tag -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
-{{- $ambientTopology := toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY") -}}
-{{- $nodeWaypointRegistryEnabled := eq (lower $ambientTopology) "node_waypoint" -}}
-{{- $nodeAgentProxyMode := lower (toString .Values.nodeAgent.proxyMode) -}}
+{{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
+{{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
 {{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
@@ -25,7 +25,7 @@
 {{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.captureMode=ebpf" -}}
 {{- end -}}
 {{- end -}}
-{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq (lower $ambientTopology) "node_waypoint")) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint")) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
 {{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}

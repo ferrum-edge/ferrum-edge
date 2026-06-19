@@ -197,10 +197,7 @@ metadata:
   name: dst-a
   namespace: __NAMESPACE__
 spec:
-  ipFamilyPolicy: RequireDualStack
-  ipFamilies:
-    - IPv4
-    - IPv6
+  __SERVICE_IP_FAMILY_BLOCK__
   selector:
     app: dst-a
   ports:
@@ -214,10 +211,7 @@ metadata:
   name: dst-b
   namespace: __NAMESPACE__
 spec:
-  ipFamilyPolicy: RequireDualStack
-  ipFamilies:
-    - IPv4
-    - IPv6
+  __SERVICE_IP_FAMILY_BLOCK__
   selector:
     app: dst-b
   ports:

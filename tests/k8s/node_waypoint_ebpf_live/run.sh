@@ -119,6 +119,26 @@ render_chart_assertions() {
     exit 1
   fi
 
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node-waypoint \
+    --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node-waypoint \
+    --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
+  if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
+    ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
+    [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]]; then
+    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases" >&2
+    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -365,7 +385,22 @@ collect_bpf_evidence() {
 
 apply_workloads() {
   log "applying live traffic workloads"
-  sed "s/__NAMESPACE__/$WORKLOAD_NS/g" "$MANIFESTS" | kubectl apply -f -
+  local service_ip_family_block
+  if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
+    service_ip_family_block=$'  ipFamilyPolicy: RequireDualStack\n  ipFamilies:\n    - IPv4\n    - IPv6'
+  else
+    service_ip_family_block=$'  ipFamilyPolicy: PreferDualStack'
+  fi
+  awk -v ns="$WORKLOAD_NS" -v family_block="$service_ip_family_block" '
+    {
+      gsub(/__NAMESPACE__/, ns)
+      if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
+        print family_block
+      } else {
+        print
+      }
+    }
+  ' "$MANIFESTS" | kubectl apply -f -
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-a --timeout=3m

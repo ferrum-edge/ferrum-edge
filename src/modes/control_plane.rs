@@ -1855,10 +1855,19 @@ pub async fn run(
                 let _ = shutdown_tx.send(true);
             }
         };
-        if let Err(err) =
-            crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic),
+        )
+        .await
         {
-            error!("CP listener task failed: {}", err);
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("CP listener task failed: {}", err);
+            }
+            Err(_) => {
+                warn!("Timed out waiting for CP listeners to drain after shutdown");
+            }
         }
     }
 
