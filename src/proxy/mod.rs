@@ -113,8 +113,8 @@ use crate::service_discovery::ServiceDiscoveryManager;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::backend::BackendTlsConfigBuilder;
-use crate::util::http_headers::headers_have_cache_control_directive;
 use crate::tls::source::{CertSource, MaterialKind};
+use crate::util::http_headers::headers_have_cache_control_directive;
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
