@@ -888,6 +888,17 @@ impl ResponseCaching {
         self.vary_index.remove(base_key);
     }
 
+    fn invalidate_cache_key(&self, base_key: &str, cache_key: &str) {
+        let Some((_, entry)) = self.cache.remove(cache_key) else {
+            return;
+        };
+
+        sub_total_size(&self.total_size, entry.approx_size());
+        if cache_key == base_key {
+            self.vary_index.remove(base_key);
+        }
+    }
+
     /// Evict expired entries when cache exceeds max_entries.
     fn evict_if_needed(&self) {
         if self.cache.len() <= self.config.max_entries {
@@ -1529,7 +1540,31 @@ impl Plugin for ResponseCaching {
             response_time_wall,
         );
 
-        if freshness_lifetime.is_zero() || corrected_initial_age >= freshness_lifetime {
+        if freshness_lifetime.is_zero() {
+            match self.merged_vary_headers(response_headers) {
+                Some(mut vary_headers) => {
+                    self.merge_existing_vary_headers(&base_key, &mut vary_headers);
+                    self.merge_present_sensitive_vary_headers(
+                        &mut vary_headers,
+                        &lookup_headers.headers,
+                    );
+                    let cache_key = self.build_cache_key_with_ready_values(
+                        ctx,
+                        &vary_headers,
+                        &lookup_headers.headers,
+                        Some(&lookup_headers.cache_key_ready_headers),
+                    );
+                    self.invalidate_cache_key(&base_key, &cache_key);
+                }
+                None => self.invalidate_base_key(&base_key),
+            }
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
+            return PluginResult::Continue;
+        }
+
+        if corrected_initial_age >= freshness_lifetime {
             if let Some(predict_key) = predict_key.as_deref() {
                 self.uncacheable_predictor.mark_uncacheable(predict_key);
             }

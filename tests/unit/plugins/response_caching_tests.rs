@@ -776,6 +776,53 @@ async fn test_bypassed_stale_response_does_not_poison_fresh_entry() {
 }
 
 #[tokio::test]
+async fn test_bypassed_zero_freshness_response_invalidates_existing_entry() {
+    let plugin = default_plugin();
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/no-cache-zero",
+        200,
+        &resp_headers,
+        b"cached",
+    )
+    .await;
+
+    let mut bypass_ctx = make_ctx("GET", "/api/no-cache-zero");
+    bypass_ctx
+        .headers
+        .insert("cache-control".to_string(), "no-cache".to_string());
+    let mut bypass_headers = HashMap::new();
+    bypass_headers.insert("cache-control".to_string(), "no-cache".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut bypass_ctx, &mut bypass_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+
+    let mut zero_response_headers = HashMap::new();
+    zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
+    plugin
+        .after_proxy(&mut bypass_ctx, 200, &mut zero_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut bypass_ctx, 200, &zero_response_headers, b"zero")
+        .await;
+
+    let mut miss_ctx = make_ctx("GET", "/api/no-cache-zero");
+    let mut miss_headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(miss_ctx.metadata.get("cache_status").unwrap(), "MISS");
+}
+
+#[tokio::test]
 async fn test_bypassed_fresh_response_clears_stale_predictor() {
     let plugin = default_plugin();
 
@@ -1154,6 +1201,106 @@ async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
     );
     assert_eq!(status, 200);
     assert_eq!(body, b"gzip");
+}
+
+#[tokio::test]
+async fn test_zero_freshness_invalidates_only_matching_vary_variant() {
+    let plugin = default_plugin();
+    let path = "/api/zero-vary";
+
+    let mut gzip_ctx = make_ctx("GET", path);
+    gzip_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_headers = HashMap::new();
+    gzip_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut gzip_ctx, &mut gzip_headers).await,
+        PluginResult::Continue
+    ));
+    let mut gzip_response_headers = HashMap::new();
+    gzip_response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    gzip_response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut gzip_ctx, 200, &mut gzip_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut gzip_ctx, 200, &gzip_response_headers, b"gzip")
+        .await;
+
+    let mut br_ctx = make_ctx("GET", path);
+    br_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "br".to_string());
+    let mut br_headers = HashMap::new();
+    br_headers.insert("accept-encoding".to_string(), "br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut br_ctx, &mut br_headers).await,
+        PluginResult::Continue
+    ));
+    let mut br_response_headers = HashMap::new();
+    br_response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    br_response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut br_ctx, 200, &mut br_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut br_ctx, 200, &br_response_headers, b"br")
+        .await;
+
+    let mut br_bypass_ctx = make_ctx("GET", path);
+    br_bypass_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "br".to_string());
+    br_bypass_ctx
+        .headers
+        .insert("cache-control".to_string(), "no-cache".to_string());
+    let mut br_bypass_headers = HashMap::new();
+    br_bypass_headers.insert("accept-encoding".to_string(), "br".to_string());
+    br_bypass_headers.insert("cache-control".to_string(), "no-cache".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut br_bypass_ctx, &mut br_bypass_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut zero_response_headers = HashMap::new();
+    zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
+    zero_response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut br_bypass_ctx, 200, &mut zero_response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut br_bypass_ctx, 200, &zero_response_headers, b"zero")
+        .await;
+
+    let mut gzip_hit_ctx = make_ctx("GET", path);
+    gzip_hit_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_hit_headers = HashMap::new();
+    gzip_hit_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    let (status, body, _) = expect_reject(
+        plugin
+            .before_proxy(&mut gzip_hit_ctx, &mut gzip_hit_headers)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"gzip");
+
+    let mut br_miss_ctx = make_ctx("GET", path);
+    br_miss_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "br".to_string());
+    let mut br_miss_headers = HashMap::new();
+    br_miss_headers.insert("accept-encoding".to_string(), "br".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut br_miss_ctx, &mut br_miss_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(br_miss_ctx.metadata.get("cache_status").unwrap(), "MISS");
 }
 
 #[tokio::test]
