@@ -2130,7 +2130,9 @@ async fn test_priority_override_delegates_context_response_body_transform() {
 
     let mut request_headers = HashMap::new();
     request_headers.insert("accept-encoding".to_string(), "gzip".to_string());
-    plugins[0].before_proxy(&mut ctx, &mut request_headers).await;
+    plugins[0]
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
     assert!(
         !request_headers.contains_key("accept-encoding"),
         "compression should strip Accept-Encoding before proxying"
