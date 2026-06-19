@@ -964,6 +964,9 @@ async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
     let path = "/api/stale-vary";
 
     let mut gzip_ctx = make_ctx("GET", path);
+    gzip_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
     let mut gzip_headers = HashMap::new();
     gzip_headers.insert("accept-encoding".to_string(), "gzip".to_string());
     assert!(matches!(
@@ -981,6 +984,9 @@ async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
         .await;
 
     let mut br_ctx = make_ctx("GET", path);
+    br_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "br".to_string());
     let mut br_headers = HashMap::new();
     br_headers.insert("accept-encoding".to_string(), "br".to_string());
     assert!(matches!(
@@ -999,6 +1005,9 @@ async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
         .await;
 
     let mut gzip_hit_ctx = make_ctx("GET", path);
+    gzip_hit_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
     let mut gzip_hit_headers = HashMap::new();
     gzip_hit_headers.insert("accept-encoding".to_string(), "gzip".to_string());
     let (status, body, _) = expect_reject(
