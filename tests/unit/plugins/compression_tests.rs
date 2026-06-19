@@ -932,12 +932,7 @@ async fn test_brotli_response_compression_roundtrip() {
     resp_headers.insert("content-encoding".to_string(), "br".to_string());
 
     let compressed = plugin
-        .transform_response_body_with_context(
-            &mut ctx,
-            original,
-            Some("text/html"),
-            &resp_headers,
-        )
+        .transform_response_body_with_context(&mut ctx, original, Some("text/html"), &resp_headers)
         .await
         .expect("should compress");
 
@@ -1718,8 +1713,10 @@ async fn test_original_request_no_transform_marker_restores_header_and_preserves
     let compressed = encoder.finish().unwrap();
 
     let mut ctx = make_request_ctx_with_body("gzip", &compressed);
-    ctx.metadata
-        .insert("ferrum:no_transform_request".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        "ferrum:no_transform_request".to_string(),
+        "true".to_string(),
+    );
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     headers.insert("content-length".to_string(), compressed.len().to_string());

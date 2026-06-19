@@ -605,9 +605,7 @@ impl Plugin for CompressionPlugin {
         // we support — there's nothing to compress.
         !self.config.algorithms.is_empty()
             && ctx.headers.contains_key("accept-encoding")
-            && !ctx
-                .metadata
-                .contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            && !ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
             && !ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
@@ -774,9 +772,7 @@ impl Plugin for CompressionPlugin {
             return PluginResult::Continue;
         }
 
-        if ctx
-            .metadata
-            .contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+        if ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)

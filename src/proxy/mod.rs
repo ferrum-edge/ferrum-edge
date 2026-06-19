@@ -15384,12 +15384,7 @@ async fn handle_proxy_request_inner(
         let ct_ref = content_type.as_deref();
         for plugin in plugins.iter() {
             if let Some(transformed) = plugin
-                .transform_response_body_with_context(
-                    &mut ctx,
-                    data,
-                    ct_ref,
-                    &response_headers,
-                )
+                .transform_response_body_with_context(&mut ctx, data, ct_ref, &response_headers)
                 .await
             {
                 // Update Content-Length to reflect the new body size
