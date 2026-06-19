@@ -672,6 +672,15 @@ impl Plugin for CompressionPlugin {
             || headers_have_cache_control_directive(response_headers, "no-transform")
     }
 
+    fn should_release_response_body_for_later_no_transform(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        true
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }

@@ -42,7 +42,7 @@ use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::route_header_transform::{
-    RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
+    RouteHeaderTransformRule, apply_route_header_transforms,
 };
 use super::{Plugin, PluginResult, RequestContext};
 use crate::util::http_headers::cache_control_has_directive;
@@ -105,59 +105,43 @@ impl ResponseTransformer {
             .is_some_and(|rules| rules.iter().any(|rule| rule.key == "content-type"))
     }
 
-    fn static_rules_may_add_cache_control_no_transform(
+    fn simulated_headers_have_cache_control_no_transform(
         &self,
-        response_headers: &HashMap<String, String>,
-    ) -> bool {
-        self.header_rules.iter().any(|rule| match rule.operation {
-            HeaderOp::Add => {
-                rule.key == "cache-control"
-                    && rule
-                        .value
-                        .as_deref()
-                        .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
-                    && find_header_ci(response_headers, "cache-control").is_none()
-            }
-            HeaderOp::Update => {
-                rule.key == "cache-control"
-                    && rule
-                        .value
-                        .as_deref()
-                        .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
-            }
-            HeaderOp::Rename => {
-                rule.new_key.as_deref() == Some("cache-control")
-                    && find_header_ci(response_headers, &rule.key)
-                        .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
-            }
-            HeaderOp::Remove => false,
-        })
-    }
-
-    fn route_rules_may_add_cache_control_no_transform(
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        ctx.route_override_response_transform
-            .as_ref()
-            .is_some_and(|rules| {
-                rules.iter().any(|rule| match rule.operation {
-                    RouteHeaderTransformOp::Add => {
-                        rule.key == "cache-control"
-                            && rule.value.as_deref().is_some_and(|value| {
-                                cache_control_has_directive(value, "no-transform")
-                            })
-                            && find_header_ci(response_headers, "cache-control").is_none()
+        let mut simulated_headers = response_headers.clone();
+        for rule in &self.header_rules {
+            match rule.operation {
+                HeaderOp::Add => {
+                    if let Some(value) = rule.value.as_ref() {
+                        simulated_headers
+                            .entry(rule.key.clone())
+                            .or_insert_with(|| value.clone());
                     }
-                    RouteHeaderTransformOp::Update => {
-                        rule.key == "cache-control"
-                            && rule.value.as_deref().is_some_and(|value| {
-                                cache_control_has_directive(value, "no-transform")
-                            })
+                }
+                HeaderOp::Update => {
+                    if let Some(value) = rule.value.as_ref() {
+                        simulated_headers.insert(rule.key.clone(), value.clone());
                     }
-                    RouteHeaderTransformOp::Remove => false,
-                })
-            })
+                }
+                HeaderOp::Remove => {
+                    simulated_headers.remove(&rule.key);
+                }
+                HeaderOp::Rename => {
+                    if let Some(new_key) = rule.new_key.as_ref()
+                        && let Some(value) = simulated_headers.remove(&rule.key)
+                    {
+                        simulated_headers.insert(new_key.clone(), value);
+                    }
+                }
+            }
+        }
+        if let Some(route_rules) = ctx.route_override_response_transform.as_ref() {
+            apply_route_header_transforms(route_rules.as_ref(), &mut simulated_headers);
+        }
+        find_header_ci(&simulated_headers, "cache-control")
+            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
     }
 }
 
@@ -431,8 +415,7 @@ impl Plugin for ResponseTransformer {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.rules_enabled()
-            && (self.static_rules_may_add_cache_control_no_transform(response_headers)
-                || Self::route_rules_may_add_cache_control_no_transform(ctx, response_headers))
+            && self.simulated_headers_have_cache_control_no_transform(ctx, response_headers)
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {

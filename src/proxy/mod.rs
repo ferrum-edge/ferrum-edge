@@ -971,14 +971,23 @@ pub(crate) fn refine_stream_response_for_content_type(
     let mut saw_active_buffering_plugin = false;
     let all_active_plugins_can_release_before_content_type_rewrite = plugins
         .iter()
-        .filter(|plugin| plugin.should_buffer_response_body(ctx))
-        .all(|plugin| {
+        .enumerate()
+        .filter(|(_, plugin)| plugin.should_buffer_response_body(ctx))
+        .all(|(index, plugin)| {
             saw_active_buffering_plugin = true;
+            let later_may_add_no_transform = plugins[index + 1..].iter().any(|later| {
+                later.may_add_response_cache_control_no_transform(ctx, response_headers)
+            });
             plugin.should_release_response_body_before_content_type_rewrite(
                 ctx,
                 response_status,
                 response_headers,
-            )
+            ) || (later_may_add_no_transform
+                && plugin.should_release_response_body_for_later_no_transform(
+                    ctx,
+                    response_status,
+                    response_headers,
+                ))
         });
     if saw_active_buffering_plugin && all_active_plugins_can_release_before_content_type_rewrite {
         return true;
@@ -24561,6 +24570,45 @@ mod tests {
             Some(&compression_ctx),
             200,
             &no_transform_headers,
+        ));
+
+        let late_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "set": {"Cache-Control": "no-transform"}
+                }))
+                .expect("security headers config should be valid"),
+            ),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &late_no_transform_plugins,
+            Some(&compression_ctx),
+            200,
+            &json_headers,
+        ));
+
+        let inspected_late_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(CompressionPlugin::new(&json!({})).unwrap()),
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+            Arc::new(
+                SecurityHeaders::new(&json!({
+                    "set": {"Cache-Control": "no-transform"}
+                }))
+                .expect("security headers config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &inspected_late_no_transform_plugins,
+            Some(&compression_ctx),
+            200,
+            &json_headers,
         ));
 
         let inspected_no_transform_plugins: Vec<Arc<dyn Plugin>> = vec![

@@ -153,6 +153,19 @@ impl Plugin for PriorityOverridePlugin {
                 response_headers,
             )
     }
+    fn should_release_response_body_for_later_no_transform(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .should_release_response_body_for_later_no_transform(
+                ctx,
+                response_status,
+                response_headers,
+            )
+    }
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,

@@ -2464,6 +2464,23 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin can release a buffered response because
+    /// a later `after_proxy` hook will add `Cache-Control: no-transform`.
+    ///
+    /// This is narrower than
+    /// [`should_release_response_body_before_content_type_rewrite`]: the proxy
+    /// has already established that a later hook can mark the final
+    /// representation as no-transform, and asks only whether that invariant
+    /// makes this plugin's buffered transform unnecessary.
+    fn should_release_response_body_for_later_no_transform(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Content-type-aware refinement of [`should_buffer_response_body`].
     ///
     /// Evaluated once per response *after* the backend response headers arrive,

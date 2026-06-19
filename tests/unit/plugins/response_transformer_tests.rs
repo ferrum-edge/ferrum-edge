@@ -787,6 +787,46 @@ async fn test_response_transformer_header_only_rules_never_buffer() {
     assert!(!plugin.should_buffer_response_body(&ctx_json));
 }
 
+#[test]
+fn test_response_transformer_no_transform_preflight_simulates_rule_order() {
+    let ctx = make_ctx();
+    let headers = HashMap::from([("cache-control".to_string(), "max-age=60".to_string())]);
+    let no_remove = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": "Cache-Control",
+            "value": "no-transform"
+        }]
+    }))
+    .unwrap();
+    assert!(!no_remove.may_add_response_cache_control_no_transform(
+        &ctx,
+        &headers
+    ));
+
+    let remove_then_add = ResponseTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "remove",
+                "target": "header",
+                "key": "Cache-Control"
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "Cache-Control",
+                "value": "no-transform"
+            }
+        ]
+    }))
+    .unwrap();
+    assert!(remove_then_add.may_add_response_cache_control_no_transform(
+        &ctx,
+        &headers
+    ));
+}
+
 // ── Route-level transform overrides (`apply_route_overrides`) ──────────────
 
 use ferrum_edge::plugins::utils::route_header_transform::{
