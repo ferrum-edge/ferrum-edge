@@ -51,9 +51,10 @@ currently enrolled (machine-gated) set, which is the authoritative answer to
   trust-bundle federation.
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 intended path gated
   by a privileged live job; IPv6 captured egress fails closed before admission;
-  Helm must mount the shared node-agent ↔ ambient pod registry for
-  `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
-  auto-select `-ebpf` images and non-eBPF builds cannot report Ready),
+  Helm must mount the shared node-agent ↔ ambient pod registry plus host
+  cgroup/bpffs views and netns capabilities for `node_waypoint`), eBPF ambient
+  capture (Dev-only; enabled chart topologies auto-select `-ebpf` images and
+  non-eBPF builds cannot report Ready),
   cross-cluster endpoint discovery, stream-family egress.
 
 ## Acceptable residual / out-of-scope (the long tail)

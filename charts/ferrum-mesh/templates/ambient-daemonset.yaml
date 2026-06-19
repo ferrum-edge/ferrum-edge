@@ -42,6 +42,9 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
+      {{- if $nodeWaypointRegistryEnabled }}
+      hostPID: true
+      {{- end }}
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: ferrum-edge
@@ -49,10 +52,21 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           securityContext:
+            {{- if $nodeWaypointRegistryEnabled }}
+            runAsUser: 0
+            runAsGroup: 0
+            {{- end }}
             capabilities:
               add:
+                {{- if $nodeWaypointRegistryEnabled }}
+                - BPF
+                {{- end }}
                 - NET_ADMIN
                 - NET_RAW
+                {{- if $nodeWaypointRegistryEnabled }}
+                - PERFMON
+                - SYS_ADMIN
+                {{- end }}
           ports:
             - name: outbound
               containerPort: {{ .Values.ambient.outboundPort }}
@@ -73,11 +87,25 @@ spec:
             {{- end }}
           {{- if $nodeWaypointRegistryEnabled }}
           volumeMounts:
+            - name: bpf-fs
+              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+              readOnly: true
+            - name: cgroup
+              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
+              readOnly: true
             - name: node-waypoint-pod-registry
               mountPath: {{ .Values.nodeAgent.podRegistryDir }}
           {{- end }}
       {{- if $nodeWaypointRegistryEnabled }}
       volumes:
+        - name: bpf-fs
+          hostPath:
+            path: {{ .Values.nodeAgent.bpfFsPath }}
+            type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.nodeAgent.cgroupRoot }}
+            type: Directory
         - name: node-waypoint-pod-registry
           hostPath:
             path: {{ .Values.nodeAgent.podRegistryDir }}

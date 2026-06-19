@@ -106,6 +106,14 @@ capability traces to a specific kernel API used by the code.
 | `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
 | `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8**. Also required in `node_waypoint` mode on every supported kernel because the agent enters pod network namespaces with `setns()` to resolve host-side veth peers before tc attachment. The chart drops `SYS_ADMIN` for `local_pod` mode on modern kernels but always adds it for `nodeAgent.proxyMode=node_waypoint`. | Older-kernel BPF operations; `setns(CLONE_NEWNET)` for pod-netns veth discovery. | Same as `CAP_BPF` / `CAP_PERFMON`; `discover_host_veth_for_pod` in [`src/ebpf/veth.rs`](../src/ebpf/veth.rs) |
 
+When `nodeAgent.proxyMode=node_waypoint`, the ambient mesh proxy is part of the
+same capture data path. The chart also grants that proxy `CAP_BPF`,
+`CAP_PERFMON`, and `CAP_SYS_ADMIN`: it opens the node-agent-pinned BPF maps by
+path, reads SOCK_OPS/orig-dst records, and enters each enrolled pod's network
+namespace with `setns(CLONE_NEWNET)` to bind the pod-loopback capture listener.
+Those extra proxy permissions are not rendered for regular ambient iptables
+mode.
+
 ### Capabilities deliberately NOT requested
 
 - **`CAP_SYS_PTRACE`** — earlier chart versions added this, but it is not
@@ -136,6 +144,12 @@ capability traces to a specific kernel API used by the code.
 | `cgroup` (hostPath) | `/sys/fs/cgroup` (default; override via `FERRUM_NODE_AGENT_CGROUP_ROOT`) | ro | Opening a cgroup directory FD is required to call `BPF_PROG_ATTACH` against it (`attach_cgroup` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs)). The directory is mounted read-only; BPF attach uses the FD via the BPF subsystem, not direct cgroup writes. |
 | ServiceAccount token | `/var/run/secrets/kubernetes.io/serviceaccount/` | ro | Automatically projected by the kubelet. Consumed by `kube::Config::incluster()` ([`build_node_agent_kube_client` in `src/modes/node_agent.rs`](../src/modes/node_agent.rs)) to authenticate the `pods`/`nodes` watcher to the API server. Operators should prefer a **projected** token with a short `expirationSeconds` (the kubelet handles rotation) over the legacy long-lived Secret token. |
 | `/proc` | implicit via `hostPID: true` | ro | Veth discovery reads `/proc/{pid}/net/if_inet6` ([`src/ebpf/veth.rs`](../src/ebpf/veth.rs)) to find the host-side veth ifindex for each enrolled pod. Without `hostPID`, the container's `/proc` only shows its own PIDs and cannot resolve pod-PID-to-veth. |
+
+In NodeWaypoint topology, the ambient proxy mounts the same host bpffs and
+cgroup roots read-only and also runs with `hostPID: true`. It does not attach
+BPF programs or write cgroups; it needs those views to open pinned maps, find a
+live PID in each registry cgroup, and `setns()` into the matching pod network
+namespace before publishing `<podRegistryDir>/.ready/<pod_uid>`.
 
 ### Mounts deliberately NOT requested
 
