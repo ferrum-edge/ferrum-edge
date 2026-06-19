@@ -847,10 +847,7 @@ plugin_configs:
     .expect("optional fail-open plugin config errors must not reject file-mode config load");
 
     assert_eq!(config.plugin_configs.len(), 1);
-    assert_eq!(
-        config.plugin_configs[0].id,
-        "plugin-optional-bad-config"
-    );
+    assert_eq!(config.plugin_configs[0].id, "plugin-optional-bad-config");
     assert_eq!(config.plugin_configs[0].plugin_name, "stdout_logging");
 }
 

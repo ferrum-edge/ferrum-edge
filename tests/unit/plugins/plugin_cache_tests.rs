@@ -292,8 +292,7 @@ fn test_removed_security_plugin_fails_closed() {
 #[test]
 fn test_builtin_plugin_registrations_are_unique_and_policy_backed() {
     use ferrum_edge::plugins::{
-        BUILTIN_PLUGIN_REGISTRATIONS, PluginFailurePolicy, available_plugins,
-        plugin_failure_policy,
+        BUILTIN_PLUGIN_REGISTRATIONS, PluginFailurePolicy, available_plugins, plugin_failure_policy,
     };
 
     let mut seen = std::collections::HashSet::new();
