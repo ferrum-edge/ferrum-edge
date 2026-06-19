@@ -771,7 +771,7 @@ where
     acc.gateway_api_route_conflicts = gateway_api_route_conflicts;
 
     for object in &included_objects {
-        if object.kind == "Namespace" {
+        if object.kind == "Namespace" || object.kind == "GatewayClass" {
             continue;
         }
         if !includes_object_namespace(&acc.options, object) {
