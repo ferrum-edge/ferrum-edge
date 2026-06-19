@@ -51,8 +51,10 @@ const CLEANUP_NEVER: u64 = u64::MAX;
 
 const DEDUP_KEY_METADATA: &str = "_dedup_key";
 const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
+const DEDUP_REDIS_LOCK_TOKEN_METADATA: &str = "_dedup_redis_lock_token";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
+const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
 const FINGERPRINT_HEADERS: &[&str] = &["content-type", "content-encoding", "content-language"];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
@@ -134,6 +136,12 @@ enum RedisDeduplicationAction {
     Miss,
     Replay(CachedResponse),
     Conflict,
+}
+
+enum RedisInFlightAction {
+    Acquired(String),
+    Conflict(DeduplicationConflict),
+    Unavailable,
 }
 
 pub struct RequestDeduplication {
@@ -387,13 +395,86 @@ impl RequestDeduplication {
         }
     }
 
-    /// Store a cached response in Redis with TTL.
-    async fn redis_set(&self, key: &str, fingerprint: &str, response: &CachedResponse) {
+    async fn redis_mark_inflight(&self, key: &str, fingerprint: &str) -> RedisInFlightAction {
+        let Some(redis) = self.redis_client.as_ref() else {
+            return RedisInFlightAction::Unavailable;
+        };
+        if !redis.is_available() {
+            return RedisInFlightAction::Unavailable;
+        }
+
+        let redis_key = redis.make_key(&[REDIS_INFLIGHT_KEY_COMPONENT, key]);
+        for _ in 0..2 {
+            let token = uuid::Uuid::new_v4().to_string();
+            let lock = SerializableInFlightLock {
+                fingerprint: fingerprint.to_string(),
+                token: token.clone(),
+            };
+            let lock_bytes = match serde_json::to_vec(&lock) {
+                Ok(bytes) => bytes,
+                Err(_) => return RedisInFlightAction::Unavailable,
+            };
+
+            match redis
+                .set_bytes_nx_with_expire(
+                    &redis_key,
+                    &lock_bytes,
+                    self.inflight_ttl.as_secs().max(1),
+                )
+                .await
+            {
+                Ok(true) => return RedisInFlightAction::Acquired(token),
+                Ok(false) => {}
+                Err(()) => return RedisInFlightAction::Unavailable,
+            }
+
+            let existing = match redis.get_bytes(&redis_key).await {
+                Ok(Some(existing)) => existing,
+                Ok(None) => continue,
+                Err(()) => return RedisInFlightAction::Unavailable,
+            };
+
+            return match serde_json::from_slice::<SerializableInFlightLock>(&existing) {
+                Ok(existing_lock) if existing_lock.fingerprint == fingerprint => {
+                    RedisInFlightAction::Conflict(DeduplicationConflict::InFlight)
+                }
+                Ok(_) => RedisInFlightAction::Conflict(DeduplicationConflict::FingerprintMismatch),
+                Err(_) => RedisInFlightAction::Conflict(DeduplicationConflict::InFlight),
+            };
+        }
+
+        RedisInFlightAction::Conflict(DeduplicationConflict::InFlight)
+    }
+
+    async fn redis_release_inflight(&self, key: &str, fingerprint: &str, token: &str) {
         let Some(redis) = self.redis_client.as_ref() else {
             return;
         };
         if !redis.is_available() {
             return;
+        }
+
+        let lock = SerializableInFlightLock {
+            fingerprint: fingerprint.to_string(),
+            token: token.to_string(),
+        };
+        let lock_bytes = match serde_json::to_vec(&lock) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let redis_key = redis.make_key(&[REDIS_INFLIGHT_KEY_COMPONENT, key]);
+        if let Err(()) = redis.delete_if_value_matches(&redis_key, &lock_bytes).await {
+            debug!("request_deduplication: Redis in-flight lock release failed");
+        }
+    }
+
+    /// Store a cached response in Redis with TTL.
+    async fn redis_set(&self, key: &str, fingerprint: &str, response: &CachedResponse) -> bool {
+        let Some(redis) = self.redis_client.as_ref() else {
+            return false;
+        };
+        if !redis.is_available() {
+            return false;
         }
 
         let serializable = SerializableCachedResponse {
@@ -405,7 +486,7 @@ impl RequestDeduplication {
 
         let data = match serde_json::to_vec(&serializable) {
             Ok(d) => d,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         let redis_key = redis.make_key(&[key]);
@@ -415,7 +496,9 @@ impl RequestDeduplication {
             .await
         {
             debug!("request_deduplication: Redis SET failed");
+            return false;
         }
+        true
     }
 
     fn next_completed_sequence(&self) -> u64 {
@@ -692,6 +775,12 @@ struct SerializableCachedResponse {
     body: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableInFlightLock {
+    fingerprint: String,
+    token: String,
+}
+
 fn hash_framed(hasher: &mut Sha256, label: &str, value: &[u8]) {
     hasher.update(label.as_bytes());
     hasher.update([0]);
@@ -963,7 +1052,10 @@ impl Plugin for RequestDeduplication {
         // Periodic cleanup
         self.cleanup_local_cache();
 
-        // Check Redis first (centralized dedup across instances)
+        // Check Redis first (centralized dedup across instances), then acquire
+        // a Redis in-flight lock before any gateway instance can dispatch the
+        // fresh request to the backend.
+        let mut redis_lock_token = None;
         if self.redis_client.is_some() {
             match self.redis_get(&key, &fingerprint).await {
                 RedisDeduplicationAction::Replay(cached) => {
@@ -991,6 +1083,29 @@ impl Plugin for RequestDeduplication {
                 }
                 RedisDeduplicationAction::Miss => {}
             }
+
+            match self.redis_mark_inflight(&key, &fingerprint).await {
+                RedisInFlightAction::Acquired(token) => {
+                    redis_lock_token = Some(token);
+                }
+                RedisInFlightAction::Conflict(DeduplicationConflict::InFlight) => {
+                    return PluginResult::Reject {
+                        status_code: 409,
+                        body: r#"{"error":"A request with this idempotency key is already in progress"}"#
+                            .to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                RedisInFlightAction::Conflict(DeduplicationConflict::FingerprintMismatch) => {
+                    return PluginResult::Reject {
+                        status_code: 409,
+                        body: r#"{"error":"Idempotency key was reused for a different request"}"#
+                            .to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                RedisInFlightAction::Unavailable => {}
+            }
         }
 
         // Check local cache and mark fresh keys as in-flight atomically under
@@ -998,6 +1113,9 @@ impl Plugin for RequestDeduplication {
         // with the same idempotency key from both reaching the backend.
         match self.local_lookup_or_mark_inflight(&key, &fingerprint, Instant::now()) {
             LocalDeduplicationAction::Replay(cached) => {
+                if let Some(token) = redis_lock_token.as_deref() {
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                }
                 debug!("request_deduplication: local cache hit, replaying response");
                 // Defense-in-depth: re-sanitize on replay even though insert
                 // already strips. Cheap (single HashMap pass) and protects
@@ -1012,6 +1130,9 @@ impl Plugin for RequestDeduplication {
                 };
             }
             LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight) => {
+                if let Some(token) = redis_lock_token.as_deref() {
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                }
                 return PluginResult::Reject {
                     status_code: 409,
                     body:
@@ -1021,6 +1142,9 @@ impl Plugin for RequestDeduplication {
                 };
             }
             LocalDeduplicationAction::Conflict(DeduplicationConflict::FingerprintMismatch) => {
+                if let Some(token) = redis_lock_token.as_deref() {
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                }
                 return PluginResult::Reject {
                     status_code: 409,
                     body: r#"{"error":"Idempotency key was reused for a different request"}"#
@@ -1035,6 +1159,10 @@ impl Plugin for RequestDeduplication {
         ctx.metadata.insert(DEDUP_KEY_METADATA.to_string(), key);
         ctx.metadata
             .insert(DEDUP_FINGERPRINT_METADATA.to_string(), fingerprint);
+        if let Some(token) = redis_lock_token {
+            ctx.metadata
+                .insert(DEDUP_REDIS_LOCK_TOKEN_METADATA.to_string(), token);
+        }
 
         PluginResult::Continue
     }
@@ -1111,9 +1239,16 @@ impl Plugin for RequestDeduplication {
         };
         self.evict_completed_over_capacity(completed, inflight);
 
-        // Also store in Redis if available
+        // Also store in Redis if available. Release the distributed in-flight
+        // lock only after the completed response is visible in Redis, so a peer
+        // cannot miss both the lock and the replayable response.
         if self.redis_client.is_some() {
-            self.redis_set(&key, &fingerprint, &cached).await;
+            let redis_store_ok = self.redis_set(&key, &fingerprint, &cached).await;
+            if redis_store_ok
+                && let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA)
+            {
+                self.redis_release_inflight(&key, &fingerprint, token).await;
+            }
         }
 
         PluginResult::Continue

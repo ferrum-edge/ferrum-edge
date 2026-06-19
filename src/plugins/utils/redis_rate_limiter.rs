@@ -924,6 +924,74 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Set a raw byte value only if the key does not already exist, with a TTL.
+    ///
+    /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
+    /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    pub async fn set_bytes_nx_with_expire(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<Option<String>, redis::RedisError> = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_seconds as i64)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(value) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(value.is_some())
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis SET NX EX failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Delete a key only when its current byte value exactly matches `expected`.
+    ///
+    /// Used for ownership-token release of distributed in-flight locks.
+    pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let script = redis::Script::new(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+             return redis.call('DEL', KEYS[1]) else return 0 end",
+        );
+        let result: Result<i64, redis::RedisError> =
+            script.key(key).arg(expected).invoke_async(&mut conn).await;
+
+        match result {
+            Ok(deleted) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(deleted > 0)
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-delete failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Build a full Redis key with the configured prefix.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();

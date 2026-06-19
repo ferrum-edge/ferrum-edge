@@ -22,6 +22,8 @@ use crate::common::TestGateway;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -279,6 +281,64 @@ async fn start_header_echo_backend(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body_str.len(),
                     body_str
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Ok(handle)
+}
+
+async fn start_slow_counting_backend(
+    port: u16,
+    hits: Arc<AtomicUsize>,
+    delay: Duration,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let hits = Arc::clone(&hits);
+            tokio::spawn(async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+                let mut request_line = String::new();
+                let _ = buf_reader.read_line(&mut request_line).await;
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let _ = buf_reader.read_line(&mut line).await;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = trimmed.split_once(':')
+                        && key.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body_buf = vec![0u8; content_length];
+                    let _ = buf_reader.read_exact(&mut body_buf).await;
+                }
+
+                let body = json!({
+                    "request_line": request_line.trim(),
+                    "backend_hits": hits.load(Ordering::SeqCst),
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
                 );
                 let _ = writer.write_all(response.as_bytes()).await;
             });
@@ -1252,6 +1312,153 @@ plugin_configs:
     gw1.shutdown();
     gw2.shutdown();
     println!("test_rate_limiting_redis_shared_across_instances PASSED");
+}
+
+/// Request deduplication must use Redis for in-flight exclusion, not only for
+/// completed response replay. Two gateway instances sharing Redis should not
+/// both execute the same idempotent POST concurrently.
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
+    if !redis_is_available().await {
+        return;
+    }
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let _backend = start_slow_counting_backend(
+        backend_port,
+        Arc::clone(&backend_hits),
+        Duration::from_millis(750),
+    )
+    .await
+    .unwrap();
+
+    let unique_prefix = format!("ferrum:test:dedup:{}", Uuid::new_v4().simple());
+    let config = |prefix: &str| {
+        format!(
+            r#"
+version: "1"
+proxies:
+  - id: "shared-dedup-proxy"
+    listen_path: "/shared-dedup"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "shared-dedup-plugin"
+
+consumers: []
+
+plugin_configs:
+  - id: "shared-dedup-plugin"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "shared-dedup-proxy"
+    enabled: true
+    config:
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 10
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+"#,
+        )
+    };
+
+    let port1 = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let port2 = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let mut gw1 = spawn_file_gateway(
+        config(&unique_prefix),
+        port1,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+    let mut gw2 = spawn_file_gateway(
+        config(&unique_prefix),
+        port2,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+
+    delete_redis_keys_by_prefix(&unique_prefix).await;
+    sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let body = r#"{"order":1}"#;
+    let idempotency_key = "shared-order-key";
+    let url1 = format!("http://127.0.0.1:{port1}/shared-dedup/orders");
+    let url2 = format!("http://127.0.0.1:{port2}/shared-dedup/orders");
+
+    let first = client
+        .post(&url1)
+        .header("Idempotency-Key", idempotency_key)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send();
+    let second = client
+        .post(&url2)
+        .header("Idempotency-Key", idempotency_key)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send();
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first gateway request failed");
+    let second = second.expect("second gateway request failed");
+
+    let statuses = [first.status().as_u16(), second.status().as_u16()];
+    assert!(
+        statuses.contains(&200) && statuses.contains(&409),
+        "one gateway should execute and the other should see Redis in-flight conflict, got {statuses:?}"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "shared Redis in-flight lock must allow only one backend execution"
+    );
+
+    let replay = client
+        .post(&url2)
+        .header("Idempotency-Key", idempotency_key)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("replay request failed");
+    assert_eq!(replay.status().as_u16(), 200);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "completed Redis response should replay after the lock is released"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "Redis replay must not execute the backend again"
+    );
+
+    gw1.shutdown();
+    gw2.shutdown();
+    println!("test_request_deduplication_redis_blocks_concurrent_cross_instance PASSED");
 }
 
 /// Namespace-based Redis key prefix isolation.
