@@ -1064,10 +1064,10 @@ impl ResponseCaching {
         let age_value = header_value(response_headers, "age")
             .and_then(parse_age_header)
             .unwrap_or_default();
-        let corrected_age_value =
-            duration_saturating_add(age_value, self.response_delay(ctx, response_time_monotonic));
-
-        apparent_age.max(corrected_age_value)
+        duration_saturating_add(
+            apparent_age.max(age_value),
+            self.response_delay(ctx, response_time_monotonic),
+        )
     }
 
     fn shared_cache_allows_authorized_response(
@@ -1466,18 +1466,16 @@ impl Plugin for ResponseCaching {
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.
-        let predict_key = ctx
-            .metadata
-            .get(CACHE_PREDICT_KEY)
-            .cloned()
-            .unwrap_or_else(|| base_key.clone());
+        let predict_key = ctx.metadata.get(CACHE_PREDICT_KEY).cloned();
 
         if !self
             .config
             .cacheable_status_codes
             .contains(&response_status)
         {
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
             return PluginResult::Continue;
         }
 
@@ -1492,7 +1490,9 @@ impl Plugin for ResponseCaching {
 
         if directives.no_store || directives.private || directives.no_cache {
             self.invalidate_base_key(&base_key);
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
             return PluginResult::Continue;
         }
 
@@ -1501,7 +1501,9 @@ impl Plugin for ResponseCaching {
         // session cookies to other users (RFC 7234 §8).
         if response_headers.contains_key("set-cookie") {
             debug!("response_caching: skipping cache — response contains Set-Cookie header");
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
             return PluginResult::Continue;
         }
 
@@ -1512,7 +1514,9 @@ impl Plugin for ResponseCaching {
         let lookup_headers = self.restore_request_headers_view(ctx);
 
         if !self.shared_cache_allows_authorized_response(ctx, directives) {
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
             return PluginResult::Continue;
         }
 
@@ -1527,7 +1531,9 @@ impl Plugin for ResponseCaching {
         );
 
         if freshness_lifetime.is_zero() || corrected_initial_age >= freshness_lifetime {
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            if let Some(predict_key) = predict_key.as_deref() {
+                self.uncacheable_predictor.mark_uncacheable(predict_key);
+            }
             return PluginResult::Continue;
         }
 
@@ -1535,7 +1541,9 @@ impl Plugin for ResponseCaching {
             Some(vary_headers) => vary_headers,
             None => {
                 self.invalidate_base_key(&base_key);
-                self.uncacheable_predictor.mark_uncacheable(&predict_key);
+                if let Some(predict_key) = predict_key.as_deref() {
+                    self.uncacheable_predictor.mark_uncacheable(predict_key);
+                }
                 return PluginResult::Continue;
             }
         };
@@ -1645,7 +1653,9 @@ impl Plugin for ResponseCaching {
         }
         self.total_size.fetch_add(entry_size, Ordering::Relaxed);
         // Response was cacheable — remove from predictor if previously marked uncacheable
-        self.uncacheable_predictor.mark_cacheable(&predict_key);
+        if let Some(predict_key) = predict_key.as_deref() {
+            self.uncacheable_predictor.mark_cacheable(predict_key);
+        }
         self.vary_index.insert(base_key, vary_headers);
 
         debug!(
