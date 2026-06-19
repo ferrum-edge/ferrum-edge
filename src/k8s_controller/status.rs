@@ -386,7 +386,8 @@ fn listener_reference_status(
     }
 
     if listener_is_terminating_tls(listener)
-        && gateway_has_multiple_distinct_tls_certificate_refs(objects, gateway)
+        && (gateway_has_multiple_distinct_tls_certificate_refs(objects, gateway)
+            || gateway_has_same_namespace_tls_conflict(objects, gateway))
     {
         return ListenerReferenceStatus::UNSUPPORTED_CERTIFICATE_REFS;
     }
@@ -431,6 +432,38 @@ fn gateway_has_multiple_distinct_tls_certificate_refs(
         selected.get_or_insert(identity);
     }
     false
+}
+
+fn gateway_has_same_namespace_tls_conflict(objects: &[K8sObject], gateway: &K8sObject) -> bool {
+    let current_identities = gateway_tls_certificate_ref_identities(objects, gateway);
+    if current_identities.is_empty() {
+        return false;
+    }
+    objects
+        .iter()
+        .filter(|object| {
+            object.kind == "Gateway"
+                && object.metadata.namespace == gateway.metadata.namespace
+                && object.metadata.name != gateway.metadata.name
+                && gateway_is_managed_by_ferrum(objects, object)
+        })
+        .flat_map(|object| gateway_tls_certificate_ref_identities(objects, object))
+        .any(|identity| !current_identities.contains(&identity))
+}
+
+fn gateway_tls_certificate_ref_identities(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+) -> Vec<(String, String)> {
+    gateway
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|listener| listener_is_terminating_tls(listener))
+        .flat_map(|listener| listener_tls_certificate_ref_identities(objects, gateway, listener))
+        .collect()
 }
 
 fn listener_tls_certificate_ref_identities(
@@ -1868,6 +1901,27 @@ fn gateway_programmed(object: &K8sObject, config: &crate::config::types::Gateway
 }
 
 fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayConfig) -> bool {
+    if matches!(object.kind.as_str(), "TCPRoute" | "TLSRoute") {
+        let prefix = format!(
+            "{}-",
+            resource_id(
+                "gwapi-l4",
+                &object.metadata.namespace,
+                &object.metadata.name,
+                "",
+            )
+        );
+        return config.proxies.iter().any(|proxy| {
+            let Some(remainder) = proxy.id.strip_prefix(&prefix) else {
+                return false;
+            };
+            remainder
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_digit())
+        });
+    }
+
     // Route proxy IDs follow `gwapi-route-{ns}-{name}-{route_kind}-{rule_idx}[-{match_idx}][-host{host_idx}]`
     // (see `gateway_api::http_route_resources`). Requiring the route_kind segment
     // to be immediately followed by a digit disambiguates routes whose names
@@ -2969,6 +3023,55 @@ mod tests {
     }
 
     #[test]
+    fn same_namespace_gateway_tls_conflict_reports_unsupported_value() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway_a = object(
+            "Gateway",
+            "edge-a",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https-a",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "certificate-a"}]}
+                }]
+            }),
+        );
+        let gateway_b = object(
+            "Gateway",
+            "edge-b",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https-b",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                }]
+            }),
+        );
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class, gateway_a, gateway_b, secret_a, secret_b],
+            options(),
+        );
+
+        for gateway_name in ["edge-a", "edge-b"] {
+            let gateway_update = update_for(&updates, "Gateway", gateway_name);
+            let conditions = gateway_update.status["conditions"].as_array().unwrap();
+            assert_condition(conditions, "ResolvedRefs", "False");
+            assert_eq!(
+                find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+                Some("UnsupportedValue")
+            );
+            assert_condition(conditions, "Programmed", "False");
+        }
+    }
+
+    #[test]
     fn gateway_api_data_plane_service_ready_requires_ready_endpoint_slice_endpoint() {
         let mut endpoint_slice = object(
             "EndpointSlice",
@@ -3439,6 +3542,43 @@ mod tests {
             find_condition(conditions, "Programmed")["reason"].as_str(),
             Some("NoRules")
         );
+    }
+
+    #[test]
+    fn tcp_route_status_reports_programmed_after_l4_materialization() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 5432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TCPRoute",
+            "db",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "TCPRoute", "db");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "True");
     }
 
     #[test]

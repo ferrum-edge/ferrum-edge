@@ -99,6 +99,7 @@ enum GatewayFrontendTlsSelection {
         cert_source: String,
         key_source: String,
     },
+    InvalidCertificateRef,
     UnsupportedMultiple,
 }
 
@@ -248,6 +249,13 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
             cert_source,
             key_source,
         } => (cert_source, key_source),
+        GatewayFrontendTlsSelection::InvalidCertificateRef => {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} has at least one unresolved TLS certificateRef; leaving frontend TLS unmaterialized",
+                object.metadata.namespace, object.metadata.name
+            ));
+            return;
+        }
         GatewayFrontendTlsSelection::UnsupportedMultiple => {
             acc.warnings.push(format!(
                 "Gateway API Gateway {}/{} has multiple distinct TLS certificateRefs, but Ferrum currently supports one frontend TLS certificate per data plane; leaving listener references unresolved",
@@ -283,6 +291,16 @@ fn gateway_frontend_tls_namespace_source(
     cert_source: String,
     key_source: String,
 ) -> Option<FrontendTlsNamespaceSource> {
+    if acc
+        .gateway_api_frontend_tls_conflict_namespaces
+        .contains(&source_namespace)
+    {
+        acc.warnings.push(format!(
+            "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace {} already has conflicting Gateway TLS sources; leaving namespace frontend TLS unmaterialized",
+            object.metadata.namespace, object.metadata.name, cert_source, source_namespace
+        ));
+        return None;
+    }
     if let Some(existing) = acc
         .config
         .frontend_tls_namespace_sources
@@ -293,13 +311,16 @@ fn gateway_frontend_tls_namespace_source(
             return Some(existing.clone());
         }
         acc.warnings.push(format!(
-            "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace {} already uses {}; keeping the first materialized certificate for that data plane",
+            "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace {} already has conflicting Gateway TLS sources (existing source {}); leaving namespace frontend TLS unmaterialized",
             object.metadata.namespace,
             object.metadata.name,
             cert_source,
             source_namespace,
             existing.cert_path
         ));
+        acc.gateway_api_frontend_tls_conflict_namespaces
+            .insert(source_namespace.clone());
+        clear_frontend_tls_namespace_source(acc, &source_namespace);
         return None;
     }
 
@@ -317,6 +338,24 @@ fn gateway_frontend_tls_namespace_source(
     Some(source)
 }
 
+fn clear_frontend_tls_namespace_source(acc: &mut K8sAccumulator, namespace: &str) {
+    acc.config
+        .frontend_tls_namespace_sources
+        .retain(|source| source.namespace != namespace);
+    if acc.config.frontend_tls_source_namespace.as_deref() != Some(namespace) {
+        return;
+    }
+    if let Some(source) = acc.config.frontend_tls_namespace_sources.first() {
+        acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
+        acc.config.frontend_tls_key_path = Some(source.key_path.clone());
+        acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
+    } else {
+        acc.config.frontend_tls_cert_path = None;
+        acc.config.frontend_tls_key_path = None;
+        acc.config.frontend_tls_source_namespace = None;
+    }
+}
+
 fn gateway_frontend_tls_sources(
     acc: &K8sAccumulator,
     object: &K8sObject,
@@ -325,18 +364,22 @@ fn gateway_frontend_tls_sources(
         return GatewayFrontendTlsSelection::None;
     };
     let mut selected: Option<(String, String)> = None;
-    for sources in listeners
+    for listener in listeners
         .iter()
         .filter(|listener| listener_is_terminating_tls(listener))
-        .flat_map(|listener| listener_frontend_tls_sources(acc, object, listener))
     {
-        if selected
-            .as_ref()
-            .is_some_and(|existing| existing != &sources)
-        {
-            return GatewayFrontendTlsSelection::UnsupportedMultiple;
+        let Some(listener_sources) = listener_frontend_tls_sources(acc, object, listener) else {
+            return GatewayFrontendTlsSelection::InvalidCertificateRef;
+        };
+        for sources in listener_sources {
+            if selected
+                .as_ref()
+                .is_some_and(|existing| existing != &sources)
+            {
+                return GatewayFrontendTlsSelection::UnsupportedMultiple;
+            }
+            selected.get_or_insert(sources);
         }
-        selected.get_or_insert(sources);
     }
     selected
         .map(
@@ -367,15 +410,18 @@ fn listener_frontend_tls_sources(
     acc: &K8sAccumulator,
     object: &K8sObject,
     listener: &Value,
-) -> Vec<(String, String)> {
-    listener
+) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for reference in listener
         .get("tls")
         .and_then(|tls| tls.get("certificateRefs"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|reference| gateway_tls_secret_ref(acc, object, reference))
-        .collect()
+    {
+        out.push(gateway_tls_secret_ref(acc, object, reference)?);
+    }
+    Some(out)
 }
 
 fn gateway_tls_secret_ref(
@@ -2380,7 +2426,10 @@ fn gateway_redirect_value_for_match(redirect: &Value, match_entry: &Value) -> Va
 }
 
 fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
-    let path = match_entry.get("path")?.as_object()?;
+    let Some(path) = match_entry.get("path") else {
+        return Some("/");
+    };
+    let path = path.as_object()?;
     if path
         .get("type")
         .and_then(Value::as_str)
@@ -3280,6 +3329,86 @@ mod tests {
             translate_k8s_objects(&[gateway, mismatched], options()).expect("translation succeeds");
         assert_eq!(mismatched_secret.config.frontend_tls_cert_path, None);
         assert_eq!(mismatched_secret.config.frontend_tls_key_path, None);
+    }
+
+    #[test]
+    fn gateway_https_listener_certificate_refs_fail_closed_when_any_ref_is_unresolved() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [
+                            {"name": "gateway-cert"},
+                            {"name": "missing-cert"}
+                        ]
+                    }
+                }]
+            }),
+        );
+        let valid = tls_secret("gateway-cert", "default", true);
+
+        let result = translate_k8s_objects(&[gateway, valid], options())
+            .expect("translation should leave unresolved TLS unmaterialized");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn same_namespace_gateway_tls_conflicts_clear_namespace_frontend_tls() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https-a",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-a"}]}
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+        let mut gateway_b = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https-b",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-b"}]}
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "edge-b".to_string();
+        let cert_a = tls_secret("cert-a", "default", true);
+        let cert_b = tls_secret("cert-b", "default", true);
+
+        let result = translate_k8s_objects(&[gateway_a, cert_a, gateway_b, cert_b], options())
+            .expect("translation should fail closed for namespace TLS conflicts");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("conflicting Gateway TLS sources"))
+        );
     }
 
     #[test]
@@ -5175,6 +5304,45 @@ mod tests {
             .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
             .expect("dispatch plugin should be emitted for redirect");
         let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/");
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_defaults_predicate_only_match_to_root_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{
+                            "headers": [{"name": "x-mode", "value": "preview"}]
+                        }],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                }
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("predicate-only prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let rule = &dispatch.config["rules"][0];
+        assert_eq!(rule["match"]["headers"]["x-mode"], "preview");
+        let redirect = &rule["redirect"];
         assert_eq!(redirect["uri"], "/new");
         assert_eq!(redirect["match_prefix"], "/");
     }

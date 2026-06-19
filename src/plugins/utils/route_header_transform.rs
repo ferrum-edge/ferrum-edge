@@ -148,8 +148,9 @@ pub fn parse_route_header_transforms(
 /// Operations are applied in declaration order so operators get
 /// predictable interleaving (e.g. an `add` after a `remove` reinstates the
 /// header with the new value). `Add` appends with a comma separator when the
-/// header already exists; `Update` is unconditional replace; `Remove` deletes
-/// the entry.
+/// header already exists, except `Set-Cookie`, which uses the proxy's
+/// newline-separated multi-value representation; `Update` is unconditional
+/// replace; `Remove` deletes the entry.
 pub fn apply_route_header_transforms(
     rules: &[RouteHeaderTransformRule],
     headers: &mut HashMap<String, String>,
@@ -164,7 +165,11 @@ pub fn apply_route_header_transforms(
                             if existing.is_empty() {
                                 existing.push_str(value);
                             } else {
-                                existing.push(',');
+                                if rule.key.eq_ignore_ascii_case("set-cookie") {
+                                    existing.push('\n');
+                                } else {
+                                    existing.push(',');
+                                }
                                 existing.push_str(value);
                             }
                         })
@@ -362,6 +367,22 @@ mod tests {
         assert_eq!(
             headers.get("x-trace").map(String::as_str),
             Some("client,from-add")
+        );
+    }
+
+    #[test]
+    fn apply_add_preserves_set_cookie_as_separate_values() {
+        let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(serde_json::json!([
+            {"operation": "add", "target": "header", "key": "Set-Cookie", "value": "route=1; Path=/"},
+        ]))
+        .unwrap();
+        let parsed = parse_route_header_transforms(&raw, "ctx").unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("set-cookie".to_string(), "backend=1; Path=/".to_string());
+        apply_route_header_transforms(&parsed, &mut headers);
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("backend=1; Path=/\nroute=1; Path=/")
         );
     }
 
