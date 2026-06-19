@@ -25,6 +25,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
+use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use uuid::Uuid;
@@ -289,10 +290,10 @@ async fn start_header_echo_backend(
     Ok(handle)
 }
 
-async fn start_slow_counting_backend_on(
+async fn start_blocking_counting_backend_on(
     listener: tokio::net::TcpListener,
     hits: Arc<AtomicUsize>,
-    delay: Duration,
+    release: Arc<Notify>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let handle = tokio::spawn(async move {
         loop {
@@ -300,9 +301,10 @@ async fn start_slow_counting_backend_on(
                 continue;
             };
             let hits = Arc::clone(&hits);
+            let release = Arc::clone(&release);
             tokio::spawn(async move {
                 hits.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(delay).await;
+                release.notified().await;
 
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut buf_reader = tokio::io::BufReader::new(reader);
@@ -1326,10 +1328,11 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
-    let _backend = start_slow_counting_backend_on(
+    let release_backend = Arc::new(Notify::new());
+    let _backend = start_blocking_counting_backend_on(
         backend_listener,
         Arc::clone(&backend_hits),
-        Duration::from_millis(750),
+        Arc::clone(&release_backend),
     )
     .await
     .unwrap();
@@ -1440,6 +1443,7 @@ plugin_configs:
         "peer gateway should see Redis in-flight conflict"
     );
 
+    release_backend.notify_waiters();
     let first = first
         .await
         .expect("first request task panicked")
