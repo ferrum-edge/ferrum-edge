@@ -384,7 +384,7 @@ fn validate_and_normalize_redirect(
     if redirect.is_empty() {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].redirect must set at least one of \
-             'uri' / 'authority' / 'scheme' so the redirect target differs from the request"
+             'uri' / 'authority' / 'port' / 'scheme' so the redirect target differs from the request"
         ));
     }
     if !(300..=399).contains(&redirect.redirect_code) {
@@ -418,6 +418,11 @@ fn validate_and_normalize_redirect(
                 "mesh_route_dispatch.rules[{rule_idx}].redirect.authority must not contain whitespace"
             ));
         }
+    }
+    if redirect.port == Some(0) {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].redirect.port must be in the 1-65535 range"
+        ));
     }
     if let Some(scheme) = redirect.scheme.as_mut() {
         *scheme = scheme.to_ascii_lowercase();
@@ -1098,9 +1103,10 @@ impl RouteRewriteConfig {
 /// rule matches, the plugin short-circuits the dispatch chain with a redirect
 /// response (3xx + `Location`) and the request never reaches a backend.
 ///
-/// At least one of `uri` / `authority` must be present so the redirect target
-/// differs from the request; an empty redirect is rejected at config-load
-/// time. `redirect_code` defaults to 301 and is constrained to the 3xx range.
+/// At least one of `uri` / `authority` / `port` / `scheme` must be present so
+/// the redirect target differs from the request; an empty redirect is rejected
+/// at config-load time. `redirect_code` defaults to 301 and is constrained to
+/// the 3xx range.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RouteRedirectConfig {
     /// Replacement path for the `Location` header. When unset, the request's
@@ -1115,6 +1121,10 @@ pub struct RouteRedirectConfig {
     /// unset, the request's own `Host` / `:authority` is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<String>,
+    /// Replacement authority port for the `Location` header. When `authority`
+    /// is unset this preserves the request host and swaps only the port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// Replacement scheme (`http` / `https`) for the `Location` header. When
     /// unset, the request's own frontend scheme is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1130,7 +1140,10 @@ fn default_redirect_code() -> u16 {
 
 impl RouteRedirectConfig {
     fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.authority.is_none() && self.scheme.is_none()
+        self.uri.is_none()
+            && self.authority.is_none()
+            && self.port.is_none()
+            && self.scheme.is_none()
     }
 }
 
@@ -1715,6 +1728,10 @@ fn build_redirect_response(
             .or_else(|| headers.get(":authority"))
             .map(String::as_str)
     });
+    let authority = authority.map(|authority| match redirect.port {
+        Some(port) => authority_with_port(authority, port),
+        None => authority.to_string(),
+    });
     let path = redirect
         .uri
         .as_deref()
@@ -1751,6 +1768,21 @@ fn build_redirect_response(
         body: String::new(),
         headers: reject_headers,
     }
+}
+
+fn authority_with_port(authority: &str, port: u16) -> String {
+    if let Some(bracketed_end) = authority.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let end = bracketed_end + 1;
+        return format!("{}:{port}", &authority[..=end]);
+    }
+    if authority.matches(':').count() == 1
+        && let Some((host, existing_port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && existing_port.parse::<u16>().is_ok()
+    {
+        return format!("{host}:{port}");
+    }
+    format!("{authority}:{port}")
 }
 
 /// Apply the per-rule fault action when the rule matched. Returns `Some` to
@@ -5202,6 +5234,51 @@ mod tests {
                 assert_eq!(
                     headers.get("location").map(String::as_str),
                     Some("https://site.example.com/keep/me")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_port_preserves_request_host_and_replaces_existing_port() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https", "port": 8443}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        let mut headers =
+            HashMap::from([("host".to_string(), "site.example.com:8080".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com:8443/keep/me")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_port_preserves_bracketed_ipv6_host() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https", "port": 8443}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/v6");
+        let mut headers = HashMap::from([("host".to_string(), "[2001:db8::1]:8080".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://[2001:db8::1]:8443/v6")
                 );
             }
             other => panic!("expected redirect Reject, got {other:?}"),

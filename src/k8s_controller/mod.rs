@@ -112,6 +112,13 @@ pub async fn start_k8s_controller(
         watch_istio: controller_config.watch_istio,
         watch_gateway_api: controller_config.watch_gateway_api,
         watch_core: controller_config.pod_discovery_enabled,
+        watch_gateway_api_data_plane_service: controller_config.watch_gateway_api
+            && controller_config
+                .gateway_api_data_plane_service_namespace
+                .is_some()
+            && controller_config
+                .gateway_api_data_plane_service_name
+                .is_some(),
         watch_node_locality: controller_config.watch_node_locality,
         // Without Istio CRDs there is no Telemetry resource that would
         // consume meshConfig providers, so the configmaps watch and its

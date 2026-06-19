@@ -706,12 +706,27 @@ async fn apply_frontend_tls_snapshot(
     config: &GatewayConfig,
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    cp_frontend_tls_materialized: &mut bool,
 ) -> Result<(), anyhow::Error> {
     match (
         config.frontend_tls_cert_path.as_deref(),
         config.frontend_tls_key_path.as_deref(),
     ) {
-        (None, None) => Ok(()),
+        (None, None) => {
+            if *cp_frontend_tls_materialized && let Some(slot) = frontend_tls_slot {
+                let had_tls = slot.load_full().as_ref().is_some();
+                slot.store(Arc::new(None));
+                proxy_state
+                    .stream_listener_manager
+                    .set_frontend_tls_config(None)
+                    .await;
+                if had_tls {
+                    info!("Cleared CP-delivered Gateway frontend TLS material");
+                }
+            }
+            *cp_frontend_tls_materialized = false;
+            Ok(())
+        }
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!(
                 "frontend TLS config must include both frontend_tls_cert_path and frontend_tls_key_path"
@@ -762,6 +777,7 @@ async fn apply_frontend_tls_snapshot(
                 .stream_listener_manager
                 .set_frontend_tls_config(Some(tls_config))
                 .await;
+            *cp_frontend_tls_materialized = true;
             info!(
                 cert_source = %cert_path,
                 "Applied CP-delivered Gateway frontend TLS material"
@@ -877,6 +893,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
     let mut stream = client.subscribe(request).await?.into_inner();
     let mut initial_snapshot_applied = startup_ready.is_none();
+    let mut cp_frontend_tls_materialized = false;
 
     // Mark connected
     if let Some(cs) = connection_state {
@@ -1011,9 +1028,13 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             );
                             continue;
                         }
-                        if let Err(error) =
-                            apply_frontend_tls_snapshot(&config, proxy_state, frontend_tls_slot)
-                                .await
+                        if let Err(error) = apply_frontend_tls_snapshot(
+                            &config,
+                            proxy_state,
+                            frontend_tls_slot,
+                            &mut cp_frontend_tls_materialized,
+                        )
+                        .await
                         {
                             error!("CP config rejected — {}", error);
                             error!("Ignoring config update with unusable frontend TLS material");

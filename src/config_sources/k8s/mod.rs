@@ -424,6 +424,10 @@ impl K8sAccumulator {
         core::endpoint_route_backends_for_service(self, namespace, service, service_port, weight)
     }
 
+    pub(crate) fn secret_is_valid_tls_certificate(&self, namespace: &str, name: &str) -> bool {
+        core::secret_is_valid_tls_certificate(self, namespace, name)
+    }
+
     fn observe_namespace(&mut self, namespace: &str) {
         self.known_namespaces.insert(namespace.to_string());
     }
@@ -650,6 +654,8 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
+        } else if object.kind == "Secret" {
+            core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
         } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {

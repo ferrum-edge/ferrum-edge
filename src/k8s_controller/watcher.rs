@@ -38,6 +38,7 @@ pub struct WatcherSelection {
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
     pub watch_core: bool,
+    pub watch_gateway_api_data_plane_service: bool,
     pub watch_node_locality: bool,
     pub watch_mesh_config: bool,
 }
@@ -229,6 +230,15 @@ pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     version: "v1",
     kind: "Secret",
     plural: "secrets",
+    namespaced: true,
+    field_selector: None,
+}];
+
+pub const GATEWAY_API_DATA_PLANE_STATUS_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "discovery.k8s.io",
+    version: "v1",
+    kind: "EndpointSlice",
+    plural: "endpointslices",
     namespaced: true,
     field_selector: None,
 }];
@@ -541,6 +551,13 @@ pub async fn start_crd_watchers(
                 .map(|resource| (resource, namespaces.clone())),
         );
     }
+    if selection.watch_gateway_api_data_plane_service {
+        core_watch_plan.extend(
+            GATEWAY_API_DATA_PLANE_STATUS_RESOURCES
+                .iter()
+                .map(|resource| (resource, namespaces.clone())),
+        );
+    }
     if selection.watch_mesh_config {
         core_watch_plan.extend(
             ISTIO_MESH_CONFIG_RESOURCES
@@ -825,6 +842,16 @@ mod tests {
         assert!(locality_kinds.contains("Pod"));
         assert!(locality_kinds.contains("Service"));
         assert!(locality_kinds.contains("EndpointSlice"));
+    }
+
+    #[test]
+    fn gateway_api_data_plane_status_resources_watch_endpoint_slices() {
+        let kinds: HashSet<&str> = GATEWAY_API_DATA_PLANE_STATUS_RESOURCES
+            .iter()
+            .map(|resource| resource.kind)
+            .collect();
+
+        assert_eq!(kinds, HashSet::from(["EndpointSlice"]));
     }
 
     #[test]

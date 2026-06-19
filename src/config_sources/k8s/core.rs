@@ -16,6 +16,7 @@ use super::{
 #[derive(Debug, Default)]
 pub(super) struct CoreState {
     services: HashMap<K8sServiceKey, CoreService>,
+    secrets: HashMap<K8sServiceKey, CoreSecret>,
     pods: HashMap<PodKey, CorePod>,
     pod_by_ip: HashMap<String, PodKey>,
     endpoint_slices: Vec<CoreEndpointSlice>,
@@ -47,6 +48,11 @@ struct CoreService {
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
     cluster_ips: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CoreSecret {
+    valid_tls_certificate: bool,
 }
 
 #[derive(Debug)]
@@ -103,6 +109,10 @@ pub(super) fn collect(
 ) -> Result<(), K8sTranslateError> {
     match object.kind.as_str() {
         "Service" => collect_service(acc, object),
+        "Secret" => {
+            collect_secret(acc, object);
+            Ok(())
+        }
         "Pod" => {
             collect_pod(acc, object);
             Ok(())
@@ -370,6 +380,69 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
         ports,
         endpoints,
     });
+}
+
+pub(super) fn secret_is_valid_tls_certificate(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .is_some_and(|secret| secret.valid_tls_certificate)
+}
+
+fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let Some(key) = K8sServiceKey::new(
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    ) else {
+        return;
+    };
+    acc.core.secrets.insert(
+        key,
+        CoreSecret {
+            valid_tls_certificate: secret_object_is_valid_tls_certificate(object),
+        },
+    );
+}
+
+fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
+    if secret.spec.get("type").and_then(Value::as_str) != Some("kubernetes.io/tls") {
+        return false;
+    }
+    let Some(data) = secret.spec.get("data").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(cert) = data.get("tls.crt").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(key) = data.get("tls.key").and_then(Value::as_str) else {
+        return false;
+    };
+    secret_data_decodes_to_certificate_pem(cert) && secret_data_decodes_to_private_key_pem(key)
+}
+
+fn secret_data_decodes_to_certificate_pem(value: &str) -> bool {
+    secret_data_decodes_to_utf8(value, |pem| pem.contains("-----BEGIN CERTIFICATE-----"))
+}
+
+fn secret_data_decodes_to_private_key_pem(value: &str) -> bool {
+    secret_data_decodes_to_utf8(value, |pem| {
+        pem.contains("-----BEGIN ") && pem.contains("PRIVATE KEY-----")
+    })
+}
+
+fn secret_data_decodes_to_utf8(value: &str, predicate: impl FnOnce(&str) -> bool) -> bool {
+    use base64::Engine as _;
+
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        return false;
+    };
+    let Ok(pem) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    predicate(pem)
 }
 
 pub(super) fn endpoint_route_backends_for_service(

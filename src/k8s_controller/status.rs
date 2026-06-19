@@ -2,7 +2,7 @@ use futures_util::StreamExt;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 use crate::config_sources::k8s::{
@@ -606,6 +606,8 @@ fn gateway_listener_statuses(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("listener");
+            let existing_listener_conditions =
+                existing_listener_status(gateway, listener_name).and_then(existing_conditions);
             let protocol = listener
                 .get("protocol")
                 .and_then(Value::as_str)
@@ -624,9 +626,9 @@ fn gateway_listener_statuses(
                 references.message
             };
             let conditions = vec![
-                condition(
+                condition_at(
                     gateway,
-                    &gateway.status,
+                    existing_listener_conditions,
                     "Accepted",
                     accepted,
                     if accepted {
@@ -640,9 +642,9 @@ fn gateway_listener_statuses(
                         "Ferrum does not support this listener protocol"
                     },
                 ),
-                condition(
+                condition_at(
                     gateway,
-                    &gateway.status,
+                    existing_listener_conditions,
                     "ResolvedRefs",
                     resolved_refs,
                     if resolved_refs {
@@ -660,9 +662,9 @@ fn gateway_listener_statuses(
                         "Ferrum could not resolve this listener"
                     },
                 ),
-                condition(
+                condition_at(
                     gateway,
-                    &gateway.status,
+                    existing_listener_conditions,
                     "Programmed",
                     gateway_programmed && resolved_refs,
                     if gateway_programmed && resolved_refs {
@@ -684,9 +686,9 @@ fn gateway_listener_statuses(
                         "Ferrum did not program this listener"
                     },
                 ),
-                condition(
+                condition_at(
                     gateway,
-                    &gateway.status,
+                    existing_listener_conditions,
                     "Conflicted",
                     false,
                     "NoConflicts",
@@ -701,6 +703,15 @@ fn gateway_listener_statuses(
             })
         })
         .collect()
+}
+
+fn existing_listener_status<'a>(gateway: &'a K8sObject, listener_name: &str) -> Option<&'a Value> {
+    gateway
+        .status
+        .get("listeners")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|listener| listener.get("name").and_then(Value::as_str) == Some(listener_name))
 }
 
 fn listener_route_kind_status(protocol: &str, listener: &Value) -> ListenerRouteKindStatus {
@@ -839,20 +850,17 @@ fn route_allowed_by_listener(
 }
 
 fn namespace_matches_selector(objects: &[K8sObject], namespace: &str, namespaces: &Value) -> bool {
-    let Some(match_labels) = namespaces
-        .get("selector")
-        .and_then(|selector| selector.get("matchLabels"))
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
     let Some(namespace_object) = objects
         .iter()
         .find(|object| object.kind == "Namespace" && object.metadata.name == namespace)
     else {
         return false;
     };
-    match_labels.iter().all(|(key, value)| {
+    let selector = namespaces.get("selector");
+    let match_labels = selector
+        .and_then(|selector| selector.get("matchLabels"))
+        .and_then(Value::as_object);
+    let labels_match = match_labels.into_iter().flatten().all(|(key, value)| {
         value.as_str().is_some_and(|expected| {
             namespace_object
                 .metadata
@@ -860,7 +868,48 @@ fn namespace_matches_selector(objects: &[K8sObject], namespace: &str, namespaces
                 .get(key)
                 .is_some_and(|actual| actual == expected)
         })
-    })
+    });
+    if !labels_match {
+        return false;
+    }
+    selector
+        .and_then(|selector| selector.get("matchExpressions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .all(|expression| {
+            namespace_selector_expression_matches(&namespace_object.metadata.labels, expression)
+        })
+}
+
+fn namespace_selector_expression_matches(
+    labels: &HashMap<String, String>,
+    expression: &Value,
+) -> bool {
+    let Some(key) = expression.get("key").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(operator) = expression.get("operator").and_then(Value::as_str) else {
+        return false;
+    };
+    let values: Vec<&str> = expression
+        .get("values")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    match operator {
+        "In" => labels
+            .get(key)
+            .is_some_and(|actual| values.iter().any(|expected| *expected == actual)),
+        "NotIn" => labels
+            .get(key)
+            .is_none_or(|actual| !values.iter().any(|expected| *expected == actual)),
+        "Exists" => labels.contains_key(key),
+        "DoesNotExist" => !labels.contains_key(key),
+        _ => false,
+    }
 }
 
 fn route_intersects_listener_hostname(route: &K8sObject, listener: &Value) -> bool {
@@ -2070,6 +2119,17 @@ mod tests {
         )
     }
 
+    fn namespace(name: &str, labels: &[(&str, &str)]) -> K8sObject {
+        let mut namespace = object("Namespace", name, json!({}));
+        namespace.api_version = "v1".to_string();
+        namespace.metadata.namespace = String::new();
+        namespace.metadata.labels = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        namespace
+    }
+
     fn update_for<'a>(
         updates: &'a [GatewayApiStatusUpdate],
         kind: &str,
@@ -2219,6 +2279,36 @@ mod tests {
         assert_condition(conditions, "ResolvedRefs", "True");
         assert_condition(conditions, "Programmed", "True");
         assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
+    fn gateway_listener_status_preserves_unchanged_listener_condition_transition_time() {
+        let gateway_class = ferrum_gateway_class();
+        let mut gateway = ferrum_gateway("edge");
+        gateway.status = json!({
+            "listeners": [{
+                "name": "http",
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "observedGeneration": 7,
+                    "reason": "Accepted",
+                    "message": "Ferrum accepted this listener",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }]
+            }]
+        });
+
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listeners = gateway_update.status["listeners"].as_array().unwrap();
+        let listener = listener_status_by_name(listeners, "http");
+        let conditions = listener["conditions"].as_array().unwrap();
+        assert_eq!(
+            find_condition(conditions, "Accepted")["lastTransitionTime"].as_str(),
+            Some("2026-01-01T00:00:00Z")
+        );
     }
 
     #[test]
@@ -2461,6 +2551,115 @@ mod tests {
             Some("NoMatchingListenerHostname")
         );
         assert_condition(conditions, "Programmed", "False");
+    }
+
+    #[test]
+    fn gateway_listener_namespace_selector_empty_selector_matches_all_namespaces() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {
+                            "from": "Selector",
+                            "selector": {}
+                        }
+                    }
+                }]
+            }),
+        );
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge", "namespace": "default"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        route.metadata.namespace = "tenant-a".to_string();
+        let tenant = namespace("tenant-a", &[]);
+
+        let updates = plan_status_updates(&[gateway_class, gateway, tenant, route], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listeners = gateway_update.status["listeners"].as_array().unwrap();
+        assert_eq!(
+            listener_status_by_name(listeners, "http")["attachedRoutes"].as_u64(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn gateway_listener_namespace_selector_matches_expressions_without_match_labels() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {
+                            "from": "Selector",
+                            "selector": {
+                                "matchExpressions": [
+                                    {"key": "env", "operator": "In", "values": ["prod"]},
+                                    {"key": "team", "operator": "Exists"}
+                                ]
+                            }
+                        }
+                    }
+                }]
+            }),
+        );
+        let mut selected_route = object(
+            "HTTPRoute",
+            "selected",
+            json!({
+                "parentRefs": [{"name": "edge", "namespace": "default"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        selected_route.metadata.namespace = "selected".to_string();
+        let mut rejected_route = object(
+            "HTTPRoute",
+            "rejected",
+            json!({
+                "parentRefs": [{"name": "edge", "namespace": "default"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        rejected_route.metadata.namespace = "rejected".to_string();
+        let selected_namespace = namespace("selected", &[("env", "prod"), ("team", "payments")]);
+        let rejected_namespace = namespace("rejected", &[("env", "dev"), ("team", "payments")]);
+
+        let updates = plan_status_updates(
+            &[
+                gateway_class,
+                gateway,
+                selected_namespace,
+                rejected_namespace,
+                selected_route,
+                rejected_route,
+            ],
+            options(),
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listeners = gateway_update.status["listeners"].as_array().unwrap();
+        assert_eq!(
+            listener_status_by_name(listeners, "http")["attachedRoutes"].as_u64(),
+            Some(1)
+        );
     }
 
     #[test]

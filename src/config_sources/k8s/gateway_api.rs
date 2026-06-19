@@ -93,6 +93,14 @@ struct RouteBackendResolution {
     valid_weight: u32,
 }
 
+struct RouteBackendGroup {
+    total_weight: u32,
+    backends: Vec<RouteBackend>,
+    expanded_endpoints: bool,
+}
+
+const GATEWAY_API_BACKEND_WEIGHT_SCALE: u32 = 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GatewayApiDispatchRulePrecedence {
     has_precedence: bool,
@@ -324,6 +332,9 @@ fn gateway_tls_secret_ref(
             Some(name),
         )
     {
+        return None;
+    }
+    if !acc.secret_is_valid_tls_certificate(namespace, name) {
         return None;
     }
     Some((
@@ -2133,13 +2144,14 @@ fn gateway_request_redirect_value(
             out.insert("scheme".to_string(), Value::String(scheme.to_string()));
         }
 
+        let redirect_port = gateway_redirect_port(object, redirect)?;
         let authority = redirect
             .get("hostname")
             .and_then(Value::as_str)
             .and_then(|host| {
                 if host.is_empty() {
                     None
-                } else if let Some(port) = redirect.get("port").and_then(Value::as_u64) {
+                } else if let Some(port) = redirect_port {
                     Some(format!("{host}:{port}"))
                 } else {
                     Some(host.to_string())
@@ -2147,6 +2159,8 @@ fn gateway_request_redirect_value(
             });
         if let Some(authority) = authority {
             out.insert("authority".to_string(), Value::String(authority));
+        } else if let Some(port) = redirect_port {
+            out.insert("port".to_string(), serde_json::json!(port));
         }
 
         if let Some((path, replace_prefix_match)) = gateway_redirect_path(redirect) {
@@ -2186,6 +2200,28 @@ fn gateway_request_redirect_value(
     }
 
     Ok(None)
+}
+
+fn gateway_redirect_port(
+    object: &K8sObject,
+    redirect: &serde_json::Map<String, Value>,
+) -> Result<Option<u16>, K8sTranslateError> {
+    let Some(port) = redirect.get("port") else {
+        return Ok(None);
+    };
+    let Some(port) = port.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            "HTTPRoute RequestRedirect port must be an integer in the 1-65535 range",
+        ));
+    };
+    if port == 0 || port > u64::from(u16::MAX) {
+        return Err(invalid_resource(
+            object,
+            "HTTPRoute RequestRedirect port must be in the 1-65535 range",
+        ));
+    }
+    Ok(Some(port as u16))
 }
 
 fn gateway_redirect_path(redirect: &serde_json::Map<String, Value>) -> Option<(&str, bool)> {
@@ -2390,7 +2426,7 @@ fn route_backends(
     rule: &Value,
     acc: &mut K8sAccumulator,
 ) -> Result<RouteBackendResolution, K8sTranslateError> {
-    let mut backends = Vec::new();
+    let mut backend_groups = Vec::new();
     let mut invalid = None;
     let mut invalid_weight = 0u32;
     let mut valid_weight = 0u32;
@@ -2439,19 +2475,28 @@ fn route_backends(
             weight,
         );
         if !endpoint_backends.is_empty() {
-            backends.extend(endpoint_backends);
+            backend_groups.push(RouteBackendGroup {
+                total_weight: weight,
+                expanded_endpoints: endpoint_backends.len() > 1,
+                backends: endpoint_backends,
+            });
             continue;
         }
-        backends.push(RouteBackend {
-            host: service_dns_name(
-                backend_name,
-                &backend_namespace,
-                &acc.options.cluster_domain,
-            ),
-            port: backend_port,
-            weight,
+        backend_groups.push(RouteBackendGroup {
+            total_weight: weight,
+            expanded_endpoints: false,
+            backends: vec![RouteBackend {
+                host: service_dns_name(
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                port: backend_port,
+                weight,
+            }],
         });
     }
+    let backends = flatten_route_backend_groups(backend_groups);
     if skipped_zero > 0 {
         if backends.is_empty() {
             acc.warnings.push(format!(
@@ -2477,6 +2522,57 @@ fn route_backends(
         invalid_weight,
         valid_weight,
     })
+}
+
+fn flatten_route_backend_groups(groups: Vec<RouteBackendGroup>) -> Vec<RouteBackend> {
+    let has_expanded_endpoint_group = groups.iter().any(|group| group.expanded_endpoints);
+    if !has_expanded_endpoint_group {
+        return groups
+            .into_iter()
+            .flat_map(|group| group.backends)
+            .collect();
+    }
+
+    let max_group_targets = groups
+        .iter()
+        .map(|group| group.backends.len())
+        .max()
+        .unwrap_or(1);
+    let scale = GATEWAY_API_BACKEND_WEIGHT_SCALE
+        .max(u32::try_from(max_group_targets).unwrap_or(u32::MAX).max(1));
+    let mut flattened = Vec::new();
+    for group in groups {
+        let total_weight = scaled_backend_weight(group.total_weight, scale);
+        if group.expanded_endpoints {
+            let len = group.backends.len();
+            for (index, mut backend) in group.backends.into_iter().enumerate() {
+                backend.weight = distributed_backend_weight(total_weight, len, index);
+                flattened.push(backend);
+            }
+        } else {
+            for mut backend in group.backends {
+                backend.weight = total_weight;
+                flattened.push(backend);
+            }
+        }
+    }
+    flattened
+}
+
+fn scaled_backend_weight(weight: u32, scale: u32) -> u32 {
+    u32::try_from(u64::from(weight).saturating_mul(u64::from(scale))).unwrap_or(u32::MAX)
+}
+
+fn distributed_backend_weight(total_weight: u32, count: usize, index: usize) -> u32 {
+    let Ok(count) = u32::try_from(count) else {
+        return 1;
+    };
+    if count == 0 {
+        return total_weight;
+    }
+    let base = total_weight / count;
+    let remainder = total_weight % count;
+    base + u32::from(u32::try_from(index).is_ok_and(|idx| idx < remainder))
 }
 
 fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
@@ -2768,6 +2864,33 @@ mod tests {
         }
     }
 
+    fn tls_secret(name: &str, namespace: &str, valid: bool) -> K8sObject {
+        use base64::Engine as _;
+
+        let (cert, key) = if valid {
+            (
+                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n",
+            )
+        } else {
+            ("Hello world", "Hello world")
+        };
+        let mut secret = object_in_namespace(
+            "Secret",
+            namespace,
+            serde_json::json!({
+                "type": "kubernetes.io/tls",
+                "data": {
+                    "tls.crt": base64::engine::general_purpose::STANDARD.encode(cert),
+                    "tls.key": base64::engine::general_purpose::STANDARD.encode(key),
+                }
+            }),
+        );
+        secret.api_version = "v1".to_string();
+        secret.metadata.name = name.to_string();
+        secret
+    }
+
     #[test]
     fn gateway_https_listener_certificate_ref_sets_frontend_tls_sources() {
         let gateway = object(
@@ -2787,7 +2910,9 @@ mod tests {
             }),
         );
 
-        let result = translate_k8s_objects(&[gateway], options()).expect("translation succeeds");
+        let secret = tls_secret("gateway-cert", "default", true);
+        let result =
+            translate_k8s_objects(&[gateway, secret], options()).expect("translation succeeds");
         assert_eq!(
             result.config.frontend_tls_cert_path.as_deref(),
             Some("k8s://default/gateway-cert#tls.crt")
@@ -2800,6 +2925,37 @@ mod tests {
             result.config.frontend_tls_source_namespace.as_deref(),
             Some("default")
         );
+    }
+
+    #[test]
+    fn gateway_https_listener_certificate_ref_requires_observed_valid_secret() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "gateway-cert"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let malformed = tls_secret("gateway-cert", "default", false);
+
+        let missing_secret = translate_k8s_objects(std::slice::from_ref(&gateway), options())
+            .expect("translation succeeds");
+        assert_eq!(missing_secret.config.frontend_tls_cert_path, None);
+        assert_eq!(missing_secret.config.frontend_tls_key_path, None);
+
+        let malformed_secret =
+            translate_k8s_objects(&[gateway, malformed], options()).expect("translation succeeds");
+        assert_eq!(malformed_secret.config.frontend_tls_cert_path, None);
+        assert_eq!(malformed_secret.config.frontend_tls_key_path, None);
     }
 
     #[test]
@@ -2837,13 +2993,14 @@ mod tests {
                 }]
             }),
         );
+        let secret = tls_secret("gateway-cert", "certs", true);
 
         let without_grant = translate_k8s_objects(std::slice::from_ref(&gateway), options())
             .expect("translation succeeds");
         assert_eq!(without_grant.config.frontend_tls_cert_path, None);
 
         let with_grant = translate_k8s_objects(
-            &[gateway, grant],
+            &[gateway, grant, secret],
             options().with_source_namespaces(vec!["default".to_string(), "certs".to_string()]),
         )
         .expect("translation succeeds");
@@ -3739,6 +3896,82 @@ mod tests {
     }
 
     #[test]
+    fn http_route_endpoint_expansion_preserves_backend_ref_weight_totals() {
+        let manual = core_service(
+            "manual",
+            serde_json::json!({
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let manual_slice = endpoint_slice_for_service(
+            "manual",
+            vec![
+                serde_json::json!({
+                    "addresses": ["10.1.0.21"],
+                    "conditions": {"ready": true}
+                }),
+                serde_json::json!({
+                    "addresses": ["10.1.0.22"],
+                    "conditions": {"ready": true}
+                }),
+            ],
+        );
+        let direct = core_service(
+            "direct",
+            serde_json::json!({
+                "clusterIP": "10.96.0.20",
+                "selector": {"app": "direct"},
+                "ports": [{"port": 8080}]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/weighted"}}],
+                    "backendRefs": [
+                        {"name": "manual", "port": 8080, "weight": 1},
+                        {"name": "direct", "port": 8080, "weight": 1}
+                    ]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[manual, manual_slice, direct, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("mixed endpoint and service backends should translate");
+
+        let upstream = result.config.upstreams.first().expect("weighted upstream");
+        assert_eq!(upstream.targets.len(), 3);
+        let expanded_total: u32 = upstream
+            .targets
+            .iter()
+            .filter(|target| target.host.starts_with("10.1.0."))
+            .map(|target| target.weight)
+            .sum();
+        let direct_weight = upstream
+            .targets
+            .iter()
+            .find(|target| target.host == "direct.default.svc.cluster.local")
+            .map(|target| target.weight)
+            .expect("direct service target");
+        assert_eq!(expanded_total, direct_weight);
+        assert!(
+            upstream
+                .targets
+                .iter()
+                .filter(|target| target.host.starts_with("10.1.0."))
+                .all(|target| target.weight > 0)
+        );
+    }
+
+    #[test]
     fn http_route_creates_proxy_per_match() {
         let result = translate_k8s_objects(
             &[object(
@@ -4004,6 +4237,45 @@ mod tests {
         let redirect = &dispatch.config["rules"][0]["redirect"];
         assert_eq!(redirect["authority"], "example.org");
         assert_eq!(redirect["redirect_code"], 302);
+    }
+
+    #[test]
+    fn http_route_request_redirect_port_without_hostname_preserves_request_host() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "scheme": "https",
+                                "port": 8443,
+                                "statusCode": 301
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["scheme"], "https");
+        assert_eq!(redirect["port"], 8443);
+        assert_eq!(redirect["redirect_code"], 301);
+        assert!(
+            redirect.get("authority").is_none(),
+            "port-only redirect must preserve the request host at the DP"
+        );
     }
 
     #[test]
