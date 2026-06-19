@@ -1323,12 +1323,10 @@ mod tests {
         let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
         let mut last_poll_at = Some(previous_poll_at);
         let mut known_proxy_ids: HashSet<String> = HashSet::from(["stale-proxy".to_string()]);
-        let mut known_consumer_ids: HashSet<String> =
-            HashSet::from(["stale-consumer".to_string()]);
+        let mut known_consumer_ids: HashSet<String> = HashSet::from(["stale-consumer".to_string()]);
         let mut known_plugin_config_ids: HashSet<String> =
             HashSet::from(["stale-plugin".to_string()]);
-        let mut known_upstream_ids: HashSet<String> =
-            HashSet::from(["stale-upstream".to_string()]);
+        let mut known_upstream_ids: HashSet<String> = HashSet::from(["stale-upstream".to_string()]);
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
@@ -1356,8 +1354,7 @@ mod tests {
         let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
         let mut last_poll_at = Some(previous_poll_at);
         let mut known_proxy_ids: HashSet<String> = HashSet::from(["proxy-a".to_string()]);
-        let mut known_consumer_ids: HashSet<String> =
-            HashSet::from(["consumer-a".to_string()]);
+        let mut known_consumer_ids: HashSet<String> = HashSet::from(["consumer-a".to_string()]);
         let mut known_plugin_config_ids: HashSet<String> = HashSet::from(["plugin-a".to_string()]);
         let mut known_upstream_ids: HashSet<String> = HashSet::from(["upstream-a".to_string()]);
 
@@ -1376,12 +1373,18 @@ mod tests {
 
         assert!(!accepted);
         assert_eq!(known_proxy_ids, HashSet::from(["proxy-a".to_string()]));
-        assert_eq!(known_consumer_ids, HashSet::from(["consumer-a".to_string()]));
+        assert_eq!(
+            known_consumer_ids,
+            HashSet::from(["consumer-a".to_string()])
+        );
         assert_eq!(
             known_plugin_config_ids,
             HashSet::from(["plugin-a".to_string()])
         );
-        assert_eq!(known_upstream_ids, HashSet::from(["upstream-a".to_string()]));
+        assert_eq!(
+            known_upstream_ids,
+            HashSet::from(["upstream-a".to_string()])
+        );
         assert_eq!(last_poll_at, Some(previous_poll_at));
     }
 

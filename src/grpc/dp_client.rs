@@ -1061,7 +1061,9 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 }
                                 if !was_empty {
                                     update_state_config_received(connection_state);
-                                    debug!("Incremental config delta from CP was valid but unchanged");
+                                    debug!(
+                                        "Incremental config delta from CP was valid but unchanged"
+                                    );
                                     continue;
                                 }
                                 // Empty delta — preserve original behavior of not
