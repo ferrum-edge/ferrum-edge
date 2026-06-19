@@ -162,8 +162,11 @@ async fn incremental_association_query_failure_rejects_delta() {
     let known_proxy_ids: HashSet<String> = baseline.proxies.iter().map(|p| p.id.clone()).collect();
     let known_consumer_ids: HashSet<String> =
         baseline.consumers.iter().map(|c| c.id.clone()).collect();
-    let known_plugin_config_ids: HashSet<String> =
-        baseline.plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+    let known_plugin_config_ids: HashSet<String> = baseline
+        .plugin_configs
+        .iter()
+        .map(|pc| pc.id.clone())
+        .collect();
     let known_upstream_ids: HashSet<String> =
         baseline.upstreams.iter().map(|u| u.id.clone()).collect();
 

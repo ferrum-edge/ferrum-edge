@@ -890,12 +890,10 @@ impl DatabaseStore {
         namespace: &str,
         operation: &str,
     ) -> Result<ProxyPluginAssociations, anyhow::Error> {
-        let sql = self.q(
-            "SELECT pp.proxy_id, pp.plugin_config_id \
+        let sql = self.q("SELECT pp.proxy_id, pp.plugin_config_id \
              FROM proxy_plugins pp \
              INNER JOIN proxies p ON pp.proxy_id = p.id \
-             WHERE p.namespace = ?",
-        );
+             WHERE p.namespace = ?");
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
             .fetch_all(&self.rpool())
@@ -1112,10 +1110,7 @@ impl DatabaseStore {
             }
             offset += self.full_load_page_size;
         }
-        Self::ensure_no_unmatched_proxy_plugin_associations(
-            "load_full_config",
-            &plugins_by_proxy,
-        )?;
+        Self::ensure_no_unmatched_proxy_plugin_associations("load_full_config", &plugins_by_proxy)?;
 
         self.check_slow_query("load_proxies", start);
         Ok(proxies)
@@ -2040,11 +2035,8 @@ impl DatabaseStore {
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
             let mut proxy = row_to_proxy(&row, id, plugins)?;
             proxy.normalize_fields();
-            self.reject_invalid_loaded_proxy_plugin_associations(
-                "list_proxies_paginated",
-                &proxy,
-            )
-            .await?;
+            self.reject_invalid_loaded_proxy_plugin_associations("list_proxies_paginated", &proxy)
+                .await?;
             proxies.push(proxy);
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(
