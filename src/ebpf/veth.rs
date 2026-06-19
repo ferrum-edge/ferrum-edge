@@ -77,7 +77,8 @@ fn discover_veth_from_cgroup(cgroup_path: &str) -> Option<String> {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+            if descend {
                 dirs.push(entry.path());
             }
         }
