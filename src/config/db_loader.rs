@@ -976,7 +976,7 @@ impl DatabaseStore {
         proxy: &Proxy,
     ) -> Result<(), anyhow::Error> {
         let errors = self
-            .validate_proxy_plugin_associations(&proxy.id, &proxy.namespace, &proxy.plugins)
+            .validate_loaded_proxy_plugin_associations(&proxy.id, &proxy.namespace, &proxy.plugins)
             .await?;
         if errors.is_empty() {
             return Ok(());
@@ -1003,6 +1003,60 @@ impl DatabaseStore {
             ));
         }
         Ok(())
+    }
+
+    async fn validate_loaded_proxy_plugin_associations(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+        associations: &[PluginAssociation],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        if associations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested_ids = Vec::with_capacity(associations.len());
+        let mut seen_assoc_ids: HashSet<&str> = HashSet::new();
+        let mut errors = Vec::new();
+
+        for assoc in associations {
+            if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
+                errors.push(format!(
+                    "Proxy '{}' references plugin_config '{}' more than once",
+                    proxy_id, assoc.plugin_config_id
+                ));
+            } else {
+                requested_ids.push(assoc.plugin_config_id.clone());
+            }
+        }
+
+        let plugin_refs = self
+            .load_plugin_config_refs(&requested_ids, namespace)
+            .await?;
+
+        for assoc in associations {
+            match plugin_refs.get(assoc.plugin_config_id.as_str()) {
+                Some(plugin) => match plugin.scope {
+                    PluginScope::Global | PluginScope::ProxyGroup => {}
+                    PluginScope::Proxy => {
+                        if plugin.proxy_id.as_deref() != Some(proxy_id) {
+                            errors.push(format!(
+                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                proxy_id,
+                                plugin.id,
+                                plugin.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
+                    }
+                },
+                None => errors.push(format!(
+                    "Proxy '{}' references non-existent plugin_config '{}'",
+                    proxy_id, assoc.plugin_config_id
+                )),
+            }
+        }
+
+        Ok(errors)
     }
 
     /// Load the full gateway configuration from the database.
