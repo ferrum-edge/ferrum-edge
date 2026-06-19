@@ -880,7 +880,11 @@ async fn test_transform_response_body_rechecks_no_transform_before_compressing()
     resp_headers.insert("cache-control".to_string(), "no-transform".to_string());
 
     let result = plugin
-        .transform_response_body(b"compressible body", Some("application/json"), &resp_headers)
+        .transform_response_body(
+            b"compressible body",
+            Some("application/json"),
+            &resp_headers,
+        )
         .await;
 
     assert!(result.is_none());
