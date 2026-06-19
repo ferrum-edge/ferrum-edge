@@ -1455,6 +1455,7 @@ plugin_configs:
     let client = reqwest::Client::new();
     let body = r#"{"order":1}"#;
     let idempotency_key = "shared-order-key";
+    let authority = "orders.example";
     let url1 = format!("http://127.0.0.1:{port1}/shared-dedup/orders");
     let url2 = format!("http://127.0.0.1:{port2}/shared-dedup/orders");
 
@@ -1466,6 +1467,7 @@ plugin_configs:
         first_client
             .post(&first_url)
             .header("Idempotency-Key", first_key)
+            .header("Host", authority)
             .header("Content-Type", "application/json")
             .body(first_body)
             .send()
@@ -1491,6 +1493,7 @@ plugin_configs:
     let second = client
         .post(&url2)
         .header("Idempotency-Key", idempotency_key)
+        .header("Host", authority)
         .header("Content-Type", "application/json")
         .body(body)
         .send()
@@ -1517,6 +1520,7 @@ plugin_configs:
     let replay = client
         .post(&url2)
         .header("Idempotency-Key", idempotency_key)
+        .header("Host", authority)
         .header("Content-Type", "application/json")
         .body(body)
         .send()
