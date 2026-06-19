@@ -297,6 +297,8 @@ The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PO
 
 `FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. If either bind signal is set, the configured `FERRUM_ADMIN_BIND_ADDRESS` (default `0.0.0.0`) is honored as-is. When the loopback fallback engages, the gateway emits a `warn!` at startup pointing at the two escape hatches. For node-agent deployments scraped over the cluster network, prefer either an explicit `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist or front the listener with a local sidecar scraper bound to loopback.
 
+When ambient NodeWaypoint and the node agent run on the same host-network nodes, their admin listeners must use distinct `FERRUM_ADMIN_HTTP_PORT` values or one listener must be disabled with port `0`. The Helm chart rejects equal host-network admin ports because Kubernetes can otherwise mark pods Ready even though one Ferrum process failed to bind its admin listener.
+
 ## CNI plugin install (optional)
 
 The node-agent's default enrollment path is the kube-rs pod watcher: it polls the Kubernetes API for pods scheduled to its node and reconciles BPF attachment from the resulting label/annotation snapshots. That works but races kubelet — a freshly-scheduled pod may complete its CNI sandbox setup, attach a network namespace, and start sending traffic *before* the watcher has seen the `Apply` event. During that window outbound traffic is not yet routed through Ferrum's eBPF redirect.

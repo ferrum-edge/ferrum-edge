@@ -6,6 +6,14 @@
 {{- $nodeWaypointRegistryEnabled := eq (lower $ambientTopology) "node_waypoint" -}}
 {{- $nodeAgentProxyMode := lower (toString .Values.nodeAgent.proxyMode) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
+{{- $ambientAdminPort := "9000" -}}
+{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
+{{- $ambientAdminPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTP_PORT") -}}
+{{- end -}}
+{{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
+{{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
+{{- end -}}
 {{- if $nodeWaypointRegistryEnabled -}}
 {{- if not .Values.nodeAgent.enabled -}}
 {{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.enabled=true" -}}
