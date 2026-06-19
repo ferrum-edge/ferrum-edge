@@ -18,9 +18,7 @@
 
 use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace,
-};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::path::PathBuf;
@@ -796,7 +794,11 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         .await
         .expect("seed primary DB");
         store
-            .create_proxy(&seeded_proxy("authoritative-primary", "/primary", backend_port))
+            .create_proxy(&seeded_proxy(
+                "authoritative-primary",
+                "/primary",
+                backend_port,
+            ))
             .await
             .expect("insert primary proxy");
         drop(store);

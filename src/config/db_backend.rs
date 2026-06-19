@@ -697,7 +697,7 @@ pub fn redact_url(url: &str) -> String {
 }
 
 /// Redact configured database URLs if a driver error includes them verbatim.
-pub fn redact_error_text(error: &dyn std::fmt::Display, urls: &[&str]) -> String {
+pub fn redact_error_text(error: impl std::fmt::Display, urls: &[&str]) -> String {
     let mut text = error.to_string();
     for url in urls {
         text = text.replace(url, &redact_url(url));

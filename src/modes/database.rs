@@ -1079,7 +1079,7 @@ pub async fn run(
                         if !db_poll.read_replica_available() {
                             if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
                                 let safe_error =
-                                    db_backend::redact_error_text(e.as_ref(), &[replica_url]);
+                                    db_backend::redact_error_text(&e, &[replica_url]);
                                 warn!(
                                     "Read replica unavailable; admin-read replica reconnect attempt failed for {}: {}",
                                     db_backend::redact_url(replica_url),
@@ -1109,10 +1109,8 @@ pub async fn run(
                                 if let Err(e) =
                                     db_poll.reconnect_read_replica(replica_url).await
                                 {
-                                    let safe_error = db_backend::redact_error_text(
-                                        e.as_ref(),
-                                        &[replica_url],
-                                    );
+                                    let safe_error =
+                                        db_backend::redact_error_text(&e, &[replica_url]);
                                     error!(
                                         "Failed to reconnect admin-read replica pool after DNS change for '{}' ({}): {}",
                                         replica_hostname,

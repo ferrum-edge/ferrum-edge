@@ -97,7 +97,7 @@ async fn reload_db_tls_material(
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
 
     db.reconnect(&effective_url).await.map_err(|error| {
-        let safe_error = redact_error_text(error.as_ref(), &[&effective_url]);
+        let safe_error = redact_error_text(&error, &[&effective_url]);
         anyhow::anyhow!(
             "database TLS reconnect failed for {}: {}",
             redact_url(&effective_url),
@@ -112,7 +112,7 @@ async fn reload_db_tls_material(
         db.reconnect_read_replica(&replica_url)
             .await
             .map_err(|error| {
-                let safe_error = redact_error_text(error.as_ref(), &[&replica_url]);
+                let safe_error = redact_error_text(&error, &[&replica_url]);
                 anyhow::anyhow!(
                     "database TLS admin-read replica reconnect failed for {}: {}",
                     redact_url(&replica_url),

@@ -2155,7 +2155,7 @@ impl DatabaseStore {
         {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable("list_proxies_paginated", error.as_ref());
+                self.mark_read_replica_unavailable("list_proxies_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_proxies_paginated against primary"
                 );
@@ -2163,9 +2163,7 @@ impl DatabaseStore {
                     .list_proxies_paginated_from_admin_read(namespace, limit, offset)
                     .await;
                 if retry.is_ok() {
-                    info!(
-                        "Admin read fallback to primary succeeded for list_proxies_paginated"
-                    );
+                    info!("Admin read fallback to primary succeeded for list_proxies_paginated");
                 }
                 retry
             }
@@ -2251,7 +2249,7 @@ impl DatabaseStore {
         {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable("list_consumers_paginated", error.as_ref());
+                self.mark_read_replica_unavailable("list_consumers_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_consumers_paginated against primary"
                 );
@@ -2259,9 +2257,7 @@ impl DatabaseStore {
                     .list_consumers_paginated_from_admin_read(namespace, limit, offset)
                     .await;
                 if retry.is_ok() {
-                    info!(
-                        "Admin read fallback to primary succeeded for list_consumers_paginated"
-                    );
+                    info!("Admin read fallback to primary succeeded for list_consumers_paginated");
                 }
                 retry
             }
@@ -2319,10 +2315,7 @@ impl DatabaseStore {
         {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable(
-                    "list_plugin_configs_paginated",
-                    error.as_ref(),
-                );
+                self.mark_read_replica_unavailable("list_plugin_configs_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_plugin_configs_paginated against primary"
                 );
@@ -2391,7 +2384,7 @@ impl DatabaseStore {
         {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable("list_upstreams_paginated", error.as_ref());
+                self.mark_read_replica_unavailable("list_upstreams_paginated", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_upstreams_paginated against primary"
                 );
@@ -2399,9 +2392,7 @@ impl DatabaseStore {
                     .list_upstreams_paginated_from_admin_read(namespace, limit, offset)
                     .await;
                 if retry.is_ok() {
-                    info!(
-                        "Admin read fallback to primary succeeded for list_upstreams_paginated"
-                    );
+                    info!("Admin read fallback to primary succeeded for list_upstreams_paginated");
                 }
                 retry
             }
@@ -4026,7 +4017,7 @@ impl DatabaseStore {
     fn mark_read_replica_unavailable(
         &self,
         operation: &'static str,
-        error: &dyn std::fmt::Display,
+        error: impl std::fmt::Display,
     ) {
         let old_pool = self.read_replica_pool.swap(None);
         if old_pool.is_some() {
@@ -4139,10 +4130,8 @@ impl DatabaseStore {
         match self.list_namespaces_from_admin_read().await {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable("list_namespaces", error.as_ref());
-                warn!(
-                    "Read replica admin query failed; retrying list_namespaces against primary"
-                );
+                self.mark_read_replica_unavailable("list_namespaces", &error);
+                warn!("Read replica admin query failed; retrying list_namespaces against primary");
                 let retry = self.list_namespaces_from_admin_read().await;
                 if retry.is_ok() {
                     info!("Admin read fallback to primary succeeded for list_namespaces");
@@ -5128,10 +5117,8 @@ impl DatabaseStore {
         match self.list_api_specs_from_admin_read(namespace, filter).await {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable("list_api_specs", error.as_ref());
-                warn!(
-                    "Read replica admin query failed; retrying list_api_specs against primary"
-                );
+                self.mark_read_replica_unavailable("list_api_specs", &error);
+                warn!("Read replica admin query failed; retrying list_api_specs against primary");
                 let retry = self.list_api_specs_from_admin_read(namespace, filter).await;
                 if retry.is_ok() {
                     info!("Admin read fallback to primary succeeded for list_api_specs");
@@ -5446,14 +5433,19 @@ impl DatabaseStore {
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         let source = self.admin_read_pool().source;
-        match self.list_audit_events_from_admin_read(namespace, filter).await {
+        match self
+            .list_audit_events_from_admin_read(namespace, filter)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(error) if source == AdminReadSource::ReadReplica => {
-                self.mark_read_replica_unavailable("list_audit_events", error.as_ref());
+                self.mark_read_replica_unavailable("list_audit_events", &error);
                 warn!(
                     "Read replica admin query failed; retrying list_audit_events against primary"
                 );
-                let retry = self.list_audit_events_from_admin_read(namespace, filter).await;
+                let retry = self
+                    .list_audit_events_from_admin_read(namespace, filter)
+                    .await;
                 if retry.is_ok() {
                     info!("Admin read fallback to primary succeeded for list_audit_events");
                 }
