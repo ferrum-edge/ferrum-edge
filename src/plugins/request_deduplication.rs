@@ -53,8 +53,7 @@ const DEDUP_KEY_METADATA: &str = "_dedup_key";
 const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
-const FINGERPRINT_HEADERS: &[&str] =
-    &["content-type", "content-encoding", "content-language"];
+const FINGERPRINT_HEADERS: &[&str] = &["content-type", "content-encoding", "content-language"];
 
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
@@ -246,22 +245,14 @@ impl RequestDeduplication {
             .unwrap_or("_");
 
         let mut hasher = Sha256::new();
-        hash_framed(
-            &mut hasher,
-            "version",
-            DEDUP_LOGICAL_KEY_VERSION.as_bytes(),
-        );
+        hash_framed(&mut hasher, "version", DEDUP_LOGICAL_KEY_VERSION.as_bytes());
         hash_framed(&mut hasher, "proxy_id", proxy_id.as_bytes());
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
         {
             hash_framed(&mut hasher, "principal", identity.as_bytes());
         }
-        hash_framed(
-            &mut hasher,
-            "idempotency_key",
-            idempotency_value.as_bytes(),
-        );
+        hash_framed(&mut hasher, "idempotency_key", idempotency_value.as_bytes());
 
         let mut key = String::with_capacity(67);
         key.push_str("v2:");
@@ -275,11 +266,7 @@ impl RequestDeduplication {
         headers: &HashMap<String, String>,
     ) -> Result<String, PluginResult> {
         let mut hasher = Sha256::new();
-        hash_framed(
-            &mut hasher,
-            "version",
-            DEDUP_FINGERPRINT_VERSION.as_bytes(),
-        );
+        hash_framed(&mut hasher, "version", DEDUP_FINGERPRINT_VERSION.as_bytes());
         hash_framed(
             &mut hasher,
             "method",
@@ -716,10 +703,9 @@ fn header_value_case_insensitive<'a>(
     headers: &'a HashMap<String, String>,
     name: &str,
 ) -> Option<&'a str> {
-    headers.iter().find_map(|(key, value)| {
-        key.eq_ignore_ascii_case(name)
-            .then_some(value.as_str())
-    })
+    headers
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
 }
 
 fn canonical_authority(headers: &HashMap<String, String>) -> String {
@@ -952,20 +938,20 @@ impl Plugin for RequestDeduplication {
         let (key, fingerprint) = {
             // Get idempotency key from headers. Keep the borrow scoped so no
             // header-map borrow survives across Redis/cache awaits below.
-            let idempotency_value =
-                match header_value_case_insensitive(headers, &self.header_name) {
-                    Some(value) if !value.is_empty() => value,
-                    _ => {
-                        if self.enforce_required {
-                            return PluginResult::Reject {
-                                status_code: 400,
-                                body: missing_idempotency_body(&self.header_name),
-                                headers: HashMap::new(),
-                            };
-                        }
-                        return PluginResult::Continue;
+            let idempotency_value = match header_value_case_insensitive(headers, &self.header_name)
+            {
+                Some(value) if !value.is_empty() => value,
+                _ => {
+                    if self.enforce_required {
+                        return PluginResult::Reject {
+                            status_code: 400,
+                            body: missing_idempotency_body(&self.header_name),
+                            headers: HashMap::new(),
+                        };
                     }
-                };
+                    return PluginResult::Continue;
+                }
+            };
             let key = self.build_key(ctx, idempotency_value);
             let fingerprint = match self.build_request_fingerprint(ctx, headers) {
                 Ok(fingerprint) => fingerprint,
