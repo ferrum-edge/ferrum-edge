@@ -920,7 +920,6 @@ impl DatabaseStore {
             return Ok(HashMap::new());
         }
 
-        let target_ids: HashSet<&str> = proxy_ids.iter().map(String::as_str).collect();
         let mut associations: ProxyPluginAssociations = HashMap::new();
         let pool = if use_primary {
             self.pool()
@@ -928,27 +927,8 @@ impl DatabaseStore {
             self.rpool()
         };
 
-        if proxy_ids.len() > 500 {
-            let rows: Vec<AnyRow> =
-                sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
-
-            for row in &rows {
-                let proxy_id = Self::proxy_plugin_association_proxy_id(row, operation)?;
-                if !target_ids.contains(proxy_id.as_str()) {
-                    continue;
-                }
-                let plugin_config_id =
-                    Self::proxy_plugin_association_plugin_config_id(row, operation, &proxy_id)?;
-                associations
-                    .entry(proxy_id)
-                    .or_default()
-                    .push(PluginAssociation { plugin_config_id });
-            }
-        } else {
-            let placeholders = std::iter::repeat_n("?", proxy_ids.len())
+        for chunk in proxy_ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = self.q(&format!(
@@ -956,7 +936,7 @@ impl DatabaseStore {
                 placeholders
             ));
             let mut query = sqlx::query(&sql);
-            for id in proxy_ids {
+            for id in chunk {
                 query = query.bind(id);
             }
             let rows = query
@@ -3111,37 +3091,39 @@ impl DatabaseStore {
             self.rpool()
         };
 
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = self.q(&format!(
-            "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
-            placeholders
-        ));
+        let mut plugin_refs = std::collections::HashMap::new();
+        for chunk in ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
+                placeholders
+            ));
 
-        let mut query = sqlx::query(&sql);
-        query = query.bind(namespace);
-        for id in ids {
-            query = query.bind(id);
-        }
+            let mut query = sqlx::query(&sql);
+            query = query.bind(namespace);
+            for id in chunk {
+                query = query.bind(id);
+            }
 
-        let rows = query.fetch_all(&pool).await?;
-        let mut plugin_refs = std::collections::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let scope = match row.try_get::<String, _>("scope")?.as_str() {
-                "proxy" => PluginScope::Proxy,
-                "proxy_group" => PluginScope::ProxyGroup,
-                _ => PluginScope::Global,
-            };
-            plugin_refs.insert(
-                id.clone(),
-                PluginConfigRef {
-                    id,
-                    scope,
-                    proxy_id: row.try_get("proxy_id").ok(),
-                },
-            );
+            let rows = query.fetch_all(&pool).await?;
+            for row in rows {
+                let id: String = row.try_get("id")?;
+                let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                    "proxy" => PluginScope::Proxy,
+                    "proxy_group" => PluginScope::ProxyGroup,
+                    _ => PluginScope::Global,
+                };
+                plugin_refs.insert(
+                    id.clone(),
+                    PluginConfigRef {
+                        id,
+                        scope,
+                        proxy_id: row.try_get("proxy_id").ok(),
+                    },
+                );
+            }
         }
 
         Ok(plugin_refs)
@@ -3165,6 +3147,7 @@ impl DatabaseStore {
     /// Maximum records per database transaction for batch operations.
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
+    const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
 
     /// Fallback page size used only when no runtime override has been set
     /// via `set_full_load_page_size()`. Matches the default for
