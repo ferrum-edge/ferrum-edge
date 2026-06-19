@@ -842,14 +842,11 @@ impl DatabaseStore {
         let message = match namespace {
             Some(namespace) => format!(
                 "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
-                operation,
-                namespace,
-                source
+                operation, namespace, source
             ),
             None => format!(
                 "operation={} resource=proxy_plugins: failed to query proxy/plugin associations: {}",
-                operation,
-                source
+                operation, source
             ),
         };
         anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
@@ -903,11 +900,12 @@ impl DatabaseStore {
         associations: &ProxyPluginAssociations,
     ) -> Result<(), anyhow::Error> {
         if let Some(proxy_id) = associations.keys().next() {
-            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-                "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
-                operation,
-                proxy_id
-            ))));
+            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+                format!(
+                    "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
+                    operation, proxy_id
+                ),
+            )));
         }
         Ok(())
     }
@@ -995,13 +993,15 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-            "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
-            operation,
-            proxy.id,
-            proxy.namespace,
-            errors.join("; ")
-        ))))
+        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+            format!(
+                "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
+                operation,
+                proxy.id,
+                proxy.namespace,
+                errors.join("; ")
+            ),
+        )))
     }
 
     async fn reject_invalid_loaded_proxy_plugin_association_page(
@@ -1026,12 +1026,14 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-            "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
-            operation,
-            namespace,
-            errors.join("; ")
-        ))))
+        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+            format!(
+                "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
+                operation,
+                namespace,
+                errors.join("; ")
+            ),
+        )))
     }
 
     fn loaded_proxy_plugin_config_ids(proxies: &[Proxy]) -> Vec<String> {
@@ -1107,11 +1109,13 @@ impl DatabaseStore {
         config: &GatewayConfig,
     ) -> Result<(), anyhow::Error> {
         if let Err(errors) = config.validate_plugin_references() {
-            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-                "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
-                operation,
-                errors.join("; ")
-            ))));
+            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+                format!(
+                    "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
+                    operation,
+                    errors.join("; ")
+                ),
+            )));
         }
         Ok(())
     }

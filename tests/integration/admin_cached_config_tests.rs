@@ -1309,8 +1309,7 @@ fn db_admin_state(
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: create_test_jwt_manager(tc),
-        cached_config: cached_config
-            .map(|config| Arc::new(ArcSwap::new(Arc::new(config)))),
+        cached_config: cached_config.map(|config| Arc::new(ArcSwap::new(Arc::new(config)))),
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
@@ -3058,7 +3057,10 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     assert_eq!(status, 200, "repaired proxy should read from DB: {body:?}");
     assert_eq!(data_source, None);
     assert_eq!(body["backend_host"], "repaired.example.com");
-    assert_eq!(body["plugins"].as_array().map(|plugins| plugins.len()), Some(0));
+    assert_eq!(
+        body["plugins"].as_array().map(|plugins| plugins.len()),
+        Some(0)
+    );
 }
 
 #[tokio::test]
