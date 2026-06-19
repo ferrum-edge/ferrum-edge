@@ -352,7 +352,11 @@ async fn start_blocking_counting_backend_on(
                 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
                 let mut request_line = String::new();
-                let _ = buf_reader.read_line(&mut request_line).await;
+                if buf_reader.read_line(&mut request_line).await.is_err()
+                    || !request_line.starts_with("POST ")
+                {
+                    return;
+                }
                 let mut content_length = 0usize;
                 loop {
                     let mut line = String::new();
@@ -1395,7 +1399,6 @@ proxies:
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
-    backend_read_timeout_ms: 120000
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shared-dedup-plugin"
