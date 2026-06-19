@@ -924,6 +924,113 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Set a raw byte value only if the key does not already exist, with a TTL.
+    ///
+    /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
+    /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    pub async fn set_bytes_nx_with_expire(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<Option<String>, redis::RedisError> = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_seconds as i64)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(value) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(value.is_some())
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis SET NX EX failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Delete a key only when its current byte value exactly matches `expected`.
+    ///
+    /// Uses optimistic transactions (`WATCH` + `MULTI`/`EXEC`) instead of Lua so
+    /// RESP-compatible Redis backends that do not support scripting can still
+    /// use ownership-token lock release.
+    pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let watch_result: Result<(), redis::RedisError> =
+            redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
+        if let Err(e) = watch_result {
+            warn!(
+                key = %key,
+                error = %e,
+                "Redis WATCH failed"
+            );
+            self.mark_unavailable();
+            return Err(());
+        }
+
+        let current: Result<Option<Vec<u8>>, redis::RedisError> =
+            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        match current {
+            Ok(Some(current)) if current == expected => {}
+            Ok(_) => {
+                let _: Result<(), redis::RedisError> =
+                    redis::cmd("UNWATCH").query_async(&mut conn).await;
+                self.available.store(true, Ordering::Relaxed);
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-delete GET failed"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+        }
+
+        let result: Result<Option<(i64,)>, redis::RedisError> = redis::pipe()
+            .atomic()
+            .cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(Some((deleted,))) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(deleted > 0)
+            }
+            Ok(None) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-delete transaction failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Build a full Redis key with the configured prefix.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();
