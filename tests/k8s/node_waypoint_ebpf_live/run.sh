@@ -211,6 +211,21 @@ render_chart_assertions() {
 
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set-string nodeAgent.env.FERRUM_ADMIN_HTTP_PORT=9000 >/tmp/ferrum-node-agent-managed-env-render.out 2>&1; then
+    echo "Node-agent render accepted a chart-managed env override" >&2
+    cat /tmp/ferrum-node-agent-managed-env-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "nodeAgent.env.FERRUM_ADMIN_HTTP_PORT is chart-managed" /tmp/ferrum-node-agent-managed-env-render.out; then
+    echo "Node-agent render rejected managed env override without a clear error" >&2
+    cat /tmp/ferrum-node-agent-managed-env-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
     --set nodeAgent.enabled=true \

@@ -1889,7 +1889,12 @@ async fn wait_for_cp_listeners_until_shutdown_or_exit(
 
     let listener_shutdown_tx = shutdown_tx.clone();
     let mut listener_monitor = tokio::spawn(async move {
-        monitor_cp_listener_handles_until_exit(listener_handles, listener_shutdown_tx).await
+        monitor_cp_listener_handles_until_exit(
+            listener_handles,
+            listener_shutdown_tx,
+            drain_timeout,
+        )
+        .await
     });
     tokio::select! {
         result = &mut listener_monitor => {
@@ -1912,19 +1917,34 @@ async fn wait_for_cp_listeners_until_shutdown_or_exit(
 async fn monitor_cp_listener_handles_until_exit(
     listener_handles: Vec<tokio::task::JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    drain_timeout: Duration,
 ) -> Result<(), tokio::task::JoinError> {
     let (first_result, _idx, remaining) = futures_util::future::select_all(listener_handles).await;
     info!("CP listener task exited; triggering control-plane shutdown");
     let _ = shutdown_tx.send(true);
 
-    let shutdown_on_panic = {
-        let shutdown_tx = shutdown_tx.clone();
-        move || {
-            let _ = shutdown_tx.send(true);
+    let remaining_result = if remaining.is_empty() {
+        Ok(())
+    } else {
+        let shutdown_on_panic = {
+            let shutdown_tx = shutdown_tx.clone();
+            move || {
+                let _ = shutdown_tx.send(true);
+            }
+        };
+        let mut remaining_monitor = tokio::spawn(async move {
+            crate::modes::file::await_listener_handles(remaining, shutdown_on_panic).await
+        });
+        match tokio::time::timeout(drain_timeout, &mut remaining_monitor).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => Err(err),
+            Err(_) => {
+                warn!("Timed out waiting for remaining CP listeners to drain after listener exit");
+                remaining_monitor.abort();
+                Ok(())
+            }
         }
     };
-    let remaining_result =
-        crate::modes::file::await_listener_handles(remaining, shutdown_on_panic).await;
 
     match (first_result, remaining_result) {
         (Err(err), _) => Err(err),
@@ -2459,6 +2479,33 @@ mod tests {
         assert!(
             *observed_shutdown.borrow(),
             "CP listener exit must flip the shared shutdown watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let exited = tokio::spawn(async {});
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![stuck, exited],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("listener-triggered shutdown must not wait forever on stuck siblings");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "listener-triggered drain should honor the configured timeout"
         );
     }
 }

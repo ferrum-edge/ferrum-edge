@@ -44,6 +44,30 @@
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- $nodeAgentManagedEnv := list
+  "FERRUM_MODE"
+  "FERRUM_MESH_CAPTURE_MODE"
+  "FERRUM_NODE_AGENT_PROXY_MODE"
+  "FERRUM_MESH_PROXY_UID"
+  "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS"
+  "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS"
+  "FERRUM_MESH_CAPTURE_EXCLUDE_PORTS"
+  "FERRUM_NODE_AGENT_FALLBACK_MODE"
+  "FERRUM_NODE_AGENT_CGROUP_ROOT"
+  "FERRUM_NODE_AGENT_BPF_FS_PATH"
+  "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR"
+  "FERRUM_NODE_AGENT_ADMIN_ENABLED"
+  "FERRUM_ADMIN_BIND_ADDRESS"
+  "FERRUM_ADMIN_HTTP_PORT"
+  "FERRUM_NODE_AGENT_NODE_NAME"
+  "FERRUM_NODE_AGENT_CNI_ENABLED"
+  "FERRUM_NODE_AGENT_CNI_SOCKET_PATH"
+-}}
+{{- range $name, $_ := .Values.nodeAgent.env }}
+{{- if has $name $nodeAgentManagedEnv -}}
+{{- fail (printf "nodeAgent.env.%s is chart-managed; set the corresponding nodeAgent value instead of overriding the rendered environment" $name) -}}
+{{- end -}}
+{{- end -}}
 {{- if $nodeWaypointRegistryEnabled -}}
 {{- if ne (lower (toString .Values.nodeAgent.captureMode)) "ebpf" -}}
 {{- fail "nodeAgent.proxyMode=node_waypoint requires nodeAgent.captureMode=ebpf" -}}

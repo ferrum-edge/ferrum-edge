@@ -21,6 +21,7 @@ on:
       - "src/modes/mesh/**"
       - "src/modes/node_agent.rs"
       - "src/plugins/prometheus_metrics.rs"
+      - "src/proxy/hbone_proxy.rs"
       - "src/proxy/netns_capture.rs"
       - "src/proxy/tcp_proxy.rs"
       - "src/socket_opts.rs"
