@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -51,6 +51,8 @@ struct PluginConfigRef {
     scope: PluginScope,
     proxy_id: Option<String>,
 }
+
+type ProxyPluginAssociations = HashMap<String, Vec<PluginAssociation>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConsumerCredentialIndexEntry {
@@ -806,6 +808,205 @@ impl DatabaseStore {
         }
     }
 
+    fn proxy_plugin_association_query_error(
+        operation: &str,
+        namespace: Option<&str>,
+        source: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        match namespace {
+            Some(namespace) => anyhow::anyhow!(
+                "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
+                operation,
+                namespace,
+                source
+            ),
+            None => anyhow::anyhow!(
+                "operation={} resource=proxy_plugins: failed to query proxy/plugin associations: {}",
+                operation,
+                source
+            ),
+        }
+    }
+
+    fn proxy_plugin_association_proxy_id(
+        row: &AnyRow,
+        operation: &str,
+    ) -> Result<String, anyhow::Error> {
+        row.try_get::<String, _>("proxy_id").map_err(|e| {
+            anyhow::anyhow!(
+                "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
+                operation,
+                e
+            )
+        })
+    }
+
+    fn proxy_plugin_association_plugin_config_id(
+        row: &AnyRow,
+        operation: &str,
+        proxy_id: &str,
+    ) -> Result<String, anyhow::Error> {
+        row.try_get::<String, _>("plugin_config_id").map_err(|e| {
+            anyhow::anyhow!(
+                "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                operation,
+                proxy_id,
+                e
+            )
+        })
+    }
+
+    fn push_proxy_plugin_association_row(
+        associations: &mut ProxyPluginAssociations,
+        row: &AnyRow,
+        operation: &str,
+    ) -> Result<(), anyhow::Error> {
+        let proxy_id = Self::proxy_plugin_association_proxy_id(row, operation)?;
+        let plugin_config_id =
+            Self::proxy_plugin_association_plugin_config_id(row, operation, &proxy_id)?;
+        associations
+            .entry(proxy_id)
+            .or_default()
+            .push(PluginAssociation { plugin_config_id });
+        Ok(())
+    }
+
+    fn ensure_no_unmatched_proxy_plugin_associations(
+        operation: &str,
+        associations: &ProxyPluginAssociations,
+    ) -> Result<(), anyhow::Error> {
+        if let Some(proxy_id) = associations.keys().next() {
+            return Err(anyhow::anyhow!(
+                "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
+                operation,
+                proxy_id
+            ));
+        }
+        Ok(())
+    }
+
+    async fn load_proxy_plugin_associations_for_namespace(
+        &self,
+        namespace: &str,
+        operation: &str,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        let sql = self.q(
+            "SELECT pp.proxy_id, pp.plugin_config_id \
+             FROM proxy_plugins pp \
+             INNER JOIN proxies p ON pp.proxy_id = p.id \
+             WHERE p.namespace = ?",
+        );
+        let rows: Vec<AnyRow> = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&self.rpool())
+            .await
+            .map_err(|e| {
+                Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
+            })?;
+
+        let mut associations = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+        }
+        Ok(associations)
+    }
+
+    async fn load_proxy_plugin_associations_for_proxy_ids(
+        &self,
+        proxy_ids: &[String],
+        operation: &str,
+        use_primary: bool,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        if proxy_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let target_ids: HashSet<&str> = proxy_ids.iter().map(String::as_str).collect();
+        let mut associations = HashMap::new();
+        let pool = if use_primary {
+            self.pool()
+        } else {
+            self.rpool()
+        };
+
+        if proxy_ids.len() > 500 {
+            let rows: Vec<AnyRow> =
+                sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
+
+            for row in &rows {
+                let proxy_id = Self::proxy_plugin_association_proxy_id(row, operation)?;
+                if !target_ids.contains(proxy_id.as_str()) {
+                    continue;
+                }
+                let plugin_config_id =
+                    Self::proxy_plugin_association_plugin_config_id(row, operation, &proxy_id)?;
+                associations
+                    .entry(proxy_id)
+                    .or_default()
+                    .push(PluginAssociation { plugin_config_id });
+            }
+        } else {
+            let placeholders = std::iter::repeat_n("?", proxy_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
+                placeholders
+            ));
+            let mut query = sqlx::query(&sql);
+            for id in proxy_ids {
+                query = query.bind(id);
+            }
+            let rows = query
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
+            for row in &rows {
+                Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+            }
+        }
+
+        Ok(associations)
+    }
+
+    async fn reject_invalid_loaded_proxy_plugin_associations(
+        &self,
+        operation: &str,
+        proxy: &Proxy,
+    ) -> Result<(), anyhow::Error> {
+        let errors = self
+            .validate_proxy_plugin_associations(&proxy.id, &proxy.namespace, &proxy.plugins)
+            .await?;
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
+            operation,
+            proxy.id,
+            proxy.namespace,
+            errors.join("; ")
+        ))
+    }
+
+    fn reject_invalid_gateway_plugin_references(
+        operation: &str,
+        config: &GatewayConfig,
+    ) -> Result<(), anyhow::Error> {
+        if let Err(errors) = config.validate_plugin_references() {
+            return Err(anyhow::anyhow!(
+                "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
+                operation,
+                errors.join("; ")
+            ));
+        }
+        Ok(())
+    }
+
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
@@ -827,6 +1028,8 @@ impl DatabaseStore {
             known_namespaces: Vec::new(),
             ..Default::default()
         };
+
+        Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
         ValidationPipeline::new(&mut config)
             .normalize_fields()
@@ -857,9 +1060,6 @@ impl DatabaseStore {
             .validate_mesh_route_dispatch_references(ValidationAction::FatalStatic(
                 "Database has invalid mesh_route_dispatch upstream reference(s)",
             ))
-            .validate_plugin_references(ValidationAction::FatalStatic(
-                "Database has invalid plugin reference(s)",
-            ))
             .validate_plugin_configs(ValidationAction::Warn)
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
@@ -881,44 +1081,12 @@ impl DatabaseStore {
         let start = Instant::now();
 
         // Batch-load proxy_plugins for proxies in this namespace (eliminates N+1).
-        let assoc_rows: Vec<AnyRow> =
-            match sqlx::query(&self.q("SELECT pp.proxy_id, pp.plugin_config_id FROM proxy_plugins pp INNER JOIN proxies p ON pp.proxy_id = p.id WHERE p.namespace = ?"))
-                .bind(namespace)
-                .fetch_all(&self.rpool())
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    error!("Failed to load proxy_plugins associations: {}", e);
-                    Vec::new()
-                }
-            };
-
-        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
-            std::collections::HashMap::new();
-        for r in &assoc_rows {
-            let proxy_id: String = match r.try_get("proxy_id") {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Failed to read proxy_id from proxy_plugins row: {}", e);
-                    continue;
-                }
-            };
-            let plugin_config_id: String = match r.try_get("plugin_config_id") {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "Failed to read plugin_config_id from proxy_plugins row (proxy_id={}): {}",
-                        proxy_id, e
-                    );
-                    continue;
-                }
-            };
-            plugins_by_proxy
-                .entry(proxy_id)
-                .or_default()
-                .push(PluginAssociation { plugin_config_id });
-        }
+        // Association rows are part of the security/policy graph, so any
+        // query or decode error rejects the whole candidate instead of
+        // publishing proxies with silently empty plugin lists.
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_namespace(namespace, "load_full_config")
+            .await?;
 
         // Load proxies in chunks to avoid unbounded SELECT * at scale.
         let mut proxies = Vec::new();
@@ -944,6 +1112,10 @@ impl DatabaseStore {
             }
             offset += self.full_load_page_size;
         }
+        Self::ensure_no_unmatched_proxy_plugin_associations(
+            "load_full_config",
+            &plugins_by_proxy,
+        )?;
 
         self.check_slow_query("load_proxies", start);
         Ok(proxies)
@@ -1522,33 +1694,17 @@ impl DatabaseStore {
             None => return Ok(None),
         };
 
-        let assoc_rows: Vec<AnyRow> = match sqlx::query(
-            &self.q("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?"),
-        )
-        .bind(id)
-        .fetch_all(&self.pool())
-        .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!("Failed to load plugin associations for proxy {}: {}", id, e);
-                Vec::new()
-            }
-        };
-
-        let plugins: Vec<PluginAssociation> = assoc_rows
-            .iter()
-            .filter_map(|r| match r.try_get::<String, _>("plugin_config_id") {
-                Ok(plugin_config_id) => Some(PluginAssociation { plugin_config_id }),
-                Err(e) => {
-                    warn!("Failed to read plugin_config_id for proxy {}: {}", id, e);
-                    None
-                }
-            })
-            .collect();
+        let proxy_ids = [id.to_string()];
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_proxy_ids(&proxy_ids, "get_proxy", true)
+            .await?;
+        let plugins = plugins_by_proxy.remove(id).unwrap_or_default();
+        Self::ensure_no_unmatched_proxy_plugin_associations("get_proxy", &plugins_by_proxy)?;
 
         let mut proxy = row_to_proxy(&row, id.to_string(), plugins)?;
         proxy.normalize_fields();
+        self.reject_invalid_loaded_proxy_plugin_associations("get_proxy", &proxy)
+            .await?;
         self.check_slow_query("get_proxy", start);
         Ok(Some(proxy))
     }
@@ -1870,48 +2026,31 @@ impl DatabaseStore {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
 
-        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
-            std::collections::HashMap::new();
-        if !proxy_ids.is_empty() {
-            let placeholders = std::iter::repeat_n("?", proxy_ids.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = self.q(&format!(
-                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
-                placeholders
-            ));
-            let mut query = sqlx::query(&sql);
-            for id in &proxy_ids {
-                query = query.bind(id);
-            }
-            match query.fetch_all(&self.rpool()).await {
-                Ok(assoc_rows) => {
-                    for r in &assoc_rows {
-                        if let (Ok(pid), Ok(pcid)) = (
-                            r.try_get::<String, _>("proxy_id"),
-                            r.try_get::<String, _>("plugin_config_id"),
-                        ) {
-                            plugins_by_proxy
-                                .entry(pid)
-                                .or_default()
-                                .push(PluginAssociation {
-                                    plugin_config_id: pcid,
-                                });
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to load proxy_plugins for paginated list: {}", e);
-                }
-            }
-        }
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_proxy_ids(
+                &proxy_ids,
+                "list_proxies_paginated",
+                false,
+            )
+            .await?;
 
         let mut proxies = Vec::new();
         for row in rows {
             let id: String = row.try_get("id")?;
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-            proxies.push(row_to_proxy(&row, id, plugins)?);
+            let mut proxy = row_to_proxy(&row, id, plugins)?;
+            proxy.normalize_fields();
+            self.reject_invalid_loaded_proxy_plugin_associations(
+                "list_proxies_paginated",
+                &proxy,
+            )
+            .await?;
+            proxies.push(proxy);
         }
+        Self::ensure_no_unmatched_proxy_plugin_associations(
+            "list_proxies_paginated",
+            &plugins_by_proxy,
+        )?;
 
         self.check_slow_query("list_proxies_paginated", start);
         Ok(PaginatedResult {
@@ -2740,74 +2879,14 @@ impl DatabaseStore {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
 
-        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
-            std::collections::HashMap::new();
-
-        if !changed_ids.is_empty() {
-            let changed_id_list: Vec<&str> = changed_ids.iter().map(|s| s.as_str()).collect();
-
-            let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 500 {
-                // Too many IDs for an IN clause — fetch all and filter in memory
-                match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                    .fetch_all(&self.rpool())
-                    .await
-                {
-                    Ok(all_rows) => all_rows
-                        .into_iter()
-                        .filter(|r| {
-                            r.try_get::<String, _>("proxy_id")
-                                .map(|id| changed_ids.contains(&id))
-                                .unwrap_or(false)
-                        })
-                        .collect(),
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch proxy_plugins for incremental update: {}. \
-                             Plugin associations may be stale until next full reload.",
-                            e
-                        );
-                        Vec::new()
-                    }
-                }
-            } else {
-                // Build parameterized IN clause for targeted fetch
-                let placeholders: String = changed_id_list
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = self.q(&format!(
-                    "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
-                    placeholders
-                ));
-                let mut query = sqlx::query(&sql);
-                for id in &changed_id_list {
-                    query = query.bind(*id);
-                }
-                match query.fetch_all(&self.rpool()).await {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch proxy_plugins for incremental update: {}. \
-                             Plugin associations may be stale until next full reload.",
-                            e
-                        );
-                        Vec::new()
-                    }
-                }
-            };
-
-            for r in &assoc_rows {
-                if let Ok(proxy_id) = r.try_get::<String, _>("proxy_id")
-                    && let Ok(plugin_config_id) = r.try_get::<String, _>("plugin_config_id")
-                {
-                    plugins_by_proxy
-                        .entry(proxy_id)
-                        .or_default()
-                        .push(PluginAssociation { plugin_config_id });
-                }
-            }
-        }
+        let changed_id_list: Vec<String> = changed_ids.iter().cloned().collect();
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_proxy_ids(
+                &changed_id_list,
+                "load_incremental_config",
+                false,
+            )
+            .await?;
 
         let mut proxies = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -2815,6 +2894,10 @@ impl DatabaseStore {
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
             proxies.push(row_to_proxy(row, id, plugins)?);
         }
+        Self::ensure_no_unmatched_proxy_plugin_associations(
+            "load_incremental_config",
+            &plugins_by_proxy,
+        )?;
 
         self.check_slow_query("load_proxies_since", start);
         Ok(proxies)
