@@ -96,7 +96,12 @@ render_chart_assertions() {
     [[ "$(grep -c -- '- PERFMON' <<<"$rendered" || true)" -lt 2 ]] ||
     [[ "$(grep -c -- '- SYS_ADMIN' <<<"$rendered" || true)" -lt 2 ]]; then
     echo "NodeWaypoint eBPF render did not grant BPF/PERFMON/SYS_ADMIN to both proxy and node-agent" >&2
-    grep -nE 'capabilities:|add:|- SYS_ADMIN|- BPF|- NET_ADMIN|- PERFMON' <<<"$rendered" >&2 || true
+    grep -nE 'capabilities:|add:|- SYS_ADMIN|- BPF|- NET_ADMIN|- PERFMON|- SYS_PTRACE' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+  if ! grep -q -- '- SYS_PTRACE' <<<"$rendered"; then
+    echo "NodeWaypoint eBPF render did not grant SYS_PTRACE to the node-waypoint proxy" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-ambient|capabilities:|add:|- SYS_ADMIN|- SYS_PTRACE' <<<"$rendered" >&2 || true
     exit 1
   fi
   if [[ "$(grep -c "name: bpf-fs" <<<"$rendered" || true)" -lt 4 ]] ||

@@ -220,11 +220,13 @@ requires the matching ambient proxy.
 
 For NodeWaypoint, the ambient proxy also needs host access normally associated
 with the node-agent: `hostPID: true`, a read-only host cgroup mount, a read-only
-host bpffs mount, and `BPF`/`PERFMON`/`SYS_ADMIN` capabilities. The proxy uses
-the cgroup mount plus host `/proc` to resolve each registered pod's live network
-namespace, `SYS_ADMIN` to `setns(CLONE_NEWNET)` and bind the pod-loopback
-listener, and bpffs/BPF access to open the node-agent-pinned orig-dst and
-SOCK_OPS maps. The chart adds those settings only when
+host bpffs mount, and `BPF`/`PERFMON`/`SYS_ADMIN`/`SYS_PTRACE` capabilities.
+The proxy uses the cgroup mount plus host `/proc` to resolve each registered
+pod's live network namespace, `SYS_PTRACE` for the kernel's
+`ptrace_may_access` checks on `/proc/{pid}/ns/net` across workload UIDs,
+`SYS_ADMIN` to `setns(CLONE_NEWNET)` and bind the pod-loopback listener, and
+bpffs/BPF access to open the node-agent-pinned orig-dst and SOCK_OPS maps. The
+chart adds those settings only when
 `nodeAgent.proxyMode=node_waypoint` and the ambient topology is
 `node_waypoint`.
 

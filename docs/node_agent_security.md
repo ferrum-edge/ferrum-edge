@@ -105,23 +105,26 @@ capability traces to a specific kernel API used by the code.
 | `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers; managing host veth qdiscs; iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
 | `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
 | `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8**. Also required in `node_waypoint` mode on every supported kernel because the agent enters pod network namespaces with `setns()` to resolve host-side veth peers before tc attachment. The chart drops `SYS_ADMIN` for `local_pod` mode on modern kernels but always adds it for `nodeAgent.proxyMode=node_waypoint`. | Older-kernel BPF operations; `setns(CLONE_NEWNET)` for pod-netns veth discovery. | Same as `CAP_BPF` / `CAP_PERFMON`; `discover_host_veth_for_pod` in [`src/ebpf/veth.rs`](../src/ebpf/veth.rs) |
+| `CAP_SYS_PTRACE` | NodeWaypoint ambient proxy only. With `hostPID: true`, Linux still applies `ptrace_may_access` checks to `/proc/{pid}/ns/net`; workloads running with different UIDs or dumpability can otherwise return `EACCES` before the proxy can enter the pod netns. This is not used for `PTRACE_ATTACH`. | `stat`/`open` of `/proc/{pid}/ns/net` for enrolled pod PIDs. | `netns_inode_for_cgroup` and `NetnsGuard::enter` in [`src/proxy/netns_capture.rs`](../src/proxy/netns_capture.rs) |
 
 When `nodeAgent.proxyMode=node_waypoint`, the ambient mesh proxy is part of the
 same capture data path. The chart also grants that proxy `CAP_BPF`,
-`CAP_PERFMON`, and `CAP_SYS_ADMIN`: it opens the node-agent-pinned BPF maps by
-path, reads SOCK_OPS/orig-dst records, and enters each enrolled pod's network
-namespace with `setns(CLONE_NEWNET)` to bind the pod-loopback capture listener.
+`CAP_PERFMON`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE`: it opens the
+node-agent-pinned BPF maps by path, reads SOCK_OPS/orig-dst records, resolves
+registered pod PIDs through host `/proc`, and enters each enrolled pod's
+network namespace with `setns(CLONE_NEWNET)` to bind the pod-loopback capture
+listener.
 Those extra proxy permissions are not rendered for regular ambient iptables
 mode.
 
+`CAP_SYS_PTRACE` is intentionally scoped to the NodeWaypoint ambient proxy, not
+the node-agent DaemonSet. It is broader than the Ferrum code path that uses it:
+Ferrum does not call `ptrace(2)`, but a compromised proxy process with that
+capability should be treated as capable of same-node process inspection unless
+an LSM profile blocks those syscalls.
+
 ### Capabilities deliberately NOT requested
 
-- **`CAP_SYS_PTRACE`** — earlier chart versions added this, but it is not
-  used by any node-agent code path. The veth discovery code
-  ([`src/ebpf/veth.rs`](../src/ebpf/veth.rs)) reads
-  `/proc/{pid}/net/if_inet6` and walks `/sys/class/net/*/ifindex` — both
-  succeed under `hostPID: true` alone, without `ptrace`/`PTRACE_ATTACH`.
-  Removed from the chart in this commit.
 - **`CAP_SYS_RESOURCE`** — `raise_fd_limit()` in [`src/main.rs`](../src/main.rs)
   raises only the soft FD cap (via `setrlimit(RLIMIT_NOFILE)`); the hard cap
   is set by the operator via `LimitNOFILE=` (systemd) or `--ulimit nofile=`
@@ -397,6 +400,8 @@ profile ferrum-node-agent /usr/local/bin/ferrum-edge {
   capability net_admin,
   capability perfmon,
   capability sys_admin,
+  # Needed only if this profile is reused for the NodeWaypoint ambient proxy.
+  capability sys_ptrace,
 }
 ```
 

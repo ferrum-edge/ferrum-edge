@@ -66,6 +66,7 @@ spec:
                 {{- if $nodeWaypointRegistryEnabled }}
                 - PERFMON
                 - SYS_ADMIN
+                - SYS_PTRACE
                 {{- end }}
           ports:
             - name: outbound
