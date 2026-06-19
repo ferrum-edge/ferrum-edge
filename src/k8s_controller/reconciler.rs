@@ -806,19 +806,24 @@ fn merge_k8s_translation(
 }
 
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
-    let k8s_supplies_tls =
-        k8s_config.frontend_tls_cert_path.is_some() || k8s_config.frontend_tls_key_path.is_some();
+    let k8s_supplies_tls = !k8s_config.frontend_tls_namespace_sources.is_empty()
+        || k8s_config.frontend_tls_cert_path.is_some()
+        || k8s_config.frontend_tls_key_path.is_some();
     if k8s_supplies_tls {
         merged.frontend_tls_cert_path = k8s_config.frontend_tls_cert_path.clone();
         merged.frontend_tls_key_path = k8s_config.frontend_tls_key_path.clone();
         merged.frontend_tls_source_namespace = k8s_config.frontend_tls_source_namespace.clone();
+        merged.frontend_tls_namespace_sources = k8s_config.frontend_tls_namespace_sources.clone();
         return;
     }
 
-    if merged.frontend_tls_source_namespace.is_some() {
+    if merged.frontend_tls_source_namespace.is_some()
+        || !merged.frontend_tls_namespace_sources.is_empty()
+    {
         merged.frontend_tls_cert_path = None;
         merged.frontend_tls_key_path = None;
         merged.frontend_tls_source_namespace = None;
+        merged.frontend_tls_namespace_sources.clear();
     }
 }
 
@@ -837,6 +842,7 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
         "frontend_tls_cert_path": &config.frontend_tls_cert_path,
         "frontend_tls_key_path": &config.frontend_tls_key_path,
         "frontend_tls_source_namespace": &config.frontend_tls_source_namespace,
+        "frontend_tls_namespace_sources": &config.frontend_tls_namespace_sources,
         "mesh": &config.mesh,
     });
     strip_volatile_timestamps(&mut value);
@@ -972,7 +978,9 @@ fn canonical_json_sort_key(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+    use crate::config::types::{
+        FrontendTlsNamespaceSource, PluginConfig, PluginScope, Proxy, Upstream,
+    };
     use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
     use crate::modes::mesh::config::{
@@ -1442,6 +1450,50 @@ mod tests {
         assert_eq!(
             merged.frontend_tls_source_namespace.as_deref(),
             Some("default")
+        );
+    }
+
+    #[test]
+    fn merge_k8s_translation_preserves_namespace_scoped_gateway_frontend_tls() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("/etc/ferrum/operator.crt".to_string()),
+            frontend_tls_key_path: Some("/etc/ferrum/operator.key".to_string()),
+            frontend_tls_source_namespace: None,
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://ns-a/cert#tls.crt?sha256=a".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-a/cert#tls.key?sha256=a".to_string()),
+            frontend_tls_source_namespace: Some("ns-a".to_string()),
+            frontend_tls_namespace_sources: vec![
+                FrontendTlsNamespaceSource {
+                    namespace: "ns-a".to_string(),
+                    cert_path: "k8s://ns-a/cert#tls.crt?sha256=a".to_string(),
+                    key_path: "k8s://ns-a/cert#tls.key?sha256=a".to_string(),
+                },
+                FrontendTlsNamespaceSource {
+                    namespace: "ns-b".to_string(),
+                    cert_path: "k8s://ns-b/cert#tls.crt?sha256=b".to_string(),
+                    key_path: "k8s://ns-b/cert#tls.key?sha256=b".to_string(),
+                },
+            ],
+            ..GatewayConfig::default()
+        };
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(merged.frontend_tls_namespace_sources.len(), 2);
+        assert!(
+            merged
+                .frontend_tls_namespace_sources
+                .iter()
+                .any(|source| source.namespace == "ns-a")
+        );
+        assert!(
+            merged
+                .frontend_tls_namespace_sources
+                .iter()
+                .any(|source| source.namespace == "ns-b")
         );
     }
 

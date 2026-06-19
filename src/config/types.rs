@@ -2222,6 +2222,12 @@ pub struct GatewayConfig {
     /// source URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_tls_source_namespace: Option<String>,
+    /// Gateway-managed frontend TLS material indexed by owning Gateway
+    /// namespace. Multi-namespace CPs keep all Gateway TLS entries here until
+    /// the per-DP namespace filter projects the matching entry into
+    /// `frontend_tls_*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontend_tls_namespace_sources: Vec<FrontendTlsNamespaceSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the
@@ -2231,6 +2237,14 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendTlsNamespaceSource {
+    pub namespace: String,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -2914,6 +2928,10 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
+        self.frontend_tls_namespace_sources
+            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        self.frontend_tls_namespace_sources
+            .dedup_by(|left, right| left.namespace == right.namespace);
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();

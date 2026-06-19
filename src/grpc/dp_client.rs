@@ -1373,6 +1373,20 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
 }
 
 fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) -> bool {
+    let had_namespace_sources = !config.frontend_tls_namespace_sources.is_empty();
+    if let Some(source) = config
+        .frontend_tls_namespace_sources
+        .iter()
+        .find(|source| source.namespace == namespace)
+        .cloned()
+    {
+        config.frontend_tls_cert_path = Some(source.cert_path);
+        config.frontend_tls_key_path = Some(source.key_path);
+        config.frontend_tls_source_namespace = Some(source.namespace);
+        config.frontend_tls_namespace_sources.clear();
+        return false;
+    }
+    config.frontend_tls_namespace_sources.clear();
     let foreign = config
         .frontend_tls_source_namespace
         .as_deref()
@@ -1382,7 +1396,7 @@ fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespac
         config.frontend_tls_key_path = None;
         config.frontend_tls_source_namespace = None;
     }
-    foreign
+    foreign || had_namespace_sources
 }
 
 /// Defense-in-depth filter for incremental deltas. Applied to
@@ -1596,6 +1610,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };
@@ -1626,6 +1641,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };
@@ -1670,6 +1686,45 @@ mod tests {
             cfg.frontend_tls_key_path.as_deref(),
             Some("k8s://secrets/gateway-cert#tls.key")
         );
+    }
+
+    #[test]
+    fn filter_config_projects_namespace_scoped_gateway_frontend_tls_sources() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("staging".to_string()),
+            frontend_tls_namespace_sources: vec![
+                crate::config::types::FrontendTlsNamespaceSource {
+                    namespace: "staging".to_string(),
+                    cert_path: "k8s://staging/gateway-cert#tls.crt".to_string(),
+                    key_path: "k8s://staging/gateway-cert#tls.key".to_string(),
+                },
+                crate::config::types::FrontendTlsNamespaceSource {
+                    namespace: "production".to_string(),
+                    cert_path: "k8s://production/gateway-cert#tls.crt".to_string(),
+                    key_path: "k8s://production/gateway-cert#tls.key".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        assert_eq!(
+            cfg.frontend_tls_cert_path.as_deref(),
+            Some("k8s://production/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            cfg.frontend_tls_key_path.as_deref(),
+            Some("k8s://production/gateway-cert#tls.key")
+        );
+        assert_eq!(
+            cfg.frontend_tls_source_namespace.as_deref(),
+            Some("production")
+        );
+        assert!(cfg.frontend_tls_namespace_sources.is_empty());
     }
 
     #[test]

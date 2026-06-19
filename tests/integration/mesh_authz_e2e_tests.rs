@@ -95,6 +95,7 @@ fn build_mesh_authz_for_workload(
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
         frontend_tls_source_namespace: None,
+        frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
     };
@@ -1321,6 +1322,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
         frontend_tls_source_namespace: None,
+        frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
     };

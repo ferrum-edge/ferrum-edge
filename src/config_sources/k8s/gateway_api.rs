@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::types::{BackendScheme, MAX_TARGET_WEIGHT};
+use crate::config::types::{BackendScheme, FrontendTlsNamespaceSource, MAX_TARGET_WEIGHT};
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
@@ -256,35 +256,63 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
         GatewayFrontendTlsSelection::None => return,
     };
 
-    match (
-        acc.config.frontend_tls_cert_path.as_deref(),
-        acc.config.frontend_tls_key_path.as_deref(),
-    ) {
-        (None, None) => {
-            acc.config.frontend_tls_cert_path = Some(cert_source);
-            acc.config.frontend_tls_key_path = Some(key_source);
-            acc.config.frontend_tls_source_namespace = Some(object.metadata.namespace.clone());
-        }
-        (Some(existing_cert), Some(existing_key))
-            if existing_cert == cert_source && existing_key == key_source =>
-        {
-            acc.config
-                .frontend_tls_source_namespace
-                .get_or_insert_with(|| object.metadata.namespace.clone());
-        }
-        (Some(existing_cert), Some(_)) => {
-            acc.warnings.push(format!(
-                "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace config already uses {}; keeping the first materialized certificate",
-                object.metadata.namespace, object.metadata.name, cert_source, existing_cert
-            ));
-        }
-        _ => {
-            acc.warnings.push(format!(
-                "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace config has partial frontend TLS material; ignoring listener certificateRef",
-                object.metadata.namespace, object.metadata.name, cert_source
-            ));
-        }
+    let source_namespace = object.metadata.namespace.clone();
+    let Some(source) = gateway_frontend_tls_namespace_source(
+        acc,
+        object,
+        source_namespace,
+        cert_source,
+        key_source,
+    ) else {
+        return;
+    };
+
+    if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
+        acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
+        acc.config.frontend_tls_key_path = Some(source.key_path.clone());
+        acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
     }
+}
+
+fn gateway_frontend_tls_namespace_source(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    source_namespace: String,
+    cert_source: String,
+    key_source: String,
+) -> Option<FrontendTlsNamespaceSource> {
+    if let Some(existing) = acc
+        .config
+        .frontend_tls_namespace_sources
+        .iter()
+        .find(|source| source.namespace == source_namespace)
+    {
+        if existing.cert_path == cert_source && existing.key_path == key_source {
+            return Some(existing.clone());
+        }
+        acc.warnings.push(format!(
+            "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace {} already uses {}; keeping the first materialized certificate for that data plane",
+            object.metadata.namespace,
+            object.metadata.name,
+            cert_source,
+            source_namespace,
+            existing.cert_path
+        ));
+        return None;
+    }
+
+    let source = FrontendTlsNamespaceSource {
+        namespace: source_namespace,
+        cert_path: cert_source,
+        key_path: key_source,
+    };
+    acc.config
+        .frontend_tls_namespace_sources
+        .push(source.clone());
+    acc.config
+        .frontend_tls_namespace_sources
+        .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    Some(source)
 }
 
 fn gateway_frontend_tls_sources(
@@ -3057,6 +3085,75 @@ mod tests {
         assert_eq!(
             result.config.frontend_tls_source_namespace.as_deref(),
             Some("default")
+        );
+        assert_eq!(result.config.frontend_tls_namespace_sources.len(), 1);
+        assert_eq!(
+            result.config.frontend_tls_namespace_sources[0].namespace,
+            "default"
+        );
+    }
+
+    #[test]
+    fn gateway_frontend_tls_sources_are_partitioned_by_gateway_namespace() {
+        let mut gateway_a = object_in_namespace(
+            "Gateway",
+            "ns-a",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-a"}]}
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "gateway-a".to_string();
+        let mut gateway_b = object_in_namespace(
+            "Gateway",
+            "ns-b",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-b"}]}
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "gateway-b".to_string();
+        let secret_a = tls_secret("cert-a", "ns-a", true);
+        let secret_b = tls_secret("cert-b", "ns-b", true);
+
+        let result = translate_k8s_objects(
+            &[gateway_a, gateway_b, secret_a, secret_b],
+            options().with_source_namespaces(vec!["ns-a".to_string(), "ns-b".to_string()]),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.frontend_tls_namespace_sources.len(), 2);
+        let source_a = result
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .find(|source| source.namespace == "ns-a")
+            .expect("ns-a TLS source should be retained");
+        let source_b = result
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .find(|source| source.namespace == "ns-b")
+            .expect("ns-b TLS source should be retained");
+        assert!(
+            source_a
+                .cert_path
+                .starts_with("k8s://ns-a/cert-a#tls.crt?sha256=")
+        );
+        assert!(
+            source_b
+                .cert_path
+                .starts_with("k8s://ns-b/cert-b#tls.crt?sha256=")
         );
     }
 
