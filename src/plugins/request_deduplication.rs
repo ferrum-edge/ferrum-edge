@@ -752,7 +752,9 @@ fn request_headers_for_fingerprint<'a>(
             || SYNTHETIC_FINGERPRINT_EXCLUSIONS
                 .iter()
                 .any(|excluded| normalized == *excluded)
-            || connection_listed.iter().any(|listed| normalized == listed.as_str())
+            || connection_listed
+                .iter()
+                .any(|listed| normalized == listed.as_str())
         {
             continue;
         }

@@ -1228,7 +1228,9 @@ async fn test_reused_key_different_synthetic_headers_replays() {
     );
     first_headers.insert("x-request-id".to_string(), "request-a".to_string());
     assert!(matches!(
-        plugin.before_proxy(&mut first_ctx, &mut first_headers).await,
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
         PluginResult::Continue
     ));
     complete_response(&plugin, &mut first_ctx).await;
@@ -1241,7 +1243,9 @@ async fn test_reused_key_different_synthetic_headers_replays() {
     );
     second_headers.insert("x-request-id".to_string(), "request-b".to_string());
 
-    let result = plugin.before_proxy(&mut second_ctx, &mut second_headers).await;
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
     assert!(matches!(result, PluginResult::RejectBinary { .. }));
 }
 
@@ -1254,7 +1258,9 @@ async fn test_reused_key_different_connection_listed_header_replays() {
     first_headers.insert("connection".to_string(), "x-debug-route".to_string());
     first_headers.insert("x-debug-route".to_string(), "blue".to_string());
     assert!(matches!(
-        plugin.before_proxy(&mut first_ctx, &mut first_headers).await,
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
         PluginResult::Continue
     ));
     complete_response(&plugin, &mut first_ctx).await;
@@ -1264,7 +1270,9 @@ async fn test_reused_key_different_connection_listed_header_replays() {
     second_headers.insert("connection".to_string(), "x-debug-route".to_string());
     second_headers.insert("x-debug-route".to_string(), "green".to_string());
 
-    let result = plugin.before_proxy(&mut second_ctx, &mut second_headers).await;
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
     assert!(matches!(result, PluginResult::RejectBinary { .. }));
 }
 
