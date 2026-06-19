@@ -312,6 +312,61 @@ async fn test_skips_non_compressible_content_type() {
     assert!(!resp_headers.contains_key("content-encoding"));
 }
 
+#[tokio::test]
+async fn test_cache_control_no_transform_disables_compression() {
+    let cases = [
+        "no-transform",
+        "public, max-age=60, no-transform",
+        "public, No-TrAnSfOrM",
+        " public ,   no-transform  ",
+    ];
+
+    for cache_control in cases {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+        resp_headers.insert("cache-control".to_string(), cache_control.to_string());
+
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+        assert!(
+            !ctx.metadata.contains_key("compression:algorithm"),
+            "algorithm should not be selected for Cache-Control: {cache_control}"
+        );
+        assert!(
+            !resp_headers.contains_key("content-encoding"),
+            "Content-Encoding should not be set for Cache-Control: {cache_control}"
+        );
+        assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+        assert_eq!(resp_headers.get("cache-control").unwrap(), cache_control);
+    }
+}
+
+#[tokio::test]
+async fn test_cache_control_substring_no_transform_does_not_disable_compression() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert(
+        "cache-control".to_string(),
+        "public, x-no-transform".to_string(),
+    );
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert!(!resp_headers.contains_key("content-length"));
+}
+
 #[test]
 fn test_response_buffering_is_narrowed_by_content_type() {
     let plugin = make_plugin(json!({}));
@@ -350,6 +405,35 @@ fn test_response_buffering_is_narrowed_by_content_type() {
         &headers
     ));
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
+}
+
+#[test]
+fn test_response_buffering_skips_cache_control_no_transform() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    headers.insert(
+        "cache-control".to_string(),
+        "public, no-transform".to_string(),
+    );
+
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+
+    headers.insert(
+        "cache-control".to_string(),
+        "public, x-no-transform".to_string(),
+    );
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
 }
 
 #[test]
@@ -785,6 +869,23 @@ async fn test_compresses_tiny_body_when_committed_in_transform() {
         .read_to_end(&mut decompressed)
         .expect("output must be valid gzip");
     assert_eq!(decompressed, tiny_body);
+}
+
+#[tokio::test]
+async fn test_transform_response_body_rechecks_no_transform_before_compressing() {
+    let plugin = make_plugin(json!({"min_content_length": 10}));
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    resp_headers.insert("cache-control".to_string(), "no-transform".to_string());
+
+    let result = plugin
+        .transform_response_body(b"compressible body", Some("application/json"), &resp_headers)
+        .await;
+
+    assert!(result.is_none());
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert_eq!(resp_headers.get("cache-control").unwrap(), "no-transform");
 }
 
 #[tokio::test]

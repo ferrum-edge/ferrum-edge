@@ -12088,7 +12088,7 @@ components:
 
     CompressionConfig:
       type: object
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression."
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors Cache-Control: no-transform by leaving the response body and representation headers unchanged."
       properties:
         algorithms:
           type: array

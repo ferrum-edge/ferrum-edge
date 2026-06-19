@@ -419,6 +419,17 @@ fn comma_header_contains_token(value: &str, token: &str) -> bool {
         .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
+fn cache_control_has_directive(value: &str, directive: &str) -> bool {
+    value.split(',').any(|part| {
+        let part = part.trim();
+        let directive_name = part
+            .split_once('=')
+            .map(|(name, _)| name.trim())
+            .unwrap_or(part);
+        directive_name.eq_ignore_ascii_case(directive)
+    })
+}
+
 /// Read from `reader` into a `Vec`, enforcing a maximum decompressed size.
 fn read_with_limit(
     reader: &mut dyn Read,
@@ -569,6 +580,12 @@ impl Plugin for CompressionPlugin {
         {
             return false;
         }
+        if response_headers
+            .get("cache-control")
+            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
+        {
+            return false;
+        }
         self.should_buffer_response_body(ctx)
             && content_type.is_some_and(|ct| self.is_compressible_content_type(ct))
     }
@@ -702,6 +719,15 @@ impl Plugin for CompressionPlugin {
             return PluginResult::Continue;
         }
 
+        // RFC 9111 no-transform forbids an intermediary from transforming the
+        // payload representation, including content-coding compression.
+        if response_headers
+            .get("cache-control")
+            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
+        {
+            return PluginResult::Continue;
+        }
+
         // Skip if response already has Content-Encoding (don't double-compress).
         if response_headers.contains_key("content-encoding") {
             return PluginResult::Continue;
@@ -829,6 +855,13 @@ impl Plugin for CompressionPlugin {
             "br" => Algorithm::Brotli,
             _ => return None,
         };
+
+        if response_headers
+            .get("cache-control")
+            .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
+        {
+            return None;
+        }
 
         // CRITICAL: once `after_proxy` set `Content-Encoding`, the response
         // is committed to that encoding. We MUST NOT short-circuit here on

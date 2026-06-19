@@ -2654,11 +2654,13 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Skip conditions** (checked in order):
 1. Response status is 204 or 304
-2. Response already has `Content-Encoding` (no double-compression)
-3. `disable_on_etag` is true and response has an `ETag` header
-4. Response `Content-Type` is not in the whitelist
-5. Response `Content-Length` is below `min_content_length`
-6. Client did not send `Accept-Encoding` with a supported algorithm
+2. Response is a range response (`206`, `Content-Range`, or an internal range marker)
+3. Response has `Cache-Control: no-transform`
+4. Response already has `Content-Encoding` (no double-compression)
+5. `disable_on_etag` is true and response has an `ETag` header
+6. Response `Content-Type` is not in the whitelist
+7. Response `Content-Length` is below `min_content_length`
+8. Client did not send `Accept-Encoding` with a supported algorithm
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
