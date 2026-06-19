@@ -113,6 +113,7 @@ use crate::service_discovery::ServiceDiscoveryManager;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::backend::BackendTlsConfigBuilder;
+use crate::util::http_headers::headers_have_cache_control_directive;
 use crate::tls::source::{CertSource, MaterialKind};
 
 use self::backend_capabilities::{
@@ -159,6 +160,30 @@ pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_respo
 /// must not commit a body transform header (e.g. `Content-Encoding`) that its
 /// buffered-only `transform_response_body` will never actually apply.
 pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
+
+/// Marker recorded in `ctx.metadata` when the ORIGINAL backend response carried
+/// `Cache-Control: no-transform`, captured before any `after_proxy` hook can
+/// mutate response headers. Compression reads this to preserve the backend's
+/// no-transform directive even if an earlier response header transformer removes
+/// or renames `Cache-Control` before compression's own `after_proxy` hook.
+pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform_response";
+
+pub(crate) fn stamp_original_response_metadata(
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) {
+    if response_status == 206 || response_headers.contains_key("content-range") {
+        ctx.metadata
+            .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
+    }
+    if headers_have_cache_control_directive(response_headers, "no-transform") {
+        ctx.metadata.insert(
+            NO_TRANSFORM_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+}
 
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
@@ -15066,16 +15091,10 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
-    // Record the ORIGINAL backend range decision before any `after_proxy` hook
-    // can rewrite the headers. A later plugin (e.g. `response_transformer`) may
-    // strip/rename `Content-Range`, which would otherwise let a body-transform
-    // plugin (`compression`) commit a transform header on a streamed range
-    // response whose body is never actually transformed. Only inserted for
-    // range responses, so the common path stays allocation-free.
-    if response_status == 206 || response_headers.contains_key("content-range") {
-        ctx.metadata
-            .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
-    }
+    // Record original backend response invariants before any `after_proxy` hook
+    // can rewrite headers. Compression preserves these markers even if an earlier
+    // hook strips/renames `Content-Range` or `Cache-Control`.
+    stamp_original_response_metadata(&mut ctx, response_status, &response_headers);
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
     annotate_gateway_mesh_metadata(

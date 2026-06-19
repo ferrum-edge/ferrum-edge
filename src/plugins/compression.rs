@@ -16,6 +16,8 @@ use std::fmt;
 use std::io::{Read, Write};
 use tracing::{debug, error, warn};
 
+use crate::util::http_headers::headers_have_cache_control_directive;
+
 use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,53 +421,6 @@ fn comma_header_contains_token(value: &str, token: &str) -> bool {
         .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
-fn cache_control_has_directive(value: &str, directive: &str) -> bool {
-    let mut segment_start = 0;
-    let mut in_quote = false;
-    let mut escaped = false;
-
-    for (idx, ch) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if in_quote && ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == '"' {
-            in_quote = !in_quote;
-            continue;
-        }
-        if ch == ',' && !in_quote {
-            if cache_control_segment_has_directive(&value[segment_start..idx], directive) {
-                return true;
-            }
-            segment_start = idx + ch.len_utf8();
-        }
-    }
-
-    cache_control_segment_has_directive(&value[segment_start..], directive)
-}
-
-fn cache_control_segment_has_directive(segment: &str, directive: &str) -> bool {
-    let segment = segment.trim();
-    let directive_name = segment
-        .split_once('=')
-        .map(|(name, _)| name.trim())
-        .unwrap_or(segment);
-    directive_name.eq_ignore_ascii_case(directive)
-}
-
-fn headers_have_cache_control_directive(
-    headers: &HashMap<String, String>,
-    directive: &str,
-) -> bool {
-    headers
-        .get("cache-control")
-        .is_some_and(|value| cache_control_has_directive(value, directive))
-}
-
 /// Read from `reader` into a `Vec`, enforcing a maximum decompressed size.
 fn read_with_limit(
     reader: &mut dyn Read,
@@ -619,6 +574,10 @@ impl Plugin for CompressionPlugin {
             || ctx
                 .metadata
                 .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || headers_have_cache_control_directive(response_headers, "no-transform")
         {
             return false;
         }
@@ -774,8 +733,14 @@ impl Plugin for CompressionPlugin {
         }
 
         // RFC 9111 no-transform forbids an intermediary from transforming the
-        // payload representation, including content-coding compression.
-        if headers_have_cache_control_directive(response_headers, "no-transform") {
+        // payload representation, including content-coding compression. The
+        // marker preserves the original backend directive if an earlier hook
+        // removed or renamed Cache-Control before compression runs.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || headers_have_cache_control_directive(response_headers, "no-transform")
+        {
             return PluginResult::Continue;
         }
 

@@ -348,6 +348,28 @@ async fn test_cache_control_no_transform_disables_compression() {
 }
 
 #[tokio::test]
+async fn test_original_no_transform_marker_disables_compression_when_header_removed() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx.metadata.insert(
+        "ferrum:no_transform_response".to_string(),
+        "true".to_string(),
+    );
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+}
+
+#[tokio::test]
 async fn test_cache_control_substring_no_transform_does_not_disable_compression() {
     let plugin = make_plugin(json!({}));
     let mut ctx = make_ctx(Some("gzip"));
@@ -460,7 +482,7 @@ fn test_response_buffering_is_narrowed_by_content_type() {
 }
 
 #[test]
-fn test_response_buffering_keeps_cache_control_no_transform_eligible() {
+fn test_response_buffering_skips_cache_control_no_transform() {
     let plugin = make_plugin(json!({}));
     let ctx = make_ctx(Some("gzip"));
     let mut headers = HashMap::new();
@@ -469,7 +491,7 @@ fn test_response_buffering_keeps_cache_control_no_transform_eligible() {
         "public, no-transform".to_string(),
     );
 
-    assert!(plugin.should_buffer_response_body_for_content_type(
+    assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json"),
         200,
@@ -481,6 +503,25 @@ fn test_response_buffering_keeps_cache_control_no_transform_eligible() {
         "public, x-no-transform".to_string(),
     );
     assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+}
+
+#[test]
+fn test_response_buffering_skips_no_transform_response_via_metadata_marker() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.metadata.insert(
+        "ferrum:no_transform_response".to_string(),
+        "true".to_string(),
+    );
+
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "1000".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json"),
         200,
