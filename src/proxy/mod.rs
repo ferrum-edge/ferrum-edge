@@ -22707,10 +22707,7 @@ mod tests {
         ctx.headers
             .insert("accept-encoding".to_string(), "gzip".to_string());
         let mut response_headers = HashMap::from([
-            (
-                "content-type".to_string(),
-                "application/json".to_string(),
-            ),
+            ("content-type".to_string(), "application/json".to_string()),
             ("content-length".to_string(), "5000".to_string()),
         ]);
 
@@ -24540,14 +24537,8 @@ mod tests {
             .headers
             .insert("accept-encoding".to_string(), "gzip".to_string());
         let no_transform_headers = HashMap::from([
-            (
-                "content-type".to_string(),
-                "application/json".to_string(),
-            ),
-            (
-                "cache-control".to_string(),
-                "no-transform".to_string(),
-            ),
+            ("content-type".to_string(), "application/json".to_string()),
+            ("cache-control".to_string(), "no-transform".to_string()),
         ]);
         let compression_relabel_plugins: Vec<Arc<dyn Plugin>> = vec![
             Arc::new(CompressionPlugin::new(&json!({})).unwrap()),

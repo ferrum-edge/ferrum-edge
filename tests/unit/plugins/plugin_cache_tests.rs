@@ -2210,15 +2210,9 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
 
     assert_eq!(plugins.len(), 2);
     assert_eq!(plugins[0].name(), "response_transformer");
-    assert!(plugins[0].may_modify_response_content_type(
-        &ctx,
-        Some("application/octet-stream")
-    ));
+    assert!(plugins[0].may_modify_response_content_type(&ctx, Some("application/octet-stream")));
     assert_eq!(plugins[1].name(), "security_headers");
-    assert!(plugins[1].may_add_response_cache_control_no_transform(
-        &ctx,
-        &response_headers
-    ));
+    assert!(plugins[1].may_add_response_cache_control_no_transform(&ctx, &response_headers));
 }
 
 #[test]
