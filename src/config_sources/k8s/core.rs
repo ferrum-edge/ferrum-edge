@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -9,7 +9,8 @@ use crate::modes::mesh::config::{
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, port_from_u64, string_field,
+    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, RouteBackend, port_from_u64,
+    string_field,
 };
 
 #[derive(Debug, Default)]
@@ -41,6 +42,7 @@ impl PodKey {
 #[derive(Debug)]
 struct CoreService {
     ports: Vec<ServicePort>,
+    has_selector: bool,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
@@ -66,7 +68,14 @@ struct CorePod {
 #[derive(Debug)]
 struct CoreEndpointSlice {
     service_key: K8sServiceKey,
+    ports: Vec<CoreEndpointSlicePort>,
     endpoints: Vec<CoreEndpoint>,
+}
+
+#[derive(Debug)]
+struct CoreEndpointSlicePort {
+    name: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -244,6 +253,11 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
         key,
         CoreService {
             ports: service_ports,
+            has_selector: object
+                .spec
+                .get("selector")
+                .and_then(Value::as_object)
+                .is_some_and(|selector| !selector.is_empty()),
             cluster_ips,
         },
     );
@@ -304,6 +318,29 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
         return;
     };
 
+    let ports = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|port| {
+            let name = string_field(port, "name")
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned);
+            let port = port
+                .get("port")
+                .and_then(Value::as_u64)
+                .filter(|port| *port != 0 && *port <= u16::MAX as u64)
+                .map(|port| port as u16);
+            if name.is_none() && port.is_none() {
+                None
+            } else {
+                Some(CoreEndpointSlicePort { name, port })
+            }
+        })
+        .collect();
+
     let endpoints = object
         .spec
         .get("endpoints")
@@ -330,8 +367,92 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
 
     acc.core.endpoint_slices.push(CoreEndpointSlice {
         service_key,
+        ports,
         endpoints,
     });
+}
+
+pub(super) fn endpoint_route_backends_for_service(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    weight: u32,
+) -> Vec<RouteBackend> {
+    if !acc.options.pod_discovery_enabled {
+        return Vec::new();
+    }
+    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), service_name.to_string())
+    else {
+        return Vec::new();
+    };
+    let Some(service) = acc.core.services.get(&service_key) else {
+        return Vec::new();
+    };
+    if service.has_selector && !service.cluster_ips.is_empty() {
+        return Vec::new();
+    }
+
+    let service_port_spec = service
+        .ports
+        .iter()
+        .find(|candidate| candidate.port == service_port);
+    let mut seen = BTreeSet::new();
+    let mut backends = Vec::new();
+    for slice in acc
+        .core
+        .endpoint_slices
+        .iter()
+        .filter(|slice| slice.service_key == service_key)
+    {
+        let Some(target_port) = endpoint_backend_port(service_port_spec, service_port, slice)
+        else {
+            continue;
+        };
+        for endpoint in slice.endpoints.iter().filter(|endpoint| endpoint.ready) {
+            for address in &endpoint.addresses {
+                if address.is_empty() {
+                    continue;
+                }
+                if seen.insert((address.clone(), target_port)) {
+                    backends.push(RouteBackend {
+                        host: address.clone(),
+                        port: target_port,
+                        weight,
+                    });
+                }
+            }
+        }
+    }
+    backends
+}
+
+fn endpoint_backend_port(
+    service_port_spec: Option<&ServicePort>,
+    service_port: u16,
+    slice: &CoreEndpointSlice,
+) -> Option<u16> {
+    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => Some(*port),
+        Some(ServiceTargetPort::Name(name)) => slice
+            .ports
+            .iter()
+            .find(|port| port.name.as_deref() == Some(name.as_str()))
+            .and_then(|port| port.port),
+        Some(ServiceTargetPort::Number(_)) => None,
+        None => {
+            if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref())
+                && let Some(port) = slice
+                    .ports
+                    .iter()
+                    .find(|port| port.name.as_deref() == Some(name))
+                    .and_then(|port| port.port)
+            {
+                return Some(port);
+            }
+            Some(service_port)
+        }
+    }
 }
 
 fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {

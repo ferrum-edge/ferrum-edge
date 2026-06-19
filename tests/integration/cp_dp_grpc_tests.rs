@@ -1677,6 +1677,7 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
             "ferrum".to_string(),
             0,
             None,
+            None,
         )
         .await;
     });

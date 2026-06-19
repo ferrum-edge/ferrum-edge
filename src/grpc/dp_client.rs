@@ -316,6 +316,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     namespace: String,
     primary_retry_secs: u64,
     connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    frontend_tls_slot: Option<crate::tls::SharedFrontendTls>,
 ) {
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start DP client");
@@ -437,6 +438,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     &namespace,
                     connection_state.as_ref(),
                     is_primary,
+                    frontend_tls_slot.as_ref(),
                 ) => res,
                 _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
                     info!(
@@ -471,6 +473,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     &namespace,
                     connection_state.as_ref(),
                     is_primary,
+                    frontend_tls_slot.as_ref(),
                 ) => res,
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
@@ -699,6 +702,75 @@ fn apply_gateway_trust_bundle_update(
     }
 }
 
+async fn apply_frontend_tls_snapshot(
+    config: &GatewayConfig,
+    proxy_state: &ProxyState,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+) -> Result<(), anyhow::Error> {
+    match (
+        config.frontend_tls_cert_path.as_deref(),
+        config.frontend_tls_key_path.as_deref(),
+    ) {
+        (None, None) => return Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "frontend TLS config must include both frontend_tls_cert_path and frontend_tls_key_path"
+            );
+        }
+        (Some(cert_path), Some(key_path)) => {
+            let Some(slot) = frontend_tls_slot else {
+                anyhow::bail!(
+                    "frontend TLS material was provided by CP but this DP did not start an HTTPS listener"
+                );
+            };
+            let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
+                anyhow::bail!(
+                    "frontend TLS material was provided by CP but this DP has no TLS policy"
+                );
+            };
+
+            let mut tls_config = crate::tls::load_tls_config_with_client_auth_and_ocsp(
+                cert_path,
+                key_path,
+                proxy_state
+                    .env_config
+                    .frontend_tls_client_ca_bundle_path
+                    .as_deref(),
+                proxy_state
+                    .env_config
+                    .frontend_tls_ocsp_response_source
+                    .as_deref(),
+                false,
+                tls_policy,
+                proxy_state.env_config.tls_cert_expiry_warning_days,
+                proxy_state.crls.as_ref().as_slice(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to materialize frontend TLS certificate source {}: {}",
+                    cert_path,
+                    error
+                )
+            })?;
+            crate::tls::enable_early_data(&mut tls_config, tls_policy);
+            if proxy_state.env_config.ktls_enabled.could_be_enabled() {
+                crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
+            }
+
+            slot.store(Arc::new(Some(tls_config.clone())));
+            proxy_state
+                .stream_listener_manager
+                .set_frontend_tls_config(Some(tls_config))
+                .await;
+            info!(
+                cert_source = %cert_path,
+                "Applied CP-delivered Gateway frontend TLS material"
+            );
+            Ok(())
+        }
+    }
+}
+
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
@@ -718,6 +790,7 @@ pub async fn connect_and_subscribe(
         namespace,
         None,
         true,
+        None,
     )
     .await
 }
@@ -734,6 +807,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
     namespace: &str,
     connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
     is_primary: bool,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -935,6 +1009,14 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             error!(
                                 "Ignoring config update with invalid mesh_route_dispatch upstream references"
                             );
+                            continue;
+                        }
+                        if let Err(error) =
+                            apply_frontend_tls_snapshot(&config, proxy_state, frontend_tls_slot)
+                                .await
+                        {
+                            error!("CP config rejected — {}", error);
+                            error!("Ignoring config update with unusable frontend TLS material");
                             continue;
                         }
                         match proxy_state.update_config(config) {
@@ -1154,10 +1236,36 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
     config.consumers.retain(|c| c.namespace == namespace);
     config.plugin_configs.retain(|pc| pc.namespace == namespace);
     config.upstreams.retain(|u| u.namespace == namespace);
+    let frontend_tls_filtered = filter_frontend_tls_sources_to_namespace(config, namespace);
     (pre.0 - config.proxies.len())
         + (pre.1 - config.consumers.len())
         + (pre.2 - config.plugin_configs.len())
         + (pre.3 - config.upstreams.len())
+        + usize::from(frontend_tls_filtered)
+}
+
+fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) -> bool {
+    let cert_namespace = config
+        .frontend_tls_cert_path
+        .as_deref()
+        .and_then(k8s_source_namespace);
+    let key_namespace = config
+        .frontend_tls_key_path
+        .as_deref()
+        .and_then(k8s_source_namespace);
+    let foreign = [cert_namespace, key_namespace]
+        .into_iter()
+        .flatten()
+        .any(|source_namespace| source_namespace != namespace);
+    if foreign {
+        config.frontend_tls_cert_path = None;
+        config.frontend_tls_key_path = None;
+    }
+    foreign
+}
+
+fn k8s_source_namespace(source: &str) -> Option<&str> {
+    source.strip_prefix("k8s://")?.split('/').next()
 }
 
 /// Defense-in-depth filter for incremental deltas. Applied to
@@ -1368,6 +1476,8 @@ mod tests {
             ],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
             trust_bundles: None,
             mesh: None,
         };
@@ -1395,11 +1505,49 @@ mod tests {
             upstreams: vec![],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
             trust_bundles: None,
             mesh: None,
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);
+    }
+
+    #[test]
+    fn filter_config_clears_foreign_frontend_tls_sources() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 1);
+        assert_eq!(cfg.frontend_tls_cert_path, None);
+        assert_eq!(cfg.frontend_tls_key_path, None);
+    }
+
+    #[test]
+    fn filter_config_keeps_matching_frontend_tls_sources() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://production/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://production/gateway-cert#tls.key".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        assert_eq!(
+            cfg.frontend_tls_cert_path.as_deref(),
+            Some("k8s://production/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            cfg.frontend_tls_key_path.as_deref(),
+            Some("k8s://production/gateway-cert#tls.key")
+        );
     }
 
     #[test]

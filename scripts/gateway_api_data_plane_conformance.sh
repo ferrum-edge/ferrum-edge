@@ -55,7 +55,9 @@ install_gateway_api_crds() {
   done
 }
 
-create_frontend_tls_secret() {
+create_tls_secret() {
+  local namespace="$1"
+  local name="$2"
   local tmpdir
   tmpdir="$(mktemp -d)"
   openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
@@ -64,10 +66,14 @@ create_frontend_tls_secret() {
     -subj "/CN=*.example.com" \
     -addext "subjectAltName=DNS:*.example.com,DNS:example.com,DNS:second-example.org,DNS:*.wildcard.org,DNS:fourth-example.wildcard.org,DNS:tls.blackbox.example" \
     >/dev/null 2>&1
-  kubectl -n "$CP_NAMESPACE" create secret tls ferrum-gateway-data-plane-tls \
+  kubectl -n "$namespace" create secret tls "$name" \
     --cert="$tmpdir/tls.crt" \
     --key="$tmpdir/tls.key" \
     --dry-run=client -o yaml | kubectl apply -f -
+}
+
+create_frontend_tls_secret() {
+  create_tls_secret "$CP_NAMESPACE" ferrum-gateway-data-plane-tls
 }
 
 deploy_control_plane() {
@@ -95,6 +101,7 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
+    --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=15 \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE="$CP_NAMESPACE" \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME="$DP_SERVICE_NAME" \
@@ -248,6 +255,7 @@ apply_blackbox_backends() {
   kubectl create namespace "$BACKEND_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   kubectl label namespace "$DP_GATEWAY_NAMESPACE" gateway-conformance=backend --overwrite
   kubectl label namespace "$BACKEND_NAMESPACE" gateway-conformance=backend --overwrite
+  create_tls_secret "$DP_GATEWAY_NAMESPACE" blackbox-tls
   cat <<'YAML' | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -279,7 +287,7 @@ spec:
                   def do_GET(self): self.reply()
                   def do_POST(self): self.reply()
                   def reply(self):
-                      body = f"backend={os.environ['BACKEND_NAME']}\nmethod={self.command}\npath={self.path}\nhost={self.headers.get('host','')}\nx-ferrum-test={self.headers.get('x-ferrum-test','')}\n"
+                      body = f"backend={os.environ['BACKEND_NAME']}\nmethod={self.command}\npath={self.path}\nhost={self.headers.get('host','')}\nx-ferrum-test={self.headers.get('x-ferrum-test','')}\nx-added-by-ferrum={self.headers.get('x-added-by-ferrum','')}\n"
                       self.send_response(200)
                       self.end_headers()
                       self.wfile.write(body.encode())
@@ -329,7 +337,7 @@ spec:
                   def do_GET(self): self.reply()
                   def do_POST(self): self.reply()
                   def reply(self):
-                      body = f"backend={os.environ['BACKEND_NAME']}\nmethod={self.command}\npath={self.path}\nhost={self.headers.get('host','')}\nx-ferrum-test={self.headers.get('x-ferrum-test','')}\n"
+                      body = f"backend={os.environ['BACKEND_NAME']}\nmethod={self.command}\npath={self.path}\nhost={self.headers.get('host','')}\nx-ferrum-test={self.headers.get('x-ferrum-test','')}\nx-added-by-ferrum={self.headers.get('x-added-by-ferrum','')}\n"
                       self.send_response(200)
                       self.end_headers()
                       self.wfile.write(body.encode())
@@ -379,7 +387,7 @@ spec:
                   def do_GET(self): self.reply()
                   def do_POST(self): self.reply()
                   def reply(self):
-                      body = f"backend={os.environ['BACKEND_NAME']}\nmethod={self.command}\npath={self.path}\nhost={self.headers.get('host','')}\nx-ferrum-test={self.headers.get('x-ferrum-test','')}\n"
+                      body = f"backend={os.environ['BACKEND_NAME']}\nmethod={self.command}\npath={self.path}\nhost={self.headers.get('host','')}\nx-ferrum-test={self.headers.get('x-ferrum-test','')}\nx-added-by-ferrum={self.headers.get('x-added-by-ferrum','')}\n"
                       self.send_response(200)
                       self.end_headers()
                       self.wfile.write(body.encode())
@@ -442,7 +450,7 @@ spec:
       tls:
         mode: Terminate
         certificateRefs:
-          - name: unused-by-ferrum-static-dp-tls
+          - name: blackbox-tls
       allowedRoutes:
         namespaces:
           from: Same
@@ -483,6 +491,31 @@ spec:
       backendRefs:
         - name: blackbox-b
           port: 8080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /modifier
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: x-added-by-ferrum
+                value: ok
+      backendRefs:
+        - name: blackbox-a
+          port: 8080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /redirect
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            hostname: redirected.blackbox.example
+            path:
+              type: ReplaceFullPath
+              replaceFullPath: /redirected
+            statusCode: 302
     - matches:
         - path:
             type: PathPrefix
@@ -645,6 +678,13 @@ curl_status() {
     -H "Host: ${host}" "http://${GATEWAY_API_STATUS_ADDRESS}${path}"
 }
 
+curl_redirect() {
+  local host="$1"
+  local path="$2"
+  curl --silent --output /dev/null --write-out '%{http_code} %{redirect_url}' --max-time 10 \
+    -H "Host: ${host}" "http://${GATEWAY_API_STATUS_ADDRESS}${path}"
+}
+
 wait_for_body_contains() {
   local host="$1"
   local path="$2"
@@ -671,7 +711,16 @@ run_blackbox_tests() {
   wait_for_body_contains blackbox.example /host "backend=blackbox-a" | tee -a "$report"
   wait_for_body_contains blackbox.example /method "method=POST" -X POST | tee -a "$report"
   wait_for_body_contains blackbox.example /header "x-ferrum-test=ok" -H "x-ferrum-test: ok" | tee -a "$report"
+  wait_for_body_contains blackbox.example /modifier "x-added-by-ferrum=ok" | tee -a "$report"
   wait_for_body_contains cross.blackbox.example /cross "backend=blackbox-cross" | tee -a "$report"
+
+  local redirect
+  redirect="$(curl_redirect blackbox.example /redirect)"
+  if [ "$redirect" != "302 http://redirected.blackbox.example/redirected" ]; then
+    echo "unexpected redirect response: ${redirect}" >&2
+    return 1
+  fi
+  echo "request redirect returned ${redirect}" >> "$report"
 
   local seen_a=0
   local seen_b=0
@@ -688,8 +737,8 @@ run_blackbox_tests() {
 
   local invalid_status
   invalid_status="$(curl_status blackbox.example /invalid)"
-  if [ "$invalid_status" = "200" ]; then
-    echo "invalid backendRef returned 200" >&2
+  if [ "$invalid_status" != "500" ]; then
+    echo "invalid backendRef returned ${invalid_status}, expected 500" >&2
     return 1
   fi
   echo "invalid backendRef failed closed with HTTP ${invalid_status}" >> "$report"

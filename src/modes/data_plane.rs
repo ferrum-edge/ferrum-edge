@@ -247,6 +247,12 @@ pub async fn run(
             "Frontend TLS live reload enabled for DP proxy HTTPS (H1/H2) and HTTP/3"
         );
     }
+    let proxy_frontend_tls_slot = tls_config.as_ref().map(|cfg| {
+        proxy_frontend_reload_handles
+            .as_ref()
+            .and_then(|handles| handles.slot.clone())
+            .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
+    });
 
     // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
     if let Some(ref tls_cfg) = tls_config {
@@ -318,12 +324,10 @@ pub async fn run(
         let https_state = proxy_state.clone();
         let https_shutdown = shutdown_tx.subscribe();
         let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
-        let reload_slot = proxy_frontend_reload_handles
-            .as_ref()
-            .and_then(|h| h.slot.clone());
+        let tls_slot = proxy_frontend_tls_slot.clone();
         let https_handle = tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
-            let result = if let Some(slot) = reload_slot {
+            let result = if let Some(slot) = tls_slot {
                 proxy::start_proxy_listener_with_dynamic_tls_and_signal(
                     https_addr,
                     https_state,
@@ -573,6 +577,7 @@ pub async fn run(
     let dp_namespace = env_config.namespace.clone();
     let dp_primary_retry_secs = env_config.dp_cp_failover_primary_retry_secs;
     let dp_conn_state = cp_connection_state.clone();
+    let dp_frontend_tls_slot = proxy_frontend_tls_slot.clone();
     let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown_and_startup_ready(
             cp_urls,
@@ -585,6 +590,7 @@ pub async fn run(
             dp_namespace,
             dp_primary_retry_secs,
             Some(dp_conn_state),
+            dp_frontend_tls_slot,
         )
         .await;
     });

@@ -985,13 +985,20 @@ fn route_status(
         match result {
             Ok(translation) => {
                 let programmed = route_programmed(object, &translation.config);
+                let unresolved_refs_reason = route_unresolved_backend_ref_reason(objects, object);
+                let resolved_refs = unresolved_refs_reason.is_none();
+                let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
                 (
                     true,
-                    true,
+                    resolved_refs,
                     programmed,
                     if programmed { "Accepted" } else { "NoRules" },
-                    "ResolvedRefs",
-                    if programmed {
+                    resolved_refs_reason,
+                    if !resolved_refs {
+                        format!(
+                            "Ferrum accepted this route but could not resolve all backendRefs: {resolved_refs_reason}"
+                        )
+                    } else if programmed {
                         "Ferrum accepted and programmed this route".to_string()
                     } else {
                         "Ferrum accepted this route but no materialized rule was produced"
@@ -1769,6 +1776,133 @@ fn route_programmed(object: &K8sObject, config: &crate::config::types::GatewayCo
             .first()
             .is_some_and(|byte| byte.is_ascii_digit())
     })
+}
+
+fn route_unresolved_backend_ref_reason(
+    objects: &[K8sObject],
+    route: &K8sObject,
+) -> Option<&'static str> {
+    let services_observed = objects.iter().any(|object| object.kind == "Service");
+    for backend_ref in route
+        .spec
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| rule.get("backendRefs").and_then(Value::as_array))
+        .flatten()
+    {
+        if backend_ref.get("weight").and_then(Value::as_u64) == Some(0) {
+            continue;
+        }
+        let to_group = backend_ref
+            .get("group")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let to_kind = backend_ref
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("Service");
+        if !to_group.is_empty() || to_kind != "Service" {
+            return Some("InvalidKind");
+        }
+
+        let backend_namespace = backend_ref
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(&route.metadata.namespace);
+        let backend_name = backend_ref.get("name").and_then(Value::as_str);
+        if backend_namespace != route.metadata.namespace
+            && !reference_grant_allows_backend_ref(
+                objects,
+                route,
+                backend_namespace,
+                to_group,
+                to_kind,
+                backend_name,
+            )
+        {
+            return Some("RefNotPermitted");
+        }
+        if services_observed
+            && let Some(backend_name) = backend_name
+            && !objects.iter().any(|object| {
+                object.kind == "Service"
+                    && object.metadata.namespace == backend_namespace
+                    && object.metadata.name == backend_name
+            })
+        {
+            return Some("BackendNotFound");
+        }
+    }
+
+    None
+}
+
+fn reference_grant_allows_backend_ref(
+    objects: &[K8sObject],
+    route: &K8sObject,
+    to_namespace: &str,
+    to_group: &str,
+    to_kind: &str,
+    to_name: Option<&str>,
+) -> bool {
+    objects
+        .iter()
+        .filter(|object| {
+            object.kind == "ReferenceGrant" && object.metadata.namespace == to_namespace
+        })
+        .any(|grant| {
+            reference_grant_has_route_from(grant, route)
+                && reference_grant_has_backend_to(grant, to_group, to_kind, to_name)
+        })
+}
+
+fn reference_grant_has_route_from(grant: &K8sObject, route: &K8sObject) -> bool {
+    grant
+        .spec
+        .get("from")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|from| {
+            from.get("group")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                == api_group(&route.api_version)
+                && from.get("kind").and_then(Value::as_str) == Some(route.kind.as_str())
+                && from.get("namespace").and_then(Value::as_str)
+                    == Some(route.metadata.namespace.as_str())
+        })
+}
+
+fn reference_grant_has_backend_to(
+    grant: &K8sObject,
+    to_group: &str,
+    to_kind: &str,
+    to_name: Option<&str>,
+) -> bool {
+    grant
+        .spec
+        .get("to")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|to| {
+            to.get("group").and_then(Value::as_str).unwrap_or_default() == to_group
+                && to.get("kind").and_then(Value::as_str) == Some(to_kind)
+                && to
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| Some(name) == to_name)
+        })
+}
+
+fn api_group(api_version: &str) -> &str {
+    api_version
+        .split_once('/')
+        .map(|(group, _version)| group)
+        .unwrap_or_default()
 }
 
 fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
@@ -2702,7 +2836,7 @@ mod tests {
         let conditions = parents[0]["conditions"].as_array().unwrap();
         assert_condition(conditions, "Accepted", "True");
         assert_condition(conditions, "ResolvedRefs", "False");
-        assert_condition(conditions, "Programmed", "False");
+        assert_condition(conditions, "Programmed", "True");
         assert_eq!(
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Accepted")

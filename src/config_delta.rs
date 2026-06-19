@@ -370,6 +370,8 @@ mod tests {
             upstreams: vec![],
             loaded_at: ts(0),
             known_namespaces: vec![],
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
             trust_bundles: None,
             mesh: None,
         }

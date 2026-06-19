@@ -393,6 +393,16 @@ impl K8sAccumulator {
         !self.service_port_names.is_empty()
     }
 
+    pub(crate) fn endpoint_route_backends_for_service(
+        &self,
+        namespace: &str,
+        service: &str,
+        service_port: u16,
+        weight: u32,
+    ) -> Vec<RouteBackend> {
+        core::endpoint_route_backends_for_service(self, namespace, service, service_port, weight)
+    }
+
     fn observe_namespace(&mut self, namespace: &str) {
         self.known_namespaces.insert(namespace.to_string());
     }
@@ -421,6 +431,7 @@ impl K8sAccumulator {
         to_namespace: String,
         to_group: String,
         to_kind: String,
+        to_name: Option<String>,
     ) {
         self.reference_grants.insert(ReferenceGrantPermission {
             from_namespace,
@@ -429,6 +440,7 @@ impl K8sAccumulator {
             to_namespace,
             to_group,
             to_kind,
+            to_name,
         });
     }
 
@@ -440,14 +452,19 @@ impl K8sAccumulator {
         to_namespace: &str,
         to_group: &str,
         to_kind: &str,
+        to_name: Option<&str>,
     ) -> bool {
-        self.reference_grants.contains(&ReferenceGrantPermission {
-            from_namespace: from_namespace.to_string(),
-            from_group: from_group.to_string(),
-            from_kind: from_kind.to_string(),
-            to_namespace: to_namespace.to_string(),
-            to_group: to_group.to_string(),
-            to_kind: to_kind.to_string(),
+        self.reference_grants.iter().any(|grant| {
+            grant.from_namespace == from_namespace
+                && grant.from_group == from_group
+                && grant.from_kind == from_kind
+                && grant.to_namespace == to_namespace
+                && grant.to_group == to_group
+                && grant.to_kind == to_kind
+                && grant
+                    .to_name
+                    .as_deref()
+                    .is_none_or(|name| Some(name) == to_name)
         })
     }
 
@@ -546,6 +563,7 @@ struct ReferenceGrantPermission {
     to_namespace: String,
     to_group: String,
     to_kind: String,
+    to_name: Option<String>,
 }
 
 pub fn translate_k8s_objects(
@@ -1181,6 +1199,7 @@ pub(crate) fn route_local_fault_value_for_rule(fault: &Value) -> Option<Value> {
     Some(Value::Object(config))
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct MeshRouteDispatchDestination<'a> {
     pub backend_host: &'a str,
     pub backend_port: u16,

@@ -8,6 +8,7 @@ use crate::config::types::BackendScheme;
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
+use crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json;
 
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
@@ -15,8 +16,9 @@ use super::{
     K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
     RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
     invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field,
-    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id, service_dns_name,
-    string_array, string_field, upstream_for_route,
+    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
+    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route,
 };
 use crate::config::types::{PluginConfig, Proxy};
 
@@ -73,6 +75,19 @@ struct RouteHostScope {
     suffix: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidBackendRefReason {
+    InvalidKind,
+    BackendNotFound,
+    RefNotPermitted,
+}
+
+#[derive(Default)]
+struct RouteBackendResolution {
+    backends: Vec<RouteBackend>,
+    invalid: Option<InvalidBackendRefReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GatewayApiDispatchRulePrecedence {
     has_precedence: bool,
@@ -95,6 +110,7 @@ pub(super) fn translate(
             if is_waypoint_gateway(object) {
                 add_waypoint_binding(acc, object);
             }
+            materialize_gateway_frontend_tls(acc, object);
             for service in mesh_services_from_gateway(object)? {
                 acc.mesh.services.push(service);
             }
@@ -160,6 +176,7 @@ pub(super) fn collect_reference_grant(
                 invalid_resource(object, "ReferenceGrant spec.to[].kind is required")
             })?;
             let to_group = string_field(to, "group").unwrap_or_default();
+            let to_name = string_field(to, "name").map(ToOwned::to_owned);
             acc.add_reference_grant(
                 from_namespace.to_string(),
                 from_group.to_string(),
@@ -167,6 +184,7 @@ pub(super) fn collect_reference_grant(
                 object.metadata.namespace.clone(),
                 to_group.to_string(),
                 to_kind.to_string(),
+                to_name,
             );
         }
     }
@@ -198,6 +216,109 @@ pub(super) fn collect_gateway_listener_policy(
         );
     }
     Ok(())
+}
+
+fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let Some((cert_source, key_source)) = gateway_frontend_tls_sources(acc, object) else {
+        return;
+    };
+
+    match (
+        acc.config.frontend_tls_cert_path.as_deref(),
+        acc.config.frontend_tls_key_path.as_deref(),
+    ) {
+        (None, None) => {
+            acc.config.frontend_tls_cert_path = Some(cert_source);
+            acc.config.frontend_tls_key_path = Some(key_source);
+        }
+        (Some(existing_cert), Some(existing_key))
+            if existing_cert == cert_source && existing_key == key_source => {}
+        (Some(existing_cert), Some(_)) => {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace config already uses {}; keeping the first materialized certificate",
+                object.metadata.namespace, object.metadata.name, cert_source, existing_cert
+            ));
+        }
+        _ => {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace config has partial frontend TLS material; ignoring listener certificateRef",
+                object.metadata.namespace, object.metadata.name, cert_source
+            ));
+        }
+    }
+}
+
+fn gateway_frontend_tls_sources(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Option<(String, String)> {
+    let listeners = object.spec.get("listeners")?.as_array()?;
+    listeners
+        .iter()
+        .filter(|listener| listener_is_terminating_tls(listener))
+        .filter_map(|listener| listener_frontend_tls_sources(acc, object, listener))
+        .next()
+}
+
+fn listener_is_terminating_tls(listener: &Value) -> bool {
+    let Some(protocol) = string_field(listener, "protocol") else {
+        return false;
+    };
+    if !protocol.eq_ignore_ascii_case("HTTPS") && !protocol.eq_ignore_ascii_case("TLS") {
+        return false;
+    }
+    let Some(tls) = listener.get("tls") else {
+        return false;
+    };
+    string_field(tls, "mode")
+        .unwrap_or("Terminate")
+        .eq_ignore_ascii_case("Terminate")
+}
+
+fn listener_frontend_tls_sources(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    listener: &Value,
+) -> Option<(String, String)> {
+    listener
+        .get("tls")
+        .and_then(|tls| tls.get("certificateRefs"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|reference| gateway_tls_secret_ref(acc, object, reference))
+        .next()
+}
+
+fn gateway_tls_secret_ref(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    reference: &Value,
+) -> Option<(String, String)> {
+    let group = string_field(reference, "group").unwrap_or_default();
+    let kind = string_field(reference, "kind").unwrap_or("Secret");
+    if !group.is_empty() || kind != "Secret" {
+        return None;
+    }
+    let name = string_field(reference, "name")?;
+    let namespace = string_field(reference, "namespace").unwrap_or(&object.metadata.namespace);
+    if namespace != object.metadata.namespace
+        && !acc.reference_grant_allows(
+            &object.metadata.namespace,
+            "gateway.networking.k8s.io",
+            "Gateway",
+            namespace,
+            "",
+            "Secret",
+            Some(name),
+        )
+    {
+        return None;
+    }
+    Some((
+        format!("k8s://{namespace}/{name}#tls.crt"),
+        format!("k8s://{namespace}/{name}#tls.key"),
+    ))
 }
 
 fn allowed_route_namespaces(listener: &Value) -> GatewayApiAllowedRoutesNamespaces {
@@ -1297,35 +1418,48 @@ fn http_route_resources(
         match_paths.sort();
         match_paths.dedup();
 
-        let backends = route_backends(object, rule, acc)?;
-        let (backend_host, backend_port, upstream_id, mut pending_upstream) = if backends.is_empty()
-        {
-            if !has_only_zero_weight_backend_refs(rule) {
-                continue;
-            }
-            (
-                ZERO_WEIGHT_BACKEND_HOST.to_string(),
-                ZERO_WEIGHT_BACKEND_PORT,
-                None,
-                None,
-            )
-        } else if backends.len() == 1 {
-            let Some(backend) = backends.into_iter().next() else {
-                continue;
-            };
-            (backend.host, backend.port, None, None)
+        let request_transform = gateway_request_header_modifier_rules(rule);
+        let redirect = gateway_request_redirect_value(object, rule)?;
+        let backend_resolution = route_backends(object, rule, acc)?;
+        let invalid_backend_fault = if backend_resolution.backends.is_empty() {
+            backend_resolution.invalid.map(invalid_backend_fault_value)
         } else {
-            let route_suffix = format!("{route_kind}-{rule_index}");
-            let upstream_id = resource_id(
-                "gwapi-route-upstream",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &route_suffix,
-            );
-            let upstream =
-                upstream_for_route(upstream_id.clone(), config_namespace.clone(), backends);
-            (String::new(), 0, Some(upstream_id), Some(upstream))
+            None
         };
+        let has_route_actions =
+            !request_transform.is_empty() || redirect.is_some() || invalid_backend_fault.is_some();
+
+        let (backend_host, backend_port, upstream_id, mut pending_upstream) =
+            if backend_resolution.backends.is_empty() {
+                if !has_only_zero_weight_backend_refs(rule) && !has_route_actions {
+                    continue;
+                }
+                (
+                    ZERO_WEIGHT_BACKEND_HOST.to_string(),
+                    ZERO_WEIGHT_BACKEND_PORT,
+                    None,
+                    None,
+                )
+            } else if backend_resolution.backends.len() == 1 {
+                let Some(backend) = backend_resolution.backends.into_iter().next() else {
+                    continue;
+                };
+                (backend.host, backend.port, None, None)
+            } else {
+                let route_suffix = format!("{route_kind}-{rule_index}");
+                let upstream_id = resource_id(
+                    "gwapi-route-upstream",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &route_suffix,
+                );
+                let upstream = upstream_for_route(
+                    upstream_id.clone(),
+                    config_namespace.clone(),
+                    backend_resolution.backends,
+                );
+                (String::new(), 0, Some(upstream_id), Some(upstream))
+            };
 
         let match_count = match_paths.len();
         for (match_index, listen_path) in match_paths.into_iter().enumerate() {
@@ -1406,7 +1540,12 @@ fn http_route_resources(
                         },
                         &skipped_descriptors,
                         &entry_descriptors_for_path,
+                        &request_transform,
+                        redirect.as_ref(),
+                        invalid_backend_fault.as_ref(),
                     );
+                    let rules_have_request_transform =
+                        dispatch_rules_carry_field(&rules, "request_transform");
                     if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
                         &proxy_id,
                         &config_namespace,
@@ -1414,8 +1553,16 @@ fn http_route_resources(
                         !has_path_only_match,
                     ) {
                         sort_dispatch_rules(&mut plugin);
-                        attach_route_plugins_to_proxy(&mut proxy, std::slice::from_ref(&plugin));
-                        plugins.push(plugin);
+                        let mut route_plugins = Vec::new();
+                        if rules_have_request_transform {
+                            route_plugins.push(route_request_transformer_plugin_for_proxy(
+                                &proxy_id,
+                                &config_namespace,
+                            ));
+                        }
+                        route_plugins.push(plugin);
+                        attach_route_plugins_to_proxy(&mut proxy, &route_plugins);
+                        plugins.extend(route_plugins);
                     }
                 }
 
@@ -1541,11 +1688,47 @@ fn http_route_dispatch_rules_for_proxy(
     route_destination: MeshRouteDispatchDestination<'_>,
     skipped_descriptors: &HashSet<RouteMatchDescriptor>,
     entry_descriptors: &[RouteMatchEntryDescriptor],
+    request_transform: &[Value],
+    redirect: Option<&Value>,
+    fault: Option<&Value>,
 ) -> (Vec<Value>, bool) {
+    let has_route_actions = !request_transform.is_empty() || redirect.is_some() || fault.is_some();
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
+        if has_route_actions {
+            return (
+                vec![gateway_api_dispatch_route_rule(
+                    object,
+                    Value::Object(serde_json::Map::new()),
+                    rule_index,
+                    0,
+                    route_destination,
+                    request_transform,
+                    redirect,
+                    fault,
+                    &Value::Object(serde_json::Map::new()),
+                )],
+                true,
+            );
+        }
         return (Vec::new(), true);
     };
     if matches.is_empty() {
+        if has_route_actions {
+            return (
+                vec![gateway_api_dispatch_route_rule(
+                    object,
+                    Value::Object(serde_json::Map::new()),
+                    rule_index,
+                    0,
+                    route_destination,
+                    request_transform,
+                    redirect,
+                    fault,
+                    &Value::Object(serde_json::Map::new()),
+                )],
+                true,
+            );
+        }
         return (Vec::new(), true);
     }
 
@@ -1618,34 +1801,247 @@ fn http_route_dispatch_rules_for_proxy(
 
         if match_criteria.is_empty() {
             has_path_only_match = true;
+            if has_route_actions {
+                rules.push(gateway_api_dispatch_route_rule(
+                    object,
+                    Value::Object(match_criteria),
+                    rule_index,
+                    match_index,
+                    route_destination,
+                    request_transform,
+                    redirect,
+                    fault,
+                    entry,
+                ));
+            }
             continue;
         }
 
-        let mut destination = serde_json::Map::new();
-        if let Some(uid) = route_destination.upstream_id {
-            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
-        } else {
-            destination.insert(
-                "backend_host".to_string(),
-                Value::String(route_destination.backend_host.to_string()),
-            );
-            destination.insert(
-                "backend_port".to_string(),
-                serde_json::json!(route_destination.backend_port),
-            );
-        }
-
-        let mut route_rule = serde_json::Map::new();
-        route_rule.insert("match".to_string(), Value::Object(match_criteria));
-        route_rule.insert("destination".to_string(), Value::Object(destination));
-        route_rule.insert(
-            GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),
-            gateway_api_dispatch_rule_precedence(object, entry, rule_index, match_index),
-        );
-        rules.push(Value::Object(route_rule));
+        rules.push(gateway_api_dispatch_route_rule(
+            object,
+            Value::Object(match_criteria),
+            rule_index,
+            match_index,
+            route_destination,
+            request_transform,
+            redirect,
+            fault,
+            entry,
+        ));
     }
 
     (rules, has_path_only_match)
+}
+
+fn gateway_api_dispatch_route_rule(
+    object: &K8sObject,
+    match_criteria: Value,
+    rule_index: usize,
+    match_index: usize,
+    route_destination: MeshRouteDispatchDestination<'_>,
+    request_transform: &[Value],
+    redirect: Option<&Value>,
+    fault: Option<&Value>,
+    precedence_entry: &Value,
+) -> Value {
+    let mut destination = serde_json::Map::new();
+    if let Some(uid) = route_destination.upstream_id {
+        destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+    } else {
+        destination.insert(
+            "backend_host".to_string(),
+            Value::String(route_destination.backend_host.to_string()),
+        );
+        destination.insert(
+            "backend_port".to_string(),
+            serde_json::json!(route_destination.backend_port),
+        );
+    }
+
+    let mut route_rule = serde_json::Map::new();
+    route_rule.insert("match".to_string(), match_criteria);
+    route_rule.insert("destination".to_string(), Value::Object(destination));
+    if !request_transform.is_empty() {
+        route_rule.insert(
+            "request_transform".to_string(),
+            Value::Array(request_transform.to_vec()),
+        );
+    }
+    if let Some(redirect) = redirect {
+        route_rule.insert("redirect".to_string(), redirect.clone());
+    }
+    if let Some(fault) = fault {
+        route_rule.insert("fault".to_string(), fault.clone());
+    }
+    route_rule.insert(
+        GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),
+        gateway_api_dispatch_rule_precedence(object, precedence_entry, rule_index, match_index),
+    );
+    Value::Object(route_rule)
+}
+
+fn dispatch_rules_carry_field(rules: &[Value], field: &str) -> bool {
+    rules.iter().any(|rule| {
+        rule.as_object()
+            .and_then(|object| object.get(field))
+            .is_some_and(|value| value.as_array().is_none_or(|array| !array.is_empty()))
+    })
+}
+
+fn gateway_request_header_modifier_rules(rule: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(filters) = rule.get("filters").and_then(Value::as_array) else {
+        return out;
+    };
+
+    for filter in filters {
+        if string_field(filter, "type") != Some("RequestHeaderModifier") {
+            continue;
+        }
+        let Some(modifier) = filter
+            .get("requestHeaderModifier")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+
+        let set = gateway_header_name_value_entries(modifier.get("set"));
+        let add = gateway_header_name_value_entries(modifier.get("add"));
+        let remove = gateway_header_remove_entries(modifier.get("remove"));
+        out.extend(route_header_transform_rules_to_json(
+            (!set.is_empty()).then_some(&set),
+            (!add.is_empty()).then_some(&add),
+            (!remove.is_empty()).then_some(remove.as_slice()),
+        ));
+    }
+
+    out
+}
+
+fn gateway_header_name_value_entries(value: Option<&Value>) -> serde_json::Map<String, Value> {
+    let mut entries = serde_json::Map::new();
+    let Some(items) = value.and_then(Value::as_array) else {
+        return entries;
+    };
+    for item in items {
+        let Some(name) = string_field(item, "name") else {
+            continue;
+        };
+        let Some(value) = string_field(item, "value") else {
+            continue;
+        };
+        entries.insert(name.to_string(), Value::String(value.to_string()));
+    }
+    entries
+}
+
+fn gateway_header_remove_entries(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn gateway_request_redirect_value(
+    object: &K8sObject,
+    rule: &Value,
+) -> Result<Option<Value>, K8sTranslateError> {
+    let Some(filters) = rule.get("filters").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    for filter in filters {
+        if string_field(filter, "type") != Some("RequestRedirect") {
+            continue;
+        }
+        let Some(redirect) = filter.get("requestRedirect").and_then(Value::as_object) else {
+            continue;
+        };
+        let mut out = serde_json::Map::new();
+
+        if let Some(scheme) = redirect.get("scheme").and_then(Value::as_str)
+            && !scheme.is_empty()
+        {
+            out.insert("scheme".to_string(), Value::String(scheme.to_string()));
+        }
+
+        let authority = redirect
+            .get("hostname")
+            .and_then(Value::as_str)
+            .and_then(|host| {
+                if host.is_empty() {
+                    None
+                } else if let Some(port) = redirect.get("port").and_then(Value::as_u64) {
+                    Some(format!("{host}:{port}"))
+                } else {
+                    Some(host.to_string())
+                }
+            });
+        if let Some(authority) = authority {
+            out.insert("authority".to_string(), Value::String(authority));
+        }
+
+        if let Some(path) = gateway_redirect_path(redirect) {
+            out.insert("uri".to_string(), Value::String(path.to_string()));
+        }
+
+        let status_code = match redirect.get("statusCode") {
+            Some(value) => {
+                let Some(code) = value.as_u64() else {
+                    return Err(invalid_resource(
+                        object,
+                        "HTTPRoute RequestRedirect statusCode must be an integer in the 300-399 range",
+                    ));
+                };
+                if !(300..=399).contains(&code) {
+                    return Err(invalid_resource(
+                        object,
+                        "HTTPRoute RequestRedirect statusCode must be in the 300-399 range",
+                    ));
+                }
+                code
+            }
+            None => 302,
+        };
+        out.insert("redirect_code".to_string(), serde_json::json!(status_code));
+
+        if out.keys().all(|key| key == "redirect_code") {
+            return Ok(None);
+        }
+        return Ok(Some(Value::Object(out)));
+    }
+
+    Ok(None)
+}
+
+fn gateway_redirect_path(redirect: &serde_json::Map<String, Value>) -> Option<&str> {
+    let path = redirect.get("path")?.as_object()?;
+    let path_type = path.get("type").and_then(Value::as_str).unwrap_or_default();
+    match path_type {
+        "ReplaceFullPath" => path.get("replaceFullPath").and_then(Value::as_str),
+        "ReplacePrefixMatch" => path.get("replacePrefixMatch").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn invalid_backend_fault_value(reason: InvalidBackendRefReason) -> Value {
+    let body = match reason {
+        InvalidBackendRefReason::InvalidKind => "Gateway API backendRef kind is unsupported",
+        InvalidBackendRefReason::BackendNotFound => "Gateway API backendRef Service was not found",
+        InvalidBackendRefReason::RefNotPermitted => {
+            "Gateway API backendRef is not permitted by ReferenceGrant"
+        }
+    };
+    serde_json::json!({
+        "abort": {
+            "status_code": 500,
+            "percentage": 100.0,
+            "body": body,
+        }
+    })
 }
 
 fn gateway_api_dispatch_rule_precedence(
@@ -1779,8 +2175,9 @@ fn route_backends(
     object: &K8sObject,
     rule: &Value,
     acc: &mut K8sAccumulator,
-) -> Result<Vec<RouteBackend>, K8sTranslateError> {
+) -> Result<RouteBackendResolution, K8sTranslateError> {
     let mut backends = Vec::new();
+    let mut invalid = None;
     let mut skipped_zero = 0usize;
     for backend_ref in rule
         .get("backendRefs")
@@ -1796,15 +2193,17 @@ fn route_backends(
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
-            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+            match checked_backend_namespace(object, backend_ref, acc, object.kind.as_str()) {
+                Ok(namespace) => namespace,
+                Err(error) if error_is_backend_ref_resolution(&error) => {
+                    invalid.get_or_insert(backend_ref_resolution_reason(&error));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         if acc.has_observed_services() && !acc.service_exists(&backend_namespace, backend_name) {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "{} backendRef Service '{}' was not found in namespace '{}'",
-                    object.kind, backend_name, backend_namespace
-                ),
-            ));
+            invalid.get_or_insert(InvalidBackendRefReason::BackendNotFound);
+            continue;
         }
         let backend_port =
             optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
@@ -1814,6 +2213,16 @@ fn route_backends(
                     80
                 },
             );
+        let endpoint_backends = acc.endpoint_route_backends_for_service(
+            &backend_namespace,
+            backend_name,
+            backend_port,
+            weight,
+        );
+        if !endpoint_backends.is_empty() {
+            backends.extend(endpoint_backends);
+            continue;
+        }
         backends.push(RouteBackend {
             host: service_dns_name(
                 backend_name,
@@ -1837,7 +2246,33 @@ fn route_backends(
             ));
         }
     }
-    Ok(backends)
+    if invalid.is_some() {
+        acc.warnings.push(format!(
+            "{} {}/{} has unresolved backendRef(s); materializing fail-closed route action",
+            object.kind, object.metadata.namespace, object.metadata.name
+        ));
+    }
+    Ok(RouteBackendResolution { backends, invalid })
+}
+
+fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains("ReferenceGrant") || message.contains("only core Service")
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
+fn backend_ref_resolution_reason(error: &K8sTranslateError) -> InvalidBackendRefReason {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. }
+            if message.contains("only core Service") =>
+        {
+            InvalidBackendRefReason::InvalidKind
+        }
+        _ => InvalidBackendRefReason::RefNotPermitted,
+    }
 }
 
 fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
@@ -1929,6 +2364,7 @@ fn checked_backend_namespace(
         backend_namespace,
         to_group,
         to_kind,
+        string_field(backend_ref, "name"),
     ) {
         Ok(backend_namespace.to_string())
     } else {
@@ -2108,6 +2544,113 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gateway_https_listener_certificate_ref_sets_frontend_tls_sources() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "gateway-cert"
+                        }]
+                    }
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway], options()).expect("translation succeeds");
+        assert_eq!(
+            result.config.frontend_tls_cert_path.as_deref(),
+            Some("k8s://default/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            result.config.frontend_tls_key_path.as_deref(),
+            Some("k8s://default/gateway-cert#tls.key")
+        );
+    }
+
+    #[test]
+    fn gateway_cross_namespace_certificate_ref_requires_reference_grant() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "gateway-cert",
+                            "namespace": "certs"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "certs",
+            serde_json::json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Secret",
+                    "name": "gateway-cert"
+                }]
+            }),
+        );
+
+        let without_grant = translate_k8s_objects(std::slice::from_ref(&gateway), options())
+            .expect("translation succeeds");
+        assert_eq!(without_grant.config.frontend_tls_cert_path, None);
+
+        let with_grant =
+            translate_k8s_objects(&[gateway, grant], options()).expect("translation succeeds");
+        assert_eq!(
+            with_grant.config.frontend_tls_cert_path.as_deref(),
+            Some("k8s://certs/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            with_grant.config.frontend_tls_key_path.as_deref(),
+            Some("k8s://certs/gateway-cert#tls.key")
+        );
+    }
+
+    fn core_service(name: &str, spec: Value) -> K8sObject {
+        let mut service = object("Service", spec);
+        service.api_version = "v1".to_string();
+        service.metadata.name = name.to_string();
+        service
+    }
+
+    fn endpoint_slice_for_service(service_name: &str, endpoints: Vec<Value>) -> K8sObject {
+        let mut slice = object(
+            "EndpointSlice",
+            serde_json::json!({
+                "addressType": "IPv4",
+                "ports": [{"name": "first-port", "port": 3000}],
+                "endpoints": endpoints
+            }),
+        );
+        slice.api_version = "discovery.k8s.io/v1".to_string();
+        slice.metadata.name = format!("{service_name}-manual");
+        slice.metadata.labels.insert(
+            "kubernetes.io/service-name".to_string(),
+            service_name.to_string(),
+        );
+        slice
+    }
+
     fn route_with_name_and_created_at(name: &str, created_at: &str) -> K8sObject {
         let mut route = object(
             "HTTPRoute",
@@ -2123,6 +2666,31 @@ mod tests {
         route.metadata.name = name.to_string();
         route.metadata.creation_timestamp = Some(created_at.to_string());
         route
+    }
+
+    fn assert_invalid_backend_fault_route(
+        result: &crate::config_sources::k8s::K8sTranslation,
+        expected_body: &str,
+    ) {
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            ZERO_WEIGHT_BACKEND_HOST
+        );
+        assert_eq!(
+            result.config.proxies[0].backend_port,
+            ZERO_WEIGHT_BACKEND_PORT
+        );
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("invalid backend route should carry mesh_route_dispatch");
+        let abort = &plugin.config["rules"][0]["fault"]["abort"];
+        assert_eq!(abort["status_code"], 500);
+        assert_eq!(abort["percentage"], 100.0);
+        assert_eq!(abort["body"].as_str(), Some(expected_body));
     }
 
     #[test]
@@ -2823,6 +3391,107 @@ mod tests {
     }
 
     #[test]
+    fn http_route_selectorless_service_uses_ready_endpoint_slice_target_port() {
+        let service = core_service(
+            "manual",
+            serde_json::json!({
+                "clusterIP": "10.96.0.10",
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let endpoint_slice = endpoint_slice_for_service(
+            "manual",
+            vec![serde_json::json!({
+                "addresses": ["10.1.0.10"],
+                "conditions": {"ready": true}
+            })],
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/manual"}}],
+                    "backendRefs": [{"name": "manual", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, endpoint_slice, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("manual EndpointSlice service should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_host, "10.1.0.10");
+        assert_eq!(result.config.proxies[0].backend_port, 3000);
+        assert!(
+            result.config.upstreams.is_empty(),
+            "single ready endpoint can be dialed directly"
+        );
+    }
+
+    #[test]
+    fn http_route_headless_service_uses_ready_endpoint_slice_targets() {
+        let service = core_service(
+            "headless",
+            serde_json::json!({
+                "clusterIP": "None",
+                "selector": {"app": "headless"},
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let endpoint_slice = endpoint_slice_for_service(
+            "headless",
+            vec![
+                serde_json::json!({
+                    "addresses": ["10.1.0.11"],
+                    "conditions": {"ready": true}
+                }),
+                serde_json::json!({
+                    "addresses": ["10.1.0.12"],
+                    "conditions": {"ready": true}
+                }),
+            ],
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/headless"}}],
+                    "backendRefs": [{"name": "headless", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, endpoint_slice, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("headless EndpointSlice service should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(result.config.upstreams[0].id.as_str())
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert_eq!(result.config.upstreams[0].targets[0].host, "10.1.0.11");
+        assert_eq!(result.config.upstreams[0].targets[0].port, 3000);
+        assert_eq!(result.config.upstreams[0].targets[1].host, "10.1.0.12");
+        assert_eq!(result.config.upstreams[0].targets[1].port, 3000);
+    }
+
+    #[test]
     fn http_route_creates_proxy_per_match() {
         let result = translate_k8s_objects(
             &[object(
@@ -2943,6 +3612,88 @@ mod tests {
         let rule_match = &plugin.config["rules"][0]["match"];
         assert_eq!(rule_match["headers"]["x-tenant"].as_str(), Some("first"));
         assert_eq!(rule_match["query_params"]["version"].as_str(), Some("v1"));
+    }
+
+    #[test]
+    fn http_route_request_header_modifier_emits_dispatch_transform_and_consumer() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/set"}}],
+                        "filters": [{
+                            "type": "RequestHeaderModifier",
+                            "requestHeaderModifier": {
+                                "set": [{"name": "X-Set", "value": "set"}],
+                                "add": [{"name": "X-Add", "value": "add"}],
+                                "remove": ["X-Remove"]
+                            }
+                        }],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "request_transformer"),
+            "route-level transforms need a request_transformer consumer"
+        );
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for route actions");
+        let request_transform = dispatch.config["rules"][0]["request_transform"]
+            .as_array()
+            .expect("request transform rules");
+        assert_eq!(request_transform.len(), 3);
+        assert_eq!(request_transform[0]["operation"], "update");
+        assert_eq!(request_transform[1]["operation"], "add");
+        assert_eq!(request_transform[2]["operation"], "remove");
+    }
+
+    #[test]
+    fn http_route_request_redirect_without_backend_materializes_dispatch_redirect() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {"hostname": "example.org"}
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("/redirect")
+        );
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["authority"], "example.org");
+        assert_eq!(redirect["redirect_code"], 302);
     }
 
     #[test]
@@ -3647,8 +4398,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_namespace_backend_ref_without_reference_grant() {
-        let err = translate_k8s_objects(
+    fn unresolved_cross_namespace_backend_ref_materializes_fail_closed_route() {
+        let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
                 serde_json::json!({
@@ -3663,11 +4414,11 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("cross-namespace backendRef must fail closed");
+        .expect("cross-namespace backendRef should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 
@@ -3704,7 +4455,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_namespace_backend_ref_when_reference_grant_from_group_mismatches() {
+    fn mismatched_reference_grant_from_group_materializes_fail_closed_route() {
         let route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -3733,17 +4484,17 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(&[route, grant], options())
-            .expect_err("ReferenceGrant group must match route API group");
+        let result = translate_k8s_objects(&[route, grant], options())
+            .expect("ReferenceGrant group mismatch should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 
     #[test]
-    fn rejects_cross_namespace_backend_ref_when_reference_grant_to_group_mismatches() {
+    fn mismatched_reference_grant_to_group_materializes_fail_closed_route() {
         let route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -3772,18 +4523,18 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(&[route, grant], options())
-            .expect_err("ReferenceGrant target group must match backendRef group");
+        let result = translate_k8s_objects(&[route, grant], options())
+            .expect("ReferenceGrant target group mismatch should translate fail-closed");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 
     #[test]
-    fn rejects_unsupported_backend_ref_kind() {
-        let err = translate_k8s_objects(
+    fn unsupported_backend_ref_kind_materializes_fail_closed_route() {
+        let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
                 serde_json::json!({
@@ -3800,12 +4551,9 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("non-Service backendRefs must fail closed");
+        .expect("non-Service backendRefs should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("only core Service backendRefs are supported")
-        );
+        assert_invalid_backend_fault_route(&result, "Gateway API backendRef kind is unsupported");
     }
 
     #[test]
@@ -3881,12 +4629,12 @@ mod tests {
         );
         let options = options().with_source_namespaces(vec!["default".to_string()]);
 
-        let err = translate_k8s_objects(&[route, grant], options)
-            .expect_err("ReferenceGrant from an excluded namespace must not authorize the route");
+        let result = translate_k8s_objects(&[route, grant], options)
+            .expect("excluded ReferenceGrant should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 

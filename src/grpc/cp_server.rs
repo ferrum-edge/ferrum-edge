@@ -59,6 +59,29 @@ use crate::modes::mesh::config::{
 };
 use crate::modes::mesh::slice::MeshSliceRequest;
 
+fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) {
+    let cert_namespace = config
+        .frontend_tls_cert_path
+        .as_deref()
+        .and_then(k8s_source_namespace);
+    let key_namespace = config
+        .frontend_tls_key_path
+        .as_deref()
+        .and_then(k8s_source_namespace);
+    let foreign = [cert_namespace, key_namespace]
+        .into_iter()
+        .flatten()
+        .any(|source_namespace| source_namespace != namespace);
+    if foreign {
+        config.frontend_tls_cert_path = None;
+        config.frontend_tls_key_path = None;
+    }
+}
+
+fn k8s_source_namespace(source: &str) -> Option<&str> {
+    source.strip_prefix("k8s://")?.split('/').next()
+}
+
 /// What set of namespaces a CP instance is authorised to serve.
 ///
 /// Built from `FERRUM_CP_NAMESPACES` + `FERRUM_NAMESPACE` at CP startup:
@@ -695,6 +718,7 @@ impl CpGrpcServer {
         config.plugin_configs.retain(|pc| pc.namespace == namespace);
         config.upstreams.retain(|u| u.namespace == namespace);
         config.known_namespaces = vec![namespace.to_string()];
+        filter_frontend_tls_sources_to_namespace(config, namespace);
     }
 
     pub(crate) fn filter_config_to_mesh_request_for_scope(
@@ -2581,5 +2605,22 @@ mod tests {
         assert_eq!(multi_cluster.east_west_gateways.len(), 1);
         assert_eq!(multi_cluster.east_west_gateways[0].namespace, "ns-a");
         assert_eq!(multi_cluster.east_west_gateways[0].name, "ewa");
+    }
+
+    #[test]
+    fn namespace_filter_strips_cross_namespace_frontend_tls_sources() {
+        use crate::config::types::*;
+
+        let config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
+            ..Default::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(filtered.frontend_tls_cert_path, None);
+        assert_eq!(filtered.frontend_tls_key_path, None);
     }
 }

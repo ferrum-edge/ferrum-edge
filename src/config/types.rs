@@ -2205,6 +2205,15 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    /// Optional proxy frontend TLS certificate source delivered with the
+    /// namespace-scoped gateway config. Kubernetes Gateway listeners populate
+    /// this from `certificateRefs` as `k8s://<namespace>/<secret>#tls.crt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_cert_path: Option<String>,
+    /// Optional proxy frontend TLS private-key source paired with
+    /// `frontend_tls_cert_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_key_path: Option<String>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the

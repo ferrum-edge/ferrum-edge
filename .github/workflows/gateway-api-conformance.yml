@@ -1,6 +1,20 @@
 name: Gateway API Conformance
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/gateway-api-conformance.yml"
+      - "scripts/gateway_api_data_plane_conformance.sh"
+      - "charts/**"
+      - "src/config_sources/k8s/**"
+      - "src/grpc/**"
+      - "src/k8s_controller/**"
+      - "src/modes/control_plane.rs"
+      - "src/modes/data_plane.rs"
+      - "src/plugins/**"
+      - "src/proxy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       gateway_api_version:
@@ -132,3 +146,4 @@ jobs:
         with:
           name: gateway-api-conformance-${{ steps.inputs.outputs.gateway_api_version }}
           path: conformance-results/
+          retention-days: 90
