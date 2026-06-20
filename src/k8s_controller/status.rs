@@ -188,12 +188,6 @@ pub fn plan_gateway_api_status_updates_with_context(
                             || managed_parent_ref_keys.contains(&conflict.key.parent_ref))
                 })
                 .collect();
-            let status_route_conflicts: Vec<&GatewayApiRouteConflict> = if object.kind == "Gateway"
-            {
-                route_conflicts.iter().collect()
-            } else {
-                object_conflicts
-            };
             let route_keys = if matches!(
                 object.kind.as_str(),
                 "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
@@ -210,7 +204,7 @@ pub fn plan_gateway_api_status_updates_with_context(
                 object,
                 options.clone(),
                 &status_context,
-                &status_route_conflicts,
+                &object_conflicts,
                 &route_keys,
                 &managed_parent_refs,
             );
@@ -244,7 +238,7 @@ fn desired_status_for_object(
         return gateway_class_status(object);
     }
 
-    let result = translate_k8s_objects_with_filter(objects, options.clone(), |candidate| {
+    let result = translate_k8s_objects_with_filter(objects, options, |candidate| {
         same_resource(candidate, object)
             || candidate.kind == "ReferenceGrant"
             || candidate.kind == "GatewayClass"
@@ -255,14 +249,7 @@ fn desired_status_for_object(
     });
 
     match object.kind.as_str() {
-        "Gateway" => gateway_status(
-            objects,
-            object,
-            &options,
-            result.as_ref(),
-            status_context,
-            route_conflicts,
-        ),
+        "Gateway" => gateway_status(objects, object, result.as_ref(), status_context),
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
             objects,
             object,
@@ -556,10 +543,8 @@ fn reference_grant_has_secret_to(grant: &K8sObject, secret_name: &str) -> bool {
 fn gateway_status(
     objects: &[K8sObject],
     object: &K8sObject,
-    options: &K8sTranslationOptions,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     status_context: &GatewayApiStatusContext,
-    route_conflicts: &[&GatewayApiRouteConflict],
 ) -> Value {
     let references = gateway_reference_status(objects, object);
     let (accepted, materialized, resolved_refs, programmed, message) = match result {
@@ -663,11 +648,9 @@ fn gateway_status(
         Value::Array(gateway_listener_statuses(
             objects,
             object,
-            options,
             result.ok().map(|translation| &translation.config),
             accepted,
             status_context.data_plane_ready,
-            route_conflicts,
         )),
     );
     status
@@ -688,11 +671,9 @@ fn gateway_status_address(address: &str) -> Value {
 fn gateway_listener_statuses(
     objects: &[K8sObject],
     gateway: &K8sObject,
-    options: &K8sTranslationOptions,
     config: Option<&GatewayConfig>,
     gateway_accepted: bool,
     data_plane_ready: bool,
-    route_conflicts: &[&GatewayApiRouteConflict],
 ) -> Vec<Value> {
     gateway
         .spec
@@ -803,13 +784,7 @@ fn gateway_listener_statuses(
             ];
             json!({
                 "name": listener_name,
-                "attachedRoutes": attached_route_count(
-                    objects,
-                    gateway,
-                    listener,
-                    options,
-                    route_conflicts
-                ),
+                "attachedRoutes": attached_route_count(objects, gateway, listener),
                 "supportedKinds": route_kinds.supported_kinds,
                 "conditions": conditions,
             })
@@ -903,13 +878,7 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
         .find(|allowed| *allowed == kind)
 }
 
-fn attached_route_count(
-    objects: &[K8sObject],
-    gateway: &K8sObject,
-    listener: &Value,
-    options: &K8sTranslationOptions,
-    route_conflicts: &[&GatewayApiRouteConflict],
-) -> usize {
+fn attached_route_count(objects: &[K8sObject], gateway: &K8sObject, listener: &Value) -> usize {
     objects
         .iter()
         .filter(|object| {
@@ -925,62 +894,9 @@ fn attached_route_count(
                     && route_allowed_by_listener(objects, route, gateway, listener)
                     && route_kind_allowed_by_listener(route, listener)
                     && route_intersects_listener_hostname(route, listener)
-                    && !route_parent_ref_fully_conflicted(
-                        objects,
-                        options,
-                        route,
-                        &parent_ref,
-                        listener,
-                        route_conflicts,
-                    )
             })
         })
         .count()
-}
-
-fn route_parent_ref_fully_conflicted(
-    objects: &[K8sObject],
-    options: &K8sTranslationOptions,
-    route: &K8sObject,
-    parent_ref: &Value,
-    listener: &Value,
-    route_conflicts: &[&GatewayApiRouteConflict],
-) -> bool {
-    let route_key = K8sResourceKey::from_object(route);
-    let parent_ref_key = route_parent_ref_key(route, parent_ref);
-    let listener_hostnames = listener_conflict_hostnames_for_route(route, listener);
-    let parent_route_keys: Vec<GatewayApiRouteConflictKey> =
-        gateway_api_route_conflict_keys_with_context(objects, options, route)
-            .into_iter()
-            .filter(|key| {
-                key.parent_ref == parent_ref_key && listener_hostnames.contains(&key.hostname)
-            })
-            .collect();
-    if parent_route_keys.is_empty() {
-        return false;
-    }
-
-    let parent_conflicts: Vec<&GatewayApiRouteConflict> = route_conflicts
-        .iter()
-        .copied()
-        .filter(|conflict| conflict.loser == route_key && conflict.key.parent_ref == parent_ref_key)
-        .collect();
-    !parent_conflicts.is_empty()
-        && parent_route_keys
-            .iter()
-            .all(|key| parent_conflicts.iter().any(|conflict| conflict.key == *key))
-}
-
-fn listener_conflict_hostnames_for_route(route: &K8sObject, listener: &Value) -> HashSet<String> {
-    let listener_hostname = listener
-        .get("hostname")
-        .and_then(Value::as_str)
-        .map(normalize_hostname)
-        .unwrap_or_else(|| "*".to_string());
-    route_hostnames(route)
-        .into_iter()
-        .filter_map(|route_hostname| intersect_hostnames(&route_hostname, &listener_hostname))
-        .collect()
 }
 
 fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
@@ -1143,34 +1059,6 @@ fn hostnames_intersect(route_hostname: &str, listener_hostname: &str) -> bool {
             route_suffix == listener_suffix
                 || suffix_is_within(route_suffix, listener_suffix)
                 || suffix_is_within(listener_suffix, route_suffix)
-        }
-    }
-}
-
-fn intersect_hostnames(route_hostname: &str, listener_hostname: &str) -> Option<String> {
-    if route_hostname == "*" {
-        return Some(listener_hostname.to_string());
-    }
-    if listener_hostname == "*" {
-        return Some(route_hostname.to_string());
-    }
-    match (
-        wildcard_hostname_suffix(route_hostname),
-        wildcard_hostname_suffix(listener_hostname),
-    ) {
-        (None, None) => (route_hostname == listener_hostname).then(|| route_hostname.to_string()),
-        (Some(route_suffix), None) => hostname_matches_wildcard(listener_hostname, route_suffix)
-            .then(|| listener_hostname.to_string()),
-        (None, Some(listener_suffix)) => hostname_matches_wildcard(route_hostname, listener_suffix)
-            .then(|| route_hostname.to_string()),
-        (Some(route_suffix), Some(listener_suffix)) => {
-            if route_suffix == listener_suffix || suffix_is_within(route_suffix, listener_suffix) {
-                Some(route_hostname.to_string())
-            } else if suffix_is_within(listener_suffix, route_suffix) {
-                Some(listener_hostname.to_string())
-            } else {
-                None
-            }
         }
     }
 }
@@ -4244,7 +4132,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_attached_routes_excludes_fully_conflicted_route_parent() {
+    fn gateway_listener_attached_routes_counts_conflicted_attached_routes() {
         let gateway_class = ferrum_gateway_class();
         let gateway = ferrum_gateway("edge");
         let older = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
@@ -4257,7 +4145,7 @@ mod tests {
             gateway_update.status["listeners"].as_array().unwrap(),
             "http",
         );
-        assert_eq!(listener["attachedRoutes"].as_u64(), Some(1));
+        assert_eq!(listener["attachedRoutes"].as_u64(), Some(2));
     }
 
     #[test]
