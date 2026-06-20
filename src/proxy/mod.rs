@@ -2885,7 +2885,9 @@ struct RequestConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// Pre-NAT original destination of an iptables-REDIRECTed connection,
     /// read once at accept on mesh outbound capture listeners
-    /// (`SO_ORIGINAL_DST`). `None` everywhere else — see
+    /// (`SO_ORIGINAL_DST`). NodeWaypoint eBPF capture can also supply this from
+    /// the resolver cookie record because cgroup/connect rewrites do not create
+    /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
 }
@@ -10389,6 +10391,7 @@ async fn run_accept_loop(
                         };
 
                         let state = Arc::clone(&state);
+                        let mut node_waypoint_orig_dst = None;
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
@@ -10396,7 +10399,10 @@ async fn run_accept_loop(
                                     // request, so the accept-time scope is unused
                                     // here; keep only the identity on the
                                     // connection metadata.
-                                    Ok((identity, _scope)) => Some(identity),
+                                    Ok(resolved) => {
+                                        node_waypoint_orig_dst = Some(resolved.orig_dst);
+                                        Some(resolved.identity)
+                                    }
                                     Err(error) => {
                                         record_node_waypoint_identity_drop(&state.overload, &error);
                                         debug!(
@@ -10443,7 +10449,15 @@ async fn run_accept_loop(
                         // contract). `None` everywhere else and for
                         // non-redirected traffic.
                         let orig_dst = if mesh_direction.is_some() {
-                            crate::socket_opts::original_dst(&stream)
+                            crate::socket_opts::original_dst(&stream).or_else(|| {
+                                if mesh_direction
+                                    == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+                                {
+                                    node_waypoint_orig_dst
+                                } else {
+                                    None
+                                }
+                            })
                         } else {
                             None
                         };

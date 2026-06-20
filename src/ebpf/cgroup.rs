@@ -15,14 +15,16 @@ use std::path::{Path, PathBuf};
 pub fn resolve_pod_cgroup_path(cgroup_root: &str, pod_uid: &str) -> Option<PathBuf> {
     let sanitized_uid = pod_uid.replace('-', "_");
 
-    systemd_pod_cgroup_paths(cgroup_root, &sanitized_uid)
+    if let Some(path) = systemd_pod_cgroup_paths(cgroup_root, &sanitized_uid)
         .into_iter()
         .chain(cgroupfs_pod_cgroup_paths(cgroup_root, pod_uid))
-        .chain(discover_pod_cgroup_paths(
-            cgroup_root,
-            pod_uid,
-            &sanitized_uid,
-        ))
+        .find(|path| path.exists())
+    {
+        return Some(path);
+    }
+
+    discover_pod_cgroup_paths(cgroup_root, pod_uid, &sanitized_uid)
+        .into_iter()
         .find(|path| path.exists())
 }
 

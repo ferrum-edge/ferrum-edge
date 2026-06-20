@@ -206,6 +206,28 @@ render_chart_assertions() {
     exit 1
   fi
 
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.admin.enabled=true \
+    --set-string nodeAgent.admin.bindAddress=::1)"
+  if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- "::1"'; then
+    echo "Node-agent readiness probe did not use the concrete IPv6 admin bind address" >&2
+    grep -nA10 "readinessProbe:" <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.admin.enabled=true \
+    --set-string nodeAgent.admin.bindAddress=0.0.0.0)"
+  if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- "127.0.0.1"'; then
+    echo "Node-agent readiness probe did not use loopback for wildcard admin bind address" >&2
+    grep -nA10 "readinessProbe:" <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -823,30 +845,40 @@ curl_from() {
   local deploy="$1"
   local url="$2"
   kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
-    curl -g -sS -m 8 -o /tmp/ferrum-live-response -w '%{http_code}' "$url"
+    sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
 }
 
 expect_allowed() {
   local from="$1"
   local label="$2"
   local url="$3"
-  local code="" status=1 err
+  local expected_body="$4"
+  local output="" code="" body="" status=1 err
   err="$(mktemp)"
   for attempt in $(seq 1 8); do
     set +e
-    code="$(curl_from "$from" "$url" 2>"$err")"
+    output="$(curl_from "$from" "$url" 2>"$err")"
     status=$?
     set -e
+    code="${output##*$'\n'}"
+    body="${output%$'\n'*}"
+    body="${body//$'\r'/}"
+    while [[ "$body" == *$'\n' ]]; do
+      body="${body%$'\n'}"
+    done
     if [[ "$status" -eq 0 && "$code" == "200" ]]; then
-      rm -f "$err"
-      return
+      if [[ "$body" == "$expected_body" ]]; then
+        rm -f "$err"
+        return
+      fi
+      break
     fi
     if [[ "$status" -eq 0 ]]; then
       break
     fi
     sleep 1
   done
-  echo "expected allow for $label from $from to $url, got HTTP ${code:-curl-exit-$status}" >&2
+  echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
   cat "$err" >&2 || true
   rm -f "$err"
   exit 1
@@ -856,11 +888,12 @@ expect_blocked() {
   local from="$1"
   local label="$2"
   local url="$3"
-  local code
+  local output code
   set +e
-  code="$(curl_from "$from" "$url" 2>/tmp/ferrum-live-curl.err)"
+  output="$(curl_from "$from" "$url" 2>/tmp/ferrum-live-curl.err)"
   local status=$?
   set -e
+  code="${output##*$'\n'}"
   if [[ "$status" -eq 0 && "$code" == "200" ]]; then
     echo "expected block for $label from $from to $url, got HTTP 200" >&2
     exit 1
@@ -873,10 +906,10 @@ run_traffic_checks() {
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
 
-  expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
-  expect_allowed src-a "same-node direct Pod IP" "http://$dst_a_ip:8080/"
-  expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
-  expect_allowed src-a "cross-node direct Pod IP" "http://$dst_b_ip:8080/"
+  expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
+  expect_allowed src-a "same-node direct Pod IP" "http://$dst_a_ip:8080/" "ok-a"
+  expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
+  expect_allowed src-a "cross-node direct Pod IP" "http://$dst_b_ip:8080/" "ok-b"
 
   expect_blocked src-b "selector/namespace DENY same-node" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
   expect_blocked src-b "selector/namespace DENY cross-node" "http://$dst_a_ip:8080/"
@@ -890,7 +923,7 @@ run_traffic_checks() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
-  expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
   expect_blocked src-b "wrong-pod attribution guard after recreation" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
 }
 

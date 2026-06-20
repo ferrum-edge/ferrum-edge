@@ -41,6 +41,13 @@
 {{- $nodeAgentImageTag = printf "%s-ebpf" $nodeAgentImageTag -}}
 {{- end -}}
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
+{{- $nodeAgentAdminBindAddress := toString .Values.nodeAgent.admin.bindAddress -}}
+{{- $nodeAgentAdminProbeHost := $nodeAgentAdminBindAddress -}}
+{{- if or (eq $nodeAgentAdminProbeHost "") (eq $nodeAgentAdminProbeHost "0.0.0.0") (eq $nodeAgentAdminProbeHost "*") -}}
+{{- $nodeAgentAdminProbeHost = "127.0.0.1" -}}
+{{- else if eq $nodeAgentAdminProbeHost "::" -}}
+{{- $nodeAgentAdminProbeHost = "::1" -}}
+{{- end -}}
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
@@ -187,7 +194,7 @@ spec:
             - name: FERRUM_NODE_AGENT_ADMIN_ENABLED
               value: "true"
             - name: FERRUM_ADMIN_BIND_ADDRESS
-              value: {{ .Values.nodeAgent.admin.bindAddress | quote }}
+              value: {{ $nodeAgentAdminBindAddress | quote }}
             - name: FERRUM_ADMIN_HTTP_PORT
               value: {{ .Values.nodeAgent.admin.port | quote }}
             {{- end }}
@@ -235,7 +242,7 @@ spec:
                 - /app/ferrum-edge
                 - health
                 - --host
-                - "127.0.0.1"
+                - {{ $nodeAgentAdminProbeHost | quote }}
                 - -p
                 - {{ .Values.nodeAgent.admin.port | quote }}
             initialDelaySeconds: 2

@@ -111,7 +111,10 @@ fn resolve_node_waypoint_stream_scope(
     // it for the connection's lifetime, so a second `policy_scope_for_pod` call
     // here could read a newer generation's scope against an older gate decision.
     match resolver.resolve_stream(stream) {
-        Ok((identity, scope)) => (scope, Some(identity.spiffe_id.as_str().to_string())),
+        Ok(resolved) => (
+            resolved.policy_scope,
+            Some(resolved.identity.spiffe_id.as_str().to_string()),
+        ),
         Err(error) => {
             debug!(
                 proxy_id = %proxy_id,
@@ -6818,7 +6821,7 @@ mod node_waypoint_stream_scope_tests {
         resolver.record_orig_dst4(
             cookie,
             OrigDst4 {
-                addr: 0x0a00_0001,
+                addr: u32::from_ne_bytes([10, 0, 0, 1]),
                 port: 8080,
                 pod_uid: pod,
                 workload_spiffe_hash: hash,

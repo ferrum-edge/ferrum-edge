@@ -45,9 +45,12 @@
 //! Linux socket cookies are unique across the IPv4/IPv6 protocol families, so
 //! both address families share a single cookie record map; this avoids the
 //! wasted IPv4 lookup that a dual-map design imposed on every IPv6 accept.
-//! The original-destination address and port are intentionally NOT surfaced
-//! by [`resolve_cookie`] / [`resolve_stream`] — production callers consume
-//! only the resolved [`NodeWaypointIdentity`].
+//! The eBPF original-destination address and port are surfaced by
+//! [`resolve_stream`] for NodeWaypoint capture: `connect4` rewrites do not
+//! create conntrack state, so `SO_ORIGINAL_DST` may be unavailable on the
+//! accept side. Production callers use this value as the direct-pod / service
+//! port routing signal while still resolving identity from the same cookie
+//! record.
 //!
 //! [`socket_cookie`]: crate::socket_opts::socket_cookie
 //!
@@ -75,6 +78,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -115,6 +119,7 @@ struct CookieRecord {
     pod_uid: [u8; 16],
     workload_spiffe_hash: u64,
     family: CookieFamily,
+    orig_dst: SocketAddr,
 }
 
 impl From<&OrigDst4> for CookieRecord {
@@ -123,6 +128,7 @@ impl From<&OrigDst4> for CookieRecord {
             pod_uid: record.pod_uid,
             workload_spiffe_hash: record.workload_spiffe_hash,
             family: CookieFamily::V4,
+            orig_dst: orig_dst4_socket_addr(record),
         }
     }
 }
@@ -133,8 +139,24 @@ impl From<&OrigDst6> for CookieRecord {
             pod_uid: record.pod_uid,
             workload_spiffe_hash: record.workload_spiffe_hash,
             family: CookieFamily::V6,
+            orig_dst: orig_dst6_socket_addr(record),
         }
     }
+}
+
+fn orig_dst4_socket_addr(record: &OrigDst4) -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::from(record.addr.to_ne_bytes())),
+        record.port as u16,
+    )
+}
+
+fn orig_dst6_socket_addr(record: &OrigDst6) -> SocketAddr {
+    let mut octets = [0u8; 16];
+    for (idx, word) in record.addr.iter().enumerate() {
+        octets[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+    }
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), record.port as u16)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,10 +359,18 @@ impl fmt::Display for NodeWaypointIdentityError {
 impl std::error::Error for NodeWaypointIdentityError {}
 
 /// Synchronous accept-path cookie lookup, returning `(pod_uid, workload SPIFFE
-/// hash)` for a socket cookie. Boxed because `ArcSwapOption` needs a `Sized`
-/// payload. Injected by the eBPF orig-dst bridge so the resolver itself stays
-/// aya-free; see [`NodeWaypointIdentityResolver::set_cookie_fallback`].
-pub type CookieLookupFallback = Box<dyn Fn(u64) -> Option<([u8; 16], u64)> + Send + Sync>;
+/// hash, original destination)` for a socket cookie. Boxed because
+/// `ArcSwapOption` needs a `Sized` payload. Injected by the eBPF orig-dst
+/// bridge so the resolver itself stays aya-free; see
+/// [`NodeWaypointIdentityResolver::set_cookie_fallback`].
+pub type CookieLookupFallback =
+    Box<dyn Fn(u64) -> Option<([u8; 16], u64, SocketAddr)> + Send + Sync>;
+
+pub struct NodeWaypointResolvedConnection {
+    pub identity: Arc<NodeWaypointIdentity>,
+    pub policy_scope: Option<Arc<PolicyScopeCache>>,
+    pub orig_dst: SocketAddr,
+}
 
 pub struct NodeWaypointIdentityResolver {
     /// Unified cookie → identity-key map. Linux socket cookies are globally
@@ -941,12 +971,11 @@ impl NodeWaypointIdentityResolver {
     pub fn resolve_stream(
         &self,
         stream: &TcpStream,
-    ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
-    {
+    ) -> Result<NodeWaypointResolvedConnection, NodeWaypointIdentityError> {
         let cookie = crate::socket_opts::socket_cookie(stream).map_err(|error| {
             NodeWaypointIdentityError::SocketCookieUnavailable(error.to_string())
         })?;
-        self.resolve_cookie(cookie)
+        self.resolve_cookie_metadata(cookie)
     }
 
     /// Resolve a socket cookie to its `(identity, scope)` pair, both derived
@@ -958,8 +987,25 @@ impl NodeWaypointIdentityResolver {
         cookie: u64,
     ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
     {
+        self.resolve_cookie_metadata(cookie)
+            .map(|resolved| (resolved.identity, resolved.policy_scope))
+    }
+
+    /// Resolve a socket cookie to identity, policy scope, and the eBPF-captured
+    /// original destination. Production accept paths use this richer form
+    /// because cgroup/connect eBPF rewrites do not populate conntrack state for
+    /// `SO_ORIGINAL_DST`.
+    fn resolve_cookie_metadata(
+        &self,
+        cookie: u64,
+    ) -> Result<NodeWaypointResolvedConnection, NodeWaypointIdentityError> {
         if let Some(record) = self.cookie_records.get(&cookie) {
-            return self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash);
+            return self.resolve_record(
+                cookie,
+                record.pod_uid,
+                record.workload_spiffe_hash,
+                record.orig_dst,
+            );
         }
         // Between-tick fallback (GAP-2M): the orig-dst bridge mirrors the pinned
         // BPF maps into `cookie_records` only on its poll interval, so a cookie
@@ -969,9 +1015,9 @@ impl NodeWaypointIdentityResolver {
         // fallback (non-eBPF / pre-install) or a miss → UnknownCookie
         // (fail-closed, unchanged).
         if let Some(fallback) = self.cookie_fallback.load_full()
-            && let Some((pod_uid, workload_spiffe_hash)) = fallback(cookie)
+            && let Some((pod_uid, workload_spiffe_hash, orig_dst)) = fallback(cookie)
         {
-            return self.resolve_record(cookie, pod_uid, workload_spiffe_hash);
+            return self.resolve_record(cookie, pod_uid, workload_spiffe_hash, orig_dst);
         }
         Err(NodeWaypointIdentityError::UnknownCookie(cookie))
     }
@@ -993,8 +1039,8 @@ impl NodeWaypointIdentityResolver {
         cookie: u64,
         pod_uid: [u8; 16],
         expected_hash: u64,
-    ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
-    {
+        orig_dst: SocketAddr,
+    ) -> Result<NodeWaypointResolvedConnection, NodeWaypointIdentityError> {
         if pod_uid == [0; 16] {
             return Err(NodeWaypointIdentityError::MissingPodUid(cookie));
         }
@@ -1047,7 +1093,11 @@ impl NodeWaypointIdentityResolver {
             // Scope from the SAME generation that just vouched for the identity:
             // captured pods resolve strictly per-UID (None on miss → fail closed).
             let scope = slice.scope_for(&pod_uid);
-            return Ok((identity, scope));
+            return Ok(NodeWaypointResolvedConnection {
+                identity,
+                policy_scope: scope,
+                orig_dst,
+            });
         }
 
         // Lazy enrollment (hash-join). The eBPF side stamps the record with
@@ -1061,7 +1111,11 @@ impl NodeWaypointIdentityResolver {
         if let Some(spiffe_id) = slice.spiffe_for_hash(expected_hash).cloned() {
             let scope = slice.scope_for(&pod_uid);
             let identity = self.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id));
-            return Ok((identity, scope));
+            return Ok(NodeWaypointResolvedConnection {
+                identity,
+                policy_scope: scope,
+                orig_dst,
+            });
         }
 
         Err(NodeWaypointIdentityError::UnknownPod(pod_uid))
@@ -1231,7 +1285,7 @@ mod tests {
 
     fn orig_dst4(pod_uid: [u8; 16], workload_spiffe_hash: u64) -> OrigDst4 {
         OrigDst4 {
-            addr: 0x0a000001,
+            addr: u32::from_ne_bytes([10, 0, 0, 1]),
             port: 8080,
             pod_uid,
             workload_spiffe_hash,
@@ -1240,7 +1294,7 @@ mod tests {
 
     fn orig_dst6(pod_uid: [u8; 16], workload_spiffe_hash: u64) -> OrigDst6 {
         OrigDst6 {
-            addr: [0, 0, 0, 1],
+            addr: [0, 0, 0, u32::from_ne_bytes([0, 0, 0, 1])],
             port: 8080,
             _pad: 0,
             pod_uid,
@@ -1437,7 +1491,7 @@ mod tests {
         // having mirrored the just-stamped accept cookie yet. The injected
         // synchronous fallback resolves cookie 42.
         resolver.set_cookie_fallback(Box::new(move |cookie| {
-            (cookie == 42).then_some((pod_uid, hash))
+            (cookie == 42).then_some((pod_uid, hash, "10.0.0.42:8080".parse().unwrap()))
         }));
 
         let (resolved, _scope) = resolver
@@ -1476,6 +1530,28 @@ mod tests {
         let (resolved, _scope) = resolver.resolve_cookie(7).expect("IPv6 identity resolves");
         assert_eq!(resolved.pod_uid, pod_uid);
         assert_eq!(resolved.spiffe_id.as_str(), "spiffe://td/ns/default/sa/api");
+    }
+
+    #[test]
+    fn resolve_cookie_metadata_preserves_original_destination() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("12121212-1212-1212-1212-121212121212").unwrap();
+        let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
+
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+        let resolved = resolver
+            .resolve_cookie_metadata(7)
+            .expect("IPv4 original destination is preserved");
+        assert_eq!(resolved.orig_dst, "10.0.0.1:8080".parse().unwrap());
+
+        resolver.record_orig_dst6(8, orig_dst6(pod_uid, hash));
+        let resolved = resolver
+            .resolve_cookie_metadata(8)
+            .expect("IPv6 original destination is preserved");
+        assert_eq!(resolved.orig_dst, "[::1]:8080".parse().unwrap());
     }
 
     #[test]
