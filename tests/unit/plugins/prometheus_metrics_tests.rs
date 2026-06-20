@@ -312,6 +312,24 @@ async fn test_registry_renders_node_agent_capture_state_condition() {
 }
 
 #[tokio::test]
+async fn test_registry_renders_node_agent_capture_state_with_namespace_label() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, "ambient-system");
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    metrics.set_capture_state(ferrum_edge::ebpf::NODE_AGENT_CAPTURE_STATE_READY);
+
+    registry.set_node_agent_metrics(metrics);
+    let output = registry.render_uncached();
+
+    assert!(output.contains(
+        "ferrum_node_agent_capture_state{state=\"ready\",namespace=\"ambient-system\"} 1"
+    ));
+    assert!(output.contains(
+        "ferrum_node_agent_capture_state{state=\"starting\",namespace=\"ambient-system\"} 0"
+    ));
+}
+
+#[tokio::test]
 async fn test_registry_renders_topology_degraded_gauge_with_reason() {
     let registry = MetricsRegistry::new();
     let metrics = Arc::new(NodeAgentMetrics::default());
