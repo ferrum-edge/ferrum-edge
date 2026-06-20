@@ -254,16 +254,7 @@ pub async fn run(
             .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
     });
     let proxy_frontend_tls_slot = if env_config.proxy_https_port != 0 {
-        Some(
-            operator_frontend_tls_slot
-                .as_ref()
-                .map(|slot| {
-                    Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                        slot.load_full().as_ref().clone(),
-                    )))
-                })
-                .unwrap_or_else(tls::empty_frontend_tls_slot),
-        )
+        proxy_frontend_tls_slot_from_operator(operator_frontend_tls_slot.as_ref())
     } else {
         None
     };
@@ -386,9 +377,9 @@ pub async fn run(
         info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
     }
 
-    // HTTPS listener. DP mode may receive Gateway-managed TLS material after
-    // startup, so keep the listener and shared TLS slot live even when no
-    // bootstrap frontend cert/key was configured.
+    // HTTPS listener. DP mode can hot-swap CP-delivered Gateway TLS material,
+    // but still requires either bootstrap or live-reload TLS material before
+    // binding the HTTPS port. This preserves HTTP-only DP deployments.
     if let Some(tls_slot) = proxy_frontend_tls_slot.clone() {
         let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
         let https_state = proxy_state.clone();
@@ -410,26 +401,17 @@ pub async fn run(
         });
         handles.push(https_handle);
         startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
-    } else {
+    } else if env_config.proxy_https_port == 0 {
         info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
+    } else {
+        info!("TLS not configured - HTTPS listener disabled");
     }
 
-    // HTTP/3 (QUIC) listener. DP mode may receive Gateway-managed TLS after
-    // startup, so a HTTPS-enabled DP can bind H3 with a temporary disabled
-    // config and wait for the CP-owned TLS slot to receive material.
+    // HTTP/3 (QUIC) listener.
     if env_config.enable_http3 {
         if env_config.proxy_https_port == 0 {
             info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
-        } else if let Some(tls_config) = tls_config
-            .clone()
-            .map(Ok)
-            .or_else(|| {
-                proxy_frontend_tls_slot
-                    .as_ref()
-                    .map(|_| tls::temporary_disabled_listener_tls_config())
-            })
-            .transpose()?
-        {
+        } else if let Some(tls_config) = tls_config.clone() {
             let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
@@ -468,13 +450,13 @@ pub async fn run(
             handles.push(h3_handle);
             startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
         } else {
-            info!("HTTP/3 disabled: HTTPS listener disabled");
+            info!("TLS not configured - HTTP/3 proxy listener disabled");
         }
     }
 
     if env_config.proxy_http_port == 0 && proxy_frontend_tls_slot.is_none() {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and FERRUM_PROXY_HTTPS_PORT=0. Only stream proxies (TCP/UDP) will serve traffic."
+            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and HTTPS is disabled or TLS is not configured. Only stream proxies (TCP/UDP) will serve traffic."
         );
     }
 
@@ -738,4 +720,40 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn proxy_frontend_tls_slot_from_operator(
+    operator_frontend_tls_slot: Option<&tls::SharedFrontendTls>,
+) -> Option<tls::SharedFrontendTls> {
+    operator_frontend_tls_slot.map(|slot| {
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            slot.load_full().as_ref().clone(),
+        )))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dp_proxy_frontend_tls_slot_is_absent_without_operator_tls() {
+        assert!(proxy_frontend_tls_slot_from_operator(None).is_none());
+    }
+
+    #[test]
+    fn dp_proxy_frontend_tls_slot_clones_operator_tls_slot() {
+        let operator_slot = tls::empty_frontend_tls_slot();
+        let listener_slot =
+            proxy_frontend_tls_slot_from_operator(Some(&operator_slot)).expect("slot");
+
+        assert!(listener_slot.load_full().as_ref().is_none());
+        operator_slot.store(Arc::new(Some(
+            tls::temporary_disabled_listener_tls_config().expect("temporary test TLS config"),
+        )));
+        assert!(
+            listener_slot.load_full().as_ref().is_none(),
+            "listener slot should be a clone, not the same ArcSwap as the operator source"
+        );
+    }
 }

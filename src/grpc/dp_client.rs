@@ -759,6 +759,9 @@ fn stage_frontend_tls_snapshot(
     cp_frontend_tls_materialized: &AtomicBool,
     frontend_tls_restore_slot: &ArcSwap<Option<Arc<rustls::ServerConfig>>>,
 ) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
+    if frontend_tls_slot.is_none() {
+        return Ok(FrontendTlsSnapshotUpdate::Unchanged);
+    }
     match (
         config.frontend_tls_cert_path.as_deref(),
         config.frontend_tls_key_path.as_deref(),
@@ -781,11 +784,6 @@ fn stage_frontend_tls_snapshot(
             );
         }
         (Some(cert_path), Some(key_path)) => {
-            if frontend_tls_slot.is_none() {
-                anyhow::bail!(
-                    "frontend TLS material was provided by CP but this DP did not start an HTTPS listener"
-                );
-            };
             if !cp_frontend_tls_materialized.load(Ordering::Acquire)
                 && let Some(slot) = frontend_tls_slot
             {
@@ -1096,6 +1094,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
                                  the CP should have filtered these (verify CP namespace matches DP)",
                                 namespace, filtered
+                            );
+                        }
+                        if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
+                            warn!(
+                                "Ignoring CP-delivered frontend TLS material because this DP has no HTTPS listener"
                             );
                         }
                         config.normalize_fields();
@@ -1447,6 +1450,18 @@ fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespac
     foreign || had_namespace_sources
 }
 
+fn clear_frontend_tls_material(config: &mut GatewayConfig) -> bool {
+    let had_material = config.frontend_tls_cert_path.is_some()
+        || config.frontend_tls_key_path.is_some()
+        || config.frontend_tls_source_namespace.is_some()
+        || !config.frontend_tls_namespace_sources.is_empty();
+    config.frontend_tls_cert_path = None;
+    config.frontend_tls_key_path = None;
+    config.frontend_tls_source_namespace = None;
+    config.frontend_tls_namespace_sources.clear();
+    had_material
+}
+
 /// Defense-in-depth filter for incremental deltas. Applied to
 /// `added_or_modified_*` vectors only; removal IDs are namespace-agnostic
 /// and harmless on the DP side because they only delete resources the DP
@@ -1611,6 +1626,56 @@ mod tests {
         assert_eq!(*revision_rx.borrow(), 2);
         assert!(!runtime.cp_materialized.load(Ordering::Acquire));
         assert!(listener_slot.load_full().as_ref().is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_frontend_tls_snapshot_ignores_tls_when_https_listener_is_absent() {
+        let proxy_state = minimal_proxy_state();
+        let config = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            ..Default::default()
+        };
+        let cp_materialized = AtomicBool::new(false);
+        let restore_slot = ArcSwap::from_pointee(None);
+
+        let update = stage_frontend_tls_snapshot(
+            &config,
+            &proxy_state,
+            None,
+            None,
+            &cp_materialized,
+            &restore_slot,
+        )
+        .expect("disabled HTTPS listener should not reject the whole snapshot");
+
+        assert!(matches!(update, FrontendTlsSnapshotUpdate::Unchanged));
+        assert!(!cp_materialized.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn clear_frontend_tls_material_removes_all_cp_tls_fields() {
+        let mut config = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            frontend_tls_namespace_sources: vec![
+                crate::config::types::FrontendTlsNamespaceSource {
+                    namespace: "default".to_string(),
+                    cert_path: "k8s://default/cert#tls.crt".to_string(),
+                    key_path: "k8s://default/cert#tls.key".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(clear_frontend_tls_material(&mut config));
+        assert_eq!(config.frontend_tls_cert_path, None);
+        assert_eq!(config.frontend_tls_key_path, None);
+        assert_eq!(config.frontend_tls_source_namespace, None);
+        assert!(config.frontend_tls_namespace_sources.is_empty());
+        assert!(!clear_frontend_tls_material(&mut config));
     }
 
     fn test_config_trust_bundles(x509_authorities: Vec<String>) -> ConfigTrustBundleSet {

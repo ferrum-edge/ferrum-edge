@@ -333,6 +333,7 @@ pub(crate) struct GatewayApiListenerPolicy {
     pub port: Option<u64>,
     pub route_kinds: HashSet<String>,
     pub materializable: bool,
+    pub routes_materializable: bool,
     pub requires_frontend_tls: bool,
 }
 

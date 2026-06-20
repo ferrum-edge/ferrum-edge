@@ -3148,7 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn same_namespace_gateway_tls_conflict_resolves_refs_and_keeps_programming() {
+    fn same_namespace_gateway_tls_conflict_resolves_refs_and_keeps_status_programming() {
         let gateway_class = ferrum_gateway_class();
         let gateway_a = object(
             "Gateway",

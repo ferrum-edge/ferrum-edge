@@ -233,6 +233,7 @@ pub(super) fn collect_gateway_listener_policy(
             port: listener.get("port").and_then(Value::as_u64),
             route_kinds: listener_allowed_route_kinds(listener),
             materializable,
+            routes_materializable: materializable,
             requires_frontend_tls,
         };
         acc.gateway_api_listener_policies.insert(
@@ -319,23 +320,25 @@ fn gateway_frontend_tls_namespace_source(
         .frontend_tls_namespace_sources
         .iter()
         .find(|source| source.namespace == source_namespace)
+        .cloned()
     {
         if existing.cert_path == cert_source && existing.key_path == key_source {
-            return existing.clone();
+            return existing;
         }
         // The current DP config has one frontend TLS serving slot per Gateway
         // namespace. Keep that slot stable, but do not withdraw otherwise valid
         // listeners solely because another Gateway in the namespace uses a
         // different valid certificateRef.
+        disable_gateway_frontend_tls_route_materialization(acc, object);
         acc.warnings.push(format!(
-            "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; keeping the existing serving source while preserving the listener as materialized",
+            "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; preserving listener status but leaving route traffic on this listener unmaterialized until multi-certificate serving is supported",
             object.metadata.namespace,
             object.metadata.name,
             cert_source,
             source_namespace,
             existing.cert_path
         ));
-        return existing.clone();
+        return existing;
     }
 
     let source = FrontendTlsNamespaceSource {
@@ -350,6 +353,34 @@ fn gateway_frontend_tls_namespace_source(
         .frontend_tls_namespace_sources
         .sort_by(|left, right| left.namespace.cmp(&right.namespace));
     source
+}
+
+fn disable_gateway_frontend_tls_route_materialization(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) {
+    for listener in object
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !listener_is_terminating_tls(listener) {
+            continue;
+        }
+        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        if let Some(policy) = acc
+            .gateway_api_listener_policies
+            .get_mut(&GatewayApiListenerKey {
+                namespace: object.metadata.namespace.clone(),
+                gateway: object.metadata.name.clone(),
+                listener: listener_name.to_string(),
+            })
+        {
+            policy.routes_materializable = false;
+        }
+    }
 }
 
 fn gateway_frontend_tls_sources(
@@ -1437,7 +1468,7 @@ fn route_listener_policy_materializes_route(
     parent_namespace: &str,
     policy: &GatewayApiListenerPolicy,
 ) -> bool {
-    policy.materializable
+    policy.routes_materializable
         && route_listener_policy_allows_route(acc, route, parent_namespace, policy)
 }
 
@@ -3606,7 +3637,7 @@ mod tests {
     }
 
     #[test]
-    fn same_namespace_gateway_tls_conflicts_keep_first_tls_source_and_materialize_listeners() {
+    fn same_namespace_gateway_tls_conflicts_keep_listener_status_but_do_not_materialize_routes() {
         let mut gateway_a = object(
             "Gateway",
             serde_json::json!({
@@ -3635,9 +3666,20 @@ mod tests {
         gateway_b.metadata.name = "edge-b".to_string();
         let cert_a = tls_secret("cert-a", "default", true);
         let cert_b = tls_secret("cert-b", "default", true);
+        let route_b = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge-b", "sectionName": "https-b"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/b"}}],
+                    "backendRefs": [{"name": "backend", "port": 8080}]
+                }]
+            }),
+        );
 
-        let result = translate_k8s_objects(&[gateway_a, cert_a, gateway_b, cert_b], options())
-            .expect("translation should keep valid same-namespace TLS listeners materialized");
+        let result =
+            translate_k8s_objects(&[gateway_a, cert_a, gateway_b, cert_b, route_b], options())
+                .expect("translation should keep valid same-namespace TLS listener status");
 
         assert!(
             result
@@ -3659,13 +3701,17 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.name == "edge-b-https-b")),
-            "later valid TLS listeners should not be withdrawn solely because the namespace already has a serving cert"
+            "status-only later valid TLS listeners should not be withdrawn solely because the namespace already has a serving cert"
+        );
+        assert!(
+            result.config.proxies.is_empty(),
+            "routes attached to the later listener must not be materialized against the wrong serving certificate"
         );
         assert!(
             result
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("additional frontend TLS certificate source"))
+                .any(|warning| warning.contains("route traffic on this listener unmaterialized"))
         );
     }
 
