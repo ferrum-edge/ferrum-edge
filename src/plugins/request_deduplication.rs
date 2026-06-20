@@ -1011,11 +1011,6 @@ impl RequestDeduplication {
         });
     }
 
-    fn advance_completed_evict_cursor(&self) {
-        let _guard = self.accounting_guard();
-        self.advance_completed_evict_cursor_locked();
-    }
-
     fn advance_completed_evict_cursor_locked(&self) {
         let Ok(_guard) = self.eviction_lock.try_lock() else {
             return;
