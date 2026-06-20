@@ -1770,9 +1770,17 @@ impl Plugin for RequestDeduplication {
                     }
                 }
                 if let Some(cached) = redis_candidate {
-                    self.redis_set(&key, &fingerprint, &cached).await;
-                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-                        self.redis_release_inflight(&key, &fingerprint, token).await;
+                    match self.redis_set(&key, &fingerprint, &cached).await {
+                        RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                                self.redis_release_inflight(&key, &fingerprint, token).await;
+                            }
+                        }
+                        // Nothing was retained locally. If Redis publication
+                        // fails too, keep the distributed in-flight lock until
+                        // `inflight_ttl` so peers cannot immediately re-run a
+                        // completed side-effecting request with no replay value.
+                        RedisStoreAction::Failed => {}
                     }
                     return PluginResult::Continue;
                 }
