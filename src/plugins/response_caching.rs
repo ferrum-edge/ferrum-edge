@@ -1335,24 +1335,6 @@ fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
         .any(|candidate| candidate == "*" || normalize_etag(candidate) == normalize_etag(etag))
 }
 
-/// Subtract `n` from the running cache-size accountant without ever wrapping.
-///
-/// This remains as a small testable primitive for callers that need saturated
-/// subtraction. Response-cache entry admission now performs exact accounting
-/// under `ResponseCaching::accounting_lock`, so production cache mutations do
-/// not depend on this helper for race safety.
-pub(crate) fn sub_total_size(total: &AtomicUsize, n: usize) {
-    if n == 0 {
-        return;
-    }
-    // `fetch_update` with a saturating closure cannot fail to converge: the
-    // closure always returns `Some`, so the CAS loop terminates and never
-    // produces an `Err`.
-    let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_sub(n))
-    });
-}
-
 /// Parse an HTTP-date for conditional-request handling.
 ///
 /// RFC 9110 §5.6.7 requires recipients to accept all three historic date

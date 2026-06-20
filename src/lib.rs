@@ -368,7 +368,14 @@ pub mod _test_support {
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.
     pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        crate::plugins::response_caching::sub_total_size(total, n);
+        use std::sync::atomic::Ordering;
+
+        if n == 0 {
+            return;
+        }
+        let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(n))
+        });
     }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
