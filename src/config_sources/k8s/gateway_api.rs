@@ -75,6 +75,7 @@ struct RouteMatchEntryDescriptor {
 struct RouteHostScope {
     proxy_hosts: Vec<String>,
     conflict_hostname: String,
+    parent_refs: Vec<String>,
     suffix: Option<String>,
 }
 
@@ -725,7 +726,7 @@ pub(crate) fn route_conflict_keys_for_acc(
                 .map(|hostnames| conflict_hostnames_for_proxy_hosts(&hostnames))
         })
         .unwrap_or_else(|| requested_hostnames.clone());
-    let parent_refs = route_parent_ref_keys(object);
+    let default_parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
     let mut keys = Vec::new();
 
@@ -737,8 +738,20 @@ pub(crate) fn route_conflict_keys_for_acc(
         .flatten()
     {
         for descriptor in route_match_descriptors(object, rule) {
-            for parent_ref in &parent_refs {
-                for hostname in &hostnames {
+            for hostname in &hostnames {
+                let parent_refs = acc
+                    .map(|acc| {
+                        route_allowed_parent_ref_keys_for_hostname(
+                            object,
+                            acc,
+                            &requested_hostnames,
+                            None,
+                            hostname,
+                        )
+                    })
+                    .filter(|refs| !refs.is_empty())
+                    .unwrap_or_else(|| default_parent_refs.clone());
+                for parent_ref in &parent_refs {
                     keys.push(GatewayApiRouteConflictKey {
                         route_family: route_family.clone(),
                         parent_ref: parent_ref.clone(),
@@ -1261,6 +1274,100 @@ fn route_parent_ref_keys_for_namespace(
     refs
 }
 
+fn route_allowed_parent_ref_keys_for_namespace(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    namespace_filter: Option<&str>,
+) -> Vec<String> {
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    };
+    if parent_refs.is_empty() {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    }
+
+    let mut refs: Vec<String> = parent_refs
+        .iter()
+        .filter_map(|parent| {
+            if !parent_ref_is_gateway(parent) {
+                return None;
+            }
+            let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
+            if namespace_filter.is_some_and(|filter| namespace != filter) {
+                return None;
+            }
+            route_parent_ref_disallow_error(acc, object, parent)
+                .is_none()
+                .then(|| route_parent_ref_key_for_parent(object, parent))
+        })
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn route_allowed_parent_ref_keys_for_hostname(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+    namespace_filter: Option<&str>,
+    conflict_hostname: &str,
+) -> Vec<String> {
+    let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    };
+    if parent_refs.is_empty() {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    }
+
+    let mut refs = Vec::new();
+    for parent_ref in parent_refs {
+        if !parent_ref_is_gateway(parent_ref) {
+            continue;
+        }
+        let Some(gateway_name) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        let gateway_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if namespace_filter.is_some_and(|namespace| namespace != gateway_namespace)
+            || route_parent_ref_disallow_error(acc, object, parent_ref).is_some()
+        {
+            continue;
+        }
+
+        let parent_ref_intersects_hostname =
+            acc.gateway_api_listener_policies
+                .iter()
+                .any(|(key, policy)| {
+                    key.namespace == gateway_namespace
+                        && key.gateway == gateway_name
+                        && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                        && route_listener_policy_materializes_route(
+                            acc,
+                            object,
+                            gateway_namespace,
+                            policy,
+                        )
+                        && route_hostnames.iter().any(|route_hostname| {
+                            intersect_hostnames(
+                                route_hostname.as_str(),
+                                policy.hostname.as_deref().unwrap_or("*"),
+                            )
+                            .as_deref()
+                                == Some(conflict_hostname)
+                        })
+                });
+        if parent_ref_intersects_hostname {
+            refs.push(route_parent_ref_key_for_parent(object, parent_ref));
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
 fn route_parent_ref_key_for_parent(object: &K8sObject, parent_ref: &Value) -> String {
     let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
     let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
@@ -1411,45 +1518,75 @@ fn ensure_route_parent_refs_allowed(
         return Ok(());
     }
 
+    let mut saw_gateway_parent = false;
+    let mut saw_allowed_gateway_parent = false;
+    let mut first_error = None;
     for parent_ref in parent_refs {
-        let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-        let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
-        if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
+        if !parent_ref_is_gateway(parent_ref) {
             continue;
         }
-        let parent_namespace =
-            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-        let listener_match = gateway_parent_ref_listener_match(acc, parent_namespace, parent_ref);
-        if parent_ref.get("sectionName").is_some() && listener_match != Some(true) {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "{} parentRef does not match any known Gateway listener in namespace '{}'",
-                    object.kind, parent_namespace
-                ),
-            ));
-        }
-        if parent_ref.get("port").is_some() && listener_match == Some(false) {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "{} parentRef does not match any known Gateway listener in namespace '{}'",
-                    object.kind, parent_namespace
-                ),
-            ));
-        }
-        if !route_namespace_allowed_by_listener(acc, object, parent_namespace, parent_ref) {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "{} parentRef.namespace '{}' is not permitted by the target Gateway listener",
-                    object.kind, parent_namespace
-                ),
-            ));
+        saw_gateway_parent = true;
+        if let Some(error) = route_parent_ref_disallow_error(acc, object, parent_ref) {
+            first_error.get_or_insert(error);
+        } else {
+            saw_allowed_gateway_parent = true;
         }
     }
 
+    if saw_gateway_parent && !saw_allowed_gateway_parent {
+        return Err(first_error.unwrap_or_else(|| {
+            invalid_resource(
+                object,
+                format!("{} has no permitted Gateway parentRefs", object.kind),
+            )
+        }));
+    }
+
     Ok(())
+}
+
+fn parent_ref_is_gateway(parent_ref: &Value) -> bool {
+    let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+    let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+    parent_kind == "Gateway" && parent_group == "gateway.networking.k8s.io"
+}
+
+fn route_parent_ref_disallow_error(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    parent_ref: &Value,
+) -> Option<K8sTranslateError> {
+    let parent_namespace =
+        string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+    let listener_match = gateway_parent_ref_listener_match(acc, parent_namespace, parent_ref);
+    if parent_ref.get("sectionName").is_some() && listener_match != Some(true) {
+        return Some(invalid_resource(
+            object,
+            format!(
+                "{} parentRef does not match any known Gateway listener in namespace '{}'",
+                object.kind, parent_namespace
+            ),
+        ));
+    }
+    if parent_ref.get("port").is_some() && listener_match == Some(false) {
+        return Some(invalid_resource(
+            object,
+            format!(
+                "{} parentRef does not match any known Gateway listener in namespace '{}'",
+                object.kind, parent_namespace
+            ),
+        ));
+    }
+    if !route_namespace_allowed_by_listener(acc, object, parent_namespace, parent_ref) {
+        return Some(invalid_resource(
+            object,
+            format!(
+                "{} parentRef.namespace '{}' is not permitted by the target Gateway listener",
+                object.kind, parent_namespace
+            ),
+        ));
+    }
+    None
 }
 
 fn gateway_parent_ref_listener_match(
@@ -1868,7 +2005,8 @@ fn http_route_resources(
     let mut plugins = Vec::new();
 
     for config_namespace in &config_namespaces {
-        let parent_refs = route_parent_ref_keys_for_namespace(object, Some(config_namespace));
+        let parent_refs =
+            route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace));
         if parent_refs.is_empty() {
             continue;
         }
@@ -1884,6 +2022,21 @@ fn http_route_resources(
             continue;
         };
         let conflict_hostnames = conflict_hostnames_for_proxy_hosts(&hostnames);
+        let parent_refs_by_hostname: HashMap<String, Vec<String>> = conflict_hostnames
+            .iter()
+            .map(|hostname| {
+                (
+                    hostname.clone(),
+                    route_allowed_parent_ref_keys_for_hostname(
+                        object,
+                        acc,
+                        &requested_hostnames,
+                        Some(config_namespace),
+                        hostname,
+                    ),
+                )
+            })
+            .collect();
         let route_namespace_suffix = (config_namespaces.len() > 1)
             .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
         let default_redirect_port = route_redirect_default_listener_port(
@@ -1988,6 +2141,7 @@ fn http_route_resources(
                     &hostnames,
                     &conflict_hostnames,
                     &parent_refs,
+                    &parent_refs_by_hostname,
                     &route_family,
                     &descriptors_for_path,
                     &losing_conflict_keys,
@@ -2034,7 +2188,7 @@ fn http_route_resources(
 
                     if object.kind == "HTTPRoute" {
                         let skipped_descriptors = skipped_descriptors_for_host(
-                            &parent_refs,
+                            &host_scope.parent_refs,
                             &route_family,
                             &host_scope.conflict_hostname,
                             &descriptors_for_path,
@@ -2096,6 +2250,7 @@ fn route_host_scopes_for_path(
     spec_hostnames: &[String],
     conflict_hostnames: &[String],
     parent_refs: &[String],
+    parent_refs_by_hostname: &HashMap<String, Vec<String>>,
     route_family: &str,
     descriptors_for_path: &[RouteMatchDescriptor],
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
@@ -2108,6 +2263,10 @@ fn route_host_scopes_for_path(
                 .map(|(index, hostname)| RouteHostScope {
                     proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
                     conflict_hostname: hostname.clone(),
+                    parent_refs: parent_refs_by_hostname
+                        .get(hostname)
+                        .cloned()
+                        .unwrap_or_else(|| parent_refs.to_vec()),
                     suffix: Some(format!("host{index}")),
                 })
                 .collect();
@@ -2118,6 +2277,7 @@ fn route_host_scopes_for_path(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "*".to_string()),
+            parent_refs: parent_refs.to_vec(),
             suffix: None,
         }];
     }
@@ -2126,9 +2286,14 @@ fn route_host_scopes_for_path(
         .iter()
         .enumerate()
         .filter_map(|(index, hostname)| {
+            let scoped_parent_refs = parent_refs_by_hostname
+                .get(hostname)
+                .filter(|refs| !refs.is_empty())
+                .cloned()
+                .unwrap_or_else(|| parent_refs.to_vec());
             let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
                 !descriptor_conflicts_for_host(
-                    parent_refs,
+                    &scoped_parent_refs,
                     route_family,
                     hostname,
                     descriptor,
@@ -2142,6 +2307,7 @@ fn route_host_scopes_for_path(
             Some(RouteHostScope {
                 proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
                 conflict_hostname: hostname.clone(),
+                parent_refs: scoped_parent_refs,
                 suffix: Some(format!("host{index}")),
             })
         })
@@ -2185,15 +2351,16 @@ fn descriptor_conflicts_for_host(
     descriptor: &RouteMatchDescriptor,
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> bool {
-    parent_refs.iter().any(|parent_ref| {
-        losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
-            route_family: route_family.to_string(),
-            parent_ref: parent_ref.clone(),
-            hostname: hostname.to_string(),
-            listen_path: descriptor.listen_path.clone(),
-            match_signature: route_conflict_match_signature(descriptor),
+    !parent_refs.is_empty()
+        && parent_refs.iter().all(|parent_ref| {
+            losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
+                route_family: route_family.to_string(),
+                parent_ref: parent_ref.clone(),
+                hostname: hostname.to_string(),
+                listen_path: descriptor.listen_path.clone(),
+                match_signature: route_conflict_match_signature(descriptor),
+            })
         })
-    })
 }
 
 fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
@@ -4256,20 +4423,62 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_http_route_drops_match_when_any_parent_ref_loses() {
+    fn conflicting_http_route_keeps_surviving_parent_ref() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "api.example.com"
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+
+        let mut gateway_b = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "other.example.com"
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "edge-b".to_string();
+
         let mut winner = route_with_name_and_created_at("api-old", "2026-01-01T00:00:00Z");
+        winner.spec["hostnames"] = serde_json::json!(["api.example.com"]);
         winner.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}]);
 
         let mut loser = route_with_name_and_created_at("api-new", "2026-01-02T00:00:00Z");
+        loser.spec["hostnames"] = serde_json::json!(["api.example.com", "other.example.com"]);
         loser.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}, {"name": "edge-b"}]);
 
-        let result =
-            translate_k8s_objects(&[loser, winner], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[gateway_a, gateway_b, loser, winner], options())
+            .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies.len(), 2);
         assert!(
-            result.config.proxies[0].id.contains("api-old"),
-            "route losing on one parentRef must not materialize an unscoped proxy"
+            result.config.proxies.iter().any(|proxy| {
+                proxy.id.contains("api-old")
+                    && proxy.hosts == vec!["api.example.com".to_string()]
+                    && proxy.listen_path.as_deref() == Some("/api")
+            }),
+            "winner should keep the conflicted edge-a hostname"
+        );
+        assert!(
+            result.config.proxies.iter().any(|proxy| {
+                proxy.id.contains("api-new")
+                    && proxy.hosts == vec!["other.example.com".to_string()]
+                    && proxy.listen_path.as_deref() == Some("/api")
+            }),
+            "loser should still materialize the surviving edge-b hostname"
         );
         assert!(result.config.validate_unique_listen_paths().is_ok());
         assert!(result.warnings.iter().any(|warning| {
@@ -4766,13 +4975,39 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_http_route_drops_match_with_surviving_parent_ref() {
-        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+    fn conflicting_http_route_keeps_surviving_listener_parent_ref() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "http-a",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "api.example.com"
+                    },
+                    {
+                        "name": "http-b",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "hostname": "other.example.com"
+                    }
+                ]
+            }),
+        );
+        let mut older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        older.spec["hostnames"] = serde_json::json!(["api.example.com"]);
+        older.spec["parentRefs"] = serde_json::json!([{"name": "sample", "sectionName": "http-a"}]);
+
         let mut mixed_parent_route = object(
             "HTTPRoute",
             serde_json::json!({
-                "hostnames": ["api.example.com"],
-                "parentRefs": [{"name": "edge"}, {"name": "edge-alt"}],
+                "hostnames": ["api.example.com", "other.example.com"],
+                "parentRefs": [
+                    {"name": "sample", "sectionName": "http-a"},
+                    {"name": "sample", "sectionName": "http-b"}
+                ],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
                     "backendRefs": [{"name": "api-b", "port": 8080}]
@@ -4782,15 +5017,19 @@ mod tests {
         mixed_parent_route.metadata.name = "api-b".to_string();
         mixed_parent_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[older, mixed_parent_route], options())
+        let result = translate_k8s_objects(&[gateway, older, mixed_parent_route], options())
             .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies.len(), 2);
         assert!(result.config.proxies.iter().any(|proxy| {
-            proxy.id.contains("api-a") && proxy.listen_path.as_deref() == Some("/api")
+            proxy.id.contains("api-a")
+                && proxy.hosts == vec!["api.example.com".to_string()]
+                && proxy.listen_path.as_deref() == Some("/api")
         }));
-        assert!(!result.config.proxies.iter().any(|proxy| {
-            proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-b")
+                && proxy.hosts == vec!["other.example.com".to_string()]
+                && proxy.listen_path.as_deref() == Some("/api")
         }));
         assert!(result.config.validate_unique_listen_paths().is_ok());
     }
@@ -6074,6 +6313,72 @@ mod tests {
             err.to_string()
                 .contains("not permitted by the target Gateway listener")
         );
+    }
+
+    #[test]
+    fn http_route_materializes_allowed_parent_when_sibling_parent_ref_is_not_allowed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "web",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "ok.example.com",
+                        "allowedRoutes": {
+                            "namespaces": {"from": "All"},
+                            "kinds": [{"kind": "HTTPRoute"}]
+                        }
+                    },
+                    {
+                        "name": "grpc",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "hostname": "blocked.example.com",
+                        "allowedRoutes": {
+                            "namespaces": {"from": "All"},
+                            "kinds": [{"kind": "GRPCRoute"}]
+                        }
+                    }
+                ]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["ok.example.com", "blocked.example.com"],
+                "parentRefs": [
+                    {"name": "sample", "sectionName": "web"},
+                    {"name": "sample", "sectionName": "grpc"}
+                ],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/ok"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("allowed parentRef should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].hosts,
+            vec!["ok.example.com".to_string()]
+        );
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/ok"));
+        assert!(result.materialized_route_parents.iter().any(|parent| {
+            parent.route.kind == "HTTPRoute"
+                && parent.route.name == "sample"
+                && parent.parent_ref == "gateway.networking.k8s.io/Gateway/default/sample/web/*"
+        }));
+        assert!(!result.materialized_route_parents.iter().any(|parent| {
+            parent.route.kind == "HTTPRoute"
+                && parent.route.name == "sample"
+                && parent.parent_ref == "gateway.networking.k8s.io/Gateway/default/sample/grpc/*"
+        }));
     }
 
     #[test]

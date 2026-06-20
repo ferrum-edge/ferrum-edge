@@ -188,6 +188,12 @@ pub fn plan_gateway_api_status_updates_with_context(
                             || managed_parent_ref_keys.contains(&conflict.key.parent_ref))
                 })
                 .collect();
+            let status_route_conflicts: Vec<&GatewayApiRouteConflict> = if object.kind == "Gateway"
+            {
+                route_conflicts.iter().collect()
+            } else {
+                object_conflicts
+            };
             let route_keys = if matches!(
                 object.kind.as_str(),
                 "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
@@ -204,7 +210,7 @@ pub fn plan_gateway_api_status_updates_with_context(
                 object,
                 options.clone(),
                 &status_context,
-                &object_conflicts,
+                &status_route_conflicts,
                 &route_keys,
                 &managed_parent_refs,
             );
@@ -238,7 +244,7 @@ fn desired_status_for_object(
         return gateway_class_status(object);
     }
 
-    let result = translate_k8s_objects_with_filter(objects, options, |candidate| {
+    let result = translate_k8s_objects_with_filter(objects, options.clone(), |candidate| {
         same_resource(candidate, object)
             || candidate.kind == "ReferenceGrant"
             || candidate.kind == "GatewayClass"
@@ -249,7 +255,14 @@ fn desired_status_for_object(
     });
 
     match object.kind.as_str() {
-        "Gateway" => gateway_status(objects, object, result.as_ref(), status_context),
+        "Gateway" => gateway_status(
+            objects,
+            object,
+            &options,
+            result.as_ref(),
+            status_context,
+            route_conflicts,
+        ),
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
             objects,
             object,
@@ -543,8 +556,10 @@ fn reference_grant_has_secret_to(grant: &K8sObject, secret_name: &str) -> bool {
 fn gateway_status(
     objects: &[K8sObject],
     object: &K8sObject,
+    options: &K8sTranslationOptions,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     status_context: &GatewayApiStatusContext,
+    route_conflicts: &[&GatewayApiRouteConflict],
 ) -> Value {
     let references = gateway_reference_status(objects, object);
     let (accepted, materialized, resolved_refs, programmed, message) = match result {
@@ -648,9 +663,11 @@ fn gateway_status(
         Value::Array(gateway_listener_statuses(
             objects,
             object,
+            options,
             result.ok().map(|translation| &translation.config),
             accepted,
             status_context.data_plane_ready,
+            route_conflicts,
         )),
     );
     status
@@ -671,9 +688,11 @@ fn gateway_status_address(address: &str) -> Value {
 fn gateway_listener_statuses(
     objects: &[K8sObject],
     gateway: &K8sObject,
+    options: &K8sTranslationOptions,
     config: Option<&GatewayConfig>,
     gateway_accepted: bool,
     data_plane_ready: bool,
+    route_conflicts: &[&GatewayApiRouteConflict],
 ) -> Vec<Value> {
     gateway
         .spec
@@ -784,7 +803,13 @@ fn gateway_listener_statuses(
             ];
             json!({
                 "name": listener_name,
-                "attachedRoutes": attached_route_count(objects, gateway, listener),
+                "attachedRoutes": attached_route_count(
+                    objects,
+                    gateway,
+                    listener,
+                    options,
+                    route_conflicts
+                ),
                 "supportedKinds": route_kinds.supported_kinds,
                 "conditions": conditions,
             })
@@ -878,7 +903,13 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
         .find(|allowed| *allowed == kind)
 }
 
-fn attached_route_count(objects: &[K8sObject], gateway: &K8sObject, listener: &Value) -> usize {
+fn attached_route_count(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+    listener: &Value,
+    options: &K8sTranslationOptions,
+    route_conflicts: &[&GatewayApiRouteConflict],
+) -> usize {
     objects
         .iter()
         .filter(|object| {
@@ -894,9 +925,62 @@ fn attached_route_count(objects: &[K8sObject], gateway: &K8sObject, listener: &V
                     && route_allowed_by_listener(objects, route, gateway, listener)
                     && route_kind_allowed_by_listener(route, listener)
                     && route_intersects_listener_hostname(route, listener)
+                    && !route_parent_ref_fully_conflicted(
+                        objects,
+                        options,
+                        route,
+                        &parent_ref,
+                        listener,
+                        route_conflicts,
+                    )
             })
         })
         .count()
+}
+
+fn route_parent_ref_fully_conflicted(
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+    route: &K8sObject,
+    parent_ref: &Value,
+    listener: &Value,
+    route_conflicts: &[&GatewayApiRouteConflict],
+) -> bool {
+    let route_key = K8sResourceKey::from_object(route);
+    let parent_ref_key = route_parent_ref_key(route, parent_ref);
+    let listener_hostnames = listener_conflict_hostnames_for_route(route, listener);
+    let parent_route_keys: Vec<GatewayApiRouteConflictKey> =
+        gateway_api_route_conflict_keys_with_context(objects, options, route)
+            .into_iter()
+            .filter(|key| {
+                key.parent_ref == parent_ref_key && listener_hostnames.contains(&key.hostname)
+            })
+            .collect();
+    if parent_route_keys.is_empty() {
+        return false;
+    }
+
+    let parent_conflicts: Vec<&GatewayApiRouteConflict> = route_conflicts
+        .iter()
+        .copied()
+        .filter(|conflict| conflict.loser == route_key && conflict.key.parent_ref == parent_ref_key)
+        .collect();
+    !parent_conflicts.is_empty()
+        && parent_route_keys
+            .iter()
+            .all(|key| parent_conflicts.iter().any(|conflict| conflict.key == *key))
+}
+
+fn listener_conflict_hostnames_for_route(route: &K8sObject, listener: &Value) -> HashSet<String> {
+    let listener_hostname = listener
+        .get("hostname")
+        .and_then(Value::as_str)
+        .map(normalize_hostname)
+        .unwrap_or_else(|| "*".to_string());
+    route_hostnames(route)
+        .into_iter()
+        .filter_map(|route_hostname| intersect_hostnames(&route_hostname, &listener_hostname))
+        .collect()
 }
 
 fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
@@ -1059,6 +1143,34 @@ fn hostnames_intersect(route_hostname: &str, listener_hostname: &str) -> bool {
             route_suffix == listener_suffix
                 || suffix_is_within(route_suffix, listener_suffix)
                 || suffix_is_within(listener_suffix, route_suffix)
+        }
+    }
+}
+
+fn intersect_hostnames(route_hostname: &str, listener_hostname: &str) -> Option<String> {
+    if route_hostname == "*" {
+        return Some(listener_hostname.to_string());
+    }
+    if listener_hostname == "*" {
+        return Some(route_hostname.to_string());
+    }
+    match (
+        wildcard_hostname_suffix(route_hostname),
+        wildcard_hostname_suffix(listener_hostname),
+    ) {
+        (None, None) => (route_hostname == listener_hostname).then(|| route_hostname.to_string()),
+        (Some(route_suffix), None) => hostname_matches_wildcard(listener_hostname, route_suffix)
+            .then(|| listener_hostname.to_string()),
+        (None, Some(listener_suffix)) => hostname_matches_wildcard(route_hostname, listener_suffix)
+            .then(|| route_hostname.to_string()),
+        (Some(route_suffix), Some(listener_suffix)) => {
+            if route_suffix == listener_suffix || suffix_is_within(route_suffix, listener_suffix) {
+                Some(route_hostname.to_string())
+            } else if suffix_is_within(listener_suffix, route_suffix) {
+                Some(listener_hostname.to_string())
+            } else {
+                None
+            }
         }
     }
 }
@@ -1230,17 +1342,25 @@ fn route_status(
         let conflict_message = parent_conflicts
             .first()
             .map(|conflict| route_conflict_message(conflict));
-        let no_matching_parent =
-            accepted && !route_parent_ref_has_matching_parent(objects, object, parent_ref);
+        let not_allowed_by_listener = accepted
+            && !all_parent_matches_conflicted
+            && route_parent_ref_not_allowed_by_listener(objects, object, parent_ref);
+        let no_matching_parent = accepted
+            && !not_allowed_by_listener
+            && !route_parent_ref_has_matching_parent(objects, object, parent_ref);
         let no_matching_listener_hostname = accepted
             && !no_matching_parent
+            && !not_allowed_by_listener
             && !route_parent_ref_has_matching_listener(objects, object, parent_ref);
         let accepted_for_parent = accepted
             && !all_parent_matches_conflicted
+            && !not_allowed_by_listener
             && !no_matching_parent
             && !no_matching_listener_hostname;
         let accepted_reason = if all_parent_matches_conflicted {
             "Conflicted"
+        } else if not_allowed_by_listener {
+            "NotAllowedByListeners"
         } else if no_matching_parent {
             "NoMatchingParent"
         } else if no_matching_listener_hostname {
@@ -1250,6 +1370,8 @@ fn route_status(
         };
         let accepted_message = if all_parent_matches_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
+        } else if not_allowed_by_listener {
+            "Ferrum rejected this route attachment because it is not permitted by the target Gateway listener"
         } else if no_matching_parent {
             "Ferrum rejected this route attachment because no matching parent listener was found"
         } else if no_matching_listener_hostname {
@@ -1261,12 +1383,15 @@ fn route_status(
         let programmed_for_parent = programmed
             && parent_materialized
             && !all_parent_matches_conflicted
+            && !not_allowed_by_listener
             && !no_matching_parent
             && !no_matching_listener_hostname;
         let programmed_reason = if programmed_for_parent {
             "Programmed"
         } else if all_parent_matches_conflicted {
             "Conflicted"
+        } else if not_allowed_by_listener {
+            "NotAllowedByListeners"
         } else if no_matching_parent {
             "NoMatchingParent"
         } else if no_matching_listener_hostname {
@@ -1284,6 +1409,8 @@ fn route_status(
             "Ferrum programmed this route"
         } else if all_parent_matches_conflicted {
             conflict_message.as_deref().unwrap_or(&message)
+        } else if not_allowed_by_listener {
+            "Ferrum did not program this route because it is not permitted by the target Gateway listener"
         } else if no_matching_listener_hostname {
             "Ferrum did not program this route because no matching listener hostname was found"
         } else if accepted_for_parent && !parent_materialized {
@@ -1776,6 +1903,38 @@ fn route_parent_ref_has_matching_listener(
                 && route_allowed_by_listener(objects, route, gateway, listener)
                 && route_intersects_listener_hostname(route, listener)
         })
+}
+
+fn route_parent_ref_not_allowed_by_listener(
+    objects: &[K8sObject],
+    route: &K8sObject,
+    parent_ref: &Value,
+) -> bool {
+    let Some(gateway) = objects.iter().find(|object| {
+        object.kind == "Gateway" && parent_ref_targets_gateway(route, parent_ref, object)
+    }) else {
+        return false;
+    };
+
+    let mut saw_matching_listener = false;
+    for listener in gateway
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !parent_ref_matches_listener(parent_ref, listener) {
+            continue;
+        }
+        saw_matching_listener = true;
+        if route_kind_allowed_by_listener(route, listener)
+            && route_allowed_by_listener(objects, route, gateway, listener)
+        {
+            return false;
+        }
+    }
+    saw_matching_listener
 }
 
 fn route_parent_ref_has_matching_parent(
@@ -3722,6 +3881,80 @@ mod tests {
     }
 
     #[test]
+    fn route_status_scopes_not_allowed_to_disallowed_parent_ref() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "web",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "allowedRoutes": {
+                            "namespaces": {"from": "All"},
+                            "kinds": [{"kind": "HTTPRoute"}]
+                        }
+                    },
+                    {
+                        "name": "grpc",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "allowedRoutes": {
+                            "namespaces": {"from": "All"},
+                            "kinds": [{"kind": "GRPCRoute"}]
+                        }
+                    }
+                ]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [
+                    {"name": "edge", "sectionName": "web"},
+                    {"name": "edge", "sectionName": "grpc"}
+                ],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let web_parent = parents
+            .iter()
+            .find(|parent| parent["parentRef"]["sectionName"].as_str() == Some("web"))
+            .expect("web parent status");
+        let grpc_parent = parents
+            .iter()
+            .find(|parent| parent["parentRef"]["sectionName"].as_str() == Some("grpc"))
+            .expect("grpc parent status");
+
+        let web_conditions = web_parent["conditions"].as_array().unwrap();
+        assert_condition(web_conditions, "Accepted", "True");
+        assert_condition(web_conditions, "Programmed", "True");
+
+        let grpc_conditions = grpc_parent["conditions"].as_array().unwrap();
+        assert_condition(grpc_conditions, "Accepted", "False");
+        assert_condition(grpc_conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(grpc_conditions, "Accepted")["reason"].as_str(),
+            Some("NotAllowedByListeners")
+        );
+        assert_eq!(
+            find_condition(grpc_conditions, "Programmed")["reason"].as_str(),
+            Some("NotAllowedByListeners")
+        );
+    }
+
+    #[test]
     fn route_status_reports_unresolved_non_service_backend_ref() {
         // Guards the second prong of `error_is_reference_resolution` against
         // wording drift in the translator's "only core Service backendRefs are
@@ -4008,6 +4241,23 @@ mod tests {
             find_condition(conditions, "Accepted")["reason"].as_str(),
             Some("Conflicted")
         );
+    }
+
+    #[test]
+    fn gateway_listener_attached_routes_excludes_fully_conflicted_route_parent() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = ferrum_gateway("edge");
+        let older = route_with_created_at("api-a", "2026-01-01T00:00:00Z");
+        let newer = route_with_created_at("api-b", "2026-01-02T00:00:00Z");
+
+        let updates = plan_status_updates(&[gateway_class, gateway, newer, older], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let listener = listener_status_by_name(
+            gateway_update.status["listeners"].as_array().unwrap(),
+            "http",
+        );
+        assert_eq!(listener["attachedRoutes"].as_u64(), Some(1));
     }
 
     #[test]
