@@ -134,8 +134,8 @@ pub(super) fn translate(
                 add_waypoint_binding(acc, object);
             }
             if acc.gateway_is_managed_by_ferrum(object) {
-                materialize_gateway_frontend_tls(acc, object);
-                for service in mesh_services_from_gateway(object)? {
+                let terminating_tls_ready = materialize_gateway_frontend_tls(acc, object);
+                for service in mesh_services_from_gateway(acc, object, terminating_tls_ready)? {
                     acc.mesh.services.push(service);
                 }
             }
@@ -223,13 +223,24 @@ pub(super) fn collect_gateway_listener_policy(
     let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
         return Ok(());
     };
+    let terminating_tls_routes_enabled = !gateway_has_terminating_tls_listeners(object)
+        || matches!(
+            gateway_frontend_tls_sources(acc, object),
+            GatewayFrontendTlsSelection::Single { .. }
+        );
     for listener in listeners {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let route_kinds =
+            if listener_is_terminating_tls(listener) && !terminating_tls_routes_enabled {
+                HashSet::new()
+            } else {
+                listener_allowed_route_kinds(listener)
+            };
         let policy = GatewayApiListenerPolicy {
             namespaces: allowed_route_namespaces(listener),
             hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
             port: listener.get("port").and_then(Value::as_u64),
-            route_kinds: listener_allowed_route_kinds(listener),
+            route_kinds,
         };
         acc.gateway_api_listener_policies.insert(
             GatewayApiListenerKey {
@@ -243,7 +254,7 @@ pub(super) fn collect_gateway_listener_policy(
     Ok(())
 }
 
-fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) {
+fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) -> bool {
     let (cert_source, key_source) = match gateway_frontend_tls_sources(acc, object) {
         GatewayFrontendTlsSelection::Single {
             cert_source,
@@ -254,16 +265,16 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
                 "Gateway API Gateway {}/{} has at least one unresolved TLS certificateRef; leaving frontend TLS unmaterialized",
                 object.metadata.namespace, object.metadata.name
             ));
-            return;
+            return false;
         }
         GatewayFrontendTlsSelection::UnsupportedMultiple => {
             acc.warnings.push(format!(
                 "Gateway API Gateway {}/{} has multiple distinct TLS certificateRefs, but Ferrum currently supports one frontend TLS certificate per data plane; leaving listener references unresolved",
                 object.metadata.namespace, object.metadata.name
             ));
-            return;
+            return false;
         }
-        GatewayFrontendTlsSelection::None => return,
+        GatewayFrontendTlsSelection::None => return false,
     };
 
     let source_namespace = object.metadata.namespace.clone();
@@ -274,7 +285,7 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
         cert_source,
         key_source,
     ) else {
-        return;
+        return false;
     };
 
     if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
@@ -282,6 +293,7 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
         acc.config.frontend_tls_key_path = Some(source.key_path.clone());
         acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
     }
+    true
 }
 
 fn gateway_frontend_tls_namespace_source(
@@ -389,6 +401,16 @@ fn gateway_frontend_tls_sources(
             },
         )
         .unwrap_or(GatewayFrontendTlsSelection::None)
+}
+
+fn gateway_has_terminating_tls_listeners(object: &K8sObject) -> bool {
+    object
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(listener_is_terminating_tls)
 }
 
 fn listener_is_terminating_tls(listener: &Value) -> bool {
@@ -1265,7 +1287,11 @@ fn compare_conflict_candidates(
     )
 }
 
-fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8sTranslateError> {
+fn mesh_services_from_gateway(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    terminating_tls_ready: bool,
+) -> Result<Vec<MeshService>, K8sTranslateError> {
     let mut services = Vec::new();
     object
         .spec
@@ -1274,6 +1300,15 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8
         .into_iter()
         .flatten()
         .try_for_each(|listener| {
+            if listener_is_terminating_tls(listener) && !terminating_tls_ready {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    string_field(listener, "name").unwrap_or("listener")
+                ));
+                return Ok(());
+            }
             let Some(raw_port) = listener.get("port").and_then(Value::as_u64) else {
                 return Ok(());
             };
@@ -1553,6 +1588,63 @@ fn route_effective_hostnames(
     }
 }
 
+fn route_redirect_default_listener_port(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+    parent_namespace_filter: Option<&str>,
+) -> Option<u16> {
+    let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let mut ports = HashSet::new();
+
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io")
+            != "gateway.networking.k8s.io"
+            || string_field(parent_ref, "kind").unwrap_or("Gateway") != "Gateway"
+        {
+            continue;
+        }
+        let Some(gateway_name) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        let gateway_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if parent_namespace_filter.is_some_and(|namespace| namespace != gateway_namespace) {
+            continue;
+        }
+
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace != gateway_namespace
+                || key.gateway != gateway_name
+                || !parent_ref_matches_listener_policy(parent_ref, key, policy)
+                || !policy.route_kinds.contains(object.kind.as_str())
+                || !route_namespace_matches_policy(acc, object, gateway_namespace, policy)
+            {
+                continue;
+            }
+            let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+            if !route_hostnames.iter().any(|route_hostname| {
+                intersect_hostnames(route_hostname.as_str(), listener_hostname).is_some()
+            }) {
+                continue;
+            }
+            if let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok()) {
+                ports.insert(port);
+            }
+        }
+    }
+
+    let mut iter = ports.into_iter();
+    let port = iter.next()?;
+    iter.next().is_none().then_some(port)
+}
+
 fn parent_ref_matches_listener_policy(
     parent_ref: &Value,
     key: &GatewayApiListenerKey,
@@ -1700,6 +1792,12 @@ fn http_route_resources(
         let conflict_hostnames = conflict_hostnames_for_proxy_hosts(&hostnames);
         let route_namespace_suffix = (config_namespaces.len() > 1)
             .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
+        let default_redirect_port = route_redirect_default_listener_port(
+            object,
+            acc,
+            &requested_hostnames,
+            Some(config_namespace.as_str()),
+        );
 
         for (rule_index, rule) in object
             .spec
@@ -1727,7 +1825,7 @@ fn http_route_resources(
             match_paths.dedup();
 
             let request_transform = gateway_request_header_modifier_rules(rule);
-            let redirect = gateway_request_redirect_value(object, rule)?;
+            let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let backend_resolution = route_backends(object, rule, acc)?;
             let invalid_backend_fault = backend_resolution.invalid.map(|reason| {
                 invalid_backend_fault_value_with_percentage(
@@ -2291,6 +2389,7 @@ fn gateway_header_remove_entries(value: Option<&Value>) -> Vec<String> {
 fn gateway_request_redirect_value(
     object: &K8sObject,
     rule: &Value,
+    default_listener_port: Option<u16>,
 ) -> Result<Option<Value>, K8sTranslateError> {
     let Some(filters) = rule.get("filters").and_then(Value::as_array) else {
         return Ok(None);
@@ -2312,7 +2411,8 @@ fn gateway_request_redirect_value(
             out.insert("scheme".to_string(), Value::String(scheme.to_string()));
         }
 
-        let redirect_port = gateway_redirect_port(object, redirect, redirect_scheme)?;
+        let redirect_port =
+            gateway_redirect_port(object, redirect, redirect_scheme, default_listener_port)?;
         let authority = redirect
             .get("hostname")
             .and_then(Value::as_str)
@@ -2365,9 +2465,10 @@ fn gateway_redirect_port(
     object: &K8sObject,
     redirect: &serde_json::Map<String, Value>,
     redirect_scheme: Option<&str>,
+    default_listener_port: Option<u16>,
 ) -> Result<Option<u16>, K8sTranslateError> {
     let Some(port) = redirect.get("port") else {
-        return Ok(default_port_for_scheme(redirect_scheme));
+        return Ok(default_port_for_scheme(redirect_scheme).or(default_listener_port));
     };
     let Some(port) = port.as_u64() else {
         return Err(invalid_resource(
@@ -3390,9 +3491,53 @@ mod tests {
         assert!(result.config.frontend_tls_namespace_sources.is_empty());
         assert!(
             result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty()),
+            "invalid terminating TLS listener must not be exposed as a data-plane service"
+        );
+        assert!(
+            result
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_to_invalid_tls_listener() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {}
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "https"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("invalid TLS listener must not accept route attachment");
+
+        assert!(
+            err.to_string()
+                .contains("not permitted by the target Gateway listener")
         );
     }
 
@@ -5224,6 +5369,54 @@ mod tests {
                 .as_object()
                 .is_some_and(|object| object.keys().all(|key| key == "redirect_code")),
             "status-only redirect must preserve request URL at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_request_redirect_without_port_uses_attached_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 8080,
+                    "protocol": "HTTP"
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                    "filters": [{
+                        "type": "RequestRedirect",
+                        "requestRedirect": {"statusCode": 301}
+                    }]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["redirect_code"], 301);
+        assert_eq!(redirect["port"], 8080);
+        assert!(
+            redirect.get("authority").is_none(),
+            "listener-derived port must still preserve the request host at the DP"
         );
     }
 

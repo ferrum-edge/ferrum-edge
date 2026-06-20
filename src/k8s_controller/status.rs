@@ -243,6 +243,7 @@ fn desired_status_for_object(
             || candidate.kind == "Gateway"
             || candidate.kind == "Namespace"
             || candidate.kind == "Service"
+            || candidate.kind == "Secret"
     });
 
     match object.kind.as_str() {
@@ -1990,7 +1991,11 @@ fn l4_route_parent_listener_ports(objects: &[K8sObject], route: &K8sObject) -> H
                 continue;
             };
             for listener in listeners {
-                if !parent_ref_matches_listener(&parent_ref, listener) {
+                if !route_kind_allowed_by_listener(route, listener)
+                    || !parent_ref_matches_listener(&parent_ref, listener)
+                    || !route_allowed_by_listener(objects, route, gateway, listener)
+                    || !route_intersects_listener_hostname(route, listener)
+                {
                     continue;
                 }
                 let Some(port) = listener.get("port").and_then(Value::as_u64) else {
@@ -3672,12 +3677,19 @@ mod tests {
             "edge",
             json!({
                 "gatewayClassName": "ferrum",
-                "listeners": [{
-                    "name": "tcp",
-                    "port": 15432,
-                    "protocol": "TCP",
-                    "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
-                }]
+                "listeners": [
+                    {
+                        "name": "web",
+                        "port": 5432,
+                        "protocol": "HTTP"
+                    },
+                    {
+                        "name": "tcp",
+                        "port": 15432,
+                        "protocol": "TCP",
+                        "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+                    }
+                ]
             }),
         );
         let route = object(

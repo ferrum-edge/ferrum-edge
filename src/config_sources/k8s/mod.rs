@@ -671,6 +671,16 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
         }
     }
     for object in objects {
+        if !includes_object_namespace(&acc.options, object) {
+            continue;
+        }
+        if object.kind == "ReferenceGrant" {
+            let _ = gateway_api::collect_reference_grant(acc, object);
+        } else if object.kind == "Secret" {
+            let _ = core::collect(acc, object);
+        }
+    }
+    for object in objects {
         if object.kind == "Gateway"
             && includes_object_namespace(&acc.options, object)
             && acc.gateway_is_managed_by_ferrum(object)
@@ -723,8 +733,6 @@ where
         observe_object_namespace(&mut acc, object);
         if object.kind == "ReferenceGrant" {
             gateway_api::collect_reference_grant(&mut acc, object)?;
-        } else if object.kind == "Gateway" && acc.gateway_is_managed_by_ferrum(object) {
-            gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
         } else if object.kind == "Service" {
             collect_service(&mut acc, object)?;
             if acc.options.pod_discovery_enabled {
@@ -740,6 +748,15 @@ where
             collect_explicit_service_entry_keys(&mut acc, object);
         } else if acc.options.pod_discovery_enabled && core::is_core_resource_kind(&object.kind) {
             core::collect(&mut acc, object)?;
+        }
+    }
+
+    for object in &included_objects {
+        if object.kind == "Gateway"
+            && includes_object_namespace(&acc.options, object)
+            && acc.gateway_is_managed_by_ferrum(object)
+        {
+            gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
         }
     }
 
