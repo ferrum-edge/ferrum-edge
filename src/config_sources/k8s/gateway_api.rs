@@ -1240,21 +1240,11 @@ fn route_parent_ref_keys_for_namespace(
         .into_iter()
         .flatten()
         .filter_map(|parent| {
-            let group = string_field(parent, "group").unwrap_or("gateway.networking.k8s.io");
-            let kind = string_field(parent, "kind").unwrap_or("Gateway");
             let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
             if namespace_filter.is_some_and(|filter| namespace != filter) {
                 return None;
             }
-            let name = string_field(parent, "name").unwrap_or("*");
-            let section = string_field(parent, "sectionName").unwrap_or("*");
-            let port = parent
-                .get("port")
-                .and_then(Value::as_u64)
-                .map_or_else(|| "*".to_string(), |port| port.to_string());
-            Some(format!(
-                "{group}/{kind}/{namespace}/{name}/{section}/{port}"
-            ))
+            Some(route_parent_ref_key_for_parent(object, parent))
         })
         .collect();
     if refs.is_empty()
@@ -1264,6 +1254,66 @@ fn route_parent_ref_keys_for_namespace(
             "gateway.networking.k8s.io/Gateway/{}/{}/*/*",
             object.metadata.namespace, "*"
         ));
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn route_parent_ref_key_for_parent(object: &K8sObject, parent_ref: &Value) -> String {
+    let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+    let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+    let namespace = string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+    let name = string_field(parent_ref, "name").unwrap_or("*");
+    let section = string_field(parent_ref, "sectionName").unwrap_or("*");
+    let port = parent_ref
+        .get("port")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "*".to_string(), |port| port.to_string());
+    format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
+}
+
+fn route_materialized_parent_ref_keys_for_namespace(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    namespace_filter: Option<&str>,
+) -> Vec<String> {
+    let mut refs = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        if group != "gateway.networking.k8s.io" || kind != "Gateway" {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if namespace_filter.is_some_and(|filter| parent_namespace != filter) {
+            continue;
+        }
+        let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+        if acc
+            .gateway_api_listener_policies
+            .iter()
+            .any(|(key, policy)| {
+                key.namespace == parent_namespace
+                    && key.gateway == parent_gateway
+                    && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                    && route_listener_policy_materializes_route(
+                        acc,
+                        object,
+                        parent_namespace,
+                        policy,
+                    )
+            })
+        {
+            refs.push(route_parent_ref_key_for_parent(object, parent_ref));
+        }
     }
     refs.sort();
     refs.dedup();
@@ -1821,6 +1871,9 @@ fn http_route_resources(
         if parent_refs.is_empty() {
             continue;
         }
+        let materialized_parent_refs =
+            route_materialized_parent_ref_keys_for_namespace(object, acc, Some(config_namespace));
+        let proxies_before_namespace = proxies.len();
         let Some(hostnames) = route_effective_hostnames(
             object,
             acc,
@@ -2026,6 +2079,11 @@ fn http_route_resources(
 
                     proxies.push(proxy);
                 }
+            }
+        }
+        if proxies.len() > proxies_before_namespace {
+            for parent_ref in materialized_parent_refs {
+                acc.record_gateway_api_materialized_route_parent(object, parent_ref);
             }
         }
     }
@@ -2947,6 +3005,11 @@ fn l4_route_proxies(
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
     ensure_l4_parent_refs_are_same_namespace(object)?;
+    let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
+        object,
+        acc,
+        Some(&object.metadata.namespace),
+    );
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -3000,6 +3063,11 @@ fn l4_route_proxies(
             retry: None,
             backend_read_timeout_ms: None,
         }));
+    }
+    if !proxies.is_empty() {
+        for parent_ref in materialized_parent_refs {
+            acc.record_gateway_api_materialized_route_parent(object, parent_ref);
+        }
     }
     Ok(proxies)
 }

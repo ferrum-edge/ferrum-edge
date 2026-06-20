@@ -7,9 +7,10 @@ use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys_with_context,
-    resource_id, secret_object_is_valid_tls_certificate, translate_k8s_objects_with_filter,
+    GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
+    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
+    gateway_api_route_conflict_keys_with_context, resource_id,
+    secret_object_is_valid_tls_certificate, translate_k8s_objects_with_filter,
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
@@ -1195,6 +1196,13 @@ fn route_status(
                 }
             }
         };
+    let materialized_parent_refs: HashSet<String> = match result {
+        Ok(translation) => materialized_route_parent_refs_for_route(
+            &translation.materialized_route_parents,
+            object,
+        ),
+        Err(_) => HashSet::new(),
+    };
 
     let mut parents = retained_existing_parent_statuses(&object.status);
     for parent_ref in managed_parent_refs {
@@ -1249,7 +1257,9 @@ fn route_status(
         } else {
             &message
         };
+        let parent_materialized = materialized_parent_refs.contains(&parent_ref_key);
         let programmed_for_parent = programmed
+            && parent_materialized
             && !all_parent_matches_conflicted
             && !no_matching_parent
             && !no_matching_listener_hostname;
@@ -1263,6 +1273,8 @@ fn route_status(
             "NoMatchingListenerHostname"
         } else if !resolved_refs {
             resolved_refs_reason
+        } else if accepted_for_parent && !parent_materialized {
+            "NoRules"
         } else if accepted_for_parent {
             accepted_reason
         } else {
@@ -1274,6 +1286,8 @@ fn route_status(
             conflict_message.as_deref().unwrap_or(&message)
         } else if no_matching_listener_hostname {
             "Ferrum did not program this route because no matching listener hostname was found"
+        } else if accepted_for_parent && !parent_materialized {
+            "Ferrum accepted this route but no materialized rule was produced for this parentRef"
         } else {
             &message
         };
@@ -1337,6 +1351,18 @@ fn route_status(
     let mut status = object.status.clone();
     ensure_status_object(&mut status).insert("parents".to_string(), Value::Array(parents));
     status
+}
+
+fn materialized_route_parent_refs_for_route(
+    materialized_route_parents: &HashSet<GatewayApiMaterializedRouteParent>,
+    route: &K8sObject,
+) -> HashSet<String> {
+    let route_key = K8sResourceKey::from_object(route);
+    materialized_route_parents
+        .iter()
+        .filter(|entry| entry.route == route_key)
+        .map(|entry| entry.parent_ref.clone())
+        .collect()
 }
 
 fn status_patch_for_update(update: &GatewayApiStatusUpdate, live_status: Option<&Value>) -> Value {
@@ -3295,6 +3321,72 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("BackendNotFound")
+        );
+    }
+
+    #[test]
+    fn route_status_programmed_is_scoped_to_each_parent_ref() {
+        let gateway_class = ferrum_gateway_class();
+        let http_gateway = ferrum_gateway("edge-http");
+        let tls_gateway = object(
+            "Gateway",
+            "edge-tls",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "missing-cert"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [
+                    {"name": "edge-http"},
+                    {"name": "edge-tls", "sectionName": "https"}
+                ],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+        let mut service = object(
+            "Service",
+            "api",
+            json!({"ports": [{"name": "http", "port": 8080}]}),
+        );
+        service.api_version = "v1".to_string();
+
+        let updates = plan_status_updates(
+            &[gateway_class, http_gateway, tls_gateway, route, service],
+            options(),
+        );
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let http_parent = parents
+            .iter()
+            .find(|parent| parent["parentRef"]["name"].as_str() == Some("edge-http"))
+            .expect("HTTP parent status");
+        let tls_parent = parents
+            .iter()
+            .find(|parent| parent["parentRef"]["name"].as_str() == Some("edge-tls"))
+            .expect("TLS parent status");
+
+        assert_condition(
+            http_parent["conditions"].as_array().unwrap(),
+            "Programmed",
+            "True",
+        );
+        let tls_conditions = tls_parent["conditions"].as_array().unwrap();
+        assert_condition(tls_conditions, "Accepted", "True");
+        assert_condition(tls_conditions, "ResolvedRefs", "True");
+        assert_condition(tls_conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(tls_conditions, "Programmed")["reason"].as_str(),
+            Some("NoRules")
         );
     }
 

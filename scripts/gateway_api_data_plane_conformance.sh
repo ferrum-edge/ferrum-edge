@@ -425,6 +425,18 @@ YAML
   kubectl -n "$BACKEND_NAMESPACE" rollout status deployment/blackbox-cross --timeout=180s
 }
 
+cleanup_upstream_gateway_api_resources_for_blackbox() {
+  kubectl -n "$DP_GATEWAY_NAMESPACE" delete \
+    gateways.gateway.networking.k8s.io \
+    httproutes.gateway.networking.k8s.io \
+    grpcroutes.gateway.networking.k8s.io \
+    referencegrants.gateway.networking.k8s.io \
+    --all --ignore-not-found
+  kubectl -n "$BACKEND_NAMESPACE" delete \
+    referencegrants.gateway.networking.k8s.io \
+    --all --ignore-not-found
+}
+
 apply_blackbox_routes() {
   cat <<'YAML' | kubectl apply -f -
 apiVersion: gateway.networking.k8s.io/v1
@@ -703,6 +715,7 @@ wait_for_body_contains() {
 }
 
 run_blackbox_tests() {
+  cleanup_upstream_gateway_api_resources_for_blackbox
   apply_blackbox_backends
   apply_blackbox_routes
   local report="$RESULTS_DIR/gateway-api-blackbox.md"

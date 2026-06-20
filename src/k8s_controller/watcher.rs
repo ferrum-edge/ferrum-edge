@@ -225,14 +225,32 @@ pub const K8S_NAMESPACE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     field_selector: None,
 }];
 
-pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
-    group: "",
-    version: "v1",
-    kind: "Secret",
-    plural: "secrets",
-    namespaced: true,
-    field_selector: None,
-}];
+pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Secret",
+        plural: "secrets",
+        namespaced: true,
+        field_selector: None,
+    },
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Service",
+        plural: "services",
+        namespaced: true,
+        field_selector: None,
+    },
+    CoreResourceSpec {
+        group: "discovery.k8s.io",
+        version: "v1",
+        kind: "EndpointSlice",
+        plural: "endpointslices",
+        namespaced: true,
+        field_selector: None,
+    },
+];
 
 pub const GATEWAY_API_DATA_PLANE_STATUS_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     group: "discovery.k8s.io",
@@ -909,14 +927,20 @@ mod tests {
     }
 
     #[test]
-    fn gateway_api_core_resources_include_secrets_for_certificate_refs() {
-        let secret = GATEWAY_API_CORE_RESOURCES
+    fn gateway_api_core_resources_cover_backend_refs_and_certificate_refs() {
+        let kinds: HashSet<&str> = GATEWAY_API_CORE_RESOURCES
             .iter()
-            .find(|resource| resource.kind == "Secret")
-            .expect("Secret watcher spec");
+            .map(|resource| resource.kind)
+            .collect();
+        assert_eq!(kinds, HashSet::from(["Secret", "Service", "EndpointSlice"]));
 
-        assert!(secret.namespaced);
-        assert_eq!(secret.plural, "secrets");
+        for resource in GATEWAY_API_CORE_RESOURCES {
+            assert!(
+                resource.namespaced,
+                "{} Gateway API core watch should be namespaced",
+                resource.kind
+            );
+        }
     }
 
     #[test]

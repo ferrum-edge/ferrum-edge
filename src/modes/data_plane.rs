@@ -254,7 +254,9 @@ pub async fn run(
             .unwrap_or_else(|| tls::frontend_tls_slot_with(cfg.clone()))
     });
     let proxy_frontend_tls_slot = if env_config.proxy_https_port != 0 {
-        proxy_frontend_tls_slot_from_operator(operator_frontend_tls_slot.as_ref())
+        Some(proxy_frontend_tls_slot_from_operator(
+            operator_frontend_tls_slot.as_ref(),
+        ))
     } else {
         None
     };
@@ -378,8 +380,9 @@ pub async fn run(
     }
 
     // HTTPS listener. DP mode can hot-swap CP-delivered Gateway TLS material,
-    // but still requires either bootstrap or live-reload TLS material before
-    // binding the HTTPS port. This preserves HTTP-only DP deployments.
+    // so a HTTPS-enabled DP starts with an empty dynamic TLS slot when no
+    // operator certificate was configured. Set FERRUM_PROXY_HTTPS_PORT=0 for
+    // HTTP-only DP deployments.
     if let Some(tls_slot) = proxy_frontend_tls_slot.clone() {
         let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
         let https_state = proxy_state.clone();
@@ -724,8 +727,8 @@ pub async fn run(
 
 fn proxy_frontend_tls_slot_from_operator(
     operator_frontend_tls_slot: Option<&tls::SharedFrontendTls>,
-) -> Option<tls::SharedFrontendTls> {
-    operator_frontend_tls_slot.map(|slot| {
+) -> tls::SharedFrontendTls {
+    operator_frontend_tls_slot.map_or_else(tls::empty_frontend_tls_slot, |slot| {
         Arc::new(arc_swap::ArcSwap::new(Arc::new(
             slot.load_full().as_ref().clone(),
         )))
@@ -737,15 +740,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dp_proxy_frontend_tls_slot_is_absent_without_operator_tls() {
-        assert!(proxy_frontend_tls_slot_from_operator(None).is_none());
+    fn dp_proxy_frontend_tls_slot_is_empty_without_operator_tls() {
+        let listener_slot = proxy_frontend_tls_slot_from_operator(None);
+
+        assert!(listener_slot.load_full().as_ref().is_none());
     }
 
     #[test]
     fn dp_proxy_frontend_tls_slot_clones_operator_tls_slot() {
         let operator_slot = tls::empty_frontend_tls_slot();
-        let listener_slot =
-            proxy_frontend_tls_slot_from_operator(Some(&operator_slot)).expect("slot");
+        let listener_slot = proxy_frontend_tls_slot_from_operator(Some(&operator_slot));
 
         assert!(listener_slot.load_full().as_ref().is_none());
         operator_slot.store(Arc::new(Some(

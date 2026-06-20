@@ -230,6 +230,11 @@ pub struct K8sTranslation {
     /// does not mark a valid (and materialized) route as `Conflicted=True`
     /// against an older sibling that the translator already dropped.
     pub route_conflicts: Vec<GatewayApiRouteConflict>,
+    /// Route parentRefs that actually produced live route configuration.
+    /// Status uses this per-parent set instead of route-wide proxy IDs so a
+    /// route attached to one programmed parent and one fail-closed parent does
+    /// not report both parents as Programmed.
+    pub materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +276,12 @@ pub struct GatewayApiRouteConflict {
     pub key: GatewayApiRouteConflictKey,
     pub winner: K8sResourceKey,
     pub loser: K8sResourceKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GatewayApiMaterializedRouteParent {
+    pub route: K8sResourceKey,
+    pub parent_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -367,6 +378,7 @@ pub(crate) struct K8sAccumulator {
     /// invalid routes (which the translator skips) cannot push a valid
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
+    gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
 }
 
 impl K8sAccumulator {
@@ -394,6 +406,7 @@ impl K8sAccumulator {
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
+            gateway_api_materialized_route_parents: HashSet::new(),
         }
     }
 
@@ -575,6 +588,18 @@ impl K8sAccumulator {
         }
     }
 
+    pub(crate) fn record_gateway_api_materialized_route_parent(
+        &mut self,
+        route: &K8sObject,
+        parent_ref: String,
+    ) {
+        self.gateway_api_materialized_route_parents
+            .insert(GatewayApiMaterializedRouteParent {
+                route: K8sResourceKey::from_object(route),
+                parent_ref,
+            });
+    }
+
     fn finish(mut self) -> K8sTranslation {
         gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);
         debug_assert!(
@@ -615,6 +640,7 @@ impl K8sAccumulator {
             config: self.config,
             warnings: self.warnings,
             route_conflicts: self.gateway_api_route_conflicts,
+            materialized_route_parents: self.gateway_api_materialized_route_parents,
         }
     }
 }
