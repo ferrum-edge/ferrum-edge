@@ -426,15 +426,16 @@ YAML
 }
 
 cleanup_upstream_gateway_api_resources_for_blackbox() {
-  kubectl -n "$DP_GATEWAY_NAMESPACE" delete \
+  local resource
+  for resource in \
     gateways.gateway.networking.k8s.io \
     httproutes.gateway.networking.k8s.io \
     grpcroutes.gateway.networking.k8s.io \
-    referencegrants.gateway.networking.k8s.io \
-    --all --ignore-not-found
+    referencegrants.gateway.networking.k8s.io; do
+    kubectl -n "$DP_GATEWAY_NAMESPACE" delete "$resource" --all --ignore-not-found
+  done
   kubectl -n "$BACKEND_NAMESPACE" delete \
-    referencegrants.gateway.networking.k8s.io \
-    --all --ignore-not-found
+    referencegrants.gateway.networking.k8s.io --all --ignore-not-found
 }
 
 apply_blackbox_routes() {

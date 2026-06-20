@@ -282,6 +282,7 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
             return false;
         }
         GatewayFrontendTlsSelection::UnsupportedMultiple => {
+            disable_gateway_frontend_tls_route_materialization(acc, object);
             acc.warnings.push(format!(
                 "Gateway API Gateway {}/{} has multiple distinct TLS certificateRefs, but Ferrum currently supports one frontend TLS certificate per data plane; leaving listener references unresolved",
                 object.metadata.namespace, object.metadata.name
@@ -3906,13 +3907,26 @@ mod tests {
                 ]
             }),
         );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "https-a"}],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
         let cert_a = tls_secret("gateway-cert-a", "default", true);
         let cert_b = tls_secret("gateway-cert-b", "default", true);
 
-        let result =
-            translate_k8s_objects(&[gateway, cert_a, cert_b], options()).expect("translation");
+        let result = translate_k8s_objects(&[gateway, cert_a, cert_b, route], options())
+            .expect("translation");
 
         assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert!(
+            result.config.proxies.is_empty(),
+            "routes attached to unsupported TLS listeners must fail closed"
+        );
         assert!(
             result
                 .warnings

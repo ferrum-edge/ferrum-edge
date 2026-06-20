@@ -70,8 +70,9 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
     Arc::new(arc_swap::ArcSwap::new(crls))
 }
 
-/// Build a throwaway server config for tests that need a valid TLS slot value.
-#[cfg(test)]
+/// Build a throwaway server config for listeners that must bind before real
+/// dynamic TLS material exists. Callers should disable accepting handshakes
+/// until the shared frontend TLS slot receives a real certificate.
 pub(crate) fn temporary_disabled_listener_tls_config() -> Result<Arc<ServerConfig>, anyhow::Error> {
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;

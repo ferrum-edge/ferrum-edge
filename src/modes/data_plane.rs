@@ -414,7 +414,9 @@ pub async fn run(
     if env_config.enable_http3 {
         if env_config.proxy_https_port == 0 {
             info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
-        } else if let Some(tls_config) = tls_config.clone() {
+        } else if let Some(tls_config) =
+            http3_startup_tls_config(tls_config.clone(), proxy_frontend_tls_slot.as_ref())?
+        {
             let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
@@ -735,6 +737,19 @@ fn proxy_frontend_tls_slot_from_operator(
     })
 }
 
+fn http3_startup_tls_config(
+    operator_tls_config: Option<Arc<rustls::ServerConfig>>,
+    proxy_frontend_tls_slot: Option<&tls::SharedFrontendTls>,
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
+    if operator_tls_config.is_some() {
+        return Ok(operator_tls_config);
+    }
+    if proxy_frontend_tls_slot.is_some() {
+        return tls::temporary_disabled_listener_tls_config().map(Some);
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +774,37 @@ mod tests {
             listener_slot.load_full().as_ref().is_none(),
             "listener slot should be a clone, not the same ArcSwap as the operator source"
         );
+    }
+
+    #[test]
+    fn http3_startup_tls_config_uses_operator_tls() {
+        let operator_tls =
+            tls::temporary_disabled_listener_tls_config().expect("temporary test TLS config");
+
+        let startup_tls =
+            http3_startup_tls_config(Some(operator_tls.clone()), None).expect("startup TLS config");
+
+        assert!(startup_tls.is_some_and(|tls| Arc::ptr_eq(&tls, &operator_tls)));
+    }
+
+    #[test]
+    fn http3_startup_tls_config_bootstraps_dynamic_tls_slot() {
+        let listener_slot = tls::empty_frontend_tls_slot();
+
+        let startup_tls =
+            http3_startup_tls_config(None, Some(&listener_slot)).expect("startup TLS config");
+
+        assert!(
+            startup_tls.is_some(),
+            "HTTP/3 should bind and wait for CP-delivered frontend TLS"
+        );
+    }
+
+    #[test]
+    fn http3_startup_tls_config_is_absent_without_any_tls_source() {
+        let startup_tls =
+            http3_startup_tls_config(None, None).expect("startup TLS config decision");
+
+        assert!(startup_tls.is_none());
     }
 }
