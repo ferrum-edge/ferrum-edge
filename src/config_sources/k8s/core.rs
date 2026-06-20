@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -77,6 +77,12 @@ struct CoreEndpoint {
     node_name: Option<String>,
 }
 
+#[derive(Debug)]
+struct CoreAutoWorkload {
+    pod_key: PodKey,
+    workload: Workload,
+}
+
 pub(super) fn is_core_resource_kind(kind: &str) -> bool {
     matches!(kind, "Pod" | "Service" | "EndpointSlice" | "Node")
 }
@@ -133,6 +139,8 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
         }
     }
 
+    let mut service_backed_pod_keys = BTreeSet::new();
+
     for key in service_keys {
         if acc.explicit_service_entries.contains(&key) {
             continue;
@@ -152,9 +160,10 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             )?;
-            for workload in auto_workloads {
-                workload_ref_strings.push(workload.spiffe_id.as_str().to_string());
-                acc.mesh.workloads.push(workload);
+            for auto in auto_workloads {
+                service_backed_pod_keys.insert(auto.pod_key);
+                workload_ref_strings.push(auto.workload.spiffe_id.as_str().to_string());
+                acc.mesh.workloads.push(auto.workload);
             }
         }
 
@@ -173,6 +182,8 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             cluster_ips: service.cluster_ips.clone(),
         });
     }
+
+    add_identity_only_workloads(acc, &service_backed_pod_keys)?;
 
     Ok(())
 }
@@ -344,7 +355,7 @@ fn auto_workloads_for_service(
     acc: &K8sAccumulator,
     service_key: &K8sServiceKey,
     endpoint_slice_indices: &[usize],
-) -> Result<Vec<Workload>, K8sTranslateError> {
+) -> Result<Vec<CoreAutoWorkload>, K8sTranslateError> {
     let mut endpoints_by_pod = BTreeMap::new();
     let mut seen_endpoint_addresses: BTreeMap<PodKey, HashSet<String>> = BTreeMap::new();
     for &slice_index in endpoint_slice_indices {
@@ -392,9 +403,35 @@ fn auto_workloads_for_service(
         if !pod.ready {
             continue;
         }
-        workloads.push(workload_from_pod(acc, service_key, pod, &endpoint)?);
+        workloads.push(CoreAutoWorkload {
+            pod_key,
+            workload: workload_from_pod(acc, service_key, pod, &endpoint)?,
+        });
     }
     Ok(workloads)
+}
+
+fn add_identity_only_workloads(
+    acc: &mut K8sAccumulator,
+    service_backed_pod_keys: &BTreeSet<PodKey>,
+) -> Result<(), K8sTranslateError> {
+    let mut pod_keys: Vec<PodKey> = acc.core.pods.keys().cloned().collect();
+    pod_keys.sort();
+    for pod_key in pod_keys {
+        if service_backed_pod_keys.contains(&pod_key) {
+            continue;
+        }
+        let Some(pod) = acc.core.pods.get(&pod_key) else {
+            continue;
+        };
+        if !pod.ready || pod.uid.is_empty() {
+            continue;
+        }
+        acc.mesh
+            .workloads
+            .push(identity_only_workload_from_pod(acc, pod)?);
+    }
+    Ok(())
 }
 
 fn workload_from_pod(
@@ -435,6 +472,42 @@ fn workload_from_pod(
         // Per-pod UID for node-waypoint scope keying; `None` when the pod
         // object carried no UID so the resolver falls back to SPIFFE scope.
         pod_uid: (!pod.uid.is_empty()).then(|| pod.uid.clone()),
+        remote_provenance: false,
+    })
+}
+
+fn identity_only_workload_from_pod(
+    acc: &K8sAccumulator,
+    pod: &CorePod,
+) -> Result<Workload, K8sTranslateError> {
+    let path = format!("ns/{}/sa/{}", pod.namespace, pod.service_account);
+    let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
+        .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
+    let locality = pod
+        .node_name
+        .as_deref()
+        .and_then(|node| acc.core.node_localities.get(node).cloned());
+
+    Ok(Workload {
+        spiffe_id,
+        selector: WorkloadSelector {
+            labels: pod.labels.clone(),
+            namespace: Some(pod.namespace.clone()),
+        },
+        service_name: pod.name.clone(),
+        // Identity-only pods feed node-waypoint source identity and scoped
+        // authz. They are not Service backends, so keep them out of direct
+        // Pod-IP routing and outbound registries.
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: acc.options.trust_domain.clone(),
+        namespace: pod.namespace.clone(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality,
+        service_account: Some(pod.service_account.clone()),
+        pod_uid: Some(pod.uid.clone()),
         remote_provenance: false,
     })
 }
@@ -819,6 +892,60 @@ mod tests {
         assert_eq!(
             mesh.workloads[0].spiffe_id.as_str(),
             "spiffe://cluster.local/ns/default/sa/reviews"
+        );
+    }
+
+    #[test]
+    fn source_only_ready_pod_materializes_identity_without_service_ref() {
+        let mut dst = ready_pod("reviews-v1", "10.1.0.10");
+        dst.metadata.uid = "11111111-1111-4111-8111-111111111111".to_string();
+
+        let mut src = ready_pod("src-a", "10.1.0.20");
+        src.metadata.uid = "22222222-2222-4222-8222-222222222222".to_string();
+        src.spec["serviceAccountName"] = json!("src-a");
+        src.metadata
+            .labels
+            .insert("app".to_string(), "src-a".to_string());
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                dst,
+                src,
+                endpoint_slice(vec![("reviews-v1", "10.1.0.10")]),
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services.len(), 1);
+        assert_eq!(mesh.services[0].workloads.len(), 1);
+        assert_eq!(mesh.workloads.len(), 2);
+
+        let source = mesh
+            .workloads
+            .iter()
+            .find(|workload| {
+                workload.pod_uid.as_deref() == Some("22222222-2222-4222-8222-222222222222")
+            })
+            .expect("source-only pod identity workload");
+        assert_eq!(
+            source.spiffe_id.as_str(),
+            "spiffe://cluster.local/ns/default/sa/src-a"
+        );
+        assert_eq!(
+            source.selector.labels.get("app").map(String::as_str),
+            Some("src-a")
+        );
+        assert!(source.addresses.is_empty());
+        assert!(source.ports.is_empty());
+        assert!(
+            mesh.services[0]
+                .workloads
+                .iter()
+                .all(|workload| workload.spiffe_id != source.spiffe_id),
+            "source-only identity workload must not be added to service workload refs"
         );
     }
 
