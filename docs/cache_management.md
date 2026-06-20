@@ -168,11 +168,11 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Cached backend response bodies with headers, keyed by request path and cache key rules.
 
-**Default limit:** 10,000 entries.
+**Default limit:** 10,000 entries and 100 MiB retained response-entry bytes.
 
-**Config field:** `max_entries` (in plugin config JSON).
+**Config fields:** `max_entries`, `max_entry_size_bytes`, and `max_total_size_bytes` (in plugin config JSON).
 
-**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
+**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. Stores hold a narrow admission/accounting lock so `max_total_size_bytes` is an exact upper bound across concurrent stores and replacements. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
 
 ### AI Semantic Cache
 
@@ -276,6 +276,8 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | Plugin | Config Field | Default | Description |
 |--------|-------------|---------|-------------|
 | `response_caching` | `max_entries` | `10000` | Maximum cached responses |
+| `response_caching` | `max_entry_size_bytes` | `1048576` | Maximum single cached response body |
+| `response_caching` | `max_total_size_bytes` | `104857600` | Exact maximum retained response-entry bytes |
 | `ai_semantic_cache` | `max_entries` | `10000` | Maximum cached LLM responses |
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
 | `soap_ws_security` | `nonce_replay_protection.max_cache_size` | `10000` | Maximum tracked nonces |

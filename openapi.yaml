@@ -13430,7 +13430,7 @@ components:
           type: integer
           format: uint64
           default: 104857600
-          description: Maximum total in-memory cache size across all entries (100 MiB by default)
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached.
         cacheable_methods:
           type: array
           items:

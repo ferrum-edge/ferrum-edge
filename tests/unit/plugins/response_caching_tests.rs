@@ -5,6 +5,7 @@ use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
     response_caching_current_total_size_for_test,
+    response_caching_size_accounting_snapshot_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
@@ -88,6 +89,15 @@ fn cached_age(headers: &HashMap<String, String>) -> u64 {
         .expect("cached response should include Age")
         .parse()
         .expect("Age should be a decimal second count")
+}
+
+fn assert_size_accounting_exact(plugin: &ResponseCaching) -> usize {
+    let (tracked, actual) = response_caching_size_accounting_snapshot_for_test(plugin);
+    assert_eq!(
+        tracked, actual,
+        "tracked response-cache size must match actual retained entry size"
+    );
+    tracked
 }
 
 fn http_date_seconds_ago(seconds: i64) -> String {
@@ -387,6 +397,7 @@ async fn test_upstream_age_near_freshness_expires_after_residency() {
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(stale_ctx.metadata.get("cache_status").unwrap(), "MISS");
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
 // === TTL expiry ===
@@ -698,6 +709,7 @@ async fn test_fallback_ttl_freshness_accounts_for_age() {
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(stale_ctx.metadata.get("cache_status").unwrap(), "MISS");
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
 // === Client Cache-Control: no-cache bypasses cache ===
@@ -862,6 +874,7 @@ async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() 
         .await;
 
     assert_eq!(response_caching_current_total_size_for_test(&plugin), 0);
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
 #[tokio::test]
@@ -896,6 +909,7 @@ async fn test_zero_freshness_set_cookie_response_invalidates_existing_entry() {
         .await;
 
     assert_eq!(response_caching_current_total_size_for_test(&plugin), 0);
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
 #[tokio::test]
@@ -954,6 +968,7 @@ async fn test_zero_freshness_auth_rejection_invalidates_existing_entry() {
         .await;
 
     assert_eq!(response_caching_current_total_size_for_test(&plugin), 0);
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
 #[tokio::test]
@@ -1060,6 +1075,7 @@ async fn test_500_not_cached() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
 // === Cache invalidation on unsafe methods ===
@@ -1150,6 +1166,7 @@ async fn test_max_entries_eviction() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
+    assert!(assert_size_accounting_exact(&plugin) > 0);
 }
 
 // === Vary header ===
@@ -2255,6 +2272,124 @@ async fn test_max_total_size_exceeded() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
+    assert!(assert_size_accounting_exact(&plugin) <= 300);
+}
+
+#[tokio::test]
+async fn test_replacement_admission_uses_size_delta() {
+    let plugin = plugin_with_config(json!({
+        "max_total_size_bytes": 450,
+        "max_entry_size_bytes": 1048576
+    }));
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/replacement-delta",
+        200,
+        &HashMap::new(),
+        &[b'a'; 200],
+    )
+    .await;
+    assert!(assert_size_accounting_exact(&plugin) <= 450);
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/replacement-delta",
+        200,
+        &HashMap::new(),
+        &[b'b'; 300],
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/replacement-delta");
+    let mut headers = HashMap::new();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        body,
+        vec![b'b'; 300],
+        "replacement should be admitted when only the positive size delta fits"
+    );
+    assert!(assert_size_accounting_exact(&plugin) <= 450);
+}
+
+#[tokio::test]
+async fn test_large_to_small_replacement_releases_capacity() {
+    let plugin = plugin_with_config(json!({
+        "max_total_size_bytes": 430,
+        "max_entry_size_bytes": 1048576
+    }));
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/replacement-shrink",
+        200,
+        &HashMap::new(),
+        &[b'a'; 300],
+    )
+    .await;
+    assert!(assert_size_accounting_exact(&plugin) <= 430);
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/replacement-shrink",
+        200,
+        &HashMap::new(),
+        &[b'b'; 20],
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/replacement-shrink");
+    let mut headers = HashMap::new();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        body,
+        vec![b'b'; 20],
+        "smaller replacement should be admitted even when old+new would exceed the cap"
+    );
+    assert!(assert_size_accounting_exact(&plugin) <= 430);
+}
+
+#[tokio::test]
+async fn test_rejected_replacement_preserves_old_entry_and_accounting() {
+    let plugin = plugin_with_config(json!({
+        "max_total_size_bytes": 450,
+        "max_entry_size_bytes": 1048576
+    }));
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/replacement-reject",
+        200,
+        &HashMap::new(),
+        &[b'a'; 200],
+    )
+    .await;
+    let before = assert_size_accounting_exact(&plugin);
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/replacement-reject",
+        200,
+        &HashMap::new(),
+        &[b'b'; 1024],
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/replacement-reject");
+    let mut headers = HashMap::new();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        body,
+        vec![b'a'; 200],
+        "oversize replacement must leave the prior cached entry intact"
+    );
+    assert_eq!(assert_size_accounting_exact(&plugin), before);
 }
 
 #[tokio::test]
@@ -2709,8 +2844,8 @@ fn test_sub_total_size_saturates_instead_of_wrapping() {
 }
 
 /// Finding #62: under many concurrent stores plus interleaved invalidations
-/// the size accountant must never underflow-wrap and must stay within a small
-/// multiple of the configured `max_total_size_bytes`.
+/// the size accountant must never exceed the configured `max_total_size_bytes`
+/// and must match the actual retained entry sizes.
 #[tokio::test]
 async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
     let plugin = Arc::new(
@@ -2747,11 +2882,16 @@ async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
         task.await.expect("store task panicked");
     }
 
-    // The accountant must never have wrapped: a wrapped usize would be a vast
-    // value far above any small multiple of the cap.
+    // The byte cap is an exact upper bound, not a per-worker or approximate
+    // target, and the tracked total must match the actual retained entries.
     let total = response_caching_current_total_size_for_test(&plugin);
+    let (tracked, actual) = response_caching_size_accounting_snapshot_for_test(&plugin);
+    assert_eq!(
+        tracked, actual,
+        "tracked total must match actual retained entry sizes"
+    );
     assert!(
-        total <= 4096 * 8,
-        "total_size drifted/overshot unexpectedly: {total}"
+        total <= 4096,
+        "total_size exceeded configured max_total_size_bytes: {total}"
     );
 }
