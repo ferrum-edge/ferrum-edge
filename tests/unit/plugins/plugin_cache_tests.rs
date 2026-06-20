@@ -234,6 +234,34 @@ fn test_proxy_scoped_plugins_override_globals_of_same_name() {
 }
 
 #[test]
+fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["ps1"]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config_with_json(
+                "ps1",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-scoped optional plugin must shadow the same-name global"
+    );
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("p2")[0].name(), "stdout_logging");
+}
+
+#[test]
 fn test_disabled_plugins_excluded() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec![])],
@@ -287,6 +315,85 @@ fn test_removed_security_plugin_fails_closed() {
             "expected aborted/rejected wrapper around the security failure for {plugin_name}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn test_builtin_plugin_registrations_are_unique_and_policy_backed() {
+    use ferrum_edge::plugins::{
+        BUILTIN_PLUGIN_REGISTRATIONS, PluginFailurePolicy, available_plugins, plugin_failure_policy,
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let available = available_plugins();
+    let mut saw_fail_closed = false;
+    let mut saw_keep_last_known_good = false;
+    let mut saw_optional_fail_open = false;
+
+    for registration in BUILTIN_PLUGIN_REGISTRATIONS {
+        assert!(
+            seen.insert(registration.name),
+            "duplicate built-in plugin registration for {}",
+            registration.name
+        );
+        assert!(
+            available.contains(&registration.name),
+            "{} missing from available_plugins()",
+            registration.name
+        );
+        assert_eq!(
+            plugin_failure_policy(registration.name),
+            Some(registration.failure_policy),
+            "{} failure policy must come from registration metadata",
+            registration.name
+        );
+
+        match registration.failure_policy {
+            PluginFailurePolicy::FailClosed => saw_fail_closed = true,
+            PluginFailurePolicy::KeepLastKnownGood => saw_keep_last_known_good = true,
+            PluginFailurePolicy::OptionalFailOpen => saw_optional_fail_open = true,
+        }
+    }
+
+    assert!(saw_fail_closed);
+    assert!(saw_keep_last_known_good);
+    assert!(saw_optional_fail_open);
+    assert_eq!(
+        plugin_failure_policy("api_chargeback"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+    assert_eq!(
+        plugin_failure_policy("api_chargeback_sink"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+}
+
+#[test]
+fn test_optional_custom_plugin_validation_failure_is_omitted() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_audit_plugin") {
+        return;
+    }
+
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("example_audit_plugin"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::OptionalFailOpen)
+    );
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "optional-audit",
+            "example_audit_plugin",
+            json!({"log_request_headers": "not-a-bool"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+
+    let cache = PluginCache::new(&config).expect("optional plugin failure should not abort cache");
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed optional custom plugin must be omitted"
+    );
 }
 
 #[test]
@@ -1439,6 +1546,130 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
     );
 }
 
+#[test]
+fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![make_plugin_config(
+            "global-stdout",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["bad-stdout"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![
+            make_plugin_config(
+                "global-stdout",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config_with_json(
+                "bad-stdout",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let delta = ConfigDelta::compute(&config1, &config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+
+    cache
+        .apply_delta(
+            &config2,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-scoped optional plugin must shadow the same-name global on delta reload"
+    );
+    assert_eq!(
+        cache.get_plugins("p2").len(),
+        1,
+        "unrelated proxies keep the global plugin"
+    );
+}
+
+#[test]
+fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![make_plugin_config(
+            "global-stdout",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["bad-group"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![
+            make_plugin_config(
+                "global-stdout",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config_with_json(
+                "bad-group",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::ProxyGroup,
+                None,
+            ),
+        ],
+    );
+    let delta = ConfigDelta::compute(&config1, &config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+
+    cache
+        .apply_delta(
+            &config2,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-group optional plugin must shadow the same-name global on delta reload"
+    );
+    assert_eq!(
+        cache.get_plugins("p2").len(),
+        1,
+        "unrelated proxies keep the global plugin"
+    );
+}
+
 // ---- Protocol-filtered plugin lookup tests ----
 
 fn make_plugin_config_with_json(
@@ -2562,6 +2793,34 @@ fn test_proxy_group_plugin_overrides_global_of_same_name() {
     let p1_ptr = std::sync::Arc::as_ptr(&p1_plugins[0]) as *const () as usize;
     let p2_ptr = std::sync::Arc::as_ptr(&p2_plugins[0]) as *const () as usize;
     assert_ne!(p1_ptr, p2_ptr);
+}
+
+#[test]
+fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config_with_json(
+                "group1",
+                "stdout_logging",
+                json!("bad-config"),
+                PluginScope::ProxyGroup,
+                None,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "failed proxy-group optional plugin must shadow the same-name global"
+    );
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("p2")[0].name(), "stdout_logging");
 }
 
 #[test]

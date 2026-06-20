@@ -12,8 +12,8 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, RequestContext, StreamConnectionContext, available_plugins,
-    create_plugin, is_security_plugin,
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, StreamConnectionContext,
+    available_plugins, create_plugin, plugin_failure_policy,
 };
 use serde_json::json;
 
@@ -139,8 +139,14 @@ fn mesh_plugins_are_registered() {
     assert!(available.contains(&"mesh_authz"));
     assert!(available.contains(&"mesh_outbound_registry"));
     assert!(available.contains(&"workload_metrics"));
-    assert!(is_security_plugin("mesh_authz"));
-    assert!(is_security_plugin("mesh_outbound_registry"));
+    assert_eq!(
+        plugin_failure_policy("mesh_authz"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
+    assert_eq!(
+        plugin_failure_policy("mesh_outbound_registry"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
     assert!(create_plugin("mesh_authz", &json!({})).unwrap().is_some());
     assert!(
         create_plugin("mesh_outbound_registry", &json!({"registry": []}))

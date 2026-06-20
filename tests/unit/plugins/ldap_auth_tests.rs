@@ -854,7 +854,10 @@ fn test_ldap_auth_max_cache_entries_custom() {
 
 #[test]
 fn test_ldap_auth_is_security_plugin() {
-    assert!(ferrum_edge::plugins::is_security_plugin("ldap_auth"));
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("ldap_auth"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::FailClosed)
+    );
 }
 
 #[test]

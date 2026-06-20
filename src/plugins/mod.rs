@@ -182,6 +182,35 @@ pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 /// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
 pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
 
+/// How plugin construction or validation failures affect cache publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginFailurePolicy {
+    /// Reject startup/reload instead of serving without the configured plugin.
+    FailClosed,
+    /// Reject reload publication so callers continue serving the last cache.
+    /// Startup also rejects because there is no previous cache to keep.
+    KeepLastKnownGood,
+    /// Log the construction failure and omit the plugin from the published cache.
+    OptionalFailOpen,
+}
+
+/// Cold-path plugin registration metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginRegistration {
+    pub name: &'static str,
+    pub failure_policy: PluginFailurePolicy,
+}
+
+const fn builtin_plugin(
+    name: &'static str,
+    failure_policy: PluginFailurePolicy,
+) -> PluginRegistration {
+    PluginRegistration {
+        name,
+        failure_policy,
+    }
+}
+
 /// Direction of a UDP datagram being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDatagramDirection {
@@ -3238,7 +3267,7 @@ pub fn create_plugin_with_http_client(
             // `plugin_cache::try_create_plugin`. Returning `Ok(None)` here routes
             // the retired name to that fatal fail-closed path regardless of any
             // custom plugin registered under the same name.
-            if is_removed_security_plugin(name) {
+            if removed_plugin_registration(name).is_some() {
                 return Ok(None);
             }
             // Fall through to custom plugins registry
@@ -3265,139 +3294,146 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
     }
 }
 
-/// Returns true if the named plugin is security-critical.
-///
-/// Validation failures for these plugins are fatal at startup — the gateway
-/// refuses to start rather than serving traffic without the intended security.
-#[allow(dead_code)]
-pub fn is_security_plugin(name: &str) -> bool {
-    matches!(
-        name,
-        "key_auth"
-            | "basic_auth"
-            | "ldap_auth"
-            | "jwt_auth"
-            | "hmac_auth"
-            | "jwks_auth"
-            | "oauth2_introspection"
-            | "oidc_relying_party"
-            | "mtls_auth"
-            | "mesh_authz"
-            | "opa"
-            | "mesh_outbound_registry"
-            | "access_control"
-            | "tcp_connection_throttle"
-            | "adaptive_concurrency"
-            | "rate_limiting"
-            | "ip_restriction"
-            | "waf"
-            | "ai_semantic_firewall"
-            | "security_headers"
-            | "openapi_validator"
-            | "mcp_gateway"
-            | "a2a_gateway"
-            | "soap_ws_security"
-    )
-}
-
 /// Removed built-in plugins that were historically security-sensitive.
 ///
 /// These names are intentionally fail-closed during config load so upgrades
 /// cannot silently drop authentication/authorization protections.
-pub fn is_removed_security_plugin(name: &str) -> bool {
-    matches!(name, "oauth2_auth" | "semantic_ai_firewall")
+pub const REMOVED_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
+    builtin_plugin("oauth2_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("semantic_ai_firewall", PluginFailurePolicy::FailClosed),
+];
+
+/// Built-in plugin factory registrations, excluding build-time custom plugins.
+pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
+    builtin_plugin(
+        "transaction_log_schema",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("tcp_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("kafka_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin(
+        "transaction_debugger",
+        PluginFailurePolicy::OptionalFailOpen,
+    ),
+    builtin_plugin("jwks_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("oauth2_introspection", PluginFailurePolicy::FailClosed),
+    builtin_plugin("oidc_relying_party", PluginFailurePolicy::FailClosed),
+    builtin_plugin("jwt_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("key_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("basic_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ldap_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("hmac_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("mtls_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("spiffe_identity", PluginFailurePolicy::FailClosed),
+    builtin_plugin("mesh_authz", PluginFailurePolicy::FailClosed),
+    builtin_plugin("opa", PluginFailurePolicy::FailClosed),
+    builtin_plugin("mesh_outbound_registry", PluginFailurePolicy::FailClosed),
+    builtin_plugin("compression", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("cors", PluginFailurePolicy::FailClosed),
+    builtin_plugin("security_headers", PluginFailurePolicy::FailClosed),
+    builtin_plugin("access_control", PluginFailurePolicy::FailClosed),
+    builtin_plugin("tcp_connection_throttle", PluginFailurePolicy::FailClosed),
+    builtin_plugin("adaptive_concurrency", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ip_restriction", PluginFailurePolicy::FailClosed),
+    builtin_plugin("bot_detection", PluginFailurePolicy::FailClosed),
+    builtin_plugin("correlation_id", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "request_transformer",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin(
+        "response_transformer",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("mesh_route_dispatch", PluginFailurePolicy::FailClosed),
+    builtin_plugin("graphql", PluginFailurePolicy::FailClosed),
+    builtin_plugin("grpc_method_router", PluginFailurePolicy::FailClosed),
+    builtin_plugin("grpc_deadline", PluginFailurePolicy::FailClosed),
+    builtin_plugin("grpc_web", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("rate_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("request_size_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("waf", PluginFailurePolicy::FailClosed),
+    builtin_plugin("response_size_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("body_validator", PluginFailurePolicy::FailClosed),
+    builtin_plugin("openapi_validator", PluginFailurePolicy::FailClosed),
+    builtin_plugin("request_termination", PluginFailurePolicy::FailClosed),
+    builtin_plugin("response_caching", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("response_mock", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "serverless_function",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("prometheus_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("proxy_alerts", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("otel_tracing", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ai_token_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ai_request_guard", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_rate_limiter", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_prompt_shield", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_semantic_firewall", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
+    builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ws_frame_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_rate_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("udp_rate_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("udp_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("statsd_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("loki_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("sse", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("request_mirror", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("load_testing", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("geo_restriction", PluginFailurePolicy::FailClosed),
+    builtin_plugin("request_deduplication", PluginFailurePolicy::FailClosed),
+    builtin_plugin("soap_ws_security", PluginFailurePolicy::FailClosed),
+    builtin_plugin("spec_expose", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("api_chargeback", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "api_chargeback_sink",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("workload_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("__mesh_bpf_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
+];
+
+pub fn builtin_plugin_registration(name: &str) -> Option<&'static PluginRegistration> {
+    BUILTIN_PLUGIN_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.name == name)
 }
 
-/// Names handled by the built-in plugin factory, excluding build-time custom
-/// plugins.
-pub const BUILTIN_PLUGIN_NAMES: &[&str] = &[
-    "transaction_log_schema",
-    "stdout_logging",
-    "http_logging",
-    "tcp_logging",
-    "kafka_logging",
-    "ws_logging",
-    "transaction_debugger",
-    "jwks_auth",
-    "oauth2_introspection",
-    "oidc_relying_party",
-    "jwt_auth",
-    "key_auth",
-    "basic_auth",
-    "ldap_auth",
-    "hmac_auth",
-    "mtls_auth",
-    "spiffe_identity",
-    "mesh_authz",
-    "opa",
-    "mesh_outbound_registry",
-    "compression",
-    "cors",
-    "security_headers",
-    "access_control",
-    "tcp_connection_throttle",
-    "adaptive_concurrency",
-    "ip_restriction",
-    "bot_detection",
-    "correlation_id",
-    "request_transformer",
-    "response_transformer",
-    "mesh_route_dispatch",
-    "graphql",
-    "grpc_method_router",
-    "grpc_deadline",
-    "grpc_web",
-    "rate_limiting",
-    "request_size_limiting",
-    "waf",
-    "response_size_limiting",
-    "body_validator",
-    "openapi_validator",
-    "request_termination",
-    "response_caching",
-    "response_mock",
-    "serverless_function",
-    "prometheus_metrics",
-    "proxy_alerts",
-    "otel_tracing",
-    "ai_token_metrics",
-    "ai_request_guard",
-    "ai_rate_limiter",
-    "ai_prompt_shield",
-    "ai_semantic_firewall",
-    "ai_response_guard",
-    "ai_semantic_cache",
-    "ai_federation",
-    "mcp_gateway",
-    "a2a_gateway",
-    "ws_message_size_limiting",
-    "ws_frame_logging",
-    "ws_rate_limiting",
-    "udp_rate_limiting",
-    "udp_logging",
-    "statsd_logging",
-    "loki_logging",
-    "sse",
-    "request_mirror",
-    "load_testing",
-    "geo_restriction",
-    "request_deduplication",
-    "soap_ws_security",
-    "spec_expose",
-    "api_chargeback",
-    "api_chargeback_sink",
-    "workload_metrics",
-    "__mesh_bpf_metrics",
-    "fault_injection",
-];
+pub fn removed_plugin_registration(name: &str) -> Option<&'static PluginRegistration> {
+    REMOVED_PLUGIN_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.name == name)
+}
+
+pub fn plugin_failure_policy(name: &str) -> Option<PluginFailurePolicy> {
+    builtin_plugin_registration(name)
+        .map(|registration| registration.failure_policy)
+        .or_else(|| {
+            removed_plugin_registration(name).map(|registration| registration.failure_policy)
+        })
+        .or_else(|| crate::custom_plugins::custom_plugin_failure_policy(name))
+}
 
 /// Returns true when `name` is handled by the built-in plugin factory.
 pub fn is_builtin_plugin_name(name: &str) -> bool {
-    BUILTIN_PLUGIN_NAMES.contains(&name)
+    builtin_plugin_registration(name).is_some()
 }
 
 pub fn available_plugins() -> Vec<&'static str> {
-    let mut plugins = BUILTIN_PLUGIN_NAMES.to_vec();
+    let mut plugins: Vec<_> = BUILTIN_PLUGIN_REGISTRATIONS
+        .iter()
+        .map(|registration| registration.name)
+        .collect();
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins
 }

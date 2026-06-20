@@ -6,8 +6,9 @@
 //! 2. `FERRUM_DB_CONFIG_BACKUP_PATH` — gateway bootstraps from a read-only
 //!    JSON backup file when the DB (and all failover URLs) are unreachable,
 //!    so pods can start serving with stale-but-working config.
-//! 3. `FERRUM_DB_READ_REPLICA_URL` — polling reads use the replica instead of
-//!    the primary. Writes always target the primary via the admin API.
+//! 3. `FERRUM_DB_READ_REPLICA_URL` — eligible admin reads can use a SQL
+//!    replica with primary fallback. Runtime config polling always reads the
+//!    primary-consistent database view.
 //!
 //! All tests use SQLite for speed and deterministic behaviour. Unreachable DBs
 //! are simulated with `?mode=ro` plus a path that does not exist on disk — sqlx
@@ -16,6 +17,8 @@
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_failover
 
 use chrono::Utc;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::path::PathBuf;
@@ -116,6 +119,68 @@ async fn wait_for_health(admin_port: u16) -> bool {
 fn kill_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn seeded_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        name: Some(id.to_string()),
+        hosts: vec![],
+        listen_path: Some(listen_path.to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
+        backend_host: "127.0.0.1".to_string(),
+        backend_port,
+        backend_path: None,
+        strip_listen_path: true,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5000,
+        backend_read_timeout_ms: 30000,
+        backend_write_timeout_ms: 30000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
+        dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: AuthMode::Single,
+        plugins: vec![],
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
+        pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
 }
 
 // ============================================================================
@@ -558,7 +623,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
 /// replication. To simulate that with SQLite, we point both URLs at the same
 /// file: migrations run on the primary URL, creating tables, and the replica
 /// URL opens the same file so reads through the replica pool succeed. This
-/// exercises the real codepath (replica connect, polling via replica) without
+/// exercises the real codepath (replica connect, admin reads can use replica) without
 /// needing a multi-database setup.
 ///
 /// The test asserts the gateway comes up healthy, the replica pool connects,
@@ -677,6 +742,143 @@ async fn test_db_read_replica_startup() {
     // silently blocking startup) should fail the suite, not be swallowed.
     panic!(
         "Read replica startup test did not complete after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+// ============================================================================
+// Test 4: Authoritative runtime polling ignores stale read replica
+// ============================================================================
+
+/// Startup full-load and runtime routing must read the primary-consistent DB
+/// view even when a SQL read replica URL is configured.
+///
+/// This seeds the primary SQLite DB with a route, points the configured
+/// "replica" at a separate empty SQLite file, and then starts the gateway.
+/// Old replica-backed startup polling would read the empty replica and fail
+/// before the proxy listener came up. The admin list call also proves replica
+/// query failure falls back to primary for eligible admin reads.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
+    println!("\n=== DB Read Replica: authoritative startup uses primary ===\n");
+    ensure_built().expect("Failed to build gateway binary");
+
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let primary_db_path: PathBuf = temp_dir.path().join("primary.db");
+        let replica_db_path: PathBuf = temp_dir.path().join("replica-empty.db");
+
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        let _backend = start_static_backend(backend_listener, "primary-authoritative-ok");
+
+        let primary_url = format!("sqlite:{}?mode=rwc", primary_db_path.to_string_lossy());
+        let replica_url = format!("sqlite:{}?mode=rwc", replica_db_path.to_string_lossy());
+
+        let store = DatabaseStore::connect_with_pool_config(
+            "sqlite",
+            &primary_url,
+            DbPoolConfig::default(),
+        )
+        .await
+        .expect("seed primary DB");
+        store
+            .create_proxy(&seeded_proxy(
+                "authoritative-primary",
+                "/primary",
+                backend_port,
+            ))
+            .await
+            .expect("insert primary proxy");
+        drop(store);
+
+        let jwt_secret = "authoritative-primary-test-jwt-secret-12345".to_string();
+        let jwt_issuer = "ferrum-edge-authoritative-primary-test".to_string();
+
+        let child = Command::new(binary_path())
+            .env("FERRUM_MODE", "database")
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", &primary_url)
+            .env("FERRUM_DB_READ_REPLICA_URL", &replica_url)
+            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
+            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("FERRUM_DB_POLL_INTERVAL", "1")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
+            .env("FERRUM_LOG_LEVEL", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn gateway");
+
+        if !wait_for_health(admin_port).await {
+            last_err = format!("attempt {}: health check did not pass", attempt);
+            eprintln!("  {}", last_err);
+            kill_child(child);
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/primary/hello", proxy_port))
+            .send()
+            .await
+            .expect("proxy request");
+        assert_eq!(
+            resp.status(),
+            200,
+            "Route seeded only in primary DB should be active at startup"
+        );
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(body, "primary-authoritative-ok");
+
+        let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let list = client
+            .get(format!("http://127.0.0.1:{}/proxies", admin_port))
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .expect("list proxies");
+        assert_eq!(
+            list.status(),
+            200,
+            "GET /proxies should fall back to primary when replica has no schema"
+        );
+        let list_body = list.text().await.unwrap_or_default();
+        assert!(
+            list_body.contains("authoritative-primary"),
+            "GET /proxies should return the primary DB proxy after fallback: {}",
+            list_body
+        );
+
+        assert!(
+            replica_db_path.exists(),
+            "Replica SQLite file should have been opened but not used for startup config"
+        );
+
+        kill_child(child);
+        println!("\n=== DB Authoritative Primary Startup Test PASSED ===\n");
+        return;
+    }
+
+    panic!(
+        "Authoritative primary startup test did not complete after {} attempts: {}",
         MAX_ATTEMPTS, last_err
     );
 }

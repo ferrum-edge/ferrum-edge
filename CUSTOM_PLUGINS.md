@@ -81,7 +81,8 @@ on_stream_disconnect()          ── fire-and-forget (logging, metrics)
 
 Create a new `.rs` file in the `custom_plugins/` directory at the project root. The file name becomes the plugin name (e.g., `my_header_injector.rs` → plugin name `my_header_injector`).
 
-Each plugin file must export a `create_plugin` factory function that returns `Result`:
+Each plugin file must export a `create_plugin` factory function that returns
+`Result` and a `failure_policy` metadata function:
 
 ```rust
 // custom_plugins/my_header_injector.rs
@@ -91,7 +92,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::plugins::{
+    Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+};
 
 pub struct MyHeaderInjector {
     header_name: String,
@@ -132,13 +135,17 @@ impl Plugin for MyHeaderInjector {
 }
 
 /// Required factory function — the build script calls this automatically.
-/// Must return Result so invalid configs are rejected at admission time
-/// (admin API returns 400, file mode fails startup, DB mode logs warnings).
+/// Must return Result so invalid configs follow this plugin's failure policy.
 pub fn create_plugin(
     config: &Value,
     _http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     Ok(Some(Arc::new(MyHeaderInjector::new(config)?)))
+}
+
+/// Required metadata function — the build script records this policy.
+pub fn failure_policy() -> PluginFailurePolicy {
+    PluginFailurePolicy::KeepLastKnownGood
 }
 ```
 
@@ -152,10 +159,14 @@ Your `new()` constructor must validate the plugin config and return `Err(String)
 
 Sensible defaults for optional fields (e.g., `limit_by` defaulting to `"ip"`) are fine — only return `Err` for fields where there is no safe default.
 
-This validation is enforced at three levels:
-1. **Admin API** — `create_plugin()` is called at create/update time; errors return HTTP 400.
-2. **File mode** — each enabled plugin is instantiated at startup; errors are fatal.
-3. **Database mode** — each enabled plugin is instantiated at load time; errors are warned.
+The `failure_policy()` return value controls cache publication when construction
+or validation fails:
+
+- `FailClosed` rejects startup or reload rather than serving without the plugin.
+- `KeepLastKnownGood` rejects reload publication so the previous plugin cache
+  keeps serving. Startup also rejects because there is no prior cache.
+- `OptionalFailOpen` logs the failure and omits the plugin from the published
+  cache. Use this only for non-enforcing plugins such as best-effort telemetry.
 
 ### 2. Build
 
@@ -593,7 +604,7 @@ schema reference.
 If your plugin needs to make outbound HTTP calls (webhooks, token introspection, external APIs), use the shared `PluginHttpClient` passed to the factory:
 
 ```rust
-use crate::plugins::PluginHttpClient;
+use crate::plugins::{Plugin, PluginFailurePolicy, PluginHttpClient};
 
 pub struct MyWebhookPlugin {
     http_client: PluginHttpClient,
@@ -619,8 +630,12 @@ Then in the factory function at the bottom of your plugin file:
 pub fn create_plugin(
     config: &Value,
     http_client: PluginHttpClient,
-) -> Option<Arc<dyn Plugin>> {
-    Some(Arc::new(MyWebhookPlugin::new(config, http_client)))
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    Ok(Some(Arc::new(MyWebhookPlugin::new(config, http_client))))
+}
+
+pub fn failure_policy() -> PluginFailurePolicy {
+    PluginFailurePolicy::OptionalFailOpen
 }
 ```
 
@@ -1155,7 +1170,8 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 ## Checklist
 
 - [ ] Plugin `.rs` file created in `custom_plugins/`
-- [ ] `create_plugin()` factory function exported with signature `(config: &Value, http_client: PluginHttpClient) -> Option<Arc<dyn Plugin>>`
+- [ ] `create_plugin()` factory function exported with signature `(config: &Value, http_client: PluginHttpClient) -> Result<Option<Arc<dyn Plugin>>, String>`
+- [ ] `failure_policy()` metadata function exported with the desired `PluginFailurePolicy`
 - [ ] `fn name()` returns the file name (without `.rs`)
 - [ ] Priority set appropriately for the execution phase
 - [ ] `supported_protocols()` returns the correct protocol set

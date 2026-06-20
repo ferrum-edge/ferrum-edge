@@ -1,5 +1,7 @@
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
+use ferrum_edge::plugins::{
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -73,7 +75,10 @@ async fn opt_in_hsts_csp_and_custom_headers_are_applied() {
 
 #[test]
 fn security_headers_is_a_security_plugin() {
-    assert!(is_security_plugin("security_headers"));
+    assert_eq!(
+        plugin_failure_policy("security_headers"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
 }
 
 #[test]

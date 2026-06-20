@@ -13409,13 +13409,13 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
       properties:
         ttl_seconds:
           type: integer
           format: uint64
           default: 300
-          description: "Default TTL in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true."
+          description: "Default freshness lifetime in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true. Upstream Age and Date still reduce remaining freshness."
         max_entries:
           type: integer
           format: uint64
@@ -13469,7 +13469,7 @@ components:
         add_cache_status_header:
           type: boolean
           default: true
-          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses"
+          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header."
         invalidate_on_unsafe_methods:
           type: boolean
           default: true
@@ -15306,7 +15306,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Returns cached responses for duplicate requests within a TTL window. Supports centralized Redis-backed mode for cross-instance deduplication."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint and are not backward-compatible with pre-fingerprint values."
       properties:
         header_name:
           type: string
@@ -15347,7 +15347,7 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+          description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized completed responses plus distributed in-flight locks). Any RESP-compatible server works."
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."

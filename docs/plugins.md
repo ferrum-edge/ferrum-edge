@@ -2143,7 +2143,7 @@ config:
 
 ### `request_deduplication`
 
-Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same key was seen within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
+Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same logical request was completed within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
 
 **Priority:** 2750
 
@@ -2167,14 +2167,19 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_password` | String (optional) | — | Redis password |
 
 **Behavior:**
-- On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
-- Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
+- Logical idempotency keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
+- Request fingerprints bind the logical key to the HTTP method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and a SHA-256 request-body digest. Raw request bodies, credentials, cookies, identities, and idempotency values are not stored in keys or fingerprints
+- On cache hit with the same fingerprint: returns the cached response with `X-Idempotent-Replayed: true` header
+- Reusing the same logical idempotency key for a different fingerprint returns `409 Conflict`
+- Concurrent duplicates with the same fingerprint return `409 Conflict` while the first request is still in-flight
+- Applicable methods with a declared body are buffered before `before_proxy`, even if the idempotency header is not present yet, so earlier header-transform plugins can add the key without making the body unavailable for fingerprinting
+- If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 
-**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Automatic local fallback when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Before a fresh request reaches the backend, the plugin acquires a Redis in-flight lock with `SET NX` and an ownership token; peers with the same fingerprint receive 409 while the first request is running, and peers reusing the same logical key for a different fingerprint receive the fingerprint-mismatch 409. Completed responses are published to Redis before the lock is token-released, so a peer cannot miss both the in-flight marker and the replayable response. Redis completed-response values include the request fingerprint and are not backward-compatible with pre-fingerprint serialized values. Automatic local fallback is used when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: request_deduplication
@@ -2979,7 +2984,7 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ttl_seconds` | u64 | `300` | Default TTL when the backend response does not provide cache freshness headers |
+| `ttl_seconds` | u64 | `300` | Default freshness lifetime when the backend response does not provide `max-age` or `s-maxage`; upstream `Age` and `Date` still reduce remaining freshness |
 | `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction |
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body |
 | `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries |
@@ -2996,7 +3001,8 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 Behavior:
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
-- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists.
+- Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.
+- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists, including a current `Age` header.
 - Authenticated requests are always partitioned by hashed effective identity. Setting `cache_key_include_consumer: true` also permits caching authenticated responses that do not explicitly opt into shared caching and partitions unauthenticated requests under `_anon`.
 - When `cache_key_include_query` is enabled, the raw query string is hashed byte-for-byte without parsing, sorting, percent-decoding, or normalizing, so duplicate parameters, parameter order, percent-encoded names, bare flags, and empty values remain distinct.
 - Requests carrying `Authorization`, `Proxy-Authorization`, or `Cookie` are keyed by hashed header values for cacheable responses so distinct credentials or sessions cannot share one cached entry.

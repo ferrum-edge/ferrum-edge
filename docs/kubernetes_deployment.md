@@ -371,8 +371,8 @@ metadata:
   name: ferrum-edge-secrets
 type: Opaque
 stringData:
-  # For Atlas: mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum?readPreference=secondaryPreferred
-  db-url: mongodb://ferrum:change-me@mongodb.default.svc.cluster.local:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred
+  # For Atlas: mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum
+  db-url: mongodb://ferrum:change-me@mongodb.default.svc.cluster.local:27017/ferrum?replicaSet=rs0
   admin-jwt-secret: change-me
 ```
 
@@ -394,7 +394,7 @@ env:
 ```
 
 **Notes:**
-- `FERRUM_DB_READ_REPLICA_URL` is not needed — use `readPreference=secondaryPreferred` in the connection string
+- `FERRUM_DB_READ_REPLICA_URL` is SQL-only and not used by MongoDB; Ferrum's MongoDB config store forces primary reads
 - `FERRUM_DB_POOL_*` settings are ignored for MongoDB
 - For MongoDB on Kubernetes, consider the [MongoDB Community Kubernetes Operator](https://github.com/mongodb/mongodb-kubernetes-operator)
 - See [docs/mongodb.md](mongodb.md) for the full deployment guide

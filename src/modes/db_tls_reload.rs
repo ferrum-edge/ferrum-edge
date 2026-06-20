@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::EnvConfig;
-use crate::config::db_backend::{DatabaseBackend, redact_url};
+use crate::config::db_backend::{DatabaseBackend, redact_error_text, redact_url};
 use crate::tls::source::MaterialKind;
 use crate::tls::source::subscription::{
     AsyncMaterialSetReloadConfig, WatchedMaterialSource, material_set_poll_interval,
@@ -97,10 +97,11 @@ async fn reload_db_tls_material(
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
 
     db.reconnect(&effective_url).await.map_err(|error| {
+        let safe_error = redact_error_text(&error, &[&effective_url]);
         anyhow::anyhow!(
             "database TLS reconnect failed for {}: {}",
             redact_url(&effective_url),
-            error
+            safe_error
         )
     })?;
 
@@ -111,10 +112,11 @@ async fn reload_db_tls_material(
         db.reconnect_read_replica(&replica_url)
             .await
             .map_err(|error| {
+                let safe_error = redact_error_text(&error, &[&replica_url]);
                 anyhow::anyhow!(
-                    "database TLS read replica reconnect failed for {}: {}",
+                    "database TLS admin-read replica reconnect failed for {}: {}",
                     redact_url(&replica_url),
-                    error
+                    safe_error
                 )
             })?;
     }
