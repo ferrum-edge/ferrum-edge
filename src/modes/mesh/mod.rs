@@ -7256,7 +7256,9 @@ async fn serve_mesh_runtime(
         bpf_metrics_state.clone(),
     )?;
     let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
-        info!("Node-waypoint identity resolver enabled; unknown socket cookies fail closed");
+        info!(
+            "Node-waypoint identity resolver enabled; unknown outbound capture socket cookies fail closed"
+        );
         let resolver = Arc::new(node_waypoint::NodeWaypointIdentityResolver::new(
             env_config.pool_shard_amount,
         ));

@@ -2754,9 +2754,11 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
-    /// Node-waypoint source identity resolver. When present, accepted sockets
-    /// must carry a node-agent/eBPF cookie record or the connection is dropped
-    /// fail-closed before TLS/HBONE processing.
+    /// Node-waypoint source identity resolver. Outbound capture sockets accepted
+    /// from per-pod in-netns listeners must carry a node-agent/eBPF cookie record
+    /// or the connection is dropped fail-closed before request processing.
+    /// Inbound HBONE sockets from peer proxies do not carry those pod-loopback
+    /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
     /// This is live, not staged: `supports_hbone_backend` gates HBONE dispatch
@@ -10337,6 +10339,20 @@ fn select_mesh_original_dst(
     }
 }
 
+fn should_resolve_node_waypoint_identity(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+}
+
+fn should_use_direct_pod_ip_http_route(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    has_node_waypoint_identity: bool,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+        && has_node_waypoint_identity
+}
+
 /// Accept loop that runs on a single listener socket. Multiple instances can
 /// run concurrently on the same address when SO_REUSEPORT is enabled.
 #[allow(clippy::too_many_arguments)]
@@ -10407,7 +10423,10 @@ async fn run_accept_loop(
                         let state = Arc::clone(&state);
                         let mut node_waypoint_orig_dst = None;
                         let node_waypoint_identity =
-                            if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
+                            if should_resolve_node_waypoint_identity(mesh_direction)
+                                && let Some(resolver) =
+                                    state.node_waypoint_identity_resolver.as_ref()
+                            {
                                 match resolver.resolve_stream(&stream) {
                                     // HTTP/HBONE re-queries the per-pod scope per
                                     // request, so the accept-time scope is unused
@@ -11863,17 +11882,19 @@ async fn handle_proxy_request_inner(
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
     // safely identify the destination service for a direct pod-IP dial.
-    let direct_pod_ip_http_route =
-        if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound) {
-            ctx.orig_dst.and_then(|orig_dst| {
-                epoch
-                    .route_table
-                    .mesh_http_egress_by_workload_decision(orig_dst)
-                    .cloned()
-            })
-        } else {
-            None
-        };
+    let direct_pod_ip_http_route = if should_use_direct_pod_ip_http_route(
+        ctx.mesh_direction,
+        ctx.node_waypoint_pod_uid.is_some(),
+    ) {
+        ctx.orig_dst.and_then(|orig_dst| {
+            epoch
+                .route_table
+                .mesh_http_egress_by_workload_decision(orig_dst)
+                .cloned()
+        })
+    } else {
+        None
+    };
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
     let route_match = match direct_pod_ip_http_route {
@@ -22004,6 +22025,51 @@ mod tests {
             ),
             Some(socket_capture_endpoint),
             "inbound capture is still the iptables original-dst path"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_identity_resolution_is_outbound_capture_only() {
+        assert!(
+            should_resolve_node_waypoint_identity(Some(
+                crate::modes::mesh::MeshTrafficDirection::Outbound
+            )),
+            "pod-loopback outbound capture must resolve the eBPF cookie before request handling"
+        );
+        assert!(
+            !should_resolve_node_waypoint_identity(Some(
+                crate::modes::mesh::MeshTrafficDirection::Inbound
+            )),
+            "peer HBONE connections on the inbound listener do not carry pod-loopback cookies"
+        );
+        assert!(
+            !should_resolve_node_waypoint_identity(None),
+            "non-mesh listeners must not be coupled to the NodeWaypoint identity resolver"
+        );
+    }
+
+    #[test]
+    fn direct_pod_ip_http_route_is_node_waypoint_only() {
+        assert!(
+            should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                true
+            ),
+            "NodeWaypoint outbound capture with a resolved source pod identity may route by original pod IP"
+        );
+        assert!(
+            !should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                false
+            ),
+            "Sidecar and other outbound listeners keep Host routing because they do not have NodeWaypoint pod identity"
+        );
+        assert!(
+            !should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Inbound),
+                true
+            ),
+            "inbound HBONE relay traffic must not use the outbound direct-pod-IP lookup"
         );
     }
 
