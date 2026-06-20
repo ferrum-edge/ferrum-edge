@@ -16,6 +16,7 @@
 //! Only applies to non-safe HTTP methods (POST, PUT, PATCH by default).
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -23,6 +24,7 @@ use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Read;
 use std::mem;
 use std::sync::LazyLock;
@@ -212,6 +214,7 @@ enum LocalCompletionAction {
     Skipped {
         inflight_count: usize,
         reason: CompletionSkipReason,
+        redis_candidate: Option<CachedResponse>,
     },
     Stale,
 }
@@ -466,6 +469,64 @@ impl RequestDeduplication {
     }
 
     fn local_lookup_or_mark_inflight(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: Instant,
+    ) -> LocalDeduplicationAction {
+        match self.local_cache.entry(key.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(DeduplicationEntry::InFlight {
+                    started_at: now,
+                    fingerprint: fingerprint.to_string(),
+                });
+                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                LocalDeduplicationAction::Fresh
+            }
+            Entry::Occupied(mut entry) => {
+                match entry.get() {
+                    DeduplicationEntry::Completed {
+                        cached,
+                        fingerprint: cached_fingerprint,
+                        ..
+                    } => {
+                        if now.duration_since(cached.inserted_at) < self.ttl {
+                            if cached_fingerprint == fingerprint {
+                                return LocalDeduplicationAction::Replay(cached.clone());
+                            }
+                            return LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            );
+                        }
+                    }
+                    DeduplicationEntry::InFlight {
+                        started_at,
+                        fingerprint: cached_fingerprint,
+                    } => {
+                        if now.duration_since(*started_at) >= self.inflight_ttl {
+                            entry.insert(DeduplicationEntry::InFlight {
+                                started_at: now,
+                                fingerprint: fingerprint.to_string(),
+                            });
+                            return LocalDeduplicationAction::Fresh;
+                        }
+                        if cached_fingerprint == fingerprint {
+                            return LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::InFlight,
+                            );
+                        }
+                        return LocalDeduplicationAction::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        );
+                    }
+                }
+                drop(entry);
+                self.replace_expired_completed_with_inflight(key, fingerprint, now)
+            }
+        }
+    }
+
+    fn replace_expired_completed_with_inflight(
         &self,
         key: &str,
         fingerprint: &str,
@@ -749,6 +810,7 @@ impl RequestDeduplication {
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::EntryTooLarge { entry_size },
+                redis_candidate: None,
             };
         }
 
@@ -756,12 +818,19 @@ impl RequestDeduplication {
         if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
             entry.remove();
             let inflight_count = decrement_atomic(&self.inflight_count);
+            let redis_candidate = self.redis_client.as_ref().map(|_| CachedResponse {
+                status_code,
+                headers,
+                body: Bytes::copy_from_slice(body),
+                inserted_at: Instant::now(),
+            });
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::TotalCapacity {
                     entry_size,
                     current_total,
                 },
+                redis_candidate,
             };
         }
 
@@ -1068,6 +1137,10 @@ struct SerializableCachedResponse {
     fingerprint: String,
     status_code: u16,
     headers: HashMap<String, String>,
+    #[serde(
+        serialize_with = "serialize_cached_response_body",
+        deserialize_with = "deserialize_cached_response_body"
+    )]
     body: Vec<u8>,
 }
 
@@ -1075,6 +1148,57 @@ struct SerializableCachedResponse {
 struct SerializableInFlightLock {
     fingerprint: String,
     token: String,
+}
+
+fn serialize_cached_response_body<S>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(body))
+}
+
+fn deserialize_cached_response_body<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CachedResponseBodyVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CachedResponseBodyVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a base64 response body string or legacy byte array")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut body = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                body.push(byte);
+            }
+            Ok(body)
+        }
+    }
+
+    deserializer.deserialize_any(CachedResponseBodyVisitor)
 }
 
 fn hash_framed(hasher: &mut Sha256, label: &str, value: &[u8]) {
@@ -1629,6 +1753,7 @@ impl Plugin for RequestDeduplication {
             LocalCompletionAction::Skipped {
                 inflight_count,
                 reason,
+                redis_candidate,
             } => {
                 match reason {
                     CompletionSkipReason::EntryTooLarge { entry_size } => {
@@ -1651,6 +1776,17 @@ impl Plugin for RequestDeduplication {
                             "request_deduplication: completed response would exceed total size limit, skipping store"
                         );
                     }
+                }
+                if let Some(cached) = redis_candidate {
+                    match self.redis_set(&key, &fingerprint, &cached).await {
+                        RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                                self.redis_release_inflight(&key, &fingerprint, token).await;
+                            }
+                        }
+                        RedisStoreAction::Failed => {}
+                    }
+                    return PluginResult::Continue;
                 }
                 if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
                     self.redis_release_inflight(&key, &fingerprint, token).await;

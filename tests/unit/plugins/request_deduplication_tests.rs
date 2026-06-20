@@ -880,6 +880,11 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
         matches!(result, PluginResult::Continue),
         "total-cap skip must clear the skipped key's in-flight marker"
     );
+
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 200, HashMap::new(), &body).is_some(),
+        "a local total-cap skip must still be small enough for Redis publication"
+    );
 }
 
 #[tokio::test]
@@ -1789,6 +1794,13 @@ fn test_legacy_redis_cached_response_without_fingerprint_is_rejected() {
 }
 
 #[test]
+fn test_legacy_redis_cached_response_byte_array_body_is_accepted() {
+    let legacy = br#"{"fingerprint":"sha256-test","status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
+
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(legacy));
+}
+
+#[test]
 fn test_redis_payload_admission_respects_entry_size_limit() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
@@ -1813,6 +1825,33 @@ fn test_redis_payload_admission_respects_entry_size_limit() {
             .is_none(),
         "oversized responses must not be serialized for Redis storage"
     );
+}
+
+#[test]
+fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+
+    let max_entry_size_bytes = 1024 * 1024;
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": max_entry_size_bytes
+    }));
+    let body = vec![0xab; 512 * 1024];
+    let payload = request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body)
+        .expect("compact Redis payload should be admitted under the entry limit");
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&payload).expect("payload should be JSON");
+
+    assert!(
+        payload_json
+            .get("body")
+            .is_some_and(serde_json::Value::is_string),
+        "Redis response bodies must serialize as compact base64 strings"
+    );
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
 }
 
 #[tokio::test]
