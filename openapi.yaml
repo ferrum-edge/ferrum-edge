@@ -15306,7 +15306,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally, clear in-flight state, and are not retained. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit before serialization, and are not backward-compatible with pre-fingerprint values."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and are not backward-compatible with pre-fingerprint values. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
       properties:
         header_name:
           type: string
@@ -15334,12 +15334,12 @@ components:
           type: integer
           minimum: 1
           default: 1048576
-          description: Maximum retained size of one completed response entry. Oversized responses are returned normally, clear in-flight state, and are not retained or serialized for Redis.
+          description: Maximum retained size of one completed response entry. Oversized retained responses are returned normally, clear in-flight state, and are not retained or serialized for Redis. Redis payloads are also skipped when their serialized value exceeds this cap.
         max_total_size_bytes:
           type: integer
           minimum: 1
           default: 104857600
-          description: Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally, clear in-flight state, and are not retained.
+          description: Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode, skipped responses clear in-flight state immediately; in Redis mode, a local-total-cap skip keeps local and distributed in-flight locks until inflight_ttl_seconds if Redis publication fails.
         applicable_methods:
           type: array
           items:

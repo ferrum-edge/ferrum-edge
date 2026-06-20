@@ -1903,11 +1903,11 @@ fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
         "application/octet-stream".to_string(),
     );
 
-    let max_entry_size_bytes = 1024 * 1024;
+    let max_entry_size_bytes = 256 * 1024;
     let plugin = make_plugin(json!({
         "max_entry_size_bytes": max_entry_size_bytes
     }));
-    let body = vec![0xab; 800 * 1024];
+    let body = vec![0xab; 160 * 1024];
     let payload = request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body)
         .expect("compact Redis payload should be admitted under the entry limit");
     let payload_json: serde_json::Value =
@@ -1920,10 +1920,28 @@ fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
         "Redis response bodies must serialize as compact base64 strings"
     );
     assert!(
-        payload.len() > max_entry_size_bytes,
-        "wire encoding can exceed the retained-entry cap without rejecting Redis publication"
+        payload.len() <= max_entry_size_bytes,
+        "compact Redis payload should remain under the configured entry cap"
     );
     assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
+}
+
+#[test]
+fn test_redis_payload_admission_rejects_serialized_payload_over_entry_limit() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1024 * 1024
+    }));
+    let body = vec![0xab; 800 * 1024];
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body).is_none(),
+        "Redis payloads must be rejected when serialized storage exceeds the entry cap"
+    );
 }
 
 #[tokio::test]

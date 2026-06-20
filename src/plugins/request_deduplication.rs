@@ -751,6 +751,14 @@ impl RequestDeduplication {
             Ok(data) => data,
             Err(_) => return RedisPayloadAdmission::RejectedBySize,
         };
+        if data.len() > self.max_entry_size_bytes {
+            debug!(
+                payload_size = data.len(),
+                max_entry_size_bytes = self.max_entry_size_bytes,
+                "request_deduplication: serialized Redis response exceeds entry size limit, skipping store"
+            );
+            return RedisPayloadAdmission::RejectedBySize;
+        }
         RedisPayloadAdmission::Admitted(data)
     }
 
