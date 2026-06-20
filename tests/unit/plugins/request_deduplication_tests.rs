@@ -888,6 +888,74 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
 }
 
 #[tokio::test]
+async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
+    let plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 768
+    }));
+    let body = vec![b'a'; 500];
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-a".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, &body).await;
+    let first_size = assert_completed_size_exact(&plugin);
+    assert!(
+        first_size <= 768,
+        "first entry should fit under the configured total cap, got {first_size}"
+    );
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-b".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx2, &body).await;
+
+    assert_eq!(assert_completed_size_exact(&plugin), first_size);
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-b".to_string(),
+    );
+    let result = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 409),
+        other => {
+            panic!("Expected Redis publish failure to preserve local in-flight lock, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_inflight_marker_carries_timestamp() {
     // Smoke test: confirm InFlight marker can be inserted multiple times for
     // distinct keys without panic and tracked_keys_count reflects the inserts.

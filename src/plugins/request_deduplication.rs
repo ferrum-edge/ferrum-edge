@@ -754,6 +754,20 @@ impl RequestDeduplication {
         RedisPayloadAdmission::Admitted(data)
     }
 
+    fn remove_matching_local_inflight(&self, key: &str, fingerprint: &str) -> Option<usize> {
+        self.local_cache
+            .remove_if(key, |_, entry| {
+                matches!(
+                    entry,
+                    DeduplicationEntry::InFlight {
+                        fingerprint: current,
+                        ..
+                    } if current == fingerprint
+                )
+            })
+            .map(|_| decrement_atomic(&self.inflight_count))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn redis_payload_for_tests(
         &self,
@@ -808,14 +822,22 @@ impl RequestDeduplication {
 
         let current_total = self.completed_size_bytes.load(Ordering::Relaxed);
         if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
-            entry.remove();
-            let inflight_count = decrement_atomic(&self.inflight_count);
-            let redis_candidate = self.redis_client.as_ref().map(|_| CachedResponse {
-                status_code,
-                headers,
-                body: Bytes::copy_from_slice(body),
-                inserted_at: Instant::now(),
-            });
+            let redis_candidate = if self.redis_client.is_some() {
+                Some(CachedResponse {
+                    status_code,
+                    headers,
+                    body: Bytes::copy_from_slice(body),
+                    inserted_at: Instant::now(),
+                })
+            } else {
+                entry.remove();
+                None
+            };
+            let inflight_count = if redis_candidate.is_some() {
+                self.inflight_count.load(Ordering::Relaxed)
+            } else {
+                decrement_atomic(&self.inflight_count)
+            };
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::TotalCapacity {
@@ -1772,13 +1794,14 @@ impl Plugin for RequestDeduplication {
                 if let Some(cached) = redis_candidate {
                     match self.redis_set(&key, &fingerprint, &cached).await {
                         RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                            self.remove_matching_local_inflight(&key, &fingerprint);
                             if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
                                 self.redis_release_inflight(&key, &fingerprint, token).await;
                             }
                         }
                         // Nothing was retained locally. If Redis publication
-                        // fails too, keep the distributed in-flight lock until
-                        // `inflight_ttl` so peers cannot immediately re-run a
+                        // fails too, keep both in-flight locks until
+                        // `inflight_ttl` so retries cannot immediately re-run a
                         // completed side-effecting request with no replay value.
                         RedisStoreAction::Failed => {}
                     }
