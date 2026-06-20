@@ -14,6 +14,7 @@ use crate::config_sources::k8s::{
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
+const DEFAULT_FERRUM_GATEWAY_CLASS_NAME: &str = "ferrum";
 const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1702,11 +1703,12 @@ fn gateway_is_managed_by_ferrum(objects: &[K8sObject], gateway: &K8sObject) -> b
     let Some(class_name) = gateway.spec.get("gatewayClassName").and_then(Value::as_str) else {
         return false;
     };
-    objects.iter().any(|object| {
-        object.kind == "GatewayClass"
-            && object.metadata.name == class_name
-            && gateway_class_is_managed_by_ferrum(object)
-    })
+    for object in objects {
+        if object.kind == "GatewayClass" && object.metadata.name == class_name {
+            return gateway_class_is_managed_by_ferrum(object);
+        }
+    }
+    class_name == DEFAULT_FERRUM_GATEWAY_CLASS_NAME
 }
 
 fn managed_route_parent_refs(objects: &[K8sObject], route: &K8sObject) -> Vec<Value> {
@@ -2502,6 +2504,67 @@ mod tests {
         let updates = plan_status_updates(&[gateway_class, gateway], options());
 
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn gateway_status_uses_builtin_ferrum_class_when_unobserved() {
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway], options());
+
+        let gateway_update = update_for(&updates, "Gateway", "edge");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
+    }
+
+    #[test]
+    fn gateway_status_honors_observed_ferrum_class_controller() {
+        let gateway_class = object(
+            "GatewayClass",
+            "ferrum",
+            json!({ "controllerName": "example.com/other-controller" }),
+        );
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway_class, gateway], options());
+
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn route_status_uses_builtin_ferrum_class_when_unobserved() {
+        let gateway = ferrum_gateway("edge");
+        let route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
+            }),
+        );
+
+        let updates = plan_status_updates(&[gateway, route], options());
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
     }
 
     #[test]
@@ -4022,7 +4085,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_route_status_requires_materialized_l4_port_to_match_gateway_listener() {
+    fn tcp_route_status_programmed_when_l4_listener_port_differs_from_backend_port() {
         let gateway_class = ferrum_gateway_class();
         let gateway = object(
             "Gateway",
@@ -4062,11 +4125,7 @@ mod tests {
         let conditions = parents[0]["conditions"].as_array().unwrap();
         assert_condition(conditions, "Accepted", "True");
         assert_condition(conditions, "ResolvedRefs", "True");
-        assert_condition(conditions, "Programmed", "False");
-        assert_eq!(
-            find_condition(conditions, "Programmed")["reason"].as_str(),
-            Some("NoRules")
-        );
+        assert_condition(conditions, "Programmed", "True");
     }
 
     #[test]

@@ -436,7 +436,7 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
         return false;
     }
     let Some(tls) = listener.get("tls") else {
-        return false;
+        return true;
     };
     string_field(tls, "mode")
         .unwrap_or("Terminate")
@@ -1426,6 +1426,44 @@ fn route_materialized_parent_ref_keys_for_namespace(
     refs.sort();
     refs.dedup();
     refs
+}
+
+fn l4_route_listener_ports_for_namespace(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    namespace_filter: Option<&str>,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !parent_ref_is_gateway(parent_ref) {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if namespace_filter.is_some_and(|filter| parent_namespace != filter) {
+            continue;
+        }
+        let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace == parent_namespace
+                && key.gateway == parent_gateway
+                && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
+                && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
+            {
+                ports.push(port);
+            }
+        }
+    }
+    ports.sort();
+    ports.dedup();
+    ports
 }
 
 fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -3178,6 +3216,8 @@ fn l4_route_proxies(
         acc,
         Some(&object.metadata.namespace),
     );
+    let materialized_listener_ports =
+        l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -3207,30 +3247,42 @@ fn l4_route_proxies(
             "TCPRoute/TLSRoute backendRefs[].port",
         )?;
 
-        proxies.push(proxy_for_route(RouteProxySpec {
-            id: resource_id(
-                "gwapi-l4",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &rule_index.to_string(),
-            ),
-            namespace: object.metadata.namespace.clone(),
-            hosts: string_array(&object.spec, "hostnames"),
-            listen_path: None,
-            strip_listen_path: false,
-            preserve_host_header: false,
-            backend_host: service_dns_name(
-                backend_name,
-                &backend_namespace,
-                &acc.options.cluster_domain,
-            ),
-            backend_port,
-            upstream_id: None,
-            backend_scheme: scheme,
-            listen_port: Some(backend_port),
-            retry: None,
-            backend_read_timeout_ms: None,
-        }));
+        let listen_ports = if materialized_listener_ports.is_empty() {
+            vec![backend_port]
+        } else {
+            materialized_listener_ports.clone()
+        };
+        for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
+            let suffix = if listen_ports.len() == 1 {
+                rule_index.to_string()
+            } else {
+                format!("{rule_index}-{listen_port_index}")
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: resource_id(
+                    "gwapi-l4",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                ),
+                namespace: object.metadata.namespace.clone(),
+                hosts: string_array(&object.spec, "hostnames"),
+                listen_path: None,
+                strip_listen_path: false,
+                preserve_host_header: false,
+                backend_host: service_dns_name(
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                backend_port,
+                upstream_id: None,
+                backend_scheme: scheme,
+                listen_port: Some(listen_port),
+                retry: None,
+                backend_read_timeout_ms: None,
+            }));
+        }
     }
     if !proxies.is_empty() {
         for parent_ref in materialized_parent_refs {
@@ -3776,6 +3828,42 @@ mod tests {
                 .as_ref()
                 .is_none_or(|mesh| mesh.services.is_empty()),
             "invalid terminating TLS listener must not be exposed as a data-plane service"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn gateway_https_listener_without_tls_block_fails_closed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS"
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway], options())
+            .expect("translation should leave listener TLS unmaterialized");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty()),
+            "HTTPS listeners without TLS material must not be exposed as plaintext services"
         );
         assert!(
             result
@@ -6859,6 +6947,42 @@ mod tests {
         .expect("translation succeeds");
 
         assert_eq!(result.config.proxies[0].listen_port, Some(5432));
+        assert_eq!(
+            result.config.proxies[0].backend_scheme,
+            Some(BackendScheme::Tcp)
+        );
+    }
+
+    #[test]
+    fn tcp_route_uses_materialized_gateway_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 15432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample"}],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_port, 5432);
+        assert_eq!(result.config.proxies[0].listen_port, Some(15432));
         assert_eq!(
             result.config.proxies[0].backend_scheme,
             Some(BackendScheme::Tcp)
