@@ -1839,7 +1839,7 @@ fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
     let plugin = make_plugin(json!({
         "max_entry_size_bytes": max_entry_size_bytes
     }));
-    let body = vec![0xab; 512 * 1024];
+    let body = vec![0xab; 800 * 1024];
     let payload = request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body)
         .expect("compact Redis payload should be admitted under the entry limit");
     let payload_json: serde_json::Value =
@@ -1850,6 +1850,10 @@ fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
             .get("body")
             .is_some_and(serde_json::Value::is_string),
         "Redis response bodies must serialize as compact base64 strings"
+    );
+    assert!(
+        payload.len() > max_entry_size_bytes,
+        "wire encoding can exceed the retained-entry cap without rejecting Redis publication"
     );
     assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
 }

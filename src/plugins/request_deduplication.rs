@@ -751,14 +751,6 @@ impl RequestDeduplication {
             Ok(data) => data,
             Err(_) => return RedisPayloadAdmission::RejectedBySize,
         };
-        if data.len() > self.max_entry_size_bytes {
-            debug!(
-                serialized_size = data.len(),
-                max_entry_size_bytes = self.max_entry_size_bytes,
-                "request_deduplication: Redis payload exceeds entry size limit, skipping store"
-            );
-            return RedisPayloadAdmission::RejectedBySize;
-        }
         RedisPayloadAdmission::Admitted(data)
     }
 
@@ -875,7 +867,6 @@ impl RequestDeduplication {
     /// attacker-influenceable hot-path amplification (finding #12). The throttle
     /// clock is monotonic (finding #57).
     fn cleanup_local_cache(&self) {
-        let _guard = self.accounting_guard();
         let now_secs = monotonic_secs();
 
         // Throttle full scans to once per interval. This gate is unconditional
@@ -897,6 +888,7 @@ impl RequestDeduplication {
             return; // Another thread is doing cleanup this interval
         }
 
+        let _guard = self.accounting_guard();
         let now = Instant::now();
         // Single all-shard pass: drop expired Completed entries and stale
         // InFlight markers. Decrement counters for entries actually removed
