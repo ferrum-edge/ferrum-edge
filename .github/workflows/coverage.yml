@@ -304,7 +304,6 @@ jobs:
 
           changed_base_args=()
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags --prune origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
             changed_base_args=(--changed-base "origin/${{ github.base_ref }}")
           fi
 
