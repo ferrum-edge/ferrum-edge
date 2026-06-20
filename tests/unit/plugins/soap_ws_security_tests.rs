@@ -1904,7 +1904,10 @@ async fn test_doctype_entity_payload_rejected() {
 
 #[test]
 fn test_soap_ws_security_is_security_plugin() {
-    assert!(ferrum_edge::plugins::is_security_plugin("soap_ws_security"));
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("soap_ws_security"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::FailClosed)
+    );
 }
 
 #[test]

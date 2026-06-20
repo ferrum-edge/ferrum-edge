@@ -26,7 +26,7 @@ use crate::config::types::{
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
@@ -368,7 +368,8 @@ pub(crate) fn statement_timeout_sql(
 #[derive(Clone)]
 pub struct DatabaseStore {
     pool: Arc<ArcSwap<AnyPool>>,
-    read_replica_pool: Option<Arc<ArcSwap<AnyPool>>>,
+    read_replica_url: Option<String>,
+    read_replica_pool: Arc<ArcSwapOption<AnyPool>>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -387,6 +388,17 @@ pub struct DatabaseStore {
     /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
     /// same cleared-state after recovery.
     migrations_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminReadSource {
+    Primary,
+    ReadReplica,
+}
+
+struct AdminReadPool {
+    pool: AnyPool,
+    source: AdminReadSource,
 }
 
 impl DatabaseStore {
@@ -700,7 +712,8 @@ impl DatabaseStore {
 
         let store = Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
-            read_replica_pool: None,
+            read_replica_url: None,
+            read_replica_pool: Arc::new(ArcSwapOption::empty()),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -756,7 +769,8 @@ impl DatabaseStore {
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
-            read_replica_pool: None,
+            read_replica_url: None,
+            read_replica_pool: Arc::new(ArcSwapOption::empty()),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -921,7 +935,7 @@ impl DatabaseStore {
              WHERE p.namespace = ?");
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await
             .map_err(|e| {
                 Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
@@ -944,13 +958,26 @@ impl DatabaseStore {
             return Ok(HashMap::new());
         }
 
-        let mut associations: ProxyPluginAssociations = HashMap::new();
         let pool = if use_primary {
             self.pool()
         } else {
             self.rpool()
         };
+        self.load_proxy_plugin_associations_for_proxy_ids_from_pool(proxy_ids, operation, &pool)
+            .await
+    }
 
+    async fn load_proxy_plugin_associations_for_proxy_ids_from_pool(
+        &self,
+        proxy_ids: &[String],
+        operation: &str,
+        pool: &AnyPool,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        if proxy_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut associations: ProxyPluginAssociations = HashMap::new();
         for chunk in proxy_ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -964,7 +991,7 @@ impl DatabaseStore {
                 query = query.bind(id);
             }
             let rows = query
-                .fetch_all(&pool)
+                .fetch_all(pool)
                 .await
                 .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
             for row in &rows {
@@ -1009,10 +1036,11 @@ impl DatabaseStore {
         operation: &str,
         namespace: &str,
         proxies: &[Proxy],
+        pool: &AnyPool,
     ) -> Result<(), anyhow::Error> {
         let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(proxies);
         let plugin_refs = self
-            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, false)
+            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, pool)
             .await?;
         let mut errors = Vec::new();
         for proxy in proxies {
@@ -1214,7 +1242,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -1245,7 +1273,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -1276,7 +1304,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -2109,7 +2137,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -2134,12 +2162,44 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_proxies_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_proxies_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_proxies_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_proxies_paginated_from_admin_read(namespace, limit, offset, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_proxies_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_proxies_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM proxies WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2149,7 +2209,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         // Batch-load proxy_plugins for only the proxies in this page
@@ -2159,10 +2219,10 @@ impl DatabaseStore {
             .collect();
 
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_proxy_ids(
+            .load_proxy_plugin_associations_for_proxy_ids_from_pool(
                 &proxy_ids,
                 "list_proxies_paginated",
-                false,
+                pool,
             )
             .await?;
 
@@ -2182,6 +2242,7 @@ impl DatabaseStore {
             "list_proxies_paginated",
             namespace,
             &proxies,
+            pool,
         )
         .await?;
 
@@ -2199,12 +2260,49 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_consumers_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_consumers_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_consumers_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_consumers_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_consumers_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_consumers_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM consumers WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2214,7 +2312,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut consumers = Vec::new();
@@ -2236,12 +2334,56 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_plugin_configs_paginated_from_admin_read(
+                namespace,
+                limit,
+                offset,
+                &admin_read.pool,
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_plugin_configs_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_plugin_configs_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_plugin_configs_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!(
+                        "Admin read fallback to primary succeeded for list_plugin_configs_paginated"
+                    );
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_plugin_configs_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM plugin_configs WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2252,7 +2394,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut configs = Vec::new();
@@ -2274,12 +2416,49 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_upstreams_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_upstreams_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_upstreams_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_upstreams_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_upstreams_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_upstreams_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM upstreams WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2289,7 +2468,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut upstreams = Vec::new();
@@ -3005,7 +3184,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
-                .fetch_all(&self.rpool())
+                .fetch_all(&self.pool())
                 .await?;
 
         if rows.is_empty() {
@@ -3023,7 +3202,7 @@ impl DatabaseStore {
             .load_proxy_plugin_associations_for_proxy_ids(
                 &changed_id_list,
                 "load_incremental_config",
-                false,
+                true,
             )
             .await?;
 
@@ -3053,7 +3232,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
-                .fetch_all(&self.rpool())
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut consumers = Vec::with_capacity(rows.len());
@@ -3076,7 +3255,7 @@ impl DatabaseStore {
         )
         .bind(namespace)
         .bind(since_str)
-        .fetch_all(&self.rpool())
+        .fetch_all(&self.pool())
         .await?;
 
         let mut configs = Vec::with_capacity(rows.len());
@@ -3098,7 +3277,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
-                .fetch_all(&self.rpool())
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut upstreams = Vec::with_capacity(rows.len());
@@ -3121,7 +3300,7 @@ impl DatabaseStore {
         let sql = self.q(table.select_ids_sql());
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
 
         let mut ids = HashSet::with_capacity(rows.len());
@@ -3143,7 +3322,8 @@ impl DatabaseStore {
         ids: &[String],
         namespace: &str,
     ) -> Result<PluginConfigRefs, anyhow::Error> {
-        self.load_plugin_config_refs_from_pool(ids, namespace, true)
+        let pool = self.pool();
+        self.load_plugin_config_refs_from_pool(ids, namespace, &pool)
             .await
     }
 
@@ -3151,16 +3331,11 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
-        use_primary: bool,
+        pool: &AnyPool,
     ) -> Result<PluginConfigRefs, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let pool = if use_primary {
-            self.pool()
-        } else {
-            self.rpool()
-        };
 
         let mut plugin_refs = std::collections::HashMap::new();
         for chunk in ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
@@ -3178,7 +3353,7 @@ impl DatabaseStore {
                 query = query.bind(id);
             }
 
-            let rows = query.fetch_all(&pool).await?;
+            let rows = query.fetch_all(pool).await?;
             for row in rows {
                 let id: String = row.try_get("id")?;
                 let scope = match row.try_get::<String, _>("scope")?.as_str() {
@@ -3824,12 +3999,13 @@ impl DatabaseStore {
         }
     }
 
-    /// Connect a read replica pool for config polling.
+    /// Connect a read replica pool for admin read offload.
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
+        self.read_replica_url = Some(replica_url.to_string());
 
         let final_url = Self::append_connect_timeout(
             replica_url,
@@ -3838,44 +4014,81 @@ impl DatabaseStore {
         );
 
         let pool = self.build_pool_options().connect(&final_url).await?;
+        sqlx::query("SELECT 1").fetch_one(&pool).await?;
 
-        self.read_replica_pool = Some(Arc::new(ArcSwap::from_pointee(pool)));
+        self.read_replica_pool.store(Some(Arc::new(pool)));
         info!(
-            "Read replica connected (db_type={}, url={})",
+            "Read replica connected for admin reads (db_type={}, url={})",
             self.db_type,
             Self::redact_url(replica_url)
         );
         Ok(())
     }
 
-    /// Get a snapshot of the read replica pool, falling back to the primary.
+    /// Get a snapshot of the read pool for admin-only list/read APIs.
     ///
-    /// Used by config polling (load_full_config, load_incremental_config) to
-    /// offload read traffic from the primary. If no read replica is configured
-    /// or the replica pool has been closed, returns the primary pool.
-    fn rpool(&self) -> AnyPool {
-        if let Some(ref rp) = self.read_replica_pool {
-            let replica = (**rp.load()).clone();
-            if replica.is_closed() {
-                self.pool()
-            } else {
-                replica
+    /// Runtime configuration polling is intentionally excluded from this path:
+    /// authoritative startup loads, incremental changed-row queries, deletion
+    /// scans, and association validation must read from the primary pool so
+    /// replica lag cannot hide changes or advance cursors incorrectly.
+    fn admin_read_pool(&self) -> AdminReadPool {
+        if self.read_replica_url.is_some()
+            && let Some(replica) = self.read_replica_pool.load_full()
+        {
+            let pool = replica.as_ref().clone();
+            if !pool.is_closed() {
+                return AdminReadPool {
+                    pool,
+                    source: AdminReadSource::ReadReplica,
+                };
             }
+            self.mark_read_replica_unavailable("admin_read_pool", "replica pool is closed");
+        }
+
+        AdminReadPool {
+            pool: self.pool(),
+            source: AdminReadSource::Primary,
+        }
+    }
+
+    /// Snapshot the admin read pool. This is intentionally admin-only; runtime
+    /// polling must call [`Self::pool`] directly.
+    fn rpool(&self) -> AnyPool {
+        self.admin_read_pool().pool
+    }
+
+    fn mark_read_replica_unavailable(
+        &self,
+        operation: &'static str,
+        error: impl std::fmt::Display,
+    ) {
+        let old_pool = self.read_replica_pool.swap(None);
+        if old_pool.is_some() {
+            warn!(
+                operation,
+                error = %error,
+                "Read replica marked unavailable; admin reads will use primary until reconnect succeeds"
+            );
         } else {
-            self.pool()
+            warn!(
+                operation,
+                error = %error,
+                "Read replica unavailable; admin reads are using primary"
+            );
+        }
+        if let Some(pool) = old_pool {
+            tokio::spawn(async move {
+                pool.close().await;
+            });
         }
     }
 
     /// Atomically replace the read replica pool with a freshly connected one.
     ///
-    /// Called by the DB polling loop when DnsCache detects that the read replica
-    /// FQDN now resolves to a different set of IPs.
+    /// Called by the DB polling loop when DnsCache detects that the read
+    /// replica FQDN now resolves to a different set of IPs, by the TLS reload
+    /// watcher, and after startup if the initial replica connection failed.
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
-        let rp = match &self.read_replica_pool {
-            Some(rp) => rp,
-            None => return Ok(()), // no replica configured
-        };
-
         sqlx::any::install_default_drivers();
 
         let final_url = Self::append_connect_timeout(
@@ -3884,17 +4097,25 @@ impl DatabaseStore {
             self.pool_config.connect_timeout_seconds,
         );
 
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
-
-        let old_pool = rp.swap(Arc::new(new_pool));
         info!(
-            "Read replica pool reconnected (db_type={}). Old pool closing in background.",
-            self.db_type
+            "Attempting read replica reconnect for admin reads (db_type={}, url={})",
+            self.db_type,
+            Self::redact_url(replica_url)
+        );
+        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
+
+        let old_pool = self.read_replica_pool.swap(Some(Arc::new(new_pool)));
+        info!(
+            "Read replica restored for admin reads (db_type={}). Old pool closing in background.",
+            self.db_type,
         );
 
-        tokio::spawn(async move {
-            old_pool.close().await;
-        });
+        if let Some(old_pool) = old_pool {
+            tokio::spawn(async move {
+                old_pool.close().await;
+            });
+        }
 
         Ok(())
     }
@@ -3940,21 +4161,56 @@ impl DatabaseStore {
         crate::config::db_backend::redact_url(url)
     }
 
-    /// Returns true if a read replica pool is configured.
+    /// Returns true if a read replica URL is configured.
     #[allow(dead_code)] // Public API for tests and future consumers
     pub fn has_read_replica_pool(&self) -> bool {
-        self.read_replica_pool.is_some()
+        self.read_replica_url.is_some()
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     pub async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self.list_namespaces_from_admin_read(&admin_read.pool).await {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_namespaces", &error);
+                warn!("Read replica admin query failed; retrying list_namespaces against primary");
+                let primary_pool = self.pool();
+                let retry = self.list_namespaces_from_admin_read(&primary_pool).await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_namespaces");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return all distinct namespaces from the authoritative primary pool.
+    pub async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        let pool = self.pool();
+        self.list_namespaces_from_pool(&pool).await
+    }
+
+    async fn list_namespaces_from_admin_read(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces_from_pool(pool).await
+    }
+
+    async fn list_namespaces_from_pool(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
         let sql = "SELECT DISTINCT namespace FROM proxies \
                    UNION SELECT DISTINCT namespace FROM consumers \
                    UNION SELECT DISTINCT namespace FROM plugin_configs \
                    UNION SELECT DISTINCT namespace FROM upstreams \
                    ORDER BY 1";
-        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.rpool()).await?;
+        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
         for row in rows {
             if let Ok(ns) = row.try_get::<String, _>("namespace") {
@@ -4918,6 +5174,38 @@ impl DatabaseStore {
         crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
         anyhow::Error,
     > {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_api_specs_from_admin_read(namespace, filter, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_api_specs", &error);
+                warn!("Read replica admin query failed; retrying list_api_specs against primary");
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_api_specs_from_admin_read(namespace, filter, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_api_specs");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_api_specs_from_admin_read(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+        pool: &AnyPool,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
         use crate::config::db_backend::{ApiSpecSortBy, PaginatedResult, SortOrder};
 
         // Build WHERE clause dynamically.
@@ -4998,7 +5286,7 @@ impl DatabaseStore {
         if let Some(ref v) = has_tag_val {
             count_query = count_query.bind(v);
         }
-        let count_row = count_query.fetch_one(&self.rpool()).await?;
+        let count_row = count_query.fetch_one(pool).await?;
         let total: i64 = count_row.try_get("cnt")?;
 
         // --- Data query (ORDER BY + LIMIT + OFFSET) --------------------------
@@ -5043,7 +5331,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.rpool())
+            .fetch_all(pool)
             .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -5213,6 +5501,37 @@ impl DatabaseStore {
         namespace: &str,
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_audit_events_from_admin_read(namespace, filter, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_audit_events", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_audit_events against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_audit_events_from_admin_read(namespace, filter, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_audit_events");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_audit_events_from_admin_read(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         let start = std::time::Instant::now();
         let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
 
@@ -5258,7 +5577,7 @@ impl DatabaseStore {
         if let Some(ref value) = filter.end {
             count_query = count_query.bind(audit_ts_string(value));
         }
-        let total: i64 = count_query.fetch_one(&self.rpool()).await?.try_get("cnt")?;
+        let total: i64 = count_query.fetch_one(pool).await?.try_get("cnt")?;
 
         let sql = self.q(&format!(
             "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
@@ -5287,7 +5606,7 @@ impl DatabaseStore {
         let rows = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.rpool())
+            .fetch_all(pool)
             .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -5317,13 +5636,18 @@ impl DatabaseBackend for DatabaseStore {
         self.has_read_replica_pool()
     }
 
+    fn read_replica_available(&self) -> bool {
+        self.read_replica_pool
+            .load_full()
+            .is_some_and(|pool| !pool.is_closed())
+    }
+
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
         let primary = self.pool.load();
         let size = primary.size();
         let idle = primary.num_idle() as u32;
 
-        let replica = self.read_replica_pool.as_ref().map(|rp| {
-            let rp = rp.load();
+        let replica = self.read_replica_pool.load_full().map(|rp| {
             Box::new(crate::config::db_backend::DbPoolStatsInner {
                 size: rp.size(),
                 idle: rp.num_idle() as u32,
@@ -5688,6 +6012,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::list_namespaces(self).await
+    }
+
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        DatabaseStore::list_namespaces_authoritative(self).await
     }
 
     async fn submit_api_spec_bundle(

@@ -56,7 +56,7 @@ export FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS=30
 
 When enabled, Ferrum fingerprints `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH` after `_SOURCE` overrides are applied. File-backed sources use `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS`; provider and Kubernetes sources use `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless their source URI includes `?poll=`.
 
-On changed bytes, Ferrum rebuilds the effective database URLs and reconnects the active SQL pool or MongoDB client. SQL read replica pools are reconnected when `FERRUM_DB_READ_REPLICA_URL` is configured. Existing in-flight DB queries keep their current connection; new DB work uses the reconnected pool/client. You can force an immediate source poll with:
+On changed bytes, Ferrum rebuilds the effective database URLs and reconnects the active SQL pool or MongoDB client. SQL admin-read replica pools are reconnected when `FERRUM_DB_READ_REPLICA_URL` is configured. Existing in-flight DB queries keep their current connection; new DB work uses the reconnected pool/client. You can force an immediate source poll with:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
@@ -402,7 +402,7 @@ TLS is enabled by default when using `mongodb+srv://` URLs:
 
 ```bash
 export FERRUM_DB_TYPE=mongodb
-export FERRUM_DB_URL="mongodb+srv://ferrum:password@cluster0.abc123.mongodb.net/ferrum?retryWrites=true&w=majority&readPreference=secondaryPreferred"
+export FERRUM_DB_URL="mongodb+srv://ferrum:password@cluster0.abc123.mongodb.net/ferrum?retryWrites=true&w=majority"
 export FERRUM_MONGO_DATABASE=ferrum
 # No FERRUM_DB_TLS_MODE needed — Atlas enables TLS by default via mongodb+srv://
 ```
@@ -497,7 +497,7 @@ If the database URL already contains TLS parameters (for example, `?sslmode=requ
 ### SQL Databases (PostgreSQL, MySQL)
 
 When using `FERRUM_DB_FAILOVER_URLS` or `FERRUM_DB_READ_REPLICA_URL`, the same
-`FERRUM_DB_TLS_MODE` and certificate path settings apply to all SQL database connections. With `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true`, primary and read-replica SQL pools are reconnected after watched database TLS source bytes change.
+`FERRUM_DB_TLS_MODE` and certificate path settings apply to all SQL database connections. With `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true`, primary and admin-read replica SQL pools are reconnected after watched database TLS source bytes change.
 If your failover or replica databases require different TLS parameters, embed them
 directly in the URL query string:
 
@@ -507,14 +507,14 @@ FERRUM_DB_FAILOVER_URLS=postgres://standby1:5432/ferrum?sslmode=verify-full&sslr
 
 ### MongoDB
 
-MongoDB handles failover and read routing differently from SQL backends:
+MongoDB handles failover differently from SQL backends:
 
-- **`FERRUM_DB_READ_REPLICA_URL` does not apply to MongoDB.** Use `readPreference` in the connection string instead (e.g., `?readPreference=secondaryPreferred`). The MongoDB driver routes reads to secondaries and writes to the primary automatically.
+- **`FERRUM_DB_READ_REPLICA_URL` does not apply to MongoDB.** Ferrum's MongoDB config store forces primary reads for authoritative polling consistency and ignores URI `readPreference`.
 
 - **`FERRUM_DB_FAILOVER_URLS` is typically unnecessary for MongoDB replica sets.** List all members directly in `FERRUM_DB_URL` and the driver handles failover natively:
 
 ```
-FERRUM_DB_URL=mongodb://mongo1:27017,mongo2:27017,mongo3:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred&tls=true&tlsCAFile=/certs/ca.pem
+FERRUM_DB_URL=mongodb://mongo1:27017,mongo2:27017,mongo3:27017/ferrum?replicaSet=rs0&tls=true&tlsCAFile=/certs/ca.pem
 ```
 
 See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including Atlas, DocumentDB, and Kubernetes examples.

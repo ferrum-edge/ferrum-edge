@@ -600,11 +600,11 @@ pub struct EnvConfig {
     /// order. All URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
     pub db_failover_urls: Vec<String>,
 
-    /// Connection URL for a SQL read replica database. When set, the polling
-    /// loop reads config from this replica instead of the primary, reducing
-    /// load on the primary. Writes (Admin API CRUD) always go to the primary.
-    /// Falls back to primary if the replica is unreachable. MongoDB uses
-    /// `readPreference` in `FERRUM_DB_URL` instead.
+    /// Connection URL for a SQL read replica database. When set, eligible
+    /// admin-only reads can use this replica and fall back to primary if the
+    /// replica is unreachable. Runtime config polling and Admin API writes
+    /// always use the primary. MongoDB read preferences are ignored by the
+    /// authoritative config store.
     pub db_read_replica_url: Option<String>,
 
     /// Threshold in milliseconds for logging slow database queries.

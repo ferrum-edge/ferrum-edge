@@ -31,16 +31,119 @@ pub mod node_agent_cni_server;
 pub mod tls_reload;
 pub(crate) mod tls_source_util;
 
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "acme")]
 use std::time::Duration;
 
 use anyhow::Context as _;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::db_backend::DatabaseBackend;
 use crate::config::env_config::EnvConfig;
+
+pub(crate) type AdminReadReplicaDnsWatermark = Arc<Mutex<Option<Vec<IpAddr>>>>;
+
+/// Schedule an admin-read replica reconnect without blocking authoritative config polling.
+pub(crate) fn spawn_admin_read_replica_reconnect(
+    db: Arc<dyn DatabaseBackend>,
+    replica_url: String,
+    in_flight: Arc<AtomicBool>,
+    reason: &'static str,
+    success_replica_ips: Option<(AdminReadReplicaDnsWatermark, Vec<IpAddr>)>,
+) -> bool {
+    if in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    tokio::spawn(async move {
+        match db.reconnect_read_replica(&replica_url).await {
+            Ok(()) => {
+                if let Some((last_replica_ips, ips)) = success_replica_ips {
+                    *last_replica_ips.lock().await = Some(ips);
+                }
+            }
+            Err(error) => {
+                let safe_error =
+                    crate::config::db_backend::redact_error_text(&error, &[&replica_url]);
+                warn!(
+                    reason = reason,
+                    "Admin-read replica reconnect failed for {}: {}",
+                    crate::config::db_backend::redact_url(&replica_url),
+                    safe_error
+                );
+            }
+        }
+        in_flight.store(false, Ordering::Release);
+    });
+
+    true
+}
+
+/// Check whether the admin-read replica needs repair and schedule it in the background.
+pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
+    db: Arc<dyn DatabaseBackend>,
+    replica_url: Option<&str>,
+    replica_hostname: Option<&str>,
+    dns_cache: &crate::dns::DnsCache,
+    last_replica_ips: AdminReadReplicaDnsWatermark,
+    in_flight: Arc<AtomicBool>,
+) {
+    let Some(replica_url) = replica_url else {
+        return;
+    };
+
+    if !db.read_replica_available() {
+        spawn_admin_read_replica_reconnect(
+            db,
+            replica_url.to_string(),
+            in_flight,
+            "replica unavailable",
+            None,
+        );
+        return;
+    }
+
+    let Some(replica_hostname) = replica_hostname else {
+        return;
+    };
+    let Ok(ips) = dns_cache.resolve_all(replica_hostname, None, None).await else {
+        return;
+    };
+
+    let previous_ips = last_replica_ips.lock().await.clone();
+    let Some(previous_ips) = previous_ips else {
+        *last_replica_ips.lock().await = Some(ips);
+        return;
+    };
+
+    let needs_reconnect = {
+        let mut prev_sorted = previous_ips.clone();
+        prev_sorted.sort();
+        let mut cur_sorted = ips.clone();
+        cur_sorted.sort();
+        prev_sorted != cur_sorted
+    };
+    if needs_reconnect {
+        info!(
+            "Read replica DNS changed for '{}': {:?} -> {:?}, scheduling admin-read replica reconnect",
+            replica_hostname, previous_ips, ips
+        );
+        let _scheduled = spawn_admin_read_replica_reconnect(
+            db,
+            replica_url.to_string(),
+            in_flight,
+            "replica DNS changed",
+            Some((last_replica_ips, ips)),
+        );
+    }
+}
 
 /// Handle pending custom-plugin database migrations at startup for the
 /// `database` and `cp` modes.

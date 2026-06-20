@@ -86,6 +86,11 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── plugins/request_deduplication ─────────────────────────────────────────
+    pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
+        crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
@@ -340,11 +345,37 @@ pub mod _test_support {
         crate::plugins::response_caching::parse_http_date(value)
     }
 
+    pub fn advance_response_caching_clock_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        duration: std::time::Duration,
+    ) {
+        plugin.advance_clock_for_tests(duration);
+    }
+
+    pub fn response_caching_current_total_size_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> usize {
+        plugin.current_total_size_for_tests()
+    }
+
+    pub fn response_caching_size_accounting_snapshot_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> (usize, usize) {
+        plugin.size_accounting_snapshot_for_tests()
+    }
+
     /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.
     pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        crate::plugins::response_caching::sub_total_size(total, n);
+        use std::sync::atomic::Ordering;
+
+        if n == 0 {
+            return;
+        }
+        let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(n))
+        });
     }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────

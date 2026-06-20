@@ -94,7 +94,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
-| `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling (SQL only). For MongoDB, use `readPreference` in the connection string |
+| `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use primary. MongoDB read preferences are ignored by Ferrum's config store |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | No | — | Log database queries slower than this threshold |
 | `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | No | `10000` | Max rows per query during full config loading (SQL only). Clamped to 100..=100000 |
 
@@ -104,7 +104,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 |---|---|---|---|---|
 | Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
 | `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
-| `FERRUM_DB_READ_REPLICA_URL` | Yes | Yes | No | No; use MongoDB `readPreference` |
+| `FERRUM_DB_READ_REPLICA_URL` | Yes, admin reads only | Yes, admin reads only | No | No; Ferrum forces primary reads |
 | `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | `disable` only as a no-op; cert paths rejected | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
 | `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | Yes | Yes | Yes | Ignored; MongoDB uses cursor-based loading |
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
@@ -137,7 +137,7 @@ than shipping incremental migrations.
 | `FERRUM_DB_TLS_CLIENT_CERT_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CLIENT_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
 | `FERRUM_DB_TLS_CLIENT_KEY_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CLIENT_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |
-| `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED` | No | `false` | Opt in to live reload of database TLS CA/client cert/client key sources in database and CP modes. On changed bytes, Ferrum reconnects the active primary pool/client and SQL read replica pool so new database connections use rotated material. Inline PEM is static until config reload |
+| `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED` | No | `false` | Opt in to live reload of database TLS CA/client cert/client key sources in database and CP modes. On changed bytes, Ferrum reconnects the active primary pool/client and SQL admin-read replica pool so new database connections use rotated material. Inline PEM is static until config reload |
 | `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS` | No | `30` | Poll interval for file-backed database TLS source watching. External sources use `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless their URI includes `?poll=`. Ignored unless database TLS live reload is enabled |
 
 See [database_tls.md](database_tls.md) for detailed configuration examples and TLS mode descriptions.

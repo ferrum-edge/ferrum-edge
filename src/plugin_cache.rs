@@ -23,7 +23,9 @@ use tracing::{error, warn};
 
 use crate::config::types::PluginConfig;
 use crate::plugins::utils::jwks_cache::retain_active_uris;
-use crate::plugins::{Plugin, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client};
+use crate::plugins::{
+    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
+};
 
 // ---------------------------------------------------------------------------
 // PriorityOverridePlugin — wraps any plugin with a user-specified priority
@@ -384,25 +386,27 @@ impl Plugin for PriorityOverridePlugin {
 /// Try to create a plugin and apply `priority_override` from the plugin config.
 ///
 /// Enabled plugin configs are load-bearing configuration: unknown plugin names
-/// and validation failures reject the whole cache generation instead of
-/// publishing a weakened cache with that plugin silently omitted.
+/// and required-plugin validation failures reject the whole cache generation.
+/// Optional plugins may be omitted only when their registration metadata allows
+/// fail-open behavior.
 fn try_create_plugin(
     pc: &PluginConfig,
     http_client: &PluginHttpClient,
-) -> Result<Arc<dyn Plugin>, String> {
+) -> Result<Option<Arc<dyn Plugin>>, String> {
     match create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone()) {
         Ok(Some(plugin)) => {
-            if let Some(priority) = pc.priority_override {
-                Ok(Arc::new(PriorityOverridePlugin {
+            let plugin: Arc<dyn Plugin> = if let Some(priority) = pc.priority_override {
+                Arc::new(PriorityOverridePlugin {
                     inner: plugin,
                     priority,
-                }))
+                })
             } else {
-                Ok(plugin)
-            }
+                plugin
+            };
+            Ok(Some(plugin))
         }
         Ok(None) => {
-            if crate::plugins::is_removed_security_plugin(&pc.plugin_name) {
+            if crate::plugins::removed_plugin_registration(&pc.plugin_name).is_some() {
                 let msg = format!(
                     "Removed security plugin '{}' (plugin_config_id={}) is not supported; migrate to a supported auth plugin before startup/reload",
                     pc.plugin_name, pc.id
@@ -422,6 +426,8 @@ fn try_create_plugin(
             }
         }
         Err(e) => {
+            let failure_policy = crate::plugins::plugin_failure_policy(&pc.plugin_name)
+                .unwrap_or(PluginFailurePolicy::FailClosed);
             let msg = format!(
                 "Plugin '{}' (plugin_config_id={}, scope={:?}, proxy_id={}) config validation failed: {}",
                 pc.plugin_name,
@@ -430,8 +436,13 @@ fn try_create_plugin(
                 pc.proxy_id.as_deref().unwrap_or("<none>"),
                 e
             );
-            error!("Config rejected: {}", msg);
-            Err(msg)
+            if failure_policy == PluginFailurePolicy::OptionalFailOpen {
+                warn!("Optional plugin omitted after validation failure: {}", msg);
+                Ok(None)
+            } else {
+                error!("Config rejected: {}", msg);
+                Err(msg)
+            }
         }
     }
 }
@@ -454,6 +465,17 @@ type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
 struct ProxyGroupPluginInstance {
     plugin: Arc<dyn Plugin>,
     config: PluginConfig,
+}
+
+fn remove_shadowed_global_plugin(
+    plugins: &mut Vec<Arc<dyn Plugin>>,
+    global_ptrs: &HashSet<usize>,
+    plugin_name: &str,
+) {
+    plugins.retain(|plugin| {
+        plugin.name() != plugin_name
+            || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
+    });
 }
 
 fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> bool {
@@ -1037,7 +1059,8 @@ impl PluginCache {
                     continue;
                 }
                 match try_create_plugin(pc, &self.http_client) {
-                    Ok(plugin) => global_plugins.push(plugin),
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
                     Err(e) => {
                         error!("Config reload: {}", e);
                         plugin_errors.push(e);
@@ -1054,7 +1077,8 @@ impl PluginCache {
                 }
                 if pc.scope == PluginScope::Global {
                     match try_create_plugin(pc, &self.http_client) {
-                        Ok(plugin) => global_plugins.push(plugin),
+                        Ok(Some(plugin)) => global_plugins.push(plugin),
+                        Ok(None) => {}
                         Err(e) => {
                             error!("Config reload: {}", e);
                             plugin_errors.push(e);
@@ -1147,7 +1171,7 @@ impl PluginCache {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, &self.http_client) {
-                            Ok(plugin) => {
+                            Ok(Some(plugin)) => {
                                 // Detect when an auto-emitted plugin instance
                                 // (Istio VirtualService translator helpers) is
                                 // about to shadow an operator-configured global
@@ -1174,13 +1198,20 @@ impl PluginCache {
                                         );
                                     }
                                 }
-                                // Remove only GLOBAL plugins of the same name
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                // Remove only GLOBAL plugins of the same name.
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
+                            }
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
                             }
                             Err(e) => {
                                 error!(proxy_id = %proxy.id, "Config reload: {}", e);
@@ -1196,14 +1227,11 @@ impl PluginCache {
                 if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
                     if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
                         let plugin = Arc::clone(&existing.plugin);
-                        merged.retain(|p| {
-                            p.name() != plugin.name()
-                                || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
-                        });
+                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
                     } else {
                         match try_create_plugin(pc, &self.http_client) {
-                            Ok(plugin) => {
+                            Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     pc.id.clone(),
                                     ProxyGroupPluginInstance {
@@ -1211,12 +1239,19 @@ impl PluginCache {
                                         config: (*pc).clone(),
                                     },
                                 );
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
+                            }
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
                             }
                             Err(e) => {
                                 error!(
@@ -1587,7 +1622,8 @@ impl PluginCache {
                 continue;
             }
             match try_create_plugin(pc, http_client) {
-                Ok(plugin) => global_plugins.push(plugin),
+                Ok(Some(plugin)) => global_plugins.push(plugin),
+                Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
             }
         }
@@ -1603,7 +1639,8 @@ impl PluginCache {
             }
             if pc.scope == PluginScope::Global {
                 match try_create_plugin(pc, http_client) {
-                    Ok(plugin) => global_plugins.push(plugin),
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
                     Err(e) => plugin_errors.push(e),
                 }
             } else if pc.scope == PluginScope::Proxy
@@ -1654,16 +1691,23 @@ impl PluginCache {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, http_client) {
-                            Ok(plugin) => {
+                            Ok(Some(plugin)) => {
                                 // Remove only GLOBAL plugins of the same name —
                                 // other proxy-scoped instances are preserved,
                                 // allowing multiple instances of the same plugin type.
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
+                            }
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
                             }
                             Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }
@@ -1678,15 +1722,12 @@ impl PluginCache {
                     if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
                         // Reuse the shared instance (Arc::clone is ~5ns)
                         let plugin = Arc::clone(&existing.plugin);
-                        merged.retain(|p| {
-                            p.name() != plugin.name()
-                                || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
-                        });
+                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
                     } else {
                         // First proxy to reference this group plugin — create the instance
                         match try_create_plugin(pc, http_client) {
-                            Ok(plugin) => {
+                            Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     pc.id.clone(),
                                     ProxyGroupPluginInstance {
@@ -1694,12 +1735,19 @@ impl PluginCache {
                                         config: (*pc).clone(),
                                     },
                                 );
-                                merged.retain(|p| {
-                                    p.name() != plugin.name()
-                                        || !global_ptrs
-                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                });
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    plugin.name(),
+                                );
                                 merged.push(plugin);
+                            }
+                            Ok(None) => {
+                                remove_shadowed_global_plugin(
+                                    &mut merged,
+                                    &global_ptrs,
+                                    &pc.plugin_name,
+                                );
                             }
                             Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }
