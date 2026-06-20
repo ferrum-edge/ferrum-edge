@@ -2291,6 +2291,55 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstream_id(
         .replace(['/', '.', ':'], "-")
 }
 
+/// Upstream id for an HTTP-family egress upstream addressed by a DIRECT pod IP,
+/// one per (HTTP-family service port × backing workload IP). A captured
+/// HTTP/1.1+ request whose `SO_ORIGINAL_DST` matches a backing workload
+/// address+targetPort routes through this single-target upstream instead of the
+/// service-host route. Kept out of the route-id prefix space (like the VIP
+/// outbound upstream ids); the paired proxy below carries the direction-scoped
+/// route prefix.
+pub(crate) fn mesh_outbound_http_bywl_upstream_id(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    canonical_ip: std::net::IpAddr,
+) -> String {
+    format!("__mesh-out-http-bywl-upstream-{namespace}-{name}-{port}-{canonical_ip}")
+        .replace(['/', '.', ':'], "-")
+}
+
+/// Reserved proxy-id prefix for hidden direct-pod-IP HTTP egress routes.
+///
+/// This deliberately starts with `__mesh-outbound-`, so if a hidden proxy ever
+/// escaped into normal host routing it would still be direction-scoped to the
+/// outbound capture listener. The route table skips these ids from host/path
+/// tiers and indexes them only by captured original destination.
+pub(crate) const MESH_OUTBOUND_HTTP_BYWL_PROXY_ID_PREFIX: &str = "__mesh-outbound-http-bywl-";
+
+pub(crate) fn is_mesh_outbound_http_bywl_route_id(id: &str) -> bool {
+    id.starts_with(MESH_OUTBOUND_HTTP_BYWL_PROXY_ID_PREFIX)
+}
+
+pub(crate) fn mesh_outbound_http_bywl_proxy_id(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    canonical_ip: std::net::IpAddr,
+) -> String {
+    format!("{MESH_OUTBOUND_HTTP_BYWL_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}")
+        .replace(['/', '.', ':'], "-")
+}
+
+fn mesh_outbound_http_bywl_hidden_host(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    canonical_ip: std::net::IpAddr,
+) -> String {
+    let token = format!("{namespace}-{name}-{port}-{canonical_ip}").replace(['/', '.', ':'], "-");
+    format!("bywl-{token}.mesh.internal")
+}
+
 /// One direct-pod-IP raw-TCP egress upstream candidate (F3 §3.4): a single
 /// backing workload IP of a service's stream-family port, resolved to its
 /// container/target port and pinned to the workload's SPIFFE identity. The
@@ -2337,6 +2386,111 @@ impl MeshTcpBywlUpstreamSpec<'_> {
             cluster_domain.trim_matches('.')
         )
     }
+}
+
+/// One direct-pod-IP HTTP-family egress candidate: a single backing workload IP
+/// of a service's HTTP-family port, resolved to its container/target port and
+/// pinned to the workload identity. This is the HTTP counterpart of
+/// [`MeshTcpBywlUpstreamSpec`], but it also forward-derives a hidden proxy id
+/// because HTTP dispatch still uses a `Proxy` + `Upstream` pair once the route
+/// table has selected the captured `(IP, target_port)` entry.
+pub(crate) struct MeshHttpBywlUpstreamSpec<'a> {
+    pub(crate) upstream_id: String,
+    pub(crate) proxy_id: String,
+    pub(crate) canonical_ip: std::net::IpAddr,
+    pub(crate) target_port: u16,
+    pub(crate) service: &'a crate::modes::mesh::config::MeshService,
+    pub(crate) service_port: &'a crate::modes::mesh::config::ServicePort,
+    pub(crate) workload: &'a crate::modes::mesh::config::Workload,
+    pub(crate) protocol: crate::modes::mesh::config::AppProtocol,
+}
+
+impl MeshHttpBywlUpstreamSpec<'_> {
+    pub(crate) fn service_fqdn(&self, cluster_domain: &str) -> String {
+        format!(
+            "{}.{}.svc.{}",
+            self.service.name,
+            self.service.namespace,
+            cluster_domain.trim_matches('.')
+        )
+    }
+}
+
+/// Forward-derive direct-pod-IP HTTP-family egress candidates. The index key is
+/// exactly `(workload IP, resolved targetPort)`: the request Host header is not
+/// trusted to select a service for direct Pod-IP traffic because the client may
+/// send an arbitrary Host while dialing a pod IP. The route table treats
+/// duplicate keys across services as unroutable, preserving identity correctness
+/// over convenience.
+pub(crate) fn mesh_outbound_http_bywl_upstreams<'a>(
+    services: &'a [crate::modes::mesh::config::MeshService],
+    workloads: &'a [crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) -> Vec<MeshHttpBywlUpstreamSpec<'a>> {
+    let mut specs = Vec::new();
+    for service in services {
+        let http_ports = service_http_family_ports(service);
+        if http_ports.is_empty() {
+            continue;
+        }
+        for service_port in http_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let mut seen: std::collections::HashSet<(std::net::IpAddr, u16)> =
+                std::collections::HashSet::new();
+            for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
+                let app_port = match service_port.target_port.as_ref() {
+                    Some(_) => match crate::modes::mesh::config::resolve_target_port(
+                        service_port.target_port.as_ref(),
+                        &workload.ports,
+                    ) {
+                        Some(p) if p != 0 => p,
+                        _ => continue,
+                    },
+                    None => service_port.port,
+                };
+                if app_port == 0 {
+                    continue;
+                }
+                for address in &workload.addresses {
+                    if address.is_empty() {
+                        continue;
+                    }
+                    let Ok(parsed) = address.parse::<std::net::IpAddr>() else {
+                        continue;
+                    };
+                    let canonical_ip = parsed.to_canonical();
+                    if !seen.insert((canonical_ip, app_port)) {
+                        continue;
+                    }
+                    specs.push(MeshHttpBywlUpstreamSpec {
+                        upstream_id: mesh_outbound_http_bywl_upstream_id(
+                            &service.namespace,
+                            &service.name,
+                            service_port.port,
+                            canonical_ip,
+                        ),
+                        proxy_id: mesh_outbound_http_bywl_proxy_id(
+                            &service.namespace,
+                            &service.name,
+                            service_port.port,
+                            canonical_ip,
+                        ),
+                        canonical_ip,
+                        target_port: app_port,
+                        service,
+                        service_port,
+                        workload,
+                        protocol,
+                    });
+                }
+            }
+        }
+    }
+    specs
 }
 
 /// Forward-derive the direct-pod-IP raw-TCP egress upstream candidates (F3
@@ -3281,9 +3435,12 @@ enum MeshEgressTransport {
 /// **Topology-aware transport** (see `.claude/rules/mesh.md` "Datapath
 /// Layering"): mesh transports differ by topology, so egress materialization
 /// does too —
-/// - **Ambient / Waypoint** egress uses **HBONE** (HTTP/2 CONNECT over mTLS to
-///   the destination's `:15008`): `mesh.hbone`-tagged targets light up
-///   `current_dispatch_hbone` → `HboneConnectionPool`.
+/// - **Ambient / NodeWaypoint** egress uses **HBONE** (HTTP/2 CONNECT over mTLS
+///   to the destination's `:15008`): `mesh.hbone`-tagged targets light up
+///   `current_dispatch_hbone` → `HboneConnectionPool`. NodeWaypoint gets its
+///   outbound capture listeners from the per-pod in-netns manager instead of
+///   `listener_plan`, but the route materialization is the same HBONE egress
+///   shape as Ambient.
 /// - **Sidecar** egress uses plain **SVID-mTLS HTTP/2** to the peer sidecar's
 ///   inbound `:15006` (HBONE is NOT Sidecar's transport): `mesh.mtls`-tagged
 ///   targets light up `current_dispatch_mesh_mtls` → `MeshMtlsConnectionPool`.
@@ -3313,10 +3470,10 @@ fn materialize_mesh_outbound_proxies(
     mesh_slice: &MeshSlice,
 ) {
     let transport = match runtime.topology {
-        MeshTopology::Ambient => MeshEgressTransport::Hbone,
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint => MeshEgressTransport::Hbone,
         MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
-        // Gateway topologies (east-west / egress / waypoints) have their own
-        // materializers and no plaintext outbound capture listener.
+        // Gateway and ServiceWaypoint topologies have their own materializers
+        // and no plaintext outbound capture listener.
         _ => return,
     };
     let now = chrono::Utc::now();
@@ -3454,9 +3611,64 @@ fn materialize_mesh_outbound_proxies(
         }
     }
 
-    if materialized > 0 {
+    let mut http_bywl_materialized = 0usize;
+    if matches!(
+        runtime.topology,
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint
+    ) {
+        for spec in mesh_outbound_http_bywl_upstreams(
+            &mesh_slice.services,
+            &mesh_slice.workloads,
+            multi_cluster,
+        ) {
+            let mut tags = crate::service_discovery::mesh::mesh_hbone_target_tags(
+                spec.service,
+                spec.workload,
+                spec.protocol,
+                spec.service_port.name.as_deref(),
+            );
+            if runtime.egress_hbone_port != hbone::ISTIO_HBONE_PORT {
+                tags.insert(
+                    crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+                    runtime.egress_hbone_port.to_string(),
+                );
+            }
+            let target = UpstreamTarget {
+                host: spec.canonical_ip.to_string(),
+                port: spec.target_port,
+                service_port_policy_key: Some(spec.service_port.port),
+                weight: 1,
+                tags,
+                locality: spec.workload.locality.clone(),
+                path: None,
+            };
+            let service_fqdn = spec.service_fqdn(&runtime.cluster_domain);
+            let upstream = mesh_outbound_route_upstream(
+                &spec.upstream_id,
+                &spec.service.namespace,
+                &service_fqdn,
+                vec![target],
+                now,
+            );
+            let proxy = mesh_outbound_http_bywl_route_proxy(&spec, now);
+            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                *existing = proxy;
+            } else {
+                config.proxies.push(proxy);
+            }
+            http_bywl_materialized += 1;
+        }
+    }
+
+    if materialized > 0 || http_bywl_materialized > 0 {
         info!(
             outbound_proxies = materialized,
+            outbound_http_bywl_proxies = http_bywl_materialized,
             transport = match transport {
                 MeshEgressTransport::Hbone => "hbone",
                 MeshEgressTransport::SidecarMtls => "mtls",
@@ -3487,24 +3699,26 @@ fn materialize_mesh_outbound_proxies(
 /// captured dial to a non-mesh destination must never be tunnelled into the
 /// mesh on a port coincidence.
 ///
-/// Per-topology scope: **Ambient and Sidecar.** The transport differs — Ambient
-/// emits `mesh.hbone` targets (relay over HBONE `:15008`), Sidecar emits
-/// `mesh.mtls` targets (relay over a fresh mesh-mTLS H2 CONNECT tunnel to the
-/// peer's `:15006`; the destination sidecar's inbound listener recognizes a bare
-/// H2 CONNECT and relays it like HBONE does) — but the materialization is
-/// identical: per-port upstreams keyed to the service VIP. Headless / VIP-less
-/// services materialize nothing routable and warn (raw streams carry no Host, so
-/// captured dials are matched strictly by `(VIP, port)`).
+/// Per-topology scope: **Ambient, NodeWaypoint, and Sidecar.** The transport
+/// differs — Ambient/NodeWaypoint emit `mesh.hbone` targets (relay over HBONE
+/// `:15008`), Sidecar emits `mesh.mtls` targets (relay over a fresh mesh-mTLS H2
+/// CONNECT tunnel to the peer's `:15006`; the destination sidecar's inbound
+/// listener recognizes a bare H2 CONNECT and relays it like HBONE does) — but
+/// the materialization is identical: per-port upstreams keyed to the service
+/// VIP. Headless / VIP-less services materialize nothing routable and warn (raw
+/// streams carry no Host, so captured dials are matched strictly by `(VIP,
+/// port)`).
 fn materialize_mesh_outbound_tcp_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    // Raw-TCP egress now rides BOTH captured topologies. Gateway topologies
-    // (east-west / egress / waypoints) have their own materializers and no
-    // plaintext outbound capture listener.
+    // Raw-TCP egress rides captured outbound topologies. NodeWaypoint capture
+    // listeners are opened per pod by the in-netns manager; the egress transport
+    // is still HBONE. Gateways and ServiceWaypoint materialize no raw-TCP
+    // outbound capture routes here.
     let transport = match runtime.topology {
-        MeshTopology::Ambient => MeshEgressTransport::Hbone,
+        MeshTopology::Ambient | MeshTopology::NodeWaypoint => MeshEgressTransport::Hbone,
         MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
         _ => return,
     };
@@ -4148,6 +4362,29 @@ fn mesh_outbound_route_proxy(
     }
 }
 
+fn mesh_outbound_http_bywl_route_proxy(
+    spec: &MeshHttpBywlUpstreamSpec<'_>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    let mut proxy = mesh_outbound_route_proxy(
+        &spec.proxy_id,
+        vec![mesh_outbound_http_bywl_hidden_host(
+            &spec.service.namespace,
+            &spec.service.name,
+            spec.service_port.port,
+            spec.canonical_ip,
+        )],
+        &spec.service.namespace,
+        &spec.upstream_id,
+        now,
+    );
+    // Direct Pod-IP HTTP is selected strictly by SO_ORIGINAL_DST, not by Host.
+    // Do not preserve an arbitrary source Host header into the HBONE request
+    // authority; the selected target IP+port is the original destination.
+    proxy.preserve_host_header = false;
+    proxy
+}
+
 /// The upstream backing a materialized outbound egress proxy: the service's
 /// transport-tagged workload targets with passive health and round-robin LB.
 /// Mirrors the east-west service upstream. Top-level DR traffic policy applies
@@ -4288,6 +4525,13 @@ fn apply_destination_rules(
     for spec in
         mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
+        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+    }
+    for spec in mesh_outbound_http_bywl_upstreams(
+        &mesh_slice.services,
+        &mesh_slice.workloads,
+        multi_cluster,
+    ) {
         outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
     }
 
@@ -10317,8 +10561,8 @@ mod tests {
         MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
         MeshService, MeshSubset, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig,
         PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, Resolution, ServiceEntry,
-        ServiceEntryLocation, ServicePort, TracingProvider, Workload, WorkloadPort, WorkloadRef,
-        WorkloadSelector,
+        ServiceEntryLocation, ServicePort, ServiceTargetPort, TracingProvider, Workload,
+        WorkloadPort, WorkloadRef, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -11427,6 +11671,13 @@ mod tests {
         }
     }
 
+    fn node_waypoint_runtime() -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            topology: MeshTopology::NodeWaypoint,
+            ..test_mesh_runtime_config()
+        }
+    }
+
     #[test]
     fn mesh_outbound_materializes_hbone_route_for_ambient_service() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
@@ -11479,6 +11730,107 @@ mod tests {
             target.tags.get("mesh.spiffe_id").map(String::as_str),
             Some(spiffe),
             "peer identity for SVID-mTLS verification"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_materializes_hbone_route_for_node_waypoint_service() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &node_waypoint_runtime(), &slice);
+
+        let proxy = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-outbound-default-reviews-8080")
+            .expect("node waypoint outbound proxy materialized");
+        assert_eq!(
+            proxy.upstream_id.as_deref(),
+            Some("__mesh-out-upstream-default-reviews-8080")
+        );
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
+            .expect("node waypoint outbound upstream materialized");
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.1");
+        assert_eq!(target.port, 8080);
+        assert_eq!(
+            target.tags.get("mesh.hbone").map(String::as_str),
+            Some("true"),
+            "NodeWaypoint outbound egress must use HBONE targets"
+        );
+        assert!(
+            !target.tags.contains_key("mesh.mtls"),
+            "NodeWaypoint must not materialize Sidecar mTLS outbound targets"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_http_bywl_upstreams_materialize_for_node_waypoint_direct_pod_ip() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut service = http_mesh_service("reviews", 8080, spiffe);
+        service.ports[0].target_port = Some(ServiceTargetPort::Number(18080));
+        let mut workload = workload_with_address("reviews", "reviews", "10.0.0.7");
+        workload.ports[0].port = 18080;
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &node_waypoint_runtime(), &slice);
+
+        let canonical_ip = "10.0.0.7".parse().expect("ip");
+        let proxy_id = mesh_outbound_http_bywl_proxy_id("default", "reviews", 8080, canonical_ip);
+        let upstream_id =
+            mesh_outbound_http_bywl_upstream_id("default", "reviews", 8080, canonical_ip);
+
+        let proxy = config
+            .proxies
+            .iter()
+            .find(|p| p.id == proxy_id)
+            .expect("direct-pod HTTP proxy materialized");
+        assert!(
+            is_mesh_outbound_route_id(&proxy.id),
+            "direct-pod HTTP proxy remains direction-scoped"
+        );
+        assert_eq!(proxy.upstream_id.as_deref(), Some(upstream_id.as_str()));
+        assert!(
+            !proxy.preserve_host_header,
+            "direct-pod HTTP must not forward an arbitrary source Host header"
+        );
+        assert!(
+            proxy
+                .hosts
+                .iter()
+                .any(|host| host.ends_with(".mesh.internal")),
+            "hidden proxy still needs a valid synthetic host for config validation"
+        );
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == upstream_id)
+            .expect("direct-pod HTTP upstream materialized");
+        assert_eq!(upstream.targets.len(), 1);
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.7");
+        assert_eq!(target.port, 18080);
+        assert_eq!(target.service_port_policy_key, Some(8080));
+        assert_eq!(
+            target.tags.get("mesh.hbone").map(String::as_str),
+            Some("true")
         );
     }
 

@@ -11828,13 +11828,57 @@ async fn handle_proxy_request_inner(
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
     let epoch = state.request_epoch.load();
 
+    // Direct Pod-IP HTTP mesh egress is selected by captured original
+    // destination before Host routing. The client-controlled Host header cannot
+    // safely identify the destination service for a direct pod-IP dial.
+    let direct_pod_ip_http_route =
+        if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound) {
+            ctx.orig_dst.and_then(|orig_dst| {
+                epoch
+                    .route_table
+                    .mesh_http_egress_by_workload_decision(orig_dst)
+                    .cloned()
+            })
+        } else {
+            None
+        };
+
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state.router_cache.find_proxy_in_snapshot(
-        &epoch.route_table,
-        epoch.route_generation,
-        request_host.as_deref(),
-        &path,
-    );
+    let route_match = match direct_pod_ip_http_route {
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {
+            proxy,
+            service_port,
+        }) => {
+            ctx.mesh_outbound_destination_authz_port = Some(service_port);
+            Some(crate::router_cache::RouteMatch {
+                proxy,
+                path_params: Vec::new(),
+                matched_prefix_len: 0,
+            })
+        }
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::CloseNotRoutable) => {
+            debug!(
+                orig_dst = ?ctx.orig_dst,
+                client_ip = %ctx.client_ip,
+                "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
+            );
+            state.request_count.fetch_add(1, Ordering::Relaxed);
+            let reject = normalize_reject_response(
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
+                &EMPTY_HEADERS,
+                request_uses_grpc_content_type,
+            );
+            record_status(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+        None => state.router_cache.find_proxy_in_snapshot(
+            &epoch.route_table,
+            epoch.route_generation,
+            request_host.as_deref(),
+            &path,
+        ),
+    };
 
     // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
     // direction-scoped: the inbound and outbound capture listeners share one
@@ -11871,7 +11915,8 @@ async fn handle_proxy_request_inner(
     let route_match = match route_match {
         Some(rm)
             if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
-                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id) =>
+                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id)
+                && !crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&rm.proxy.id) =>
         {
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
