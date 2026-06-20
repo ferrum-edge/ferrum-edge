@@ -10323,6 +10323,20 @@ impl SourceIpOverride {
     }
 }
 
+fn select_mesh_original_dst(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    socket_original_dst: Option<SocketAddr>,
+    node_waypoint_original_dst: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    match mesh_direction {
+        Some(crate::modes::mesh::MeshTrafficDirection::Outbound) => {
+            node_waypoint_original_dst.or(socket_original_dst)
+        }
+        Some(crate::modes::mesh::MeshTrafficDirection::Inbound) => socket_original_dst,
+        None => None,
+    }
+}
+
 /// Accept loop that runs on a single listener socket. Multiple instances can
 /// run concurrently on the same address when SO_REUSEPORT is enabled.
 #[allow(clippy::too_many_arguments)]
@@ -10437,27 +10451,21 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
-                        // Read the captured connection's pre-NAT original
-                        // destination ONCE per accept, only on mesh capture
-                        // listeners (one getsockopt; every request on the
-                        // connection shares it). Outbound: `:15001` REDIRECT
-                        // capture, port = the dialed SERVICE port. Inbound:
-                        // the injector also REDIRECTs a sidecar-less client's
-                        // direct dial of the app port to `:15006`, port = the
-                        // CONTAINER port (peer-sidecar dials are direct and
-                        // yield `None` per the `socket_opts::original_dst`
-                        // contract). `None` everywhere else and for
-                        // non-redirected traffic.
+                        // Read the captured connection's original destination
+                        // ONCE per accept, only on mesh capture listeners. For
+                        // iptables REDIRECT capture, `SO_ORIGINAL_DST` carries
+                        // the pre-NAT address. For NodeWaypoint cgroup/connect
+                        // capture there is no conntrack original-dst state, so
+                        // the eBPF resolver's original destination wins for
+                        // outbound. Every request on the connection shares this
+                        // value. `None` everywhere else and for non-redirected
+                        // traffic.
                         let orig_dst = if mesh_direction.is_some() {
-                            crate::socket_opts::original_dst(&stream).or_else(|| {
-                                if mesh_direction
-                                    == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
-                                {
-                                    node_waypoint_orig_dst
-                                } else {
-                                    None
-                                }
-                            })
+                            select_mesh_original_dst(
+                                mesh_direction,
+                                crate::socket_opts::original_dst(&stream),
+                                node_waypoint_orig_dst,
+                            )
                         } else {
                             None
                         };
@@ -10495,15 +10503,25 @@ async fn run_accept_loop(
                                 // service port)`), then fall back to the
                                 // direct-pod-IP / headless by-workload index
                                 // (strict `(workload IP, target port)`, F3 §3.4)
-                                // — a client that resolved a headless service
-                                // itself dials a POD IP, bypassing the VIP table.
+                                // only when no HTTP direct-pod-IP route owns the
+                                // same target. HTTP direct-pod-IP egress needs the
+                                // HTTP request path for Host-independent routing
+                                // and AuthorizationPolicy evaluation.
+                                let http_direct_pod_ip_owner = epoch
+                                    .route_table
+                                    .mesh_http_egress_by_workload_decision(dst)
+                                    .is_some();
                                 let decision = epoch
                                     .route_table
                                     .mesh_tcp_egress_decision(dst)
                                     .or_else(|| {
-                                        epoch
-                                            .route_table
-                                            .mesh_tcp_egress_by_workload_decision(dst)
+                                        if http_direct_pod_ip_owner {
+                                            None
+                                        } else {
+                                            epoch
+                                                .route_table
+                                                .mesh_tcp_egress_by_workload_decision(dst)
+                                        }
                                     })
                                     .cloned();
                                 match decision {
@@ -21953,6 +21971,40 @@ mod tests {
             }
         }))
         .expect("valid proxy")
+    }
+
+    #[test]
+    fn node_waypoint_outbound_prefers_ebpf_original_destination() {
+        let socket_capture_endpoint: SocketAddr = "127.0.0.1:15001".parse().unwrap();
+        let ebpf_original_dst: SocketAddr = "10.244.1.4:8080".parse().unwrap();
+
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                Some(socket_capture_endpoint),
+                Some(ebpf_original_dst),
+            ),
+            Some(ebpf_original_dst),
+            "cgroup/connect capture has no conntrack original-dst, so direct Pod-IP HTTP must route by the eBPF original destination"
+        );
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                Some(socket_capture_endpoint),
+                None,
+            ),
+            Some(socket_capture_endpoint),
+            "non-node-waypoint outbound REDIRECT capture still uses SO_ORIGINAL_DST"
+        );
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Inbound),
+                Some(socket_capture_endpoint),
+                Some(ebpf_original_dst),
+            ),
+            Some(socket_capture_endpoint),
+            "inbound capture is still the iptables original-dst path"
+        );
     }
 
     #[test]
