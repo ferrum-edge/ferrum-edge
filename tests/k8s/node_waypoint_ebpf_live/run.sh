@@ -398,6 +398,45 @@ collect_node_agent_metrics() {
   done
 }
 
+collect_ambient_node_waypoint_identities() {
+  local out_dir="$RESULTS_DIR/ambient-node-waypoint-identities"
+  mkdir -p "$out_dir"
+  local token
+  token="$(admin_bearer_token)"
+  local -a pods
+  mapfile -t pods < <(kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  local idx=0
+  for pod in "${pods[@]}"; do
+    local port=$((19300 + idx))
+    local identities_file="$out_dir/$pod.json"
+    local pf_log="$out_dir/$pod-port-forward.log"
+    local pf_pid
+    idx=$((idx + 1))
+    kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+    pf_pid=$!
+    for _ in $(seq 1 20); do
+      if curl -fsS -H "Authorization: Bearer $token" \
+        "http://127.0.0.1:$port/node-waypoint/identities" >"$identities_file"; then
+        break
+      fi
+      sleep 0.25
+    done
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+  done
+}
+
+collect_traffic_failure_diagnostics() {
+  collect_node_agent_metrics
+  collect_ambient_node_waypoint_identities
+  collect_bpf_evidence || true
+  for node in "$NODE_A" "$NODE_B"; do
+    dump_node_waypoint_registry "$node"
+  done
+}
+
 first_pod_for() {
   kubectl -n "$1" get pod -l "$2" \
     -o jsonpath='{.items[0].metadata.name}'
@@ -452,6 +491,10 @@ collect_bpf_evidence() {
           bpftool prog show
           bpftool link show
           bpftool map show
+          for pin in /sys/fs/bpf/ferrum/orig_dst4 /sys/fs/bpf/ferrum/orig_dst6; do
+            echo "## bpftool map dump pinned $pin"
+            bpftool map dump pinned "$pin" 2>&1 || true
+          done
           find /sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null || true
         ' >"$tmp" 2>&1
       else
@@ -464,6 +507,11 @@ collect_bpf_evidence() {
             bpftool prog show
             bpftool link show
             bpftool map show
+            for pin in /host/sys/fs/bpf/ferrum/orig_dst4 /host/sys/fs/bpf/ferrum/orig_dst6 /sys/fs/bpf/ferrum/orig_dst4 /sys/fs/bpf/ferrum/orig_dst6; do
+              [ -e "$pin" ] || continue
+              echo "## bpftool map dump pinned $pin"
+              bpftool map dump pinned "$pin" 2>&1 || true
+            done
             if [ -d /host/sys/fs/bpf/ferrum ]; then
               find /host/sys/fs/bpf/ferrum -maxdepth 1 -type f -print 2>/dev/null | sed "s#^/host##" || true
             elif command -v nsenter >/dev/null 2>&1; then
@@ -881,6 +929,7 @@ expect_allowed() {
   echo "expected allow for $label from $from to $url with body '$expected_body', got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
   cat "$err" >&2 || true
   rm -f "$err"
+  collect_traffic_failure_diagnostics
   exit 1
 }
 
