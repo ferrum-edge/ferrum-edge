@@ -223,24 +223,17 @@ pub(super) fn collect_gateway_listener_policy(
     let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
         return Ok(());
     };
-    let terminating_tls_routes_enabled = !gateway_has_terminating_tls_listeners(object)
-        || matches!(
-            gateway_frontend_tls_sources(acc, object),
-            GatewayFrontendTlsSelection::Single { .. }
-        );
     for listener in listeners {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
-        let route_kinds =
-            if listener_is_terminating_tls(listener) && !terminating_tls_routes_enabled {
-                HashSet::new()
-            } else {
-                listener_allowed_route_kinds(listener)
-            };
+        let requires_frontend_tls = listener_is_terminating_tls(listener);
+        let materializable = listener_is_materializable(acc, object, listener);
         let policy = GatewayApiListenerPolicy {
             namespaces: allowed_route_namespaces(listener),
             hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
             port: listener.get("port").and_then(Value::as_u64),
-            route_kinds,
+            route_kinds: listener_allowed_route_kinds(listener),
+            materializable,
+            requires_frontend_tls,
         };
         acc.gateway_api_listener_policies.insert(
             GatewayApiListenerKey {
@@ -252,6 +245,26 @@ pub(super) fn collect_gateway_listener_policy(
         );
     }
     Ok(())
+}
+
+fn listener_is_materializable(acc: &K8sAccumulator, object: &K8sObject, listener: &Value) -> bool {
+    if !listener_is_terminating_tls(listener) {
+        return true;
+    }
+    let Some(sources) = listener_frontend_tls_sources(acc, object, listener) else {
+        return false;
+    };
+    let mut selected: Option<(String, String)> = None;
+    for source in sources {
+        if selected
+            .as_ref()
+            .is_some_and(|existing| existing != &source)
+        {
+            return false;
+        }
+        selected.get_or_insert(source);
+    }
+    selected.is_some()
 }
 
 fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) -> bool {
@@ -354,6 +367,7 @@ fn clear_frontend_tls_namespace_source(acc: &mut K8sAccumulator, namespace: &str
     acc.config
         .frontend_tls_namespace_sources
         .retain(|source| source.namespace != namespace);
+    withdraw_frontend_tls_listeners(acc, namespace);
     if acc.config.frontend_tls_source_namespace.as_deref() != Some(namespace) {
         return;
     }
@@ -368,6 +382,19 @@ fn clear_frontend_tls_namespace_source(acc: &mut K8sAccumulator, namespace: &str
     }
 }
 
+fn withdraw_frontend_tls_listeners(acc: &mut K8sAccumulator, namespace: &str) {
+    let mut withdrawn_service_names = HashSet::new();
+    for (key, policy) in &mut acc.gateway_api_listener_policies {
+        if key.namespace == namespace && policy.requires_frontend_tls {
+            policy.materializable = false;
+            withdrawn_service_names.insert(format!("{}-{}", key.gateway, key.listener));
+        }
+    }
+    acc.mesh.services.retain(|service| {
+        service.namespace != namespace || !withdrawn_service_names.contains(&service.name)
+    });
+}
+
 fn gateway_frontend_tls_sources(
     acc: &K8sAccumulator,
     object: &K8sObject,
@@ -376,12 +403,16 @@ fn gateway_frontend_tls_sources(
         return GatewayFrontendTlsSelection::None;
     };
     let mut selected: Option<(String, String)> = None;
+    let mut saw_terminating_tls = false;
+    let mut saw_invalid_ref = false;
     for listener in listeners
         .iter()
         .filter(|listener| listener_is_terminating_tls(listener))
     {
+        saw_terminating_tls = true;
         let Some(listener_sources) = listener_frontend_tls_sources(acc, object, listener) else {
-            return GatewayFrontendTlsSelection::InvalidCertificateRef;
+            saw_invalid_ref = true;
+            continue;
         };
         for sources in listener_sources {
             if selected
@@ -400,17 +431,11 @@ fn gateway_frontend_tls_sources(
                 key_source,
             },
         )
-        .unwrap_or(GatewayFrontendTlsSelection::None)
-}
-
-fn gateway_has_terminating_tls_listeners(object: &K8sObject) -> bool {
-    object
-        .spec
-        .get("listeners")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(listener_is_terminating_tls)
+        .unwrap_or(if saw_invalid_ref && saw_terminating_tls {
+            GatewayFrontendTlsSelection::InvalidCertificateRef
+        } else {
+            GatewayFrontendTlsSelection::None
+        })
 }
 
 fn listener_is_terminating_tls(listener: &Value) -> bool {
@@ -1290,7 +1315,7 @@ fn compare_conflict_candidates(
 fn mesh_services_from_gateway(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
-    terminating_tls_ready: bool,
+    namespace_tls_ready: bool,
 ) -> Result<Vec<MeshService>, K8sTranslateError> {
     let mut services = Vec::new();
     object
@@ -1300,7 +1325,9 @@ fn mesh_services_from_gateway(
         .into_iter()
         .flatten()
         .try_for_each(|listener| {
-            if listener_is_terminating_tls(listener) && !terminating_tls_ready {
+            if listener_is_terminating_tls(listener)
+                && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
+            {
                 acc.warnings.push(format!(
                     "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
                     object.metadata.namespace,
@@ -1353,9 +1380,17 @@ fn ensure_route_parent_refs_allowed(
         }
         let parent_namespace =
             string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-        if parent_ref_selector_requires_listener_match(parent_ref)
-            && gateway_parent_ref_listener_match(acc, parent_namespace, parent_ref) == Some(false)
-        {
+        let listener_match = gateway_parent_ref_listener_match(acc, parent_namespace, parent_ref);
+        if parent_ref.get("sectionName").is_some() && listener_match != Some(true) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{} parentRef does not match any known Gateway listener in namespace '{}'",
+                    object.kind, parent_namespace
+                ),
+            ));
+        }
+        if parent_ref.get("port").is_some() && listener_match == Some(false) {
             return Err(invalid_resource(
                 object,
                 format!(
@@ -1376,10 +1411,6 @@ fn ensure_route_parent_refs_allowed(
     }
 
     Ok(())
-}
-
-fn parent_ref_selector_requires_listener_match(parent_ref: &Value) -> bool {
-    parent_ref.get("sectionName").is_some() || parent_ref.get("port").is_some()
 }
 
 fn gateway_parent_ref_listener_match(
@@ -1416,7 +1447,7 @@ fn route_namespace_allowed_by_listener(
                 listener: listener_name.to_string(),
             })
         else {
-            return route.metadata.namespace == parent_namespace;
+            return false;
         };
         return route_listener_policy_allows_route(acc, route, parent_namespace, policy);
     }
@@ -1441,6 +1472,16 @@ fn route_listener_policy_allows_route(
 ) -> bool {
     policy.route_kinds.contains(route.kind.as_str())
         && route_namespace_matches_policy(acc, route, parent_namespace, policy)
+}
+
+fn route_listener_policy_materializes_route(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    policy.materializable
+        && route_listener_policy_allows_route(acc, route, parent_namespace, policy)
 }
 
 fn route_namespace_matches_policy(
@@ -1490,31 +1531,44 @@ fn namespace_selector_expression_matches(
 }
 
 fn route_materialization_namespaces(object: &K8sObject, acc: &K8sAccumulator) -> Vec<String> {
-    let mut namespaces: Vec<String> = object
+    let mut saw_gateway_parent = false;
+    let mut saw_known_parent_listener = false;
+    let mut saw_section_name_parent = false;
+    let mut namespaces = Vec::new();
+    for parent_ref in object
         .spec
         .get("parentRefs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|parent_ref| {
-            let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-            let parent_group =
-                string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
-            if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
-                return None;
+    {
+        let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
+            continue;
+        }
+        saw_gateway_parent = true;
+        saw_section_name_parent |= parent_ref.get("sectionName").is_some();
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace == parent_namespace
+                && key.gateway == parent_gateway
+                && parent_ref_matches_listener_policy(parent_ref, key, policy)
+            {
+                saw_known_parent_listener = true;
+                if route_listener_policy_materializes_route(acc, object, parent_namespace, policy) {
+                    namespaces.push(parent_namespace.to_string());
+                }
             }
-            let parent_namespace =
-                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-            if route_namespace_allowed_by_listener(acc, object, parent_namespace, parent_ref) {
-                Some(parent_namespace.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
+        }
+    }
     namespaces.sort();
     namespaces.dedup();
-    if namespaces.is_empty() {
+    if namespaces.is_empty()
+        && (!saw_gateway_parent || (!saw_known_parent_listener && !saw_section_name_parent))
+    {
         namespaces.push(object.metadata.namespace.clone());
     }
     namespaces
@@ -1556,8 +1610,7 @@ fn route_effective_hostnames(
             if key.namespace != gateway_namespace
                 || key.gateway != gateway_name
                 || !parent_ref_matches_listener_policy(parent_ref, key, policy)
-                || !policy.route_kinds.contains(object.kind.as_str())
-                || !route_namespace_matches_policy(acc, object, gateway_namespace, policy)
+                || !route_listener_policy_materializes_route(acc, object, gateway_namespace, policy)
             {
                 continue;
             }
@@ -1623,8 +1676,7 @@ fn route_redirect_default_listener_port(
             if key.namespace != gateway_namespace
                 || key.gateway != gateway_name
                 || !parent_ref_matches_listener_policy(parent_ref, key, policy)
-                || !policy.route_kinds.contains(object.kind.as_str())
-                || !route_namespace_matches_policy(acc, object, gateway_namespace, policy)
+                || !route_listener_policy_materializes_route(acc, object, gateway_namespace, policy)
             {
                 continue;
             }
@@ -3107,41 +3159,45 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
-fn listener_route_kind(protocol: Option<&str>) -> Option<&'static str> {
+fn listener_route_kinds_for_protocol(protocol: Option<&str>) -> Vec<&'static str> {
     match protocol.unwrap_or_default().to_ascii_uppercase().as_str() {
-        "HTTP" | "HTTPS" => Some("HTTPRoute"),
-        "GRPC" | "GRPCS" => Some("GRPCRoute"),
-        "TCP" => Some("TCPRoute"),
-        "TLS" => Some("TLSRoute"),
-        _ => None,
+        "HTTP" | "HTTPS" => vec!["HTTPRoute", "GRPCRoute"],
+        "GRPC" | "GRPCS" => vec!["GRPCRoute"],
+        "TCP" => vec!["TCPRoute"],
+        "TLS" => vec!["TLSRoute"],
+        _ => Vec::new(),
     }
 }
 
 fn listener_allowed_route_kinds(listener: &Value) -> HashSet<String> {
-    let Some(protocol_kind) = listener_route_kind(string_field(listener, "protocol")) else {
+    let protocol_kinds = listener_route_kinds_for_protocol(string_field(listener, "protocol"));
+    if protocol_kinds.is_empty() {
         return HashSet::new();
-    };
-    let protocol_kind = protocol_kind.to_string();
+    }
     let Some(kinds) = listener
         .get("allowedRoutes")
         .and_then(|allowed_routes| allowed_routes.get("kinds"))
         .and_then(Value::as_array)
     else {
-        return HashSet::from([protocol_kind]);
+        return protocol_kinds.into_iter().map(ToOwned::to_owned).collect();
     };
     kinds
         .iter()
-        .filter(|kind| listener_allowed_route_kind_matches_protocol(kind, &protocol_kind))
-        .map(|_| protocol_kind.clone())
+        .filter_map(|kind| listener_allowed_route_kind(kind, &protocol_kinds))
+        .map(ToOwned::to_owned)
         .collect()
 }
 
-fn listener_allowed_route_kind_matches_protocol(kind: &Value, protocol_kind: &str) -> bool {
+fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> Option<&'a str> {
     let group = string_field(kind, "group").unwrap_or("gateway.networking.k8s.io");
-    let Some(kind) = string_field(kind, "kind") else {
-        return false;
-    };
-    group == "gateway.networking.k8s.io" && kind == protocol_kind
+    let kind = string_field(kind, "kind")?;
+    if group != "gateway.networking.k8s.io" {
+        return None;
+    }
+    protocol_kinds
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == kind)
 }
 
 #[cfg(test)]
@@ -3506,7 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_rejects_parent_ref_to_invalid_tls_listener() {
+    fn http_route_attaches_but_does_not_materialize_for_invalid_tls_listener() {
         let gateway = object(
             "Gateway",
             serde_json::json!({
@@ -3532,12 +3588,63 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(&[gateway, route], options())
-            .expect_err("invalid TLS listener must not accept route attachment");
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("invalid TLS listener should not reject route attachment");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(
+            result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty())
+        );
+    }
+
+    #[test]
+    fn gateway_valid_tls_listener_materializes_when_sibling_tls_listener_is_invalid() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https-valid",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "valid-cert"}]}
+                    },
+                    {
+                        "name": "https-invalid",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "missing-cert"}]}
+                    }
+                ]
+            }),
+        );
+        let cert = tls_secret("valid-cert", "default", true);
+
+        let result = translate_k8s_objects(&[gateway, cert], options())
+            .expect("valid sibling TLS listener should materialize");
 
         assert!(
-            err.to_string()
-                .contains("not permitted by the target Gateway listener")
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/valid-cert#tls.crt?sha256="))
+        );
+        let mesh = result.config.mesh.as_ref().expect("mesh emitted");
+        assert!(
+            mesh.services
+                .iter()
+                .any(|service| service.name == "sample-https-valid")
+        );
+        assert!(
+            mesh.services
+                .iter()
+                .all(|service| service.name != "sample-https-invalid")
         );
     }
 
@@ -3578,6 +3685,14 @@ mod tests {
         assert_eq!(result.config.frontend_tls_cert_path, None);
         assert_eq!(result.config.frontend_tls_key_path, None);
         assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty()),
+            "conflicted TLS listeners should be withdrawn"
+        );
         assert!(
             result
                 .warnings
@@ -5862,6 +5977,74 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("not permitted by the target Gateway listener")
+        );
+    }
+
+    #[test]
+    fn grpc_route_can_attach_to_http_listener_when_allowed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "GRPCRoute"}]
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/grpc"},
+                        "method": {
+                            "service": "ferrum.echo.v1.Echo",
+                            "method": "Ping"
+                        }
+                    }],
+                    "backendRefs": [{"name": "grpc", "port": 50051}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("HTTP listeners should allow GRPCRoute when requested");
+
+        assert_eq!(result.config.proxies.len(), 1);
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_when_section_name_listener_is_absent() {
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "missing"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[route], options())
+            .expect_err("explicit missing listener selector should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("does not match any known Gateway listener")
         );
     }
 

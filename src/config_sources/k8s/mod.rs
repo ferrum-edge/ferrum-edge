@@ -332,6 +332,8 @@ pub(crate) struct GatewayApiListenerPolicy {
     pub hostname: Option<String>,
     pub port: Option<u64>,
     pub route_kinds: HashSet<String>,
+    pub materializable: bool,
+    pub requires_frontend_tls: bool,
 }
 
 pub(crate) struct K8sAccumulator {
