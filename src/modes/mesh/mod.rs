@@ -13516,8 +13516,8 @@ mod tests {
             !config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-outbound-")),
-            "must yield to the operator proxy on the overlapping host"
+                .any(|p| p.id == "__mesh-outbound-default-reviews-8080"),
+            "must yield the service-host outbound proxy to the operator proxy on the overlapping host"
         );
         assert!(config.proxies.iter().any(|p| p.id == "operator-reviews"));
     }
