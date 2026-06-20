@@ -46,17 +46,50 @@ its path through `FERRUM_EDGE_TEST_BIN` so subprocess-based functional tests
 contribute to the same coverage report. MongoDB functional tests are included
 in the filter list and skip gracefully when local MongoDB is not available.
 
-## CI Baseline
+## CI Baseline And Gates
 
-The scheduled `Coverage` workflow runs on pushes to `main`, manual dispatch,
-and Sundays at 06:00 UTC. It publishes an HTML report and LCOV file as a
-30-day GitHub Actions artifact. It also writes the overall coverage percentage
-and lowest/highest-covered files to the workflow step summary.
+The `Coverage` workflow runs on pull requests, pushes to `main`, manual
+dispatch, and Sundays at 06:00 UTC. It publishes an HTML report, LCOV file, JSON
+summary, and terminal summary as a 30-day GitHub Actions artifact named
+`coverage-report`. It also writes the overall coverage percentage and
+lowest/highest-covered files to the workflow step summary.
 
-Current overall coverage: **79.15% line coverage** (`143,848/181,736` lines),
-captured locally on 2026-05-24 with `scripts/coverage.sh`. Replace this local
-snapshot with the first successful `Coverage` workflow artifact value after the
-workflow is merged to `main` if it differs.
+The PR gate is based on the latest completed default-branch coverage artifact
+available when the gate was introduced on 2026-06-20:
+
+| Scope | Remote baseline | Gate |
+| --- | ---: | ---: |
+| Overall line coverage | `210900/269397` lines, **78.29%** | **78.28%** |
+| `src/plugins/` line coverage | `54957/64665` lines, **84.99%** | **84.98%** |
+| Changed coverable `src/plugins/` lines on PRs | same plugin baseline | **84.98%** |
+
+The thresholds are intentionally rounded down from the measured remote values
+so presentation precision does not fail a run, while any real coverage drop in
+overall or plugin coverage still fails CI. Changed-line coverage is enforced
+only for coverable lines reported by LCOV; generated, ignored, or otherwise
+non-coverable lines are ignored consistently with the main coverage report.
+
+To inspect the same remote results without running coverage locally:
+
+```bash
+gh run list --repo ferrum-edge/ferrum-edge --workflow Coverage --branch main
+gh run download <run-id> --repo ferrum-edge/ferrum-edge --name coverage-report --dir /tmp/ferrum-coverage
+python3 scripts/check_coverage_thresholds.py \
+  --coverage-json /tmp/ferrum-coverage/coverage.json \
+  --lcov /tmp/ferrum-coverage/lcov.info \
+  --min-overall-line 78.28 \
+  --min-plugins-line 84.98 \
+  --min-changed-plugins-line 84.98
+```
+
+The normal PR `CI` workflow also includes required plugin hardening regression
+jobs:
+
+- `Plugin Hardening Unit Regressions`: cache byte accounting and
+  last-known-good plugin reload regressions.
+- `Plugin Hardening Redis Regression`: multi-instance Redis request
+  deduplication with `FERRUM_REDIS_REQUIRED=1`, so Redis startup failures cannot
+  silently skip the regression.
 
 Latest opt-in functional benchmark: **81.68% line coverage**
 (`148,432/181,717` lines), captured locally on 2026-05-25 with

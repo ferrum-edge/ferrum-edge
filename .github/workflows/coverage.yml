@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 0"
@@ -17,6 +20,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # From the latest completed default-branch coverage artifact available when
+  # this gate was introduced: overall 210900/269397 lines (78.29%) and
+  # src/plugins 54957/64665 lines (84.99%). Floors are rounded down to avoid
+  # failing on floating-point presentation noise while still catching real drops.
+  MIN_OVERALL_LINE_COVERAGE: "78.28"
+  MIN_PLUGINS_LINE_COVERAGE: "84.98"
+  MIN_CHANGED_PLUGIN_LINE_COVERAGE: "84.98"
   # cargo-llvm-cov applies this during report generation; v0.8.7 warns if it
   # is passed to --no-report collection commands.
   LLVM_COV_IGNORE_FILENAME_REGEX: "(vendor/|tests/|build\\.rs|target/|custom_plugins/|ebpf/|proto/)"
@@ -186,6 +196,8 @@ jobs:
     needs: coverage-shard
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -286,7 +298,26 @@ jobs:
             jq -r "${rows} | sort_by(-.percent, -.count) | .[:20][] | \"| \(.file) | \(.covered)/\(.count) | \(((.percent * 100 | round) / 100))% |\"" coverage-report/coverage.json
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check coverage thresholds
+        run: |
+          set -euo pipefail
+
+          changed_base_args=()
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --prune origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+            changed_base_args=(--changed-base "origin/${{ github.base_ref }}")
+          fi
+
+          python3 scripts/check_coverage_thresholds.py \
+            --coverage-json coverage-report/coverage.json \
+            --lcov coverage-report/lcov.info \
+            --min-overall-line "$MIN_OVERALL_LINE_COVERAGE" \
+            --min-plugins-line "$MIN_PLUGINS_LINE_COVERAGE" \
+            --min-changed-plugins-line "$MIN_CHANGED_PLUGIN_LINE_COVERAGE" \
+            "${changed_base_args[@]}"
+
       - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-report

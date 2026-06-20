@@ -48,6 +48,37 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  plugin-hardening-unit-regressions:
+    name: Plugin Hardening Unit Regressions
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-plugin-hardening-unit"
+
+      - name: Run cache accounting and reload safety regressions
+        run: |
+          set -euo pipefail
+          cargo test --test unit_tests test_concurrent_stores_keep_size_bounded_and_non_wrapping
+          cargo test --test unit_tests test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache
+          cargo test --test unit_tests test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache
+          cargo test --test unit_tests test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Summarize plugin hardening unit regressions
+        if: always()
+        run: |
+          echo "## Plugin Hardening Unit Regressions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- test_concurrent_stores_keep_size_bounded_and_non_wrapping" >> $GITHUB_STEP_SUMMARY
+          echo "- test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
+          echo "- test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
+          echo "- test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
+
   test-lib:
     name: Inline Lib Tests
     if: github.event_name == 'pull_request'
@@ -824,6 +855,82 @@ jobs:
         env:
           FUNCTIONAL_FILTERS: ${{ matrix.filters }}
 
+  plugin-hardening-redis-regression:
+    name: Plugin Hardening Redis Regression
+    if: github.event_name == 'pull_request'
+    needs: [build-gateway-binary, build-functional-tests-archive]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download prebuilt gateway binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug
+
+      - name: Mark gateway binary executable
+        run: chmod +x target/debug/ferrum-edge
+
+      - name: Download functional tests archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
+          path: .
+
+      - name: Start Redis
+        run: |
+          set -euo pipefail
+          docker run -d --name ferrum-ci-plugin-hardening-redis -p 6379:6379 redis:7-alpine
+          redis_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-ci-plugin-hardening-redis redis-cli ping 2>/dev/null | grep -q PONG; then
+              redis_ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$redis_ok" ]; then
+            echo "::error::redis did not become ready"
+            docker logs ferrum-ci-plugin-hardening-redis
+            exit 1
+          fi
+          echo "plugin hardening redis ready (redis:6379)"
+
+      - name: Run cross-instance request deduplication regression
+        run: |
+          set -euo pipefail
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
+            --run-ignored=all \
+            --no-fail-fast \
+            -j 1 \
+            test_request_deduplication_redis_blocks_concurrent_cross_instance
+        env:
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          FERRUM_REDIS_REQUIRED: "1"
+          RUST_BACKTRACE: 1
+
+      - name: Summarize plugin hardening Redis regression
+        if: always()
+        run: |
+          echo "## Plugin Hardening Redis Regression" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
+
   gateway-api-conformance:
     name: Gateway API Conformance
     if: github.event_name == 'pull_request'
@@ -1342,6 +1449,7 @@ jobs:
     if: always() && github.event_name == 'pull_request'
     needs:
       - test-unit
+      - plugin-hardening-unit-regressions
       - test-lib
       - test-secrets
       - test-service-integration
@@ -1351,6 +1459,7 @@ jobs:
       - build-gateway-binary
       - build-functional-tests-archive
       - test-functional
+      - plugin-hardening-redis-regression
       - gateway-api-conformance
       - helm-chart
     runs-on: ubuntu-latest
@@ -1362,6 +1471,7 @@ jobs:
           echo "| Suite | Result |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
           echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plugin hardening unit regressions | ${{ needs.plugin-hardening-unit-regressions.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Secret backends | ${{ needs.test-secrets.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Service integration | ${{ needs.test-service-integration.result }} |" >> $GITHUB_STEP_SUMMARY
@@ -1371,10 +1481,12 @@ jobs:
           echo "| Gateway binary build | ${{ needs.build-gateway-binary.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional archive build | ${{ needs.build-functional-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plugin hardening Redis regression | ${{ needs.plugin-hardening-redis-regression.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Helm chart | ${{ needs.helm-chart.result }} |" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
+             [ "${{ needs.plugin-hardening-unit-regressions.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
              [ "${{ needs.test-secrets.result }}" != "success" ] ||
              [ "${{ needs.test-service-integration.result }}" != "success" ] ||
@@ -1384,6 +1496,7 @@ jobs:
              [ "${{ needs.build-gateway-binary.result }}" != "success" ] ||
              [ "${{ needs.build-functional-tests-archive.result }}" != "success" ] ||
              [ "${{ needs.test-functional.result }}" != "success" ] ||
+             [ "${{ needs.plugin-hardening-redis-regression.result }}" != "success" ] ||
              [ "${{ needs.gateway-api-conformance.result }}" != "success" ] ||
              [ "${{ needs.helm-chart.result }}" != "success" ]; then
             exit 1
