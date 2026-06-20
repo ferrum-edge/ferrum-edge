@@ -360,7 +360,6 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
     gateway_api_gateway_classes: HashMap<String, bool>,
-    gateway_api_frontend_tls_conflict_namespaces: HashSet<String>,
     pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
     /// translator's filtered object set. Reused by the status writer so
@@ -392,7 +391,6 @@ impl K8sAccumulator {
             gateway_api_conflict_losers: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
-            gateway_api_frontend_tls_conflict_namespaces: HashSet::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
         }

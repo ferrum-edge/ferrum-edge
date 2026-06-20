@@ -291,15 +291,13 @@ fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject
     };
 
     let source_namespace = object.metadata.namespace.clone();
-    let Some(source) = gateway_frontend_tls_namespace_source(
+    let source = gateway_frontend_tls_namespace_source(
         acc,
         object,
         source_namespace,
         cert_source,
         key_source,
-    ) else {
-        return false;
-    };
+    );
 
     if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
         acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
@@ -315,17 +313,7 @@ fn gateway_frontend_tls_namespace_source(
     source_namespace: String,
     cert_source: String,
     key_source: String,
-) -> Option<FrontendTlsNamespaceSource> {
-    if acc
-        .gateway_api_frontend_tls_conflict_namespaces
-        .contains(&source_namespace)
-    {
-        acc.warnings.push(format!(
-            "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace {} already has conflicting Gateway TLS sources; leaving namespace frontend TLS unmaterialized",
-            object.metadata.namespace, object.metadata.name, cert_source, source_namespace
-        ));
-        return None;
-    }
+) -> FrontendTlsNamespaceSource {
     if let Some(existing) = acc
         .config
         .frontend_tls_namespace_sources
@@ -333,20 +321,21 @@ fn gateway_frontend_tls_namespace_source(
         .find(|source| source.namespace == source_namespace)
     {
         if existing.cert_path == cert_source && existing.key_path == key_source {
-            return Some(existing.clone());
+            return existing.clone();
         }
+        // The current DP config has one frontend TLS serving slot per Gateway
+        // namespace. Keep that slot stable, but do not withdraw otherwise valid
+        // listeners solely because another Gateway in the namespace uses a
+        // different valid certificateRef.
         acc.warnings.push(format!(
-            "Gateway API Gateway {}/{} requested frontend TLS certificate source {}, but namespace {} already has conflicting Gateway TLS sources (existing source {}); leaving namespace frontend TLS unmaterialized",
+            "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; keeping the existing serving source while preserving the listener as materialized",
             object.metadata.namespace,
             object.metadata.name,
             cert_source,
             source_namespace,
             existing.cert_path
         ));
-        acc.gateway_api_frontend_tls_conflict_namespaces
-            .insert(source_namespace.clone());
-        clear_frontend_tls_namespace_source(acc, &source_namespace);
-        return None;
+        return existing.clone();
     }
 
     let source = FrontendTlsNamespaceSource {
@@ -360,39 +349,7 @@ fn gateway_frontend_tls_namespace_source(
     acc.config
         .frontend_tls_namespace_sources
         .sort_by(|left, right| left.namespace.cmp(&right.namespace));
-    Some(source)
-}
-
-fn clear_frontend_tls_namespace_source(acc: &mut K8sAccumulator, namespace: &str) {
-    acc.config
-        .frontend_tls_namespace_sources
-        .retain(|source| source.namespace != namespace);
-    withdraw_frontend_tls_listeners(acc, namespace);
-    if acc.config.frontend_tls_source_namespace.as_deref() != Some(namespace) {
-        return;
-    }
-    if let Some(source) = acc.config.frontend_tls_namespace_sources.first() {
-        acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
-        acc.config.frontend_tls_key_path = Some(source.key_path.clone());
-        acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
-    } else {
-        acc.config.frontend_tls_cert_path = None;
-        acc.config.frontend_tls_key_path = None;
-        acc.config.frontend_tls_source_namespace = None;
-    }
-}
-
-fn withdraw_frontend_tls_listeners(acc: &mut K8sAccumulator, namespace: &str) {
-    let mut withdrawn_service_names = HashSet::new();
-    for (key, policy) in &mut acc.gateway_api_listener_policies {
-        if key.namespace == namespace && policy.requires_frontend_tls {
-            policy.materializable = false;
-            withdrawn_service_names.insert(format!("{}-{}", key.gateway, key.listener));
-        }
-    }
-    acc.mesh.services.retain(|service| {
-        service.namespace != namespace || !withdrawn_service_names.contains(&service.name)
-    });
+    source
 }
 
 fn gateway_frontend_tls_sources(
@@ -3649,7 +3606,7 @@ mod tests {
     }
 
     #[test]
-    fn same_namespace_gateway_tls_conflicts_clear_namespace_frontend_tls() {
+    fn same_namespace_gateway_tls_conflicts_keep_first_tls_source_and_materialize_listeners() {
         let mut gateway_a = object(
             "Gateway",
             serde_json::json!({
@@ -3680,24 +3637,35 @@ mod tests {
         let cert_b = tls_secret("cert-b", "default", true);
 
         let result = translate_k8s_objects(&[gateway_a, cert_a, gateway_b, cert_b], options())
-            .expect("translation should fail closed for namespace TLS conflicts");
+            .expect("translation should keep valid same-namespace TLS listeners materialized");
 
-        assert_eq!(result.config.frontend_tls_cert_path, None);
-        assert_eq!(result.config.frontend_tls_key_path, None);
-        assert!(result.config.frontend_tls_namespace_sources.is_empty());
         assert!(
             result
                 .config
-                .mesh
-                .as_ref()
-                .is_none_or(|mesh| mesh.services.is_empty()),
-            "conflicted TLS listeners should be withdrawn"
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/cert-a#tls.crt?sha256="))
+        );
+        assert_eq!(result.config.frontend_tls_namespace_sources.len(), 1);
+        assert!(
+            result.config.mesh.as_ref().is_some_and(|mesh| mesh
+                .services
+                .iter()
+                .any(|service| service.name == "edge-a-https-a")),
+            "the first valid TLS listener should stay materialized"
+        );
+        assert!(
+            result.config.mesh.as_ref().is_some_and(|mesh| mesh
+                .services
+                .iter()
+                .any(|service| service.name == "edge-b-https-b")),
+            "later valid TLS listeners should not be withdrawn solely because the namespace already has a serving cert"
         );
         assert!(
             result
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("conflicting Gateway TLS sources"))
+                .any(|warning| warning.contains("additional frontend TLS certificate source"))
         );
     }
 

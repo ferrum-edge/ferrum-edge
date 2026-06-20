@@ -3148,7 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn same_namespace_gateway_tls_conflict_resolves_refs_but_withdraws_programming() {
+    fn same_namespace_gateway_tls_conflict_resolves_refs_and_keeps_programming() {
         let gateway_class = ferrum_gateway_class();
         let gateway_a = object(
             "Gateway",
@@ -3188,11 +3188,7 @@ mod tests {
             let gateway_update = update_for(&updates, "Gateway", gateway_name);
             let conditions = gateway_update.status["conditions"].as_array().unwrap();
             assert_condition(conditions, "ResolvedRefs", "True");
-            assert_condition(conditions, "Programmed", "False");
-            assert_eq!(
-                find_condition(conditions, "Programmed")["reason"].as_str(),
-                Some("NoListeners")
-            );
+            assert_condition(conditions, "Programmed", "True");
 
             let listeners = gateway_update.status["listeners"].as_array().unwrap();
             let listener = listener_status_by_name(
@@ -3205,11 +3201,7 @@ mod tests {
             );
             let listener_conditions = listener["conditions"].as_array().unwrap();
             assert_condition(listener_conditions, "ResolvedRefs", "True");
-            assert_condition(listener_conditions, "Programmed", "False");
-            assert_eq!(
-                find_condition(listener_conditions, "Programmed")["reason"].as_str(),
-                Some("NoListeners")
-            );
+            assert_condition(listener_conditions, "Programmed", "True");
         }
     }
 
