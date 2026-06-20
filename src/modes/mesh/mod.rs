@@ -4378,10 +4378,10 @@ fn mesh_outbound_http_bywl_route_proxy(
         &spec.upstream_id,
         now,
     );
-    // Direct Pod-IP HTTP is selected strictly by SO_ORIGINAL_DST, not by Host.
-    // Do not preserve an arbitrary source Host header into the HBONE request
-    // authority; the selected target IP+port is the original destination.
-    proxy.preserve_host_header = false;
+    // Direct Pod-IP HTTP selects its workload strictly by SO_ORIGINAL_DST before
+    // Host routing. Preserve the application Host after that selection so the
+    // backend does not see a synthetic pod-IP authority.
+    proxy.preserve_host_header = true;
     proxy
 }
 
@@ -11809,8 +11809,8 @@ mod tests {
         );
         assert_eq!(proxy.upstream_id.as_deref(), Some(upstream_id.as_str()));
         assert!(
-            !proxy.preserve_host_header,
-            "direct-pod HTTP must not forward an arbitrary source Host header"
+            proxy.preserve_host_header,
+            "direct-pod HTTP routing is orig-dst selected, but the chosen backend should still see the original Host header"
         );
         assert!(
             proxy
