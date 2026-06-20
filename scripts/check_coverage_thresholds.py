@@ -194,9 +194,9 @@ def main() -> int:
     parser.add_argument("--coverage-json", type=Path, required=True)
     parser.add_argument("--lcov", type=Path, required=True)
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
-    parser.add_argument("--min-overall-line", type=float, required=True)
-    parser.add_argument("--min-plugins-line", type=float, required=True)
-    parser.add_argument("--min-changed-plugins-line", type=float, required=True)
+    parser.add_argument("--min-overall-line", type=float)
+    parser.add_argument("--min-plugins-line", type=float)
+    parser.add_argument("--min-changed-plugins-line", type=float)
     parser.add_argument("--changed-base")
     args = parser.parse_args()
 
@@ -236,18 +236,25 @@ def main() -> int:
     print("\n".join(summary_lines))
 
     failures: list[str] = []
-    if overall["percent"] < args.min_overall_line:
+    if (
+        args.min_overall_line is not None
+        and overall["percent"] < args.min_overall_line
+    ):
         failures.append(
             f"overall line coverage {overall['percent']:.2f}% is below "
             f"{args.min_overall_line:.2f}%"
         )
-    if plugins["percent"] < args.min_plugins_line:
+    if (
+        args.min_plugins_line is not None
+        and plugins["percent"] < args.min_plugins_line
+    ):
         failures.append(
             f"src/plugins line coverage {plugins['percent']:.2f}% is below "
             f"{args.min_plugins_line:.2f}%"
         )
     if (
-        changed is not None
+        args.min_changed_plugins_line is not None
+        and changed is not None
         and int(changed["count"]) > 0
         and changed["percent"] < args.min_changed_plugins_line
     ):

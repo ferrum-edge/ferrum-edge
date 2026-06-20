@@ -51,23 +51,39 @@ in the filter list and skip gracefully when local MongoDB is not available.
 The `Coverage` workflow runs on pull requests, pushes to `main`, manual
 dispatch, and Sundays at 06:00 UTC. It publishes an HTML report, LCOV file, JSON
 summary, and terminal summary as a 30-day GitHub Actions artifact named
-`coverage-report`. It also writes the overall coverage percentage and
-lowest/highest-covered files to the workflow step summary.
+`coverage-report` whenever coverage is collected. It also writes the overall
+coverage percentage and lowest/highest-covered files to the workflow step
+summary.
 
-The PR gate is based on the latest completed default-branch coverage artifact
-available when the gate was introduced on 2026-06-20:
+The full default-branch gate is based on the latest completed `main` coverage
+artifact available when the gate was introduced on 2026-06-20:
 
 | Scope | Remote baseline | Gate |
 | --- | ---: | ---: |
 | Overall line coverage | `210900/269397` lines, **78.29%** | **78.28%** |
 | `src/plugins/` line coverage | `54957/64665` lines, **84.99%** | **84.98%** |
-| Changed coverable `src/plugins/` lines on PRs | same plugin baseline | **84.98%** |
+| Changed coverable `src/plugins/` lines on plugin PRs | same plugin baseline | **84.98%** |
 
 The thresholds are intentionally rounded down from the measured remote values
 so presentation precision does not fail a run, while any real coverage drop in
-overall or plugin coverage still fails CI. Changed-line coverage is enforced
-only for coverable lines reported by LCOV; generated, ignored, or otherwise
-non-coverable lines are ignored consistently with the main coverage report.
+overall or plugin coverage still fails the full default-branch gate.
+
+PR coverage is mode-aware:
+
+- Pull requests that touch plugin coverage-relevant files run a single
+  plugin-focused coverage job over `--lib` and `--test unit_tests`, then enforce
+  changed-line coverage for coverable `src/plugins/` lines.
+- Pull requests that do not touch plugin coverage-relevant files keep the
+  required `Merge Coverage` check as a fast no-op.
+- Pushes to `main`, manual dispatches, and scheduled runs still execute the full
+  coverage shard matrix and enforce the overall and `src/plugins/` thresholds.
+
+Plugin coverage-relevant paths are `src/plugins/**`, `src/plugin_cache.rs`,
+`tests/unit/plugins/**`,
+`tests/functional/functional_redis_rate_limiting_test.rs`,
+`.github/workflows/coverage.yml`, and
+`scripts/check_coverage_thresholds.py`. Generated, ignored, or otherwise
+non-coverable changed lines are ignored consistently with the LCOV report.
 
 To inspect the same remote results without running coverage locally:
 
@@ -78,7 +94,16 @@ python3 scripts/check_coverage_thresholds.py \
   --coverage-json /tmp/ferrum-coverage/coverage.json \
   --lcov /tmp/ferrum-coverage/lcov.info \
   --min-overall-line 78.28 \
-  --min-plugins-line 84.98 \
+  --min-plugins-line 84.98
+```
+
+For PR changed-line investigation, compare against the PR base SHA:
+
+```bash
+python3 scripts/check_coverage_thresholds.py \
+  --coverage-json /tmp/ferrum-coverage/coverage.json \
+  --lcov /tmp/ferrum-coverage/lcov.info \
+  --changed-base <base-sha> \
   --min-changed-plugins-line 84.98
 ```
 

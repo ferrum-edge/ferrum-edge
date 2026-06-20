@@ -32,8 +32,65 @@ env:
   LLVM_COV_IGNORE_FILENAME_REGEX: "(vendor/|tests/|build\\.rs|target/|custom_plugins/|ebpf/|proto/)"
 
 jobs:
+  coverage-plan:
+    name: Coverage Plan
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - id: plan
+        name: Select coverage mode
+        run: |
+          set -euo pipefail
+
+          mode=full
+          reason="full coverage is required for ${EVENT_NAME}"
+          changed_files="changed-files.txt"
+          : > "$changed_files"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            mode=skip
+            reason="no plugin coverage-relevant files changed"
+            base_ref="${BASE_SHA:-origin/${BASE_REF}}"
+            git diff --name-only "${base_ref}...HEAD" > "$changed_files"
+
+            plugin_pattern='^(\.github/workflows/coverage\.yml|scripts/check_coverage_thresholds\.py|src/plugin_cache\.rs|tests/functional/functional_redis_rate_limiting_test\.rs)$|^(src/plugins/|tests/unit/plugins/)'
+            if grep -Eq "$plugin_pattern" "$changed_files"; then
+              mode=plugin
+              reason="plugin coverage-relevant files changed"
+            fi
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Coverage Plan"
+            echo ""
+            echo "Mode: **${mode}**"
+            echo ""
+            echo "${reason}"
+            if [ -s "$changed_files" ]; then
+              echo ""
+              echo "### Changed Files"
+              echo ""
+              while IFS= read -r path; do
+                echo "- \`${path}\`"
+              done < "$changed_files"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
+
   coverage-shard:
     name: Coverage Shard (${{ matrix.shard }})
+    needs: coverage-plan
+    if: needs.coverage-plan.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -193,25 +250,63 @@ jobs:
     name: Merge Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: coverage-shard
+    needs:
+      - coverage-plan
+      - coverage-shard
+    if: always()
     steps:
+      - name: Fail when coverage planning fails
+        if: needs.coverage-plan.result != 'success'
+        run: exit 1
+
+      - name: Skip coverage for unrelated PR changes
+        if: needs.coverage-plan.outputs.mode == 'skip'
+        run: |
+          {
+            echo "## Coverage Gate"
+            echo ""
+            echo "No plugin coverage-relevant files changed in this PR."
+            echo "Full coverage still runs on pushes to main, manual dispatch, and schedule."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when full coverage shards fail
+        if: needs.coverage-plan.outputs.mode == 'full' && needs.coverage-shard.result != 'success'
+        run: exit 1
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        if: needs.coverage-plan.outputs.mode != 'skip'
         with:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust-ci
+        if: needs.coverage-plan.outputs.mode != 'skip'
         with:
           shared-key: "ci-coverage"
 
       - name: Install cargo-llvm-cov
+        if: needs.coverage-plan.outputs.mode != 'skip'
         uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
         with:
           tool: cargo-llvm-cov
 
       - name: Install llvm tools
+        if: needs.coverage-plan.outputs.mode != 'skip'
         run: rustup component add llvm-tools-preview
 
+      - name: Run PR plugin coverage
+        if: needs.coverage-plan.outputs.mode == 'plugin'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report \
+            --lib
+          cargo llvm-cov --no-report \
+            --test unit_tests
+        env:
+          RUST_BACKTRACE: 1
+
       - name: Download coverage data
+        if: needs.coverage-plan.outputs.mode == 'full'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: coverage-data-*
@@ -219,6 +314,7 @@ jobs:
           merge-multiple: true
 
       - name: Extract coverage data
+        if: needs.coverage-plan.outputs.mode == 'full'
         run: |
           set -euo pipefail
           # Each shard tar holds *.profraw plus the instrumented binaries with
@@ -237,6 +333,7 @@ jobs:
           test -n "$(find target/llvm-cov-target -name '*.profraw' -print -quit)"
 
       - name: Generate coverage reports
+        if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
           set -euo pipefail
           mkdir -p coverage-report
@@ -258,6 +355,7 @@ jobs:
             --output-path coverage-report/coverage.json
 
       - name: Write coverage summary
+        if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
           set -euo pipefail
 
@@ -299,24 +397,39 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check coverage thresholds
+        if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
           set -euo pipefail
 
+          threshold_args=()
+          if [ "$COVERAGE_MODE" = "full" ]; then
+            threshold_args+=(
+              --min-overall-line "$MIN_OVERALL_LINE_COVERAGE"
+              --min-plugins-line "$MIN_PLUGINS_LINE_COVERAGE"
+            )
+          else
+            threshold_args+=(--min-changed-plugins-line "$MIN_CHANGED_PLUGIN_LINE_COVERAGE")
+          fi
+
           changed_base_args=()
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            changed_base_args=(--changed-base "origin/${{ github.base_ref }}")
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="${BASE_SHA:-origin/${BASE_REF}}"
+            changed_base_args=(--changed-base "$base_ref")
           fi
 
           python3 scripts/check_coverage_thresholds.py \
             --coverage-json coverage-report/coverage.json \
             --lcov coverage-report/lcov.info \
-            --min-overall-line "$MIN_OVERALL_LINE_COVERAGE" \
-            --min-plugins-line "$MIN_PLUGINS_LINE_COVERAGE" \
-            --min-changed-plugins-line "$MIN_CHANGED_PLUGIN_LINE_COVERAGE" \
+            "${threshold_args[@]}" \
             "${changed_base_args[@]}"
+        env:
+          COVERAGE_MODE: ${{ needs.coverage-plan.outputs.mode }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
 
       - name: Upload coverage report
-        if: always()
+        if: always() && needs.coverage-plan.outputs.mode != 'skip'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-report
