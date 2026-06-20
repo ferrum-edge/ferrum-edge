@@ -1770,13 +1770,9 @@ impl Plugin for RequestDeduplication {
                     }
                 }
                 if let Some(cached) = redis_candidate {
-                    match self.redis_set(&key, &fingerprint, &cached).await {
-                        RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
-                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-                                self.redis_release_inflight(&key, &fingerprint, token).await;
-                            }
-                        }
-                        RedisStoreAction::Failed => {}
+                    self.redis_set(&key, &fingerprint, &cached).await;
+                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                        self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                     return PluginResult::Continue;
                 }
