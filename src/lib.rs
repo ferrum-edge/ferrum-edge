@@ -358,6 +358,12 @@ pub mod _test_support {
         plugin.current_total_size_for_tests()
     }
 
+    pub fn response_caching_size_accounting_snapshot_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> (usize, usize) {
+        plugin.size_accounting_snapshot_for_tests()
+    }
+
     /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.

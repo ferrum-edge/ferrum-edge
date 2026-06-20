@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -202,11 +202,11 @@ struct CacheEntry {
     /// A full cache key is always its base key optionally followed by
     /// `:<vary dimensions>` (see [`ResponseCaching::build_cache_key`]), so
     /// `&key[..base_key_len]` recovers the base key without re-parsing the
-    /// colon-delimited (and query-colon-bearing) structure. [`prune_vary_index`]
-    /// uses it to reclaim `vary_index` mappings whose base key has no surviving
-    /// variant.
+    /// colon-delimited (and query-colon-bearing) structure.
+    /// [`prune_vary_index_locked`] uses it to reclaim `vary_index` mappings
+    /// whose base key has no surviving variant.
     ///
-    /// [`prune_vary_index`]: ResponseCaching::prune_vary_index
+    /// [`prune_vary_index_locked`]: ResponseCaching::prune_vary_index_locked
     base_key_len: usize,
 }
 
@@ -554,6 +554,7 @@ pub struct ResponseCaching {
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
     total_size: Arc<AtomicUsize>,
+    accounting_lock: Arc<Mutex<()>>,
     clock_offset_nanos: Arc<AtomicU64>,
     uncacheable_predictor: UncacheablePredictor,
 }
@@ -575,9 +576,16 @@ impl ResponseCaching {
             cache: Arc::new(DashMap::new()),
             vary_index: Arc::new(DashMap::new()),
             total_size: Arc::new(AtomicUsize::new(0)),
+            accounting_lock: Arc::new(Mutex::new(())),
             clock_offset_nanos: Arc::new(AtomicU64::new(0)),
             uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100)),
         })
+    }
+
+    fn accounting_guard(&self) -> MutexGuard<'_, ()> {
+        self.accounting_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Current value of the running cache-size accountant.
@@ -587,6 +595,31 @@ impl ResponseCaching {
     #[allow(dead_code)]
     pub(crate) fn current_total_size_for_tests(&self) -> usize {
         self.total_size.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn size_accounting_snapshot_for_tests(&self) -> (usize, usize) {
+        let _guard = self.accounting_guard();
+        (
+            self.total_size.load(Ordering::Relaxed),
+            self.actual_total_size_locked(),
+        )
+    }
+
+    fn actual_total_size_locked(&self) -> usize {
+        self.cache
+            .iter()
+            .map(|entry| entry.value().approx_size())
+            .sum()
+    }
+
+    fn sub_total_size_locked(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let current = self.total_size.load(Ordering::Relaxed);
+        self.total_size
+            .store(current.saturating_sub(n), Ordering::Relaxed);
     }
 
     /// Advance this plugin instance's clock without sleeping.
@@ -869,6 +902,11 @@ impl ResponseCaching {
     }
 
     fn invalidate_base_key(&self, base_key: &str) {
+        let _guard = self.accounting_guard();
+        self.invalidate_base_key_locked(base_key);
+    }
+
+    fn invalidate_base_key_locked(&self, base_key: &str) {
         let mut variant_prefix = String::with_capacity(base_key.len() + 1);
         variant_prefix.push_str(base_key);
         variant_prefix.push(':');
@@ -883,17 +921,22 @@ impl ResponseCaching {
         });
 
         if removed_size > 0 {
-            sub_total_size(&self.total_size, removed_size);
+            self.sub_total_size_locked(removed_size);
         }
         self.vary_index.remove(base_key);
     }
 
     fn invalidate_cache_key(&self, base_key: &str, cache_key: &str) {
+        let _guard = self.accounting_guard();
+        self.invalidate_cache_key_locked(base_key, cache_key);
+    }
+
+    fn invalidate_cache_key_locked(&self, base_key: &str, cache_key: &str) {
         let Some((_, entry)) = self.cache.remove(cache_key) else {
             return;
         };
 
-        sub_total_size(&self.total_size, entry.approx_size());
+        self.sub_total_size_locked(entry.approx_size());
         if cache_key == base_key {
             self.vary_index.remove(base_key);
         }
@@ -942,7 +985,7 @@ impl ResponseCaching {
     }
 
     /// Evict expired entries when cache exceeds max_entries.
-    fn evict_if_needed(&self) {
+    fn evict_if_needed_locked(&self) {
         if self.cache.len() <= self.config.max_entries {
             return;
         }
@@ -957,7 +1000,7 @@ impl ResponseCaching {
                 true
             }
         });
-        sub_total_size(&self.total_size, removed_size);
+        self.sub_total_size_locked(removed_size);
 
         if self.cache.len() > self.config.max_entries {
             let mut entries: Vec<(String, Duration)> = self
@@ -970,7 +1013,7 @@ impl ResponseCaching {
             let to_remove = self.cache.len() - self.config.max_entries;
             for (key, _) in entries.into_iter().take(to_remove) {
                 if let Some((_, removed)) = self.cache.remove(&key) {
-                    sub_total_size(&self.total_size, removed.approx_size());
+                    self.sub_total_size_locked(removed.approx_size());
                 }
             }
         }
@@ -997,7 +1040,7 @@ impl ResponseCaching {
     /// deliberately batched with slack so a saturated, high-cardinality cache
     /// reclaims stale mappings in groups instead of cloning every live base key
     /// on every store.
-    fn prune_vary_index(&self) {
+    fn prune_vary_index_locked(&self) {
         let cache_len = self.cache.len();
         if self.vary_index.len() <= cache_len.saturating_add(vary_index_prune_slack(cache_len)) {
             return;
@@ -1033,6 +1076,7 @@ impl ResponseCaching {
     /// Invalidate cache entries matching a path pattern.
     /// Called when an unsafe method (POST/PUT/PATCH/DELETE) hits a path.
     fn invalidate_path(&self, ctx: &RequestContext) {
+        let _guard = self.accounting_guard();
         let proxy_id = ctx
             .matched_proxy
             .as_ref()
@@ -1059,12 +1103,12 @@ impl ResponseCaching {
         });
 
         if removed_size > 0 {
-            sub_total_size(&self.total_size, removed_size);
+            self.sub_total_size_locked(removed_size);
         }
         // A path sweep can strand many base keys' `vary_index` mappings at once
         // (every principal/variant of the invalidated path); reclaim them now
         // rather than waiting for the next store.
-        self.prune_vary_index();
+        self.prune_vary_index_locked();
     }
 
     fn add_cache_status_header(&self, headers: &mut HashMap<String, String>, value: &str) {
@@ -1293,13 +1337,10 @@ fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
 
 /// Subtract `n` from the running cache-size accountant without ever wrapping.
 ///
-/// Inserts use `fetch_add` while several removal paths (`invalidate_base_key`,
-/// `evict_if_needed`, expired-entry removal, the insert-replace path) subtract.
-/// A plain `fetch_sub` underflows to ~`usize::MAX` if accounting ever drifts
-/// (a double-subtract or a lost add), and because the store path rejects when
-/// `current_total + entry_size > max`, that wrap would permanently wedge the
-/// cap and disable all future stores. Saturating at `0` keeps any drift
-/// bounded and self-correcting instead of self-disabling.
+/// This remains as a small testable primitive for callers that need saturated
+/// subtraction. Response-cache entry admission now performs exact accounting
+/// under `ResponseCaching::accounting_lock`, so production cache mutations do
+/// not depend on this helper for race safety.
 pub(crate) fn sub_total_size(total: &AtomicUsize, n: usize) {
     if n == 0 {
         return;
@@ -1454,9 +1495,7 @@ impl Plugin for ResponseCaching {
             let current_age = entry.current_age(now);
             if !entry.is_fresh_at(now) {
                 drop(entry);
-                if let Some((_, removed)) = self.cache.remove(&cache_key) {
-                    sub_total_size(&self.total_size, removed.approx_size());
-                }
+                self.invalidate_cache_key(&base_key, &cache_key);
             } else {
                 debug!(cache_key = %cache_key, "response_caching: cache HIT");
 
@@ -1682,33 +1721,62 @@ impl Plugin for ResponseCaching {
             freshness_lifetime,
             corrected_initial_age,
             // `cache_key` is `base_key` plus an optional `:<vary>` suffix, so
-            // `base_key.len()` is the prefix that `prune_vary_index` slices back
-            // out to recover this entry's base key.
+            // `base_key.len()` is the prefix that `prune_vary_index_locked`
+            // slices back out to recover this entry's base key.
             base_key_len: base_key.len(),
         };
         let entry_size = entry.approx_size();
 
-        let current_total = self.total_size.load(Ordering::Relaxed);
-        if current_total.saturating_add(entry_size) > self.config.max_total_size_bytes {
-            debug!(
-                cache_key = %cache_key,
-                current_total = current_total,
-                entry_size = entry_size,
-                max_total = self.config.max_total_size_bytes,
-                "response_caching: total cache size would exceed limit, skipping cache"
-            );
-            return PluginResult::Continue;
-        }
+        {
+            // Lock ordering: acquire `accounting_lock` before mutating
+            // `cache`, `vary_index`, or `total_size`, and never acquire it
+            // while holding a DashMap entry guard. Cache-hit reads do not take
+            // this lock.
+            let _guard = self.accounting_guard();
+            let old_size = self
+                .cache
+                .get(&cache_key)
+                .map(|old_entry| old_entry.approx_size())
+                .unwrap_or(0);
+            let current_total = self.total_size.load(Ordering::Relaxed);
+            let next_total = current_total
+                .saturating_sub(old_size)
+                .saturating_add(entry_size);
 
-        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
-            sub_total_size(&self.total_size, old.approx_size());
+            if entry_size > self.config.max_total_size_bytes
+                || next_total > self.config.max_total_size_bytes
+            {
+                debug!(
+                    cache_key = %cache_key,
+                    current_total = current_total,
+                    old_size = old_size,
+                    entry_size = entry_size,
+                    next_total = next_total,
+                    max_total = self.config.max_total_size_bytes,
+                    "response_caching: total cache size would exceed limit, skipping cache"
+                );
+                return PluginResult::Continue;
+            }
+
+            if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
+                debug_assert_eq!(
+                    old.approx_size(),
+                    old_size,
+                    "response_caching replacement size must match admitted old entry"
+                );
+            }
+            self.total_size.store(next_total, Ordering::Relaxed);
+            self.vary_index.insert(base_key, vary_headers);
+            self.evict_if_needed_locked();
+            // The store above is the only path that grows `vary_index`; prune
+            // here so a high-cardinality principal stream can't leak it
+            // unboundedly.
+            self.prune_vary_index_locked();
         }
-        self.total_size.fetch_add(entry_size, Ordering::Relaxed);
         // Response was cacheable; remove the exact cache key from the predictor
         // even for client no-cache bypass refreshes, which return before
         // `CACHE_PREDICT_KEY` is available.
         self.uncacheable_predictor.mark_cacheable(&cache_key);
-        self.vary_index.insert(base_key, vary_headers);
 
         debug!(
             cache_key = %cache_key,
@@ -1718,10 +1786,6 @@ impl Plugin for ResponseCaching {
             "response_caching: cached response"
         );
 
-        self.evict_if_needed();
-        // The store above is the only path that grows `vary_index`; prune here
-        // so a high-cardinality principal stream can't leak it unboundedly.
-        self.prune_vary_index();
         PluginResult::Continue
     }
 }
@@ -1877,8 +1941,8 @@ mod tests {
         // by base key. `vary_index` was only ever pruned in
         // `invalidate_base_key`, so a stream of distinct principals (JWT `sub`s,
         // ephemeral SPIFFE IDs) would leak it without bound even though
-        // `self.cache` stays capped at `max_entries`. `prune_vary_index` must
-        // reclaim mappings whose base key has no surviving cache variant.
+        // `self.cache` stays capped at `max_entries`. `prune_vary_index_locked`
+        // must reclaim mappings whose base key has no surviving cache variant.
         let max_entries = 4;
         let plugin = plugin_with_config(json!({
             "ttl_seconds": 60,
@@ -1925,7 +1989,7 @@ mod tests {
             plugin.cache.len() + vary_index_prune_slack(plugin.cache.len());
         assert!(
             plugin.vary_index.len() <= max_vary_index_entries,
-            "vary_index leaked past cache+slack bound ({}): {} entries — prune_vary_index did not reclaim stale base keys",
+            "vary_index leaked past cache+slack bound ({}): {} entries — prune_vary_index_locked did not reclaim stale base keys",
             max_vary_index_entries,
             plugin.vary_index.len()
         );
