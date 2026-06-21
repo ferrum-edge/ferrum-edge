@@ -118,7 +118,6 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
         .unwrap_or(0)
 }
 
-use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -1515,21 +1514,15 @@ impl Plugin for RequestDeduplication {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        // Never hold a `text/event-stream` body: it cannot be cached for
-        // idempotent replay (an incrementally-delivered stream has no final
-        // body to store), so buffering it would only pin an unbounded response
-        // on the buffered path with no benefit. Streaming it instead keeps the
-        // `InFlight` marker active for the lifetime of the still-in-flight
-        // stream — which is exactly the concurrent-duplicate protection this
-        // plugin promises — and the marker self-heals once it exceeds
-        // `inflight_ttl` (documented to cover the longest protected request,
-        // including a long-lived stream). The marker is intentionally NOT
-        // released at response-headers time: there is no plugin hook for
-        // streamed-body completion, and releasing early would admit a duplicate
-        // mutating request to the backend while the original stream is still
-        // running, defeating the in-flight lock.
+        // Keep buffering for every keyed response, including `text/event-stream`.
+        // Request-deduplication publishes or releases the in-flight marker from
+        // `on_final_response_body`, and that hook only runs on the buffered path.
+        // Opting out for SSE would leave finite event-stream responses stuck as
+        // in-flight until TTL cleanup, causing stale 409s and max_entries-bypassing
+        // memory pressure. The content type is still accepted here so the hook
+        // signature stays aligned with other plugins' content-aware gates.
+        let _ = content_type;
         self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_event_stream_content_type)
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
