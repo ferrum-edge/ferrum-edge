@@ -575,9 +575,8 @@ impl DatabaseStore {
             .await?;
 
         if self.db_type != "sqlite" {
-            let lock_sql = self.q(
-                "SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE",
-            );
+            let lock_sql =
+                self.q("SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE");
             sqlx::query(&lock_sql)
                 .bind(Self::CONFIG_CHANGE_LOCK_NAME)
                 .fetch_optional(&mut **tx)
@@ -3837,10 +3836,8 @@ impl DatabaseStore {
         }
         let cutoff = max_sequence - Self::CHANGE_LOG_RETAIN_PER_NAMESPACE;
         let retained_row = sqlx::query(
-            &self.q(
-                "SELECT COALESCE(MAX(sequence), 0) AS retained_sequence \
-                 FROM config_changes WHERE namespace = ? AND sequence <= ?",
-            ),
+            &self.q("SELECT COALESCE(MAX(sequence), 0) AS retained_sequence \
+                 FROM config_changes WHERE namespace = ? AND sequence <= ?"),
         )
         .bind(namespace)
         .bind(cutoff as i64)

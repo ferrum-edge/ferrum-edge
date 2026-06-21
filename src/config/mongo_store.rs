@@ -1220,16 +1220,16 @@ mod inner {
                 })
                 .sort(doc! { "sequence": -1 })
                 .await?;
-            let retained_sequence =
-                match retained_doc.as_ref().and_then(|doc| doc.get("sequence")) {
-                    Some(Bson::Int64(value)) if *value > 0 => Some(*value),
-                    Some(Bson::Int32(value)) if *value > 0 => Some(*value as i64),
-                    Some(other) => anyhow::bail!(
-                        "MongoDB config_changes row has invalid sequence: {:?}",
-                        other
-                    ),
-                    None => None,
-                };
+            let retained_sequence = match retained_doc.as_ref().and_then(|doc| doc.get("sequence"))
+            {
+                Some(Bson::Int64(value)) if *value > 0 => Some(*value),
+                Some(Bson::Int32(value)) if *value > 0 => Some(*value as i64),
+                Some(other) => anyhow::bail!(
+                    "MongoDB config_changes row has invalid sequence: {:?}",
+                    other
+                ),
+                None => None,
+            };
             self.config_changes()
                 .delete_many(doc! {
                     "namespace": namespace,

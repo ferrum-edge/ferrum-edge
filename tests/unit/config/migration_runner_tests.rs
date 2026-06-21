@@ -197,10 +197,7 @@ async fn test_run_pending_restores_full_load_indexes_on_existing_v001_db() {
         "idx_upstreams_ns_id",
     ] {
         let drop_sql = format!("DROP INDEX {index_name}");
-        sqlx::query(&drop_sql)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(&drop_sql).execute(&pool).await.unwrap();
     }
     let index_names = get_index_names(&pool).await;
     for index_name in [
