@@ -721,6 +721,32 @@ pub async fn handle_admin_request(
             });
         }
 
+        if state.mode == "database"
+            && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
+                .database_delta_poll_metrics_snapshot()
+        {
+            if let Some(degraded) = snapshot.degraded {
+                health_status["status"] = json!("degraded");
+                health_status["database_polling"] = json!({
+                    "status": "degraded",
+                    "reason": degraded.reason,
+                    "resource_category": degraded.resource_category,
+                    "validation_category": degraded.validation_category,
+                    "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
+                    "current_backoff_bucket": degraded.current_backoff_bucket,
+                    "current_backoff_seconds": degraded.current_backoff_seconds,
+                    "escalated": degraded.escalated,
+                });
+            } else {
+                health_status["database_polling"] = json!({
+                    "status": "ok",
+                    "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
+                    "current_backoff_bucket": snapshot.current_backoff_bucket,
+                    "current_backoff_seconds": snapshot.current_backoff_seconds,
+                });
+            }
+        }
+
         if state
             .proxy_state
             .as_ref()
@@ -2990,7 +3016,7 @@ fn build_metrics(state: &AdminState) -> Value {
             );
         }
 
-        json!({
+        let mut metrics = json!({
             "gateway": {
                 "mode": state.mode,
                 "ferrum_version": crate::FERRUM_VERSION,
@@ -3056,7 +3082,15 @@ fn build_metrics(state: &AdminState) -> Value {
             "rate_limiting": {
                 "tracked_key_count": rate_limiter_keys,
             },
-        })
+        });
+        if state.mode == "database"
+            && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
+                .database_delta_poll_metrics_snapshot()
+        {
+            metrics["database_polling"] =
+                serde_json::to_value(snapshot).unwrap_or_else(|_| json!(null));
+        }
+        metrics
     } else {
         // CP mode or no proxy state
         json!({

@@ -39,7 +39,7 @@ curl http://localhost:9000/status
 # Returns: {"status": "ok", "timestamp": "...", "mode": "database"}
 ```
 
-Both endpoints return the same response and do not require JWT authentication, making them suitable for load balancer health probes.
+Both endpoints return the same response and do not require JWT authentication, making them suitable for load balancer health probes. In database mode, the response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` there while the gateway keeps serving the last known-good runtime config.
 
 ## TLS Inventory
 
@@ -512,7 +512,7 @@ Returns:
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
-The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. It includes TLS inventory gauges `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` for loaded certificate sources, plus `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_refresh_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total` for background source watcher activity. In mesh mode it also includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
+The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. It includes TLS inventory gauges `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` for loaded certificate sources, plus `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_refresh_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total` for background source watcher activity. In database mode it also includes bounded rejected-delta polling metrics such as `ferrum_database_delta_rejections_total`, `ferrum_database_delta_backoff_bucket`, `ferrum_database_delta_forced_full_reloads_total`, and `ferrum_database_delta_recoveries_total`. In mesh mode it also includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
 
 ### Runtime Metrics
 

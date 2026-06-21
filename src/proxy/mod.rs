@@ -6596,9 +6596,6 @@ impl ProxyState {
             &self.env_config.namespace,
         );
         if let Err(errors) = self.validate_full_config(&new_config) {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
             return ConfigApplyOutcome::rejected(errors);
         }
 
@@ -6632,10 +6629,6 @@ impl ProxyState {
             Ok(None) => return ConfigApplyOutcome::Unchanged,
             Err(e) => {
                 let message = format!("security plugin validation failed: {e}");
-                error!(
-                    "Incremental config rejected — security plugin validation failed: {}",
-                    e
-                );
                 return ConfigApplyOutcome::rejected_one(message);
             }
         };

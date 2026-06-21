@@ -571,6 +571,14 @@ pub struct EnvConfig {
     pub db_type: Option<String>,
     pub db_url: Option<String>,
     pub db_poll_interval: u64,
+    /// Database-mode initial backoff, in seconds, after a database incremental
+    /// delta is rejected by validation. CP mode uses the normal DB poll interval.
+    pub db_rejected_delta_backoff_initial_seconds: u64,
+    /// Database-mode maximum rejected-delta retry backoff, in seconds.
+    pub db_rejected_delta_backoff_max_seconds: u64,
+    /// Database-mode number of identical rejected deltas before the poller
+    /// attempts an authoritative primary-backed full reload.
+    pub db_rejected_delta_full_reload_threshold: u64,
     pub db_tls_mode: Option<DbTlsMode>,
     pub db_tls_ca_cert_path: Option<String>,
     pub db_tls_client_cert_path: Option<String>,
@@ -1690,6 +1698,9 @@ impl Default for EnvConfig {
             db_type: None,
             db_url: None,
             db_poll_interval: 30,
+            db_rejected_delta_backoff_initial_seconds: 1,
+            db_rejected_delta_backoff_max_seconds: 30,
+            db_rejected_delta_full_reload_threshold: 3,
             db_tls_mode: None,
             db_tls_ca_cert_path: None,
             db_tls_client_cert_path: None,
@@ -2017,6 +2028,9 @@ impl EnvConfig {
             db_type: Option<String> = "FERRUM_DB_TYPE";
             db_url: Option<String> = "FERRUM_DB_URL";
             db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64, max(1u64);
+            db_rejected_delta_backoff_initial_seconds: u64 = "FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS" => 1u64, clamp(1u64, 3600u64);
+            db_rejected_delta_backoff_max_seconds: u64 = "FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS" => 30u64, clamp(1u64, 3600u64);
+            db_rejected_delta_full_reload_threshold: u64 = "FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD" => 3u64, max(1u64);
             db_tls_mode: Option<DbTlsMode> = "FERRUM_DB_TLS_MODE";
             db_tls_ca_cert_path: Option<String> = "FERRUM_DB_TLS_CA_CERT_PATH";
             db_tls_client_cert_path: Option<String> = "FERRUM_DB_TLS_CLIENT_CERT_PATH";
@@ -2050,6 +2064,18 @@ impl EnvConfig {
                 "FERRUM_DB_POLL_INTERVAL=0 is clamped to 1 second; set a positive interval to avoid this implicit floor"
             );
         }
+        let db_rejected_delta_backoff_max_seconds = if db_rejected_delta_backoff_max_seconds
+            < db_rejected_delta_backoff_initial_seconds
+        {
+            tracing::warn!(
+                configured_initial = db_rejected_delta_backoff_initial_seconds,
+                configured_max = db_rejected_delta_backoff_max_seconds,
+                "FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS is below the initial backoff; clamped to the initial value"
+            );
+            db_rejected_delta_backoff_initial_seconds
+        } else {
+            db_rejected_delta_backoff_max_seconds
+        };
         // Clamp statement timeout at parse time so the warning fires once at
         // startup instead of on every new database connection.
         const MAX_STATEMENT_TIMEOUT_SECONDS: u64 = 3600;
@@ -2648,6 +2674,9 @@ impl EnvConfig {
             db_type,
             db_url,
             db_poll_interval,
+            db_rejected_delta_backoff_initial_seconds,
+            db_rejected_delta_backoff_max_seconds,
+            db_rejected_delta_full_reload_threshold,
             db_tls_mode,
             db_tls_ca_cert_path,
             db_tls_client_cert_path,
