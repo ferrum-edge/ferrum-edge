@@ -3407,6 +3407,8 @@ impl DatabaseStore {
         let changes = self
             .load_config_changes_after(namespace, after_sequence)
             .await?;
+        self.ensure_change_cursor_available(namespace, after_sequence)
+            .await?;
 
         if changes.is_empty() {
             self.check_slow_query("load_incremental_config", start);

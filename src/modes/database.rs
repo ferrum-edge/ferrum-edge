@@ -2202,6 +2202,7 @@ async fn load_full_config_with_sequence(
     db: &Arc<dyn DatabaseBackend>,
     namespace: &str,
 ) -> Result<(GatewayConfig, u64), anyhow::Error> {
+    db.maybe_apply_deferred_migrations().await?;
     let sequence = db.latest_change_sequence(namespace).await?;
     let config = db.load_full_config(namespace).await?;
     Ok((config, sequence))
@@ -2267,6 +2268,30 @@ mod tests {
         assert!(
             source.contains("let mut last_change_sequence: Option<u64> = initial_change_sequence;"),
             "poll loop must start from the initial full-load cursor"
+        );
+    }
+
+    #[test]
+    fn full_reload_applies_deferred_migrations_before_sequence_cursor_read() {
+        let source = include_str!("database.rs");
+        let helper_start = source
+            .find("async fn load_full_config_with_sequence")
+            .expect("load_full_config_with_sequence helper must exist");
+        let helper_end = source[helper_start..]
+            .find("fn commit_full_reload_poll_state")
+            .expect("commit_full_reload_poll_state helper must follow full load helper");
+        let helper_source = &source[helper_start..helper_start + helper_end];
+
+        let migration_hook = helper_source
+            .find("maybe_apply_deferred_migrations")
+            .expect("full reload helper must apply deferred migrations");
+        let sequence_read = helper_source
+            .find("latest_change_sequence")
+            .expect("full reload helper must read latest change sequence");
+
+        assert!(
+            migration_hook < sequence_read,
+            "deferred migrations must run before reading config_changes"
         );
     }
 

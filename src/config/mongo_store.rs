@@ -1230,12 +1230,6 @@ mod inner {
                 ),
                 None => None,
             };
-            self.config_changes()
-                .delete_many(doc! {
-                    "namespace": namespace,
-                    "sequence": { "$lte": cutoff as i64 },
-                })
-                .await?;
             if let Some(retained_sequence) = retained_sequence {
                 self.config_change_counters()
                     .update_one(
@@ -1248,6 +1242,12 @@ mod inner {
                     .upsert(true)
                     .await?;
             }
+            self.config_changes()
+                .delete_many(doc! {
+                    "namespace": namespace,
+                    "sequence": { "$lte": cutoff as i64 },
+                })
+                .await?;
             Ok(())
         }
 
@@ -2256,6 +2256,8 @@ mod inner {
                     _ => {}
                 }
             }
+            self.ensure_change_cursor_available(namespace, after_sequence)
+                .await?;
             if change_count >= CHANGE_LOG_BATCH_LIMIT as usize {
                 anyhow::bail!(
                     "MongoDB config change batch for namespace '{}' reached limit {}; forcing full reload",

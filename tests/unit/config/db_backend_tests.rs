@@ -383,6 +383,25 @@ fn incremental_result_is_empty_when_default() {
 }
 
 #[test]
+fn incremental_result_deserializes_legacy_delta_without_sequence_cursor() {
+    let result: IncrementalResult = serde_json::from_value(serde_json::json!({
+        "added_or_modified_proxies": [],
+        "removed_proxy_ids": [],
+        "added_or_modified_consumers": [],
+        "removed_consumer_ids": [],
+        "added_or_modified_plugin_configs": [],
+        "removed_plugin_config_ids": [],
+        "added_or_modified_upstreams": [],
+        "removed_upstream_ids": [],
+        "poll_timestamp": "2026-06-21T00:00:00Z"
+    }))
+    .expect("legacy incremental deltas without sequence_cursor must deserialize");
+
+    assert_eq!(result.sequence_cursor, 0);
+    assert!(result.is_empty());
+}
+
+#[test]
 fn incremental_result_not_empty_with_added_proxy() {
     let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
         "id": "p1",

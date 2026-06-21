@@ -95,6 +95,7 @@ pub struct IncrementalResult {
     pub added_or_modified_upstreams: Vec<Upstream>,
     pub removed_upstream_ids: Vec<String>,
     /// Highest durable config change sequence included in this poll.
+    #[serde(default)]
     pub sequence_cursor: u64,
     /// Timestamp to use as the in-memory/gRPC config version for this delta.
     pub poll_timestamp: DateTime<Utc>,
