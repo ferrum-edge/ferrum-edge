@@ -319,6 +319,10 @@ pub enum NodeWaypointIdentityError {
         expected: u64,
         actual: u64,
     },
+    PodUidMismatch {
+        expected: [u8; 16],
+        actual: [u8; 16],
+    },
 }
 
 impl fmt::Display for NodeWaypointIdentityError {
@@ -351,6 +355,12 @@ impl fmt::Display for NodeWaypointIdentityError {
                 f,
                 "node-waypoint SPIFFE hash mismatch for pod {}: expected {expected}, got {actual}",
                 pod_uid_label(pod_uid)
+            ),
+            Self::PodUidMismatch { expected, actual } => write!(
+                f,
+                "node-waypoint pod UID mismatch: listener expected pod {}, eBPF record resolved pod {}",
+                pod_uid_label(expected),
+                pod_uid_label(actual)
             ),
         }
     }
@@ -978,6 +988,24 @@ impl NodeWaypointIdentityResolver {
         self.resolve_cookie_metadata(cookie)
     }
 
+    /// Resolve an accepted stream and require the eBPF record's pod UID to
+    /// match the pod-specific in-netns listener that accepted it. This is a
+    /// defense-in-depth guard for the sock-ops bridge's `netns_cookie = 0`
+    /// compatibility key: the bridge may recover an accept-side cookie when the
+    /// passive callback reports the proxy task's netns, but userspace still
+    /// refuses to admit a connection whose source pod does not match the
+    /// listener it arrived on.
+    pub fn resolve_stream_for_expected_pod(
+        &self,
+        stream: &TcpStream,
+        expected_pod_uid: [u8; 16],
+    ) -> Result<NodeWaypointResolvedConnection, NodeWaypointIdentityError> {
+        let cookie = crate::socket_opts::socket_cookie(stream).map_err(|error| {
+            NodeWaypointIdentityError::SocketCookieUnavailable(error.to_string())
+        })?;
+        self.resolve_cookie_metadata_for_expected_pod(cookie, expected_pod_uid)
+    }
+
     /// Resolve a socket cookie to its `(identity, scope)` pair, both derived
     /// from the SAME slice load (see [`Self::resolve_record`]). Both branches —
     /// the warm `cookie_records` hit and the between-tick synchronous fallback —
@@ -1020,6 +1048,21 @@ impl NodeWaypointIdentityResolver {
             return self.resolve_record(cookie, pod_uid, workload_spiffe_hash, orig_dst);
         }
         Err(NodeWaypointIdentityError::UnknownCookie(cookie))
+    }
+
+    fn resolve_cookie_metadata_for_expected_pod(
+        &self,
+        cookie: u64,
+        expected_pod_uid: [u8; 16],
+    ) -> Result<NodeWaypointResolvedConnection, NodeWaypointIdentityError> {
+        let resolved = self.resolve_cookie_metadata(cookie)?;
+        if resolved.identity.pod_uid != expected_pod_uid {
+            return Err(NodeWaypointIdentityError::PodUidMismatch {
+                expected: expected_pod_uid,
+                actual: resolved.identity.pod_uid,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Resolve an eBPF-stamped `(pod_uid, workload_spiffe_hash)` record to its
@@ -1552,6 +1595,37 @@ mod tests {
             .resolve_cookie_metadata(8)
             .expect("IPv6 original destination is preserved");
         assert_eq!(resolved.orig_dst, "[::1]:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn resolve_cookie_metadata_for_expected_pod_rejects_wrong_listener_uid() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let actual_pod = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let expected_pod = parse_pod_uid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let identity =
+            NodeWaypointIdentity::new(actual_pod, spiffe("spiffe://td/ns/default/sa/api"));
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::new(),
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )]);
+        resolver.record_orig_dst4(7, orig_dst4(actual_pod, hash));
+
+        let error = match resolver.resolve_cookie_metadata_for_expected_pod(7, expected_pod) {
+            Ok(_) => panic!("listener pod UID mismatch must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            NodeWaypointIdentityError::PodUidMismatch {
+                expected: expected_pod,
+                actual: actual_pod,
+            }
+        );
     }
 
     #[test]

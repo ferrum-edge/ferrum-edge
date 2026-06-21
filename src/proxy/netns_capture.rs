@@ -14,9 +14,11 @@
 //! The GAP-2M `sock_ops` cookie bridge has the same requirement from the other
 //! direction: it re-keys the orig-dst record by `(netns cookie, 4-tuple)` at
 //! active-established and recovers it at passive-established using the
-//! accept-side socket's netns cookie. That only matches when the accepting
-//! socket shares the connecting socket's netns — i.e. when the proxy accepts
-//! *in the pod netns*.
+//! accept-side callback's netns cookie. Live kernels may report the proxy
+//! accepting task's netns for that passive callback even though the listener was
+//! bound in the workload netns. The eBPF bridge therefore has a best-effort
+//! any-netns fallback, and this listener passes its expected pod UID into the
+//! accept path so a fallback match is still validated before admission.
 //!
 //! # What this does
 //!
@@ -27,8 +29,8 @@
 //! socket. The listening socket's fd is process-global once created, so the
 //! accept loop runs on the shared tokio runtime in the host netns; only the
 //! `bind()` happens in the pod netns. The accepted connection then resolves its
-//! source pod identity through the same cookie path as before — which now
-//! succeeds because the bridge's same-netns assumption holds.
+//! source pod identity through the same cookie path as before, with the listener
+//! pod UID used as a final guard against any fallback tuple collision.
 //!
 //! The node-agent (which watches pods and holds their cgroup paths) publishes
 //! the enrolled-pod set to a pinned registry directory; this manager polls it
@@ -54,6 +56,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+
+use crate::modes::mesh::node_waypoint::parse_pod_uid;
 
 use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 
@@ -542,6 +546,17 @@ impl NetnsBackend for ProxyNetnsBackend {
         target: &PodCaptureTarget,
         capture_addr: SocketAddr,
     ) -> Option<OpenedNetnsListener> {
+        let expected_pod_uid = match parse_pod_uid(&target.pod_uid) {
+            Ok(pod_uid) => pod_uid,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    %error,
+                    "Node-waypoint in-netns listener rejected invalid pod UID"
+                );
+                return None;
+            }
+        };
         let std_listener =
             match imp::bind_capture_listener_in_pod_netns(&target.cgroup_path, capture_addr) {
                 Ok(listener) => listener,
@@ -609,6 +624,7 @@ impl NetnsBackend for ProxyNetnsBackend {
                 mesh_direction,
                 0,
                 SourceIpOverride::Dynamic(source_ip_rx),
+                Some(expected_pod_uid),
             )
             .await;
         });

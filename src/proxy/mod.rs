@@ -253,6 +253,9 @@ fn record_node_waypoint_identity_drop(
         NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
             crate::overload::NodeWaypointDropReason::HashMismatch
         }
+        NodeWaypointIdentityError::PodUidMismatch { .. } => {
+            crate::overload::NodeWaypointDropReason::HashMismatch
+        }
     };
     overload.record_node_waypoint_drop(reason);
 }
@@ -9847,6 +9850,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         None,
         0,
         SourceIpOverride::none(),
+        None,
     )
     .await;
     Ok(())
@@ -10254,6 +10258,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     mesh_direction,
                     i,
                     SourceIpOverride::none(),
+                    None,
                 )
                 .await;
             }));
@@ -10277,6 +10282,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             mesh_direction,
             0,
             SourceIpOverride::none(),
+            None,
         )
         .await;
 
@@ -10300,6 +10306,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             mesh_direction,
             0,
             SourceIpOverride::none(),
+            None,
         )
         .await;
     }
@@ -10370,6 +10377,7 @@ async fn run_accept_loop(
     // pod IP so client-IP authz conditions, logs, and IP-keyed plugins see the
     // pod instead of loopback.
     source_ip_override: SourceIpOverride,
+    node_waypoint_expected_pod_uid: Option<[u8; 16]>,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     // Count consecutive accept() failures to back off a busy-loop. Under fd
@@ -10427,7 +10435,17 @@ async fn run_accept_loop(
                                 && let Some(resolver) =
                                     state.node_waypoint_identity_resolver.as_ref()
                             {
-                                match resolver.resolve_stream(&stream) {
+                                let resolved = if let Some(expected_pod_uid) =
+                                    node_waypoint_expected_pod_uid
+                                {
+                                    resolver.resolve_stream_for_expected_pod(
+                                        &stream,
+                                        expected_pod_uid,
+                                    )
+                                } else {
+                                    resolver.resolve_stream(&stream)
+                                };
+                                match resolved {
                                     // HTTP/HBONE re-queries the per-pod scope per
                                     // request, so the accept-time scope is unused
                                     // here; keep only the identity on the
