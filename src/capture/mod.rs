@@ -3145,7 +3145,7 @@ mod tests {
 
         assert!(
             cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && c.contains("-p udp --dport 15020 -j RETURN")),
+                && c.contains("-p udp --dport 5353 -j RETURN")),
             "UDP inbound exclude port RETURN missing: {cmds:?}"
         );
     }
@@ -3673,23 +3673,35 @@ mod tests {
 
         let plan = IptablesPlan::for_config(&config);
 
-        // The IPv4 family must emit NO UDP state at all (no TPROXY rule — neither
-        // the unqualified outbound nor the `--dst-type LOCAL` inbound catch-all —
-        // and no UDP mangle chains / PREROUTING jumps / fwmark routing for v4).
-        // Both the outbound AND inbound catch-alls are unqualified `-j TPROXY`
-        // diversions that would black-hole all IPv4 UDP though only IPv6 was
-        // selected (codex r4).
-        for cmd in &plan.v4_commands {
-            let touches_udp_tproxy = cmd.contains("-p udp") && cmd.contains("-j TPROXY");
-            let touches_routing = cmd.starts_with("ip rule") || cmd.starts_with("ip route");
-            assert!(
-                !cmd.contains("FERRUM_MESH_UDP")
-                    && !touches_udp_tproxy
-                    && !cmd.contains("fwmark")
-                    && !touches_routing,
-                "IPv6-only explicit includes must emit no IPv4 UDP state: {cmd}"
-            );
-        }
+        // The IPv4 family must emit no OUTBOUND UDP catch-all or MARK rule when
+        // only IPv6 CIDRs are selected. Inbound LOCAL capture is still emitted for
+        // the active IPv4 family so pod-destined UDP fail-closes behind the mesh
+        // relay instead of bypassing mTLS/authz.
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND") && c.contains("-j TPROXY")),
+            "IPv6-only explicit includes must not emit IPv4 outbound UDP TPROXY state: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK") && c.contains("-j MARK")),
+            "IPv6-only explicit includes must not MARK IPv4 outbound UDP egress: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                    && c.contains("-m addrtype --dst-type LOCAL")
+                    && c.contains("-j TPROXY")),
+            "IPv4 inbound UDP LOCAL capture must stay installed for fail-closed inbound protection: {:?}",
+            plan.v4_commands
+        );
         // The TCP IPv4 chains are still present (CIDR scoping is outbound-UDP-only).
         assert!(
             plan.v4_commands
@@ -3756,9 +3768,10 @@ mod tests {
             "IPv4 routing must be installed when a port include emits a rule: {:?}",
             plan.v4_commands
         );
-        // But the IPv4 family must STILL NOT get either UNQUALIFIED catch-all — the
-        // implicit outbound catch-all OR the inbound `--dst-type LOCAL` catch-all
-        // (both would black-hole all IPv4 UDP though only IPv6 was CIDR-selected).
+        // But the IPv4 family must STILL NOT get an unqualified OUTBOUND
+        // catch-all. Inbound `--dst-type LOCAL` capture is deliberately present
+        // for fail-closed inbound protection even when the outbound CIDR selector
+        // is IPv6-only.
         assert!(
             !plan
                 .v4_commands
@@ -3771,11 +3784,12 @@ mod tests {
             plan.v4_commands
         );
         assert!(
-            !plan
-                .v4_commands
+            plan.v4_commands
                 .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-j TPROXY")),
-            "IPv4 inbound catch-all must stay suppressed for the unselected family: {:?}",
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                    && c.contains("-m addrtype --dst-type LOCAL")
+                    && c.contains("-j TPROXY")),
+            "IPv4 inbound LOCAL capture must stay installed for fail-closed inbound protection: {:?}",
             plan.v4_commands
         );
         // The IPv6 family keeps its CIDR-qualified OUTBOUND rule (it IS the selected
