@@ -576,12 +576,7 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.config.decompress_request
-            && ctx.headers.contains_key("content-encoding")
-            && !ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
-            && !ctx
-                .metadata
-                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+        self.config.decompress_request && ctx.headers.contains_key("content-encoding")
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
@@ -701,30 +696,34 @@ impl Plugin for CompressionPlugin {
         // `max_decompressed_request_size` but still unnecessary work).
         headers.remove("x-ferrum-original-content-encoding");
 
-        // RFC 9111 no-transform is valid on requests too. Treat it as an opt-out
-        // from gateway request/response representation changes and leave
-        // Accept-Encoding/Content-Encoding intact for the origin to handle.
-        if request_no_transform(ctx, headers) {
+        // RFC 9111 no-transform on requests opts out of gateway response
+        // compression, but it must not disable request decompression when
+        // `decompress_request` is enabled. Cache-Control is client-controlled;
+        // honoring it for request-body normalization would let compressed
+        // uploads bypass downstream body-inspection hooks.
+        let has_request_no_transform = request_no_transform(ctx, headers);
+        if has_request_no_transform {
             ensure_cache_control_no_transform(headers);
             ctx.metadata.insert(
                 REQUEST_NO_TRANSFORM_METADATA_KEY.to_string(),
                 "true".to_string(),
             );
-            return PluginResult::Continue;
         }
 
         // Save original Accept-Encoding before we potentially strip it.
         // Read from `headers` param — ctx.headers may be empty when the handler
         // uses the zero-clone fast path (std::mem::take).
-        if let Some(ae) = headers.get("accept-encoding") {
-            ctx.metadata
-                .insert("compression:accept_encoding".to_string(), ae.clone());
-        }
+        if !has_request_no_transform {
+            if let Some(ae) = headers.get("accept-encoding") {
+                ctx.metadata
+                    .insert("compression:accept_encoding".to_string(), ae.clone());
+            }
 
-        // Strip Accept-Encoding from the backend request so the backend
-        // sends an uncompressed response (we'll compress it ourselves).
-        if self.config.remove_accept_encoding {
-            headers.remove("accept-encoding");
+            // Strip Accept-Encoding from the backend request so the backend
+            // sends an uncompressed response (we'll compress it ourselves).
+            if self.config.remove_accept_encoding {
+                headers.remove("accept-encoding");
+            }
         }
 
         // For request decompression: save the Content-Encoding value before
@@ -928,10 +927,6 @@ impl Plugin for CompressionPlugin {
             return None;
         }
 
-        if headers_have_cache_control_directive(request_headers, "no-transform") {
-            return None;
-        }
-
         // Check Content-Encoding to decide how to decompress. The original
         // header was removed in before_proxy and saved under the private key
         // x-ferrum-original-content-encoding so the backend doesn't see it.
@@ -966,18 +961,11 @@ impl Plugin for CompressionPlugin {
 
     async fn transform_request_body_with_context(
         &self,
-        ctx: &mut RequestContext,
+        _ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
-        {
-            return None;
-        }
         self.transform_request_body(body, content_type, request_headers)
             .await
     }
