@@ -27,10 +27,7 @@ async fn seed_runtime_row_set(store: &DatabaseStore, idx: usize) {
     )
     .bind(format!("u-{suffix}"))
     .bind(format!("upstream-{suffix}"))
-    .bind(format!(
-        r#"[{{"host":"127.0.0.1","port":{}}}]"#,
-        8100 + idx
-    ))
+    .bind(format!(r#"[{{"host":"127.0.0.1","port":{}}}]"#, 8100 + idx))
     .bind(&ts)
     .bind(&ts)
     .execute(&pool)

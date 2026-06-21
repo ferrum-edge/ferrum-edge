@@ -1276,11 +1276,7 @@ impl DatabaseStore {
         // query or decode error rejects the whole candidate instead of
         // publishing proxies with silently empty plugin lists.
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_namespace_tx(
-                namespace,
-                "load_full_config",
-                tx,
-            )
+            .load_proxy_plugin_associations_for_namespace_tx(namespace, "load_full_config", tx)
             .await?;
 
         // Load proxies in chunks to avoid unbounded SELECT * at scale.

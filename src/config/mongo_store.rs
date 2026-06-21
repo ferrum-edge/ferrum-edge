@@ -1648,10 +1648,12 @@ mod inner {
                 } else {
                     (
                         self.load_full_proxies_opt_session(namespace, None).await?,
-                        self.load_full_consumers_opt_session(namespace, None).await?,
+                        self.load_full_consumers_opt_session(namespace, None)
+                            .await?,
                         self.load_full_plugin_configs_opt_session(namespace, None)
                             .await?,
-                        self.load_full_upstreams_opt_session(namespace, None).await?,
+                        self.load_full_upstreams_opt_session(namespace, None)
+                            .await?,
                     )
                 };
 
@@ -1692,125 +1694,6 @@ mod inner {
             }
 
             Ok(config)
-        }
-
-        async fn load_full_proxies_opt_session(
-            &self,
-            namespace: &str,
-            session: Option<&mut ClientSession>,
-        ) -> Result<Vec<Proxy>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
-            let proxies_collection = self.proxies();
-            let mut proxies = Vec::new();
-
-            if let Some(s) = session {
-                let mut cursor = proxies_collection.find(filter).session(&mut *s).await?;
-                while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut proxy = doc_to_proxy(doc)?;
-                    proxy.api_spec_id = None;
-                    proxies.push(proxy);
-                }
-            } else {
-                let mut cursor = proxies_collection.find(filter).await?;
-                while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut proxy = doc_to_proxy(doc)?;
-                    proxy.api_spec_id = None;
-                    proxies.push(proxy);
-                }
-            }
-
-            Ok(proxies)
-        }
-
-        async fn load_full_consumers_opt_session(
-            &self,
-            namespace: &str,
-            session: Option<&mut ClientSession>,
-        ) -> Result<Vec<Consumer>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
-            let consumers_collection = self.consumers();
-            let mut consumers = Vec::new();
-
-            if let Some(s) = session {
-                let mut cursor = consumers_collection.find(filter).session(&mut *s).await?;
-                while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    consumers.push(doc_to_consumer(doc)?);
-                }
-            } else {
-                let mut cursor = consumers_collection.find(filter).await?;
-                while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    consumers.push(doc_to_consumer(doc)?);
-                }
-            }
-
-            Ok(consumers)
-        }
-
-        async fn load_full_plugin_configs_opt_session(
-            &self,
-            namespace: &str,
-            session: Option<&mut ClientSession>,
-        ) -> Result<Vec<PluginConfig>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
-            let plugin_configs_collection = self.plugin_configs();
-            let mut plugin_configs = Vec::new();
-
-            if let Some(s) = session {
-                let mut cursor = plugin_configs_collection
-                    .find(filter)
-                    .session(&mut *s)
-                    .await?;
-                while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut plugin_config = doc_to_plugin_config(doc)?;
-                    plugin_config.api_spec_id = None;
-                    plugin_configs.push(plugin_config);
-                }
-            } else {
-                let mut cursor = plugin_configs_collection.find(filter).await?;
-                while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut plugin_config = doc_to_plugin_config(doc)?;
-                    plugin_config.api_spec_id = None;
-                    plugin_configs.push(plugin_config);
-                }
-            }
-
-            Ok(plugin_configs)
-        }
-
-        async fn load_full_upstreams_opt_session(
-            &self,
-            namespace: &str,
-            session: Option<&mut ClientSession>,
-        ) -> Result<Vec<Upstream>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
-            let upstreams_collection = self.upstreams();
-            let mut upstreams = Vec::new();
-
-            if let Some(s) = session {
-                let mut cursor = upstreams_collection.find(filter).session(&mut *s).await?;
-                while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut upstream = doc_to_upstream(doc)?;
-                    upstream.api_spec_id = None;
-                    upstreams.push(upstream);
-                }
-            } else {
-                let mut cursor = upstreams_collection.find(filter).await?;
-                while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut upstream = doc_to_upstream(doc)?;
-                    upstream.api_spec_id = None;
-                    upstreams.push(upstream);
-                }
-            }
-
-            Ok(upstreams)
         }
 
         async fn load_gateway_trust_bundles(
@@ -4333,6 +4216,125 @@ mod inner {
     }
 
     impl MongoStore {
+        async fn load_full_proxies_opt_session(
+            &self,
+            namespace: &str,
+            session: Option<&mut ClientSession>,
+        ) -> Result<Vec<Proxy>, anyhow::Error> {
+            let filter = doc! { "namespace": namespace };
+            let proxies_collection = self.proxies();
+            let mut proxies = Vec::new();
+
+            if let Some(s) = session {
+                let mut cursor = proxies_collection.find(filter).session(&mut *s).await?;
+                while cursor.advance(&mut *s).await? {
+                    let doc = cursor.deserialize_current()?;
+                    let mut proxy = doc_to_proxy(doc)?;
+                    proxy.api_spec_id = None;
+                    proxies.push(proxy);
+                }
+            } else {
+                let mut cursor = proxies_collection.find(filter).await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    let mut proxy = doc_to_proxy(doc)?;
+                    proxy.api_spec_id = None;
+                    proxies.push(proxy);
+                }
+            }
+
+            Ok(proxies)
+        }
+
+        async fn load_full_consumers_opt_session(
+            &self,
+            namespace: &str,
+            session: Option<&mut ClientSession>,
+        ) -> Result<Vec<Consumer>, anyhow::Error> {
+            let filter = doc! { "namespace": namespace };
+            let consumers_collection = self.consumers();
+            let mut consumers = Vec::new();
+
+            if let Some(s) = session {
+                let mut cursor = consumers_collection.find(filter).session(&mut *s).await?;
+                while cursor.advance(&mut *s).await? {
+                    let doc = cursor.deserialize_current()?;
+                    consumers.push(doc_to_consumer(doc)?);
+                }
+            } else {
+                let mut cursor = consumers_collection.find(filter).await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    consumers.push(doc_to_consumer(doc)?);
+                }
+            }
+
+            Ok(consumers)
+        }
+
+        async fn load_full_plugin_configs_opt_session(
+            &self,
+            namespace: &str,
+            session: Option<&mut ClientSession>,
+        ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+            let filter = doc! { "namespace": namespace };
+            let plugin_configs_collection = self.plugin_configs();
+            let mut plugin_configs = Vec::new();
+
+            if let Some(s) = session {
+                let mut cursor = plugin_configs_collection
+                    .find(filter)
+                    .session(&mut *s)
+                    .await?;
+                while cursor.advance(&mut *s).await? {
+                    let doc = cursor.deserialize_current()?;
+                    let mut plugin_config = doc_to_plugin_config(doc)?;
+                    plugin_config.api_spec_id = None;
+                    plugin_configs.push(plugin_config);
+                }
+            } else {
+                let mut cursor = plugin_configs_collection.find(filter).await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    let mut plugin_config = doc_to_plugin_config(doc)?;
+                    plugin_config.api_spec_id = None;
+                    plugin_configs.push(plugin_config);
+                }
+            }
+
+            Ok(plugin_configs)
+        }
+
+        async fn load_full_upstreams_opt_session(
+            &self,
+            namespace: &str,
+            session: Option<&mut ClientSession>,
+        ) -> Result<Vec<Upstream>, anyhow::Error> {
+            let filter = doc! { "namespace": namespace };
+            let upstreams_collection = self.upstreams();
+            let mut upstreams = Vec::new();
+
+            if let Some(s) = session {
+                let mut cursor = upstreams_collection.find(filter).session(&mut *s).await?;
+                while cursor.advance(&mut *s).await? {
+                    let doc = cursor.deserialize_current()?;
+                    let mut upstream = doc_to_upstream(doc)?;
+                    upstream.api_spec_id = None;
+                    upstreams.push(upstream);
+                }
+            } else {
+                let mut cursor = upstreams_collection.find(filter).await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    let mut upstream = doc_to_upstream(doc)?;
+                    upstream.api_spec_id = None;
+                    upstreams.push(upstream);
+                }
+            }
+
+            Ok(upstreams)
+        }
+
         /// Load all `_id` values from a collection (for deletion detection).
         #[allow(dead_code)]
         async fn load_collection_ids(
