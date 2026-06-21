@@ -948,13 +948,8 @@ mod inner {
             operation: &str,
         ) -> Result<(), anyhow::Error> {
             let sequence = self.next_config_change_sequence().await?;
-            let doc = Self::config_change_doc(
-                sequence,
-                namespace,
-                resource_type,
-                resource_id,
-                operation,
-            );
+            let doc =
+                Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes().insert_one(doc).await?;
             self.compact_config_changes(namespace).await?;
             Ok(())
@@ -969,13 +964,8 @@ mod inner {
             operation: &str,
         ) -> Result<(), anyhow::Error> {
             let sequence = self.next_config_change_sequence_in_session(session).await?;
-            let doc = Self::config_change_doc(
-                sequence,
-                namespace,
-                resource_type,
-                resource_id,
-                operation,
-            );
+            let doc =
+                Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes()
                 .insert_one(doc)
                 .session(&mut *session)
@@ -2199,9 +2189,7 @@ mod inner {
                                     .session(&mut *s)
                                     .await?;
                                 let orphaned = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(
-                                        &mut *s,
-                                    ))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 this.record_config_change_in_session(
@@ -2354,13 +2342,14 @@ mod inner {
                                     .session(&mut *s)
                                     .await?
                                     .map(|doc| {
-                                        let sid =
-                                            doc.get_str("_id").map(str::to_string).map_err(|e| {
+                                        let sid = doc.get_str("_id").map(str::to_string).map_err(
+                                            |e| {
                                                 mongodb::error::Error::custom(format!(
                                                     "api_spec for proxy {} is missing _id: {}",
                                                     id, e
                                                 ))
-                                            })?;
+                                            },
+                                        )?;
                                         let namespace = doc
                                             .get_str("namespace")
                                             .map(str::to_string)
@@ -2426,9 +2415,9 @@ mod inner {
                                                 uid,
                                             )
                                             .await
-                                            .map_err(|e| {
-                                                mongodb::error::Error::custom(e.to_string())
-                                            })?
+                                            .map_err(
+                                                |e| mongodb::error::Error::custom(e.to_string()),
+                                            )?
                                         } else {
                                             None
                                         };
@@ -2448,9 +2437,7 @@ mod inner {
                                 }
 
                                 let orphaned_proxy_group_plugin_deletes = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(
-                                        &mut *s,
-                                    ))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 if result.deleted_count > 0 {
@@ -2484,15 +2471,14 @@ mod inner {
                                                 "upstream",
                                                 upstream_id,
                                                 "delete",
-                                            )
-                                            .await
-                                            .map_err(|e| {
-                                                mongodb::error::Error::custom(e.to_string())
-                                            })?;
-                                        }
+                                        )
+                                        .await
+                                        .map_err(
+                                            |e| mongodb::error::Error::custom(e.to_string()),
+                                        )?;
                                     }
-                                    if let Some(upstream_id) =
-                                        deleted_orphaned_upstream_id.as_ref()
+                                }
+                                    if let Some(upstream_id) = deleted_orphaned_upstream_id.as_ref()
                                     {
                                         this.record_config_change_in_session(
                                             &mut *s,
@@ -2904,8 +2890,7 @@ mod inner {
                     .await?;
                 }
                 session.commit_transaction().await?;
-                self.compact_config_changes_best_effort(&pc.namespace)
-                    .await;
+                self.compact_config_changes_best_effort(&pc.namespace).await;
             } else {
                 self.plugin_configs().insert_one(doc).await?;
                 self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
@@ -2973,8 +2958,7 @@ mod inner {
                     .await?;
                 }
                 session.commit_transaction().await?;
-                self.compact_config_changes_best_effort(&pc.namespace)
-                    .await;
+                self.compact_config_changes_best_effort(&pc.namespace).await;
             } else {
                 self.plugin_configs()
                     .replace_one(doc! { "_id": &pc.id }, doc)
@@ -3662,8 +3646,10 @@ mod inner {
                     .await?;
                 }
                 session.commit_transaction().await?;
-                let namespaces: HashSet<String> =
-                    proxies.iter().map(|proxy| proxy.namespace.clone()).collect();
+                let namespaces: HashSet<String> = proxies
+                    .iter()
+                    .map(|proxy| proxy.namespace.clone())
+                    .collect();
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
@@ -3784,8 +3770,10 @@ mod inner {
                     .await?;
                 }
                 session.commit_transaction().await?;
-                let namespaces: HashSet<String> =
-                    configs.iter().map(|config| config.namespace.clone()).collect();
+                let namespaces: HashSet<String> = configs
+                    .iter()
+                    .map(|config| config.namespace.clone())
+                    .collect();
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
@@ -5596,7 +5584,8 @@ mod inner {
                 self.compact_config_changes_best_effort(namespace).await;
                 for (_, plugin_namespace) in &orphaned_proxy_group_plugin_deletes {
                     if plugin_namespace.as_str() != namespace {
-                        self.compact_config_changes_best_effort(plugin_namespace).await;
+                        self.compact_config_changes_best_effort(plugin_namespace)
+                            .await;
                     }
                 }
                 self.check_slow_query("delete_api_spec", start);
@@ -5695,13 +5684,8 @@ mod inner {
                     .await?;
             }
             for (plugin_id, plugin_namespace) in orphaned_proxy_group_plugin_deletes {
-                self.record_config_change(
-                    &plugin_namespace,
-                    "plugin_config",
-                    &plugin_id,
-                    "delete",
-                )
-                .await?;
+                self.record_config_change(&plugin_namespace, "plugin_config", &plugin_id, "delete")
+                    .await?;
             }
 
             self.check_slow_query("delete_api_spec", start);

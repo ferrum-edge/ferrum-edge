@@ -420,7 +420,10 @@ async fn load_full_config_multi_with_sequence(
 ) -> Result<(GatewayConfig, HashMap<String, u64>), anyhow::Error> {
     let mut sequences = HashMap::new();
     if namespaces.is_empty() {
-        sequences.insert("ferrum".to_string(), db.latest_change_sequence("ferrum").await?);
+        sequences.insert(
+            "ferrum".to_string(),
+            db.latest_change_sequence("ferrum").await?,
+        );
     }
     for ns in namespaces {
         sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
