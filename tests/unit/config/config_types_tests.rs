@@ -2871,7 +2871,7 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
 }
 
 #[test]
-fn test_unique_listen_paths_allows_same_host_path_in_different_namespaces() {
+fn test_unique_listen_paths_rejects_same_host_path_in_different_namespaces() {
     let mut tenant_a = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
     tenant_a.namespace = "tenant-a".to_string();
     let mut tenant_b = make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]);
@@ -2879,9 +2879,11 @@ fn test_unique_listen_paths_allows_same_host_path_in_different_namespaces() {
     let mut config = empty_config();
     config.proxies = vec![tenant_a, tenant_b];
 
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
     assert!(
-        config.validate_unique_listen_paths().is_ok(),
-        "proxy listen_path uniqueness is namespace-scoped"
+        err[0].contains("Overlapping host+listen_path"),
+        "runtime routing is listener-wide, so cross-namespace host/path duplicates must be rejected: {err:?}"
     );
 }
 
@@ -3701,6 +3703,23 @@ fn test_validate_unique_listen_paths_rejects_overlapping_host_only_proxies() {
     assert!(
         config.validate_unique_listen_paths().is_err(),
         "two host-only proxies on the same host must conflict"
+    );
+}
+
+#[test]
+fn test_validate_unique_listen_paths_rejects_cross_namespace_host_only_overlap() {
+    let mut a = make_host_only_proxy("a", &["shared.example.com"]);
+    a.namespace = "tenant-a".to_string();
+    let mut b = make_host_only_proxy("b", &["shared.example.com"]);
+    b.namespace = "tenant-b".to_string();
+    let config = GatewayConfig {
+        proxies: vec![a, b],
+        ..Default::default()
+    };
+
+    assert!(
+        config.validate_unique_listen_paths().is_err(),
+        "host-only routing is listener-wide, so cross-namespace host duplicates must conflict"
     );
 }
 
