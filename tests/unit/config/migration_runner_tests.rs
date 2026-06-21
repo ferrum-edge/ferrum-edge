@@ -149,8 +149,16 @@ async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
         .await
         .unwrap();
     let index_names = get_index_names(&pool).await;
-    assert!(!index_names.iter().any(|n| n == "idx_config_changes_ns_sequence"));
-    assert!(!index_names.iter().any(|n| n == "idx_config_changes_sequence"));
+    assert!(
+        !index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_ns_sequence")
+    );
+    assert!(
+        !index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_sequence")
+    );
 
     let applied = runner.run_pending().await.unwrap();
     assert!(
@@ -159,11 +167,15 @@ async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
     );
     let index_names = get_index_names(&pool).await;
     assert!(
-        index_names.iter().any(|n| n == "idx_config_changes_ns_sequence"),
+        index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_ns_sequence"),
         "compatibility pass must restore idx_config_changes_ns_sequence"
     );
     assert!(
-        index_names.iter().any(|n| n == "idx_config_changes_sequence"),
+        index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_sequence"),
         "compatibility pass must restore idx_config_changes_sequence"
     );
 }
