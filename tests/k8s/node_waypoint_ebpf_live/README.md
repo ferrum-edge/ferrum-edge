@@ -16,8 +16,9 @@ The script renders the chart first and fails if an enabled eBPF node-agent or
 NodeWaypoint proxy would use a non-`-ebpf` image. It then installs the chart,
 checks `/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`,
 collects BPF program/link/map evidence with `bpftool`, creates same-node and
-cross-node source/destination pods, and exercises Service ClusterIP and direct
-Pod-IP traffic. On dual-stack clusters it requires IPv6 to be rejected before a
+cross-node source/destination pods, and verifies Service ClusterIP and direct
+Pod-IP traffic fail closed until NodeWaypoint can target a reachable HBONE
+peer address. On dual-stack clusters it requires IPv6 to be rejected before a
 request is admitted until the end-to-end IPv6 NodeWaypoint path is implemented.
 The ambient proxy is started with `FERRUM_MESH_ALLOW_NO_CA=true` because this
 disposable test targets eBPF capture, pod attribution, and policy scoping, not

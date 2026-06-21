@@ -591,13 +591,20 @@ async fn run_with_backend(
             }
             _ = retry_interval.tick() => {
                 // Re-drive any pod whose transient enrollment failure has aged
-                // past the backoff window. Cheap no-op when none are pending.
+                // past the backoff window, and retry stale pod-IP map removals
+                // that would otherwise keep capture partially attached. Cheap
+                // no-ops when none are pending.
                 retry_backed_off_pod_enrollments(
                     backend.as_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                     false,
+                );
+                retry_pending_pod_ip_removals(
+                    backend.as_mut(),
+                    &pod_states,
+                    metrics.as_ref(),
                 );
             }
         }
@@ -1442,6 +1449,30 @@ fn pending_capture_failure_key(state_key: &str, operation: &str, detail: &str) -
     format!("{state_key}:{operation}:{detail}")
 }
 
+#[derive(Debug, Clone)]
+struct PendingCaptureFailure {
+    key: String,
+    state_key: String,
+    operation: String,
+    detail: String,
+}
+
+fn parse_pending_capture_failure_key(key: &str) -> Option<PendingCaptureFailure> {
+    let mut parts = key.rsplitn(3, ':');
+    let detail = parts.next()?;
+    let operation = parts.next()?;
+    let state_key = parts.next()?;
+    if state_key.is_empty() || operation.is_empty() || detail.is_empty() {
+        return None;
+    }
+    Some(PendingCaptureFailure {
+        key: key.to_string(),
+        state_key: state_key.to_string(),
+        operation: operation.to_string(),
+        detail: detail.to_string(),
+    })
+}
+
 #[cfg(test)]
 fn pending_capture_failure_prefix(state_key: &str) -> String {
     format!("{state_key}:")
@@ -1456,6 +1487,29 @@ fn remember_pending_capture_failure(state_key: &str, operation: &str, detail: &s
 
 fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str) {
     PENDING_CAPTURE_FAILURES.remove(&pending_capture_failure_key(state_key, operation, detail));
+}
+
+fn forget_pending_pod_ip_remove_failures_for_ip(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::Ipv4Addr,
+) -> usize {
+    let key_prefix = pod_state_key_prefix(pod_states);
+    let detail = ip.to_string();
+    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            (failure.state_key.starts_with(&key_prefix)
+                && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
+                && failure.detail == detail)
+                .then_some(failure.key)
+        })
+        .collect();
+    let removed = keys.len();
+    for key in keys {
+        PENDING_CAPTURE_FAILURES.remove(&key);
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -1620,6 +1674,68 @@ fn retry_backed_off_pod_enrollments(
         );
         handle_pod_added(backend, pod_states, config, metrics, &event);
     }
+}
+
+fn pending_pod_ip_removal_failures(
+    pod_states: &DashMap<String, PodAttachmentState>,
+) -> Vec<(String, std::net::Ipv4Addr)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            if !failure.state_key.starts_with(&key_prefix)
+                || failure.operation != CAPTURE_FAILURE_POD_IP_REMOVE
+            {
+                return None;
+            }
+            let ip = failure.detail.parse().ok()?;
+            Some((failure.key, ip))
+        })
+        .collect()
+}
+
+fn retry_pending_pod_ip_removals(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+) {
+    let pending = pending_pod_ip_removal_failures(pod_states);
+    if pending.is_empty() {
+        return;
+    }
+
+    for (failure_key, ip) in pending {
+        if let Some(owner_pod_uid) = pod_owning_ip(pod_states, ip) {
+            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            debug!(
+                owner_pod_uid,
+                %ip,
+                "Cleared pending pod IP removal failure because another tracked pod owns the IP"
+            );
+            continue;
+        }
+
+        match backend.remove_pod_ip(ip) {
+            Ok(()) => {
+                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                debug!(%ip, "Recovered pending pod IP map removal failure");
+            }
+            Err(e) => {
+                warn!(
+                    %ip,
+                    error = %e,
+                    "Retrying pending pod IP map removal failed; keeping capture state degraded"
+                );
+            }
+        }
+    }
+
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
 /// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
@@ -1968,6 +2084,9 @@ fn handle_pod_added(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
+        if let Some(ip) = pod_ip {
+            forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
+        }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
@@ -2062,6 +2181,7 @@ fn remove_pod_ip_if_unowned(
         );
         let state_key = pod_state_key(pod_states, pod_uid);
         forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     }
@@ -2089,6 +2209,15 @@ fn other_pod_owning_ip(
         (entry.key().as_str() != pod_uid && entry.value().pod_ip == Some(ip))
             .then(|| entry.key().clone())
     })
+}
+
+fn pod_owning_ip(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::Ipv4Addr,
+) -> Option<String> {
+    pod_states
+        .iter()
+        .find_map(|entry| (entry.value().pod_ip == Some(ip)).then(|| entry.key().clone()))
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -5792,7 +5921,102 @@ mod tests {
             "pod-IP removal failures can leave stale map entries and must keep degraded readiness"
         );
 
-        forget_pending_capture_failures_for_pod(&state_key);
+        backend.fail_remove_pod_ip = false;
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+
+        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(
+            !backend.pod_ips.contains_key(&ip),
+            "retry must remove the stale pod-IP map entry"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
+    }
+
+    #[test]
+    fn pod_ip_remove_failure_clears_when_ip_is_reowned() {
+        let mut backend = MockEbpfBackend {
+            fail_remove_pod_ip: true,
+            ..MockEbpfBackend::default()
+        };
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "old".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let old_state_key = pod_state_key(&pod_states, "pod-uid-1");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
+
+        let failure_key =
+            pending_capture_failure_key(&old_state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
+        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+
+        pod_states.insert(
+            "pod-uid-2".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-2".to_string(),
+                pod_name: "new".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+
+        assert!(
+            !PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+            "re-owned pod IP should clear stale removal failure instead of keeping readiness degraded"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
     }
 
     #[test]

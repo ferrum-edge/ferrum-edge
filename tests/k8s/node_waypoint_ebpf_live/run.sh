@@ -950,15 +950,15 @@ expect_blocked() {
 }
 
 run_traffic_checks() {
-  log "running IPv4 same-node/cross-node Service and Pod-IP checks"
+  log "running IPv4 same-node/cross-node fail-closed Service and Pod-IP checks"
   local dst_a_ip dst_b_ip
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
 
-  expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
-  expect_allowed src-a "same-node direct Pod IP" "http://$dst_a_ip:8080/" "ok-a"
-  expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
-  expect_allowed src-a "cross-node direct Pod IP" "http://$dst_b_ip:8080/" "ok-b"
+  expect_blocked src-a "same-node Service ClusterIP fail-closed until NodeWaypoint HBONE target delivery exists" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  expect_blocked src-a "same-node direct Pod IP fail-closed until NodeWaypoint HBONE target delivery exists" "http://$dst_a_ip:8080/"
+  expect_blocked src-a "cross-node Service ClusterIP fail-closed until NodeWaypoint HBONE target delivery exists" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
+  expect_blocked src-a "cross-node direct Pod IP fail-closed until NodeWaypoint HBONE target delivery exists" "http://$dst_b_ip:8080/"
 
   expect_blocked src-b "selector/namespace DENY same-node" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
   expect_blocked src-b "selector/namespace DENY cross-node" "http://$dst_a_ip:8080/"
@@ -972,7 +972,7 @@ run_traffic_checks() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
-  expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
+  expect_blocked src-a "recreated source identity fail-closed until NodeWaypoint HBONE target delivery exists" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
   expect_blocked src-b "wrong-pod attribution guard after recreation" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
 }
 
