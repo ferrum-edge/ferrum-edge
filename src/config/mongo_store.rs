@@ -213,6 +213,8 @@ mod inner {
 
     struct MongoCollectionHandle {
         collection: Collection<Document>,
+        // Keep this handle in scope for cursor-producing finds; cursors can
+        // issue getMore calls after the initial find future completes.
         _connection: Arc<MongoConnectionBundle>,
     }
 
@@ -884,7 +886,8 @@ mod inner {
             let options = FindOptions::builder()
                 .projection(doc! { "_id": 0, "updated_at": 1 })
                 .build();
-            let mut cursor = self.api_specs().find(filter).with_options(options).await?;
+            let api_specs = self.api_specs();
+            let mut cursor = api_specs.find(filter).with_options(options).await?;
             let mut overage: i64 = 0;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -915,8 +918,8 @@ mod inner {
             session: Option<&mut ClientSession>,
         ) -> Result<(), anyhow::Error> {
             if let Some(s) = session {
-                let mut cursor = self
-                    .plugin_configs()
+                let plugin_configs = self.plugin_configs();
+                let mut cursor = plugin_configs
                     .find(doc! { "scope": "proxy_group" })
                     .projection(doc! { "_id": 1 })
                     .session(&mut *s)
@@ -948,8 +951,8 @@ mod inner {
             }
 
             // Find all proxy_group-scoped plugin config IDs
-            let mut cursor = self
-                .plugin_configs()
+            let plugin_configs = self.plugin_configs();
+            let mut cursor = plugin_configs
                 .find(doc! { "scope": "proxy_group" })
                 .projection(doc! { "_id": 1 })
                 .await?;
@@ -982,8 +985,8 @@ mod inner {
             upstream_id: &str,
         ) -> Result<Option<PluginConfig>, anyhow::Error> {
             if let Some(s) = session {
-                let mut cursor = self
-                    .plugin_configs()
+                let plugin_configs = self.plugin_configs();
+                let mut cursor = plugin_configs
                     .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
                     .session(&mut *s)
                     .await?;
@@ -994,8 +997,8 @@ mod inner {
                     }
                 }
             } else {
-                let mut cursor = self
-                    .plugin_configs()
+                let plugin_configs = self.plugin_configs();
+                let mut cursor = plugin_configs
                     .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
                     .await?;
                 while cursor.advance().await? {
@@ -1014,8 +1017,8 @@ mod inner {
             spec: &ApiSpec,
             previous_declared_assoc_ids: &HashSet<String>,
         ) -> Result<Option<String>, anyhow::Error> {
-            let mut plugin_cursor = self
-                .plugin_configs()
+            let plugin_configs = self.plugin_configs();
+            let mut plugin_cursor = plugin_configs
                 .find(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                 .await?;
             let mut plugins = Vec::new();
@@ -1070,8 +1073,8 @@ mod inner {
                 .cloned()
                 .collect();
 
-            let mut upstream_cursor = self
-                .upstreams()
+            let upstreams_collection = self.upstreams();
+            let mut upstream_cursor = upstreams_collection
                 .find(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                 .await?;
             let mut upstreams = Vec::new();
@@ -1116,8 +1119,8 @@ mod inner {
         ) -> Result<(), anyhow::Error> {
             if let Some(s) = session {
                 let mut upstream_ids = Vec::new();
-                let mut upstream_cursor = self
-                    .upstreams()
+                let upstreams_collection = self.upstreams();
+                let mut upstream_cursor = upstreams_collection
                     .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
                     .projection(doc! { "_id": 1 })
                     .session(&mut *s)
@@ -1157,8 +1160,8 @@ mod inner {
                 }
 
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
-                let mut plugin_cursor = self
-                    .plugin_configs()
+                let plugin_configs = self.plugin_configs();
+                let mut plugin_cursor = plugin_configs
                     .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
                     .session(&mut *s)
                     .await?;
@@ -1181,8 +1184,8 @@ mod inner {
                 }
             } else {
                 let mut upstream_ids = Vec::new();
-                let mut upstream_cursor = self
-                    .upstreams()
+                let upstreams_collection = self.upstreams();
+                let mut upstream_cursor = upstreams_collection
                     .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
                     .projection(doc! { "_id": 1 })
                     .await?;
@@ -1219,8 +1222,8 @@ mod inner {
                 }
 
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
-                let mut plugin_cursor = self
-                    .plugin_configs()
+                let plugin_configs = self.plugin_configs();
+                let mut plugin_cursor = plugin_configs
                     .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
                     .await?;
                 while plugin_cursor.advance().await? {
@@ -1610,7 +1613,8 @@ mod inner {
             // the SQL path's explicit `api_spec_id: None` in row_to_proxy / row_to_upstream
             // / row_to_plugin_config. Do NOT strip on write paths or admin-read paths.
             let mut proxies = Vec::new();
-            let mut cursor = self.proxies().find(ns_filter.clone()).await?;
+            let proxies_collection = self.proxies();
+            let mut cursor = proxies_collection.find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 let mut p = doc_to_proxy(doc)?;
@@ -1619,14 +1623,16 @@ mod inner {
             }
 
             let mut consumers = Vec::new();
-            let mut cursor = self.consumers().find(ns_filter.clone()).await?;
+            let consumers_collection = self.consumers();
+            let mut cursor = consumers_collection.find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 consumers.push(doc_to_consumer(doc)?);
             }
 
             let mut plugin_configs = Vec::new();
-            let mut cursor = self.plugin_configs().find(ns_filter.clone()).await?;
+            let plugin_configs_collection = self.plugin_configs();
+            let mut cursor = plugin_configs_collection.find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 let mut pc = doc_to_plugin_config(doc)?;
@@ -1635,7 +1641,8 @@ mod inner {
             }
 
             let mut upstreams = Vec::new();
-            let mut cursor = self.upstreams().find(ns_filter).await?;
+            let upstreams_collection = self.upstreams();
+            let mut cursor = upstreams_collection.find(ns_filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 let mut u = doc_to_upstream(doc)?;
@@ -1723,7 +1730,8 @@ mod inner {
             // Strip api_spec_id on every resource for the same reason as load_full_config:
             // api_spec_id is admin-only metadata and must not reach the gateway runtime.
             let mut added_or_modified_proxies = Vec::new();
-            let mut cursor = self.proxies().find(filter.clone()).await?;
+            let proxies_collection = self.proxies();
+            let mut cursor = proxies_collection.find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 let mut p = doc_to_proxy(doc)?;
@@ -1732,14 +1740,16 @@ mod inner {
             }
 
             let mut added_or_modified_consumers = Vec::new();
-            let mut cursor = self.consumers().find(filter.clone()).await?;
+            let consumers_collection = self.consumers();
+            let mut cursor = consumers_collection.find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 added_or_modified_consumers.push(doc_to_consumer(doc)?);
             }
 
             let mut added_or_modified_plugin_configs = Vec::new();
-            let mut cursor = self.plugin_configs().find(filter.clone()).await?;
+            let plugin_configs_collection = self.plugin_configs();
+            let mut cursor = plugin_configs_collection.find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 let mut pc = doc_to_plugin_config(doc)?;
@@ -1748,7 +1758,8 @@ mod inner {
             }
 
             let mut added_or_modified_upstreams = Vec::new();
-            let mut cursor = self.upstreams().find(filter).await?;
+            let upstreams_collection = self.upstreams();
+            let mut cursor = upstreams_collection.find(filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 let mut u = doc_to_upstream(doc)?;
@@ -2100,7 +2111,8 @@ mod inner {
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self.proxies().find(ns_filter).with_options(options).await?;
+            let proxies = self.proxies();
+            let mut cursor = proxies.find(ns_filter).with_options(options).await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -2163,11 +2175,8 @@ mod inner {
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self
-                .consumers()
-                .find(ns_filter)
-                .with_options(options)
-                .await?;
+            let consumers = self.consumers();
+            let mut cursor = consumers.find(ns_filter).with_options(options).await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -2262,11 +2271,8 @@ mod inner {
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self
-                .plugin_configs()
-                .find(ns_filter)
-                .with_options(options)
-                .await?;
+            let plugin_configs = self.plugin_configs();
+            let mut cursor = plugin_configs.find(ns_filter).with_options(options).await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -2392,11 +2398,8 @@ mod inner {
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self
-                .upstreams()
-                .find(ns_filter)
-                .with_options(options)
-                .await?;
+            let upstreams = self.upstreams();
+            let mut cursor = upstreams.find(ns_filter).with_options(options).await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -2462,8 +2465,8 @@ mod inner {
             // Otherwise iterate candidates and check host overlap in Rust so
             // wildcard semantics (e.g. `*.example.com` overlapping with
             // `api.example.com`) are detected correctly.
-            let mut cursor = self
-                .proxies()
+            let proxies = self.proxies();
+            let mut cursor = proxies
                 .find(filter)
                 .projection(doc! { "_id": 1, "hosts": 1 })
                 .await?;
@@ -3463,8 +3466,8 @@ mod inner {
             let proxy_to_persist: std::borrow::Cow<'_, crate::admin::api_specs::ExtractedBundle> = {
                 // 1. Spec-owned plugin IDs currently in the DB.
                 let old_spec_plugin_ids: std::collections::HashSet<String> = {
-                    let mut cursor = self
-                        .plugin_configs()
+                    let plugin_configs = self.plugin_configs();
+                    let mut cursor = plugin_configs
                         .find(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                         .await?;
                     let mut ids = std::collections::HashSet::new();
@@ -3876,11 +3879,8 @@ mod inner {
                 .limit(mongo_limit)
                 .projection(doc! { "spec_content": 0, "resource_hash": 0 })
                 .build();
-            let mut cursor = self
-                .api_specs()
-                .find(filter_doc)
-                .with_options(options)
-                .await?;
+            let api_specs = self.api_specs();
+            let mut cursor = api_specs.find(filter_doc).with_options(options).await?;
 
             let mut specs = Vec::new();
             if let Some(since) = exact_postfilter_since {
@@ -3928,8 +3928,8 @@ mod inner {
             let options = FindOptions::builder()
                 .sort(doc! { "created_at": 1, "_id": 1 })
                 .build();
-            let mut cursor = self
-                .plugin_configs()
+            let plugin_configs = self.plugin_configs();
+            let mut cursor = plugin_configs
                 .find(doc! { "namespace": namespace, "api_spec_id": spec_id })
                 .with_options(options)
                 .await?;
@@ -3964,8 +3964,8 @@ mod inner {
             let options = FindOptions::builder()
                 .sort(doc! { "created_at": 1, "_id": 1 })
                 .build();
-            let mut cursor = self
-                .upstreams()
+            let upstreams = self.upstreams();
+            let mut cursor = upstreams
                 .find(doc! { "namespace": namespace, "api_spec_id": spec_id })
                 .with_options(options)
                 .await?;
@@ -4174,11 +4174,8 @@ mod inner {
                 .skip(Some(filter.offset as u64))
                 .limit(Some(filter.limit as i64))
                 .build();
-            let mut cursor = self
-                .audit_events()
-                .find(filter_doc)
-                .with_options(options)
-                .await?;
+            let audit_events = self.audit_events();
+            let mut cursor = audit_events.find(filter_doc).with_options(options).await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 items.push(doc_to_audit_event(cursor.deserialize_current()?)?);
@@ -5665,7 +5662,7 @@ mod inner {
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn swapped_connection_keeps_old_temp_until_old_handle_drops() {
+        async fn swapped_connection_keeps_old_temp_until_cursor_scope_guard_drops() {
             let materialized = MongoStore::materialize_tls_source_to_file(
                 TEST_CERT_PEM,
                 MaterialKind::Cert,
@@ -5691,7 +5688,7 @@ mod inner {
                     vec![temp_path],
                 )));
 
-            let old_handle = store.proxies();
+            let old_cursor_collection_guard = store.proxies();
             let new_client = mongodb::Client::with_options(
                 mongodb::options::ClientOptions::builder()
                     .hosts(vec![])
@@ -5709,9 +5706,9 @@ mod inner {
 
             assert!(
                 path.exists(),
-                "old temp PEM must remain while an old collection handle holds the bundle"
+                "old temp PEM must remain while a cursor's collection guard holds the bundle"
             );
-            drop(old_handle);
+            drop(old_cursor_collection_guard);
             assert!(
                 !path.exists(),
                 "old temp PEM should be removed after the final old bundle handle drops"
