@@ -78,6 +78,14 @@ mod inner {
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
+    #[derive(Clone, Copy)]
+    struct ConfigChangeWrite<'a> {
+        namespace: &'a str,
+        resource_type: &'a str,
+        resource_id: &'a str,
+        operation: &'a str,
+    }
+
     /// Build an ordering-safe `$gte` lower bound for the string-typed
     /// `updated_at` field.
     ///
@@ -892,6 +900,31 @@ mod inner {
             Self::config_change_sequence_from_counter_doc(&doc)
         }
 
+        async fn reserve_config_change_sequences(
+            &self,
+            count: usize,
+        ) -> Result<u64, anyhow::Error> {
+            if count == 0 {
+                anyhow::bail!("cannot reserve zero MongoDB config change sequences");
+            }
+            let count = i64::try_from(count).map_err(|_| {
+                anyhow::anyhow!("MongoDB config change batch exceeds i64 sequence range")
+            })?;
+            let doc = self
+                .config_change_counters()
+                .find_one_and_update(
+                    doc! { "_id": "global" },
+                    doc! { "$inc": { "sequence": count } },
+                )
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("MongoDB config change counter update returned no document")
+                })?;
+            Self::config_change_sequence_from_counter_doc(&doc)
+        }
+
         async fn next_config_change_sequence_in_session(
             &self,
             session: &mut ClientSession,
@@ -955,6 +988,46 @@ mod inner {
             Ok(())
         }
 
+        async fn record_config_changes_batch(
+            &self,
+            changes: &[ConfigChangeWrite<'_>],
+        ) -> Result<(), anyhow::Error> {
+            if changes.is_empty() {
+                return Ok(());
+            }
+            let latest_sequence = self.reserve_config_change_sequences(changes.len()).await?;
+            let count = changes.len() as u64;
+            let first_sequence = latest_sequence.checked_sub(count - 1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MongoDB config change sequence reservation underflowed for {} changes",
+                    changes.len()
+                )
+            })?;
+            let created_at = Utc::now().to_rfc3339();
+            let docs: Vec<Document> = changes
+                .iter()
+                .enumerate()
+                .map(|(idx, change)| {
+                    doc! {
+                        "sequence": (first_sequence + idx as u64) as i64,
+                        "namespace": change.namespace,
+                        "resource_type": change.resource_type,
+                        "resource_id": change.resource_id,
+                        "operation": change.operation,
+                        "created_at": created_at.clone(),
+                    }
+                })
+                .collect();
+            self.config_changes().insert_many(docs).await?;
+
+            let namespaces: HashSet<&str> = changes.iter().map(|change| change.namespace).collect();
+            for namespace in namespaces {
+                self.compact_config_changes(namespace).await?;
+            }
+
+            Ok(())
+        }
+
         async fn record_config_change_in_session(
             &self,
             session: &mut ClientSession,
@@ -980,6 +1053,82 @@ mod inner {
                     namespace, e
                 );
             }
+        }
+
+        async fn rollback_standalone_created_document(
+            &self,
+            collection_name: &str,
+            namespace: &str,
+            resource_type: &str,
+            resource_id: &str,
+            change_error: &anyhow::Error,
+        ) {
+            match self
+                .collection(collection_name)
+                .delete_one(doc! { "_id": resource_id })
+                .await
+            {
+                Ok(result) if result.deleted_count > 0 => warn!(
+                    "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
+                    resource_type, resource_id, namespace, change_error
+                ),
+                Ok(_) => warn!(
+                    "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback found no inserted document: {}",
+                    resource_type, resource_id, namespace, change_error
+                ),
+                Err(rollback_err) => warn!(
+                    "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                    resource_type, resource_id, namespace, rollback_err, change_error
+                ),
+            }
+        }
+
+        async fn rollback_standalone_created_documents(
+            &self,
+            collection_name: &str,
+            resource_type: &str,
+            resource_ids: &[&str],
+            change_error: &anyhow::Error,
+        ) {
+            if resource_ids.is_empty() {
+                return;
+            }
+
+            let mut deleted_count = 0_u64;
+            for chunk in resource_ids.chunks(500) {
+                let id_values: Vec<Bson> = chunk
+                    .iter()
+                    .map(|resource_id| Bson::String((*resource_id).to_string()))
+                    .collect();
+                match self
+                    .collection(collection_name)
+                    .delete_many(doc! { "_id": { "$in": id_values } })
+                    .await
+                {
+                    Ok(result) => {
+                        deleted_count += result.deleted_count;
+                    }
+                    Err(rollback_err) => {
+                        warn!(
+                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after deleting {} of {} inserted documents: {}; original error: {}",
+                            resource_type,
+                            deleted_count,
+                            resource_ids.len(),
+                            rollback_err,
+                            change_error
+                        );
+                        return;
+                    }
+                }
+            }
+
+            warn!(
+                "Rolled back MongoDB standalone {} batch create after config_changes write failed; deleted {} of {} inserted documents: {}",
+                resource_type,
+                deleted_count,
+                resource_ids.len(),
+                change_error
+            );
         }
 
         async fn compact_config_changes(&self, namespace: &str) -> Result<(), anyhow::Error> {
@@ -1969,7 +2118,9 @@ mod inner {
             let mut consumer_ops = std::collections::HashMap::new();
             let mut plugin_config_ops = std::collections::HashMap::new();
             let mut upstream_ops = std::collections::HashMap::new();
+            let mut change_count = 0_usize;
             while cursor.advance().await? {
+                change_count += 1;
                 let doc = cursor.deserialize_current()?;
                 let sequence = match doc.get("sequence") {
                     Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
@@ -1998,6 +2149,13 @@ mod inner {
                     }
                     _ => {}
                 }
+            }
+            if change_count >= CHANGE_LOG_BATCH_LIMIT as usize {
+                anyhow::bail!(
+                    "MongoDB config change batch for namespace '{}' reached limit {}; forcing full reload",
+                    namespace,
+                    CHANGE_LOG_BATCH_LIMIT
+                );
             }
 
             let split_ops =
@@ -2140,8 +2298,20 @@ mod inner {
                     .await;
             } else {
                 self.proxies().insert_one(doc).await?;
-                self.record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_created_document(
+                        "proxies",
+                        &proxy.namespace,
+                        "proxy",
+                        &proxy.id,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
             self.check_slow_query("create_proxy", start);
             Ok(())
@@ -2735,8 +2905,20 @@ mod inner {
                     .await;
             } else {
                 self.consumers().insert_one(doc).await?;
-                self.record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_created_document(
+                        "consumers",
+                        &consumer.namespace,
+                        "consumer",
+                        &consumer.id,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
             self.check_slow_query("create_consumer", start);
             Ok(())
@@ -2893,13 +3075,37 @@ mod inner {
                 self.compact_config_changes_best_effort(&pc.namespace).await;
             } else {
                 self.plugin_configs().insert_one(doc).await?;
-                self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_created_document(
+                        "plugin_configs",
+                        &pc.namespace,
+                        "plugin_config",
+                        &pc.id,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
                 if pc.scope == PluginScope::Proxy
                     && let Some(proxy_id) = pc.proxy_id.as_deref()
                 {
-                    self.record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
-                        .await?;
+                    if let Err(err) = self
+                        .record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
+                        .await
+                    {
+                        self.rollback_standalone_created_document(
+                            "plugin_configs",
+                            &pc.namespace,
+                            "plugin_config",
+                            &pc.id,
+                            &err,
+                        )
+                        .await;
+                        return Err(err);
+                    }
                 }
             }
             self.check_slow_query("create_plugin_config", start);
@@ -3131,8 +3337,20 @@ mod inner {
                     .await;
             } else {
                 self.upstreams().insert_one(doc).await?;
-                self.record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_created_document(
+                        "upstreams",
+                        &upstream.namespace,
+                        "upstream",
+                        &upstream.id,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
             self.check_slow_query("create_upstream", start);
             Ok(())
@@ -3656,9 +3874,20 @@ mod inner {
                 Ok(result.inserted_ids.len())
             } else {
                 let result = self.proxies().insert_many(docs).ordered(false).await?;
-                for proxy in proxies {
-                    self.record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
-                        .await?;
+                let changes: Vec<ConfigChangeWrite<'_>> = proxies
+                    .iter()
+                    .map(|proxy| ConfigChangeWrite {
+                        namespace: &proxy.namespace,
+                        resource_type: "proxy",
+                        resource_id: &proxy.id,
+                        operation: "upsert",
+                    })
+                    .collect();
+                if let Err(err) = self.record_config_changes_batch(&changes).await {
+                    let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+                    self.rollback_standalone_created_documents("proxies", "proxy", &ids, &err)
+                        .await;
+                    return Err(err);
                 }
                 Ok(result.inserted_ids.len())
             }
@@ -3725,14 +3954,23 @@ mod inner {
                 Ok(result.inserted_ids.len())
             } else {
                 let result = self.consumers().insert_many(docs).ordered(false).await?;
-                for consumer in consumers {
-                    self.record_config_change(
-                        &consumer.namespace,
-                        "consumer",
-                        &consumer.id,
-                        "upsert",
-                    )
-                    .await?;
+                let changes: Vec<ConfigChangeWrite<'_>> = consumers
+                    .iter()
+                    .map(|consumer| ConfigChangeWrite {
+                        namespace: &consumer.namespace,
+                        resource_type: "consumer",
+                        resource_id: &consumer.id,
+                        operation: "upsert",
+                    })
+                    .collect();
+                if let Err(err) = self.record_config_changes_batch(&changes).await {
+                    let ids: Vec<&str> = consumers
+                        .iter()
+                        .map(|consumer| consumer.id.as_str())
+                        .collect();
+                    self.rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
+                        .await;
+                    return Err(err);
                 }
                 Ok(result.inserted_ids.len())
             }
@@ -3784,14 +4022,25 @@ mod inner {
                     .insert_many(docs)
                     .ordered(false)
                     .await?;
-                for config in configs {
-                    self.record_config_change(
-                        &config.namespace,
+                let changes: Vec<ConfigChangeWrite<'_>> = configs
+                    .iter()
+                    .map(|config| ConfigChangeWrite {
+                        namespace: &config.namespace,
+                        resource_type: "plugin_config",
+                        resource_id: &config.id,
+                        operation: "upsert",
+                    })
+                    .collect();
+                if let Err(err) = self.record_config_changes_batch(&changes).await {
+                    let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+                    self.rollback_standalone_created_documents(
+                        "plugin_configs",
                         "plugin_config",
-                        &config.id,
-                        "upsert",
+                        &ids,
+                        &err,
                     )
-                    .await?;
+                    .await;
+                    return Err(err);
                 }
                 Ok(result.inserted_ids.len())
             }
@@ -3839,14 +4088,23 @@ mod inner {
                 Ok(result.inserted_ids.len())
             } else {
                 let result = self.upstreams().insert_many(docs).ordered(false).await?;
-                for upstream in upstreams {
-                    self.record_config_change(
-                        &upstream.namespace,
-                        "upstream",
-                        &upstream.id,
-                        "upsert",
-                    )
-                    .await?;
+                let changes: Vec<ConfigChangeWrite<'_>> = upstreams
+                    .iter()
+                    .map(|upstream| ConfigChangeWrite {
+                        namespace: &upstream.namespace,
+                        resource_type: "upstream",
+                        resource_id: &upstream.id,
+                        operation: "upsert",
+                    })
+                    .collect();
+                if let Err(err) = self.record_config_changes_batch(&changes).await {
+                    let ids: Vec<&str> = upstreams
+                        .iter()
+                        .map(|upstream| upstream.id.as_str())
+                        .collect();
+                    self.rollback_standalone_created_documents("upstreams", "upstream", &ids, &err)
+                        .await;
+                    return Err(err);
                 }
                 Ok(result.inserted_ids.len())
             }

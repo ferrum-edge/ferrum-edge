@@ -1762,11 +1762,15 @@ impl DatabaseStore {
         // Look up the proxy's current upstream_id before deleting so we can
         // cascade-delete that upstream if it becomes orphaned. Also capture the
         // api_spec row, if this proxy owns one, before the FK cascade removes it.
-        let proxy_row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?"))
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let proxy_select_sql = if self.db_type == "sqlite" {
+            self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?")
+        } else {
+            self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ? FOR UPDATE")
+        };
+        let proxy_row: Option<AnyRow> = sqlx::query(&proxy_select_sql)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some(proxy_row) = proxy_row else {
             tx.rollback().await?;
             self.check_slow_query("delete_proxy", start);
@@ -3555,6 +3559,14 @@ impl DatabaseStore {
         .bind(Self::CHANGE_LOG_BATCH_LIMIT)
         .fetch_all(&self.pool())
         .await?;
+
+        if rows.len() >= Self::CHANGE_LOG_BATCH_LIMIT as usize {
+            anyhow::bail!(
+                "config change batch for namespace '{}' reached limit {}; forcing full reload",
+                namespace,
+                Self::CHANGE_LOG_BATCH_LIMIT
+            );
+        }
 
         let mut changes = Vec::with_capacity(rows.len());
         for row in rows {

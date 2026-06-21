@@ -107,6 +107,7 @@ impl V001SqlBuilder {
         sqlx::query(self.create_config_changes_sql())
             .execute(pool)
             .await?;
+        self.create_config_change_indexes(pool).await?;
         Ok(())
     }
 
@@ -211,6 +212,17 @@ impl V001SqlBuilder {
             .await?;
 
         for idx_sql in self.namespace_unique_index_sqls() {
+            self.execute_index_sql(pool, idx_sql).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn create_config_change_indexes(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_config_changes_ns_sequence ON config_changes (namespace, sequence)",
+            "CREATE INDEX IF NOT EXISTS idx_config_changes_sequence ON config_changes (sequence)",
+        ] {
             self.execute_index_sql(pool, idx_sql).await?;
         }
 

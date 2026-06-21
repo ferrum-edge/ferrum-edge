@@ -134,6 +134,40 @@ async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
     .expect("restored proxy_route_locks must be writable");
 }
 
+#[tokio::test]
+async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    sqlx::query("DROP INDEX idx_config_changes_ns_sequence")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX idx_config_changes_sequence")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let index_names = get_index_names(&pool).await;
+    assert!(!index_names.iter().any(|n| n == "idx_config_changes_ns_sequence"));
+    assert!(!index_names.iter().any(|n| n == "idx_config_changes_sequence"));
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "V001 is already tracked, so no migration should be newly applied"
+    );
+    let index_names = get_index_names(&pool).await;
+    assert!(
+        index_names.iter().any(|n| n == "idx_config_changes_ns_sequence"),
+        "compatibility pass must restore idx_config_changes_ns_sequence"
+    );
+    assert!(
+        index_names.iter().any(|n| n == "idx_config_changes_sequence"),
+        "compatibility pass must restore idx_config_changes_sequence"
+    );
+}
+
 /// Incremental polling reads durable change records after the last accepted
 /// sequence cursor. The `(namespace, sequence)` index must support the range
 /// scan and ordering so polling cost follows retained changes, not total

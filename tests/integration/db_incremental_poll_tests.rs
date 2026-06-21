@@ -314,3 +314,38 @@ async fn retention_gap_reports_cursor_behind_retained_sequence() {
         "retention gap error should explain the cursor problem, got: {message}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saturated_change_log_batch_forces_full_reload_fallback() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "WITH digits(d) AS ( \
+             VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9) \
+         ), seq(n) AS ( \
+             SELECT ones.d + tens.d * 10 + hundreds.d * 100 + thousands.d * 1000 + 1 \
+             FROM digits AS ones \
+             CROSS JOIN digits AS tens \
+             CROSS JOIN digits AS hundreds \
+             CROSS JOIN digits AS thousands \
+         ) \
+         INSERT INTO config_changes \
+             (sequence, namespace, resource_type, resource_id, operation, created_at) \
+         SELECT n, 'ferrum', 'upstream', 'upstream-' || n, 'delete', ? FROM seq",
+    )
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("manual saturated config_changes insert must succeed");
+
+    let err = match store.load_incremental_config("ferrum", 0).await {
+        Ok(_) => panic!("saturated change-log batch must force caller to full reload"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("reached limit") && message.contains("forcing full reload"),
+        "saturated batch error should explain the full-reload fallback, got: {message}"
+    );
+}
