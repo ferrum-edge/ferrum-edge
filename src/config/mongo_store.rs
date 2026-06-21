@@ -19,9 +19,10 @@
 //! snapshot transaction so the runtime config is read from one multi-collection
 //! view. Standalone deployments cannot provide multi-collection snapshots, so
 //! they use sequential primary reads and only reject inconsistencies caught by
-//! the runtime load validation path. Incremental polling reads durable
-//! `config_changes` documents after the accepted sequence cursor and point-loads
-//! changed resource IDs.
+//! the runtime load validation path. Replica-set incremental polling reads
+//! durable `config_changes` documents after the accepted sequence cursor and
+//! point-loads changed resource IDs; standalone deployments force full reloads
+//! because resource writes and change records are not transactionally coupled.
 //!
 //! **Index creation**: The `run_migrations()` method creates indexes instead of
 //! running SQL migrations. `createIndex` is idempotent **only when the full
@@ -956,6 +957,10 @@ mod inner {
             }
         }
 
+        fn config_change_retention_doc_id(namespace: &str) -> String {
+            format!("retention:{namespace}")
+        }
+
         fn config_change_doc(
             sequence: u64,
             namespace: &str,
@@ -1207,12 +1212,42 @@ mod inner {
                 return Ok(());
             }
             let cutoff = latest - CHANGE_LOG_RETAIN_PER_NAMESPACE;
+            let retained_doc = self
+                .config_changes()
+                .find_one(doc! {
+                    "namespace": namespace,
+                    "sequence": { "$lte": cutoff as i64 },
+                })
+                .sort(doc! { "sequence": -1 })
+                .await?;
+            let retained_sequence =
+                match retained_doc.as_ref().and_then(|doc| doc.get("sequence")) {
+                    Some(Bson::Int64(value)) if *value > 0 => Some(*value),
+                    Some(Bson::Int32(value)) if *value > 0 => Some(*value as i64),
+                    Some(other) => anyhow::bail!(
+                        "MongoDB config_changes row has invalid sequence: {:?}",
+                        other
+                    ),
+                    None => None,
+                };
             self.config_changes()
                 .delete_many(doc! {
                     "namespace": namespace,
                     "sequence": { "$lte": cutoff as i64 },
                 })
                 .await?;
+            if let Some(retained_sequence) = retained_sequence {
+                self.config_change_counters()
+                    .update_one(
+                        doc! { "_id": Self::config_change_retention_doc_id(namespace) },
+                        doc! {
+                            "$max": { "retained_sequence": retained_sequence },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .upsert(true)
+                    .await?;
+            }
             Ok(())
         }
 
@@ -1221,29 +1256,25 @@ mod inner {
             namespace: &str,
             after_sequence: u64,
         ) -> Result<(), anyhow::Error> {
-            if after_sequence == 0 {
-                return Ok(());
-            }
             let doc = self
-                .config_changes()
-                .find_one(doc! { "namespace": namespace })
-                .sort(doc! { "sequence": 1 })
+                .config_change_counters()
+                .find_one(doc! { "_id": Self::config_change_retention_doc_id(namespace) })
                 .await?;
             if let Some(doc) = doc {
-                let min_sequence = match doc.get("sequence") {
+                let retained_sequence = match doc.get("retained_sequence") {
                     Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
                     Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
                     other => anyhow::bail!(
-                        "MongoDB config_changes row has invalid sequence: {:?}",
+                        "MongoDB config change retention row has invalid sequence: {:?}",
                         other
                     ),
                 };
-                if min_sequence > after_sequence.saturating_add(1) {
+                if after_sequence < retained_sequence {
                     anyhow::bail!(
                         "config change cursor {} for namespace '{}' is behind retained sequence {}",
                         after_sequence,
                         namespace,
-                        min_sequence
+                        retained_sequence
                     );
                 }
             }
@@ -2170,6 +2201,11 @@ mod inner {
             namespace: &str,
             after_sequence: u64,
         ) -> Result<IncrementalResult, anyhow::Error> {
+            if !self.replica_set_configured() {
+                anyhow::bail!(
+                    "standalone MongoDB uses non-transactional config_changes writes; forcing full reload"
+                );
+            }
             let start = std::time::Instant::now();
             let poll_timestamp = Utc::now();
             self.ensure_change_cursor_available(namespace, after_sequence)

@@ -36,6 +36,10 @@ const EXPECTED_INDEX_NAMES: &[&str] = &[
     "idx_consumers_ns_updated",
     "idx_plugin_configs_ns_updated",
     "idx_upstreams_ns_updated",
+    "idx_proxies_ns_id",
+    "idx_consumers_ns_id",
+    "idx_plugin_configs_ns_id",
+    "idx_upstreams_ns_id",
     "idx_audit_events_namespace_ts_id",
     // Sequence indexes for durable incremental-poll change tracking.
     "idx_config_changes_ns_sequence",
@@ -178,6 +182,56 @@ async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
             .any(|n| n == "idx_config_changes_sequence"),
         "compatibility pass must restore idx_config_changes_sequence"
     );
+}
+
+#[tokio::test]
+async fn test_run_pending_restores_full_load_indexes_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    for index_name in [
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+    ] {
+        let drop_sql = format!("DROP INDEX {index_name}");
+        sqlx::query(&drop_sql)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let index_names = get_index_names(&pool).await;
+    for index_name in [
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+    ] {
+        assert!(
+            !index_names.iter().any(|n| n == index_name),
+            "{index_name} should be absent after DROP INDEX"
+        );
+    }
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "V001 is already tracked, so no migration should be newly applied"
+    );
+    let index_names = get_index_names(&pool).await;
+    for index_name in [
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+    ] {
+        assert!(
+            index_names.iter().any(|n| n == index_name),
+            "compatibility pass must restore {index_name}"
+        );
+    }
 }
 
 /// Incremental polling reads durable change records after the last accepted

@@ -104,9 +104,16 @@ impl V001SqlBuilder {
         sqlx::query(self.create_proxy_route_locks_sql())
             .execute(pool)
             .await?;
+        sqlx::query(self.create_config_change_locks_sql())
+            .execute(pool)
+            .await?;
+        sqlx::query(self.create_config_change_retention_sql())
+            .execute(pool)
+            .await?;
         sqlx::query(self.create_config_changes_sql())
             .execute(pool)
             .await?;
+        self.create_full_load_indexes(pool).await?;
         self.create_config_change_indexes(pool).await?;
         Ok(())
     }
@@ -130,6 +137,8 @@ impl V001SqlBuilder {
             self.create_proxy_route_locks_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
+            self.create_config_change_locks_sql(),
+            self.create_config_change_retention_sql(),
             self.create_config_changes_sql(),
             // api_specs must come AFTER proxies (api_specs.proxy_id FKs
             // proxies(id) ON DELETE CASCADE, so the proxies table must exist
@@ -157,14 +166,19 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_consumers_updated_at ON consumers (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_updated_at ON plugin_configs (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_updated_at ON upstreams (updated_at)",
-            // No standalone `(namespace)` indexes — fully covered by the
-            // `(namespace, updated_at)` compounds below via the leading-column
-            // rule. Keeping both would only add write amplification.
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (consumer_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
+            // Full config loads use keyset pagination with
+            // `WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?`. The
+            // `(namespace, updated_at)` compounds do not cover that access
+            // pattern, so keep dedicated `(namespace, id)` indexes.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_config_changes_ns_sequence ON config_changes (namespace, sequence)",
             "CREATE INDEX IF NOT EXISTS idx_config_changes_sequence ON config_changes (sequence)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
@@ -222,6 +236,19 @@ impl V001SqlBuilder {
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_config_changes_ns_sequence ON config_changes (namespace, sequence)",
             "CREATE INDEX IF NOT EXISTS idx_config_changes_sequence ON config_changes (sequence)",
+        ] {
+            self.execute_index_sql(pool, idx_sql).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn create_full_load_indexes(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
         ] {
             self.execute_index_sql(pool, idx_sql).await?;
         }
@@ -599,6 +626,44 @@ impl V001SqlBuilder {
                 proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
                 plugin_config_id TEXT NOT NULL REFERENCES plugin_configs(id) ON DELETE CASCADE,
                 PRIMARY KEY (proxy_id, plugin_config_id)
+            )
+            "#
+        }
+    }
+
+    fn create_config_change_locks_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS config_change_locks (
+                lock_name VARCHAR(64) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                updated_at VARCHAR(64) NOT NULL
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS config_change_locks (
+                lock_name TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL
+            )
+            "#
+        }
+    }
+
+    fn create_config_change_retention_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS config_change_retention (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                retained_sequence BIGINT NOT NULL DEFAULT 0,
+                updated_at VARCHAR(64) NOT NULL
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS config_change_retention (
+                namespace TEXT PRIMARY KEY,
+                retained_sequence BIGINT NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             )
             "#
         }

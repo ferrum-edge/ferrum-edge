@@ -290,7 +290,7 @@ async fn association_additions_and_removals_are_proxy_change_events() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn retention_gap_reports_cursor_behind_retained_sequence() {
+async fn sparse_global_sequence_gap_without_retention_still_polls_incrementally() {
     let (store, _temp_dir) = sqlite_store().await;
     let ts = Utc::now().to_rfc3339();
 
@@ -303,6 +303,31 @@ async fn retention_gap_reports_cursor_behind_retained_sequence() {
     .execute(&store.pool())
     .await
     .expect("manual config_changes insert must succeed");
+
+    let result = store
+        .load_incremental_config("ferrum", 1)
+        .await
+        .expect("sparse sequence gap without retention must not force full reload");
+    assert_eq!(result.sequence_cursor, 10);
+    assert_eq!(
+        result.removed_upstream_ids,
+        vec!["missing-upstream".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_gap_reports_cursor_behind_retained_sequence() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO config_change_retention (namespace, retained_sequence, updated_at) \
+         VALUES ('ferrum', 10, ?)",
+    )
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("manual config_change_retention insert must succeed");
 
     let err = match store.load_incremental_config("ferrum", 1).await {
         Ok(_) => panic!("retention gap must force caller to full reload"),

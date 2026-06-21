@@ -419,6 +419,42 @@ impl DatabaseStore {
         }
     }
 
+    fn config_change_lock_insert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT IGNORE INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?)"
+                .to_string(),
+            "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?)"
+                .to_string(),
+            _ => self.q("INSERT INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?) \
+                 ON CONFLICT (lock_name) DO NOTHING"),
+        }
+    }
+
+    fn config_change_retention_upsert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT INTO config_change_retention \
+                 (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE \
+                 retained_sequence = GREATEST(retained_sequence, VALUES(retained_sequence)), \
+                 updated_at = VALUES(updated_at)"
+                .to_string(),
+            "sqlite" => "INSERT INTO config_change_retention \
+                 (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 retained_sequence = max(config_change_retention.retained_sequence, excluded.retained_sequence), \
+                 updated_at = excluded.updated_at"
+                .to_string(),
+            _ => self.q("INSERT INTO config_change_retention \
+                 (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 retained_sequence = GREATEST(config_change_retention.retained_sequence, EXCLUDED.retained_sequence), \
+                 updated_at = EXCLUDED.updated_at"),
+        }
+    }
+
     fn listen_path_candidate_sql(
         &self,
         listen_path: Option<&str>,
@@ -517,6 +553,33 @@ impl DatabaseStore {
             sqlx::query(&lock_sql)
                 .bind(namespace)
                 .bind(&route_key_hash)
+                .fetch_optional(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn lock_config_change_sequence_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        // Serialize SQL change-log inserts so auto-incremented sequences become
+        // visible to pollers in commit order.
+        let now = Utc::now().to_rfc3339();
+        let insert_sql = self.config_change_lock_insert_sql();
+        sqlx::query(&insert_sql)
+            .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+
+        if self.db_type != "sqlite" {
+            let lock_sql = self.q(
+                "SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE",
+            );
+            sqlx::query(&lock_sql)
+                .bind(Self::CONFIG_CHANGE_LOCK_NAME)
                 .fetch_optional(&mut **tx)
                 .await?;
         }
@@ -3515,24 +3578,21 @@ impl DatabaseStore {
         namespace: &str,
         after_sequence: u64,
     ) -> Result<(), anyhow::Error> {
-        if after_sequence == 0 {
-            return Ok(());
-        }
         let row = sqlx::query(
-            &self.q("SELECT MIN(sequence) AS min_sequence FROM config_changes WHERE namespace = ?"),
+            &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
         )
         .bind(namespace)
-        .fetch_one(&self.pool())
+        .fetch_optional(&self.pool())
         .await?;
-        let min_sequence: Option<i64> = row.try_get("min_sequence")?;
-        if let Some(min_sequence) = min_sequence {
-            let min_sequence = min_sequence.max(0) as u64;
-            if min_sequence > after_sequence.saturating_add(1) {
+        if let Some(row) = row {
+            let retained_sequence: i64 = row.try_get("retained_sequence")?;
+            let retained_sequence = retained_sequence.max(0) as u64;
+            if after_sequence < retained_sequence {
                 anyhow::bail!(
                     "config change cursor {} for namespace '{}' is behind retained sequence {}",
                     after_sequence,
                     namespace,
-                    min_sequence
+                    retained_sequence
                 );
             }
         }
@@ -3746,6 +3806,7 @@ impl DatabaseStore {
         resource_id: &str,
         operation: &str,
     ) -> Result<(), anyhow::Error> {
+        self.lock_config_change_sequence_tx(tx).await?;
         sqlx::query(&self.q("INSERT INTO config_changes \
              (namespace, resource_type, resource_id, operation, created_at) \
              VALUES (?, ?, ?, ?, ?)"))
@@ -3775,11 +3836,31 @@ impl DatabaseStore {
             return Ok(());
         }
         let cutoff = max_sequence - Self::CHANGE_LOG_RETAIN_PER_NAMESPACE;
+        let retained_row = sqlx::query(
+            &self.q(
+                "SELECT COALESCE(MAX(sequence), 0) AS retained_sequence \
+                 FROM config_changes WHERE namespace = ? AND sequence <= ?",
+            ),
+        )
+        .bind(namespace)
+        .bind(cutoff as i64)
+        .fetch_one(&mut **tx)
+        .await?;
+        let retained_sequence: i64 = retained_row.try_get("retained_sequence")?;
         sqlx::query(&self.q("DELETE FROM config_changes WHERE namespace = ? AND sequence <= ?"))
             .bind(namespace)
             .bind(cutoff as i64)
             .execute(&mut **tx)
             .await?;
+        if retained_sequence > 0 {
+            let upsert_sql = self.config_change_retention_upsert_sql();
+            sqlx::query(&upsert_sql)
+                .bind(namespace)
+                .bind(retained_sequence)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&mut **tx)
+                .await?;
+        }
         Ok(())
     }
 
@@ -3874,6 +3955,7 @@ impl DatabaseStore {
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
     const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
+    const CONFIG_CHANGE_LOCK_NAME: &str = "global";
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 

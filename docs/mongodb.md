@@ -349,7 +349,7 @@ New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `Plu
 
 ## Incremental Polling
 
-MongoDB uses the same durable incremental polling strategy as SQL backends:
+MongoDB replica sets use the same durable incremental polling strategy as SQL backends:
 
 1. **Startup:** A full load reads all runtime collections and seeds the latest accepted `config_changes.sequence`. Replica sets use a snapshot transaction; standalone deployments use sequential primary reads and only reject inconsistencies caught by the runtime load validation path.
 2. **Subsequent polls:** Pollers read ordered `config_changes` documents after the accepted sequence cursor, collapse each resource to its final operation in the batch, and point-load changed IDs only.
@@ -358,3 +358,5 @@ MongoDB uses the same durable incremental polling strategy as SQL backends:
 5. **Fallback:** If incremental poll fails, Ferrum falls back to the same full-load path and rejects the candidate on any query, decode, or runtime load validation error.
 
 The `config_changes` collection has `{namespace, sequence}` and `{sequence}` indexes so polling cost is proportional to the number of retained changes read, not total runtime resource count.
+
+Standalone MongoDB does not provide multi-document transactions, so resource writes and their `config_changes` records cannot be made crash-atomic. Ferrum therefore forces standalone MongoDB pollers through the full-load fallback path instead of accepting an incremental cursor that could miss a resource mutation whose change record was not committed.
