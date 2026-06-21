@@ -4411,7 +4411,6 @@ mod inner {
     mod tests {
         use super::*;
         use std::collections::HashSet;
-        use std::io::Write as _;
 
         #[test]
         fn audit_ts_range_filter_uses_bson_datetimes() {
@@ -5665,8 +5664,8 @@ mod inner {
             );
         }
 
-        #[test]
-        fn swapped_connection_keeps_old_temp_until_old_handle_drops() {
+        #[tokio::test(flavor = "current_thread")]
+        async fn swapped_connection_keeps_old_temp_until_old_handle_drops() {
             let materialized = MongoStore::materialize_tls_source_to_file(
                 TEST_CERT_PEM,
                 MaterialKind::Cert,
