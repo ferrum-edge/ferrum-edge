@@ -52,11 +52,14 @@ mod inner {
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::ops::Deref;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tracing::{debug, error, info, warn};
+    use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use regex::escape as regex_escape;
 
@@ -172,6 +175,55 @@ mod inner {
         matches!(repl_set_name, Some(name) if !name.is_empty())
     }
 
+    struct MaterializedTlsPath {
+        path: PathBuf,
+        temp_path: Option<tempfile::TempPath>,
+    }
+
+    struct MongoConnectionBundle {
+        client: Client,
+        db: Database,
+        // Own generated TLS PEM files for exactly as long as this driver
+        // client can open new sockets using their paths.
+        _tls_temp_paths: Vec<tempfile::TempPath>,
+    }
+
+    impl MongoConnectionBundle {
+        fn new(client: Client, db: Database, tls_temp_paths: Vec<tempfile::TempPath>) -> Self {
+            Self {
+                client,
+                db,
+                _tls_temp_paths: tls_temp_paths,
+            }
+        }
+    }
+
+    struct MongoDatabaseHandle {
+        db: Database,
+        _connection: Arc<MongoConnectionBundle>,
+    }
+
+    impl Deref for MongoDatabaseHandle {
+        type Target = Database;
+
+        fn deref(&self) -> &Self::Target {
+            &self.db
+        }
+    }
+
+    struct MongoCollectionHandle {
+        collection: Collection<Document>,
+        _connection: Arc<MongoConnectionBundle>,
+    }
+
+    impl Deref for MongoCollectionHandle {
+        type Target = Collection<Document>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.collection
+        }
+    }
+
     /// Step labels for the standalone-mongod (no-replica-set) `delete_proxy`
     /// path, in execution order. Documented as data so the order can be
     /// regression-tested without a running MongoDB server.
@@ -238,24 +290,24 @@ mod inner {
     /// Implements [`DatabaseBackend`] to provide a NoSQL alternative to the
     /// sqlx-backed `DatabaseStore`. Uses the official `mongodb` Rust driver.
     ///
-    /// **Failover & reconnect**: `client` and `db` are wrapped in
-    /// `Arc<ArcSwap<...>>` so [`Self::try_failover_reconnect`] can atomically
-    /// replace the underlying `Client` when the primary URL is unreachable
-    /// and a configured failover URL is healthy. Readers that already loaded
-    /// the old client keep using it (commands in flight complete normally),
-    /// then drop their reference and pick up the new one on the next call.
-    /// This mirrors the `Arc<ArcSwap<AnyPool>>` pattern used by the sqlx
-    /// `DatabaseStore` for the same reason — without it, every "failover"
-    /// attempt would just ping the dead client and the gateway would never
-    /// recover for standalone (non-replica-set) MongoDB deployments.
+    /// **Failover & reconnect**: the live `Client`, `Database`, and generated
+    /// TLS PEM guards are wrapped in one `ArcSwap` bundle so
+    /// [`Self::try_failover_reconnect`] can atomically replace the underlying
+    /// client when the primary URL is unreachable and a configured failover URL
+    /// is healthy. Readers that already loaded the old bundle keep using it
+    /// (commands in flight complete normally), then drop their reference and
+    /// pick up the new one on the next call. This mirrors the
+    /// `Arc<ArcSwap<AnyPool>>` pattern used by the sqlx `DatabaseStore` for the
+    /// same reason — without it, every "failover" attempt would just ping the
+    /// dead client and the gateway would never recover for standalone
+    /// (non-replica-set) MongoDB deployments.
     #[derive(Clone)]
     pub struct MongoStore {
-        // The live client. Held only so it gets dropped when swapped out;
-        // every collection access goes through `db()`, which loads from
-        // `db` directly (the `Database` handle internally references the
-        // current client).
-        client: Arc<ArcSwap<Client>>,
-        db: Arc<ArcSwap<Database>>,
+        // The live client, database handle, and any generated TLS PEM paths.
+        // Swapping the bundle as one Arc keeps files present while an old
+        // client can still open sockets, then removes them when the final old
+        // bundle reference is dropped.
+        connection: Arc<ArcSwap<MongoConnectionBundle>>,
         // Settings captured at startup so failover rebuilds use identical
         // ClientOptions for every non-URL field.
         conn_settings: MongoConnSettings,
@@ -314,7 +366,7 @@ mod inner {
                 tls_insecure,
             };
 
-            let (client, db, replica_set_configured) = Self::build_client_and_db(
+            let (connection, replica_set_configured) = Self::build_connection_bundle(
                 mongo_url,
                 &conn_settings,
                 tls_enabled,
@@ -336,8 +388,7 @@ mod inner {
             }
 
             Ok(Self {
-                client: Arc::new(ArcSwap::from_pointee(client)),
-                db: Arc::new(ArcSwap::from_pointee(db)),
+                connection: Arc::new(ArcSwap::from_pointee(connection)),
                 conn_settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -356,7 +407,7 @@ mod inner {
         /// Used by both [`Self::connect`] (initial connect) and
         /// [`DatabaseBackend::reconnect`] (failover) so the two paths
         /// can never diverge on how `ClientOptions` are built.
-        async fn build_client_and_db(
+        async fn build_connection_bundle(
             mongo_url: &str,
             settings: &MongoConnSettings,
             tls_enabled: bool,
@@ -364,7 +415,7 @@ mod inner {
             tls_client_cert_path: Option<&str>,
             tls_client_key_path: Option<&str>,
             tls_insecure: bool,
-        ) -> Result<(Client, Database, bool), anyhow::Error> {
+        ) -> Result<(MongoConnectionBundle, bool), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
             if client_options.selection_criteria.is_some() {
                 warn!(
@@ -398,6 +449,7 @@ mod inner {
             // Configure TLS via the canonical database TLS env vars.
             // Only set programmatic TLS if the connection string doesn't already
             // include TLS options (connection string takes precedence).
+            let mut tls_temp_paths: Vec<tempfile::TempPath> = Vec::new();
             if tls_enabled && client_options.tls.is_none() {
                 let ca = tls_ca_cert_path
                     .map(|ca_path| {
@@ -408,6 +460,12 @@ mod inner {
                         )
                     })
                     .transpose()?;
+                let ca_path = ca.as_ref().map(|ca| ca.path.clone());
+                if let Some(ca) = ca
+                    && let Some(temp_path) = ca.temp_path
+                {
+                    tls_temp_paths.push(temp_path);
+                }
 
                 // MongoDB requires client cert + key in a single combined PEM file.
                 // If the user provides separate cert and key files, combine them
@@ -424,10 +482,16 @@ mod inner {
                     )?),
                     _ => None,
                 };
+                let cert_key_path = cert_key.as_ref().map(|cert_key| cert_key.path.clone());
+                if let Some(cert_key) = cert_key
+                    && let Some(temp_path) = cert_key.temp_path
+                {
+                    tls_temp_paths.push(temp_path);
+                }
 
                 // Build TlsOptions using the typed-state builder. Each method
                 // consumes the builder, so we chain conditionally.
-                let tls_opts = Self::build_tls_options(ca, cert_key, tls_insecure);
+                let tls_opts = Self::build_tls_options(ca_path, cert_key_path, tls_insecure);
 
                 client_options.tls = Some(Tls::Enabled(tls_opts));
                 info!(
@@ -461,7 +525,10 @@ mod inner {
                 replica_set_configured
             );
 
-            Ok((client, db, replica_set_configured))
+            Ok((
+                MongoConnectionBundle::new(client, db, tls_temp_paths),
+                replica_set_configured,
+            ))
         }
 
         /// Combine separate PEM cert and key sources into a single temporary file.
@@ -471,7 +538,10 @@ mod inner {
         /// vars use separate sources (matching the PostgreSQL/MySQL convention).
         /// This helper reads both sources and writes a combined PEM to a securely
         /// created temp file with restrictive permissions.
-        fn combine_cert_key_pem(cert_path: &str, key_path: &str) -> Result<PathBuf, anyhow::Error> {
+        fn combine_cert_key_pem(
+            cert_path: &str,
+            key_path: &str,
+        ) -> Result<MaterializedTlsPath, anyhow::Error> {
             let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
             let key_source = CertSource::parse(key_path, MaterialKind::Key);
             let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
@@ -482,81 +552,110 @@ mod inner {
             // Write combined PEM to a securely-created temp file. `tempfile`
             // creates files with restrictive permissions and random names,
             // avoiding predictable-path and world-readable key leakage risks.
-            let mut combined = Vec::with_capacity(
+            let mut combined = Zeroizing::new(Vec::with_capacity(
                 cert_material.bytes.expose_secret().len()
                     + key_material.bytes.expose_secret().len()
                     + 1,
-            );
+            ));
             combined.extend_from_slice(cert_material.bytes.expose_secret());
             combined.extend_from_slice(b"\n");
             combined.extend_from_slice(key_material.bytes.expose_secret());
-            let temp_file = tempfile::Builder::new()
-                .prefix("ferrum-mongo-client-")
-                .suffix(".pem")
-                .tempfile()
-                .map_err(|e| anyhow::anyhow!("Failed to create temp PEM file: {}", e))?;
-            let (_file, combined_path) = temp_file.keep().map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to persist combined MongoDB client PEM '{}': {}",
-                    e.file.path().display(),
-                    e.error
-                )
-            })?;
-            std::fs::write(&combined_path, combined).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to write combined MongoDB client PEM to '{}': {}",
-                    combined_path.display(),
-                    e
-                )
-            })?;
+            let materialized = Self::write_owned_temp_pem(
+                "ferrum-mongo-client-",
+                combined.as_slice(),
+                "combined MongoDB client PEM",
+            )?;
 
             info!(
-                "Combined MongoDB client cert ({}) + key ({}) into {}",
-                cert_material.source_id,
-                key_material.source_id,
-                combined_path.display()
+                "Combined MongoDB client cert ({}) + key ({}) into owned temporary PEM",
+                cert_material.source_id, key_material.source_id
             );
-            Ok(combined_path)
+            Ok(materialized)
         }
 
         fn materialize_tls_source_to_file(
             source_value: &str,
             kind: MaterialKind,
             temp_prefix: &str,
-        ) -> Result<PathBuf, anyhow::Error> {
+        ) -> Result<MaterializedTlsPath, anyhow::Error> {
             let source = CertSource::parse(source_value, kind);
             if let Some(path) = source.as_file_path() {
-                return Ok(path);
+                return Ok(MaterializedTlsPath {
+                    path,
+                    temp_path: None,
+                });
             }
 
             let material = load_material_blocking(&source, kind)
                 .map_err(|e| anyhow::anyhow!("Failed to load MongoDB TLS material: {}", e))?;
-            let temp_file = tempfile::Builder::new()
+            let materialized = Self::write_owned_temp_pem(
+                temp_prefix,
+                material.bytes.expose_secret(),
+                "MongoDB TLS PEM",
+            )?;
+
+            info!(
+                "Materialized MongoDB TLS source {} into owned temporary PEM",
+                material.source_id
+            );
+            Ok(materialized)
+        }
+
+        fn write_owned_temp_pem(
+            temp_prefix: &str,
+            contents: &[u8],
+            label: &str,
+        ) -> Result<MaterializedTlsPath, anyhow::Error> {
+            let mut temp_file = tempfile::Builder::new()
                 .prefix(temp_prefix)
                 .suffix(".pem")
                 .tempfile()
-                .map_err(|e| anyhow::anyhow!("Failed to create temp PEM file: {}", e))?;
-            let (_file, material_path) = temp_file.keep().map_err(|e| {
+                .map_err(|e| anyhow::anyhow!("Failed to create temporary {label}: {e}"))?;
+            temp_file.as_file_mut().write_all(contents).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to persist MongoDB TLS PEM '{}': {}",
-                    e.file.path().display(),
-                    e.error
+                    "Failed to write temporary {label} '{}': {e}",
+                    temp_file.path().display()
                 )
             })?;
-            std::fs::write(&material_path, material.bytes.expose_secret()).map_err(|e| {
+            temp_file.as_file_mut().flush().map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to write MongoDB TLS PEM to '{}': {}",
-                    material_path.display(),
-                    e
+                    "Failed to flush temporary {label} '{}': {e}",
+                    temp_file.path().display()
                 )
             })?;
+            Self::set_private_file_permissions(temp_file.path(), label)?;
+            let path = temp_file.path().to_path_buf();
+            let temp_path = temp_file.into_temp_path();
+            Ok(MaterializedTlsPath {
+                path,
+                temp_path: Some(temp_path),
+            })
+        }
 
-            info!(
-                "Materialized MongoDB TLS source {} into {}",
-                material.source_id,
-                material_path.display()
-            );
-            Ok(material_path)
+        #[cfg(unix)]
+        fn set_private_file_permissions(path: &Path, label: &str) -> Result<(), anyhow::Error> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to inspect permissions for temporary {label} '{}': {e}",
+                        path.display()
+                    )
+                })?
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(path, permissions).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to set private permissions on temporary {label} '{}': {e}",
+                    path.display()
+                )
+            })
+        }
+
+        #[cfg(not(unix))]
+        fn set_private_file_permissions(_path: &Path, _label: &str) -> Result<(), anyhow::Error> {
+            Ok(())
         }
 
         /// Build `TlsOptions` from the individual components.
@@ -695,35 +794,53 @@ mod inner {
         // Collection accessors
         // -------------------------------------------------------------------
 
-        /// Snapshot of the current `Database` handle. Cheap clone (the driver's
-        /// `Database` is internally Arc-based) so callers can hold the handle
-        /// across awaits without blocking concurrent `reconnect()` swaps.
-        fn db(&self) -> Database {
-            (**self.db.load()).clone()
+        /// Snapshot of the current connection bundle. Holding this `Arc`
+        /// keeps generated TLS PEM guards alive for any driver handle cloned
+        /// from it.
+        fn connection(&self) -> Arc<MongoConnectionBundle> {
+            self.connection.load_full()
         }
 
-        fn proxies(&self) -> Collection<Document> {
-            self.db().collection("proxies")
+        /// Snapshot of the current `Database` handle, tied to the bundle that
+        /// owns any generated TLS files it may need for new sockets.
+        fn db(&self) -> MongoDatabaseHandle {
+            let connection = self.connection();
+            MongoDatabaseHandle {
+                db: connection.db.clone(),
+                _connection: connection,
+            }
         }
 
-        fn consumers(&self) -> Collection<Document> {
-            self.db().collection("consumers")
+        fn collection(&self, name: &str) -> MongoCollectionHandle {
+            let connection = self.connection();
+            MongoCollectionHandle {
+                collection: connection.db.collection(name),
+                _connection: connection,
+            }
         }
 
-        fn plugin_configs(&self) -> Collection<Document> {
-            self.db().collection("plugin_configs")
+        fn proxies(&self) -> MongoCollectionHandle {
+            self.collection("proxies")
         }
 
-        fn upstreams(&self) -> Collection<Document> {
-            self.db().collection("upstreams")
+        fn consumers(&self) -> MongoCollectionHandle {
+            self.collection("consumers")
         }
 
-        fn api_specs(&self) -> Collection<Document> {
-            self.db().collection("api_specs")
+        fn plugin_configs(&self) -> MongoCollectionHandle {
+            self.collection("plugin_configs")
         }
 
-        fn audit_events(&self) -> Collection<Document> {
-            self.db().collection("audit_events")
+        fn upstreams(&self) -> MongoCollectionHandle {
+            self.collection("upstreams")
+        }
+
+        fn api_specs(&self) -> MongoCollectionHandle {
+            self.collection("api_specs")
+        }
+
+        fn audit_events(&self) -> MongoCollectionHandle {
+            self.collection("audit_events")
         }
 
         // -------------------------------------------------------------------
@@ -1700,7 +1817,8 @@ mod inner {
             let mut doc = proxy_to_doc(proxy)?;
 
             if self.replica_set_configured.load(Ordering::Acquire) {
-                let mut session = self.client.load().start_session().await?;
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
                 session
                     .start_transaction()
                     .and_run((self, &proxy.id, doc), |s, (this, id, doc)| {
@@ -1757,7 +1875,8 @@ mod inner {
             let start = std::time::Instant::now();
 
             if self.replica_set_configured.load(Ordering::Acquire) {
-                let mut session = self.client.load().start_session().await?;
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
                 let deleted = session
                     .start_transaction()
                     .and_run((self, id.to_string()), |s, (this, id)| {
@@ -2616,12 +2735,12 @@ mod inner {
 
         async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
             // Build a fresh Client + Database against the requested URL using
-            // the captured connection settings. `build_client_and_db` runs a
+            // the captured connection settings. `build_connection_bundle` runs a
             // ping before returning, so on `Ok` we know the new client can
             // actually talk to MongoDB. On `Err` the swap is skipped and the
             // existing (possibly degraded) client stays in place — same
             // contract as `DatabaseStore::reconnect` for sqlx.
-            let (new_client, new_db, replica_set_configured) = Self::build_client_and_db(
+            let (new_connection, replica_set_configured) = Self::build_connection_bundle(
                 db_url,
                 &self.conn_settings,
                 self.conn_settings.tls_enabled,
@@ -2632,13 +2751,13 @@ mod inner {
             )
             .await?;
 
-            // Atomic swap. Readers that already loaded the old `Database`
-            // handle keep using it (in-flight commands complete); the next
-            // call to `db()` picks up the new handle. Old client is held
-            // briefly here, then dropped — the driver closes idle
-            // connections in the background.
-            let _old_db = self.db.swap(Arc::new(new_db));
-            let _old_client = self.client.swap(Arc::new(new_client));
+            // Atomic swap. Readers that already loaded the old `Client` or
+            // `Database` handle keep using it (in-flight commands complete);
+            // the next call to `db()`/`client()` picks up the new handle. Any
+            // generated TLS files are owned by the same bundle as the driver
+            // client, so old files are deleted only after the final old bundle
+            // reference is dropped.
+            let _old_connection = self.connection.swap(Arc::new(new_connection));
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
 
@@ -3175,7 +3294,8 @@ mod inner {
 
             if self.replica_set_configured() {
                 // With a replica set: use a multi-document transaction.
-                let mut session = self.client.load().start_session().await?;
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
                 session.start_transaction().await?;
 
                 if let Some(u) = &bundle.upstream {
@@ -3407,7 +3527,8 @@ mod inner {
             let effective_bundle: &crate::admin::api_specs::ExtractedBundle = &proxy_to_persist;
 
             if self.replica_set_configured() {
-                let mut session = self.client.load().start_session().await?;
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
                 session.start_transaction().await?;
 
                 self.ensure_no_external_spec_upstream_refs_opt_session(
@@ -3893,7 +4014,8 @@ mod inner {
                 // With a replica set: use a multi-document transaction so that a
                 // partial failure does not leave orphaned proxy/upstream/plugin rows.
                 // Mirrors `submit_api_spec_bundle` and `replace_api_spec_bundle`.
-                let mut session = self.client.load().start_session().await?;
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
                 session.start_transaction().await?;
 
                 self.ensure_no_external_spec_upstream_refs_opt_session(
@@ -4106,7 +4228,7 @@ mod inner {
             collection_name: &str,
             filter: Document,
         ) -> Result<HashSet<String>, anyhow::Error> {
-            let collection: Collection<Document> = self.db().collection(collection_name);
+            let collection = self.collection(collection_name);
             let options = FindOptions::builder().projection(doc! { "_id": 1 }).build();
             let mut cursor = collection.find(filter).with_options(options).await?;
             let mut ids = HashSet::new();
@@ -4124,7 +4246,7 @@ mod inner {
             &self,
             collection_name: &str,
         ) -> Result<HashSet<String>, anyhow::Error> {
-            let collection: Collection<Document> = self.db().collection(collection_name);
+            let collection = self.collection(collection_name);
             let values = collection.distinct("namespace", doc! {}).await?;
             let mut namespaces = HashSet::new();
             for val in values {
@@ -4203,7 +4325,7 @@ mod inner {
         }
 
         async fn ensure_document_id_available_for_api_spec_replace(
-            collection: Collection<Document>,
+            collection: MongoCollectionHandle,
             resource_type: &str,
             id: &str,
             namespace: &str,
@@ -4289,6 +4411,7 @@ mod inner {
     mod tests {
         use super::*;
         use std::collections::HashSet;
+        use std::io::Write as _;
 
         #[test]
         fn audit_ts_range_filter_uses_bson_datetimes() {
@@ -5297,10 +5420,10 @@ mod inner {
         // dead) primary, so failover never actually happened for
         // standalone MongoDB deployments.
         //
-        // We build a `MongoStore` whose `db` and `client` ArcSwaps point at
-        // a `Client` constructed against a non-routable URL. `Client::with_options`
-        // does NOT connect (the driver is lazy — the first command triggers
-        // the real handshake), so this works without a live MongoDB.
+        // We build a `MongoStore` whose connection bundle points at a `Client`
+        // constructed against a non-routable URL. `Client::with_options` does
+        // NOT connect (the driver is lazy — the first command triggers the
+        // real handshake), so this works without a live MongoDB.
         // -------------------------------------------------------------------
 
         /// Construct a `MongoStore` directly without going through `connect()`,
@@ -5329,9 +5452,9 @@ mod inner {
             let client = mongodb::Client::with_options(opts)
                 .expect("Client::with_options should accept empty hosts");
             let db = client.database(&settings.database_name);
+            let connection = MongoConnectionBundle::new(client, db, Vec::new());
             MongoStore {
-                client: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(client)),
-                db: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(db)),
+                connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 conn_settings: settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -5355,7 +5478,7 @@ mod inner {
         async fn try_failover_reconnect_returns_err_when_all_urls_unroutable() {
             // 240.0.0.1 is in the reserved 240/4 block — no host will ever
             // route to it, so `ClientOptions::parse` succeeds but the
-            // subsequent ping inside `build_client_and_db` fails fast
+            // subsequent ping inside `build_connection_bundle` fails fast
             // (bounded by `server_selection_timeout_secs = 1`).
             let store = make_test_store(vec![
                 "mongodb://240.0.0.1:27017/test".to_string(),
@@ -5430,9 +5553,14 @@ mod inner {
             // Confirm the accessor sees the original namespace before the swap.
             assert_eq!(store.db().name(), "test");
 
-            // Swap in the new handles (mirrors what `reconnect()` does on success).
-            store.db.store(std::sync::Arc::new(new_db));
-            store.client.store(std::sync::Arc::new(new_client));
+            // Swap in the new bundle (mirrors what `reconnect()` does on success).
+            store
+                .connection
+                .store(std::sync::Arc::new(MongoConnectionBundle::new(
+                    new_client,
+                    new_db,
+                    Vec::new(),
+                )));
 
             // Accessor must now return the swapped handle. If it kept a
             // captured copy of the original `db` field (the pre-fix bug),
@@ -5444,6 +5572,150 @@ mod inner {
                  (proxies/consumers/plugin_configs/upstreams) all flow through \
                  db(), so a stale handle would mean every read still goes to \
                  the dead primary even after a successful reconnect"
+            );
+        }
+
+        const TEST_CERT_PEM: &str =
+            "-----BEGIN CERTIFICATE-----\nZmVycnVtLXRlc3QtY2VydA==\n-----END CERTIFICATE-----\n";
+        const TEST_KEY_PEM: &str =
+            "-----BEGIN PRIVATE KEY-----\nZmVycnVtLXRlc3Qta2V5\n-----END PRIVATE KEY-----\n";
+
+        #[test]
+        fn materialized_inline_tls_source_is_removed_when_guard_drops() {
+            let materialized = MongoStore::materialize_tls_source_to_file(
+                TEST_CERT_PEM,
+                MaterialKind::Cert,
+                "ferrum-mongo-test-cert-",
+            )
+            .expect("materialize inline cert");
+            let path = materialized.path.clone();
+
+            assert!(path.exists(), "owned temp cert should exist while guarded");
+            assert!(
+                materialized.temp_path.is_some(),
+                "inline PEM materialization must own a temp guard"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .expect("temp cert metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "temporary PEM permissions must be 0600");
+            }
+
+            drop(materialized);
+
+            assert!(
+                !path.exists(),
+                "owned temp cert should be removed when the guard drops"
+            );
+        }
+
+        #[test]
+        fn path_tls_source_is_not_deleted_by_materialization_drop() {
+            let mut source_file = tempfile::NamedTempFile::new().expect("source temp file");
+            source_file
+                .write_all(TEST_CERT_PEM.as_bytes())
+                .expect("write source cert");
+            let source_path = source_file.path().to_path_buf();
+            let source_value = source_path.display().to_string();
+
+            let materialized = MongoStore::materialize_tls_source_to_file(
+                &source_value,
+                MaterialKind::Cert,
+                "ferrum-mongo-test-cert-",
+            )
+            .expect("materialize path cert");
+
+            assert_eq!(materialized.path, source_path);
+            assert!(
+                materialized.temp_path.is_none(),
+                "ordinary file paths are operator-owned, not generated temps"
+            );
+            drop(materialized);
+
+            assert!(
+                source_path.exists(),
+                "operator-provided cert path must not be deleted"
+            );
+        }
+
+        #[test]
+        fn combined_client_pem_is_removed_when_guard_drops() {
+            let materialized = MongoStore::combine_cert_key_pem(TEST_CERT_PEM, TEST_KEY_PEM)
+                .expect("combine cert and key");
+            let path = materialized.path.clone();
+            let combined = std::fs::read_to_string(&path).expect("combined PEM content");
+
+            assert!(combined.contains("BEGIN CERTIFICATE"));
+            assert!(combined.contains("BEGIN PRIVATE KEY"));
+            assert!(
+                materialized.temp_path.is_some(),
+                "combined client PEM must be guard-owned"
+            );
+
+            drop(materialized);
+
+            assert!(
+                !path.exists(),
+                "combined client PEM should be removed when the guard drops"
+            );
+        }
+
+        #[test]
+        fn swapped_connection_keeps_old_temp_until_old_handle_drops() {
+            let materialized = MongoStore::materialize_tls_source_to_file(
+                TEST_CERT_PEM,
+                MaterialKind::Cert,
+                "ferrum-mongo-test-held-",
+            )
+            .expect("materialize held temp");
+            let MaterializedTlsPath { path, temp_path } = materialized;
+            let temp_path = temp_path.expect("generated temp guard");
+
+            let store = make_test_store(vec![]);
+            let old_client = mongodb::Client::with_options(
+                mongodb::options::ClientOptions::builder()
+                    .hosts(vec![])
+                    .build(),
+            )
+            .expect("old client");
+            let old_db = old_client.database("old_with_temp");
+            store
+                .connection
+                .store(std::sync::Arc::new(MongoConnectionBundle::new(
+                    old_client,
+                    old_db,
+                    vec![temp_path],
+                )));
+
+            let old_handle = store.proxies();
+            let new_client = mongodb::Client::with_options(
+                mongodb::options::ClientOptions::builder()
+                    .hosts(vec![])
+                    .build(),
+            )
+            .expect("new client");
+            let new_db = new_client.database("new_without_temp");
+            store
+                .connection
+                .store(std::sync::Arc::new(MongoConnectionBundle::new(
+                    new_client,
+                    new_db,
+                    Vec::new(),
+                )));
+
+            assert!(
+                path.exists(),
+                "old temp PEM must remain while an old collection handle holds the bundle"
+            );
+            drop(old_handle);
+            assert!(
+                !path.exists(),
+                "old temp PEM should be removed after the final old bundle handle drops"
             );
         }
 
