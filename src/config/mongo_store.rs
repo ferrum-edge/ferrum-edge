@@ -3091,21 +3091,19 @@ mod inner {
                 }
                 if pc.scope == PluginScope::Proxy
                     && let Some(proxy_id) = pc.proxy_id.as_deref()
-                {
-                    if let Err(err) = self
+                    && let Err(err) = self
                         .record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
                         .await
-                    {
-                        self.rollback_standalone_created_document(
-                            "plugin_configs",
-                            &pc.namespace,
-                            "plugin_config",
-                            &pc.id,
-                            &err,
-                        )
-                        .await;
-                        return Err(err);
-                    }
+                {
+                    self.rollback_standalone_created_document(
+                        "plugin_configs",
+                        &pc.namespace,
+                        "plugin_config",
+                        &pc.id,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
                 }
             }
             self.check_slow_query("create_plugin_config", start);
