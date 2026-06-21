@@ -2196,7 +2196,7 @@ mod inner {
                                     &mut *s,
                                     namespace.as_str(),
                                     "proxy",
-                                    *id,
+                                    id,
                                     "upsert",
                                 )
                                 .await
