@@ -40,7 +40,7 @@ The test automatically skips if the container isn't running.
 
 ### MongoDB (`test_scale_perf_30k_proxies_mongodb`)
 
-Uses a MongoDB Docker container to measure how the document-store backend scales. The gateway stores its config collections in the `ferrum_scale` database (`FERRUM_MONGO_DATABASE`) and creates the production indexes automatically on startup, so the poll/deletion-diff queries exercise the same `{namespace, updated_at}` / `{namespace, _id}` covering indexes used in production.
+Uses a MongoDB Docker container to measure how the document-store backend scales. The gateway stores its config collections in the `ferrum_scale` database (`FERRUM_MONGO_DATABASE`) and creates the production indexes automatically on startup, so incremental polls exercise the same `config_changes` `{namespace, sequence}` and `{sequence}` indexes used in production.
 
 **Prerequisite**: Start the MongoDB container:
 

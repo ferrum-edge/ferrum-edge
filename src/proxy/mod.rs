@@ -28015,6 +28015,7 @@ mod tests {
                 removed_plugin_config_ids: vec!["pc1".to_string()],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
+                sequence_cursor: 0,
                 poll_timestamp: now,
             })
             .await;

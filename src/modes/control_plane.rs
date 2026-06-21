@@ -313,65 +313,16 @@ fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
 /// per namespace, then concatenates the per-namespace results into a single
 /// `IncrementalResult` so the rest of the polling loop's validate / apply /
 /// partition pipeline stays the same.
-///
-/// The `since` and known-id sets are scoped per namespace inside this
-/// function: each namespace's deletion detection only compares its own
-/// known IDs against its own current IDs (otherwise a removal in namespace
-/// A would look like an unknown ID in namespace B's list and incorrectly
-/// surface). For the back-compat `Single` case, the call collapses to a
-/// single per-namespace fetch identical to the pre-T2-A path.
-#[allow(clippy::too_many_arguments)]
 async fn load_incremental_config_multi(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
-    since: chrono::DateTime<chrono::Utc>,
-    known_proxy_ids: &std::collections::HashSet<String>,
-    known_consumer_ids: &std::collections::HashSet<String>,
-    known_plugin_config_ids: &std::collections::HashSet<String>,
-    known_upstream_ids: &std::collections::HashSet<String>,
-    proxy_ns: &std::collections::HashMap<String, String>,
-    consumer_ns: &std::collections::HashMap<String, String>,
-    plugin_config_ns: &std::collections::HashMap<String, String>,
-    upstream_ns: &std::collections::HashMap<String, String>,
+    after_sequence: u64,
 ) -> Result<IncrementalResult, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        return db
-            .load_incremental_config(
-                ns,
-                since,
-                known_proxy_ids,
-                known_consumer_ids,
-                known_plugin_config_ids,
-                known_upstream_ids,
-            )
-            .await;
+        return db.load_incremental_config(ns, after_sequence).await;
     }
 
-    // Build per-namespace known-id subsets so each call's deletion detection
-    // is scoped correctly. A known ID in namespace A must not be compared
-    // against namespace B's "current" list, or the incremental poll would
-    // see it as removed.
-    use std::collections::HashSet;
-    let split_ids = |ids: &HashSet<String>,
-                     lookup: &std::collections::HashMap<String, String>|
-     -> std::collections::HashMap<String, HashSet<String>> {
-        let mut out: std::collections::HashMap<String, HashSet<String>> =
-            std::collections::HashMap::new();
-        for id in ids {
-            if let Some(ns) = lookup.get(id) {
-                out.entry(ns.clone()).or_default().insert(id.clone());
-            }
-        }
-        out
-    };
-    let split_proxies = split_ids(known_proxy_ids, proxy_ns);
-    let split_consumers = split_ids(known_consumer_ids, consumer_ns);
-    let split_plugin_configs = split_ids(known_plugin_config_ids, plugin_config_ns);
-    let split_upstreams = split_ids(known_upstream_ids, upstream_ns);
-
-    let empty: HashSet<String> = HashSet::new();
-    let mut combined_poll_timestamp = None;
     let mut combined = IncrementalResult {
         added_or_modified_proxies: Vec::new(),
         removed_proxy_ids: Vec::new(),
@@ -381,23 +332,11 @@ async fn load_incremental_config_multi(
         removed_plugin_config_ids: Vec::new(),
         added_or_modified_upstreams: Vec::new(),
         removed_upstream_ids: Vec::new(),
+        sequence_cursor: after_sequence,
         poll_timestamp: chrono::Utc::now(),
     };
     for ns in namespaces {
-        let ns_proxies = split_proxies.get(ns).unwrap_or(&empty);
-        let ns_consumers = split_consumers.get(ns).unwrap_or(&empty);
-        let ns_plugin_configs = split_plugin_configs.get(ns).unwrap_or(&empty);
-        let ns_upstreams = split_upstreams.get(ns).unwrap_or(&empty);
-        let mut delta = db
-            .load_incremental_config(
-                ns,
-                since,
-                ns_proxies,
-                ns_consumers,
-                ns_plugin_configs,
-                ns_upstreams,
-            )
-            .await?;
+        let mut delta = db.load_incremental_config(ns, after_sequence).await?;
         combined
             .added_or_modified_proxies
             .append(&mut delta.added_or_modified_proxies);
@@ -422,25 +361,10 @@ async fn load_incremental_config_multi(
         combined
             .removed_upstream_ids
             .append(&mut delta.removed_upstream_ids);
-        // Keep the earliest per-namespace poll start. Writes that land in an
-        // early-polled namespace while later namespaces are still being read
-        // must remain behind the next `since` watermark.
-        let poll_timestamp =
-            min_incremental_poll_timestamp(combined_poll_timestamp, delta.poll_timestamp);
-        combined_poll_timestamp = Some(poll_timestamp);
-        combined.poll_timestamp = poll_timestamp;
+        combined.sequence_cursor = combined.sequence_cursor.max(delta.sequence_cursor);
+        combined.poll_timestamp = combined.poll_timestamp.min(delta.poll_timestamp);
     }
     Ok(combined)
-}
-
-fn min_incremental_poll_timestamp(
-    current: Option<chrono::DateTime<chrono::Utc>>,
-    next: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
-    match current {
-        Some(current) if current <= next => current,
-        _ => next,
-    }
 }
 
 /// Load and merge per-namespace `GatewayConfig`s into a single combined config.
@@ -478,12 +402,24 @@ async fn load_full_config_multi(
     Ok(combined)
 }
 
+async fn load_full_config_multi_with_sequence(
+    db: &dyn DatabaseBackend,
+    namespaces: &[String],
+) -> Result<(GatewayConfig, u64), anyhow::Error> {
+    let mut sequence = 0;
+    for ns in namespaces {
+        sequence = sequence.max(db.latest_change_sequence(ns).await?);
+    }
+    let config = load_full_config_multi(db, namespaces).await?;
+    Ok((config, sequence))
+}
+
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
 /// each namespace that has at least one changed or removed resource.
 ///
 /// Resources are matched by their `namespace` field; removed IDs are
 /// partitioned via a `(id → namespace)` lookup built from the CP's current
-/// known-IDs sets so deletions reach the right per-namespace channel.
+/// accepted config so deletions reach the right per-namespace channel.
 fn partition_incremental_by_namespace(
     result: IncrementalResult,
     proxy_ns: &std::collections::HashMap<String, String>,
@@ -495,6 +431,7 @@ fn partition_incremental_by_namespace(
 
     let mut buckets: HashMap<String, IncrementalResult> = HashMap::new();
     let poll_timestamp = result.poll_timestamp;
+    let sequence_cursor = result.sequence_cursor;
 
     let make_empty = |ts: chrono::DateTime<chrono::Utc>| IncrementalResult {
         added_or_modified_proxies: Vec::new(),
@@ -505,6 +442,7 @@ fn partition_incremental_by_namespace(
         removed_plugin_config_ids: Vec::new(),
         added_or_modified_upstreams: Vec::new(),
         removed_upstream_ids: Vec::new(),
+        sequence_cursor,
         poll_timestamp: ts,
     };
 
@@ -1229,8 +1167,8 @@ pub async fn run(
 
     // Database polling loop -> push incremental deltas to DPs and mesh nodes (with shutdown).
     //
-    // Uses the same incremental polling strategy as database mode: indexed
-    // `updated_at > ?` queries + lightweight ID queries for deletion detection.
+    // Uses the same incremental polling strategy as database mode: durable
+    // change-log reads after the last accepted sequence cursor.
     // Deltas are broadcast as DELTA updates; DPs apply them via apply_incremental.
     // Falls back to FULL_SNAPSHOT on incremental poll failure.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
@@ -1290,17 +1228,9 @@ pub async fn run(
         let mut last_polled_namespaces = initial_polled_namespaces;
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
-        // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
         let mut last_gateway_trust_bundles = initial_config.trust_bundles.clone();
-        let (
-            mut known_proxy_ids,
-            mut known_consumer_ids,
-            mut known_plugin_config_ids,
-            mut known_upstream_ids,
-        ) = db_backend::extract_known_ids(&initial_config);
-        let mut last_poll_at: Option<chrono::DateTime<chrono::Utc>> =
-            Some(initial_config.loaded_at);
+        let mut last_change_sequence: Option<u64> = None;
 
         loop {
             tokio::select! {
@@ -1368,23 +1298,13 @@ pub async fn run(
                             Some(&last_polled_namespaces),
                         )
                         .await;
-                        match load_full_config_multi(db_poll.as_ref(), &nslist).await {
-                            Ok(new_config) => {
+                        match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                            Ok((new_config, sequence)) => {
                                 // Treat pool swap as a new source snapshot.
-                                let (
-                                    next_known_proxy_ids,
-                                    next_known_consumer_ids,
-                                    next_known_plugin_config_ids,
-                                    next_known_upstream_ids,
-                                ) = db_backend::extract_known_ids(&new_config);
                                 last_gateway_trust_bundles = new_config.trust_bundles.clone();
-                                last_poll_at = Some(new_config.loaded_at);
+                                last_change_sequence = Some(sequence);
                                 let new_config_arc = Arc::new(new_config.clone());
                                 config_poll.store(new_config_arc.clone());
-                                known_proxy_ids = next_known_proxy_ids;
-                                known_consumer_ids = next_known_consumer_ids;
-                                known_plugin_config_ids = next_known_plugin_config_ids;
-                                known_upstream_ids = next_known_upstream_ids;
                                 last_polled_namespaces = nslist.clone();
                                 force_full_reload = false;
                                 db_available_poll.store(true, Ordering::Relaxed);
@@ -1418,7 +1338,7 @@ pub async fn run(
                                 continue;
                             }
                         }
-                    } else if let Some(since) = last_poll_at {
+                    } else if let Some(after_sequence) = last_change_sequence {
                         // Resolve the polled namespace list. For `Single`
                         // / `Set` this is the explicit list (no DB call).
                         // For `All`, authoritative namespace discovery runs
@@ -1445,15 +1365,7 @@ pub async fn run(
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
                             &nslist,
-                            since,
-                            &known_proxy_ids,
-                            &known_consumer_ids,
-                            &known_plugin_config_ids,
-                            &known_upstream_ids,
-                            &current_proxy_ns,
-                            &current_consumer_ns,
-                            &current_plugin_config_ns,
-                            &current_upstream_ns,
+                            after_sequence,
                         )
                         .await
                         {
@@ -1461,12 +1373,13 @@ pub async fn run(
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
+                                    let next_sequence = result.sequence_cursor;
                                     let source_trust_bundles = match db_poll
                                         .load_gateway_trust_bundles(&poll_namespace)
                                         .await
                                     {
                                         Ok(GatewayTrustBundlePoll::Unchanged) => {
-                                            last_poll_at = Some(result.poll_timestamp);
+                                            last_change_sequence = Some(next_sequence);
                                             continue;
                                         }
                                         Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
@@ -1478,7 +1391,7 @@ pub async fn run(
                                         Err(e) => {
                                             warn!(
                                                 "Failed to refresh gateway trust bundles after empty incremental poll; \
-                                                 leaving last_poll_at unchanged so the next poll retries: {}",
+                                                 leaving the sequence cursor unchanged so the next poll retries: {}",
                                                 e
                                             );
                                             continue;
@@ -1510,25 +1423,14 @@ pub async fn run(
                                         last_gateway_trust_bundles =
                                             source_trust_bundles;
                                     }
-                                    last_poll_at = Some(result.poll_timestamp);
+                                    last_change_sequence = Some(next_sequence);
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
-
-                                // Collect ID changes before moving result into
-                                // apply_incremental — needed for known-ID advancement
-                                // after validation passes.
-                                let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
-                                let removed_proxy_ids = result.removed_proxy_ids.clone();
-                                let added_consumer_ids: Vec<String> = result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect();
-                                let removed_consumer_ids = result.removed_consumer_ids.clone();
-                                let added_plugin_config_ids: Vec<String> = result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect();
-                                let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
-                                let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
-                                let removed_upstream_ids = result.removed_upstream_ids.clone();
+                                let next_sequence = result.sequence_cursor;
 
                                 // Apply delta to a cloned config, then validate
-                                // before broadcasting or advancing known IDs.
+                                // before broadcasting or advancing the sequence cursor.
                                 // Mirrors database mode's validate-before-swap
                                 // contract via ProxyState::apply_incremental.
                                 let mut new_config = (*config_poll.load_full()).clone();
@@ -1586,7 +1488,7 @@ pub async fn run(
                                     }
                                     warn!(
                                         "Incremental config update rejected by validation; \
-                                         leaving last_poll_at unchanged so the next poll \
+                                         leaving the sequence cursor unchanged so the next poll \
                                          retries the same rows"
                                     );
                                     continue;
@@ -1616,13 +1518,8 @@ pub async fn run(
                                     }
                                 }
 
-                                // Validation passed — advance known IDs, broadcast
-                                // the delta to DPs, and store the new config.
-                                update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
-                                update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
-                                update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
-                                update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
-
+                                // Validation passed — broadcast the delta to DPs
+                                // and store the new config before advancing the cursor.
                                 // Apply to CP's own in-memory config before broadcasting so
                                 // subscribers that connect during this poll either receive the
                                 // queued delta or load a snapshot that already contains it.
@@ -1679,7 +1576,7 @@ pub async fn run(
                                     partitions.len(),
                                     version
                                 );
-                                last_poll_at = Some(poll_ts);
+                                last_change_sequence = Some(next_sequence);
                             }
                             Err(e) => {
                                 warn!(
@@ -1687,16 +1584,11 @@ pub async fn run(
                                     e
                                 );
                                 // Fallback to full config load + full snapshot broadcast
-                                match load_full_config_multi(db_poll.as_ref(), &nslist).await {
-                                    Ok(new_config) => {
+                                match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                                    Ok((new_config, sequence)) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
-                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                        known_proxy_ids = p;
-                                        known_consumer_ids = c;
-                                        known_plugin_config_ids = pc;
-                                        known_upstream_ids = u;
                                         last_polled_namespaces = nslist.clone();
-                                        last_poll_at = Some(new_config.loaded_at);
+                                        last_change_sequence = Some(sequence);
                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
@@ -1717,16 +1609,11 @@ pub async fn run(
                                         // try failover URLs before giving up.
                                         match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
-                                                match load_full_config_multi(db_poll.as_ref(), &nslist).await {
-                                                    Ok(new_config) => {
+                                                match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                                                    Ok((new_config, sequence)) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
-                                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                                        known_proxy_ids = p;
-                                                        known_consumer_ids = c;
-                                                        known_plugin_config_ids = pc;
-                                                        known_upstream_ids = u;
                                                         last_polled_namespaces = nslist.clone();
-                                                        last_poll_at = Some(new_config.loaded_at);
+                                                        last_change_sequence = Some(sequence);
                                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
@@ -1887,27 +1774,12 @@ pub async fn run(
     Ok(())
 }
 
-/// Update a known ID set by adding new IDs and removing deleted ones.
-fn update_known_ids(
-    known: &mut std::collections::HashSet<String>,
-    added: &Vec<String>,
-    removed: &[String],
-) {
-    for id in removed {
-        known.remove(id);
-    }
-    for id in added {
-        known.insert(id.clone());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::db_backend::IncrementalResult;
     use crate::config::types::*;
     use chrono::Utc;
-    use std::collections::HashSet;
     use std::time::Instant;
 
     fn empty_incremental() -> IncrementalResult {
@@ -1920,6 +1792,7 @@ mod tests {
             removed_plugin_config_ids: vec![],
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
+            sequence_cursor: 0,
             poll_timestamp: Utc::now(),
         }
     }
@@ -2094,47 +1967,6 @@ mod tests {
         let mut items: Vec<(&str, i32)> = vec![];
         upsert_by_id(&mut items, vec![("a", 1)], |item| item.0);
         assert_eq!(items.len(), 1);
-    }
-
-    // update_known_ids
-
-    #[test]
-    fn update_known_ids_adds_and_removes() {
-        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
-        assert!(known.contains("a"));
-        assert!(!known.contains("b"));
-        assert!(known.contains("c"));
-        assert!(known.contains("d"));
-    }
-
-    #[test]
-    fn update_known_ids_remove_nonexistent_is_noop() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
-        assert_eq!(known.len(), 1);
-        assert!(known.contains("a"));
-    }
-
-    #[test]
-    fn update_known_ids_empty_operations() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec![], &[]);
-        assert_eq!(known.len(), 1);
-    }
-
-    #[test]
-    fn multi_namespace_poll_timestamp_keeps_earliest_namespace_start() {
-        let base = Utc::now();
-        let first_namespace = base + chrono::Duration::seconds(2);
-        let later_namespace = base + chrono::Duration::seconds(5);
-        let earliest_namespace = base + chrono::Duration::seconds(1);
-
-        let first = min_incremental_poll_timestamp(None, first_namespace);
-        let second = min_incremental_poll_timestamp(Some(first), later_namespace);
-        let third = min_incremental_poll_timestamp(Some(second), earliest_namespace);
-
-        assert_eq!(third, earliest_namespace);
     }
 
     // apply_incremental_to_config

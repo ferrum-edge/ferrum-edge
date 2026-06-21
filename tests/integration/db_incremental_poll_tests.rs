@@ -1,15 +1,20 @@
-//! Integration tests for the incremental DB poll boundary condition.
+//! Integration tests for durable DB incremental polling.
 //!
-//! Verifies that `load_incremental_config` uses `>=` (inclusive) on the
-//! `updated_at` comparison so that a row written at exactly the safety-margin
-//! boundary is never missed.
+//! Incremental polling is driven by ordered `config_changes` records, not
+//! wall-clock timestamps or full resource-ID scans. These tests exercise the
+//! SQLite SQL path because the same `DatabaseStore` implementation is shared by
+//! all SQL backends behind dialect-specific SQL rendering.
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use std::collections::HashSet;
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
+    PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
+};
+use serde_json::json;
+use std::collections::HashMap;
 use tempfile::TempDir;
 
-/// Helper: create a SQLite-backed `DatabaseStore` with migrations applied.
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("incremental_poll_test.db");
@@ -20,172 +25,292 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
     (store, temp_dir)
 }
 
-/// A row whose `updated_at` equals `since_safe` (the 1-second-adjusted
-/// boundary) must be included in the incremental result.
-///
-/// Before the fix, `WHERE updated_at > ?` excluded this row. After the fix
-/// (`>=`), it is correctly returned. Duplicates are harmless because the
-/// incremental merge is ID-keyed.
-#[tokio::test(flavor = "multi_thread")]
-async fn incremental_poll_includes_row_at_exact_boundary() {
-    let (store, _temp_dir) = sqlite_store().await;
-
-    // Pick a deterministic boundary timestamp.
-    // `load_incremental_config(since)` subtracts 1 second internally
-    // (`since_safe = since - 1s`), then queries `WHERE updated_at >= since_safe`.
-    // We set the row's `updated_at` to `since - 1s` (i.e. exactly `since_safe`).
-    let since = Utc::now();
-    let boundary_ts = (since - Duration::seconds(1)).to_rfc3339();
-
-    // Insert a minimal upstream row with `updated_at` at the exact boundary.
-    let pool = store.pool();
-    sqlx::query(
-        "INSERT INTO upstreams (id, namespace, name, targets, algorithm, created_at, updated_at) \
-         VALUES ('boundary-upstream', 'ferrum', 'boundary', '[{\"host\":\"127.0.0.1\",\"port\":8080}]', 'round_robin', ?, ?)",
-    )
-    .bind(&boundary_ts)
-    .bind(&boundary_ts)
-    .fetch_all(&pool)
-    .await
-    .expect("INSERT must succeed");
-
-    // No known IDs — simulates a fresh incremental poll where we have no prior
-    // state (the ID set is empty, so nothing counts as "previously seen").
-    let empty: HashSet<String> = HashSet::new();
-
-    let result = store
-        .load_incremental_config("ferrum", since, &empty, &empty, &empty, &empty)
-        .await
-        .expect("incremental poll must succeed");
-
-    // The upstream at the boundary timestamp must be included.
-    assert_eq!(
-        result.added_or_modified_upstreams.len(),
-        1,
-        "upstream at exact boundary timestamp must be returned by >= comparison"
-    );
-    assert_eq!(
-        result.added_or_modified_upstreams[0].id,
-        "boundary-upstream"
-    );
+fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        name: None,
+        targets: vec![UpstreamTarget {
+            host: host.to_string(),
+            port,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
 }
 
-/// A row whose `updated_at` is strictly before `since_safe` must NOT be
-/// returned — the inclusive `>=` should not pull in arbitrarily old rows.
+fn test_plugin_config(id: &str) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        plugin_name: "stdout_logging".to_string(),
+        config: json!({}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn test_proxy(id: &str, listen_path: &str, plugins: Vec<PluginAssociation>) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        name: Some(format!("Test Proxy {}", id)),
+        hosts: vec![],
+        listen_path: Some(listen_path.to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
+        backend_host: "localhost".to_string(),
+        backend_port: 3000,
+        backend_path: None,
+        strip_listen_path: true,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5000,
+        backend_read_timeout_ms: 30000,
+        backend_write_timeout_ms: 30000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
+        dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: AuthMode::Single,
+        plugins,
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
+        pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn incremental_poll_excludes_row_before_boundary() {
+async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
     let (store, _temp_dir) = sqlite_store().await;
+    let start_sequence = store
+        .latest_change_sequence("ferrum")
+        .await
+        .expect("latest sequence must load");
 
-    let since = Utc::now();
-    // Place the row 5 seconds before `since_safe` (i.e. 6 seconds before `since`).
-    let old_ts = (since - Duration::seconds(6)).to_rfc3339();
+    let mut upstream = test_upstream("sequence-upstream", "127.0.0.1", 8080);
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("upstream create must succeed");
 
-    let pool = store.pool();
+    let created = store
+        .load_incremental_config("ferrum", start_sequence)
+        .await
+        .expect("incremental create poll must succeed");
+    assert_eq!(created.added_or_modified_upstreams.len(), 1);
+    assert_eq!(
+        created.added_or_modified_upstreams[0].id,
+        "sequence-upstream"
+    );
+    assert!(created.removed_upstream_ids.is_empty());
+    assert!(created.sequence_cursor > start_sequence);
+
+    let replayed = store
+        .load_incremental_config("ferrum", start_sequence)
+        .await
+        .expect("incremental replay must succeed");
+    assert_eq!(replayed.sequence_cursor, created.sequence_cursor);
+    assert_eq!(replayed.added_or_modified_upstreams.len(), 1);
+    assert_eq!(
+        replayed.added_or_modified_upstreams[0].id,
+        "sequence-upstream"
+    );
+
+    upstream.targets[0].port = 9090;
+    store
+        .update_upstream(&upstream)
+        .await
+        .expect("upstream update must succeed");
+    let updated = store
+        .load_incremental_config("ferrum", created.sequence_cursor)
+        .await
+        .expect("incremental update poll must succeed");
+    assert_eq!(updated.added_or_modified_upstreams.len(), 1);
+    assert_eq!(updated.added_or_modified_upstreams[0].targets[0].port, 9090);
+    assert!(updated.sequence_cursor > created.sequence_cursor);
+
+    store
+        .delete_upstream("sequence-upstream")
+        .await
+        .expect("upstream delete must succeed");
+    let deleted = store
+        .load_incremental_config("ferrum", updated.sequence_cursor)
+        .await
+        .expect("incremental delete poll must succeed");
+    assert!(deleted.added_or_modified_upstreams.is_empty());
+    assert_eq!(deleted.removed_upstream_ids, vec!["sequence-upstream"]);
+    assert!(deleted.sequence_cursor > updated.sequence_cursor);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_poll_does_not_scan_rows_without_change_records() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
     sqlx::query(
-        "INSERT INTO upstreams (id, namespace, name, targets, algorithm, created_at, updated_at) \
-         VALUES ('old-upstream', 'ferrum', 'old', '[{\"host\":\"127.0.0.1\",\"port\":8080}]', 'round_robin', ?, ?)",
+        "INSERT INTO upstreams \
+         (id, namespace, name, targets, algorithm, created_at, updated_at) \
+         VALUES ('raw-upstream', 'ferrum', 'raw', '[{\"host\":\"127.0.0.1\",\"port\":8080}]', 'round_robin', ?, ?)",
     )
-    .bind(&old_ts)
-    .bind(&old_ts)
-    .fetch_all(&pool)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&store.pool())
     .await
-    .expect("INSERT must succeed");
-
-    let empty: HashSet<String> = HashSet::new();
+    .expect("raw upstream insert must succeed");
 
     let result = store
-        .load_incremental_config("ferrum", since, &empty, &empty, &empty, &empty)
+        .load_incremental_config("ferrum", 0)
         .await
         .expect("incremental poll must succeed");
-
-    // The old upstream must not appear.
     assert!(
-        result.added_or_modified_upstreams.is_empty(),
-        "upstream well before the boundary must not be returned"
+        result.is_empty(),
+        "raw resource rows without config_changes records must not be discovered by incremental polling"
     );
+    assert_eq!(result.sequence_cursor, 0);
 }
 
-/// All four table queries (`proxies`, `consumers`, `plugin_configs`,
-/// `upstreams`) must use inclusive comparison. Insert one row per table
-/// at exactly the boundary and verify all are returned.
 #[tokio::test(flavor = "multi_thread")]
-async fn incremental_poll_boundary_all_four_tables() {
+async fn association_additions_and_removals_are_proxy_change_events() {
     let (store, _temp_dir) = sqlite_store().await;
-
-    let since = Utc::now();
-    let boundary_ts = (since - Duration::seconds(1)).to_rfc3339();
-
-    let pool = store.pool();
-
-    // Upstream
-    sqlx::query(
-        "INSERT INTO upstreams (id, namespace, name, targets, algorithm, created_at, updated_at) \
-         VALUES ('u1', 'ferrum', 'u1', '[{\"host\":\"127.0.0.1\",\"port\":8080}]', 'round_robin', ?, ?)",
-    )
-    .bind(&boundary_ts)
-    .bind(&boundary_ts)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    // Proxy (requires an upstream FK or NULL upstream_id)
-    sqlx::query(
-        "INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, created_at, updated_at) \
-         VALUES ('p1', 'ferrum', 'p1', '[]', '/test', 'https', '127.0.0.1', 8080, ?, ?)",
-    )
-    .bind(&boundary_ts)
-    .bind(&boundary_ts)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    // Consumer
-    sqlx::query(
-        "INSERT INTO consumers (id, namespace, username, credentials, created_at, updated_at) \
-         VALUES ('c1', 'ferrum', 'testuser', '{}', ?, ?)",
-    )
-    .bind(&boundary_ts)
-    .bind(&boundary_ts)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    // Plugin config
-    sqlx::query(
-        "INSERT INTO plugin_configs (id, namespace, plugin_name, config, enabled, created_at, updated_at) \
-         VALUES ('pc1', 'ferrum', 'rate_limiting', '{\"limits\":[{\"scope\":\"default\",\"requests_per_minute\":100}]}', 1, ?, ?)",
-    )
-    .bind(&boundary_ts)
-    .bind(&boundary_ts)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    let empty: HashSet<String> = HashSet::new();
-
-    let result = store
-        .load_incremental_config("ferrum", since, &empty, &empty, &empty, &empty)
+    let plugin = test_plugin_config("proxy-group-plugin");
+    store
+        .create_plugin_config(&plugin)
         .await
-        .expect("incremental poll must succeed");
+        .expect("plugin create must succeed");
+    let mut proxy = test_proxy("association-proxy", "/association", vec![]);
+    store
+        .create_proxy(&proxy)
+        .await
+        .expect("proxy create must succeed");
+    let seed_sequence = store
+        .latest_change_sequence("ferrum")
+        .await
+        .expect("latest sequence must load after seed");
 
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: plugin.id.clone(),
+    }];
+    store
+        .update_proxy(&proxy)
+        .await
+        .expect("proxy association add must succeed");
+
+    let added = store
+        .load_incremental_config("ferrum", seed_sequence)
+        .await
+        .expect("association add poll must succeed");
+    let changed_proxy = added
+        .added_or_modified_proxies
+        .iter()
+        .find(|proxy| proxy.id == "association-proxy")
+        .expect("proxy association add must be represented by a proxy change");
+    assert_eq!(changed_proxy.plugins.len(), 1);
     assert_eq!(
-        result.added_or_modified_upstreams.len(),
-        1,
-        "upstream at boundary must be included"
+        changed_proxy.plugins[0].plugin_config_id,
+        "proxy-group-plugin"
     );
-    assert_eq!(
-        result.added_or_modified_proxies.len(),
-        1,
-        "proxy at boundary must be included"
-    );
-    assert_eq!(
-        result.added_or_modified_consumers.len(),
-        1,
-        "consumer at boundary must be included"
-    );
-    assert_eq!(
-        result.added_or_modified_plugin_configs.len(),
-        1,
-        "plugin_config at boundary must be included"
+
+    proxy.plugins.clear();
+    store
+        .update_proxy(&proxy)
+        .await
+        .expect("proxy association remove must succeed");
+    let removed = store
+        .load_incremental_config("ferrum", added.sequence_cursor)
+        .await
+        .expect("association removal poll must succeed");
+    let changed_proxy = removed
+        .added_or_modified_proxies
+        .iter()
+        .find(|proxy| proxy.id == "association-proxy")
+        .expect("proxy association removal must be represented by a proxy change");
+    assert!(changed_proxy.plugins.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_gap_reports_cursor_behind_retained_sequence() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO config_changes \
+         (sequence, namespace, resource_type, resource_id, operation, created_at) \
+         VALUES (10, 'ferrum', 'upstream', 'missing-upstream', 'delete', ?)",
+    )
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("manual config_changes insert must succeed");
+
+    let err = match store.load_incremental_config("ferrum", 1).await {
+        Ok(_) => panic!("retention gap must force caller to full reload"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("behind retained sequence"),
+        "retention gap error should explain the cursor problem, got: {message}"
     );
 }

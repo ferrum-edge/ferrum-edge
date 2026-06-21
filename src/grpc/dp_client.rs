@@ -1921,6 +1921,7 @@ mod tests {
                 upstream_in_namespace("u-staging", "staging"),
             ],
             removed_upstream_ids: vec![],
+            sequence_cursor: 0,
             poll_timestamp: Utc::now(),
         };
 
@@ -1950,6 +1951,7 @@ mod tests {
             removed_plugin_config_ids: vec![],
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
+            sequence_cursor: 0,
             poll_timestamp: Utc::now(),
         };
         assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 0);

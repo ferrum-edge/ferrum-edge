@@ -78,9 +78,10 @@ impl Default for ApiSpecListFilter {
 
 /// Result of an incremental config poll.
 ///
-/// Contains only the resources that changed since the last poll, plus IDs of
-/// resources that were deleted. The polling loop uses this to apply surgical
-/// updates without loading the entire database.
+/// Contains only resources referenced by durable change-log records newer than
+/// the caller's sequence cursor, plus IDs of resources that were deleted. The
+/// polling loop advances `sequence_cursor` only after the delta validates and
+/// applies, so rejected deltas are retried from the same durable point.
 ///
 /// Serializable for CP-to-DP gRPC delta broadcasts.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -93,7 +94,9 @@ pub struct IncrementalResult {
     pub removed_plugin_config_ids: Vec<String>,
     pub added_or_modified_upstreams: Vec<Upstream>,
     pub removed_upstream_ids: Vec<String>,
-    /// Timestamp to use as `since` for the next incremental poll.
+    /// Highest durable config change sequence included in this poll.
+    pub sequence_cursor: u64,
+    /// Timestamp to use as the in-memory/gRPC config version for this delta.
     pub poll_timestamp: DateTime<Utc>,
 }
 
@@ -233,15 +236,16 @@ pub trait DatabaseBackend: Send + Sync {
     // Incremental polling
     // -----------------------------------------------------------------------
 
-    /// Load only resources changed since `since`, plus detect deletions.
+    /// Return the highest durable config-change sequence currently committed
+    /// for `namespace`. Callers seed this after a full reload so subsequent
+    /// incremental polls start from an authoritative snapshot boundary.
+    async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    /// Load only resources changed after `after_sequence`.
     async fn load_incremental_config(
         &self,
         namespace: &str,
-        since: DateTime<Utc>,
-        known_proxy_ids: &HashSet<String>,
-        known_consumer_ids: &HashSet<String>,
-        known_plugin_config_ids: &HashSet<String>,
-        known_upstream_ids: &HashSet<String>,
+        after_sequence: u64,
     ) -> Result<IncrementalResult, anyhow::Error>;
 
     // -----------------------------------------------------------------------
@@ -624,9 +628,11 @@ pub trait DatabaseBackend: Send + Sync {
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error>;
 }
 
-/// Extract known IDs from a full config (used to seed the incremental poller).
+/// Extract resource IDs from a full config.
 ///
 /// This is a pure function on `GatewayConfig`, independent of any backend.
+// Used by external test crates; the binary target otherwise flags it as dead code.
+#[allow(dead_code)]
 pub fn extract_known_ids(
     config: &GatewayConfig,
 ) -> (
