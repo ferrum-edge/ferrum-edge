@@ -1131,6 +1131,76 @@ mod inner {
             );
         }
 
+        fn resource_ids_without_failed_insert_indices<'a>(
+            resource_ids: &'a [&'a str],
+            failed_indices: &HashSet<usize>,
+        ) -> Vec<&'a str> {
+            resource_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, resource_id)| {
+                    if failed_indices.contains(&idx) {
+                        None
+                    } else {
+                        Some(*resource_id)
+                    }
+                })
+                .collect()
+        }
+
+        fn rollback_ids_for_unordered_insert_error<'a>(
+            resource_ids: &'a [&'a str],
+            err: &mongodb::error::Error,
+        ) -> Vec<&'a str> {
+            let mongodb::error::ErrorKind::InsertMany(insert_error) = err.kind.as_ref() else {
+                return Vec::new();
+            };
+            let failed_indices: HashSet<usize> = insert_error
+                .write_errors
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|write_error| write_error.index)
+                .collect();
+            Self::resource_ids_without_failed_insert_indices(resource_ids, &failed_indices)
+        }
+
+        async fn rollback_standalone_updated_document(
+            &self,
+            collection_name: &str,
+            resource_type: &str,
+            resource_id: &str,
+            previous_doc: Option<Document>,
+            change_error: &anyhow::Error,
+        ) {
+            let Some(previous_doc) = previous_doc else {
+                warn!(
+                    "MongoDB standalone {} update for id '{}' failed to record config_changes, \
+                     but no previous document was available to restore: {}",
+                    resource_type, resource_id, change_error
+                );
+                return;
+            };
+            match self
+                .collection(collection_name)
+                .replace_one(doc! { "_id": resource_id }, previous_doc)
+                .await
+            {
+                Ok(result) if result.matched_count > 0 => warn!(
+                    "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
+                    resource_type, resource_id, change_error
+                ),
+                Ok(_) => warn!(
+                    "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
+                    resource_type, resource_id, change_error
+                ),
+                Err(rollback_err) => warn!(
+                    "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                    resource_type, resource_id, rollback_err, change_error
+                ),
+            }
+        }
+
         async fn compact_config_changes(&self, namespace: &str) -> Result<(), anyhow::Error> {
             let latest = self.latest_change_sequence(namespace).await?;
             if latest <= CHANGE_LOG_RETAIN_PER_NAMESPACE {
@@ -2389,6 +2459,7 @@ mod inner {
                     .await
                     .map_err(|e| anyhow::anyhow!("update_proxy transaction failed: {}", e))?
             } else {
+                let previous_doc = self.proxies().find_one(doc! { "_id": &proxy.id }).await?;
                 if let Some(spec_doc) = self
                     .api_specs()
                     .find_one(doc! { "proxy_id": &proxy.id })
@@ -2402,15 +2473,23 @@ mod inner {
                 self.proxies()
                     .replace_one(doc! { "_id": &proxy.id }, doc)
                     .await?;
-                Vec::new()
-            };
-            let orphaned_proxy_group_plugin_deletes = if use_replica_set {
-                transaction_orphaned_proxy_group_plugin_deletes
-            } else {
-                self.record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_updated_document(
+                        "proxies",
+                        "proxy",
+                        &proxy.id,
+                        previous_doc,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
                 self.cleanup_orphaned_proxy_group_plugins().await?
             };
+            let orphaned_proxy_group_plugin_deletes = transaction_orphaned_proxy_group_plugin_deletes;
             if use_replica_set {
                 self.compact_config_changes_best_effort(&proxy.namespace)
                     .await;
@@ -2947,11 +3026,24 @@ mod inner {
                 self.compact_config_changes_best_effort(&consumer.namespace)
                     .await;
             } else {
+                let previous_doc = self.consumers().find_one(doc! { "_id": &consumer.id }).await?;
                 self.consumers()
                     .replace_one(doc! { "_id": &consumer.id }, doc)
                     .await?;
-                self.record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_updated_document(
+                        "consumers",
+                        "consumer",
+                        &consumer.id,
+                        previous_doc,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
             self.check_slow_query("update_consumer", start);
             Ok(())
@@ -3167,13 +3259,28 @@ mod inner {
                 self.plugin_configs()
                     .replace_one(doc! { "_id": &pc.id }, doc)
                     .await?;
-                self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                    .await?;
-                if pc.scope == PluginScope::Proxy
-                    && let Some(proxy_id) = pc.proxy_id.as_deref()
-                {
-                    self.record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
+                let change_result: Result<(), anyhow::Error> = async {
+                    self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
                         .await?;
+                    if pc.scope == PluginScope::Proxy
+                        && let Some(proxy_id) = pc.proxy_id.as_deref()
+                    {
+                        self.record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
+                            .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(err) = change_result {
+                    self.rollback_standalone_updated_document(
+                        "plugin_configs",
+                        "plugin_config",
+                        &pc.id,
+                        existing_doc,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
                 }
             }
             self.check_slow_query("update_plugin_config", start);
@@ -3400,8 +3507,20 @@ mod inner {
                 self.upstreams()
                     .replace_one(doc! { "_id": &upstream.id }, doc)
                     .await?;
-                self.record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
-                    .await?;
+                if let Err(err) = self
+                    .record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
+                    .await
+                {
+                    self.rollback_standalone_updated_document(
+                        "upstreams",
+                        "upstream",
+                        &upstream.id,
+                        existing_doc,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
             self.check_slow_query("update_upstream", start);
             Ok(())
@@ -3871,7 +3990,22 @@ mod inner {
                 }
                 Ok(result.inserted_ids.len())
             } else {
-                let result = self.proxies().insert_many(docs).ordered(false).await?;
+                let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+                let result = match self.proxies().insert_many(docs).ordered(false).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let err = anyhow::Error::new(err);
+                        self.rollback_standalone_created_documents(
+                            "proxies",
+                            "proxy",
+                            &rollback_ids,
+                            &err,
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
                 let changes: Vec<ConfigChangeWrite<'_>> = proxies
                     .iter()
                     .map(|proxy| ConfigChangeWrite {
@@ -3882,7 +4016,6 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
                     self.rollback_standalone_created_documents("proxies", "proxy", &ids, &err)
                         .await;
                     return Err(err);
@@ -3951,7 +4084,25 @@ mod inner {
                 }
                 Ok(result.inserted_ids.len())
             } else {
-                let result = self.consumers().insert_many(docs).ordered(false).await?;
+                let ids: Vec<&str> = consumers
+                    .iter()
+                    .map(|consumer| consumer.id.as_str())
+                    .collect();
+                let result = match self.consumers().insert_many(docs).ordered(false).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let err = anyhow::Error::new(err);
+                        self.rollback_standalone_created_documents(
+                            "consumers",
+                            "consumer",
+                            &rollback_ids,
+                            &err,
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
                 let changes: Vec<ConfigChangeWrite<'_>> = consumers
                     .iter()
                     .map(|consumer| ConfigChangeWrite {
@@ -3962,10 +4113,6 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    let ids: Vec<&str> = consumers
-                        .iter()
-                        .map(|consumer| consumer.id.as_str())
-                        .collect();
                     self.rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
                         .await;
                     return Err(err);
@@ -4015,11 +4162,27 @@ mod inner {
                 }
                 Ok(result.inserted_ids.len())
             } else {
-                let result = self
+                let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+                let result = match self
                     .plugin_configs()
                     .insert_many(docs)
                     .ordered(false)
-                    .await?;
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let err = anyhow::Error::new(err);
+                        self.rollback_standalone_created_documents(
+                            "plugin_configs",
+                            "plugin_config",
+                            &rollback_ids,
+                            &err,
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
                 let changes: Vec<ConfigChangeWrite<'_>> = configs
                     .iter()
                     .map(|config| ConfigChangeWrite {
@@ -4030,7 +4193,6 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
                     self.rollback_standalone_created_documents(
                         "plugin_configs",
                         "plugin_config",
@@ -4085,7 +4247,25 @@ mod inner {
                 }
                 Ok(result.inserted_ids.len())
             } else {
-                let result = self.upstreams().insert_many(docs).ordered(false).await?;
+                let ids: Vec<&str> = upstreams
+                    .iter()
+                    .map(|upstream| upstream.id.as_str())
+                    .collect();
+                let result = match self.upstreams().insert_many(docs).ordered(false).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let err = anyhow::Error::new(err);
+                        self.rollback_standalone_created_documents(
+                            "upstreams",
+                            "upstream",
+                            &rollback_ids,
+                            &err,
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                };
                 let changes: Vec<ConfigChangeWrite<'_>> = upstreams
                     .iter()
                     .map(|upstream| ConfigChangeWrite {
@@ -4096,10 +4276,6 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    let ids: Vec<&str> = upstreams
-                        .iter()
-                        .map(|upstream| upstream.id.as_str())
-                        .collect();
                     self.rollback_standalone_created_documents("upstreams", "upstream", &ids, &err)
                         .await;
                     return Err(err);
@@ -4900,6 +5076,26 @@ mod inner {
                     self.api_specs().insert_one(spec_doc).await?;
                     inserted_spec = true;
 
+                    if let Some(u) = &bundle.upstream {
+                        self.record_config_change(&u.namespace, "upstream", &u.id, "upsert")
+                            .await?;
+                    }
+                    self.record_config_change(
+                        &bundle.proxy.namespace,
+                        "proxy",
+                        &bundle.proxy.id,
+                        "upsert",
+                    )
+                    .await?;
+                    for pc in &bundle.plugins {
+                        self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
+                            .await?;
+                    }
+                    for (plugin_id, namespace) in &orphaned_proxy_group_plugin_deletes {
+                        self.record_config_change(namespace, "plugin_config", plugin_id, "delete")
+                            .await?;
+                    }
+
                     Ok(())
                 }
                 .await;
@@ -4915,39 +5111,22 @@ mod inner {
                     .await;
                     return Err(e);
                 }
-            }
-
-            if use_replica_set {
-                let mut namespaces_to_compact = HashSet::new();
-                if let Some(u) = &bundle.upstream {
-                    namespaces_to_compact.insert(u.namespace.clone());
-                }
-                namespaces_to_compact.insert(bundle.proxy.namespace.clone());
-                namespaces_to_compact.extend(bundle.plugins.iter().map(|pc| pc.namespace.clone()));
-                namespaces_to_compact.extend(
-                    orphaned_proxy_group_plugin_deletes
-                        .iter()
-                        .map(|(_, namespace)| namespace.clone()),
-                );
-                for namespace in namespaces_to_compact {
-                    self.compact_config_changes_best_effort(&namespace).await;
-                }
                 return Ok(());
             }
 
+            let mut namespaces_to_compact = HashSet::new();
             if let Some(u) = &bundle.upstream {
-                self.record_config_change(&u.namespace, "upstream", &u.id, "upsert")
-                    .await?;
+                namespaces_to_compact.insert(u.namespace.clone());
             }
-            self.record_config_change(&bundle.proxy.namespace, "proxy", &bundle.proxy.id, "upsert")
-                .await?;
-            for pc in &bundle.plugins {
-                self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                    .await?;
-            }
-            for (plugin_id, namespace) in orphaned_proxy_group_plugin_deletes {
-                self.record_config_change(&namespace, "plugin_config", &plugin_id, "delete")
-                    .await?;
+            namespaces_to_compact.insert(bundle.proxy.namespace.clone());
+            namespaces_to_compact.extend(bundle.plugins.iter().map(|pc| pc.namespace.clone()));
+            namespaces_to_compact.extend(
+                orphaned_proxy_group_plugin_deletes
+                    .iter()
+                    .map(|(_, namespace)| namespace.clone()),
+            );
+            for namespace in namespaces_to_compact {
+                self.compact_config_changes_best_effort(&namespace).await;
             }
 
             Ok(())
@@ -7872,6 +8051,21 @@ mod inner {
             assert!(
                 proxy_delete < plugin_delete,
                 "compensating rollback must delete the proxy before plugin_configs"
+            );
+        }
+
+        #[test]
+        fn unordered_insert_rollback_skips_failed_write_indices() {
+            let resource_ids = vec!["proxy-a", "proxy-b", "proxy-c", "proxy-d"];
+            let failed_indices = HashSet::from([1_usize, 3_usize]);
+
+            assert_eq!(
+                MongoStore::resource_ids_without_failed_insert_indices(
+                    &resource_ids,
+                    &failed_indices
+                ),
+                vec!["proxy-a", "proxy-c"],
+                "unordered batch rollback must target only successful inserts"
             );
         }
 

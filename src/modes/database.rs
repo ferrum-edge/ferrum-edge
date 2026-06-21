@@ -1014,47 +1014,51 @@ pub async fn run(
         .await?;
     }
 
-    // Load initial config from database, falling back to backup file if configured
+    // Load initial config from database, falling back to backup file if configured.
+    // Successful DB loads seed the durable change cursor so the first poll can
+    // use config_changes immediately; backup loads intentionally start without
+    // a cursor and force an authoritative DB reload after recovery.
     let backup_path = env_config.db_config_backup_path.clone();
-    let config = match db.load_full_config(&env_config.namespace).await {
-        Ok(cfg) => {
-            info!(
-                "Database mode: loaded {} proxies, {} consumers",
-                cfg.proxies.len(),
-                cfg.consumers.len()
-            );
-            cfg
-        }
-        Err(e) => {
-            // Database unreachable — try backup file for pod restart resilience
-            if let Some(ref path) = backup_path {
-                warn!(
-                    "Database load failed ({}), attempting backup file: {}",
-                    e, path
+    let (config, initial_change_sequence) =
+        match load_full_config_with_sequence(&db, &env_config.namespace).await {
+            Ok((cfg, sequence)) => {
+                info!(
+                    "Database mode: loaded {} proxies, {} consumers",
+                    cfg.proxies.len(),
+                    cfg.consumers.len()
                 );
-                match load_config_backup(path) {
-                    Some(cfg) => {
-                        warn!(
-                            "Starting with backup config ({} proxies, {} consumers). \
-                             Database polling will retry and update when DB recovers.",
-                            cfg.proxies.len(),
-                            cfg.consumers.len()
-                        );
-                        cfg
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "Database load failed and no usable backup at {}: {}",
-                            path,
-                            e
-                        ));
-                    }
-                }
-            } else {
-                return Err(e);
+                (cfg, Some(sequence))
             }
-        }
-    };
+            Err(e) => {
+                // Database unreachable — try backup file for pod restart resilience
+                if let Some(ref path) = backup_path {
+                    warn!(
+                        "Database load failed ({}), attempting backup file: {}",
+                        e, path
+                    );
+                    match load_config_backup(path) {
+                        Some(cfg) => {
+                            warn!(
+                                "Starting with backup config ({} proxies, {} consumers). \
+                                 Database polling will retry and update when DB recovers.",
+                                cfg.proxies.len(),
+                                cfg.consumers.len()
+                            );
+                            (cfg, None)
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Database load failed and no usable backup at {}: {}",
+                                path,
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
     // Validate stream proxy ports don't conflict with gateway reserved ports
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -1763,9 +1767,9 @@ pub async fn run(
     // Database polling loop (with shutdown) — uses incremental polling
     // to avoid full table scans on every cycle.
     //
-    // The first poll after startup performs an authoritative full reload and
-    // seeds the durable config-change sequence cursor. Subsequent polls read
-    // only change-log rows after that accepted cursor.
+    // Normal startup seeds the durable config-change sequence cursor before
+    // this task starts. Backup/offline bootstrap leaves the cursor empty so the
+    // first recovered poll performs an authoritative full reload.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let proxy_state_poll = proxy_state.clone();
@@ -1809,7 +1813,7 @@ pub async fn run(
             database_delta_poll_metrics_for_poll,
         );
 
-        let mut last_change_sequence: Option<u64> = None;
+        let mut last_change_sequence: Option<u64> = initial_change_sequence;
 
         loop {
             tokio::select! {
@@ -2252,6 +2256,21 @@ async fn mark_db_available_after_successful_poll_load(
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
+        let source = include_str!("database.rs");
+        assert!(
+            source.contains("let (config, initial_change_sequence) ="),
+            "database startup must retain the initial full-load change sequence"
+        );
+        assert!(
+            source.contains(
+                "let mut last_change_sequence: Option<u64> = initial_change_sequence;"
+            ),
+            "poll loop must start from the initial full-load cursor"
+        );
+    }
 
     #[test]
     fn full_reload_unchanged_commits_sequence_cursor() {
