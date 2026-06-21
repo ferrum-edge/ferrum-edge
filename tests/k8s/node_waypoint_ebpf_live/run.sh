@@ -605,6 +605,76 @@ workload_pod_records() {
     awk 'NF == 3'
 }
 
+workload_pod_record_for_app() {
+  local app="$1"
+  kubectl -n "$WORKLOAD_NS" get pod -l "app=$app" \
+    -o jsonpath='{.items[0].metadata.uid}{"\t"}{.items[0].spec.nodeName}{"\t"}{.items[0].metadata.name}'
+}
+
+ambient_pod_on_node() {
+  local node="$1"
+  kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    --field-selector "spec.nodeName=$node" \
+    -o jsonpath='{.items[0].metadata.name}'
+}
+
+pick_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+fetch_node_waypoint_identities_for_node() {
+  local node="$1"
+  local out="$2"
+  local ambient_pod port token pf_log pf_pid fetched
+  ambient_pod="$(ambient_pod_on_node "$node")"
+  if [[ -z "$ambient_pod" ]]; then
+    echo "no ferrum-mesh-ambient pod found on node $node" >&2
+    return 1
+  fi
+  port="$(pick_loopback_port)"
+  token="$(admin_bearer_token)"
+  pf_log="$out.port-forward.log"
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  fetched=false
+  for _ in $(seq 1 20); do
+    if curl -fsS -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:$port/node-waypoint/identities" >"$out" 2>"$out.curl"; then
+      fetched=true
+      break
+    fi
+    sleep 0.25
+  done
+  kill "$pf_pid" 2>/dev/null || true
+  wait "$pf_pid" 2>/dev/null || true
+  [[ "$fetched" == "true" ]]
+}
+
+node_waypoint_identities_include_uid() {
+  local identities_file="$1"
+  local uid="$2"
+  python3 - "$identities_file" "$uid" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+
+uid = sys.argv[2]
+for identity in data.get("identities") or []:
+    if identity.get("pod_uid") == uid:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 node_host_file_exists() {
   local node="$1"
   local path="$2"
@@ -897,6 +967,46 @@ curl_from() {
     sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
 }
 
+wait_for_node_waypoint_admission() {
+  local from="$1"
+  local label="$2"
+  local url="$3"
+  local uid node pod identities_dir identities_file err record
+  record="$(workload_pod_record_for_app "$from")"
+  IFS=$'\t' read -r uid node pod <<<"$record"
+  if [[ -z "${uid:-}" || -z "${node:-}" || -z "${pod:-}" ]]; then
+    echo "could not resolve workload pod record for app=$from" >&2
+    kubectl -n "$WORKLOAD_NS" get pods -o wide >&2 || true
+    exit 1
+  fi
+
+  log "waiting for NodeWaypoint admission for $label ($pod on $node)"
+  identities_dir="$RESULTS_DIR/ambient-node-waypoint-admission"
+  mkdir -p "$identities_dir"
+  identities_file="$identities_dir/$from-$uid.json"
+
+  for _ in $(seq 1 30); do
+    err="$(mktemp)"
+    set +e
+    curl_from "$from" "$url" >/dev/null 2>"$err"
+    set -e
+    rm -f "$err"
+
+    if fetch_node_waypoint_identities_for_node "$node" "$identities_file" &&
+      node_waypoint_identities_include_uid "$identities_file" "$uid"; then
+      return
+    fi
+    sleep 2
+  done
+
+  echo "NodeWaypoint did not admit $label traffic from $pod ($uid) on $node to $url" >&2
+  if [[ -f "$identities_file" ]]; then
+    cat "$identities_file" >&2 || true
+  fi
+  collect_traffic_failure_diagnostics
+  exit 1
+}
+
 expect_allowed() {
   local from="$1"
   local label="$2"
@@ -961,6 +1071,9 @@ run_traffic_checks() {
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
 
+  wait_for_node_waypoint_admission src-a "src-a same-node Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  wait_for_node_waypoint_admission src-b "src-b same-node Service path" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
+
   expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
   expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
 
@@ -979,6 +1092,8 @@ run_traffic_checks() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
+  wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
   expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
   expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
 }
