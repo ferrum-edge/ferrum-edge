@@ -14,10 +14,10 @@
 //!   via [`FederationStore::snapshot`], which dereferences a single `ArcSwap`.
 //! - **Validated swap**: each polled bundle is validated through the same
 //!   trust-bundle invariants as a slice-provided bundle before being stored.
-//!   A failed poll bumps the failure metric and keeps the last-good entry —
-//!   `FERRUM_MESH_FEDERATION_FAIL_OPEN=false` (default) means cross-cluster
-//!   mTLS verifies against the last successful bundle; once-and-only-once
-//!   poll failures never delete a previously fetched bundle.
+//!   A failed poll bumps the failure metric and keeps the last-good entry.
+//!   `FERRUM_MESH_FEDERATION_FAIL_OPEN` controls only bootstrap fallback for
+//!   remotes with no last-good polled bundle yet; once a bundle has been
+//!   fetched, transient poll failures never delete it.
 //! - **Backoff**: each remote endpoint runs in its own tokio task with
 //!   jittered exponential backoff matching `src/grpc/dp_client.rs`
 //!   (1s → 30s cap, ±25% jitter). On success the per-target backoff resets to
@@ -25,7 +25,7 @@
 //! - **Shutdown**: every loop watches the gateway's shutdown channel; SIGTERM
 //!   drains the poller cleanly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -467,13 +467,10 @@ struct RemoteClusterPollTarget {
 pub struct FederationPollerConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
-    /// Reserved for future verifier integration. Today this value is
-    /// recorded in poll-failure log lines for operator visibility but does
-    /// NOT influence the verifier — cross-cluster mTLS always verifies
-    /// against the last-good bundle (fail-closed). When the verifier is
-    /// extended to honour this flag, `true` will let trust domains with no
-    /// cached bundle fall through to the CP-supplied slice. Tracked in
-    /// [`docs/mesh.md`](../../../docs/mesh.md) "Trust Federation".
+    /// Federation bootstrap policy. When true, a remote trust domain with a
+    /// configured federation endpoint may use a CP-supplied fallback bundle
+    /// before the first successful poll. When false, that remote trust domain
+    /// stays inactive until the poller installs a last-good bundle.
     pub fail_open: bool,
 }
 
@@ -1077,23 +1074,65 @@ pub(crate) fn next_backoff_secs(current_secs: u64) -> u64 {
     common_next_backoff_secs(current_secs, true)
 }
 
+fn dynamic_federation_trust_domains(
+    multi_cluster: Option<&MultiClusterConfig>,
+    poll_enabled: bool,
+) -> HashSet<TrustDomain> {
+    if !poll_enabled {
+        return HashSet::new();
+    }
+    multi_cluster
+        .map(|mc| {
+            mc.remote_clusters
+                .iter()
+                .filter(|remote| {
+                    remote
+                        .federation_endpoint
+                        .as_deref()
+                        .is_some_and(|endpoint| !endpoint.trim().is_empty())
+                })
+                .map(|remote| remote.trust_domain.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Merge the live federation snapshot into the static [`TrustBundleSet`] the
 /// control plane handed us. Used by the slice-apply path so the dispatched
-/// [`crate::config::types::GatewayConfig`] sees the most recent cross-cluster
-/// authorities.
+/// [`crate::config::types::GatewayConfig`] sees the currently active
+/// cross-cluster authorities.
 ///
 /// Merge precedence: the live snapshot (polled) wins on conflict because the
-/// poller signals a fresh trust-domain rotation; the CP-supplied bundles
-/// remain as a fallback for trust domains the poller hasn't fetched (or
-/// hasn't fetched successfully yet).
+/// poller signals a fresh trust-domain rotation. When
+/// `FERRUM_MESH_FEDERATION_FAIL_OPEN=false` and federation polling is enabled,
+/// a remote cluster that declares a `federation_endpoint` must have a last-good
+/// polled bundle before its trust domain is activated. CP-supplied bundles for
+/// such domains are treated as bootstrap fallback only when
+/// `FERRUM_MESH_FEDERATION_FAIL_OPEN=true` (or polling is disabled entirely).
+/// This makes the fail-open setting observable while still preserving
+/// last-good polled bundles across transient poll failures.
 pub fn merge_federation_into_trust_bundles(
     trust_bundles: Option<TrustBundleSet>,
     snapshot: &FederationSnapshot,
+    multi_cluster: Option<&MultiClusterConfig>,
+    fail_open: bool,
+    poll_enabled: bool,
 ) -> Option<TrustBundleSet> {
-    if snapshot.bundles.is_empty() {
-        return trust_bundles;
-    }
     let mut set = trust_bundles?;
+
+    if !fail_open {
+        let dynamic_domains = dynamic_federation_trust_domains(multi_cluster, poll_enabled);
+        if !dynamic_domains.is_empty() {
+            set.federated.retain(|fed| {
+                !dynamic_domains.contains(&fed.trust_domain)
+                    || snapshot.bundles.contains_key(&fed.trust_domain)
+            });
+        }
+    }
+
+    if snapshot.bundles.is_empty() {
+        return Some(set);
+    }
     // Dedupe by trust domain: drop any existing federated entries whose trust
     // domain the poller has fetched, then append the fresh polled bundles.
     set.federated
@@ -1296,7 +1335,8 @@ mod tests {
         );
 
         let merged =
-            merge_federation_into_trust_bundles(Some(cp_bundle), &polled).expect("merge result");
+            merge_federation_into_trust_bundles(Some(cp_bundle), &polled, None, false, false)
+                .expect("merge result");
         assert_eq!(merged.federated.len(), 1);
         assert_eq!(
             merged.federated[0].x509_authorities[0],
@@ -1337,7 +1377,8 @@ mod tests {
         );
 
         let merged =
-            merge_federation_into_trust_bundles(Some(cp_bundle), &polled).expect("merge result");
+            merge_federation_into_trust_bundles(Some(cp_bundle), &polled, None, false, false)
+                .expect("merge result");
         let domains: Vec<_> = merged
             .federated
             .iter()
@@ -1350,7 +1391,7 @@ mod tests {
     #[test]
     fn merge_returns_none_without_cp_or_polled() {
         let polled = FederationSnapshot::default();
-        assert!(merge_federation_into_trust_bundles(None, &polled).is_none());
+        assert!(merge_federation_into_trust_bundles(None, &polled, None, false, false).is_none());
     }
 
     #[test]
@@ -1365,10 +1406,162 @@ mod tests {
             federated: Vec::new(),
         };
         let polled = FederationSnapshot::default();
-        let merged =
-            merge_federation_into_trust_bundles(Some(cp_bundle.clone()), &polled).expect("kept");
+        let merged = merge_federation_into_trust_bundles(
+            Some(cp_bundle.clone()),
+            &polled,
+            None,
+            false,
+            false,
+        )
+        .expect("kept");
         assert_eq!(merged.federated.len(), 0);
         assert_eq!(merged.local.trust_domain, td("local"));
+    }
+
+    #[test]
+    fn merge_fail_closed_blocks_cp_fallback_until_first_poll() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let remote_td = td("remote.example.com");
+        let cp_bundle = TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: td("local"),
+                x509_authorities: vec![sample_cert_base64()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: vec![TrustBundle {
+                trust_domain: remote_td.clone(),
+                x509_authorities: vec!["cp_value".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }],
+        };
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "remote".to_string(),
+                trust_domain: remote_td.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        let merged = merge_federation_into_trust_bundles(
+            Some(cp_bundle),
+            &FederationSnapshot::default(),
+            Some(&mc),
+            false,
+            true,
+        )
+        .expect("merge result");
+
+        assert!(
+            merged.federated.is_empty(),
+            "fail-closed mode must not activate a CP fallback for a dynamic federation endpoint before a poll succeeds"
+        );
+    }
+
+    #[test]
+    fn merge_fail_open_uses_cp_fallback_until_first_poll() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let remote_td = td("remote.example.com");
+        let cp_bundle = TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: td("local"),
+                x509_authorities: vec![sample_cert_base64()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: vec![TrustBundle {
+                trust_domain: remote_td.clone(),
+                x509_authorities: vec!["cp_value".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }],
+        };
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "remote".to_string(),
+                trust_domain: remote_td.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        let merged = merge_federation_into_trust_bundles(
+            Some(cp_bundle),
+            &FederationSnapshot::default(),
+            Some(&mc),
+            true,
+            true,
+        )
+        .expect("merge result");
+
+        assert_eq!(merged.federated.len(), 1);
+        assert_eq!(merged.federated[0].trust_domain, remote_td);
+        assert_eq!(merged.federated[0].x509_authorities[0], "cp_value");
+    }
+
+    #[test]
+    fn merge_polled_bundle_wins_in_fail_closed_mode() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let remote_td = td("remote.example.com");
+        let cp_bundle = TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: td("local"),
+                x509_authorities: vec![sample_cert_base64()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: vec![TrustBundle {
+                trust_domain: remote_td.clone(),
+                x509_authorities: vec!["cp_value".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }],
+        };
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "remote".to_string(),
+                trust_domain: remote_td.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut polled = FederationSnapshot::default();
+        polled.bundles.insert(
+            remote_td.clone(),
+            FederatedBundle {
+                bundle: TrustBundle {
+                    trust_domain: remote_td.clone(),
+                    x509_authorities: vec![sample_cert_base64()],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                fetched_at_unix_seconds: 1,
+                endpoint: "https://remote/.well-known/spiffe".to_string(),
+                cluster_name: "remote".to_string(),
+            },
+        );
+
+        let merged =
+            merge_federation_into_trust_bundles(Some(cp_bundle), &polled, Some(&mc), false, true)
+                .expect("merge result");
+
+        assert_eq!(merged.federated.len(), 1);
+        assert_eq!(merged.federated[0].trust_domain, remote_td);
+        assert_eq!(
+            merged.federated[0].x509_authorities[0],
+            sample_cert_base64()
+        );
     }
 
     #[test]
