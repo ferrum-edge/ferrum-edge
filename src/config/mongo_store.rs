@@ -2489,7 +2489,8 @@ mod inner {
                 }
                 self.cleanup_orphaned_proxy_group_plugins().await?
             };
-            let orphaned_proxy_group_plugin_deletes = transaction_orphaned_proxy_group_plugin_deletes;
+            let orphaned_proxy_group_plugin_deletes =
+                transaction_orphaned_proxy_group_plugin_deletes;
             if use_replica_set {
                 self.compact_config_changes_best_effort(&proxy.namespace)
                     .await;
@@ -3026,7 +3027,10 @@ mod inner {
                 self.compact_config_changes_best_effort(&consumer.namespace)
                     .await;
             } else {
-                let previous_doc = self.consumers().find_one(doc! { "_id": &consumer.id }).await?;
+                let previous_doc = self
+                    .consumers()
+                    .find_one(doc! { "_id": &consumer.id })
+                    .await?;
                 self.consumers()
                     .replace_one(doc! { "_id": &consumer.id }, doc)
                     .await?;
@@ -3994,7 +3998,8 @@ mod inner {
                 let result = match self.proxies().insert_many(docs).ordered(false).await {
                     Ok(result) => result,
                     Err(err) => {
-                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let rollback_ids =
+                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
                         self.rollback_standalone_created_documents(
                             "proxies",
@@ -4091,7 +4096,8 @@ mod inner {
                 let result = match self.consumers().insert_many(docs).ordered(false).await {
                     Ok(result) => result,
                     Err(err) => {
-                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let rollback_ids =
+                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
                         self.rollback_standalone_created_documents(
                             "consumers",
@@ -4163,15 +4169,11 @@ mod inner {
                 Ok(result.inserted_ids.len())
             } else {
                 let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
-                let result = match self
-                    .plugin_configs()
-                    .insert_many(docs)
-                    .ordered(false)
-                    .await
-                {
+                let result = match self.plugin_configs().insert_many(docs).ordered(false).await {
                     Ok(result) => result,
                     Err(err) => {
-                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let rollback_ids =
+                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
                         self.rollback_standalone_created_documents(
                             "plugin_configs",
@@ -4254,7 +4256,8 @@ mod inner {
                 let result = match self.upstreams().insert_many(docs).ordered(false).await {
                     Ok(result) => result,
                     Err(err) => {
-                        let rollback_ids = Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                        let rollback_ids =
+                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
                         self.rollback_standalone_created_documents(
                             "upstreams",

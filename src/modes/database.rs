@@ -2265,9 +2265,7 @@ mod tests {
             "database startup must retain the initial full-load change sequence"
         );
         assert!(
-            source.contains(
-                "let mut last_change_sequence: Option<u64> = initial_change_sequence;"
-            ),
+            source.contains("let mut last_change_sequence: Option<u64> = initial_change_sequence;"),
             "poll loop must start from the initial full-load cursor"
         );
     }
