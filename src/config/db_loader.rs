@@ -1289,7 +1289,8 @@ impl DatabaseStore {
             } else {
                 "SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ?"
             };
-            let mut query = sqlx::query(&self.q(sql)).bind(namespace);
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
             if let Some(last_id) = last_id.as_deref() {
                 query = query.bind(last_id);
             }
@@ -1330,7 +1331,8 @@ impl DatabaseStore {
             } else {
                 "SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ?"
             };
-            let mut query = sqlx::query(&self.q(sql)).bind(namespace);
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
             if let Some(last_id) = last_id.as_deref() {
                 query = query.bind(last_id);
             }
@@ -1368,7 +1370,8 @@ impl DatabaseStore {
             } else {
                 "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ?"
             };
-            let mut query = sqlx::query(&self.q(sql)).bind(namespace);
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
             if let Some(last_id) = last_id.as_deref() {
                 query = query.bind(last_id);
             }
@@ -2211,7 +2214,8 @@ impl DatabaseStore {
             } else {
                 "SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ?"
             };
-            let mut query = sqlx::query(&self.q(sql)).bind(namespace);
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
             if let Some(last_id) = last_id.as_deref() {
                 query = query.bind(last_id);
             }
