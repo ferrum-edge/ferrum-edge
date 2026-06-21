@@ -2785,6 +2785,10 @@ fn materialize_sidecar_inbound_proxies(
                         runtime.cluster_domain.trim_matches('.')
                     ),
                     tls_inspect: matches!(effective_protocol, AppProtocol::Tls),
+                    first_bytes_inspect: matches!(
+                        effective_protocol,
+                        AppProtocol::Tls | AppProtocol::Tcp | AppProtocol::Redis
+                    ),
                 });
             }
         }
@@ -13702,7 +13706,11 @@ mod tests {
         assert_eq!(route.service_fqdn, "redis.default.svc.cluster.local");
         assert!(
             !route.tls_inspect,
-            "a server-first Redis inbound port must not be marked for SNI peeking"
+            "a Redis inbound port must not be marked for SNI peeking"
+        );
+        assert!(
+            route.first_bytes_inspect,
+            "a Redis inbound port can be client-first, so stream plugins must receive first bytes"
         );
     }
 
@@ -13746,6 +13754,10 @@ mod tests {
         assert!(
             route.tls_inspect,
             "an opaque-TLS inbound port must be marked for ClientHello SNI peeking"
+        );
+        assert!(
+            route.first_bytes_inspect,
+            "an opaque-TLS inbound port must expose ClientHello bytes to stream plugins"
         );
     }
 

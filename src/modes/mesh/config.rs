@@ -2251,12 +2251,13 @@ pub struct MeshInboundTcpRoute {
     /// `true` only for opaque-TLS app ports (`AppProtocol::Tls`), where the
     /// captured plaintext bytes are a real TLS ClientHello so the inbound relay
     /// peeks the SNI before the stream plugin chain (a `when: connection.sni`
-    /// `AuthorizationPolicy` needs it). `false` for server-first raw-TCP ports
-    /// (Redis/MySQL/Postgres/Mongo/plain TCP), whose clients send NOTHING until
-    /// the backend greeting — peeking those would block the relay on the
-    /// handshake clock (up to `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`,
-    /// indefinitely when `0`) before the loopback dial.
+    /// `AuthorizationPolicy` needs it).
     pub tls_inspect: bool,
+    /// `true` for client-first stream protocols whose opening bytes should be
+    /// made available to first-bytes-aware plugins (stream WAF, TCP TLS-shape
+    /// checks). `false` for known server-first raw-TCP protocols (Mongo/MySQL/
+    /// Postgres), whose clients send nothing until the backend greeting.
+    pub first_bytes_inspect: bool,
 }
 
 fn default_waypoint_for() -> String {

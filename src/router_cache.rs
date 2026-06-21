@@ -274,11 +274,14 @@ pub(crate) struct MeshTcpInboundEntry {
     /// The local service FQDN for logging.
     pub(crate) service_fqdn: String,
     /// `true` only for opaque-TLS app ports: the inbound relay peeks the
-    /// ClientHello SNI before the stream plugin chain. `false` for server-first
-    /// raw-TCP ports, where peeking would block the relay on the handshake clock
-    /// (the client sends nothing until the backend greeting). Carried from
+    /// ClientHello SNI before the stream plugin chain. Carried from
     /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
     pub(crate) tls_inspect: bool,
+    /// `true` for client-first stream protocols whose opening bytes should be
+    /// made available to first-bytes-aware plugins. `false` for known
+    /// server-first raw-TCP protocols, where peeking would block the relay on
+    /// the handshake clock before the backend greeting can arrive.
+    pub(crate) first_bytes_inspect: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -1802,6 +1805,7 @@ impl RouterCache {
                         backend_addr: route.backend_addr,
                         service_fqdn: route.service_fqdn.clone(),
                         tls_inspect: route.tls_inspect,
+                        first_bytes_inspect: route.first_bytes_inspect,
                     })
                 });
             }
@@ -4701,8 +4705,11 @@ mod tests {
             namespace: "default".to_string(),
             service_name: "redis".to_string(),
             service_fqdn: "redis.default.svc.cluster.local".to_string(),
-            // Redis is server-first: the relay must NOT peek SNI for this port.
+            // Redis is not opaque TLS: the relay must NOT peek SNI for this port.
             tls_inspect: false,
+            // Redis can be client-first, so first-bytes-aware plugins must see
+            // the opening plaintext bytes.
+            first_bytes_inspect: true,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4721,7 +4728,11 @@ mod tests {
         assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
         assert!(
             !entry.tls_inspect,
-            "server-first raw-TCP inbound entries must not SNI-peek (would stall on the handshake clock)"
+            "non-TLS raw-TCP inbound entries must not SNI-peek"
+        );
+        assert!(
+            entry.first_bytes_inspect,
+            "client-first plaintext raw-TCP inbound entries must expose first bytes to stream plugins"
         );
         assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert_eq!(
