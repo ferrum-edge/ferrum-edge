@@ -450,7 +450,10 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
         .port_overrides
         .get(&8080)
         .expect("top-level http overlay fan-out lands on every target port");
-    assert_eq!(port_override.http_max_requests_per_connection, Some(75));
+    assert!(
+        port_override.http_max_requests_per_connection.is_none(),
+        "maxRequestsPerConnection is deferred and must not project into port overrides"
+    );
     assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(port_override.h2_max_concurrent_streams, Some(250));
     assert_eq!(
@@ -466,7 +469,10 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
         .as_ref()
         .and_then(|overrides| overrides.get(&8080))
         .expect("proxy dispatch port override projected");
-    assert_eq!(dispatch_override.http_max_requests_per_connection, Some(75));
+    assert!(
+        dispatch_override.http_max_requests_per_connection.is_none(),
+        "maxRequestsPerConnection must not project into dispatch overrides"
+    );
     assert_eq!(dispatch_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(dispatch_override.h2_max_concurrent_streams, Some(250));
     assert_eq!(
@@ -705,8 +711,12 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
         .expect("per-port overlay present");
     // Per-port wins for the field it sets:
     assert_eq!(port_override.h2_max_concurrent_streams, Some(999));
-    // Fields not respecified by per-port survive from the fan-out:
-    assert_eq!(port_override.http_max_requests_per_connection, Some(75));
+    // Supported fields not respecified by per-port survive from the fan-out;
+    // maxRequestsPerConnection is intentionally deferred and not projected.
+    assert!(
+        port_override.http_max_requests_per_connection.is_none(),
+        "unsupported maxRequestsPerConnection must not survive as effective policy"
+    );
     assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
 }
 
@@ -755,7 +765,10 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
         .port_overrides
         .get(&8080)
         .expect("per-port overlay present");
-    assert_eq!(port_override.http_max_requests_per_connection, Some(10));
+    assert!(
+        port_override.http_max_requests_per_connection.is_none(),
+        "unsupported maxRequestsPerConnection must not project at port level"
+    );
     assert_eq!(port_override.http_idle_timeout_ms, Some(30_000));
     assert_eq!(port_override.h2_max_concurrent_streams, Some(20));
 

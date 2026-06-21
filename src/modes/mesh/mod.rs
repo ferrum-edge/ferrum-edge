@@ -4842,8 +4842,8 @@ fn apply_traffic_policy_to_port_override(
 /// destination-level `connectionPool` for that port; Ferrum instead does a
 /// per-field merge (top-level fan-out, then this additive per-port overlay).
 /// This is pre-existing and CONSISTENT across every `connectionPool` knob
-/// (`maxRequestsPerConnection` / `idleTimeout` / `http2MaxRequests` /
-/// `maxConnections` / `tcpKeepalive`), so unifying it to complete-replacement
+/// (`idleTimeout` / `http2MaxRequests` / `maxConnections` / `tcpKeepalive`),
+/// so unifying it to complete-replacement
 /// is a separate uniform follow-up (it would change existing
 /// idleTimeout/http2MaxRequests behavior + their tests). It is documented in
 /// `docs/mesh.md`.
@@ -4859,9 +4859,9 @@ fn apply_connection_pool_http_to_port_override(
     slot: &mut UpstreamPortOverride,
     http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
 ) {
-    if let Some(max) = http.max_requests_per_connection {
-        slot.http_max_requests_per_connection = Some(max);
-    }
+    // `maxRequestsPerConnection` is intentionally NOT projected. The parser
+    // validates and status-reports it as deferred because Ferrum does not have
+    // close-after-N-requests behavior for backend pools.
     if let Some(idle_ms) = http.idle_timeout_ms {
         slot.http_idle_timeout_ms = Some(idle_ms);
     }

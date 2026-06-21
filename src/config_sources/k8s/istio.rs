@@ -1070,12 +1070,14 @@ fn translate_port_level_settings(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrafficPolicyScope {
     /// `spec.trafficPolicy` or a `spec.trafficPolicy.portLevelSettings[]` entry.
-    /// `connectionPool.http.{h2UpgradePolicy,maxRetries}` are projected here.
+    /// `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
+    /// are projected here.
     TopLevelOrPort,
     /// `spec.subsets[].trafficPolicy`. The mesh apply path turns subsets into
     /// `SubsetTrafficPolicy` (LB / TLS / connect-timeout / passive-health only),
-    /// so `connectionPool.http.{h2UpgradePolicy,maxRetries}` NEVER reach the
-    /// `port_overrides` / effective `Proxy` for a subset — they are deferred.
+    /// so `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
+    /// NEVER reach the `port_overrides` / effective `Proxy` for a subset — they
+    /// are deferred.
     Subset,
 }
 
@@ -1284,17 +1286,17 @@ fn parse_keepalive_duration_seconds(
 
 /// Translate Istio `connectionPool.http` into Ferrum's typed HTTP overlay.
 ///
-/// Supported fields: `maxRequestsPerConnection`, `idleTimeout`,
-/// `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`, and
-/// `http1MaxPendingRequests`. At top-level / `portLevelSettings` scope every
-/// field is projected; there are no longer any deferred `connectionPool.http`
-/// knobs at that scope. (`h2UpgradePolicy` / `maxRetries` /
-/// `http1MaxPendingRequests` are still deferred-warned for a SUBSET
-/// `trafficPolicy` — see the `scope` note below — because a subset's
-/// `SubsetTrafficPolicy` carries no `connectionPool.http`.) Returning
-/// `Ok(None)` from this function signals "block was present but no supported
-/// field was set" so the caller can skip emitting an empty overlay on the
-/// slice.
+/// Supported fields: `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`,
+/// `maxRetries`, and `http1MaxPendingRequests`. `maxRequestsPerConnection` is
+/// parsed and validated for operator feedback, but is NOT projected because the
+/// runtime does not have close-after-N-requests behavior for the shared backend
+/// pools. At top-level / `portLevelSettings` scope every supported field is
+/// projected. (`h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests` are
+/// still deferred-warned for a SUBSET `trafficPolicy` — see the `scope` note
+/// below — because a subset's `SubsetTrafficPolicy` carries no
+/// `connectionPool.http`.) Returning `Ok(None)` from this function signals
+/// "block was present but no supported field was set" so the caller can skip
+/// emitting an empty overlay on the slice.
 ///
 /// `maxRetries` semantics differ honestly from Envoy: Envoy's
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
@@ -1327,19 +1329,18 @@ fn translate_connection_pool_http(
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
     use crate::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // `maxRequestsPerConnection: 0` is Istio's explicit "unlimited" value and is
-    // advertised as supported by the Ferrum schema/OpenAPI, so accept it here
-    // (`allow_zero = true`); the projected `Proxy.pool_max_requests_per_connection`
-    // validator likewise permits `0`.
-    let max_requests_per_connection = match http.get("maxRequestsPerConnection") {
-        Some(v) => Some(translate_http_uint32(
-            object,
-            "maxRequestsPerConnection",
-            v,
-            true,
-        )?),
-        None => None,
-    };
+    // `maxRequestsPerConnection` is parsed and validated so malformed
+    // DestinationRules still fail closed, but it is not carried on the mesh
+    // overlay: the runtime has no close-after-N backend request behavior for
+    // the shared reqwest/direct-H2/gRPC/H3/HBONE pools. Keep this warning and
+    // `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in `istio_status.rs` in sync.
+    if let Some(v) = http.get("maxRequestsPerConnection") {
+        let _ = translate_http_uint32(object, "maxRequestsPerConnection", v, true)?;
+        acc.warnings.push(format!(
+            "DestinationRule {}/{}: connectionPool.http.maxRequestsPerConnection is parsed and validated but not applied (backend close-after-N-requests is unsupported); use http2MaxRequests for HTTP/2-family concurrency instead",
+            object.metadata.namespace, object.metadata.name
+        ));
+    }
     let idle_timeout_ms = match string_field(http, "idleTimeout") {
         Some(raw) => Some(parse_http_idle_timeout_ms(object, raw)?),
         None => None,
@@ -1406,7 +1407,7 @@ fn translate_connection_pool_http(
     };
 
     let overlay = MeshConnectionPoolHttp {
-        max_requests_per_connection,
+        max_requests_per_connection: None,
         idle_timeout_ms,
         http2_max_requests,
         h2_upgrade_policy,
@@ -1457,9 +1458,8 @@ fn translate_h2_upgrade_policy(
 /// values are always rejected. `allow_zero` controls the lower bound: most
 /// knobs (`http2MaxRequests`, `maxRetries`) reject `0` as ambiguous, but
 /// `maxRequestsPerConnection` accepts `0` as Istio's documented "unlimited"
-/// sentinel (Istio default; the Ferrum schema/OpenAPI advertise `0` as the
-/// supported unlimited value for `Proxy.pool_max_requests_per_connection`),
-/// so blocking it here would reject a config the schema claims to accept.
+/// sentinel. The field is still deferred, but accepting `0` keeps validation
+/// compatible with Istio while status/warnings make the no-op visible.
 fn translate_http_uint32(
     object: &K8sObject,
     field: &str,
@@ -15000,9 +15000,20 @@ extensionProviders:
         let dr = &mesh.destination_rules[0];
         let tp = dr.traffic_policy.as_ref().expect("traffic policy");
         let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert_eq!(http.max_requests_per_connection, Some(100));
+        assert!(
+            http.max_requests_per_connection.is_none(),
+            "maxRequestsPerConnection is validated but deferred, not projected"
+        );
         assert_eq!(http.idle_timeout_ms, Some(300_000));
         assert_eq!(http.http2_max_requests, Some(1000));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -15071,9 +15082,20 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .expect("port http overlay");
-        assert_eq!(http.max_requests_per_connection, Some(50));
+        assert!(
+            http.max_requests_per_connection.is_none(),
+            "maxRequestsPerConnection is deferred at port level too"
+        );
         assert_eq!(http.idle_timeout_ms, Some(60_000));
         assert_eq!(http.http2_max_requests, Some(200));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "port-level unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -15128,11 +15150,10 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_accepts_zero_max_requests_per_connection() {
+    fn destination_rule_accepts_zero_max_requests_per_connection_but_defers_it() {
         // Istio's documented "unlimited" sentinel for maxRequestsPerConnection
-        // is `0`; the Ferrum schema/OpenAPI advertise `0` as supported, so the
-        // translator must accept it (unlike `http2MaxRequests`/`maxRetries`,
-        // which reject zero) and carry it through to the overlay.
+        // is `0`; keep accepting it for validation compatibility, but do not
+        // carry the unsupported field into the mesh overlay.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -15149,9 +15170,21 @@ extensionProviders:
 
         let mesh = result.config.mesh.expect("mesh config");
         let dr = &mesh.destination_rules[0];
-        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
-        let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert_eq!(http.max_requests_per_connection, Some(0));
+        assert!(
+            dr.traffic_policy
+                .as_ref()
+                .and_then(|tp| tp.connection_pool_http.as_ref())
+                .is_none(),
+            "maxRequestsPerConnection-only block must not synthesize an effective overlay"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -15275,8 +15308,8 @@ extensionProviders:
     fn destination_rule_projects_top_level_http_connection_pool_knobs_without_warning() {
         // After F5.1's final knob, ALL of `maxRetries`, `h2UpgradePolicy`, and
         // `http1MaxPendingRequests` are projected at top-level/portLevelSettings
-        // and must NOT warn. There are no longer any deferred connectionPool.http
-        // knobs at top-level scope. Every supported field lands on the overlay.
+        // and must NOT warn. `maxRequestsPerConnection` is the only top-level
+        // deferred connectionPool.http knob. Every supported field lands on the overlay.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",

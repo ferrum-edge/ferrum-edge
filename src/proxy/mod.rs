@@ -16391,17 +16391,10 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
     });
 
-    // Per-port `maxRequestsPerConnection` is wire-projected end-to-end onto
-    // `Proxy.pool_max_requests_per_connection`. Hyper does not yet expose a
-    // close-after-N-requests builder knob, so the runtime effect remains
-    // pending (same status as the proxy-level field's existing docstring) —
-    // wiring the per-port projection here means the field will light up the
-    // moment a request-count wrapper is introduced. The proxy field is
-    // `Option<u64>`; widen the `u32` override to match the schema.
-    let max_reqs_override = override_config
-        .http_max_requests_per_connection
-        .map(u64::from)
-        .filter(|new| Some(*new) != proxy.pool_max_requests_per_connection);
+    // `maxRequestsPerConnection` is intentionally not projected from
+    // DestinationRule-derived port overrides. It has no backend close-after-N
+    // runtime behavior, so translation/status report it as deferred instead of
+    // letting a legacy carried value appear effective here.
 
     // Per-port backend TLS (DestinationRule `portLevelSettings[].tls`), resolved
     // at apply time. Overrides the proxy's upstream-/subset-level `resolved_tls`
@@ -16433,7 +16426,6 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
-        && max_reqs_override.is_none()
         && tls_override.is_none()
         && h2_upgrade_override.is_none()
         && http1_pending_override.is_none()
@@ -16450,9 +16442,6 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(secs) = idle_seconds_override {
         owned.pool_idle_timeout_seconds = Some(secs);
-    }
-    if let Some(n) = max_reqs_override {
-        owned.pool_max_requests_per_connection = Some(n);
     }
     if let Some(tls) = tls_override {
         owned.resolved_tls = tls.clone();
@@ -28345,8 +28334,9 @@ mod tests {
     // ── T1-C: HTTP connection-pool projection onto effective proxy ───────
 
     /// Helper: clone the standard test proxy and add a per-port override
-    /// carrying the three new HTTP fields plus the existing connect timeout
-    /// so each test can dial in only the field it cares about.
+    /// carrying the supported HTTP fields plus a legacy
+    /// maxRequestsPerConnection carrier and the existing connect timeout so
+    /// each test can dial in only the field it cares about.
     fn proxy_with_http_overrides_for_test(
         connect_ms: u64,
         h2_streams: Option<u32>,
@@ -28396,15 +28386,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_effective_proxy_projects_max_requests_per_connection_as_u64() {
-        // Per-port wire field is `u32`; `Proxy.pool_max_requests_per_connection`
-        // is `Option<u64>` for schema compatibility. The widening conversion
-        // must round-trip without sign drift or truncation.
+    fn resolve_effective_proxy_ignores_legacy_max_requests_per_connection() {
+        // The field has no close-after-N runtime behavior. A legacy carried
+        // override must not make the effective proxy look programmed.
         let proxy = proxy_with_http_overrides_for_test(5000, None, None, Some(40));
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
-        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
-        assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "a legacy-only maxRequestsPerConnection override must be ignored"
+        );
+        assert_eq!(effective.pool_max_requests_per_connection, None);
     }
 
     #[test]
@@ -28434,7 +28426,6 @@ mod tests {
             proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
         proxy.pool_http2_max_concurrent_streams = Some(250);
         proxy.pool_idle_timeout_seconds = Some(120);
-        proxy.pool_max_requests_per_connection = Some(40);
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(
@@ -28453,7 +28444,6 @@ mod tests {
             proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
         proxy.backend_connect_timeout_ms = 5000; // override = 5000 too, no diff
         proxy.pool_idle_timeout_seconds = Some(120); // matches override
-        proxy.pool_max_requests_per_connection = Some(40); // matches override
         // h2 streams currently None → override Some(250) differs.
         // Override `connect_timeout_ms` to a different value so it's a diff
         // too: but we already set proxy=5000 and override=5000 above → matches.
@@ -28472,7 +28462,7 @@ mod tests {
         assert_eq!(owned.pool_http2_max_concurrent_streams, Some(250));
         // Unchanged fields preserved from proxy:
         assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
-        assert_eq!(owned.pool_max_requests_per_connection, Some(40));
+        assert_eq!(owned.pool_max_requests_per_connection, None);
     }
 
     // ── F5.1: h2UpgradePolicy projection + dispatch decision ─────────────
