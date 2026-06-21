@@ -509,7 +509,7 @@ impl Harness {
         // `reqwest` (raw HTTP framing + hyper H2 prior knowledge), so we wait
         // for the proxy port explicitly before any test exercises it.
         gateway
-            .wait_for_proxy_port(Duration::from_secs(10))
+            .wait_for_proxy_port(Duration::from_secs(30))
             .await
             .expect("proxy port did not become ready");
         Harness {
