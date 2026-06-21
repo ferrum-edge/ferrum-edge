@@ -2788,8 +2788,8 @@ fn test_wildcard_does_not_match_base_domain() {
 }
 
 #[test]
-fn test_wildcard_does_not_match_multi_level() {
-    assert!(!wildcard_matches("*.example.com", "a.b.example.com"));
+fn test_wildcard_matches_multi_level() {
+    assert!(wildcard_matches("*.example.com", "a.b.example.com"));
 }
 
 #[test]
@@ -2868,6 +2868,21 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Overlapping"));
+}
+
+#[test]
+fn test_unique_listen_paths_allows_same_host_path_in_different_namespaces() {
+    let mut tenant_a = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]);
+    tenant_b.namespace = "tenant-b".to_string();
+    let mut config = empty_config();
+    config.proxies = vec![tenant_a, tenant_b];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "proxy listen_path uniqueness is namespace-scoped"
+    );
 }
 
 /// Mesh block for the sibling-exemption tests: one service per entry,
@@ -3067,6 +3082,20 @@ fn test_unique_listen_paths_catchall_vs_specific_host() {
     ];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
+}
+
+#[test]
+fn test_unique_listen_paths_allows_exact_host_over_wildcard_same_path() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("exact", "/api", vec!["foo.example.com"]),
+        make_proxy_with_hosts("wildcard", "/api", vec!["*.example.com"]),
+    ];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "router checks exact host routes before wildcard routes, so this overlap is deterministic"
+    );
 }
 
 #[test]
@@ -3582,26 +3611,11 @@ fn test_validate_namespace_rejects_bad_chars() {
     }
 }
 
-// The in-memory validators `validate_unique_listen_paths` and
-// `validate_stream_proxies` operate on a GatewayConfig that has ALREADY been
-// filtered to a single namespace (by `FERRUM_NAMESPACE` in file mode, by
-// `WHERE namespace = ?` SQL in DB mode, or by `FERRUM_NAMESPACE` scoping of
-// the CP's own load path). They therefore treat listen_path and listen_port
-// as globally unique — there is no namespace awareness here, and that is by
-// design. Per-namespace uniqueness is enforced at admission time by the
-// admin API (`check_listen_port_unique(namespace, ..)`,
-// `check_proxy_name_unique(..)`, etc. in `src/config/db_backend.rs`) and by
-// UNIQUE indexes on `(namespace, ..)` in `v001_initial_schema.rs`. The
-// functional namespace suite in `tests/functional/functional_namespace_test.rs`
-// covers that admission-layer behavior end-to-end.
+// The in-memory validators keep proxy uniqueness namespace-scoped. This
+// matches the admission-layer and storage invariants, where listen paths and
+// ports are unique within a namespace but can be reused by another namespace.
 #[test]
-fn test_listen_path_validator_is_single_namespace_post_filter() {
-    // Two proxies with the same listen_path — the validator flags the
-    // conflict regardless of the namespace field on each proxy, confirming
-    // this validator does not do namespace grouping. If you're here because
-    // this test failed, either namespace-aware validation was just added
-    // (update the test to assert cross-namespace Ok) or a regression
-    // silently dropped the conflict detection (fix the validator).
+fn test_listen_path_validator_is_namespace_scoped() {
     let mut a = make_proxy("p-a", "/shared");
     a.namespace = "prod".to_string();
     let mut b = make_proxy("p-b", "/shared");
@@ -3612,8 +3626,8 @@ fn test_listen_path_validator_is_single_namespace_post_filter() {
         ..Default::default()
     };
     assert!(
-        config.validate_unique_listen_paths().is_err(),
-        "validator currently flags duplicate listen_path globally — see comment"
+        config.validate_unique_listen_paths().is_ok(),
+        "duplicate listen_path values in different namespaces should be allowed"
     );
 }
 

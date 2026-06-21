@@ -1167,6 +1167,13 @@ pub async fn run(
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
             watch_node_locality: env_config.k8s_node_locality_enabled,
+            gateway_api_data_plane_service_namespace: env_config
+                .gateway_api_data_plane_service_namespace
+                .clone(),
+            gateway_api_data_plane_service_name: env_config
+                .gateway_api_data_plane_service_name
+                .clone(),
+            gateway_api_status_address: env_config.gateway_api_status_address.clone(),
             // Effective Sidecar ingress materialization gate (F6 §6.2): ingress
             // is materialized only when enforcement is on AND not dry-run,
             // mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run`

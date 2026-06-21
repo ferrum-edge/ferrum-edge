@@ -64,8 +64,8 @@ pub struct Http3ListenerOptions {
     pub frontend_tls_reload: Option<Http3FrontendTlsReload>,
 }
 
-/// Frontend TLS live-reload inputs for the H3 listener. Populated only when
-/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
+/// Frontend TLS live-reload inputs for the H3 listener. This may be populated
+/// by operator file reload or by a DP CP-delivered Gateway TLS overlay.
 pub struct Http3FrontendTlsReload {
     /// Shared frontend TLS slot. The proxy HTTPS / H2 / H3 listeners read
     /// from the same slot so they observe the same rotated cert/key pair.
@@ -350,6 +350,12 @@ pub async fn start_http3_listener_with_signal(
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
     let frontend_listen_port = bound_addr.map(|addr| addr.port());
+    if let Some(reload) = frontend_tls_reload.as_ref()
+        && reload.tls_slot.load_full().as_ref().is_none()
+    {
+        endpoint.set_server_config(None);
+        info!("HTTP/3 listener started disabled until frontend TLS material is available");
+    }
     info!("HTTP/3 (QUIC) listener started on {}", local_addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
@@ -442,9 +448,10 @@ pub async fn start_http3_listener_with_signal(
                 };
                 let new_tls = slot.load_full().as_ref().clone();
                 let Some(new_tls) = new_tls else {
-                    warn!(
+                    endpoint.set_server_config(None);
+                    info!(
                         revision,
-                        "Frontend TLS reload notified but slot is empty; keeping current HTTP/3 server config"
+                        "HTTP/3 listener disabled because frontend TLS slot is empty"
                     );
                     continue;
                 };
@@ -7066,6 +7073,10 @@ mod build_h3_backend_headers_tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };

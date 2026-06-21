@@ -134,6 +134,25 @@ pub struct DpGrpcTlsReload {
     pub revision_rx: watch::Receiver<u64>,
 }
 
+#[derive(Clone)]
+pub struct DpFrontendTlsRuntime {
+    pub listener_slot: crate::tls::SharedFrontendTls,
+    pub restore_source_slot: Option<crate::tls::SharedFrontendTls>,
+    pub h3_revision_tx: Option<watch::Sender<u64>>,
+    pub cp_materialized: Arc<AtomicBool>,
+}
+
+impl DpFrontendTlsRuntime {
+    pub fn new(listener_slot: crate::tls::SharedFrontendTls) -> Self {
+        Self {
+            listener_slot,
+            restore_source_slot: None,
+            h3_revision_tx: None,
+            cp_materialized: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 /// Build the DP/mesh gRPC TLS client config from shared env settings.
 pub fn build_dp_grpc_tls_config(
     env_config: &EnvConfig,
@@ -316,6 +335,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     namespace: String,
     primary_retry_secs: u64,
     connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    frontend_tls_runtime: Option<DpFrontendTlsRuntime>,
 ) {
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start DP client");
@@ -354,6 +374,19 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
         .unwrap_or(0);
+    let frontend_tls_slot = frontend_tls_runtime
+        .as_ref()
+        .map(|runtime| runtime.listener_slot.clone());
+    let cp_frontend_tls_materialized = frontend_tls_runtime
+        .as_ref()
+        .map(|runtime| runtime.cp_materialized.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>> =
+        Arc::new(ArcSwap::new(Arc::new(
+            frontend_tls_slot
+                .as_ref()
+                .and_then(|slot| slot.load_full().as_ref().clone()),
+        )));
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -427,7 +460,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 .is_none_or(|r| r.load(Ordering::Acquire));
         let result = if should_race_primary {
             tokio::select! {
-                res = connect_and_subscribe_with_startup_ready(
+                res = connect_and_subscribe_with_startup_ready_inner(
                     cp_url,
                     &jwt_secret,
                     &node_id,
@@ -437,6 +470,10 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     &namespace,
                     connection_state.as_ref(),
                     is_primary,
+                    frontend_tls_slot.as_ref(),
+                    frontend_tls_runtime.as_ref(),
+                    cp_frontend_tls_materialized.clone(),
+                    frontend_tls_restore_slot.clone(),
                 ) => res,
                 _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
                     info!(
@@ -461,7 +498,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             }
         } else {
             tokio::select! {
-                res = connect_and_subscribe_with_startup_ready(
+                res = connect_and_subscribe_with_startup_ready_inner(
                     cp_url,
                     &jwt_secret,
                     &node_id,
@@ -471,6 +508,10 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     &namespace,
                     connection_state.as_ref(),
                     is_primary,
+                    frontend_tls_slot.as_ref(),
+                    frontend_tls_runtime.as_ref(),
+                    cp_frontend_tls_materialized.clone(),
+                    frontend_tls_restore_slot.clone(),
                 ) => res,
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
@@ -699,6 +740,154 @@ fn apply_gateway_trust_bundle_update(
     }
 }
 
+enum FrontendTlsSnapshotUpdate {
+    Unchanged,
+    Clear {
+        restore_tls_config: Option<Arc<rustls::ServerConfig>>,
+    },
+    Replace {
+        tls_config: Arc<rustls::ServerConfig>,
+        cert_source: String,
+    },
+}
+
+fn stage_frontend_tls_snapshot(
+    config: &GatewayConfig,
+    proxy_state: &ProxyState,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
+    cp_frontend_tls_materialized: &AtomicBool,
+    frontend_tls_restore_slot: &ArcSwap<Option<Arc<rustls::ServerConfig>>>,
+) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
+    if frontend_tls_slot.is_none() {
+        return Ok(FrontendTlsSnapshotUpdate::Unchanged);
+    }
+    match (
+        config.frontend_tls_cert_path.as_deref(),
+        config.frontend_tls_key_path.as_deref(),
+    ) {
+        (None, None) => {
+            if cp_frontend_tls_materialized.load(Ordering::Acquire) {
+                Ok(FrontendTlsSnapshotUpdate::Clear {
+                    restore_tls_config: frontend_tls_runtime
+                        .and_then(|runtime| runtime.restore_source_slot.as_ref())
+                        .and_then(|slot| slot.load_full().as_ref().clone())
+                        .or_else(|| frontend_tls_restore_slot.load_full().as_ref().clone()),
+                })
+            } else {
+                Ok(FrontendTlsSnapshotUpdate::Unchanged)
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "frontend TLS config must include both frontend_tls_cert_path and frontend_tls_key_path"
+            );
+        }
+        (Some(cert_path), Some(key_path)) => {
+            if !cp_frontend_tls_materialized.load(Ordering::Acquire)
+                && let Some(slot) = frontend_tls_slot
+            {
+                frontend_tls_restore_slot.store(slot.load_full());
+            }
+            let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
+                anyhow::bail!(
+                    "frontend TLS material was provided by CP but this DP has no TLS policy"
+                );
+            };
+
+            let mut tls_config = crate::tls::load_tls_config_with_client_auth_and_ocsp(
+                cert_path,
+                key_path,
+                proxy_state
+                    .env_config
+                    .frontend_tls_client_ca_bundle_path
+                    .as_deref(),
+                proxy_state
+                    .env_config
+                    .frontend_tls_ocsp_response_source
+                    .as_deref(),
+                false,
+                tls_policy,
+                proxy_state.env_config.tls_cert_expiry_warning_days,
+                proxy_state.crls.as_ref().as_slice(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to materialize frontend TLS certificate source {}: {}",
+                    cert_path,
+                    error
+                )
+            })?;
+            crate::tls::enable_early_data(&mut tls_config, tls_policy);
+            if proxy_state.env_config.ktls_enabled.could_be_enabled() {
+                crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
+            }
+
+            Ok(FrontendTlsSnapshotUpdate::Replace {
+                tls_config,
+                cert_source: cert_path.to_string(),
+            })
+        }
+    }
+}
+
+async fn commit_frontend_tls_snapshot(
+    update: FrontendTlsSnapshotUpdate,
+    proxy_state: &ProxyState,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
+    cp_frontend_tls_materialized: &AtomicBool,
+) {
+    match update {
+        FrontendTlsSnapshotUpdate::Unchanged => {}
+        FrontendTlsSnapshotUpdate::Clear { restore_tls_config } => {
+            if let Some(slot) = frontend_tls_slot {
+                let had_tls = slot.load_full().as_ref().is_some();
+                slot.store(Arc::new(restore_tls_config.clone()));
+                proxy_state
+                    .stream_listener_manager
+                    .set_frontend_tls_config(restore_tls_config.clone())
+                    .await;
+                if restore_tls_config.is_some() {
+                    info!(
+                        "Restored operator frontend TLS material after clearing CP-delivered Gateway frontend TLS"
+                    );
+                } else if had_tls {
+                    info!("Cleared CP-delivered Gateway frontend TLS material");
+                }
+                bump_frontend_tls_revision(frontend_tls_runtime);
+            }
+            cp_frontend_tls_materialized.store(false, Ordering::Release);
+        }
+        FrontendTlsSnapshotUpdate::Replace {
+            tls_config,
+            cert_source,
+        } => {
+            if let Some(slot) = frontend_tls_slot {
+                slot.store(Arc::new(Some(tls_config.clone())));
+                proxy_state
+                    .stream_listener_manager
+                    .set_frontend_tls_config(Some(tls_config))
+                    .await;
+                cp_frontend_tls_materialized.store(true, Ordering::Release);
+                bump_frontend_tls_revision(frontend_tls_runtime);
+                info!(
+                    cert_source = %cert_source,
+                    "Applied CP-delivered Gateway frontend TLS material"
+                );
+            }
+        }
+    }
+}
+
+fn bump_frontend_tls_revision(frontend_tls_runtime: Option<&DpFrontendTlsRuntime>) {
+    if let Some(revision_tx) =
+        frontend_tls_runtime.and_then(|runtime| runtime.h3_revision_tx.as_ref())
+    {
+        revision_tx.send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+}
+
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
@@ -718,6 +907,7 @@ pub async fn connect_and_subscribe(
         namespace,
         None,
         true,
+        None,
     )
     .await
 }
@@ -734,6 +924,47 @@ pub async fn connect_and_subscribe_with_startup_ready(
     namespace: &str,
     connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
     is_primary: bool,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+) -> Result<(), anyhow::Error> {
+    let frontend_tls_runtime =
+        frontend_tls_slot.map(|slot| DpFrontendTlsRuntime::new(slot.clone()));
+    connect_and_subscribe_with_startup_ready_inner(
+        cp_url,
+        jwt_secret,
+        node_id,
+        proxy_state,
+        tls_config,
+        startup_ready,
+        namespace,
+        connection_state,
+        is_primary,
+        frontend_tls_slot,
+        frontend_tls_runtime.as_ref(),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(ArcSwap::new(Arc::new(
+            frontend_tls_slot
+                .map(|slot| slot.load_full().as_ref().clone())
+                .unwrap_or(None),
+        ))),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_and_subscribe_with_startup_ready_inner(
+    cp_url: &str,
+    jwt_secret: &GrpcJwtSecret,
+    node_id: &str,
+    proxy_state: &ProxyState,
+    tls_config: Option<&DpGrpcTlsConfig>,
+    startup_ready: Option<Arc<AtomicBool>>,
+    namespace: &str,
+    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
+    is_primary: bool,
+    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
+    frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
+    cp_frontend_tls_materialized: Arc<AtomicBool>,
+    frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -865,6 +1096,11 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 namespace, filtered
                             );
                         }
+                        if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
+                            warn!(
+                                "Ignoring CP-delivered frontend TLS material because this DP has no HTTPS listener"
+                            );
+                        }
                         config.normalize_fields();
                         config.resolve_upstream_tls();
                         if let Err(errors) = config.validate_all_fields_with_ip_policy(
@@ -937,8 +1173,33 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             );
                             continue;
                         }
+                        let frontend_tls_update = match stage_frontend_tls_snapshot(
+                            &config,
+                            proxy_state,
+                            frontend_tls_slot,
+                            frontend_tls_runtime,
+                            cp_frontend_tls_materialized.as_ref(),
+                            frontend_tls_restore_slot.as_ref(),
+                        ) {
+                            Ok(update) => update,
+                            Err(error) => {
+                                error!("CP config rejected — {}", error);
+                                error!(
+                                    "Ignoring config update with unusable frontend TLS material"
+                                );
+                                continue;
+                            }
+                        };
                         match proxy_state.update_config(config) {
                             ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                                commit_frontend_tls_snapshot(
+                                    frontend_tls_update,
+                                    proxy_state,
+                                    frontend_tls_slot,
+                                    frontend_tls_runtime,
+                                    cp_frontend_tls_materialized.as_ref(),
+                                )
+                                .await;
                                 apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
@@ -1154,10 +1415,51 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
     config.consumers.retain(|c| c.namespace == namespace);
     config.plugin_configs.retain(|pc| pc.namespace == namespace);
     config.upstreams.retain(|u| u.namespace == namespace);
+    let frontend_tls_filtered = filter_frontend_tls_sources_to_namespace(config, namespace);
     (pre.0 - config.proxies.len())
         + (pre.1 - config.consumers.len())
         + (pre.2 - config.plugin_configs.len())
         + (pre.3 - config.upstreams.len())
+        + usize::from(frontend_tls_filtered)
+}
+
+fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) -> bool {
+    let had_namespace_sources = !config.frontend_tls_namespace_sources.is_empty();
+    if let Some(source) = config
+        .frontend_tls_namespace_sources
+        .iter()
+        .find(|source| source.namespace == namespace)
+        .cloned()
+    {
+        config.frontend_tls_cert_path = Some(source.cert_path);
+        config.frontend_tls_key_path = Some(source.key_path);
+        config.frontend_tls_source_namespace = Some(source.namespace);
+        config.frontend_tls_namespace_sources.clear();
+        return false;
+    }
+    config.frontend_tls_namespace_sources.clear();
+    let foreign = config
+        .frontend_tls_source_namespace
+        .as_deref()
+        .is_some_and(|source_namespace| source_namespace != namespace);
+    if foreign {
+        config.frontend_tls_cert_path = None;
+        config.frontend_tls_key_path = None;
+        config.frontend_tls_source_namespace = None;
+    }
+    foreign || had_namespace_sources
+}
+
+fn clear_frontend_tls_material(config: &mut GatewayConfig) -> bool {
+    let had_material = config.frontend_tls_cert_path.is_some()
+        || config.frontend_tls_key_path.is_some()
+        || config.frontend_tls_source_namespace.is_some()
+        || !config.frontend_tls_namespace_sources.is_empty();
+    config.frontend_tls_cert_path = None;
+    config.frontend_tls_key_path = None;
+    config.frontend_tls_source_namespace = None;
+    config.frontend_tls_namespace_sources.clear();
+    had_material
 }
 
 /// Defense-in-depth filter for incremental deltas. Applied to
@@ -1226,6 +1528,9 @@ mod tests {
     //! `tests/integration/cp_dp_grpc_tests.rs` via
     //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
     use super::*;
+    use crate::config::EnvConfig;
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::proxy::ProxyState;
     use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
@@ -1263,6 +1568,114 @@ mod tests {
             jittered_backoff_with_entropy(0, 0),
             Duration::from_millis(100)
         );
+    }
+
+    fn minimal_proxy_state() -> ProxyState {
+        ProxyState::new(
+            GatewayConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            EnvConfig::default(),
+            None,
+            None,
+        )
+        .expect("minimal ProxyState should construct")
+        .0
+    }
+
+    #[tokio::test]
+    async fn commit_frontend_tls_snapshot_notifies_h3_reload_revision() {
+        let proxy_state = minimal_proxy_state();
+        let listener_slot = crate::tls::empty_frontend_tls_slot();
+        let (revision_tx, revision_rx) = watch::channel(0_u64);
+        let runtime = DpFrontendTlsRuntime {
+            listener_slot: listener_slot.clone(),
+            restore_source_slot: None,
+            h3_revision_tx: Some(revision_tx),
+            cp_materialized: Arc::new(AtomicBool::new(false)),
+        };
+        let tls_config =
+            crate::tls::temporary_disabled_listener_tls_config().expect("test TLS config");
+
+        commit_frontend_tls_snapshot(
+            FrontendTlsSnapshotUpdate::Replace {
+                tls_config,
+                cert_source: "test-cert".to_string(),
+            },
+            &proxy_state,
+            Some(&listener_slot),
+            Some(&runtime),
+            runtime.cp_materialized.as_ref(),
+        )
+        .await;
+
+        assert_eq!(*revision_rx.borrow(), 1);
+        assert!(runtime.cp_materialized.load(Ordering::Acquire));
+        assert!(listener_slot.load_full().as_ref().is_some());
+
+        commit_frontend_tls_snapshot(
+            FrontendTlsSnapshotUpdate::Clear {
+                restore_tls_config: None,
+            },
+            &proxy_state,
+            Some(&listener_slot),
+            Some(&runtime),
+            runtime.cp_materialized.as_ref(),
+        )
+        .await;
+
+        assert_eq!(*revision_rx.borrow(), 2);
+        assert!(!runtime.cp_materialized.load(Ordering::Acquire));
+        assert!(listener_slot.load_full().as_ref().is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_frontend_tls_snapshot_ignores_tls_when_https_listener_is_absent() {
+        let proxy_state = minimal_proxy_state();
+        let config = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            ..Default::default()
+        };
+        let cp_materialized = AtomicBool::new(false);
+        let restore_slot = ArcSwap::from_pointee(None);
+
+        let update = stage_frontend_tls_snapshot(
+            &config,
+            &proxy_state,
+            None,
+            None,
+            &cp_materialized,
+            &restore_slot,
+        )
+        .expect("disabled HTTPS listener should not reject the whole snapshot");
+
+        assert!(matches!(update, FrontendTlsSnapshotUpdate::Unchanged));
+        assert!(!cp_materialized.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn clear_frontend_tls_material_removes_all_cp_tls_fields() {
+        let mut config = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            frontend_tls_namespace_sources: vec![
+                crate::config::types::FrontendTlsNamespaceSource {
+                    namespace: "default".to_string(),
+                    cert_path: "k8s://default/cert#tls.crt".to_string(),
+                    key_path: "k8s://default/cert#tls.key".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(clear_frontend_tls_material(&mut config));
+        assert_eq!(config.frontend_tls_cert_path, None);
+        assert_eq!(config.frontend_tls_key_path, None);
+        assert_eq!(config.frontend_tls_source_namespace, None);
+        assert!(config.frontend_tls_namespace_sources.is_empty());
+        assert!(!clear_frontend_tls_material(&mut config));
     }
 
     fn test_config_trust_bundles(x509_authorities: Vec<String>) -> ConfigTrustBundleSet {
@@ -1368,6 +1781,10 @@ mod tests {
             ],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };
@@ -1395,11 +1812,93 @@ mod tests {
             upstreams: vec![],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);
+    }
+
+    #[test]
+    fn filter_config_clears_foreign_gateway_frontend_tls_sources() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("staging".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 1);
+        assert_eq!(cfg.frontend_tls_cert_path, None);
+        assert_eq!(cfg.frontend_tls_key_path, None);
+        assert_eq!(cfg.frontend_tls_source_namespace, None);
+    }
+
+    #[test]
+    fn filter_config_keeps_matching_gateway_frontend_tls_sources() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://secrets/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://secrets/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("production".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        assert_eq!(
+            cfg.frontend_tls_cert_path.as_deref(),
+            Some("k8s://secrets/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            cfg.frontend_tls_key_path.as_deref(),
+            Some("k8s://secrets/gateway-cert#tls.key")
+        );
+    }
+
+    #[test]
+    fn filter_config_projects_namespace_scoped_gateway_frontend_tls_sources() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("staging".to_string()),
+            frontend_tls_namespace_sources: vec![
+                crate::config::types::FrontendTlsNamespaceSource {
+                    namespace: "staging".to_string(),
+                    cert_path: "k8s://staging/gateway-cert#tls.crt".to_string(),
+                    key_path: "k8s://staging/gateway-cert#tls.key".to_string(),
+                },
+                crate::config::types::FrontendTlsNamespaceSource {
+                    namespace: "production".to_string(),
+                    cert_path: "k8s://production/gateway-cert#tls.crt".to_string(),
+                    key_path: "k8s://production/gateway-cert#tls.key".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        assert_eq!(
+            cfg.frontend_tls_cert_path.as_deref(),
+            Some("k8s://production/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            cfg.frontend_tls_key_path.as_deref(),
+            Some("k8s://production/gateway-cert#tls.key")
+        );
+        assert_eq!(
+            cfg.frontend_tls_source_namespace.as_deref(),
+            Some("production")
+        );
+        assert!(cfg.frontend_tls_namespace_sources.is_empty());
     }
 
     #[test]

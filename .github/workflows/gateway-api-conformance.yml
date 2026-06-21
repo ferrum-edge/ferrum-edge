@@ -1,32 +1,46 @@
 name: Gateway API Conformance
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/gateway-api-conformance.yml"
+      - "scripts/gateway_api_data_plane_conformance.sh"
+      - "charts/**"
+      - "src/config_sources/k8s/**"
+      - "src/grpc/**"
+      - "src/k8s_controller/**"
+      - "src/modes/control_plane.rs"
+      - "src/modes/data_plane.rs"
+      - "src/plugins/**"
+      - "src/proxy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       gateway_api_version:
         description: Gateway API tag to test against
         required: false
         default: v1.5.1
+      conformance_profile:
+        description: Upstream Gateway API conformance profile
+        required: false
+        default: GATEWAY-HTTP
       supported_features:
         description: Comma-separated Gateway API conformance features
         required: false
-        default: Gateway,HTTPRoute
-      conformance_tests:
-        description: Space-separated upstream conformance test short names to run
+        default: Gateway,ReferenceGrant,HTTPRoute
+      skip_tests:
+        description: Optional space-separated upstream conformance tests to skip
         required: false
-        # This workflow deploys the Gateway API controller/status surface only.
-        # Full GATEWAY-HTTP traffic profile runs need a routable Ferrum data
-        # plane Service and should be enabled with that runtime work.
-        default: GatewayClassObservedGenerationBump GatewayObservedGenerationBump HTTPRouteObservedGenerationBump HTTPRouteInvalidCrossNamespaceParentRef
+        default: ""
   schedule:
     - cron: "0 7 * * 1"
 
 permissions:
   contents: read
 
-# Both runs are useful artifact bundles, so keep both — but serialize them so
-# a Monday cron tick doesn't race a manual workflow_dispatch on the same
-# resource budget.
+# Both runs are useful artifact bundles, so keep both, but serialize them so a
+# Monday cron tick does not race a manual workflow_dispatch on the same budget.
 concurrency:
   group: gateway-api-conformance
   cancel-in-progress: false
@@ -51,28 +65,31 @@ jobs:
       - name: Resolve inputs
         id: inputs
         run: |
+          set -euo pipefail
           gateway_api_version="${{ github.event.inputs.gateway_api_version }}"
+          conformance_profile="${{ github.event.inputs.conformance_profile }}"
           supported_features="${{ github.event.inputs.supported_features }}"
-          conformance_tests="${{ github.event.inputs.conformance_tests }}"
+          skip_tests="${{ github.event.inputs.skip_tests }}"
           if [ -z "$gateway_api_version" ]; then
             gateway_api_version="v1.5.1"
           fi
-          if [ -z "$supported_features" ]; then
-            supported_features="Gateway,HTTPRoute"
+          if [ -z "$conformance_profile" ]; then
+            conformance_profile="GATEWAY-HTTP"
           fi
-          if [ -z "$conformance_tests" ]; then
-            conformance_tests="GatewayClassObservedGenerationBump GatewayObservedGenerationBump HTTPRouteObservedGenerationBump HTTPRouteInvalidCrossNamespaceParentRef"
+          if [ -z "$supported_features" ]; then
+            supported_features="Gateway,ReferenceGrant,HTTPRoute"
           fi
           echo "gateway_api_version=$gateway_api_version" >> "$GITHUB_OUTPUT"
+          echo "conformance_profile=$conformance_profile" >> "$GITHUB_OUTPUT"
           echo "supported_features=$supported_features" >> "$GITHUB_OUTPUT"
-          echo "conformance_tests=$conformance_tests" >> "$GITHUB_OUTPUT"
+          echo "skip_tests=$skip_tests" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test-functional"
 
       - name: Build gateway binary
-        run: cargo build --bin ferrum-edge
+        run: cargo build --profile pr-build --bin ferrum-edge
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
@@ -91,199 +108,37 @@ jobs:
       - name: Package Ferrum image
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
-          binary-path: target/debug/ferrum-edge
+          binary-path: target/pr-build/ferrum-edge
           image: ${{ env.FERRUM_IMAGE }}
 
-      - name: Create kind cluster
-        run: |
-          set -euo pipefail
-          kind create cluster --name ferrum-gwapi --wait 120s
-          kind load docker-image "$FERRUM_IMAGE" --name ferrum-gwapi
-
-      - name: Install Gateway API CRDs
-        run: |
-          set -euo pipefail
-          gateway_api_version="${{ steps.inputs.outputs.gateway_api_version }}"
-          kubectl apply --server-side=true -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${gateway_api_version}/standard-install.yaml"
-          # Wait on every standard-install CRD that the controller watches or
-          # writes status to. If we wait on only three, the controller's first
-          # reflector loop logs a noisy discovery warning before the others
-          # become Established.
-          for crd in \
-            gatewayclasses.gateway.networking.k8s.io \
-            gateways.gateway.networking.k8s.io \
-            httproutes.gateway.networking.k8s.io \
-            grpcroutes.gateway.networking.k8s.io \
-            referencegrants.gateway.networking.k8s.io; do
-            kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
-          done
-
-      - name: Deploy Ferrum mesh controller
-        run: |
-          set -euo pipefail
-          kubectl create namespace ferrum
-          # Exercise the Gateway API controller only; do not install the
-          # injector webhook because it can intercept pod admission before its
-          # own TLS secret/endpoints exist in this single-node conformance lab.
-          admin_secret="$(openssl rand -hex 32)"
-          grpc_secret="$(openssl rand -hex 32)"
-          echo "::add-mask::${admin_secret}"
-          echo "::add-mask::${grpc_secret}"
-          kubectl -n ferrum create secret generic ferrum-mesh-gateway-api-credentials \
-            --from-literal=admin-jwt-secret="${admin_secret}" \
-            --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
-          helm upgrade --install ferrum ./charts/ferrum-mesh \
-            --namespace ferrum \
-            --set image.repository=ferrum-edge \
-            --set image.tag=gateway-api-conformance \
-            --set image.pullPolicy=IfNotPresent \
-            --set controlPlane.enabled=true \
-            --set injector.enabled=false \
-            --set ca.enabled=false \
-            --set controlPlane.rbac.create=true \
-            --set controlPlane.rbac.gatewayApi=true \
-            --set controlPlane.rbac.istio=false \
-            --set controlPlane.rbac.meshConfig=false \
-            --set controlPlane.rbac.podDiscovery=true \
-            --set controlPlane.database.type=sqlite \
-            --set-string 'controlPlane.database.url=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
-            --set controlPlane.credentials.adminJwtSecret.existingSecret.name=ferrum-mesh-gateway-api-credentials \
-            --set controlPlane.credentials.adminJwtSecret.existingSecret.key=admin-jwt-secret \
-            --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.name=ferrum-mesh-gateway-api-credentials \
-            --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.key=cp-dp-grpc-jwt-secret \
-            --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
-            --set controlPlane.env.FERRUM_LOG_LEVEL=info \
-            --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
-            --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
-            --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
-            --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false
-          # The conformance assertions are gating, so a dead control plane is
-          # an infrastructure failure (image pull error, RBAC misconfig,
-          # crashloop). Surface that explicitly instead of running tests
-          # against a dead controller and reporting unrelated failures.
-          if ! kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s; then
-            kubectl -n ferrum describe deployment/ferrum-mesh-control-plane || true
-            kubectl -n ferrum describe replicasets || true
-            kubectl -n ferrum describe pods || true
-            kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=200 || true
-            kubectl -n ferrum get events --sort-by=.lastTimestamp || true
-            echo "::error title=Control plane never reached Ready::skipping conformance run"
-            exit 1
-          fi
-
-      - name: Create Ferrum GatewayClass
-        run: |
-          cat <<'YAML' | kubectl apply -f -
-          apiVersion: gateway.networking.k8s.io/v1
-          kind: GatewayClass
-          metadata:
-            name: ferrum
-          spec:
-            controllerName: ferrum.io/gateway-controller
-          YAML
+      - name: Set up Ferrum Gateway API lab
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+        run: bash scripts/gateway_api_data_plane_conformance.sh setup
 
       - name: Run upstream Gateway API conformance
         id: conformance
         env:
-          GATEWAY_API_CONFORMANCE_TESTS: ${{ steps.inputs.outputs.conformance_tests }}
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+          GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
-        run: |
-          set -uo pipefail
-          results="$GITHUB_WORKSPACE/conformance-results"
-          mkdir -p "$results"
-          git clone --depth 1 --branch "${{ steps.inputs.outputs.gateway_api_version }}" https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
-          cd /tmp/gateway-api
-          : > "$results/gateway-api-conformance-test.json"
-          status=0
-          # Mirror the per-subtest retry from ci.yml's conformance loop so a
-          # transient kube-apiserver poll timeout on a single subtest doesn't
-          # fail the whole standalone conformance job. Real regressions in
-          # Ferrum's status writer fail every attempt; flakes recover on retry.
-          MAX_ATTEMPTS=2
-          for test_name in $GATEWAY_API_CONFORMANCE_TESTS; do
-            echo "::group::Gateway API conformance: ${test_name}"
-            test_report="$results/gateway-api-conformance-${test_name}-report.yaml"
-            test_status=1
-            # Per-attempt log paths so a flaky first attempt's diagnostics
-            # survive the retry. The aggregate JSON appends every attempt.
-            for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-              if [ "$attempt" -gt 1 ]; then
-                echo "::warning title=Gateway API conformance retry::${test_name} attempt ${attempt}/${MAX_ATTEMPTS}"
-              fi
-              test_log="$results/gateway-api-conformance-${test_name}-attempt${attempt}.json"
-              if go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
-                --gateway-class=ferrum \
-                --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
-                --run-test="$test_name" \
-                --cleanup-base-resources=false \
-                --organization=Ferrum \
-                --project="Ferrum Edge" \
-                --url=https://github.com/ferrum-edge/ferrum-edge \
-                --version="${GITHUB_SHA}" \
-                --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
-                --report-output="$test_report" \
-                2>&1 | tee "$test_log"; then
-                test_status=0
-              else
-                test_status=${PIPESTATUS[0]}
-              fi
-              cat "$test_log" >> "$results/gateway-api-conformance-test.json"
-              if [ "$test_status" -eq 0 ]; then
-                break
-              fi
-            done
-            if [ "$test_status" -ne 0 ]; then
-              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status} after ${MAX_ATTEMPTS} attempt(s)"
-              status="$test_status"
-            fi
-            echo "::endgroup::"
-          done
-          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
-          if [ "$status" -ne 0 ]; then
-            echo "::error title=Gateway API conformance failed::go test exited with $status; diagnostics will be uploaded"
-            exit "$status"
-          fi
+          GATEWAY_API_SKIP_TESTS: ${{ steps.inputs.outputs.skip_tests }}
+        run: bash scripts/gateway_api_data_plane_conformance.sh upstream
+
+      - name: Run Ferrum Gateway API black-box checks
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+          GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
+          GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
+        run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
 
       - name: Collect diagnostics
         if: always()
-        run: |
-          set +e
-          results="$GITHUB_WORKSPACE/conformance-results"
-          mkdir -p "$results"
-          kubectl get gatewayclasses,gateways,httproutes,grpcroutes -A -o yaml > "$results/gateway-api-resources.yaml"
-          kubectl -n ferrum get all -o wide > "$results/ferrum-namespace.txt"
-          kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/ferrum-control-plane-deployment.txt"
-          kubectl -n ferrum get events --sort-by=.lastTimestamp > "$results/ferrum-events.txt"
-          kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$results/ferrum-control-plane.log"
-          {
-            kubectl auth can-i get gatewayclasses/status --as=system:serviceaccount:ferrum:ferrum-mesh
-            kubectl auth can-i patch gatewayclasses/status --as=system:serviceaccount:ferrum:ferrum-mesh
-            kubectl auth can-i get gateways/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
-            kubectl auth can-i patch gateways/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
-            kubectl auth can-i get httproutes/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
-            kubectl auth can-i patch httproutes/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
-          } > "$results/ferrum-rbac-can-i.txt"
-          cat > "$results/CONFORMANCE.md" <<EOF
-          # Gateway API Conformance
-
-          Gateway API version: ${{ steps.inputs.outputs.gateway_api_version }}
-
-          Supported features: ${{ steps.inputs.outputs.supported_features }}
-
-          Targeted upstream tests: ${{ steps.inputs.outputs.conformance_tests }}
-
-          Conformance exit code: ${{ steps.conformance.outputs.exit_code }}
-
-          Artifacts:
-          - gateway-api-conformance-test.json
-          - gateway-api-conformance-*-report.yaml
-          - gateway-api-resources.yaml
-          - ferrum-namespace.txt
-          - ferrum-control-plane-deployment.txt
-          - ferrum-events.txt
-          - ferrum-control-plane.log
-          - ferrum-rbac-can-i.txt
-          EOF
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+          GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
+          GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
+        run: bash scripts/gateway_api_data_plane_conformance.sh diagnostics
 
       - name: Upload conformance artifacts
         if: always()
@@ -291,3 +146,4 @@ jobs:
         with:
           name: gateway-api-conformance-${{ steps.inputs.outputs.gateway_api_version }}
           path: conformance-results/
+          retention-days: 90

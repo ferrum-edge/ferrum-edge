@@ -2469,9 +2469,9 @@ fn sidecar_host_pattern_matches(
 /// Istio Sidecar `egress.hosts` supports a leading-label wildcard:
 ///   - `reviews.alpha.svc.cluster.local` matches only that exact FQDN.
 ///   - `*.foo.com` matches `bar.foo.com` (one label before the suffix) but not
-///     `foo.com` nor `a.b.foo.com`. This is the same single-label wildcard
-///     semantic used elsewhere in the gateway
-///     (see `crate::config::types::wildcard_matches` and the mesh DNS proxy).
+///     `foo.com` nor `a.b.foo.com`. This is the Istio Sidecar and mesh DNS
+///     proxy semantic; proxy listener host matching intentionally uses broader
+///     DNS suffix wildcard semantics.
 ///
 /// Resource hosts may themselves be wildcards (e.g. a `ServiceEntry.hosts`
 /// entry of `*.googleapis.com`). When the pattern is `*` it admits any
@@ -2498,9 +2498,9 @@ fn host_matches_pattern(pattern: &str, candidate: &str) -> bool {
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // `*.foo.com` matches `bar.foo.com` (exactly one extra label) but not
-        // `foo.com` itself nor `a.b.foo.com`. Mirrors `wildcard_matches` in
-        // `src/config/types.rs` so route-side and mesh-side wildcard semantics
-        // stay aligned.
+        // `foo.com` itself nor `a.b.foo.com`. This remains the Istio Sidecar
+        // scope-host semantic even though proxy listener host matching accepts
+        // deeper DNS suffix wildcard matches.
         if candidate == suffix {
             return false;
         }
@@ -7749,8 +7749,7 @@ mod tests {
         // namespace. Mirrors the canonical Istio Sidecar wildcard semantic.
         assert!(host_matches_pattern("*.foo.com", "bar.foo.com"));
         assert!(host_matches_pattern("*.foo.com", "baz.foo.com"));
-        // Base domain itself does NOT match (consistent with
-        // wildcard_matches in src/config/types.rs).
+        // Base domain itself does NOT match.
         assert!(!host_matches_pattern("*.foo.com", "foo.com"));
         // Multi-level subdomains do NOT match (single-label wildcard).
         assert!(!host_matches_pattern("*.foo.com", "a.b.foo.com"));
