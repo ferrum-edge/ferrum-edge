@@ -27412,7 +27412,7 @@ mod tests {
     }
 
     fn make_validation_stream_proxy(id: &str, listen_port: u16) -> Proxy {
-        serde_json::from_value(json!({
+        let mut proxy: Proxy = serde_json::from_value(json!({
             "id": id,
             "namespace": "ferrum",
             "name": "test-stream-proxy",
@@ -27422,7 +27422,9 @@ mod tests {
             "backend_port": 8080,
             "backend_tls_verify_server_cert": true,
         }))
-        .expect("validation test stream proxy should deserialize")
+        .expect("validation test stream proxy should deserialize");
+        proxy.normalize_fields();
+        proxy
     }
 
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
