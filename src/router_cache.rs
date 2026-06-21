@@ -8,16 +8,18 @@
 //! Caches (host, path) → proxy lookups in a bounded DashMap for O(1) repeated hits.
 //! Regex route matches use a separate cache partition to prevent high-cardinality
 //! regex paths (e.g., UUID segments) from evicting prefix route cache entries.
-//! Route table rebuilds happen atomically via ArcSwap when config changes —
-//! never on the hot request path.
+//! Route table rebuilds publish the table and its cache-validation generation as
+//! one ArcSwap snapshot when config changes — never on the hot request path.
 
 use arc_swap::ArcSwap;
+use crossbeam_queue::ArrayQueue;
+use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use regex::{Regex, RegexSet};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
@@ -28,6 +30,27 @@ thread_local! {
     /// per-lookup String allocation on cache hits (the 99%+ fast path).
     static CACHE_KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
 }
+
+const ROUTER_CACHE_EVICTION_SAMPLE_LIMIT: usize = 256;
+const ROUTER_CACHE_EVICTION_MAX_REMOVALS: usize = 64;
+/// One in every `HEAD_BLEND_PERIOD` eviction passes mixes a small rotating slice
+/// of resident keys into the reservoir sample (see `frequency_aware_evict`) so
+/// that entries which fell out of the recency reservoir without ever being
+/// sampled can still become eviction candidates. Kept infrequent so the
+/// reservoir stays the dominant candidate source and the extra bounded head walk
+/// only runs occasionally. Must be non-zero (it is a modulus divisor).
+const HEAD_BLEND_PERIOD: u64 = 8;
+/// Capacity of each partition's eviction sample reservoir (a lock-free MPMC
+/// ring). Eviction samples candidate keys by draining this ring instead of
+/// walking a shard-ordered prefix of the DashMap, so per-pass work is bounded by
+/// `ROUTER_CACHE_EVICTION_SAMPLE_LIMIT` regardless of `max_cache_entries` and
+/// every inserted key — including cold, high-cardinality keys that land deep in
+/// the map — is eventually an eviction candidate. Sized to several sample
+/// windows so a single pass can fill its budget with headroom for concurrent
+/// cold inserts arriving between passes. Must stay non-zero: `ArrayQueue::new`
+/// panics on a zero capacity (a fixed compile-time constant, so this is an
+/// invariant, never a runtime input).
+const ROUTER_CACHE_EVICTION_RING_CAPACITY: usize = 4096;
 
 /// How [`RouterCache::search_route_table`] treats direction-scoped materialized
 /// mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`). The inbound and
@@ -176,7 +199,7 @@ pub(crate) struct HostRouteTable {
     /// host/path tiers, since they are (host, path)-keyed and every sibling
     /// shares its service's hosts + `/`). After a representative matches on
     /// the outbound capture listener,
-    /// [`HostRouteTable::select_mesh_outbound_port_route`] swaps in the
+    /// [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] swaps in the
     /// sibling whose service port equals the connection's captured original
     /// destination port. Built at route-table construction; empty outside
     /// mesh mode.
@@ -203,6 +226,32 @@ pub(crate) struct HostRouteTable {
     /// backing workload addresses, canonicalized the SAME way as the VIP keys);
     /// empty outside mesh mode.
     mesh_tcp_egress_by_workload: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+    /// Local Sidecar raw-TCP inbound lookup: captured original-destination app
+    /// port → loopback relay entry. Consulted by the inbound accept loop before
+    /// Hyper parses the connection, so Redis/MySQL/etc. bytes never enter the
+    /// HTTP parser. Built from runtime-only mesh preparation state; empty
+    /// outside Sidecar mesh mode or when no local stream-family service port
+    /// resolved.
+    mesh_tcp_inbound: HashMap<u16, Arc<MeshTcpInboundEntry>>,
+    /// UDP mesh egress lookup (F3 §3.3 Stage 4): strict `(service VIP, UDP
+    /// service port)` → relay entry, consulted by the UDP capture listener for
+    /// each captured datagram's recovered original destination BEFORE any
+    /// forwarding. Built forward from the prepared `mesh` block (UDP ports ×
+    /// `cluster_ips`); Ambient-only relay (the materializer skips non-Ambient
+    /// topologies, so non-Ambient entries are always `CloseNotRoutable`). Empty
+    /// outside mesh mode.
+    //
+    // Consumed by the mesh UDP capture listener, which is Linux-only
+    // (`IP_TRANSPARENT` + recvmsg cmsg). The field is still built on every
+    // platform (the route table is platform-agnostic), so silence the dead-code
+    // warning where the only consumer is `#[cfg(not(linux))]`-compiled out.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+}
+
+pub(crate) struct RouteSnapshot {
+    table: Arc<HostRouteTable>,
+    generation: u64,
 }
 
 /// One routable raw-TCP egress destination: the per-port upstream to
@@ -215,6 +264,21 @@ pub(crate) struct MeshTcpEgressEntry {
     pub(crate) relay_proxy: Arc<Proxy>,
     /// The service FQDN (the upstream's DR-matchable name) for logging.
     pub(crate) service_fqdn: String,
+}
+
+/// One local raw-TCP Sidecar inbound destination: the synthesized relay proxy
+/// and loopback backend selected by captured original-destination app port.
+pub(crate) struct MeshTcpInboundEntry {
+    pub(crate) relay_proxy: Arc<Proxy>,
+    pub(crate) backend_addr: std::net::SocketAddr,
+    /// The local service FQDN for logging.
+    pub(crate) service_fqdn: String,
+    /// `true` only for opaque-TLS app ports: the inbound relay peeks the
+    /// ClientHello SNI before the stream plugin chain. `false` for server-first
+    /// raw-TCP ports, where peeking would block the relay on the handshake clock
+    /// (the client sends nothing until the backend greeting). Carried from
+    /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
+    pub(crate) tls_inspect: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -321,7 +385,7 @@ pub(crate) enum MeshInboundPortSelectError {
     PortNotMaterialized,
 }
 
-/// Why [`HostRouteTable::select_mesh_outbound_port_route`] refused to pick a
+/// Why [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] refused to pick a
 /// per-port sibling. Both cases fail closed at the request handler — captured
 /// traffic is never forwarded to a port the client did not dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,23 +421,43 @@ impl HostRouteTable {
     ///   even for single-port groups — the client dialed a port the mesh does
     ///   not route, and forwarding it to a different port's backend would be a
     ///   misroute.
+    #[cfg(test)]
     pub(crate) fn select_mesh_outbound_port_route(
         &self,
         current: RouteMatch,
         orig_dst_port: Option<u16>,
     ) -> Result<RouteMatch, MeshOutboundPortSelectError> {
+        self.select_mesh_outbound_port_route_with_authz_port(current, orig_dst_port)
+            .map(|(route_match, _)| route_match)
+    }
+
+    /// Swap a matched mesh outbound representative route for the sibling
+    /// matching the connection's captured original-destination port, plus the
+    /// service port that authorization policy should see as
+    /// `destination.port` when the selected route belongs to a mesh outbound
+    /// service group.
+    pub(crate) fn select_mesh_outbound_port_route_with_authz_port(
+        &self,
+        current: RouteMatch,
+        orig_dst_port: Option<u16>,
+    ) -> Result<(RouteMatch, Option<u16>), MeshOutboundPortSelectError> {
         let Some(group) = self.mesh_outbound_ports.get(&current.proxy.id) else {
-            return Ok(current);
+            return Ok((current, None));
         };
         match orig_dst_port {
-            None if group.declared_http_ports == 1 => Ok(current),
+            None if group.declared_http_ports == 1 => {
+                Ok((current, group.ports.first().map(|(port, _)| *port)))
+            }
             None => Err(MeshOutboundPortSelectError::OrigDstUnavailable),
             Some(port) => match group.ports.iter().find(|(p, _)| *p == port) {
-                Some((_, proxy)) => Ok(RouteMatch {
-                    proxy: Arc::clone(proxy),
-                    path_params: current.path_params,
-                    matched_prefix_len: current.matched_prefix_len,
-                }),
+                Some((selected_port, proxy)) => Ok((
+                    RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: current.path_params,
+                        matched_prefix_len: current.matched_prefix_len,
+                    },
+                    Some(*selected_port),
+                )),
                 None => Err(MeshOutboundPortSelectError::PortNotMaterialized),
             },
         }
@@ -517,6 +601,41 @@ impl HostRouteTable {
         self.mesh_tcp_egress_by_workload
             .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
     }
+
+    /// Local Sidecar raw-TCP inbound lookup for a captured connection's
+    /// original destination. The inbound REDIRECT path preserves the local app
+    /// port in `orig_dst.port()`, which selects the loopback relay target.
+    /// `None` means no prepared stream-family local service port matched.
+    pub(crate) fn mesh_tcp_inbound_entry(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<Arc<MeshTcpInboundEntry>> {
+        if self.mesh_tcp_inbound.is_empty() {
+            return None;
+        }
+        self.mesh_tcp_inbound.get(&orig_dst.port()).cloned()
+    }
+
+    /// UDP mesh egress lookup (F3 §3.3 Stage 4) for a captured datagram's
+    /// recovered original destination. `None` ⇒ not a declared `(service VIP,
+    /// UDP service port)` pair: the datagram is NOT mesh-routable and is dropped
+    /// by the capture listener (UDP has no fall-through HTTP path). A declared
+    /// but unroutable pair is `CloseNotRoutable` — fail closed, never guessed.
+    //
+    // Linux-only consumer (the UDP capture listener); see the field comment.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn mesh_udp_egress_decision(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<&MeshTcpEgressDecision> {
+        if self.mesh_udp_egress.is_empty() {
+            return None;
+        }
+        // Canonicalized so an IPv4-mapped IPv6 capture address still matches the
+        // IPv4 VIP the slice declared.
+        self.mesh_udp_egress
+            .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
+    }
 }
 
 /// Cached regex match result (stored in regex_cache).
@@ -558,7 +677,7 @@ struct CountMinSketch {
     row1: AlignedCounterRow,
     width_mask: usize,
     /// Total increments across all keys, for triggering periodic aging.
-    total_increments: AtomicU64,
+    total_increments: CachePadded<AtomicU64>,
     /// Age (halve all counters) after this many increments.
     age_threshold: u64,
 }
@@ -574,7 +693,7 @@ impl CountMinSketch {
             row0,
             row1,
             width_mask: width - 1,
-            total_increments: AtomicU64::new(0),
+            total_increments: CachePadded::new(AtomicU64::new(0)),
             age_threshold,
         }
     }
@@ -666,8 +785,8 @@ impl CountMinSketch {
 /// high-cardinality regex paths (e.g., `/users/{uuid}/...`) cannot evict
 /// frequently-hit prefix route cache entries.
 pub struct RouterCache {
-    /// Pre-computed host-based route index.
-    route_table: ArcSwap<HostRouteTable>,
+    /// Pre-computed host-based route index and its cache-validation generation.
+    route_snapshot: ArcSwap<RouteSnapshot>,
     /// Bounded cache for prefix route lookups: "host\0path" → matched proxy.
     /// `proxy: None` entries represent negative cache (no route matched from any tier).
     prefix_cache: DashMap<String, PrefixCacheEntry>,
@@ -678,19 +797,39 @@ pub struct RouterCache {
     regex_cache: DashMap<String, RegexCacheEntry>,
     /// Maximum entries in each cache partition before eviction.
     max_cache_entries: usize,
+    /// Approximate prefix cache entries maintained on insert/remove so cold
+    /// inserts do not scan all DashMap shards through `len()`.
+    prefix_cache_entries: AtomicUsize,
+    /// Approximate regex cache entries maintained on insert/remove so cold
+    /// inserts do not scan all DashMap shards through `len()`.
+    regex_cache_entries: AtomicUsize,
     /// Resolved DashMap shard count used by the lookup caches.
     #[cfg(test)]
     cache_shard_amount: usize,
-    /// Monotonic counters for eviction tracking per partition.
+    /// Monotonic counters for eviction tracking per partition (entries removed).
     prefix_eviction_counter: AtomicU64,
     regex_eviction_counter: AtomicU64,
+    /// Monotonic counters of eviction *attempts* (passes) per partition. They
+    /// advance by one per eviction pass regardless of how many entries were
+    /// removed, and exist purely as telemetry / a test signal that passes fired.
+    /// They no longer drive sample selection: candidates are drawn from the
+    /// per-partition eviction reservoir below, not from a rotating DashMap window.
+    prefix_eviction_attempts: AtomicU64,
+    regex_eviction_attempts: AtomicU64,
+    /// Bounded lock-free reservoirs of recently inserted cache keys, one per
+    /// partition. Every cold-path miss insert pushes its key here; eviction
+    /// drains candidates from the reservoir instead of walking a shard-ordered
+    /// DashMap prefix. This keeps each eviction pass O(sample_size) (independent
+    /// of `max_cache_entries`) while letting the whole keyspace — including cold,
+    /// high-cardinality entries that land deep in the map — become eviction
+    /// candidates as they are inserted, rather than only the first few thousand
+    /// shard-ordered entries. `force_push` overwrites the oldest queued key when
+    /// full, so the reservoir is a moving window over recent inserts.
+    prefix_eviction_reservoir: ArrayQueue<String>,
+    regex_eviction_reservoir: ArrayQueue<String>,
     /// Frequency sketch shared by both cache partitions.
     /// Tracks access frequency for frequency-aware eviction (least-frequent-of-sample).
     frequency_sketch: CountMinSketch,
-    /// Route-table generation for standalone wrapper users. RequestEpoch hot
-    /// paths pass their own route_generation into lookup so LB-only epochs do
-    /// not invalidate route cache entries.
-    route_generation: AtomicU64,
 }
 
 impl RouterCache {
@@ -706,8 +845,8 @@ impl RouterCache {
     /// clamped to `[10_000, 1_000_000]`. That keeps direct callers aligned
     /// with production env-var resolution while still getting a usable cache.
     /// Without this,
-    /// `frequency_aware_evict`'s `max_entries / 4 == 0` short-circuit would leave
-    /// the cache unbounded under load.
+    /// the tiny-cache eviction short-circuit would leave the cache unbounded
+    /// under load.
     #[allow(dead_code)]
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
         Self::with_shard_amount(config, max_cache_entries, 0)
@@ -734,7 +873,7 @@ impl RouterCache {
         } else {
             max_cache_entries
         };
-        let table = Self::build_route_table(config);
+        let table = Arc::new(Self::build_route_table(config));
         // Sketch width: 2x cache capacity, clamped to [1024, 65536], power of two.
         let sketch_width = (max_cache_entries * 2).clamp(1024, 65536);
         // Age after cache_capacity * 4 increments to adapt to workload changes.
@@ -748,16 +887,26 @@ impl RouterCache {
         // num_cpus * 16))` — see `crate::util::sharding`.
         let shards = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Self {
-            route_table: ArcSwap::new(Arc::new(table)),
+            route_snapshot: ArcSwap::new(Arc::new(RouteSnapshot {
+                table,
+                generation: 1,
+            })),
             prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
             regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
             max_cache_entries,
+            prefix_cache_entries: AtomicUsize::new(0),
+            regex_cache_entries: AtomicUsize::new(0),
             #[cfg(test)]
             cache_shard_amount: shards,
             prefix_eviction_counter: AtomicU64::new(0),
             regex_eviction_counter: AtomicU64::new(0),
+            prefix_eviction_attempts: AtomicU64::new(0),
+            regex_eviction_attempts: AtomicU64::new(0),
+            // ROUTER_CACHE_EVICTION_RING_CAPACITY is a non-zero compile-time
+            // constant, so `ArrayQueue::new` cannot panic here.
+            prefix_eviction_reservoir: ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY),
+            regex_eviction_reservoir: ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY),
             frequency_sketch: CountMinSketch::new(sketch_width, age_threshold),
-            route_generation: AtomicU64::new(1),
         }
     }
 
@@ -770,15 +919,143 @@ impl RouterCache {
         table: Arc<HostRouteTable>,
         route_generation: u64,
     ) {
-        self.route_table.store(table);
-        self.route_generation
-            .store(route_generation, Ordering::Release);
+        let previous_generation = self.route_snapshot.load().generation;
+        self.route_snapshot.store(Arc::new(RouteSnapshot {
+            table,
+            generation: route_generation,
+        }));
+        if previous_generation != route_generation {
+            self.clear_lookup_caches();
+        }
     }
 
     pub(crate) fn clear_lookup_caches(&self) {
+        // Eviction is driven by the atomic entry counters, so the clear and the
+        // counter reset must stay coherent even while request threads keep
+        // inserting cache misses concurrently (a reload runs alongside live
+        // traffic). Neither a blind `store(0)` nor a `store(len())` is safe:
+        //
+        //   * `store(0)` and `store(self.prefix_cache.len())` both *overwrite*
+        //     the counter, so any insert whose `fetch_add(1)` lands between the
+        //     value being computed and the store has its increment clobbered.
+        //     With `store(len())` the racing insert's entry may not yet be
+        //     visible to the `len()` read, so the store can leave the counter
+        //     *below* the real entry count — under-reporting admin stats and
+        //     delaying future eviction until later inserts make up the lost
+        //     increment.
+        //
+        // Instead subtract a snapshot of the counter taken just before each
+        // `clear()`, *floored at the live map length* (see
+        // `reconcile_cache_entries_after_clear`). `fetch_sub` is an atomic RMW
+        // that composes additively with concurrent `fetch_add(1)`s, so no
+        // increment is ever lost. Correctness sketch: every entry resident
+        // *after* the clear was inserted after the `clear()` call, so its
+        // `fetch_add` (which always follows its map insert) ran after the
+        // snapshot load and is therefore not part of the subtracted snapshot —
+        // resident entries stay counted. The `max(map.len())` floor closes the
+        // one remaining under-count window: if an eviction pass races the clear
+        // and `fetch_sub`s its own removals *after* this snapshot is loaded, the
+        // snapshot still includes those entries, so subtracting it bare would
+        // double-count the evictor's removals and could leave the counter below
+        // the live set; flooring at `len()` (a valid lower bound on resident
+        // entries) makes that impossible. This is the load-bearing invariant:
+        // under-counting would delay eviction and let the cache grow unbounded,
+        // so we only ever err toward over-count.
+        //
+        // The residual imprecision is a bounded *over*-count: an entry inserted
+        // in the window `[snapshot load, clear()]` whose `fetch_add` runs after
+        // the subtract is removed by `clear()` yet still counted (its +1 is not
+        // in the subtracted snapshot). Note this over-count does NOT self-correct
+        // through eviction — an eviction subtracts equal amounts from the counter
+        // and the live set, preserving the offset — so it persists until the next
+        // clear. It is nonetheless harmless and self-limiting: (1) it only feeds
+        // the eviction-trigger comparison and admin telemetry, never a
+        // correctness/security decision, and erring high just makes eviction fire
+        // marginally early; (2) it is bounded by the inserts that race a single
+        // clear (a `clear()` is microseconds), not the whole map; and (3) it
+        // cannot accumulate across reloads — the *next* clear snapshots the
+        // entire current counter (leftover offset included) and subtracts it,
+        // re-deriving the counter from that reload's race window. Eliminating
+        // even this bounded skew would require making the clear and the counter
+        // reset atomic per entry, which DashMap does not offer without a global
+        // lock on the proxy hot path; the bounded over-count is the deliberate
+        // trade. Each partition snapshots, clears, and subtracts together so the
+        // per-partition window is as small as possible (the regex partition no
+        // longer sits between the prefix snapshot and the prefix subtract).
+        let prefix_cleared = self.prefix_cache_entries.load(Ordering::Relaxed);
         self.prefix_cache.clear();
+        reconcile_cache_entries_after_clear(
+            &self.prefix_cache_entries,
+            &self.prefix_cache,
+            prefix_cleared,
+        );
+        let regex_cleared = self.regex_cache_entries.load(Ordering::Relaxed);
         self.regex_cache.clear();
+        reconcile_cache_entries_after_clear(
+            &self.regex_cache_entries,
+            &self.regex_cache,
+            regex_cleared,
+        );
+        // Drain the reservoirs *after* clearing the maps. A race-insert that lands
+        // after `clear()` but before this drain can have its candidate key popped
+        // here, so its still-resident entry temporarily holds no reservoir slot.
+        // That is an accepted eviction-*quality* residual, not a correctness gap:
+        // the entry stays resident and counted, so the capacity bound is still
+        // enforced — it simply re-enters the candidate pool via the periodic
+        // resident-key blend / underfilled-sample top-up in `frequency_aware_evict`
+        // (the very mechanism added for "resident keys that aged out of the
+        // reservoir"), or via its next access re-inserting it as a miss. Draining
+        // *before* clearing would NOT help — inserts race the clear regardless of
+        // order — and would reintroduce the unbounded-spin hazard the
+        // capacity-bounded `drain_reservoir` exists to avoid (a sustained insert
+        // storm could keep a drain-until-empty loop from ever terminating). So the
+        // ordering here is deliberate.
+        drain_reservoir(&self.prefix_eviction_reservoir);
+        drain_reservoir(&self.regex_eviction_reservoir);
         self.frequency_sketch.reset();
+    }
+
+    fn insert_prefix_cache_entry(&self, cache_key: String, entry: PrefixCacheEntry) {
+        // Record this key as an eviction candidate only *after* the map insert
+        // lands, then trip eviction. If we enqueued before the insert, a
+        // concurrent eviction pass (the cache may already be over capacity) could
+        // pop this key, find `map.contains_key` still false, and drop it as
+        // stale — leaving the freshly inserted entry with no reservoir candidate,
+        // so under sustained traffic where the reservoir never empties cold
+        // entries stay outside the eviction sample and bias eviction toward later
+        // inserts. Enqueuing after the insert guarantees a popped candidate is
+        // live. `force_push` is O(1) and lock-free; it overwrites the oldest
+        // queued key when the reservoir is full, and any key it drops is simply a
+        // candidate we chose not to consider. This runs only on the cold miss
+        // path, never on the cache-hit fast path. The clone is required because
+        // the map insert consumes the key.
+        let reservoir_key = cache_key.clone();
+        let is_new = self.prefix_cache.insert(cache_key, entry).is_none();
+        // Entry is now resident either way; enqueue the candidate so any concurrent
+        // evictor that later pops it sees a live entry. On an overwrite this just
+        // refreshes recency (membership unchanged).
+        let _ = self.prefix_eviction_reservoir.force_push(reservoir_key);
+        if is_new {
+            let entries = self.prefix_cache_entries.fetch_add(1, Ordering::Relaxed) + 1;
+            if entries > self.max_cache_entries {
+                self.evict_prefix_sample();
+            }
+        }
+    }
+
+    fn insert_regex_cache_entry(&self, cache_key: String, entry: RegexCacheEntry) {
+        // See `insert_prefix_cache_entry`: enqueue the eviction candidate only
+        // after the map insert lands so a concurrent evictor never pops it while
+        // it is not yet resident. Cold miss path only.
+        let reservoir_key = cache_key.clone();
+        let is_new = self.regex_cache.insert(cache_key, entry).is_none();
+        let _ = self.regex_eviction_reservoir.force_push(reservoir_key);
+        if is_new {
+            let entries = self.regex_cache_entries.fetch_add(1, Ordering::Relaxed) + 1;
+            if entries > self.max_cache_entries {
+                self.evict_regex_sample();
+            }
+        }
     }
 
     /// Find the matching proxy for a request host and path.
@@ -794,9 +1071,8 @@ impl RouterCache {
     /// Prefix and regex matches use separate cache partitions.
     #[allow(dead_code)] // Library/test API; request hot paths use find_proxy_in_snapshot().
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
-        let generation = self.route_generation.load(Ordering::Acquire);
-        let table = self.route_table.load();
-        self.find_proxy_in_snapshot(&table, generation, host, path)
+        let snapshot = self.route_snapshot.load();
+        self.find_proxy_in_snapshot(&snapshot.table, snapshot.generation, host, path)
     }
 
     pub(crate) fn find_proxy_in_snapshot(
@@ -871,13 +1147,8 @@ impl RouterCache {
                     || is_exact_path_proxy(&route_match.proxy) =>
             {
                 // Regex/exact match → regex cache (stores matched length).
-                if self.regex_cache.len() >= self.max_cache_entries
-                    && !self.regex_cache.contains_key(&cache_key)
-                {
-                    self.evict_regex_sample();
-                }
                 self.frequency_sketch.increment(&cache_key);
-                self.regex_cache.insert(
+                self.insert_regex_cache_entry(
                     cache_key,
                     RegexCacheEntry {
                         proxy: Arc::clone(&route_match.proxy),
@@ -889,13 +1160,8 @@ impl RouterCache {
             }
             Some(route_match) => {
                 // Prefix match → prefix cache
-                if self.prefix_cache.len() >= self.max_cache_entries
-                    && !self.prefix_cache.contains_key(&cache_key)
-                {
-                    self.evict_prefix_sample();
-                }
                 self.frequency_sketch.increment(&cache_key);
-                self.prefix_cache.insert(
+                self.insert_prefix_cache_entry(
                     cache_key,
                     PrefixCacheEntry {
                         proxy: Some(Arc::clone(&route_match.proxy)),
@@ -905,13 +1171,8 @@ impl RouterCache {
             }
             None => {
                 // Negative entry → prefix cache (both tiers missed)
-                if self.prefix_cache.len() >= self.max_cache_entries
-                    && !self.prefix_cache.contains_key(&cache_key)
-                {
-                    self.evict_prefix_sample();
-                }
                 self.frequency_sketch.increment(&cache_key);
-                self.prefix_cache.insert(
+                self.insert_prefix_cache_entry(
                     cache_key,
                     PrefixCacheEntry {
                         proxy: None,
@@ -1079,8 +1340,8 @@ impl RouterCache {
     /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).
     pub fn cache_stats(&self) -> (usize, usize, u64, u64, usize) {
         (
-            self.prefix_cache.len(),
-            self.regex_cache.len(),
+            self.prefix_cache_entries.load(Ordering::Relaxed),
+            self.regex_cache_entries.load(Ordering::Relaxed),
             self.prefix_eviction_counter.load(Ordering::Relaxed),
             self.regex_eviction_counter.load(Ordering::Relaxed),
             self.max_cache_entries,
@@ -1090,13 +1351,13 @@ impl RouterCache {
     /// Number of entries currently in the prefix cache (for testing).
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn cache_len(&self) -> usize {
-        self.prefix_cache.len()
+        self.prefix_cache_entries.load(Ordering::Relaxed)
     }
 
     /// Number of entries currently in the regex cache (for testing).
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn regex_cache_len(&self) -> usize {
-        self.regex_cache.len()
+        self.regex_cache_entries.load(Ordering::Relaxed)
     }
 
     /// Resolved DashMap shard count used by `prefix_cache` and `regex_cache`.
@@ -1105,10 +1366,32 @@ impl RouterCache {
         self.cache_shard_amount
     }
 
+    #[cfg(test)]
+    fn route_table_for_tests(&self) -> Arc<HostRouteTable> {
+        let snapshot = self.route_snapshot.load();
+        Arc::clone(&snapshot.table)
+    }
+
+    #[cfg(test)]
+    fn route_snapshot_for_tests(&self) -> Arc<RouteSnapshot> {
+        self.route_snapshot.load_full()
+    }
+
+    #[cfg(test)]
+    fn publish_route_snapshot_without_clearing_for_tests(
+        &self,
+        table: Arc<HostRouteTable>,
+        generation: u64,
+    ) {
+        self.route_snapshot
+            .store(Arc::new(RouteSnapshot { table, generation }));
+    }
+
     /// Number of routes in the pre-sorted route table (for testing).
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_count(&self) -> usize {
-        let table = self.route_table.load();
+        let snapshot = self.route_snapshot.load();
+        let table = &snapshot.table;
         let exact_count: usize = table.exact_hosts.values().map(|v| v.path_index.len()).sum();
         let exact_path_count: usize = table
             .exact_hosts_exact_paths
@@ -1150,37 +1433,59 @@ impl RouterCache {
 
     /// Evict low-frequency entries from the prefix cache using frequency-guided sampling.
     ///
-    /// Samples up to `8 * target_removals` entries from the DashMap, estimates each
-    /// entry's access frequency via the Count-Min Sketch, and removes the least
-    /// frequent entries. This protects hot cache entries from eviction while keeping
-    /// the eviction cost proportional to the sample size, not the cache size.
+    /// Samples a small bounded set of candidate keys from the eviction reservoir,
+    /// estimates each entry's access frequency via the Count-Min Sketch, and
+    /// removes the least frequent entries. This protects hot cache entries from
+    /// eviction while keeping the eviction cost bounded by constants, not cache
+    /// capacity, and — because every inserted key passes through the reservoir —
+    /// lets cold entries anywhere in the map become eviction candidates.
     fn evict_prefix_sample(&self) {
+        // Bump the pass counter for telemetry and reuse it as the head-blend
+        // rotation seed so successive passes periodically sample resident keys
+        // from a rotating window (see `frequency_aware_evict`).
+        let pass = self
+            .prefix_eviction_attempts
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let removed = frequency_aware_evict(
             &self.prefix_cache,
+            &self.prefix_eviction_reservoir,
             &self.frequency_sketch,
             self.max_cache_entries,
+            pass,
         );
-        self.prefix_eviction_counter
-            .fetch_add(removed as u64, Ordering::Relaxed);
-        debug!(
-            "Router prefix cache evicted {} entries (was at capacity {})",
-            removed, self.max_cache_entries
-        );
+        if removed > 0 {
+            subtract_cache_entries(&self.prefix_cache_entries, removed);
+            self.prefix_eviction_counter
+                .fetch_add(removed as u64, Ordering::Relaxed);
+            debug!(
+                "Router prefix cache evicted {} entries (was at capacity {})",
+                removed, self.max_cache_entries
+            );
+        }
     }
 
     /// Evict low-frequency entries from the regex cache using frequency-guided sampling.
     fn evict_regex_sample(&self) {
+        // Bump the pass counter for telemetry and reuse it as the head-blend
+        // rotation seed (see `evict_prefix_sample` / `frequency_aware_evict`).
+        let pass = self.regex_eviction_attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let removed = frequency_aware_evict(
             &self.regex_cache,
+            &self.regex_eviction_reservoir,
             &self.frequency_sketch,
             self.max_cache_entries,
+            pass,
         );
-        self.regex_eviction_counter
-            .fetch_add(removed as u64, Ordering::Relaxed);
-        debug!(
-            "Router regex cache evicted {} entries (was at capacity {})",
-            removed, self.max_cache_entries
-        );
+        if removed > 0 {
+            subtract_cache_entries(&self.regex_cache_entries, removed);
+            self.regex_eviction_counter
+                .fetch_add(removed as u64, Ordering::Relaxed);
+            debug!(
+                "Router regex cache evicted {} entries (was at capacity {})",
+                removed, self.max_cache_entries
+            );
+        }
     }
 
     /// Build a pre-computed host route table from config.
@@ -1480,6 +1785,97 @@ impl RouterCache {
             }
         }
 
+        // ── Local raw-TCP Sidecar inbound lookup ──────────────────────────
+        // Forward-derived during mesh preparation from the same local
+        // workload/service view that HTTP inbound materialization consumes.
+        // Keyed by the captured original-destination app/container port.
+        let mut mesh_tcp_inbound: HashMap<u16, Arc<MeshTcpInboundEntry>> = HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            for route in &mesh.local_inbound_tcp_routes {
+                if route.match_port == 0 || route.backend_addr.port() == 0 {
+                    continue;
+                }
+                let relay_proxy = Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(route));
+                mesh_tcp_inbound.entry(route.match_port).or_insert_with(|| {
+                    Arc::new(MeshTcpInboundEntry {
+                        relay_proxy,
+                        backend_addr: route.backend_addr,
+                        service_fqdn: route.service_fqdn.clone(),
+                        tls_inspect: route.tls_inspect,
+                    })
+                });
+            }
+        }
+
+        // ── UDP egress (VIP, UDP port) lookup (F3 §3.3 Stage 4) ─────────────
+        // Forward-derived from the prepared `mesh` block: every declared UDP
+        // service port × every declared service VIP. Routable when its per-port
+        // UDP upstream materialized (Ambient-only — the materializer skips
+        // non-Ambient topologies, so those pairs resolve to CloseNotRoutable);
+        // otherwise the pair is mesh-owned but unroutable and the capture
+        // listener drops it (never guesses). VIPs are canonicalized so
+        // mapped-IPv6 captures match. Mirrors the raw-TCP VIP table above.
+        let mut mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision> =
+            HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            let upstream_ids: std::collections::HashSet<&str> =
+                config.upstreams.iter().map(|u| u.id.as_str()).collect();
+            for service in &mesh.services {
+                let udp_ports = crate::modes::mesh::service_udp_stream_ports(service);
+                if udp_ports.is_empty() || service.cluster_ips.is_empty() {
+                    continue;
+                }
+                for sp in udp_ports {
+                    let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        sp.port,
+                    );
+                    let decision = if upstream_ids.contains(upstream_id.as_str()) {
+                        let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                            &service.namespace,
+                            &service.name,
+                            sp.port,
+                            &upstream_id,
+                        );
+                        // Project the UDP upstream's DestinationRule per-port
+                        // overrides (`portLevelSettings`: connectTimeout,
+                        // tcpKeepalive, ...) onto the synthesized relay proxy's
+                        // `dispatch_port_overrides`. `resolve_dispatch_port_overrides`
+                        // only populates configured `config.proxies`, not these
+                        // router-synthesized egress relay proxies, so without this
+                        // the UDP egress dial (`hbone_pool::get_datagram_tunnel`,
+                        // which reads `dispatch_port_overrides`) would ignore the
+                        // DR (codex r5 P2).
+                        relay_proxy.dispatch_port_overrides =
+                            dispatch_port_overrides_for_upstream(config, &upstream_id);
+                        let relay_proxy = Arc::new(relay_proxy);
+                        let service_fqdn = config
+                            .upstreams
+                            .iter()
+                            .find(|u| u.id == upstream_id)
+                            .and_then(|u| u.name.clone())
+                            .unwrap_or_else(|| format!("{}.{}", service.name, service.namespace));
+                        MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
+                            upstream_id,
+                            relay_proxy,
+                            service_fqdn,
+                        }))
+                    } else {
+                        MeshTcpEgressDecision::CloseNotRoutable
+                    };
+                    for vip in &service.cluster_ips {
+                        let Ok(ip) = vip.parse::<std::net::IpAddr>() else {
+                            continue;
+                        };
+                        mesh_udp_egress
+                            .entry((ip.to_canonical(), sp.port))
+                            .or_insert_with(|| decision.clone());
+                    }
+                }
+            }
+        }
+
         for proxy in config
             .proxies
             .iter()
@@ -1715,8 +2111,36 @@ impl RouterCache {
             mesh_inbound_ports,
             mesh_tcp_egress,
             mesh_tcp_egress_by_workload,
+            mesh_tcp_inbound,
+            mesh_udp_egress,
         }
     }
+}
+
+/// Project an upstream's DestinationRule per-port overrides (`port_overrides`)
+/// into the `dispatch_port_overrides` shape carried on a `Proxy`. Mirrors
+/// `GatewayConfig::resolve_dispatch_port_overrides` for a single upstream, used
+/// to populate router-synthesized mesh egress relay proxies (which are NOT in
+/// `config.proxies`, so the GatewayConfig-level pass never touches them).
+/// Returns `None` when the upstream is absent or declares no port overrides.
+fn dispatch_port_overrides_for_upstream(
+    config: &GatewayConfig,
+    upstream_id: &str,
+) -> Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>> {
+    let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
+    if upstream.port_overrides.is_empty() {
+        return None;
+    }
+    let resolved: std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride> =
+        upstream
+            .port_overrides
+            .iter()
+            .filter_map(|(port, ovr)| {
+                crate::config::types::ResolvedPortOverride::from_upstream_override(ovr)
+                    .map(|resolved| (*port, resolved))
+            })
+            .collect();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 impl IndexedExactPathRoutes {
@@ -1794,7 +2218,6 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
     // 2. Walk backwards through "/" boundaries for longest-prefix match.
     //    At each "/" position, try both "with slash" (for listen_paths ending in "/")
     //    and "without slash" (for listen_paths like "/api" matching "/api/users").
-    let bytes = match_path.as_bytes();
     let mut search_end = match_path.len();
     loop {
         match match_path[..search_end].rfind('/') {
@@ -1823,18 +2246,15 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
                 }
 
                 // Try without trailing slash: "/api" matching "/api/users"
-                // The char at listen_path.len() must be '/' or '?' (boundary check)
+                // `without_slash` is built directly from `slash_pos`, so the
+                // next byte is the segment boundary that made this candidate.
                 let without_slash = &match_path[..slash_pos];
                 if let Some(proxy) = routes.path_index.get(without_slash) {
-                    // Verify boundary: char after the prefix must be '/'
-                    // (we know it is because we found the slash at slash_pos)
-                    if bytes[slash_pos] == b'/' {
-                        return Some(RouteMatch {
-                            proxy: Arc::clone(proxy),
-                            path_params: Vec::new(),
-                            matched_prefix_len: without_slash.len(),
-                        });
-                    }
+                    return Some(RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: Vec::new(),
+                        matched_prefix_len: without_slash.len(),
+                    });
                 }
 
                 search_end = slash_pos;
@@ -1914,35 +2334,274 @@ fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
     proxy_count.saturating_mul(3).clamp(10_000, 1_000_000)
 }
 
-/// Evict entries from a DashMap using frequency-guided sampling.
+fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+        Some(entries.saturating_sub(removed))
+    });
+}
+
+/// Reconcile a per-partition entry counter after its map has just been
+/// `clear()`ed, subtracting `removed` (a pre-clear snapshot of the counter) while
+/// flooring the result at the live map length so the counter can never drop
+/// *below* the resident set.
 ///
-/// Samples a bounded number of entries, estimates each entry's access frequency
-/// via the Count-Min Sketch, then removes the least frequent entries from the sample.
-/// This approach is O(sample_size), not O(cache_size), and protects frequently
-/// accessed entries from eviction (similar to Redis LFU and TinyUFO).
+/// A plain `subtract_cache_entries(snapshot)` is unsafe here because a config
+/// reload runs concurrently with both live request inserts *and* an in-flight
+/// eviction pass. If an evictor `map.remove`s `r` entries and `fetch_sub(r)`s the
+/// counter after this snapshot was loaded, those `r` entries are still part of
+/// the snapshot (they were counted when inserted, before the load), so
+/// subtracting the snapshot double-counts the evictor's `r` and can leave the
+/// counter `r` below the live map size. Under-count is the dangerous direction:
+/// inserts only trigger eviction from this counter (`entries > max_cache_entries`
+/// in `insert_*_cache_entry`), so an under-count delays eviction and lets the
+/// cache overshoot its configured bound until later inserts refill the deficit.
 ///
-/// Returns the number of entries actually removed.
-fn frequency_aware_evict<V>(
+/// `DashMap::len()` read *inside* the `fetch_update` closure is a valid lower
+/// bound on the resident set at that instant (it sums shard lengths; an entry is
+/// counted iff its insert has landed, and every entry's counter `fetch_add`
+/// follows its map insert). Flooring at `len()` therefore guarantees the
+/// post-clear counter is `>= live`, preserving the load-bearing `counter >= live`
+/// invariant. The benign bounded *over*-count documented in `clear_lookup_caches`
+/// (an insert in the `[snapshot load, clear()]` window whose entry is removed by
+/// `clear()` yet still counted) is unaffected — `len()` only ever raises the
+/// floor, never lowers the value below it. `len()` is O(shards) and runs only on
+/// the cold reload path, never the proxy hot path; CAS retries re-read it, which
+/// is correct.
+fn reconcile_cache_entries_after_clear<V>(
+    counter: &AtomicUsize,
+    map: &DashMap<String, V>,
+    removed: usize,
+) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+        Some(entries.saturating_sub(removed).max(map.len()))
+    });
+}
+
+/// Drop queued keys from an eviction reservoir on a config-driven cache clear.
+///
+/// Used so a rebuild does not leave stale candidate keys queued. `pop` is O(1)
+/// and lock-free; stale keys are otherwise harmless (they self-skip on the
+/// live-entry check in `frequency_aware_evict`), but draining keeps the
+/// reservoir coherent with the cleared map.
+///
+/// The drain is bounded to the reservoir's fixed capacity rather than looping
+/// until empty. A reload runs concurrently with request threads still inserting
+/// cache misses (each `force_push`es a key here), so an unbounded
+/// `while pop().is_some()` could be kept non-empty by a sustained
+/// high-cardinality insert storm and make the reload spin for an unbounded
+/// time. Popping at most `capacity` times still removes every key that was
+/// queued when the clear began (the queue cannot hold more than `capacity`);
+/// any keys pushed by races after that point are fresh candidates for the
+/// rebuilt cache, and the few that may be stale self-skip on the next pass.
+fn drain_reservoir(reservoir: &ArrayQueue<String>) {
+    for _ in 0..reservoir.capacity() {
+        if reservoir.pop().is_none() {
+            break;
+        }
+    }
+}
+
+/// Append up to `budget` resident DashMap keys (not already in `seen`) to the
+/// eviction `sample`, starting from a rotated, bounded shard-order offset.
+///
+/// Shared by the periodic resident-key blend and the underfilled-sample top-up
+/// in `frequency_aware_evict`. The offset is `rotation.wrapping_mul(budget)`
+/// taken modulo `sample_size + 1`, so the `skip` walks at most `sample_size`
+/// extra positions and the whole step stays O(`sample_size`), never an O(n) map
+/// scan. `rotation` advances the window across map positions over successive
+/// calls so different resident keys are sampled over time. Frequencies come from
+/// the Count-Min Sketch so the blended keys compete on the same footing as
+/// reservoir candidates.
+fn blend_resident_keys<V>(
     map: &DashMap<String, V>,
     sketch: &CountMinSketch,
-    max_entries: usize,
-) -> usize {
-    let target_removals = max_entries / 4;
-    if target_removals == 0 {
-        return 0;
+    sample: &mut Vec<(String, u8)>,
+    seen: &mut HashSet<String>,
+    rotation: usize,
+    budget: usize,
+    sample_size: usize,
+) {
+    if budget == 0 {
+        return;
     }
-    let sample_size = target_removals * 8;
-
-    // Collect a sample of (key, frequency) pairs by iterating the DashMap.
-    // DashMap::iter() yields entries in shard order (pseudo-random relative to
-    // insertion order), so taking the first N entries is effectively a random sample.
-    let mut sample: Vec<(String, u8)> = Vec::with_capacity(sample_size);
-    for entry in map.iter() {
-        if sample.len() >= sample_size {
-            break;
+    let offset = rotation
+        .wrapping_mul(budget)
+        .checked_rem(sample_size + 1)
+        .unwrap_or(0);
+    for entry in map.iter().skip(offset).take(budget) {
+        if !seen.insert(entry.key().clone()) {
+            continue; // already sampled this pass
         }
         let freq = sketch.estimate(entry.key());
         sample.push((entry.key().clone(), freq));
+    }
+}
+
+/// Evict entries from a DashMap using frequency-guided sampling.
+///
+/// Builds a bounded sample of candidate keys by draining the per-partition
+/// eviction reservoir (the keys most recently inserted as cache misses),
+/// estimates each entry's access frequency via the Count-Min Sketch, then
+/// removes the least frequent entries from the sample. Sampling from the
+/// reservoir rather than walking a shard-ordered DashMap prefix keeps each pass
+/// O(`sample_size`) regardless of `max_entries` and lets cold entries anywhere
+/// in the map become eviction candidates (every inserted key passed through the
+/// reservoir), so hot entries near the front of shard iteration are no longer
+/// the only ones at risk. Frequently accessed entries are still protected
+/// (similar to Redis LFU and TinyUFO).
+///
+/// `blend_rotation` periodically mixes a small bounded slice of *resident* keys
+/// into the sample so that entries which aged out of the reservoir before any
+/// eviction fired — e.g. the earliest inserts under the default >=10k cap, which
+/// fill the map before the first eviction and then fall out of the 4096-slot
+/// reservoir — can still become eviction candidates instead of becoming
+/// immortal. Production passes the per-partition eviction-attempts counter so
+/// the blend rotates its window across map positions over successive passes and
+/// only fires every `HEAD_BLEND_PERIOD` passes (the reservoir remains the
+/// dominant source). On a blend pass the reservoir drain is capped so a fixed
+/// slice of the sample budget (`<= sample_size / 4`) is *reserved* for resident
+/// keys; without that reservation a sustained high-cardinality stream keeps the
+/// reservoir full, the blend never gets spare budget, and the cold-resident
+/// rescue silently stops contributing. Passing `0` disables the blend (used by
+/// unit tests that assert pure-reservoir behavior). The rotated offset is capped
+/// at `sample_size`, so the head walk stays O(`sample_size`) and never becomes an
+/// O(n) scan.
+///
+/// The sample is also topped up from resident keys whenever it comes back
+/// *underfilled* — shorter than twice the removal target — not only when it is
+/// fully empty. A reload racing with inserts can leave the reservoir full of
+/// stale/duplicate keys so the bounded pop loop yields only a handful of live
+/// candidates; evicting that tiny sample wholesale would drop hot entries
+/// regardless of frequency while cold entries remain resident. Topping up from a
+/// bounded resident-key walk keeps eviction from being starved into removing its
+/// entire sample. (This also subsumes the transient-empty case right after a
+/// clear, so the cache still cannot overshoot capacity unbounded.) The top-up
+/// walk is bounded by `sample_size`.
+///
+/// Residual (deliberate, not an oversight): the rotated blend offset is taken
+/// modulo `sample_size + 1`, so `map.iter().skip(offset)` walks at most
+/// `sample_size` positions and the blend sweeps only the first `~2 * sample_size`
+/// shard-ordered positions, not the whole map. This cap is load-bearing: the
+/// hot-path contract is that an eviction pass is O(`sample_size`) regardless of
+/// `max_cache_entries`, and `skip(offset)` is O(`offset`). Rotating the offset
+/// across the whole map (`% map.len()`) would make a blend pass O(`map.len()`) —
+/// a per-eviction O(n) scan on the proxy path under the default >=10k (up to 1M)
+/// cap — which is exactly what the reservoir design exists to avoid. Resident
+/// keys deeper than the swept window therefore still rely on re-entering the
+/// reservoir (a later access re-inserts them as a miss after a generation bump,
+/// or a survivor requeue keeps them) to become candidates. Uniform coverage of
+/// arbitrarily-deep stale residents would need shard-indexed sampling (a
+/// DashMap-internal `shards()` walk that visits a bounded slice of each shard in
+/// O(`sample_size`)); that is deferred as a heavier rework rather than paying an
+/// O(n) blend scan here.
+fn frequency_aware_evict<V>(
+    map: &DashMap<String, V>,
+    reservoir: &ArrayQueue<String>,
+    sketch: &CountMinSketch,
+    max_entries: usize,
+    blend_rotation: u64,
+) -> usize {
+    let sample_size = max_entries.min(ROUTER_CACHE_EVICTION_SAMPLE_LIMIT);
+    if sample_size < 4 {
+        return 0;
+    }
+
+    let target_removals = (sample_size / 4).clamp(1, ROUTER_CACHE_EVICTION_MAX_REMOVALS);
+
+    // Decide up front whether this is a periodic resident-key blend pass. On a
+    // blend pass we *reserve* part of the sample budget for resident keys so the
+    // blend always contributes, even when the reservoir alone could fill the
+    // whole sample. Without reserving room, a sustained high-cardinality stream
+    // keeps the reservoir full, the old `sample.len() < sample_size` guard never
+    // fires, and the resident-key walk that is meant to rescue entries which aged
+    // out of the reservoir before the first eviction (e.g. the earliest inserts
+    // under the default >=10k cap) never runs — pinning those cold residents
+    // permanently and shrinking effective capacity. Reserving caps the reservoir
+    // drain so the blend has guaranteed headroom on its period.
+    let blend_active = blend_rotation != 0 && blend_rotation.is_multiple_of(HEAD_BLEND_PERIOD);
+    let head_reserve = if blend_active {
+        (sample_size / 4).max(1)
+    } else {
+        0
+    };
+    let reservoir_budget = sample_size - head_reserve;
+
+    // Drain up to `reservoir_budget` distinct, still-live candidate keys from the
+    // reservoir. Bounded by `2 * sample_size` pops (O(1) each); stale keys
+    // (already evicted) and duplicates are dropped so the sample reflects distinct
+    // live entries. Popping past `reservoir_budget` makes headway through stale
+    // entries without ever turning the drain into an unbounded loop, and leaves
+    // `head_reserve` slots free for the blend below.
+    let mut sample: Vec<(String, u8)> = Vec::with_capacity(sample_size);
+    let mut seen: HashSet<String> = HashSet::with_capacity(sample_size);
+    let max_pops = sample_size.saturating_mul(2);
+    for _ in 0..max_pops {
+        if sample.len() >= reservoir_budget {
+            break;
+        }
+        let Some(key) = reservoir.pop() else {
+            break;
+        };
+        if !map.contains_key(&key) {
+            continue; // stale candidate; self-cleans from the reservoir
+        }
+        if !seen.insert(key.clone()) {
+            continue; // duplicate within this pass
+        }
+        let freq = sketch.estimate(&key);
+        sample.push((key, freq));
+    }
+
+    // Periodic resident-key blend: mix a small, rotating slice of resident keys
+    // into the sample so older entries that fell out of the reservoir can still be
+    // evicted. Runs only every `HEAD_BLEND_PERIOD` passes; the reserved budget
+    // above guarantees it has room even when the reservoir is full, so the blend
+    // actually contributes rather than only consuming spare budget. The reservoir
+    // remains the dominant source (it gets `sample_size - head_reserve` of the
+    // budget). `head_reserve` is at most `sample_size / 4`, so the walk stays
+    // O(`sample_size`).
+    if blend_active {
+        let head_budget = head_reserve.min(sample_size - sample.len());
+        let rotation_steps = (blend_rotation / HEAD_BLEND_PERIOD) as usize;
+        blend_resident_keys(
+            map,
+            sketch,
+            &mut sample,
+            &mut seen,
+            rotation_steps,
+            head_budget,
+            sample_size,
+        );
+    }
+
+    // Top up an underfilled sample from resident keys before choosing victims.
+    // The reservoir sample can come up short of the removal target even when the
+    // reservoir is non-empty — e.g. after a reload races with inserts the queue
+    // fills with stale/duplicate keys, so the bounded pop loop yields only a few
+    // live candidates. The old code only topped up when the sample was *empty*,
+    // so a tiny non-empty sample would have every member evicted regardless of
+    // frequency (`to_remove == sample.len()`), evicting hot entries while many
+    // cold entries remained resident. Treat any sample shorter than the removal
+    // target like the empty case and supplement it with a bounded resident-key
+    // walk so eviction is never starved into removing its whole sample. This walk
+    // is also bounded by `sample_size`, so the pass stays O(`sample_size`).
+    if sample.len() < target_removals * 2 {
+        // Walk from the head (offset 0) rather than a rotated window: the top-up
+        // is a rare recovery path (it only fires when the reservoir under-delivers)
+        // and wants maximal coverage of accessible residents to fill the sample,
+        // not the rotation the periodic blend uses to sweep over time. This also
+        // exactly reproduces the previous empty-sample fallback's `take(sample_size)`
+        // from the head when the reservoir yielded nothing.
+        let topup_budget = sample_size - sample.len();
+        blend_resident_keys(
+            map,
+            sketch,
+            &mut sample,
+            &mut seen,
+            0,
+            topup_budget,
+            sample_size,
+        );
     }
 
     if sample.is_empty() {
@@ -1960,6 +2619,22 @@ fn frequency_aware_evict<V>(
         if map.remove(key).is_some() {
             removed += 1;
         }
+    }
+
+    // Requeue the sampled survivors (everything not removed) so they remain
+    // eviction candidates on a later pass. Without this, draining the reservoir
+    // permanently dropped these still-live keys: in a saturated cache an old
+    // cold-but-not-coldest entry would get a single chance to be removed and
+    // then become effectively immortal, while subsequent passes could only
+    // sample freshly inserted keys. `force_push` is O(1) and lock-free, and the
+    // survivor count is bounded by `sample_size`, so requeueing keeps the pass
+    // O(`sample_size`) and the reservoir a moving window over still-resident
+    // recent inserts rather than a one-shot queue. Survivors came from the head
+    // of the reservoir; pushing them back puts them behind newer inserts, which
+    // is the intended recency ordering. Stale survivors (none here — every
+    // sample entry was live when popped) would self-skip on the next pass.
+    for (key, _) in sample.drain(to_remove..) {
+        let _ = reservoir.force_push(key);
     }
 
     removed
@@ -2179,6 +2854,17 @@ mod tests {
 
     // ── frequency_aware_evict tests ─────────────────────────────────────
 
+    /// Build an eviction reservoir holding every key currently in `map`.
+    /// Eviction now samples candidates from the reservoir, so the unit tests
+    /// must enqueue the keys they expect to be eligible.
+    fn reservoir_with_map_keys<V>(map: &DashMap<String, V>) -> ArrayQueue<String> {
+        let reservoir = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+        for entry in map.iter() {
+            let _ = reservoir.force_push(entry.key().clone());
+        }
+        reservoir
+    }
+
     #[test]
     fn evict_removes_low_frequency_entries() {
         let sketch = CountMinSketch::new(1024, 100_000);
@@ -2198,7 +2884,8 @@ mod tests {
             }
         }
 
-        let removed = frequency_aware_evict(&map, &sketch, 100);
+        let reservoir = reservoir_with_map_keys(&map);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 100, 0);
         assert!(removed > 0, "Should have evicted some entries");
         assert!(map.len() < 100, "Map should be smaller after eviction");
 
@@ -2227,26 +2914,469 @@ mod tests {
     fn evict_empty_map_is_noop() {
         let sketch = CountMinSketch::new(64, 1000);
         let map: DashMap<String, ()> = DashMap::new();
-        let removed = frequency_aware_evict(&map, &sketch, 100);
+        let reservoir = reservoir_with_map_keys(&map);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 100, 0);
         assert_eq!(removed, 0);
     }
 
     #[test]
     fn evict_very_small_capacity_is_noop() {
-        // target_removals = max_entries / 4 = 3 / 4 = 0
+        // Tiny capacities skip sampling because there is no meaningful LFU set.
         let sketch = CountMinSketch::new(64, 1000);
         let map: DashMap<String, ()> = DashMap::new();
         map.insert("a".into(), ());
-        let removed = frequency_aware_evict(&map, &sketch, 3);
+        let reservoir = reservoir_with_map_keys(&map);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 3, 0);
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn evict_large_capacity_uses_bounded_sample() {
+        let sketch = CountMinSketch::new(65_536, 1_000_000);
+        let map: DashMap<String, ()> = DashMap::new();
+
+        for i in 0..1_000 {
+            let key = format!("key-{i}");
+            map.insert(key.clone(), ());
+            sketch.increment(&key);
+        }
+
+        let reservoir = reservoir_with_map_keys(&map);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 10_000, 0);
+        assert!(
+            removed <= ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "eviction removed {removed} entries despite bounded sample"
+        );
+        assert!(
+            map.len() >= 1_000 - ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "eviction should not scan and remove the whole map"
+        );
+    }
+
+    #[test]
+    fn evict_falls_back_to_head_when_reservoir_empty() {
+        // If the reservoir is empty (e.g. right after a clear) eviction must
+        // still make progress via the bounded head sample so the cache cannot
+        // grow without bound.
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..200 {
+            map.insert(format!("key-{i}"), ());
+        }
+        let empty = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+        let removed = frequency_aware_evict(&map, &empty, &sketch, 200, 0);
+        assert!(removed > 0, "empty reservoir must fall back to head sample");
+        assert!(removed <= ROUTER_CACHE_EVICTION_MAX_REMOVALS);
+    }
+
+    #[test]
+    fn evict_skips_stale_reservoir_keys() {
+        // Keys queued in the reservoir but no longer in the map (already evicted
+        // or cleared) must be skipped, not counted, and must not cause spurious
+        // removals.
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..50 {
+            map.insert(format!("live-{i}"), ());
+        }
+        let reservoir = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+        // Queue stale keys first, then a couple of live ones.
+        for i in 0..100 {
+            let _ = reservoir.force_push(format!("stale-{i}"));
+        }
+        for i in 0..50 {
+            let _ = reservoir.force_push(format!("live-{i}"));
+        }
+        let before = map.len();
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50, 0);
+        // Only live keys can be removed; stale candidates never touch the map.
+        assert_eq!(map.len() + removed, before);
+        for i in 0..100 {
+            assert!(!map.contains_key(&format!("stale-{i}")));
+        }
+    }
+
+    #[test]
+    fn evict_requeues_sampled_survivors() {
+        // Survivors of a sample (live keys popped but not in the removed
+        // bottom quartile) must be pushed back into the reservoir so a later
+        // pass can reconsider them. Otherwise a single pass would permanently
+        // drop them and they could become immortal once resident.
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..50 {
+            map.insert(format!("key-{i}"), ());
+            // Uniform-ish frequency so removals come from a small quartile and
+            // most sampled keys survive the pass.
+            sketch.increment(&format!("key-{i}"));
+        }
+        let reservoir = reservoir_with_map_keys(&map);
+
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50, 0);
+        assert!(removed > 0, "expected at least one removal");
+        // Survivors were requeued: the reservoir holds the sampled-but-kept
+        // keys (sample_size - removed), not zero.
+        let surviving_candidates = reservoir.len();
+        assert!(
+            surviving_candidates > 0,
+            "sampled survivors must be requeued, reservoir is empty"
+        );
+        // Every requeued key is still live in the map (no stale survivors).
+        let mut drained = Vec::new();
+        while let Some(k) = reservoir.pop() {
+            assert!(
+                map.contains_key(&k),
+                "requeued survivor {k} is not a live map entry"
+            );
+            drained.push(k);
+        }
+        assert_eq!(drained.len(), surviving_candidates);
+    }
+
+    #[test]
+    fn blend_resident_keys_appends_within_bounds() {
+        // Direct unit test of the shared resident-key walk: it appends up to
+        // `budget` not-yet-seen resident keys, dedups against `seen`, and the
+        // rotated offset is taken modulo `sample_size + 1` so it never panics or
+        // walks more than `budget` positions.
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..100 {
+            map.insert(format!("k-{i}"), ());
+        }
+        let mut sample: Vec<(String, u8)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // budget 0 is a no-op.
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen, 3, 0, 64);
+        assert!(sample.is_empty());
+
+        // A normal call appends exactly `budget` distinct keys.
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen, 1, 8, 64);
+        assert_eq!(sample.len(), 8);
+        assert_eq!(seen.len(), 8);
+
+        // Keys already in `seen` are skipped (no duplicates appended).
+        let before = sample.len();
+        let dup_key = sample[0].0.clone();
+        let mut seen_with_dup = seen.clone();
+        // Force the walk to encounter an already-seen key by seeding `seen` with
+        // everything; the next call must add nothing.
+        for entry in map.iter() {
+            seen_with_dup.insert(entry.key().clone());
+        }
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen_with_dup, 2, 8, 64);
+        assert_eq!(sample.len(), before, "all-seen walk must append nothing");
+        assert!(seen_with_dup.contains(&dup_key));
+
+        // A large rotation must not panic (offset is reduced modulo sample_size+1).
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen, usize::MAX, 4, 64);
+    }
+
+    #[test]
+    fn evict_blend_reserves_budget_on_blend_pass() {
+        // Regression for the reserved-budget fix (F2): on a blend pass the
+        // reservoir drain is capped (`reservoir_budget = sample_size - head_reserve`)
+        // so the resident-key blend always has room, even when the reservoir alone
+        // could fill the whole sample. Without the reservation a saturated
+        // reservoir filled the sample, the old `sample.len() < sample_size` guard
+        // never fired, and cold residents that aged out of the reservoir could
+        // never be evicted.
+        //
+        // Sizing is chosen so coverage is deterministic, not shard-order-luck:
+        // sample_size = 40 -> head_reserve = 10, reservoir_budget = 30. The map
+        // holds 40 HOT keys (saturating the reservoir past reservoir_budget) plus
+        // 20 COLD keys absent from the reservoir (60 entries total). The blend
+        // walk covers a rotating `[offset, offset+10)` window with offsets
+        // sweeping 0..40 over rotations, so its union covers map positions 0..49;
+        // at most 10 of the 20 cold keys can sit in positions 50..59, so >=10 cold
+        // keys are guaranteed inside the covered window and become candidates.
+        let sketch = CountMinSketch::new(8192, 1_000_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..20 {
+            let cold = format!("cold-{i}");
+            map.insert(cold.clone(), ());
+            sketch.increment(&cold); // freq 1
+        }
+        for i in 0..40 {
+            let hot = format!("hot-{i}");
+            map.insert(hot.clone(), ());
+            for _ in 0..100 {
+                sketch.increment(&hot); // hot
+            }
+        }
+        let reservoir = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+
+        // Run blend passes across rotations, re-saturating the reservoir with hot,
+        // live keys before each pass (mimics sustained hot traffic keeping it full
+        // so the reservoir would otherwise monopolize the sample). The F2 guarantee
+        // is that cold residents *become candidates*: a cold key (freq 1) sorts
+        // below every co-sampled hot key (freq 100), so as soon as the rotating
+        // blend window covers a cold position it is evicted. Coverage of map
+        // positions 0..49 is guaranteed (see sizing note), and >=10 cold keys must
+        // lie there, so at least one cold key is deterministically evicted within
+        // the sweep — impossible if the blend never ran for lack of reserved room.
+        let mut cold_evicted = false;
+        for r in 1..=32u64 {
+            for i in 0..40 {
+                let _ = reservoir.force_push(format!("hot-{i}"));
+            }
+            let pass = r * HEAD_BLEND_PERIOD; // always a blend pass
+            let _ = frequency_aware_evict(&map, &reservoir, &sketch, 40, pass);
+            let cold_remaining = (0..20)
+                .filter(|i| map.contains_key(&format!("cold-{i}")))
+                .count();
+            if cold_remaining < 20 {
+                cold_evicted = true;
+                break;
+            }
+        }
+        assert!(
+            cold_evicted,
+            "reserved blend budget must let cold residents (absent from a full \
+             reservoir) become eviction candidates; none were evicted across the \
+             rotation sweep (the blend never ran for lack of reserved room)"
+        );
+    }
+
+    #[test]
+    fn evict_tops_up_underfilled_sample_instead_of_clearing_it() {
+        // Regression for the top-up fix (F3): a reservoir polluted with stale
+        // keys can yield only a couple of live candidates. The old code only
+        // topped up when the live sample was *empty*, so a tiny non-empty sample
+        // had every member evicted regardless of frequency. Here the only live
+        // reservoir candidates are HOT; without the top-up they would all be
+        // removed even though many cold residents exist. With the top-up, cold
+        // residents are pulled in so the hot candidates survive.
+        let sketch = CountMinSketch::new(4096, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        // Cold residents not in the reservoir (occupy the head of the map for the
+        // top-up walk's `skip(0)` offset on rotation 1).
+        for i in 0..256 {
+            let key = format!("cold-{i}");
+            map.insert(key.clone(), ());
+            sketch.increment(&key); // freq 1
+        }
+        // Two hot live keys, plus a flood of stale keys, in the reservoir.
+        let reservoir = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+        for i in 0..2 {
+            let key = format!("hot-{i}");
+            map.insert(key.clone(), ());
+            for _ in 0..200 {
+                sketch.increment(&key);
+            }
+        }
+        // Stale keys first so the bounded pop loop burns its budget on them and
+        // the live sample comes up short (only the 2 hot keys are live).
+        for i in 0..400 {
+            let _ = reservoir.force_push(format!("stale-{i}"));
+        }
+        for i in 0..2 {
+            let _ = reservoir.force_push(format!("hot-{i}"));
+        }
+
+        // Non-blend pass (rotation not divisible by HEAD_BLEND_PERIOD) so only the
+        // shortfall top-up can supply extra candidates. `to_remove` is
+        // target_removals (sample_size/4 = 64), so without the top-up the 2-key
+        // sample would lose both hot keys; with it, 64 cold residents absorb the
+        // removal.
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 257, 1);
+        assert!(removed > 0, "underfilled sample must still evict");
+        assert!(
+            map.contains_key("hot-0") && map.contains_key("hot-1"),
+            "hot live candidates must not be wholesale-evicted from a tiny sample"
+        );
+        let cold_remaining = (0..256)
+            .filter(|i| map.contains_key(&format!("cold-{i}")))
+            .count();
+        assert!(
+            cold_remaining < 256,
+            "top-up should let cold residents absorb the eviction (cold_remaining={cold_remaining})"
+        );
+    }
+
+    #[test]
+    fn successive_evictions_stay_bounded_and_fire_passes() {
+        // Drive several real eviction passes through `evict_prefix_sample` and
+        // assert the cache stays bounded near capacity and the pass counter
+        // advances (eviction is actually firing on cold inserts).
+        let config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("p", "/")],
+            ..GatewayConfig::default()
+        };
+        // Tiny capacity so each cache-miss insert trips eviction quickly.
+        let cache = RouterCache::new(&config, 8);
+
+        // Generate enough distinct paths to force multiple eviction passes.
+        for i in 0..200 {
+            let _ = cache.find_proxy(None, &format!("/p/{i}"));
+        }
+
+        let attempts = cache.prefix_eviction_attempts.load(Ordering::Relaxed);
+        assert!(
+            attempts >= 2,
+            "expected multiple eviction passes, got {attempts}"
+        );
+        // Cache stays bounded near capacity even under sustained cold-insert
+        // churn (the reservoir-driven sample keeps eviction bounded per pass).
+        assert!(
+            cache.cache_len() <= cache.max_cache_entries + ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "cache should stay bounded, len={}",
+            cache.cache_len()
+        );
+    }
+
+    #[test]
+    fn eviction_covers_cold_entries_and_protects_hot_ones() {
+        // Regression for the bounded-prefix eviction bug: under high-cardinality
+        // churn, cold entries that land deep in the shard-ordered map must still
+        // become eviction candidates (via the insert-time reservoir), while hot
+        // entries that are repeatedly accessed must survive. The old rotation
+        // only ever sampled the first ~4096 iterator positions, so deep cold
+        // entries were immortal and hot entries in the covered windows churned.
+        let config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("p", "/")],
+            ..GatewayConfig::default()
+        };
+        // Capacity well below the number of distinct cold paths so eviction runs
+        // continuously, but the reservoir (4096) dwarfs it so candidates are
+        // drawn from the recent-insert stream, not a shard prefix.
+        let cache = RouterCache::new(&config, 256);
+
+        // A small set of hot paths, hammered repeatedly so their frequency stays
+        // high across the run.
+        let hot: Vec<String> = (0..8).map(|i| format!("/p/hot-{i}")).collect();
+        for _ in 0..50 {
+            for h in &hot {
+                let _ = cache.find_proxy(None, h);
+            }
+        }
+
+        // Drive a large stream of distinct cold paths interleaved with hot hits.
+        // Far more than capacity, so the cache is continuously evicting.
+        for i in 0..5_000 {
+            let _ = cache.find_proxy(None, &format!("/p/cold-{i}"));
+            if i % 4 == 0 {
+                for h in &hot {
+                    let _ = cache.find_proxy(None, h);
+                }
+            }
+        }
+
+        // The cache stayed bounded despite 5k distinct cold inserts — proof the
+        // deep cold entries were reachable as eviction candidates (otherwise the
+        // counter-driven cap could not have held).
+        assert!(
+            cache.cache_len() <= cache.max_cache_entries + ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "cache should stay bounded under high-cardinality churn, len={}",
+            cache.cache_len()
+        );
+
+        // Hot entries must have *survived* eviction on their own frequency, so
+        // inspect cache residency directly rather than calling `find_proxy`
+        // (which would repopulate a missing entry from the route table and mask
+        // an eviction). The hot keys were accumulating frequency throughout the
+        // run (50 warm-up hits + ~1250 interleaved hits each), so they should be
+        // far above the cold keys (frequency 1) the sampler removes. The old
+        // prefix-only sampler would have evicted hot entries sitting in the
+        // covered shard windows; this asserts the reservoir+sketch keeps them.
+        let surviving_hot = hot
+            .iter()
+            .filter(|h| cache.prefix_cache.contains_key(&make_cache_key(None, h)))
+            .count();
+        assert_eq!(
+            surviving_hot,
+            hot.len(),
+            "all hot entries should still be resident in the cache (not repopulated): \
+             survived {surviving_hot}/{}",
+            hot.len()
+        );
+    }
+
+    #[test]
+    fn clear_lookup_caches_keeps_counter_coherent() {
+        // After a clear, the entry counter must equal the live map length so the
+        // counter-driven eviction cap is not desynced below the real count.
+        let config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("p", "/")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 10_000);
+        for i in 0..500 {
+            let _ = cache.find_proxy(None, &format!("/p/{i}"));
+        }
+        assert!(cache.cache_len() > 0);
+        cache.clear_lookup_caches();
+        assert_eq!(
+            cache.cache_len(),
+            cache.prefix_cache.len(),
+            "prefix counter must match the live map length after clear"
+        );
+        assert_eq!(
+            cache.regex_cache_len(),
+            cache.regex_cache.len(),
+            "regex counter must match the live map length after clear"
+        );
+        // The reservoir is drained so no stale candidates linger.
+        assert!(cache.prefix_eviction_reservoir.is_empty());
+        assert!(cache.regex_eviction_reservoir.is_empty());
+    }
+
+    #[test]
+    fn reconcile_after_clear_never_undercounts_live_entries() {
+        // Models the clear-vs-evict race: a pre-clear counter snapshot can
+        // over-cover the live set when an in-flight eviction pass subtracts its
+        // own removals after the snapshot was taken. Subtracting the bare
+        // snapshot would drive the counter below the resident map; the
+        // `max(map.len())` floor must prevent that (under-count is the dangerous
+        // direction — it delays eviction and lets the cache overshoot its cap).
+        let map: DashMap<String, u8> = DashMap::new();
+        // Resident set survives the "clear" (these stand in for race-inserts that
+        // landed after clear() but are still live and counted).
+        for i in 0..40 {
+            map.insert(format!("live-{i}"), 1);
+        }
+        let counter = AtomicUsize::new(40);
+        // A racing evictor already subtracted 25 of these 40 from the counter,
+        // but the stale snapshot still reflects the full 40 (those 25 were
+        // counted before the snapshot load).
+        counter.fetch_sub(25, Ordering::Relaxed);
+        let stale_snapshot = 40usize;
+        reconcile_cache_entries_after_clear(&counter, &map, stale_snapshot);
+        // Bare subtract would have saturated to 0 (15 - 40); the floor keeps the
+        // counter at >= the 40 live entries, so the cap can never be under-driven.
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            map.len(),
+            "counter must be floored at the live map length, never below it"
+        );
+        assert!(counter.load(Ordering::Relaxed) >= map.len());
+    }
+
+    #[test]
+    fn reconcile_after_clear_subtracts_when_above_live_floor() {
+        // When no race is in play the helper behaves like the plain subtract:
+        // snapshot fully removed, counter lands at the (empty) live length.
+        let map: DashMap<String, u8> = DashMap::new();
+        let counter = AtomicUsize::new(500);
+        reconcile_cache_entries_after_clear(&counter, &map, 500);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // With residents present and a snapshot that does not over-cover them,
+        // the subtract still applies and floors at the live length.
+        for i in 0..10 {
+            map.insert(format!("k-{i}"), 1);
+        }
+        let counter = AtomicUsize::new(310);
+        reconcile_cache_entries_after_clear(&counter, &map, 300);
+        assert_eq!(counter.load(Ordering::Relaxed), 10);
     }
 
     // ── RouterCache::new auto-resolution tests ──────────────────────────
     //
     // FERRUM_ROUTER_CACHE_MAX_ENTRIES=0 is the documented "auto" sentinel.
     // Harden `new` itself so direct callers (tests, future refactors) can't
-    // end up with an effectively unbounded cache — `frequency_aware_evict`
-    // returns 0 when `max_entries / 4 == 0`.
+    // end up with an effectively unbounded cache under tiny explicit capacities.
 
     fn minimal_proxy_for_routing(id: &str, listen_path: &str) -> Proxy {
         use crate::config::types::{
@@ -2275,6 +3405,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             resolved_tls: BackendTlsConfig::default_verify(),
             dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
             dns_override: None,
             dns_cache_ttl_seconds: None,
             auth_mode: AuthMode::Single,
@@ -2339,7 +3470,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // Outbound listener: the outbound route is served.
         let outb = cache
@@ -2379,7 +3510,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert_eq!(
             cache
                 .resolve_route_excluding_wrong_direction(
@@ -2454,7 +3585,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // The tiers hold exactly the lowest-port representative — including on
         // a cached second lookup (selection is post-cache, per request).
@@ -2505,7 +3636,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
         let kept = table
@@ -2547,7 +3678,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
         assert!(
@@ -2587,7 +3718,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("oddball"), "/").expect("route");
         let kept = table
@@ -2625,7 +3756,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
         assert!(
@@ -2787,6 +3918,148 @@ mod tests {
     }
 
     #[test]
+    fn store_route_table_snapshot_clears_lookup_caches_on_generation_change() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 100);
+
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match");
+        assert_eq!(old.proxy.id, "old");
+        assert_eq!(cache.cache_len(), 1);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        cache.store_route_table_snapshot(RouterCache::build_route_table_snapshot(&new_config), 2);
+
+        let (prefix, regex, _, _, _) = cache.cache_stats();
+        assert_eq!(prefix, 0, "prefix cache should clear on route reload");
+        assert_eq!(regex, 0, "regex cache should clear on route reload");
+
+        let new = cache
+            .find_proxy(None, "/api/resource")
+            .expect("new route should match");
+        assert_eq!(new.proxy.id, "new");
+        assert_eq!(cache.cache_len(), 1);
+    }
+
+    #[test]
+    fn standalone_route_snapshot_publishes_table_and_generation_together() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 100);
+
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match");
+        assert_eq!(old.proxy.id, "old");
+        assert_eq!(cache.route_snapshot_for_tests().generation, 1);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        cache.store_route_table_snapshot(RouterCache::build_route_table_snapshot(&new_config), 2);
+
+        let snapshot = cache.route_snapshot_for_tests();
+        assert_eq!(snapshot.generation, 2);
+        let new = cache
+            .find_proxy_in_snapshot(&snapshot.table, snapshot.generation, None, "/api/resource")
+            .expect("new route should match through the published snapshot");
+        assert_eq!(new.proxy.id, "new");
+    }
+
+    #[test]
+    fn standalone_lookup_rejects_stale_cache_after_snapshot_publication() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 100);
+
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match");
+        assert_eq!(old.proxy.id, "old");
+        assert_eq!(cache.cache_len(), 1);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        cache.publish_route_snapshot_without_clearing_for_tests(
+            RouterCache::build_route_table_snapshot(&new_config),
+            2,
+        );
+        assert_eq!(
+            cache.cache_len(),
+            1,
+            "old generation cache entry should still be resident before reload clearing"
+        );
+
+        let new = cache
+            .find_proxy(None, "/api/resource")
+            .expect("new route should match despite stale resident cache entry");
+        assert_eq!(new.proxy.id, "new");
+        let snapshot = cache.route_snapshot_for_tests();
+        assert_eq!(snapshot.generation, 2);
+    }
+
+    #[test]
+    fn standalone_lookup_during_reload_observes_one_complete_route_snapshot() {
+        use std::sync::{Barrier, mpsc};
+
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = Arc::new(RouterCache::new(&old_config, 100));
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match before reload");
+        assert_eq!(old.proxy.id, "old");
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        let new_table = RouterCache::build_route_table_snapshot(&new_config);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        let reader_cache = Arc::clone(&cache);
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            let observed = reader_cache
+                .find_proxy(None, "/api/resource")
+                .map(|route_match| route_match.proxy.id.clone());
+            tx.send(observed).expect("send observed route");
+        });
+
+        barrier.wait();
+        cache.store_route_table_snapshot(new_table, 2);
+        let observed = rx.recv().expect("receive observed route");
+        reader.join().expect("reader thread should not panic");
+
+        assert!(
+            matches!(observed.as_deref(), Some("old") | Some("new")),
+            "lookup must observe either the complete old snapshot or the complete new snapshot, got {observed:?}"
+        );
+        let after = cache
+            .find_proxy(None, "/api/resource")
+            .expect("route should match after reload");
+        assert_eq!(after.proxy.id, "new");
+    }
+
+    #[test]
     fn new_resolves_zero_max_entries_to_auto_floor() {
         // 5 proxies × 3 = 15, well below the 10_000 floor — must clamp up.
         let config = config_with_n_proxies(5);
@@ -2924,7 +4197,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // Tiers hold exactly the lowest-service-port representative.
         let rm = cache
@@ -2999,7 +4272,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         for (orig_dst, authority) in [(None, None), (None, Some(9999u16)), (Some(9999u16), None)] {
             let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
@@ -3059,7 +4332,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // Lowest listener port is the tier representative.
         let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
@@ -3124,7 +4397,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // No port signal at all: falls through to the sole listener AND stamps
         // the declared listener port for authz.
@@ -3221,7 +4494,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // No port signal: with two DECLARED listeners and one resolved, the group
         // is ambiguous → fail closed (NOT a fall-through to the survivor).
@@ -3271,7 +4544,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         // No signal → keep (back-compat), and NO ingress authz port (service
         // default authorizes on the backend port).
@@ -3307,7 +4580,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
         assert!(matches!(
@@ -3367,7 +4640,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let decision =
             |addr: &str| table.mesh_tcp_egress_decision(addr.parse().expect("socket addr"));
@@ -3410,9 +4683,126 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_tcp_egress_decision("10.96.0.1:6379".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
+    fn mesh_tcp_inbound_table_routes_by_captured_app_port() {
+        use crate::config::types::BackendScheme;
+        use crate::modes::mesh::config::{MeshConfig, MeshInboundTcpRoute};
+
+        let route = MeshInboundTcpRoute {
+            match_port: 6380,
+            backend_addr: "127.0.0.1:6380".parse().unwrap(),
+            namespace: "default".to_string(),
+            service_name: "redis".to_string(),
+            service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            // Redis is server-first: the relay must NOT peek SNI for this port.
+            tls_inspect: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                local_inbound_tcp_routes: vec![route],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+
+        let entry = table
+            .mesh_tcp_inbound_entry("10.0.0.7:6380".parse().unwrap())
+            .expect("captured app port should route");
+        assert_eq!(entry.backend_addr, "127.0.0.1:6380".parse().unwrap());
+        assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
+        assert!(
+            !entry.tls_inspect,
+            "server-first raw-TCP inbound entries must not SNI-peek (would stall on the handshake clock)"
+        );
+        assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(
+            entry.relay_proxy.id,
+            "__mesh-in-tcp-relay-default-redis-6380"
+        );
+
+        assert!(
+            table
+                .mesh_tcp_inbound_entry("10.0.0.7:6381".parse().unwrap())
+                .is_none(),
+            "raw-TCP inbound never routes by IP or nearby port alone"
+        );
+    }
+
+    #[test]
+    fn mesh_udp_egress_table_routes_by_vip_and_port() {
+        // F3 §3.3 Stage 4: a UDP service port × VIP routes through the per-port
+        // UDP upstream; an undeclared port / different IP misses; a declared pair
+        // whose upstream did not materialize is CloseNotRoutable (fail closed).
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+        let service = MeshService {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: std::collections::HashMap::new(),
+            cluster_ips: vec!["10.96.0.10".to_string()],
+        };
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": "__mesh-out-udp-upstream-default-dns-53",
+            "name": "dns.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.9", "port": 53}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        let decision =
+            |addr: &str| table.mesh_udp_egress_decision(addr.parse().expect("socket addr"));
+
+        match decision("10.96.0.10:53") {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(entry.upstream_id, "__mesh-out-udp-upstream-default-dns-53");
+                assert_eq!(entry.service_fqdn, "dns.default.svc.cluster.local");
+            }
+            _ => panic!("expected Relay decision for an exact (VIP, UDP port) match"),
+        }
+        // Mapped-IPv6 capture of the same IPv4 VIP still matches.
+        assert!(matches!(
+            decision("[::ffff:10.96.0.10]:53"),
+            Some(MeshTcpEgressDecision::Relay(_))
+        ));
+        // Undeclared port / different IP miss (not mesh UDP destinations).
+        assert!(decision("10.96.0.10:54").is_none());
+        assert!(decision("10.96.0.11:53").is_none());
+
+        // Declared pair whose upstream did NOT materialize: CloseNotRoutable.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        assert!(matches!(
+            table.mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
         ));
     }
@@ -3493,7 +4883,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
 
         let bywl = |addr: &str| {
             table.mesh_tcp_egress_by_workload_decision(addr.parse().expect("socket addr"))
@@ -3539,7 +4929,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table.load();
+        let table = cache.route_table_for_tests();
         assert!(matches!(
             table.mesh_tcp_egress_by_workload_decision("10.0.0.7:6380".parse().unwrap()),
             Some(MeshTcpEgressDecision::CloseNotRoutable)

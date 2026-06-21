@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
@@ -9,12 +10,14 @@ use crate::modes::mesh::config::{
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, port_from_u64, string_field,
+    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, RouteBackend, port_from_u64,
+    string_field,
 };
 
 #[derive(Debug, Default)]
 pub(super) struct CoreState {
     services: HashMap<K8sServiceKey, CoreService>,
+    secrets: HashMap<K8sServiceKey, CoreSecret>,
     pods: HashMap<PodKey, CorePod>,
     pod_by_ip: HashMap<String, PodKey>,
     endpoint_slices: Vec<CoreEndpointSlice>,
@@ -41,10 +44,17 @@ impl PodKey {
 #[derive(Debug)]
 struct CoreService {
     ports: Vec<ServicePort>,
+    has_selector: bool,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
     cluster_ips: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CoreSecret {
+    valid_tls_certificate: bool,
+    tls_material_digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -66,7 +76,14 @@ struct CorePod {
 #[derive(Debug)]
 struct CoreEndpointSlice {
     service_key: K8sServiceKey,
+    ports: Vec<CoreEndpointSlicePort>,
     endpoints: Vec<CoreEndpoint>,
+}
+
+#[derive(Debug)]
+struct CoreEndpointSlicePort {
+    name: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -78,11 +95,14 @@ struct CoreEndpoint {
 }
 
 pub(super) fn is_core_resource_kind(kind: &str) -> bool {
-    matches!(kind, "Pod" | "Service" | "EndpointSlice" | "Node")
+    matches!(
+        kind,
+        "Pod" | "Service" | "EndpointSlice" | "Node" | "Namespace" | "Secret"
+    )
 }
 
 pub(super) fn is_cluster_scoped_core_resource_kind(kind: &str) -> bool {
-    matches!(kind, "Node")
+    matches!(kind, "Node" | "Namespace")
 }
 
 pub(super) fn collect(
@@ -91,6 +111,10 @@ pub(super) fn collect(
 ) -> Result<(), K8sTranslateError> {
     match object.kind.as_str() {
         "Service" => collect_service(acc, object),
+        "Secret" => {
+            collect_secret(acc, object);
+            Ok(())
+        }
         "Pod" => {
             collect_pod(acc, object);
             Ok(())
@@ -241,6 +265,11 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
         key,
         CoreService {
             ports: service_ports,
+            has_selector: object
+                .spec
+                .get("selector")
+                .and_then(Value::as_object)
+                .is_some_and(|selector| !selector.is_empty()),
             cluster_ips,
         },
     );
@@ -301,6 +330,29 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
         return;
     };
 
+    let ports = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|port| {
+            let name = string_field(port, "name")
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned);
+            let port = port
+                .get("port")
+                .and_then(Value::as_u64)
+                .filter(|port| *port != 0 && *port <= u16::MAX as u64)
+                .map(|port| port as u16);
+            if name.is_none() && port.is_none() {
+                None
+            } else {
+                Some(CoreEndpointSlicePort { name, port })
+            }
+        })
+        .collect();
+
     let endpoints = object
         .spec
         .get("endpoints")
@@ -327,8 +379,202 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
 
     acc.core.endpoint_slices.push(CoreEndpointSlice {
         service_key,
+        ports,
         endpoints,
     });
+}
+
+pub(super) fn secret_is_valid_tls_certificate(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .is_some_and(|secret| secret.valid_tls_certificate)
+}
+
+pub(super) fn secret_tls_material_digest<'a>(
+    acc: &'a K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> Option<&'a str> {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .and_then(|secret| secret.tls_material_digest.as_deref())
+}
+
+fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let Some(key) = K8sServiceKey::new(
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    ) else {
+        return;
+    };
+    let valid_tls_certificate = secret_object_is_valid_tls_certificate(object);
+    acc.core.secrets.insert(
+        key,
+        CoreSecret {
+            valid_tls_certificate,
+            tls_material_digest: valid_tls_certificate
+                .then(|| secret_tls_material_digest_for_object(object))
+                .flatten(),
+        },
+    );
+}
+
+fn secret_tls_material_digest_for_object(secret: &K8sObject) -> Option<String> {
+    let data = secret.spec.get("data").and_then(Value::as_object)?;
+    let cert = data.get("tls.crt").and_then(Value::as_str)?;
+    let key = data.get("tls.key").and_then(Value::as_str)?;
+    let mut digest = Sha256::new();
+    digest.update(cert.as_bytes());
+    digest.update([0]);
+    digest.update(key.as_bytes());
+    Some(hex::encode(digest.finalize()))
+}
+
+pub(crate) fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
+    if secret.spec.get("type").and_then(Value::as_str) != Some("kubernetes.io/tls") {
+        return false;
+    }
+    let Some(data) = secret.spec.get("data").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(cert) = data.get("tls.crt").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(key) = data.get("tls.key").and_then(Value::as_str) else {
+        return false;
+    };
+    secret_data_decodes_to_valid_tls_pair(cert, key)
+}
+
+fn secret_data_decodes_to_valid_tls_pair(cert_value: &str, key_value: &str) -> bool {
+    let Some(certs) = secret_data_decodes_to_certificate_chain(cert_value) else {
+        return false;
+    };
+    let Some(key) = secret_data_decodes_to_private_key(key_value) else {
+        return false;
+    };
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    rustls::sign::CertifiedKey::from_der(certs, key, &provider).is_ok()
+}
+
+fn secret_data_decodes_to_certificate_chain(
+    value: &str,
+) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
+            return None;
+        };
+        (!certs.is_empty()).then_some(certs)
+    })
+}
+
+fn secret_data_decodes_to_private_key(
+    value: &str,
+) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        rustls_pemfile::private_key(&mut reader).ok().flatten()
+    })
+}
+
+fn secret_data_decodes_to_bytes<T>(
+    value: &str,
+    predicate: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
+    use base64::Engine as _;
+
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        return None;
+    };
+    predicate(&bytes)
+}
+
+pub(super) fn endpoint_route_backends_for_service(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    weight: u32,
+) -> Vec<RouteBackend> {
+    if !acc.options.pod_discovery_enabled {
+        return Vec::new();
+    }
+    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), service_name.to_string())
+    else {
+        return Vec::new();
+    };
+    let Some(service) = acc.core.services.get(&service_key) else {
+        return Vec::new();
+    };
+    if service.has_selector && !service.cluster_ips.is_empty() {
+        return Vec::new();
+    }
+
+    let service_port_spec = service
+        .ports
+        .iter()
+        .find(|candidate| candidate.port == service_port);
+    let mut seen = BTreeSet::new();
+    let mut backends = Vec::new();
+    for slice in acc
+        .core
+        .endpoint_slices
+        .iter()
+        .filter(|slice| slice.service_key == service_key)
+    {
+        let Some(target_port) = endpoint_backend_port(service_port_spec, service_port, slice)
+        else {
+            continue;
+        };
+        for endpoint in slice.endpoints.iter().filter(|endpoint| endpoint.ready) {
+            for address in &endpoint.addresses {
+                if address.is_empty() {
+                    continue;
+                }
+                if seen.insert((address.clone(), target_port)) {
+                    backends.push(RouteBackend {
+                        host: address.clone(),
+                        port: target_port,
+                        weight,
+                    });
+                }
+            }
+        }
+    }
+    backends
+}
+
+fn endpoint_backend_port(
+    service_port_spec: Option<&ServicePort>,
+    service_port: u16,
+    slice: &CoreEndpointSlice,
+) -> Option<u16> {
+    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => Some(*port),
+        Some(ServiceTargetPort::Name(name)) => slice
+            .ports
+            .iter()
+            .find(|port| port.name.as_deref() == Some(name.as_str()))
+            .and_then(|port| port.port),
+        Some(ServiceTargetPort::Number(_)) => None,
+        None => {
+            if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref())
+                && let Some(port) = slice
+                    .ports
+                    .iter()
+                    .find(|port| port.name.as_deref() == Some(name))
+                    .and_then(|port| port.port)
+            {
+                return Some(port);
+            }
+            Some(service_port)
+        }
+    }
 }
 
 fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {

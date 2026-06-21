@@ -174,7 +174,7 @@ pub async fn start_admin_listener(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls(addr, state, shutdown, None).await
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None).await
 }
 
 /// Start the Admin API listener with optional TLS support.
@@ -184,8 +184,23 @@ pub async fn start_admin_listener_with_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
+}
+
+/// Start the Admin API listener with optional TLS support and signal readiness
+/// after the TCP socket binds successfully.
+pub async fn start_admin_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
     serve_admin_on_listener(listener, state, shutdown, tls_config).await
 }
 
@@ -201,8 +216,23 @@ pub async fn start_admin_listener_with_dynamic_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
 ) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_dynamic_tls_and_signal(addr, state, shutdown, tls_slot, None).await
+}
+
+/// Start the Admin API HTTPS listener with a hot-swappable frontend TLS slot
+/// and signal readiness after the TCP socket binds successfully.
+pub async fn start_admin_listener_with_dynamic_tls_and_signal(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
     serve_admin_on_listener_with_dynamic_tls(listener, state, shutdown, tls_slot).await
 }
 
@@ -2187,6 +2217,165 @@ impl PersistCounts {
     }
 }
 
+/// Reject a retry-enabled batch proxy whose `mesh_route_dispatch` rules route
+/// matched traffic to a mesh-tagged upstream (`mesh.hbone` / `mesh.mtls`) — the
+/// batch-import equivalent of the route-override conflict check in
+/// `Proxy::after_validate`.
+///
+/// The candidate plugin set mirrors the runtime plugin cache: the batch's own
+/// proxy-scoped/proxy_group `mesh_route_dispatch` instances the proxy attaches,
+/// plus enabled DB globals (excluded when a batch local instance shadows them by
+/// name). Override-destination upstreams resolve from the batch payload first,
+/// then the DB. Redirect rules and same-upstream rules that leave retry untouched
+/// are skipped (the latter is covered by the default-upstream check).
+async fn validate_batch_route_override_conflicts(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+    batch_upstreams: &std::collections::HashMap<&str, &crate::config::types::Upstream>,
+    batch_plugin_configs: &std::collections::HashMap<&str, &PluginConfig>,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+    validation_errors: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+
+    let attached_ids: HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+
+    // Proxy-scoped/proxy_group mesh_route_dispatch instances this proxy attaches,
+    // resolved from the batch payload first then the DB (a batch proxy can attach
+    // a pre-existing DB plugin). A local instance shadows DB globals of the same
+    // name.
+    let mut candidates: Vec<PluginConfig> = Vec::new();
+    let mut shadows_global = false;
+    for id in &attached_ids {
+        let pc = if let Some(pc) = batch_plugin_configs.get(*id) {
+            Some((*pc).clone())
+        } else {
+            match db.get_plugin_config(id).await? {
+                Some(pc) if pc.namespace == namespace => Some(pc),
+                _ => None,
+            }
+        };
+        if let Some(pc) = pc
+            && pc.enabled
+            && pc.plugin_name == "mesh_route_dispatch"
+        {
+            shadows_global = true;
+            candidates.push(pc);
+        }
+    }
+
+    if !shadows_global {
+        // A `scope=global` `mesh_route_dispatch` submitted IN THIS SAME BATCH needs
+        // no proxy association to run, and it is not yet in the DB — so the DB-global
+        // page below would miss it. Enumerate the batch's own enabled global
+        // dispatch plugins first (deduping by id against the DB fetch) so a batch
+        // that creates the whole conflicting graph (retry proxy + mesh upstream +
+        // global route override) is rejected before persist instead of 502ing.
+        let mut seen_global_ids: HashSet<String> = HashSet::new();
+        for pc in batch_plugin_configs.values() {
+            if pc.scope == PluginScope::Global
+                && pc.namespace == namespace
+                && pc.enabled
+                && pc.plugin_name == "mesh_route_dispatch"
+                && seen_global_ids.insert(pc.id.clone())
+            {
+                candidates.push((*pc).clone());
+            }
+        }
+        let mut offset = 0_i64;
+        const PAGE_SIZE: i64 = 1_000;
+        loop {
+            let page = db
+                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+                .await?;
+            let items_len = page.items.len() as i64;
+            for plugin in page.items {
+                if plugin.scope == PluginScope::Global
+                    && plugin.enabled
+                    && plugin.plugin_name == "mesh_route_dispatch"
+                    && seen_global_ids.insert(plugin.id.clone())
+                {
+                    candidates.push(plugin);
+                }
+            }
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
+        }
+    }
+
+    let default_uid = proxy.upstream_id.as_deref().unwrap_or("");
+    for pc in &candidates {
+        let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&pc.config) else {
+            continue;
+        };
+        for rule in &dispatch.rules {
+            if rule.redirect.is_some() {
+                continue;
+            }
+            let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
+                continue;
+            };
+            let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+            if override_uid == default_uid && !rule_changes_retry {
+                continue;
+            }
+            let effective_retry = if rule.retry.is_some() {
+                rule.retry.clone()
+            } else if rule.retry_disabled {
+                None
+            } else {
+                proxy.retry.clone()
+            };
+            // Runtime preserves `proxy.upstream_subset` only for a same-upstream
+            // rule; a different-upstream override drops it.
+            let selected_subset = if override_uid == default_uid {
+                proxy.upstream_subset.as_deref()
+            } else {
+                None
+            };
+            let resolved = if let Some(u) = batch_upstreams.get(override_uid) {
+                Some((*u).clone())
+            } else {
+                match db.get_upstream(override_uid).await {
+                    Ok(Some(u)) if u.namespace == namespace => Some(u),
+                    Ok(_) => None,
+                    Err(e) => return Err(e),
+                }
+            };
+            if let Some(upstream) = resolved
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
+                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &upstream,
+                        selected_subset,
+                        effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                        mesh_model,
+                    )
+            {
+                validation_errors.push(
+                    crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        override_uid,
+                        &conflict,
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
@@ -2992,6 +3181,9 @@ async fn handle_batch_create(
         upstreams: batch.upstreams.clone(),
         loaded_at: now,
         known_namespaces: Vec::new(),
+        mesh: state
+            .cached_gateway_config()
+            .and_then(|config| config.mesh.clone()),
         ..Default::default()
     };
 
@@ -3093,6 +3285,79 @@ async fn handle_batch_create(
             }
         }
 
+        // Reject a retry-enabled proxy whose selected default-upstream targets
+        // require a mesh transport (`mesh.hbone` / `mesh.mtls`): retry forces that
+        // transport off at runtime and the request 502s (issue #1669). The
+        // per-resource CRUD paths reject this, so the batch import must too rather
+        // than persist a config the next load rejects. The upstream is resolved
+        // from the batch payload first, then the DB. Route-dispatch override
+        // destinations are checked separately below
+        // (`validate_batch_route_override_conflicts`).
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            let resolved_upstream = if let Some(upstream) = batch_upstreams.get(upstream_id) {
+                Some((*upstream).clone())
+            } else {
+                match db.get_upstream(upstream_id).await {
+                    Ok(Some(upstream)) if upstream.namespace == namespace => Some(upstream),
+                    Ok(_) => None,
+                    Err(err) => {
+                        validation_errors.push(format!(
+                            "Proxy '{}' upstream mesh-transport check failed: {}",
+                            proxy.id, err
+                        ));
+                        None
+                    }
+                }
+            };
+            if let Some(upstream) = resolved_upstream
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
+                        // Per-resource batch proxies arrive without their
+                        // `#[serde(skip)]` `dispatch_port_overrides` resolved;
+                        // derive them from the referenced upstream so a
+                        // `maxRetries = 0` mesh-port cap is honored as the runtime
+                        // applies it.
+                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &upstream,
+                        proxy.upstream_subset.as_deref(),
+                        proxy.retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                        batch_config.mesh.as_deref(),
+                    )
+            {
+                validation_errors.push(
+                    crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        upstream_id,
+                        &conflict,
+                    ),
+                );
+            }
+        }
+
+        // Spec/route overrides: an enabled `mesh_route_dispatch` plugin in this
+        // batch (proxy-scoped/proxy_group association) or an existing DB global can
+        // route matched traffic to a mesh-tagged upstream even when the proxy's
+        // default upstream is plain — the same 502 path. The per-resource CRUD
+        // proxy write rejects this; the batch must too rather than persist a config
+        // the next config load rejects (which silently stalls applying the batch).
+        if let Err(err) = validate_batch_route_override_conflicts(
+            db.as_ref(),
+            namespace,
+            proxy,
+            &batch_upstreams,
+            &batch_plugin_configs,
+            batch_config.mesh.as_deref(),
+            &mut validation_errors,
+        )
+        .await
+        {
+            validation_errors.push(format!(
+                "Proxy '{}' route-override mesh-transport check failed: {}",
+                proxy.id, err
+            ));
+        }
+
         let mut unresolved = Vec::new();
 
         for assoc in &proxy.plugins {
@@ -3116,8 +3381,14 @@ async fn handle_batch_create(
                         }
                     }
                     PluginScope::ProxyGroup => {
-                        // ProxyGroup plugins have no proxy_id — any proxy can
-                        // reference them via its plugins association list.
+                        if plugin_config.proxy_id.is_some() {
+                            validation_errors.push(format!(
+                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                proxy.id,
+                                plugin_config.id,
+                                plugin_config.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
                 },
                 None => unresolved.push(assoc.clone()),
@@ -3441,6 +3712,9 @@ async fn handle_restore(
             upstreams: payload.upstreams.clone(),
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            mesh: state
+                .cached_gateway_config()
+                .and_then(|config| config.mesh.clone()),
             ..Default::default()
         };
         temp_config.normalize_fields();

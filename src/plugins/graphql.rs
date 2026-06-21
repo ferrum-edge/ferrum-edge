@@ -398,10 +398,20 @@ fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> ParsedQuery
         }
         None => {
             // The structured parser found no operation (e.g. a non-standard or
-            // unparseable body). Fall back to the legacy whole-document scan so
-            // we do not introduce false rejections; op_type comes from the
-            // leading keyword as before.
+            // unparseable body). The legacy whole-document scan is
+            // fragment-blind, so fail closed when fragment syntax is present
+            // rather than enforcing weaker depth/complexity limits.
             let trimmed = trim_leading_ignored(query);
+            if !fragments.is_empty() || contains_fragment_syntax(trimmed) {
+                return ParsedQuery::Reject {
+                    status_code: 400,
+                    message: "Query contains fragments but could not be structurally analyzed"
+                        .to_string(),
+                };
+            }
+            // Otherwise fall back to the legacy whole-document scan so we do
+            // not introduce false rejections for fragment-free non-standard
+            // bodies; op_type comes from the leading keyword as before.
             let op_type = if strip_operation_keyword(trimmed, "mutation").is_some() {
                 "mutation"
             } else if strip_operation_keyword(trimmed, "subscription").is_some() {
@@ -963,6 +973,38 @@ fn strip_operation_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str>
         return None;
     }
     Some(rest)
+}
+
+fn contains_fragment_syntax(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'#' => {
+                i = skip_line_comment(bytes, i);
+            }
+            b'"' => {
+                i = skip_string(bytes, i);
+            }
+            b'.' if i + 2 < len && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' => {
+                return true;
+            }
+            c if is_graphql_name_start(c) => {
+                let (ident, after_ident) = read_name(bytes, i);
+                if ident == "fragment" {
+                    return true;
+                }
+                i = after_ident;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    false
 }
 
 /// Analyze a GraphQL query string for depth, complexity, and alias count.

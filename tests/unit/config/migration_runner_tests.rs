@@ -36,6 +36,7 @@ const EXPECTED_INDEX_NAMES: &[&str] = &[
     "idx_consumers_ns_updated",
     "idx_plugin_configs_ns_updated",
     "idx_upstreams_ns_updated",
+    "idx_audit_events_namespace_ts_id",
     // Covering indexes for the incremental-poll deletion diff.
     "idx_proxies_ns_id",
     "idx_consumers_ns_id",
@@ -70,6 +71,69 @@ async fn test_migration_runner_fresh_database() {
             index_names
         );
     }
+}
+
+/// Returns true if a table with the given name exists in the SQLite database.
+async fn table_exists(pool: &sqlx::AnyPool, table: &str) -> bool {
+    let rows: Vec<sqlx::any::AnyRow> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    !rows.is_empty()
+}
+
+/// Regression test for the route-lock compatibility pass.
+///
+/// `proxy_route_locks` was folded into the V001 baseline after databases could
+/// already have V001 recorded in `_ferrum_migrations`. The migration loop skips
+/// V001 once version 1 is tracked, so without an idempotent compatibility pass
+/// the table would never be created on those databases — and the proxy
+/// persistence path writes to it on every create/update/batch/API-spec write,
+/// so each write would fail with a missing-table error.
+///
+/// This simulates such a database by applying V001, dropping `proxy_route_locks`
+/// (leaving the V001 record intact, exactly as a pre-fold database looks), then
+/// re-running `run_pending()` and asserting the table is restored and writable.
+#[tokio::test]
+async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    // Fresh apply records V001 and creates proxy_route_locks.
+    runner.run_pending().await.unwrap();
+    assert!(table_exists(&pool, "proxy_route_locks").await);
+
+    // Simulate a database that recorded V001 *before* proxy_route_locks was
+    // folded in: the V001 record stays, but the table is gone.
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!table_exists(&pool, "proxy_route_locks").await);
+
+    // The migration loop skips already-tracked V001, but the idempotent
+    // compatibility pass must recreate the table.
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "V001 is already tracked, so no migration should be newly applied"
+    );
+    assert!(
+        table_exists(&pool, "proxy_route_locks").await,
+        "run_pending must restore proxy_route_locks on an existing V001 database"
+    );
+
+    // The restored table must accept the route-lock insert the persistence
+    // path performs.
+    sqlx::query(
+        "INSERT INTO proxy_route_locks (namespace, route_key_hash, created_at) \
+         VALUES ('ferrum', 'deadbeef', '2025-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("restored proxy_route_locks must be writable");
 }
 
 /// The incremental-poll deletion diff runs `SELECT id ... WHERE namespace = ?`

@@ -66,6 +66,131 @@ async fn test_plugin_name_and_priority() {
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
+#[test]
+fn test_response_buffering_is_narrowed_by_response_content_type() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let ctx = ctx_with_content_type("GET", "application/json");
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new()));
+}
+
+#[test]
+fn test_streaming_response_buffering_requires_explicit_opt_in() {
+    let default_plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let opt_in_plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let ctx = ctx_with_content_type("POST", "application/json");
+
+    assert!(
+        !default_plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &HashMap::new()
+        )
+    );
+    assert!(opt_in_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+}
+
+// The pre-header `should_buffer_response_body` decision drives every backend
+// dispatch path — including the retry, native-gRPC, and HTTP/3-backend paths
+// that never consult the header-time content-type refinement. These tests pin
+// the request-shape gating that keeps those paths streaming (PR #1751 follow-up).
+
+#[test]
+fn test_pre_header_decision_streams_sse_accept_requests() {
+    let default_plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let opt_in_plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    // A client asking for a stream must not be buffered by default, even on the
+    // retry / gRPC / H3-backend paths that skip the content-type refinement.
+    assert!(!default_plugin.should_buffer_response_body(&ctx));
+    // Opt-in restores buffering for operators who want streamed token metrics.
+    assert!(opt_in_plugin.should_buffer_response_body(&ctx));
+}
+
+#[test]
+fn test_pre_header_decision_streams_request_streaming_marker() {
+    let default_plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let opt_in_plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+
+    // A `stream: true` request flagged by an earlier AI plugin must not be
+    // buffered by default.
+    assert!(!default_plugin.should_buffer_response_body(&ctx));
+    assert!(opt_in_plugin.should_buffer_response_body(&ctx));
+}
+
+#[test]
+fn test_pre_header_decision_never_buffers_native_grpc() {
+    let default_plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let opt_in_plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+
+    // Native gRPC is never buffered (this plugin only parses JSON/SSE bodies),
+    // regardless of the streaming opt-in.
+    let grpc = ctx_with_content_type("POST", "application/grpc");
+    assert!(!default_plugin.should_buffer_response_body(&grpc));
+    assert!(!opt_in_plugin.should_buffer_response_body(&grpc));
+
+    let grpc_proto = ctx_with_content_type("POST", "application/grpc+proto");
+    assert!(!default_plugin.should_buffer_response_body(&grpc_proto));
+
+    // gRPC-Web is NOT native gRPC and stays on the normal (buffered) path.
+    let grpc_web = ctx_with_content_type("POST", "application/grpc-web");
+    assert!(default_plugin.should_buffer_response_body(&grpc_web));
+
+    // Bogus suffixes that share the `application/grpc` prefix but are NOT native
+    // gRPC (the dispatcher routes these as plain HTTP via the canonical
+    // delimiter-aware classifier). They must stay on the buffered path so a JSON
+    // LLM response from a tolerant upstream is still parsed for token usage; a
+    // naive prefix check would wrongly opt them out of buffering.
+    let grpc_foo = ctx_with_content_type("POST", "application/grpcfoo");
+    assert!(default_plugin.should_buffer_response_body(&grpc_foo));
+    let grpc_evil = ctx_with_content_type("POST", "application/grpc-evil");
+    assert!(default_plugin.should_buffer_response_body(&grpc_evil));
+}
+
+#[test]
+fn test_pre_header_decision_buffers_plain_json_requests() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+
+    // A normal (non-streaming, non-gRPC) request keeps buffering so JSON token
+    // accounting still works on every dispatch path.
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+    assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
+}
+
 // ─── OpenAI format ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -659,6 +784,10 @@ fn test_invalid_config_shapes_rejected() {
         (
             json!({"include_token_details": "yes"}),
             "include_token_details",
+        ),
+        (
+            json!({"buffer_streaming_responses": "yes"}),
+            "buffer_streaming_responses",
         ),
         (json!({"metadata_prefix": ""}), "metadata_prefix"),
         (

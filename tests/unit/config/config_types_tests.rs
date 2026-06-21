@@ -1,11 +1,14 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
-    LocalityPreference, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
+    LocalityPreference, MeshSdConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
+    ResolvedPortOverride, ResolvedSubsetTrafficPolicy, RetryConfig, SdProvider,
+    ServiceDiscoveryConfig, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
     validate_host_entry, validate_resource_id, wildcard_matches,
 };
-use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshConfig, MeshService, MeshTracingConfig, ServicePort, TracingProvider,
+};
 use std::collections::HashMap;
 
 /// Helper to create a minimal proxy with required fields.
@@ -32,6 +35,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -94,6 +98,7 @@ fn make_upstream(id: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "localhost".into(),
             port: 3000,
+            service_port_policy_key: None,
             weight: 100,
             tags: HashMap::new(),
             locality: None,
@@ -116,10 +121,42 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+#[test]
+fn upstream_target_service_port_policy_key_is_derived_not_serialized() {
+    let target = UpstreamTarget {
+        host: "10.0.0.1".to_string(),
+        port: 8080,
+        service_port_policy_key: Some(80),
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+
+    let serialized = serde_json::to_value(&target).expect("serialize target");
+    assert!(
+        serialized.get("service_port_policy_key").is_none(),
+        "derived policy key must not be emitted into config JSON"
+    );
+
+    let deserialized: UpstreamTarget = serde_json::from_value(serde_json::json!({
+        "host": "10.0.0.1",
+        "port": 8080,
+        "service_port_policy_key": 80,
+        "weight": 1
+    }))
+    .expect("deserialize target");
+    assert!(
+        deserialized.service_port_policy_key.is_none(),
+        "config JSON must not be able to set the derived policy key"
+    );
 }
 
 #[test]
@@ -410,6 +447,40 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
         ResolvedPortOverride::from_upstream_override(&empty).is_none(),
         "empty overlay must collapse to None"
     );
+}
+
+#[test]
+fn seed_connection_pool_http_from_fallback_merges_field_by_field() {
+    use ferrum_edge::config::types::ResolvedPortOverride;
+
+    // Per-port entry sets connectTimeout + one connectionPool.http field; the
+    // remaining http fields must be inherited from the SD top-level fallback and
+    // the per-port-set field must win. Non-http fields are untouched. This is the
+    // exact field-merge `resolve_effective_proxy_for_target` performs for an SD
+    // upstream (#1806 codex r1 finding 3).
+    let mut per_port = ResolvedPortOverride {
+        connect_timeout_ms: Some(750),
+        h2_max_concurrent_streams: Some(10),
+        ..ResolvedPortOverride::default()
+    };
+    let fallback = ResolvedPortOverride {
+        h2_max_concurrent_streams: Some(64),
+        http_idle_timeout_ms: Some(120_000),
+        max_retries: Some(2),
+        http1_max_pending_requests: Some(32),
+        ..ResolvedPortOverride::default()
+    };
+
+    per_port.seed_connection_pool_http_from_fallback(&fallback);
+
+    // Per-port field wins.
+    assert_eq!(per_port.h2_max_concurrent_streams, Some(10));
+    // Unset http fields inherited from the fallback.
+    assert_eq!(per_port.http_idle_timeout_ms, Some(120_000));
+    assert_eq!(per_port.max_retries, Some(2));
+    assert_eq!(per_port.http1_max_pending_requests, Some(32));
+    // Non-connectionPool.http field untouched (fallback never carries it).
+    assert_eq!(per_port.connect_timeout_ms, Some(750));
 }
 
 #[test]
@@ -867,6 +938,7 @@ fn test_unique_listen_paths_valid() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -926,6 +998,7 @@ fn test_unique_listen_paths_valid() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -1001,6 +1074,7 @@ fn test_unique_listen_paths_duplicate() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -1060,6 +1134,7 @@ fn test_unique_listen_paths_duplicate() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -1638,6 +1713,551 @@ fn test_upstream_references_none_ok() {
     assert!(config.validate_upstream_references().is_ok());
 }
 
+#[test]
+fn retry_proxy_rejects_required_mesh_transport_upstream_targets() {
+    for tag in ["mesh.hbone", "mesh.mtls"] {
+        let mut upstream = make_upstream("mesh-upstream");
+        upstream.targets[0]
+            .tags
+            .insert(tag.to_string(), "true".to_string());
+        let mut proxy = make_proxy("p1", "/api");
+        proxy.upstream_id = Some("mesh-upstream".into());
+        proxy.retry = Some(RetryConfig::default());
+        let mut config = empty_config();
+        config.upstreams = vec![upstream];
+        config.proxies = vec![proxy];
+
+        let err = config.validate_upstream_references().unwrap_err();
+        assert!(
+            err.iter()
+                .any(|msg| msg.contains("enables retry") && msg.contains(tag)),
+            "expected retry/{tag} conflict, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
+    let mut upstream = make_upstream("mixed-upstream");
+    upstream.targets = vec![
+        UpstreamTarget {
+            host: "plain.local".into(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: HashMap::from([("version".to_string(), "plain".to_string())]),
+            locality: None,
+            path: None,
+        },
+        UpstreamTarget {
+            host: "mesh.local".into(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: HashMap::from([
+                ("version".to_string(), "mesh".to_string()),
+                ("mesh.hbone".to_string(), "true".to_string()),
+            ]),
+            locality: None,
+            path: None,
+        },
+    ];
+    upstream.subsets = Some(vec![ferrum_edge::config::types::SubsetDefinition {
+        name: "plain".to_string(),
+        labels: HashMap::from([("version".to_string(), "plain".to_string())]),
+        traffic_policy: None,
+    }]);
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mixed-upstream".into());
+    proxy.upstream_subset = Some("plain".into());
+    proxy.retry = Some(RetryConfig::default());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(config.validate_upstream_references().is_ok());
+}
+
+#[test]
+fn retry_proxy_rejects_boolish_truthy_mesh_transport_tags() {
+    // Runtime treats `1`/`yes`/`on` as truthy for mesh.hbone/mesh.mtls, so the
+    // validator must too (otherwise these pass admission then 502 at runtime).
+    for value in ["1", "yes", "YES", "on", "True"] {
+        let mut upstream = make_upstream("mesh-upstream");
+        upstream.targets[0]
+            .tags
+            .insert("mesh.hbone".to_string(), value.to_string());
+        let mut proxy = make_proxy("p1", "/api");
+        proxy.upstream_id = Some("mesh-upstream".into());
+        proxy.retry = Some(RetryConfig::default());
+        let mut config = empty_config();
+        config.upstreams = vec![upstream];
+        config.proxies = vec![proxy];
+
+        let err = config.validate_upstream_references().unwrap_err();
+        assert!(
+            err.iter()
+                .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
+            "expected retry/mesh.hbone conflict for tag value {value:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn retry_proxy_rejects_mesh_service_discovery_upstream() {
+    // Mesh service-discovery upstreams have empty static targets at admission
+    // but later publish HBONE-required targets, so retry conflicts even though
+    // no static target carries a mesh tag.
+    let mut upstream = make_upstream("mesh-sd-upstream");
+    upstream.targets.clear();
+    upstream.service_discovery = Some(ferrum_edge::config::types::ServiceDiscoveryConfig {
+        provider: ferrum_edge::config::types::SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(ferrum_edge::config::types::MeshSdConfig {
+            service_name: "reviews".to_string(),
+            namespace: None,
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-sd-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
+        "expected retry/mesh service-discovery conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_mesh_route_dispatch_override_upstream() {
+    // A plain default upstream but a mesh_route_dispatch rule that overrides the
+    // upstream to a mesh-tagged one must be rejected: matched requests would
+    // 502 at runtime.
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let dispatch = PluginConfig {
+        id: "route-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "route-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![dispatch];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected retry/route-override conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_mesh_target_when_status_retries_miss_allowed_methods() {
+    // Status-code retries that only apply to methods this proxy cannot serve can
+    // never trigger at runtime, so they must not block a mesh-tagged upstream.
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.allowed_methods = Some(vec!["GET".to_string()]);
+    proxy.retry = Some(RetryConfig {
+        max_retries: 3,
+        retryable_status_codes: vec![503],
+        retryable_methods: vec!["POST".to_string()],
+        retry_on_connect_failure: false,
+        ..RetryConfig::default()
+    });
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "status retries for non-served methods should not block mesh targets"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_mesh_target_when_status_retries_hit_allowed_methods() {
+    // The same config but with an overlapping method (GET) is rejected.
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.allowed_methods = Some(vec!["GET".to_string()]);
+    proxy.retry = Some(RetryConfig {
+        max_retries: 3,
+        retryable_status_codes: vec![503],
+        retryable_methods: vec!["GET".to_string()],
+        retry_on_connect_failure: false,
+        ..RetryConfig::default()
+    });
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
+        "expected retry/mesh conflict when status retries overlap allowed_methods, got {err:?}"
+    );
+}
+
+fn mesh_target(host: &str, port: u16) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.into(),
+        port,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: HashMap::from([("mesh.hbone".to_string(), "true".to_string())]),
+        locality: None,
+        path: None,
+    }
+}
+
+#[test]
+fn retry_proxy_rejects_when_a_later_mesh_target_port_escapes_the_cap() {
+    // The LB can select ANY mesh target. Capping retry to 0 on the FIRST mesh
+    // target's port but leaving a second mesh target's port uncapped still 502s
+    // when the LB picks the second, so the conflict must be reported.
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets = vec![mesh_target("a.local", 8080), mesh_target("b.local", 9090)];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    // Cap only the first target's port (8080) to zero.
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        8080_u16,
+        ResolvedPortOverride {
+            max_retries: Some(0),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("9090")),
+        "expected conflict from the uncapped mesh target on port 9090, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_when_every_mesh_target_port_is_capped_to_zero() {
+    // When every selectable mesh target's port zeroes retry, runtime never
+    // engages retry on any of them, so HBONE dispatch is preserved end-to-end.
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets = vec![mesh_target("a.local", 8080), mesh_target("b.local", 9090)];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    let zero = || ResolvedPortOverride {
+        max_retries: Some(0),
+        ..ResolvedPortOverride::default()
+    };
+    proxy.dispatch_port_overrides = Some(HashMap::from([(8080_u16, zero()), (9090_u16, zero())]));
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "every mesh target's retry is capped to zero; no 502 path remains"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_mesh_target_when_policy_port_cap_zeroes_retry() {
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets = vec![mesh_target("a.local", 8080)];
+    upstream.targets[0].service_port_policy_key = Some(80);
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        80_u16,
+        ResolvedPortOverride {
+            max_retries: Some(0),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "the static target dials 8080 but retry is capped by declared Service port 80"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_mesh_service_discovery_when_selected_policy_port_caps_retry() {
+    let namespace = ferrum_edge::config::types::default_namespace();
+    let mut upstream = make_upstream("mesh-sd-upstream");
+    upstream.targets.clear();
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "reviews".into(),
+            namespace: None,
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-sd-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        80_u16,
+        ResolvedPortOverride {
+            max_retries: Some(0),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    let mut config = empty_config();
+    config.mesh = Some(Box::new(MeshConfig {
+        services: vec![MeshService {
+            name: "reviews".into(),
+            namespace,
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".into()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    }));
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "omitted mesh.port selects Service port 80, whose cap disarms retry before HBONE dispatch"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_same_upstream_dispatch_rule_that_adds_retry() {
+    // Base proxy has NO retry, but a mesh_route_dispatch rule pointing at the
+    // SAME (mesh-tagged) default upstream adds its own retry. Runtime applies
+    // that rule retry via `route_override_retry` before dispatch, so those
+    // matched requests 502 — the same-upstream rule must be evaluated.
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let dispatch = PluginConfig {
+        id: "route-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                {
+                    "match": {},
+                    "destination": { "upstream_id": "mesh-upstream" },
+                    "retry": { "max_retries": 3 }
+                }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = None;
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "route-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![dispatch];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected same-upstream rule-added-retry conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
+    // A global mesh_route_dispatch routes to a mesh upstream, but the proxy
+    // attaches its OWN mesh_route_dispatch (which shadows the global of the same
+    // name in PluginCache). The global never runs for this proxy, so its rule
+    // must not trigger a spurious rejection.
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let global_dispatch = PluginConfig {
+        id: "global-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    // Local instance that shadows the global; routes only to the plain upstream.
+    let local_dispatch = PluginConfig {
+        id: "local-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "plain-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "local-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![global_dispatch, local_dispatch];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "shadowed global dispatch must not trigger a retry/mesh rejection"
+    );
+}
+
+#[test]
+fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
+    // Control for the shadow test: with NO local dispatch, the global rule does
+    // apply and the conflict must be reported.
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let global_dispatch = PluginConfig {
+        id: "global-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![global_dispatch];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected unshadowed global dispatch conflict, got {err:?}"
+    );
+}
+
 // ---- priority_override validation tests ----
 
 #[test]
@@ -2168,8 +2788,8 @@ fn test_wildcard_does_not_match_base_domain() {
 }
 
 #[test]
-fn test_wildcard_does_not_match_multi_level() {
-    assert!(!wildcard_matches("*.example.com", "a.b.example.com"));
+fn test_wildcard_matches_multi_level() {
+    assert!(wildcard_matches("*.example.com", "a.b.example.com"));
 }
 
 #[test]
@@ -2248,6 +2868,21 @@ fn test_unique_listen_paths_same_path_overlapping_hosts() {
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Overlapping"));
+}
+
+#[test]
+fn test_unique_listen_paths_allows_same_host_path_in_different_namespaces() {
+    let mut tenant_a = make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]);
+    tenant_b.namespace = "tenant-b".to_string();
+    let mut config = empty_config();
+    config.proxies = vec![tenant_a, tenant_b];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "proxy listen_path uniqueness is namespace-scoped"
+    );
 }
 
 /// Mesh block for the sibling-exemption tests: one service per entry,
@@ -2447,6 +3082,20 @@ fn test_unique_listen_paths_catchall_vs_specific_host() {
     ];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert_eq!(err.len(), 1);
+}
+
+#[test]
+fn test_unique_listen_paths_allows_exact_host_over_wildcard_same_path() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("exact", "/api", vec!["foo.example.com"]),
+        make_proxy_with_hosts("wildcard", "/api", vec!["*.example.com"]),
+    ];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "router checks exact host routes before wildcard routes, so this overlap is deterministic"
+    );
 }
 
 #[test]
@@ -2962,26 +3611,11 @@ fn test_validate_namespace_rejects_bad_chars() {
     }
 }
 
-// The in-memory validators `validate_unique_listen_paths` and
-// `validate_stream_proxies` operate on a GatewayConfig that has ALREADY been
-// filtered to a single namespace (by `FERRUM_NAMESPACE` in file mode, by
-// `WHERE namespace = ?` SQL in DB mode, or by `FERRUM_NAMESPACE` scoping of
-// the CP's own load path). They therefore treat listen_path and listen_port
-// as globally unique — there is no namespace awareness here, and that is by
-// design. Per-namespace uniqueness is enforced at admission time by the
-// admin API (`check_listen_port_unique(namespace, ..)`,
-// `check_proxy_name_unique(..)`, etc. in `src/config/db_backend.rs`) and by
-// UNIQUE indexes on `(namespace, ..)` in `v001_initial_schema.rs`. The
-// functional namespace suite in `tests/functional/functional_namespace_test.rs`
-// covers that admission-layer behavior end-to-end.
+// The in-memory validators keep proxy uniqueness namespace-scoped. This
+// matches the admission-layer and storage invariants, where listen paths and
+// ports are unique within a namespace but can be reused by another namespace.
 #[test]
-fn test_listen_path_validator_is_single_namespace_post_filter() {
-    // Two proxies with the same listen_path — the validator flags the
-    // conflict regardless of the namespace field on each proxy, confirming
-    // this validator does not do namespace grouping. If you're here because
-    // this test failed, either namespace-aware validation was just added
-    // (update the test to assert cross-namespace Ok) or a regression
-    // silently dropped the conflict detection (fix the validator).
+fn test_listen_path_validator_is_namespace_scoped() {
     let mut a = make_proxy("p-a", "/shared");
     a.namespace = "prod".to_string();
     let mut b = make_proxy("p-b", "/shared");
@@ -2992,8 +3626,8 @@ fn test_listen_path_validator_is_single_namespace_post_filter() {
         ..Default::default()
     };
     assert!(
-        config.validate_unique_listen_paths().is_err(),
-        "validator currently flags duplicate listen_path globally — see comment"
+        config.validate_unique_listen_paths().is_ok(),
+        "duplicate listen_path values in different namespaces should be allowed"
     );
 }
 

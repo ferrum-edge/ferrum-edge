@@ -1,6 +1,7 @@
 //! Prometheus helpers for Istio/GAMMA-style mesh metrics.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +35,15 @@ static MESH_FEDERATION_POLL_FAILURES: LazyLock<DashMap<MeshFederationPollFailure
     LazyLock::new(DashMap::new);
 static MESH_FEDERATION_LAST_SUCCESS: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
+static MESH_REMOTE_DISCOVERY_POLL_FAILURES: LazyLock<
+    DashMap<MeshRemoteDiscoveryPollFailureKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
+static MESH_REMOTE_DISCOVERY_POLL_SUCCESSES: LazyLock<
+    DashMap<MeshRemoteDiscoveryPollSuccessKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
+static MESH_REMOTE_DISCOVERY_LAST_SUCCESS: LazyLock<
+    DashMap<MeshRemoteDiscoveryPollSuccessKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
@@ -91,6 +101,19 @@ struct MeshMtlsHandshakeFailureKey {
 struct MeshFederationPollFailureKey {
     trust_domain: Arc<str>,
     endpoint: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshRemoteDiscoveryPollFailureKey {
+    cluster: Arc<str>,
+    trust_domain: Arc<str>,
+    control_plane: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshRemoteDiscoveryPollSuccessKey {
+    cluster: Arc<str>,
+    trust_domain: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -281,6 +304,97 @@ pub fn record_mesh_federation_poll_success(
         .store(fetched_at_unix_seconds, Ordering::Relaxed);
 }
 
+pub fn increment_mesh_remote_discovery_poll_failure(
+    cluster: impl AsRef<str>,
+    trust_domain: impl AsRef<str>,
+    control_plane: impl AsRef<str>,
+) {
+    let key = MeshRemoteDiscoveryPollFailureKey {
+        cluster: Arc::from(cluster.as_ref()),
+        trust_domain: Arc::from(trust_domain.as_ref()),
+        control_plane: Arc::from(redact_control_plane_label(control_plane.as_ref()).as_str()),
+    };
+    MESH_REMOTE_DISCOVERY_POLL_FAILURES
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Strip the query and fragment from a control-plane URL before it becomes the
+/// `control_plane` metric label.
+///
+/// `/metrics` is unauthenticated, and operators frequently copy-paste a
+/// control-plane URL with credential-like query parameters (`?token=...`).
+/// `sanitize_url_for_logging` (the caller's pre-pass) removes userinfo but keeps
+/// the path/query, so the secret must be dropped here, at the metric store site,
+/// before it is ever rendered. Scheme / host / port / path are preserved so the
+/// label still identifies the endpoint. Parsing keeps any leading userinfo
+/// stripped as a defense-in-depth backstop even if an un-sanitized URL reaches
+/// this path. Unparseable input falls back to truncating at the first `?`/`#`
+/// after the authority so no query/fragment text can leak.
+fn redact_control_plane_label(control_plane: &str) -> String {
+    match url::Url::parse(control_plane) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            // Defense-in-depth: drop any userinfo that slipped past the caller's
+            // sanitizer. `set_username`/`set_password` only error for URLs that
+            // cannot bear userinfo (e.g. cannot-be-a-base), which is harmless.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => {
+            // Cut at the first query/fragment delimiter so credential-bearing
+            // segments never survive even when the URL does not parse.
+            let cut = control_plane
+                .find(['?', '#'])
+                .unwrap_or(control_plane.len());
+            control_plane[..cut].to_string()
+        }
+    }
+}
+
+pub fn record_mesh_remote_discovery_poll_success(
+    cluster: impl AsRef<str>,
+    trust_domain: impl AsRef<str>,
+    fetched_at_unix_seconds: u64,
+) {
+    let key = MeshRemoteDiscoveryPollSuccessKey {
+        cluster: Arc::from(cluster.as_ref()),
+        trust_domain: Arc::from(trust_domain.as_ref()),
+    };
+    MESH_REMOTE_DISCOVERY_POLL_SUCCESSES
+        .entry(key.clone())
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+    MESH_REMOTE_DISCOVERY_LAST_SUCCESS
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(fetched_at_unix_seconds, Ordering::Relaxed);
+}
+
+/// Drop the remote-discovery success / last-success / endpoint-age series for a
+/// cluster once it is removed or becomes ineligible.
+///
+/// Removing a cluster from `RemoteEndpointStore` clears its cached endpoints but
+/// leaves the success counter and the last-success gauge (plus the derived
+/// `endpoint_age_seconds`) on the unauthenticated `/metrics` output, where they
+/// would keep advertising a freshly-polled, endpoint-less cluster and could fire
+/// stale alerts after a normal config/trust change. The success-counter and
+/// last-success maps are keyed identically, so a single key prunes both.
+pub fn clear_mesh_remote_discovery_metrics(
+    cluster: impl AsRef<str>,
+    trust_domain: impl AsRef<str>,
+) {
+    let key = MeshRemoteDiscoveryPollSuccessKey {
+        cluster: Arc::from(cluster.as_ref()),
+        trust_domain: Arc::from(trust_domain.as_ref()),
+    };
+    MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.remove(&key);
+    MESH_REMOTE_DISCOVERY_LAST_SUCCESS.remove(&key);
+}
+
 pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
     let key = MeshMtlsHandshakeFailureKey {
         reason: Arc::from(reason.as_ref()),
@@ -467,6 +581,63 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         }
     }
 
+    if !MESH_REMOTE_DISCOVERY_POLL_FAILURES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_poll_failures_total Remote-cluster endpoint discovery poll failures.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter\n");
+        for entry in MESH_REMOTE_DISCOVERY_POLL_FAILURES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\",control_plane=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().cluster),
+                escape_label_value(&entry.key().trust_domain),
+                escape_label_value(&entry.key().control_plane),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_poll_successes_total Successful remote-cluster endpoint discovery polls.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_successes_total counter\n");
+        for entry in MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().cluster),
+                escape_label_value(&entry.key().trust_domain),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_REMOTE_DISCOVERY_LAST_SUCCESS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_last_success_timestamp_seconds Unix timestamp of last successful remote-cluster endpoint discovery poll.\n",
+        );
+        output
+            .push_str("# TYPE ferrum_mesh_remote_discovery_last_success_timestamp_seconds gauge\n");
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_endpoint_age_seconds Age of the cached remote-cluster endpoints, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_endpoint_age_seconds gauge\n");
+        for entry in MESH_REMOTE_DISCOVERY_LAST_SUCCESS.iter() {
+            let last = entry.value().load(Ordering::Relaxed);
+            let cluster = escape_label_value(&entry.key().cluster);
+            let trust_domain = escape_label_value(&entry.key().trust_domain);
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                cluster, trust_domain, last
+            ));
+            let age = now.saturating_sub(last);
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                cluster, trust_domain, age
+            ));
+        }
+    }
+
     let xds_streams_rejected = XDS_STREAMS_REJECTED.load(Ordering::Relaxed);
     if xds_streams_rejected > 0 {
         output.push_str(
@@ -571,7 +742,8 @@ const MESH_LABEL_INTERN_CAP: usize = 4096;
 /// Process-wide intern pool that turns repeated mesh-label `&str` values into a
 /// shared `Arc<str>` so [`mesh_request_key`] can clone (atomic increment)
 /// instead of heap-allocating a fresh `Arc` per field on every call.
-static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> = LazyLock::new(DashMap::new);
+static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> =
+    LazyLock::new(|| DashMap::with_shard_amount(super::observability_shard_amount()));
 static MESH_LABEL_INTERN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Intern a mesh label value into a shared `Arc<str>`.
@@ -732,35 +904,46 @@ pub fn render_mesh_histogram(
     key: &MeshRequestKey,
     histogram: &HistogramBuckets,
 ) {
+    let base_labels = mesh_label_base_fragment(key);
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let le = boundary.to_string();
-        let labels = mesh_label_fragment(key, Some(&le));
         let count = histogram.counts[i].load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "ferrum_mesh_request_duration_ms_bucket{{{}}} {}\n",
-            labels, count
-        ));
+        let _ = writeln!(
+            output,
+            "ferrum_mesh_request_duration_ms_bucket{{{},le=\"{}\"}} {}",
+            base_labels, boundary, count
+        );
     }
     let total_count = histogram.count.load(Ordering::Relaxed);
-    let labels = mesh_label_fragment(key, Some("+Inf"));
-    output.push_str(&format!(
-        "ferrum_mesh_request_duration_ms_bucket{{{}}} {}\n",
-        labels, total_count
-    ));
-    let labels = mesh_label_fragment(key, None);
+    let _ = writeln!(
+        output,
+        "ferrum_mesh_request_duration_ms_bucket{{{},le=\"+Inf\"}} {}",
+        base_labels, total_count
+    );
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
-    output.push_str(&format!(
-        "ferrum_mesh_request_duration_ms_sum{{{}}} {:.2}\n",
-        labels, sum
-    ));
-    output.push_str(&format!(
-        "ferrum_mesh_request_duration_ms_count{{{}}} {}\n",
-        labels, total_count
-    ));
+    let _ = writeln!(
+        output,
+        "ferrum_mesh_request_duration_ms_sum{{{}}} {:.2}",
+        base_labels, sum
+    );
+    let _ = writeln!(
+        output,
+        "ferrum_mesh_request_duration_ms_count{{{}}} {}",
+        base_labels, total_count
+    );
 }
 
 pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
-    let mut labels = format!(
+    let mut labels = mesh_label_base_fragment(key);
+    if let Some(le) = le {
+        let _ = write!(labels, ",le=\"{}\"", le);
+    }
+    labels
+}
+
+fn mesh_label_base_fragment(key: &MeshRequestKey) -> String {
+    let mut labels = String::with_capacity(512);
+    let _ = write!(
+        labels,
         "source_workload=\"{}\",source_namespace=\"{}\",source_principal=\"{}\",source_app=\"{}\",source_service=\"{}\",destination_workload=\"{}\",destination_namespace=\"{}\",destination_principal=\"{}\",destination_app=\"{}\",destination_service=\"{}\",request_protocol=\"{}\",response_code=\"{}\",response_flags=\"{}\",connection_security_policy=\"{}\"",
         escape_label_value(&key.source_workload),
         escape_label_value(&key.source_namespace),
@@ -777,9 +960,6 @@ pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
         escape_label_value(&key.response_flags),
         escape_label_value(&key.connection_security_policy)
     );
-    if let Some(le) = le {
-        labels.push_str(&format!(",le=\"{}\"", le));
-    }
     labels
 }
 
@@ -837,7 +1017,13 @@ mod tests {
             now.saturating_sub(1),
             now,
         );
-        MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS.store(0, Ordering::Relaxed);
+        // Evict deterministically rather than via `render`'s throttle-gated
+        // path: the throttle (`MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS`) is a
+        // shared global, so a concurrent test's `render` could consume the
+        // interval and make this render skip eviction. Calling the eviction
+        // directly isolates this test from that cross-test race while still
+        // exercising the real staleness predicate.
+        evict_stale_mesh_cert_expiry_series(now);
 
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
@@ -900,6 +1086,162 @@ mod tests {
                 "ferrum_xds_warming_partial_applies_total{{namespace=\"{namespace}\"}} 1"
             )),
             "warming partial-apply counter series missing: {output}"
+        );
+    }
+
+    #[test]
+    fn render_emits_remote_discovery_poll_metrics() {
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("remote-{suffix}");
+        let trust_domain = format!("td-{suffix}.example");
+        let control_plane = format!("https://remote-{suffix}.example:9443");
+        // The store-site redaction normalizes through `url::Url`, which appends
+        // a canonical trailing-slash path for an authority-only URL.
+        let expected_label = format!("https://remote-{suffix}.example:9443/");
+        let fetched_at = unix_now_seconds().saturating_sub(5);
+
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
+        record_mesh_remote_discovery_poll_success(&cluster, &trust_domain, fetched_at);
+
+        let mut output = String::new();
+        render_mesh_observability_metrics(&mut output);
+
+        assert!(
+            output.contains("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter"),
+            "remote discovery failure counter TYPE line missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"{expected_label}\"}} 2"
+            )),
+            "remote discovery failure counter series missing: {output}"
+        );
+        assert!(
+            output.contains("# TYPE ferrum_mesh_remote_discovery_poll_successes_total counter"),
+            "remote discovery success counter TYPE line missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 1"
+            )),
+            "remote discovery success counter series missing: {output}"
+        );
+        assert!(
+            output.contains(
+                "# TYPE ferrum_mesh_remote_discovery_last_success_timestamp_seconds gauge"
+            ),
+            "remote discovery last-success gauge TYPE line missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} {fetched_at}"
+            )),
+            "remote discovery last-success series missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} "
+            )),
+            "remote discovery endpoint age series missing: {output}"
+        );
+    }
+
+    /// SECURITY (codex finding): a `control_plane_url` carrying credential-like
+    /// query parameters must not surface on the unauthenticated `/metrics`
+    /// failure-counter label. The store-site redaction drops the query/fragment
+    /// while keeping scheme/host/port/path so the endpoint is still identifiable.
+    #[test]
+    fn remote_discovery_failure_label_redacts_query_and_fragment() {
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("remote-{suffix}");
+        let trust_domain = format!("td-{suffix}.example");
+        let host = format!("cp-{suffix}.example");
+        let leaky_url = format!("https://{host}:9443/subscribe?token=secret&api_key=abc#frag");
+
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &leaky_url);
+
+        let mut output = String::new();
+        render_mesh_observability_metrics(&mut output);
+
+        // Pull out just this cluster's failure line so the assertions are scoped.
+        let line = output
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_mesh_remote_discovery_poll_failures_total")
+                    && l.contains(&format!("cluster=\"{cluster}\""))
+            })
+            .unwrap_or_else(|| panic!("failure series for {cluster} missing: {output}"));
+
+        assert!(
+            !line.contains("token") && !line.contains("secret"),
+            "query token leaked into metric label: {line}"
+        );
+        assert!(
+            !line.contains("api_key") && !line.contains("abc"),
+            "query api_key leaked into metric label: {line}"
+        );
+        assert!(
+            !line.contains("frag") && !line.contains('?') && !line.contains('#'),
+            "fragment/query delimiters leaked into metric label: {line}"
+        );
+        // The scheme/host/port/path that identify the endpoint are retained.
+        assert!(
+            line.contains(&format!("control_plane=\"https://{host}:9443/subscribe\"")),
+            "redacted label dropped the identifying endpoint: {line}"
+        );
+    }
+
+    /// The redaction also strips userinfo as a defense-in-depth backstop even if
+    /// an un-sanitized URL reaches the store site, and degrades safely (cut at
+    /// the first delimiter) for input that does not parse as a URL.
+    #[test]
+    fn redact_control_plane_label_handles_userinfo_and_unparseable() {
+        assert_eq!(
+            redact_control_plane_label("https://user:pw@cp.example:9443/p?token=x"),
+            "https://cp.example:9443/p"
+        );
+        // Not a URL: must still drop everything from the first `?`/`#`.
+        assert_eq!(
+            redact_control_plane_label("not a url?token=secret"),
+            "not a url"
+        );
+        assert_eq!(
+            redact_control_plane_label("garbage#token=secret"),
+            "garbage"
+        );
+    }
+
+    /// codex finding: when a remote cluster is removed, its success / last-success
+    /// / endpoint-age series must be pruned so a stale, endpoint-less cluster does
+    /// not keep advertising a fresh poll on unauthenticated `/metrics`.
+    #[test]
+    fn clear_mesh_remote_discovery_metrics_prunes_success_and_age() {
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("remote-{suffix}");
+        let trust_domain = format!("td-{suffix}.example");
+        let fetched_at = unix_now_seconds().saturating_sub(5);
+
+        record_mesh_remote_discovery_poll_success(&cluster, &trust_domain, fetched_at);
+
+        // Present before the clear.
+        let mut before = String::new();
+        render_mesh_observability_metrics(&mut before);
+        assert!(
+            before.contains(&format!(
+                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 1"
+            )),
+            "precondition: success series should exist before clear: {before}"
+        );
+
+        clear_mesh_remote_discovery_metrics(&cluster, &trust_domain);
+
+        // Gone after the clear — neither the success counter nor the gauges.
+        let mut after = String::new();
+        render_mesh_observability_metrics(&mut after);
+        assert!(
+            !after.contains(&format!("cluster=\"{cluster}\"")),
+            "success / last-success / age series must be pruned after clear: {after}"
         );
     }
 }

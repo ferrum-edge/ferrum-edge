@@ -24,7 +24,8 @@ use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
-use crate::grpc::auth::verify_grpc_jwt_metadata;
+use crate::grpc::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
 use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
@@ -60,10 +61,6 @@ impl XdsStreamConfig {
         }
     }
 
-    fn replace(&mut self, config: GatewayConfig) {
-        *self = Self::new(config);
-    }
-
     fn apply_update(&mut self, update: &ConfigUpdate) -> bool {
         if !XdsAdsServer::apply_update_to_stream_config(&mut self.config, update) {
             return false;
@@ -78,9 +75,12 @@ impl XdsStreamConfig {
 pub struct XdsAdsServer {
     config: Arc<ArcSwap<GatewayConfig>>,
     update_tx: broadcast::Sender<ConfigUpdate>,
+    namespace_broadcasts: Option<Arc<NamespaceBroadcasts>>,
     jwt_secret: String,
     expected_issuer: String,
     namespace: String,
+    scope: CpScope,
+    require_ns_claim: bool,
     stream_channel_capacity: usize,
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
@@ -92,6 +92,7 @@ pub struct XdsAdsServer {
     /// is recorded here when first seen and read at snapshot-build time.
     /// Cleared when the node's last stream ends.
     workload_identities: Arc<DashMap<String, String>>,
+    waypoint_names: Arc<DashMap<String, String>>,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
@@ -174,6 +175,7 @@ struct XdsStreamGuard {
     nonce_tracker: Arc<XdsNonceTracker>,
     active_streams: Arc<XdsStreamRegistry>,
     workload_identities: Arc<DashMap<String, String>>,
+    waypoint_names: Arc<DashMap<String, String>>,
 }
 
 impl XdsStreamGuard {
@@ -182,6 +184,7 @@ impl XdsStreamGuard {
         nonce_tracker: Arc<XdsNonceTracker>,
         active_streams: Arc<XdsStreamRegistry>,
         workload_identities: Arc<DashMap<String, String>>,
+        waypoint_names: Arc<DashMap<String, String>>,
     ) -> Self {
         Self {
             node_id: None,
@@ -189,6 +192,7 @@ impl XdsStreamGuard {
             nonce_tracker,
             active_streams,
             workload_identities,
+            waypoint_names,
         }
     }
 
@@ -211,6 +215,7 @@ impl XdsStreamGuard {
             self.snapshot_cache.remove(&node_id);
             self.nonce_tracker.remove_node(&node_id);
             self.workload_identities.remove(&node_id);
+            self.waypoint_names.remove(&node_id);
         }
     }
 }
@@ -253,14 +258,18 @@ impl XdsAdsServer {
         Self {
             config,
             update_tx,
+            namespace_broadcasts: None,
             jwt_secret,
             expected_issuer,
-            namespace,
+            namespace: namespace.clone(),
+            scope: CpScope::Single(namespace),
+            require_ns_claim: false,
             stream_channel_capacity: stream_channel_capacity.max(1),
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::new(DEFAULT_XDS_MAX_STREAMS_PER_NODE)),
             workload_identities: Arc::new(DashMap::new()),
+            waypoint_names: Arc::new(DashMap::new()),
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -270,6 +279,21 @@ impl XdsAdsServer {
 
     pub fn with_sidecar_enforcement_dry_run(mut self, dry_run: bool) -> Self {
         self.sidecar_enforced_dry_run = dry_run;
+        self
+    }
+
+    pub fn with_scope(mut self, scope: CpScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn with_require_namespace_claim(mut self, require: bool) -> Self {
+        self.require_ns_claim = require;
+        self
+    }
+
+    pub fn with_namespace_broadcasts(mut self, broadcasts: Arc<NamespaceBroadcasts>) -> Self {
+        self.namespace_broadcasts = Some(broadcasts);
         self
     }
 
@@ -304,8 +328,115 @@ impl XdsAdsServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
+    fn verify_jwt_metadata(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<AllowedNamespaces, Status> {
+        verify_grpc_jwt_metadata_with_claims(metadata, &self.jwt_secret, &self.expected_issuer)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn resolve_xds_namespace(&self, allowed: &AllowedNamespaces) -> Result<String, Status> {
+        CpGrpcServer::resolve_stream_namespace_for_scope(
+            &self.scope,
+            self.require_ns_claim,
+            allowed,
+        )
+    }
+
+    fn filter_config_for_xds_request(
+        &self,
+        config: &GatewayConfig,
+        namespace: &str,
+        waypoint_name: Option<String>,
+    ) -> GatewayConfig {
+        let request = MeshSliceRequest {
+            namespace: namespace.to_string(),
+            waypoint_name,
+            ..MeshSliceRequest::default()
+        }
+        .with_enforce_sidecar_egress(self.sidecar_enforced)
+        .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
+        .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
+        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, &request, &self.scope)
+    }
+
+    fn replace_stream_config_if_changed(
+        &self,
+        stream_config: &mut XdsStreamConfig,
+        config: GatewayConfig,
+    ) -> bool {
+        let fingerprint = config_fingerprint(&config);
+        if stream_config.fingerprint == fingerprint {
+            return false;
+        }
+        *stream_config = XdsStreamConfig {
+            config,
+            fingerprint,
+        };
+        true
+    }
+
+    fn refresh_stream_config_from_current(
+        &self,
+        stream_config: &mut XdsStreamConfig,
+        namespace: &str,
+        waypoint_name: Option<String>,
+    ) -> bool {
+        let current = self.config.load_full();
+        let filtered =
+            self.filter_config_for_xds_request(current.as_ref(), namespace, waypoint_name);
+        self.replace_stream_config_if_changed(stream_config, filtered)
+    }
+
+    fn apply_xds_update_to_stream_config(
+        &self,
+        stream_config: &mut XdsStreamConfig,
+        update: &ConfigUpdate,
+        namespace: &str,
+        waypoint_name: Option<String>,
+    ) -> bool {
+        if self.namespace_broadcasts.is_some() {
+            // Multi-namespace broadcast payloads are ConfigSync-strict on purpose.
+            // xDS needs the mesh request view, so treat the per-namespace event as
+            // a wake-up and rebuild from the current shared config before serializing.
+            return self.refresh_stream_config_from_current(
+                stream_config,
+                namespace,
+                waypoint_name,
+            );
+        }
+        let previous_fingerprint = stream_config.fingerprint.clone();
+        if !stream_config.apply_update(update) {
+            return false;
+        }
+        let filtered =
+            self.filter_config_for_xds_request(&stream_config.config, namespace, waypoint_name);
+        *stream_config = XdsStreamConfig::new(filtered);
+        stream_config.fingerprint != previous_fingerprint
+    }
+
+    fn apply_pre_node_xds_update_to_stream_config(
+        &self,
+        stream_config: &mut XdsStreamConfig,
+        update: &ConfigUpdate,
+        namespace: &str,
+    ) {
+        let _ = self.apply_xds_update_to_stream_config(stream_config, update, namespace, None);
+    }
+
+    fn updates_for_namespace(&self, namespace: &str) -> broadcast::Receiver<ConfigUpdate> {
+        self.namespace_broadcasts
+            .as_ref()
+            .map(|broadcasts| broadcasts.sender_for(namespace).subscribe())
+            .unwrap_or_else(|| self.update_tx.subscribe())
+    }
+
+    fn snapshot_namespace_for_config(&self, config: &GatewayConfig) -> String {
+        if config.known_namespaces.len() == 1 {
+            return config.known_namespaces[0].clone();
+        }
+        self.namespace.clone()
     }
 
     fn rebuild_snapshot(&self, node_id: &str) -> XdsSnapshot {
@@ -314,13 +445,28 @@ impl XdsAdsServer {
     }
 
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
-        let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone())
+        self.rebuild_snapshot_from_config_for_node(node_id, node_id, config)
+    }
+
+    fn rebuild_snapshot_from_config_for_node(
+        &self,
+        metadata_key: &str,
+        node_id: &str,
+        config: &GatewayConfig,
+    ) -> XdsSnapshot {
+        let namespace = self.snapshot_namespace_for_config(config);
+        let request = MeshSliceRequest::from_xds_node(node_id.to_string(), namespace)
             // The workload SPIFFE (from `Node.metadata`) takes precedence over
             // the `node_id`-derived one so Sidecar narrowing / the local-inbound
             // view are computed for the right workload even with a hostname node.
             .with_workload_spiffe_id(
                 self.workload_identities
-                    .get(node_id)
+                    .get(metadata_key)
+                    .map(|entry| entry.value().clone()),
+            )
+            .with_waypoint_name(
+                self.waypoint_names
+                    .get(metadata_key)
                     .map(|entry| entry.value().clone()),
             )
             .with_cluster_domain(self.cluster_domain.clone())
@@ -338,7 +484,7 @@ impl XdsAdsServer {
         // Non-stream helper for tests and one-off callers. ADS streams carry
         // XdsStreamConfig so request/ACK cache hits do not rehash config.
         let fingerprint = config_fingerprint(config);
-        self.snapshot_for_config_with_fingerprint(node_id, config, &fingerprint)
+        self.snapshot_for_config_with_fingerprint(node_id, node_id, config, &fingerprint)
     }
 
     fn snapshot_for_stream_config(
@@ -346,7 +492,17 @@ impl XdsAdsServer {
         node_id: &str,
         stream_config: &XdsStreamConfig,
     ) -> Arc<XdsSnapshot> {
+        self.snapshot_for_stream_config_with_cache_key(node_id, node_id, stream_config)
+    }
+
+    fn snapshot_for_stream_config_with_cache_key(
+        &self,
+        cache_key: &str,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+    ) -> Arc<XdsSnapshot> {
         self.snapshot_for_config_with_fingerprint(
+            cache_key,
             node_id,
             &stream_config.config,
             &stream_config.fingerprint,
@@ -355,21 +511,68 @@ impl XdsAdsServer {
 
     fn snapshot_for_config_with_fingerprint(
         &self,
+        cache_key: &str,
         node_id: &str,
         config: &GatewayConfig,
         fingerprint: &XdsConfigFingerprint,
     ) -> Arc<XdsSnapshot> {
-        if let Some(snapshot) = self.snapshot_cache.get_if_fingerprint(node_id, fingerprint) {
+        if let Some(snapshot) = self
+            .snapshot_cache
+            .get_if_fingerprint(cache_key, fingerprint)
+        {
             return snapshot;
         }
 
-        let next = self.rebuild_snapshot_from_config(node_id, config);
-        self.snapshot_cache
-            .insert_with_fingerprint(next, fingerprint.clone())
+        let next = self.rebuild_snapshot_from_config_for_node(cache_key, node_id, config);
+        self.snapshot_cache.insert_with_fingerprint_for_key(
+            cache_key.to_string(),
+            next,
+            fingerprint.clone(),
+        )
     }
 
     fn invalidate_snapshot_for_config_update(&self, node_id: &str) {
         self.snapshot_cache.remove(node_id);
+    }
+
+    fn reconcile_node_metadata(
+        &self,
+        state_key: &str,
+        metadata: crate::xds::carrier::XdsNodeMetadata,
+    ) -> bool {
+        let identity_changed = Self::reconcile_optional_string_state(
+            &self.workload_identities,
+            state_key,
+            metadata.workload_spiffe_id,
+        );
+        let waypoint_changed = Self::reconcile_optional_string_state(
+            &self.waypoint_names,
+            state_key,
+            metadata.waypoint_name,
+        );
+        if identity_changed || waypoint_changed {
+            self.invalidate_snapshot_for_config_update(state_key);
+        }
+        identity_changed || waypoint_changed
+    }
+
+    fn reconcile_optional_string_state(
+        values: &DashMap<String, String>,
+        key: &str,
+        value: Option<String>,
+    ) -> bool {
+        match value.filter(|value| !value.trim().is_empty()) {
+            Some(value) => {
+                values.insert(key.to_string(), value.clone()).as_deref() != Some(value.as_str())
+            }
+            None => values.remove(key).is_some(),
+        }
+    }
+
+    fn waypoint_name_for_state_key(&self, state_key: &str) -> Option<String> {
+        self.waypoint_names
+            .get(state_key)
+            .map(|entry| entry.value().clone())
     }
 
     fn stream_guard(&self) -> XdsStreamGuard {
@@ -378,6 +581,7 @@ impl XdsAdsServer {
             self.nonce_tracker.clone(),
             self.active_streams.clone(),
             self.workload_identities.clone(),
+            self.waypoint_names.clone(),
         )
     }
 
@@ -386,8 +590,17 @@ impl XdsAdsServer {
         snapshot: &XdsSnapshot,
         subscription: &XdsSubscription,
     ) -> DiscoveryResponse {
+        self.sotw_response_with_nonce_key(snapshot, subscription, &snapshot.node_id)
+    }
+
+    fn sotw_response_with_nonce_key(
+        &self,
+        snapshot: &XdsSnapshot,
+        subscription: &XdsSubscription,
+        nonce_node_key: &str,
+    ) -> DiscoveryResponse {
         let nonce = self.nonce_tracker.issue_nonce(
-            &snapshot.node_id,
+            nonce_node_key,
             &subscription.type_url,
             &snapshot.version,
         );
@@ -420,8 +633,30 @@ impl XdsAdsServer {
         explicitly_subscribed_names: &[String],
         explicitly_unsubscribed_names: &[String],
     ) -> DeltaDiscoveryResponse {
-        let nonce = self.nonce_tracker.issue_nonce(
+        self.delta_response_with_nonce_key(
+            snapshot,
+            previous,
+            subscription,
+            initial_resource_versions,
+            explicitly_subscribed_names,
+            explicitly_unsubscribed_names,
             &snapshot.node_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delta_response_with_nonce_key(
+        &self,
+        snapshot: &XdsSnapshot,
+        previous: Option<&XdsSnapshot>,
+        subscription: &XdsSubscription,
+        initial_resource_versions: &HashMap<String, String>,
+        explicitly_subscribed_names: &[String],
+        explicitly_unsubscribed_names: &[String],
+        nonce_node_key: &str,
+    ) -> DeltaDiscoveryResponse {
+        let nonce = self.nonce_tracker.issue_nonce(
+            nonce_node_key,
             &subscription.type_url,
             &snapshot.version,
         );
@@ -577,6 +812,7 @@ impl XdsAdsServer {
         let fingerprint = config_fingerprint(config);
         self.sotw_responses_for_subscriptions_from_config_with_fingerprint(
             node_id,
+            node_id,
             subscriptions,
             config,
             &fingerprint,
@@ -591,7 +827,25 @@ impl XdsAdsServer {
         stream_config: &XdsStreamConfig,
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
+        self.sotw_responses_for_stream_config_with_previous_key(
+            node_id,
+            node_id,
+            subscriptions,
+            stream_config,
+            previous,
+        )
+    }
+
+    fn sotw_responses_for_stream_config_with_previous_key(
+        &self,
+        cache_key: &str,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
         self.sotw_responses_for_subscriptions_from_config_with_fingerprint(
+            cache_key,
             node_id,
             subscriptions,
             &stream_config.config,
@@ -602,13 +856,15 @@ impl XdsAdsServer {
 
     fn sotw_responses_for_subscriptions_from_config_with_fingerprint(
         &self,
+        cache_key: &str,
         node_id: &str,
         subscriptions: &HashMap<String, XdsSubscription>,
         config: &GatewayConfig,
         fingerprint: &XdsConfigFingerprint,
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
-        let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
+        let snapshot =
+            self.snapshot_for_config_with_fingerprint(cache_key, node_id, config, fingerprint);
         let force_required_refresh = required_mesh_slice_resources_changed(previous, &snapshot);
         let responses = subscriptions
             .values()
@@ -617,7 +873,9 @@ impl XdsAdsServer {
                     || (force_required_refresh
                         && is_required_mesh_slice_sotw_type_url(&subscription.type_url))
             })
-            .map(|subscription| self.sotw_response(&snapshot, subscription))
+            .map(|subscription| {
+                self.sotw_response_with_nonce_key(&snapshot, subscription, cache_key)
+            })
             .collect();
         (snapshot, responses)
     }
@@ -631,6 +889,7 @@ impl XdsAdsServer {
     ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
         let fingerprint = config_fingerprint(config);
         self.sotw_response_for_request_with_fingerprint(
+            node_id,
             node_id,
             config,
             &fingerprint,
@@ -646,7 +905,25 @@ impl XdsAdsServer {
         subscriptions: &mut HashMap<String, XdsSubscription>,
         request: &DiscoveryRequest,
     ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
+        self.sotw_response_for_stream_request_key(
+            node_id,
+            node_id,
+            stream_config,
+            subscriptions,
+            request,
+        )
+    }
+
+    fn sotw_response_for_stream_request_key(
+        &self,
+        cache_key: &str,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DiscoveryRequest,
+    ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
         self.sotw_response_for_request_with_fingerprint(
+            cache_key,
             node_id,
             &stream_config.config,
             &stream_config.fingerprint,
@@ -657,6 +934,7 @@ impl XdsAdsServer {
 
     fn sotw_response_for_request_with_fingerprint(
         &self,
+        cache_key: &str,
         node_id: &str,
         config: &GatewayConfig,
         fingerprint: &XdsConfigFingerprint,
@@ -664,7 +942,7 @@ impl XdsAdsServer {
         request: &DiscoveryRequest,
     ) -> Option<(Arc<XdsSnapshot>, DiscoveryResponse)> {
         if !request.response_nonce.is_empty() {
-            match self.record_sotw_ack(node_id, request) {
+            match self.record_sotw_ack(cache_key, request) {
                 AckOutcome::Acked => debug!(
                     node_id = %node_id,
                     type_url = %request.type_url,
@@ -701,7 +979,8 @@ impl XdsAdsServer {
             .is_none_or(|previous| previous != &subscription);
         subscriptions.insert(request.type_url.clone(), subscription.clone());
         if should_send_sotw_response(request, resource_names_changed) {
-            let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
+            let snapshot =
+                self.snapshot_for_config_with_fingerprint(cache_key, node_id, config, fingerprint);
             if !request.response_nonce.is_empty()
                 && !subscription_change_affects_resources(
                     &snapshot,
@@ -711,7 +990,7 @@ impl XdsAdsServer {
             {
                 return None;
             }
-            let response = self.sotw_response(&snapshot, &subscription);
+            let response = self.sotw_response_with_nonce_key(&snapshot, &subscription, cache_key);
             Some((snapshot, response))
         } else {
             None
@@ -744,7 +1023,27 @@ impl XdsAdsServer {
         request: &DeltaDiscoveryRequest,
         previous: Option<&XdsSnapshot>,
     ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
+        self.delta_response_for_stream_request_without_ack_key(
+            node_id,
+            node_id,
+            stream_config,
+            subscriptions,
+            request,
+            previous,
+        )
+    }
+
+    fn delta_response_for_stream_request_without_ack_key(
+        &self,
+        cache_key: &str,
+        node_id: &str,
+        stream_config: &XdsStreamConfig,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DeltaDiscoveryRequest,
+        previous: Option<&XdsSnapshot>,
+    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
         self.delta_response_for_request_with_fingerprint_without_ack(
+            cache_key,
             node_id,
             &stream_config.config,
             &stream_config.fingerprint,
@@ -766,6 +1065,7 @@ impl XdsAdsServer {
         let _ = self.record_and_log_delta_ack(node_id, request);
         self.delta_response_for_request_with_fingerprint_without_ack(
             node_id,
+            node_id,
             config,
             fingerprint,
             subscriptions,
@@ -774,8 +1074,10 @@ impl XdsAdsServer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delta_response_for_request_with_fingerprint_without_ack(
         &self,
+        cache_key: &str,
         node_id: &str,
         config: &GatewayConfig,
         fingerprint: &XdsConfigFingerprint,
@@ -798,14 +1100,16 @@ impl XdsAdsServer {
             resource_names_changed,
             explicit_subscription_request,
         ) {
-            let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
-            let response = self.delta_response(
+            let snapshot =
+                self.snapshot_for_config_with_fingerprint(cache_key, node_id, config, fingerprint);
+            let response = self.delta_response_with_nonce_key(
                 &snapshot,
                 previous,
                 &subscription,
                 &request.initial_resource_versions,
                 &request.resource_names_subscribe,
                 &request.resource_names_unsubscribe,
+                cache_key,
             );
             Some((snapshot, response))
         } else {
@@ -883,6 +1187,7 @@ impl XdsAdsServer {
         let fingerprint = config_fingerprint(config);
         self.delta_responses_for_subscriptions_from_config_with_fingerprint(
             node_id,
+            node_id,
             subscriptions,
             config,
             &fingerprint,
@@ -897,7 +1202,25 @@ impl XdsAdsServer {
         stream_config: &XdsStreamConfig,
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        self.delta_responses_for_stream_config_with_previous_key(
+            node_id,
+            node_id,
+            subscriptions,
+            stream_config,
+            previous,
+        )
+    }
+
+    fn delta_responses_for_stream_config_with_previous_key(
+        &self,
+        cache_key: &str,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous: Option<&XdsSnapshot>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
         self.delta_responses_for_subscriptions_from_config_with_fingerprint(
+            cache_key,
             node_id,
             subscriptions,
             &stream_config.config,
@@ -913,7 +1236,25 @@ impl XdsAdsServer {
         stream_config: &XdsStreamConfig,
         previous_by_type: &HashMap<String, Arc<XdsSnapshot>>,
     ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let snapshot = self.snapshot_for_stream_config(node_id, stream_config);
+        self.delta_responses_for_stream_config_with_previous_by_type_key(
+            node_id,
+            node_id,
+            subscriptions,
+            stream_config,
+            previous_by_type,
+        )
+    }
+
+    fn delta_responses_for_stream_config_with_previous_by_type_key(
+        &self,
+        cache_key: &str,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        stream_config: &XdsStreamConfig,
+        previous_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        let snapshot =
+            self.snapshot_for_stream_config_with_cache_key(cache_key, node_id, stream_config);
         let responses = subscriptions
             .values()
             .filter_map(|subscription| {
@@ -921,13 +1262,14 @@ impl XdsAdsServer {
                     .get(&subscription.type_url)
                     .map(Arc::as_ref);
                 subscription_resources_changed(previous, &snapshot, subscription).then(|| {
-                    self.delta_response(
+                    self.delta_response_with_nonce_key(
                         &snapshot,
                         previous,
                         subscription,
                         &HashMap::new(),
                         &[],
                         &[],
+                        cache_key,
                     )
                 })
             })
@@ -937,20 +1279,30 @@ impl XdsAdsServer {
 
     fn delta_responses_for_subscriptions_from_config_with_fingerprint(
         &self,
+        cache_key: &str,
         node_id: &str,
         subscriptions: &HashMap<String, XdsSubscription>,
         config: &GatewayConfig,
         fingerprint: &XdsConfigFingerprint,
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
+        let snapshot =
+            self.snapshot_for_config_with_fingerprint(cache_key, node_id, config, fingerprint);
         let responses = subscriptions
             .values()
             .filter(|subscription| {
                 subscription_resources_changed(previous, &snapshot, subscription)
             })
             .map(|subscription| {
-                self.delta_response(&snapshot, previous, subscription, &HashMap::new(), &[], &[])
+                self.delta_response_with_nonce_key(
+                    &snapshot,
+                    previous,
+                    subscription,
+                    &HashMap::new(),
+                    &[],
+                    &[],
+                    cache_key,
+                )
             })
             .collect();
         (snapshot, responses)
@@ -1026,6 +1378,8 @@ impl XdsAdsServer {
         &self,
         updates: &mut broadcast::Receiver<ConfigUpdate>,
         stream_config: &mut XdsStreamConfig,
+        namespace: &str,
+        waypoint_name: Option<String>,
     ) {
         // Catch-up runs on the request path before a stream has emitted its
         // first response. We intentionally do not invalidate the per-node
@@ -1036,7 +1390,12 @@ impl XdsAdsServer {
         loop {
             match updates.try_recv() {
                 Ok(update) => {
-                    stream_config.apply_update(&update);
+                    self.apply_xds_update_to_stream_config(
+                        stream_config,
+                        &update,
+                        namespace,
+                        waypoint_name.clone(),
+                    );
                 }
                 Err(broadcast::error::TryRecvError::Empty) => return,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -1044,8 +1403,11 @@ impl XdsAdsServer {
                         "xDS ADS stream lagged by {} config updates while catching up; using current shared snapshot",
                         n
                     );
-                    let current = self.config.load_full();
-                    stream_config.replace(current.as_ref().clone());
+                    self.refresh_stream_config_from_current(
+                        stream_config,
+                        namespace,
+                        waypoint_name.clone(),
+                    );
                 }
                 Err(broadcast::error::TryRecvError::Closed) => return,
             }
@@ -1100,6 +1462,10 @@ fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     }
 }
 
+fn xds_state_key(namespace: &str, node_id: &str) -> String {
+    format!("{}:{}{}", namespace.len(), namespace, node_id)
+}
+
 fn fingerprint_bytes<const N: usize>(parts: [&[u8]; N]) -> XdsConfigFingerprint {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -1121,19 +1487,55 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DiscoveryRequest>>,
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
-        self.verify_jwt_metadata(request.metadata())?;
+        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+            Ok(allowed) => allowed,
+            Err(status) => {
+                CpGrpcServer::audit_tenant_subscription(
+                    "xDS.StreamAggregatedResources",
+                    "",
+                    "",
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
+        let stream_namespace = match self.resolve_xds_namespace(&allowed) {
+            Ok(namespace) => namespace,
+            Err(status) => {
+                CpGrpcServer::audit_tenant_subscription(
+                    "xDS.StreamAggregatedResources",
+                    "",
+                    "",
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
+        CpGrpcServer::audit_tenant_subscription(
+            "xDS.StreamAggregatedResources",
+            "",
+            &stream_namespace,
+            "success",
+            "",
+        );
 
         let mut requests = request.into_inner();
         let server = self.clone();
-        let mut updates = server.update_tx.subscribe();
+        let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
+            let mut node_state_key: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
-            let mut stream_config =
-                XdsStreamConfig::new(server.config.load_full().as_ref().clone());
+            let mut stream_config = XdsStreamConfig::new(server.filter_config_for_xds_request(
+                server.config.load_full().as_ref(),
+                &stream_namespace,
+                None,
+            ));
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
@@ -1158,10 +1560,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                         };
+                        let current_state_key = node_state_key
+                            .clone()
+                            .unwrap_or_else(|| xds_state_key(&stream_namespace, &current_node_id));
                         if node_id.is_none() {
-                            if let Err(status) = stream_guard.set_node_id(&current_node_id) {
+                            if let Err(status) = stream_guard.set_node_id(&current_state_key) {
                                 warn!(
                                     node_id = %current_node_id,
+                                    namespace = %stream_namespace,
                                     error = %status.message(),
                                     "Rejecting xDS ADS stream: per-node stream ceiling exceeded"
                                 );
@@ -1170,6 +1576,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                             node_id = Some(current_node_id.clone());
+                            node_state_key = Some(current_state_key.clone());
                         };
 
                         // Reconcile this node's workload identity from
@@ -1179,36 +1586,17 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         // fingerprint) only, so any identity CHANGE must drop the
                         // cached slice. ACKs carry `node: None` and don't reach
                         // here, preserving the identity mid-stream.
-                        if let Some(node) = request.node.as_ref() {
-                            match crate::xds::carrier::decode_node_metadata(&node.metadata)
-                                .workload_spiffe_id
-                                .filter(|s| !s.is_empty())
-                            {
-                                Some(spiffe) => {
-                                    let previous = server
-                                        .workload_identities
-                                        .insert(current_node_id.clone(), spiffe.clone());
-                                    if previous.as_deref() != Some(spiffe.as_str()) {
-                                        server
-                                            .invalidate_snapshot_for_config_update(&current_node_id);
-                                    }
-                                }
-                                None => {
-                                    // Node present but carrying no workload identity
-                                    // (e.g. a reconnect under the same node id
-                                    // without metadata) clears any stale identity,
-                                    // so the new stream isn't narrowed with the
-                                    // previous workload.
-                                    if server
-                                        .workload_identities
-                                        .remove(&current_node_id)
-                                        .is_some()
-                                    {
-                                        server
-                                            .invalidate_snapshot_for_config_update(&current_node_id);
-                                    }
-                                }
-                            }
+                        if let Some(node) = request.node.as_ref()
+                            && server.reconcile_node_metadata(
+                                &current_state_key,
+                                crate::xds::carrier::decode_node_metadata(&node.metadata),
+                            )
+                        {
+                            server.refresh_stream_config_from_current(
+                                &mut stream_config,
+                                &stream_namespace,
+                                server.waypoint_name_for_state_key(&current_state_key),
+                            );
                         }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
@@ -1224,10 +1612,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             return;
                         }
                         if subscriptions.is_empty() {
-                            server.catch_up_pending_updates(&mut updates, &mut stream_config);
+                            server.catch_up_pending_updates(
+                                &mut updates,
+                                &mut stream_config,
+                                &stream_namespace,
+                                server.waypoint_name_for_state_key(&current_state_key),
+                            );
                         }
 
-                        let send_failed = if let Some((snapshot, response)) = server.sotw_response_for_stream_request(
+                        let send_failed = if let Some((snapshot, response)) = server.sotw_response_for_stream_request_key(
+                            &current_state_key,
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
@@ -1246,17 +1640,36 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     update = updates.recv() => {
                         match update {
                             Ok(update) => {
-                                if !stream_config.apply_update(&update) {
-                                    continue;
-                                }
                                 let Some(current_node_id) = node_id.as_ref() else {
+                                    server.apply_pre_node_xds_update_to_stream_config(
+                                        &mut stream_config,
+                                        &update,
+                                        &stream_namespace,
+                                    );
                                     continue;
                                 };
-                                server.invalidate_snapshot_for_config_update(current_node_id);
+                                let Some(current_state_key) = node_state_key.as_ref() else {
+                                    server.apply_pre_node_xds_update_to_stream_config(
+                                        &mut stream_config,
+                                        &update,
+                                        &stream_namespace,
+                                    );
+                                    continue;
+                                };
+                                if !server.apply_xds_update_to_stream_config(
+                                    &mut stream_config,
+                                    &update,
+                                    &stream_namespace,
+                                    server.waypoint_name_for_state_key(current_state_key),
+                                ) {
+                                    continue;
+                                }
+                                server.invalidate_snapshot_for_config_update(current_state_key);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.sotw_responses_for_stream_config_with_previous(
+                                let (snapshot, responses) = server.sotw_responses_for_stream_config_with_previous_key(
+                                    current_state_key,
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -1271,16 +1684,33 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS ADS stream lagged by {} config updates; sending fresh snapshots", n);
-                                let current = server.config.load_full();
-                                stream_config.replace(current.as_ref().clone());
                                 let Some(current_node_id) = node_id.as_ref() else {
+                                    server.refresh_stream_config_from_current(
+                                        &mut stream_config,
+                                        &stream_namespace,
+                                        None,
+                                    );
                                     continue;
                                 };
-                                server.invalidate_snapshot_for_config_update(current_node_id);
+                                let Some(current_state_key) = node_state_key.as_ref() else {
+                                    server.refresh_stream_config_from_current(
+                                        &mut stream_config,
+                                        &stream_namespace,
+                                        None,
+                                    );
+                                    continue;
+                                };
+                                server.refresh_stream_config_from_current(
+                                    &mut stream_config,
+                                    &stream_namespace,
+                                    server.waypoint_name_for_state_key(current_state_key),
+                                );
+                                server.invalidate_snapshot_for_config_update(current_state_key);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.sotw_responses_for_stream_config_with_previous(
+                                let (snapshot, responses) = server.sotw_responses_for_stream_config_with_previous_key(
+                                    current_state_key,
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -1307,19 +1737,55 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        self.verify_jwt_metadata(request.metadata())?;
+        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+            Ok(allowed) => allowed,
+            Err(status) => {
+                CpGrpcServer::audit_tenant_subscription(
+                    "xDS.DeltaAggregatedResources",
+                    "",
+                    "",
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
+        let stream_namespace = match self.resolve_xds_namespace(&allowed) {
+            Ok(namespace) => namespace,
+            Err(status) => {
+                CpGrpcServer::audit_tenant_subscription(
+                    "xDS.DeltaAggregatedResources",
+                    "",
+                    "",
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
+        CpGrpcServer::audit_tenant_subscription(
+            "xDS.DeltaAggregatedResources",
+            "",
+            &stream_namespace,
+            "success",
+            "",
+        );
 
         let mut requests = request.into_inner();
         let server = self.clone();
-        let mut updates = server.update_tx.subscribe();
+        let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
         tokio::spawn(async move {
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
+            let mut node_state_key: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
-            let mut stream_config =
-                XdsStreamConfig::new(server.config.load_full().as_ref().clone());
+            let mut stream_config = XdsStreamConfig::new(server.filter_config_for_xds_request(
+                server.config.load_full().as_ref(),
+                &stream_namespace,
+                None,
+            ));
             let mut last_sent_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> = HashMap::new();
             let mut last_accepted_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> =
                 HashMap::new();
@@ -1346,10 +1812,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                         };
+                        let current_state_key = node_state_key
+                            .clone()
+                            .unwrap_or_else(|| xds_state_key(&stream_namespace, &current_node_id));
                         if node_id.is_none() {
-                            if let Err(status) = stream_guard.set_node_id(&current_node_id) {
+                            if let Err(status) = stream_guard.set_node_id(&current_state_key) {
                                 warn!(
                                     node_id = %current_node_id,
+                                    namespace = %stream_namespace,
                                     error = %status.message(),
                                     "Rejecting xDS delta ADS stream: per-node stream ceiling exceeded"
                                 );
@@ -1358,6 +1828,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                             node_id = Some(current_node_id.clone());
+                            node_state_key = Some(current_state_key.clone());
                         };
 
                         // Reconcile this node's workload identity from
@@ -1367,36 +1838,17 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         // fingerprint) only, so any identity CHANGE must drop the
                         // cached slice. ACKs carry `node: None` and don't reach
                         // here, preserving the identity mid-stream.
-                        if let Some(node) = request.node.as_ref() {
-                            match crate::xds::carrier::decode_node_metadata(&node.metadata)
-                                .workload_spiffe_id
-                                .filter(|s| !s.is_empty())
-                            {
-                                Some(spiffe) => {
-                                    let previous = server
-                                        .workload_identities
-                                        .insert(current_node_id.clone(), spiffe.clone());
-                                    if previous.as_deref() != Some(spiffe.as_str()) {
-                                        server
-                                            .invalidate_snapshot_for_config_update(&current_node_id);
-                                    }
-                                }
-                                None => {
-                                    // Node present but carrying no workload identity
-                                    // (e.g. a reconnect under the same node id
-                                    // without metadata) clears any stale identity,
-                                    // so the new stream isn't narrowed with the
-                                    // previous workload.
-                                    if server
-                                        .workload_identities
-                                        .remove(&current_node_id)
-                                        .is_some()
-                                    {
-                                        server
-                                            .invalidate_snapshot_for_config_update(&current_node_id);
-                                    }
-                                }
-                            }
+                        if let Some(node) = request.node.as_ref()
+                            && server.reconcile_node_metadata(
+                                &current_state_key,
+                                crate::xds::carrier::decode_node_metadata(&node.metadata),
+                            )
+                        {
+                            server.refresh_stream_config_from_current(
+                                &mut stream_config,
+                                &stream_namespace,
+                                server.waypoint_name_for_state_key(&current_state_key),
+                            );
                         }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
@@ -1412,10 +1864,15 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             return;
                         }
                         if subscriptions.is_empty() {
-                            server.catch_up_pending_updates(&mut updates, &mut stream_config);
+                            server.catch_up_pending_updates(
+                                &mut updates,
+                                &mut stream_config,
+                                &stream_namespace,
+                                server.waypoint_name_for_state_key(&current_state_key),
+                            );
                         }
 
-                        let ack_outcome = server.record_and_log_delta_ack(&current_node_id, &request);
+                        let ack_outcome = server.record_and_log_delta_ack(&current_state_key, &request);
                         remember_delta_accepted_snapshot(
                             ack_outcome.as_ref(),
                             &request.type_url,
@@ -1425,7 +1882,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         let previous = last_accepted_snapshot_by_type
                             .get(&request.type_url)
                             .cloned();
-                        if let Some((snapshot, response)) = server.delta_response_for_stream_request_without_ack(
+                        if let Some((snapshot, response)) = server.delta_response_for_stream_request_without_ack_key(
+                            &current_state_key,
                             &current_node_id,
                             &stream_config,
                             &mut subscriptions,
@@ -1442,17 +1900,36 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     update = updates.recv() => {
                         match update {
                             Ok(update) => {
-                                if !stream_config.apply_update(&update) {
-                                    continue;
-                                }
                                 let Some(current_node_id) = node_id.as_ref() else {
+                                    server.apply_pre_node_xds_update_to_stream_config(
+                                        &mut stream_config,
+                                        &update,
+                                        &stream_namespace,
+                                    );
                                     continue;
                                 };
-                                server.invalidate_snapshot_for_config_update(current_node_id);
+                                let Some(current_state_key) = node_state_key.as_ref() else {
+                                    server.apply_pre_node_xds_update_to_stream_config(
+                                        &mut stream_config,
+                                        &update,
+                                        &stream_namespace,
+                                    );
+                                    continue;
+                                };
+                                if !server.apply_xds_update_to_stream_config(
+                                    &mut stream_config,
+                                    &update,
+                                    &stream_namespace,
+                                    server.waypoint_name_for_state_key(current_state_key),
+                                ) {
+                                    continue;
+                                }
+                                server.invalidate_snapshot_for_config_update(current_state_key);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type_key(
+                                    current_state_key,
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -1469,16 +1946,33 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS delta ADS stream lagged by {} config updates; sending fresh snapshots", n);
-                                let current = server.config.load_full();
-                                stream_config.replace(current.as_ref().clone());
                                 let Some(current_node_id) = node_id.as_ref() else {
+                                    server.refresh_stream_config_from_current(
+                                        &mut stream_config,
+                                        &stream_namespace,
+                                        None,
+                                    );
                                     continue;
                                 };
-                                server.invalidate_snapshot_for_config_update(current_node_id);
+                                let Some(current_state_key) = node_state_key.as_ref() else {
+                                    server.refresh_stream_config_from_current(
+                                        &mut stream_config,
+                                        &stream_namespace,
+                                        None,
+                                    );
+                                    continue;
+                                };
+                                server.refresh_stream_config_from_current(
+                                    &mut stream_config,
+                                    &stream_namespace,
+                                    server.waypoint_name_for_state_key(current_state_key),
+                                );
+                                server.invalidate_snapshot_for_config_update(current_state_key);
                                 if subscriptions.is_empty() {
                                     continue;
                                 }
-                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type(
+                                let (snapshot, responses) = server.delta_responses_for_stream_config_with_previous_by_type_key(
+                                    current_state_key,
                                     current_node_id,
                                     &subscriptions,
                                     &stream_config,
@@ -1742,8 +2236,8 @@ mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
     use crate::modes::mesh::config::{
-        AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, MtlsMode,
-        PeerAuthentication, ServicePort,
+        AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, MeshWaypointBinding,
+        MeshWaypointServiceRef, MtlsMode, PeerAuthentication, ServicePort,
     };
     use chrono::{TimeZone, Utc};
     use prost::Message;
@@ -1804,10 +2298,14 @@ mod tests {
     }
 
     fn mesh_service(name: &str) -> MeshService {
+        mesh_service_in_namespace("default", name)
+    }
+
+    fn mesh_service_in_namespace(namespace: &str, name: &str) -> MeshService {
         MeshService {
             cluster_ips: Vec::new(),
             name: name.to_string(),
-            namespace: "default".to_string(),
+            namespace: namespace.to_string(),
             ports: vec![ServicePort {
                 port: 8080,
                 protocol: AppProtocol::Http,
@@ -1816,6 +2314,28 @@ mod tests {
             }],
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+        }
+    }
+
+    fn waypoint_gateway_config(service_name: &str, version_second: u32) -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service_in_namespace("default", service_name)],
+                waypoint_bindings: vec![MeshWaypointBinding {
+                    name: "waypoint".to_string(),
+                    namespace: "infra".to_string(),
+                    waypoint_for: "service".to_string(),
+                    services: vec![MeshWaypointServiceRef {
+                        namespace: "default".to_string(),
+                        name: service_name.to_string(),
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
+            loaded_at: Utc
+                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+                .unwrap(),
+            ..GatewayConfig::default()
         }
     }
 
@@ -2050,6 +2570,7 @@ mod tests {
             nonce_tracker.clone(),
             active_streams.clone(),
             Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
         );
         first
             .set_node_id("node-a")
@@ -2059,6 +2580,7 @@ mod tests {
             snapshot_cache.clone(),
             nonce_tracker.clone(),
             active_streams.clone(),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
         let err = second
@@ -2081,6 +2603,7 @@ mod tests {
             snapshot_cache,
             nonce_tracker,
             active_streams.clone(),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
         assert!(
@@ -2162,6 +2685,175 @@ mod tests {
         assert_eq!(
             snapshot_cluster_names(&snapshot),
             vec!["cluster/default/api/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn xds_prefilter_preserves_sidecar_admitted_cross_namespace_services() {
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![
+                    mesh_service("api"),
+                    mesh_service_in_namespace("beta", "checkout"),
+                    mesh_service_in_namespace("gamma", "payments"),
+                ],
+                sidecars: vec![MeshSidecar {
+                    name: "beta-egress".to_string(),
+                    namespace: "default".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["beta/*".to_string()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                }],
+                ..MeshConfig::default()
+            })),
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            ..GatewayConfig::default()
+        };
+        let server = test_server_with_sidecar_enforcement(config.clone(), true);
+
+        let filtered = server.filter_config_for_xds_request(&config, "default", None);
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            mesh.services
+                .iter()
+                .any(|service| service.namespace == "beta" && service.name == "checkout"),
+            "xDS prefilter must keep sidecar-admitted beta service before snapshot slicing"
+        );
+        assert!(
+            !mesh
+                .services
+                .iter()
+                .any(|service| service.namespace == "gamma"),
+            "xDS prefilter must still drop namespaces not admitted by the Sidecar"
+        );
+
+        let snapshot = server.snapshot_for_config("xds-node", &filtered);
+        assert_eq!(
+            snapshot_cluster_names(&snapshot),
+            vec!["cluster/beta/checkout/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn xds_updates_subscribe_to_authenticated_namespace_channel() {
+        let broadcasts = Arc::new(NamespaceBroadcasts::new(4));
+        let server = test_server(gateway_config_with_service(true, 0))
+            .with_namespace_broadcasts(broadcasts.clone());
+        let mut tenant_a_updates = server.updates_for_namespace("tenant-a");
+        let mut tenant_b_updates = server.updates_for_namespace("tenant-b");
+        let update = full_config_update(&gateway_config_with_service(false, 1));
+
+        broadcasts
+            .sender_for("tenant-b")
+            .send(update.clone())
+            .expect("tenant-b update should broadcast");
+
+        assert!(matches!(
+            tenant_a_updates.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            tenant_b_updates
+                .try_recv()
+                .expect("tenant-b update should arrive")
+                .version,
+            update.version
+        );
+    }
+
+    #[test]
+    fn xds_state_keys_partition_same_node_id_by_namespace() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let stream_config = XdsStreamConfig::new(gateway_config_with_service(true, 0));
+        let tenant_a_key = xds_state_key("tenant-a", "node-a");
+        let tenant_b_key = xds_state_key("tenant-b", "node-a");
+
+        let tenant_a_snapshot = server.snapshot_for_stream_config_with_cache_key(
+            &tenant_a_key,
+            "node-a",
+            &stream_config,
+        );
+        let tenant_b_snapshot = server.snapshot_for_stream_config_with_cache_key(
+            &tenant_b_key,
+            "node-a",
+            &stream_config,
+        );
+
+        assert_ne!(tenant_a_key, tenant_b_key);
+        assert_eq!(tenant_a_snapshot.node_id, "node-a");
+        assert_eq!(tenant_b_snapshot.node_id, "node-a");
+        assert!(server.snapshot_cache.get(&tenant_a_key).is_some());
+        assert!(server.snapshot_cache.get(&tenant_b_key).is_some());
+        assert!(server.snapshot_cache.get("node-a").is_none());
+    }
+
+    #[test]
+    fn xds_node_metadata_uses_authenticated_state_key_for_snapshot_build() {
+        let config = waypoint_gateway_config("reviews", 0);
+        let server = test_server(config.clone());
+        let tenant_key = xds_state_key("infra", "node-a");
+        let bare_node_key = "node-a";
+
+        assert!(server.reconcile_node_metadata(
+            &tenant_key,
+            crate::xds::carrier::XdsNodeMetadata {
+                workload_spiffe_id: None,
+                waypoint_name: Some("waypoint".to_string()),
+            },
+        ));
+        assert!(server.waypoint_names.get(&tenant_key).is_some());
+        assert!(server.waypoint_names.get(bare_node_key).is_none());
+
+        let filtered =
+            server.filter_config_for_xds_request(&config, "infra", Some("waypoint".to_string()));
+        let stream_config = XdsStreamConfig::new(filtered);
+        let snapshot = server.snapshot_for_stream_config_with_cache_key(
+            &tenant_key,
+            bare_node_key,
+            &stream_config,
+        );
+
+        assert_eq!(snapshot.node_id, bare_node_key);
+        assert_eq!(
+            snapshot_cluster_names(&snapshot),
+            vec!["cluster/default/reviews/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn xds_namespace_broadcast_refresh_preserves_waypoint_bound_services() {
+        let config = waypoint_gateway_config("reviews", 0);
+        let server = test_server(config.clone())
+            .with_namespace_broadcasts(Arc::new(NamespaceBroadcasts::new(4)));
+        let strict_payload = CpGrpcServer::filter_config_to_namespace(&config, "infra");
+        let mut stream_config = XdsStreamConfig::new(strict_payload.clone());
+        let update = full_config_update(&strict_payload);
+
+        assert!(server.apply_xds_update_to_stream_config(
+            &mut stream_config,
+            &update,
+            "infra",
+            Some("waypoint".to_string()),
+        ));
+        let state_key = xds_state_key("infra", "node-a");
+        server.reconcile_node_metadata(
+            &state_key,
+            crate::xds::carrier::XdsNodeMetadata {
+                workload_spiffe_id: None,
+                waypoint_name: Some("waypoint".to_string()),
+            },
+        );
+        let snapshot =
+            server.snapshot_for_stream_config_with_cache_key(&state_key, "node-a", &stream_config);
+
+        assert_eq!(
+            snapshot_cluster_names(&snapshot),
+            vec!["cluster/default/reviews/8080".to_string()]
         );
     }
 
@@ -2379,7 +3071,7 @@ mod tests {
             .send(full_config_update(&new_config))
             .expect("pending update should send");
         let mut stream_config = XdsStreamConfig::new(old_config);
-        server.catch_up_pending_updates(&mut updates, &mut stream_config);
+        server.catch_up_pending_updates(&mut updates, &mut stream_config, "default", None);
         let mut subscriptions = HashMap::new();
         let request = DiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
@@ -2403,6 +3095,37 @@ mod tests {
     }
 
     #[test]
+    fn recv_update_before_first_sotw_request_updates_stream_config() {
+        let old_config = gateway_config_with_named_service("old", 0);
+        let server = test_server(old_config.clone());
+        let new_config = gateway_config_with_named_service("new", 1);
+        let update = full_config_update(&new_config);
+        let mut stream_config = XdsStreamConfig::new(old_config);
+
+        server.apply_pre_node_xds_update_to_stream_config(&mut stream_config, &update, "default");
+
+        let mut subscriptions = HashMap::new();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: vec!["*".to_string()],
+            ..DiscoveryRequest::default()
+        };
+        let (_, response) = server
+            .sotw_response_for_stream_request(
+                "node-a",
+                &stream_config,
+                &mut subscriptions,
+                &request,
+            )
+            .expect("first SotW request should receive the pre-node update snapshot");
+
+        assert_eq!(
+            cluster_names(&response),
+            vec!["cluster/default/new/8080".to_string()]
+        );
+    }
+
+    #[test]
     fn pending_update_before_first_delta_request_updates_stream_config() {
         let old_config = gateway_config_with_named_service("old", 0);
         let server = test_server(old_config.clone());
@@ -2413,7 +3136,7 @@ mod tests {
             .send(full_config_update(&new_config))
             .expect("pending update should send");
         let mut stream_config = XdsStreamConfig::new(old_config);
-        server.catch_up_pending_updates(&mut updates, &mut stream_config);
+        server.catch_up_pending_updates(&mut updates, &mut stream_config, "default", None);
         let request = DeltaDiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names_subscribe: vec!["*".to_string()],

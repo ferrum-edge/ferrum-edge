@@ -170,6 +170,23 @@ pub struct MeshSlice {
     pub waypoint_name: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// `labels` is an AMBIGUOUS intersection inferred from a shared-SPIFFE match
+    /// across multiple workloads, NOT this workload's authoritative label set.
+    /// Set only when the slice request carried no explicit labels and more than
+    /// one workload shared the SPIFFE id, so `labels` is the (possibly empty)
+    /// intersection while `mesh_policies` / `peer_authentications` /
+    /// `request_authentications` carry the candidate-any superset.
+    ///
+    /// Consumers that hold the workload's real labels MUST prefer those over the
+    /// intersection when this is `true`: the xDS DP re-filters the superset
+    /// against its local `FERRUM_MESH_WORKLOAD_LABELS` rather than letting the
+    /// non-empty intersection carrier replace them (otherwise a candidate-only
+    /// selector PeerAuthentication / RequestAuthentication / AuthorizationPolicy
+    /// is silently dropped — a fail-open whenever the intersection is non-empty).
+    /// `false` (the default) means `labels` is authoritative; never serialized
+    /// when unset so non-ambiguous slices stay byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub labels_ambiguous: bool,
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
@@ -408,6 +425,13 @@ impl MeshSlice {
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
             && self.labels == other.labels
+            // The ambiguous-labels marker can flip independently of `labels`
+            // (e.g. the shared-SPIFFE candidate set shrinks from two workloads
+            // to one while the intersection is unchanged), changing how the xDS
+            // DP resolves label precedence. It MUST be compared so the slice is
+            // re-broadcast and the DP stops deferring to (or starts deferring
+            // to) its local labels; omitting it would keep the stale precedence.
+            && self.labels_ambiguous == other.labels_ambiguous
             && self.workloads == other.workloads
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
@@ -535,6 +559,81 @@ impl MeshSlice {
         )
     }
 
+    /// Resolve the effective inbound mTLS mode for `port`, FAILING CLOSED on an
+    /// ambiguous shared-SPIFFE slice whose partial label intersection cannot
+    /// confirm a candidate-only selector PeerAuthentication.
+    ///
+    /// On a `labels_ambiguous` slice, `self.labels` is only the intersection of
+    /// the divergent candidates sharing this SPIFFE, NOT this workload's
+    /// authoritative labels, and `peer_authentications` carries the candidate-any
+    /// superset (a STRICT PeerAuth that matches only ONE candidate rode in). The
+    /// plain [`Self::resolve_effective_mtls_mode`] re-filters by the partial
+    /// intersection, so such a selector STRICT is silently dropped and the
+    /// listener falls back to `Permissive` — a silent fail-OPEN: a workload whose
+    /// real labels match the selector would have required mTLS.
+    ///
+    /// When the marker is set, we cannot prove an unresolvable selector
+    /// PeerAuth does NOT apply, so we ESCALATE to the most-restrictive effective
+    /// mode any such candidate-only selector PeerAuth would yield for this port
+    /// (Strict > Permissive > Disable), but never DOWNGRADE below the
+    /// normally-resolved mode. The operator's remedy is to pin
+    /// `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` so the marker clears
+    /// and the superset is re-filtered deterministically. A non-ambiguous slice
+    /// (the marker absent — unique SPIFFE, concrete request labels, or a DP that
+    /// resolved its authoritative labels) is enforcement-IDENTICAL to the plain
+    /// resolver.
+    pub fn resolve_inbound_mtls_mode_fail_closed(&self, port: u16) -> MtlsMode {
+        let resolved = self.resolve_effective_mtls_mode(port);
+        if !self.labels_ambiguous {
+            return resolved;
+        }
+        // Most-restrictive mode among candidate-any selector PeerAuths that the
+        // partial intersection could NOT confirm (the plain resolver dropped
+        // them). Only WorkloadSelector-scoped entries with non-empty selector
+        // labels are at risk: namespace/mesh-wide scopes resolve against the
+        // authoritative `self.namespace`, not the ambiguous labels. A selector
+        // whose NAMESPACE does not match `self.namespace` is also authoritatively
+        // non-applicable (namespace is not ambiguous), so only LABEL divergence
+        // is escalated here.
+        let mut effective = resolved;
+        for pa in &self.peer_authentications {
+            if classify_peer_auth_scope(pa) != PeerAuthScope::WorkloadSelector {
+                continue;
+            }
+            if peer_auth_applies_to_workload(pa, &self.namespace, &self.labels) {
+                // Already accounted for by the normal resolution above.
+                continue;
+            }
+            // Skip selectors that fail to apply for a reason OTHER than the
+            // ambiguous labels — i.e. a namespace mismatch, which is
+            // authoritative. Re-test the selector against the workload labels but
+            // with the namespace constraint honored: if it still does not match
+            // even when the slice IS this workload (label superset assumption),
+            // the mismatch is the namespace, not the labels.
+            if !peer_auth_selector_namespace_matches(pa, &self.namespace) {
+                continue;
+            }
+            let candidate = peer_auth_effective_mode(pa, port);
+            if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(effective)
+            {
+                effective = candidate;
+            }
+        }
+        if effective != resolved {
+            tracing::warn!(
+                port,
+                resolved = ?resolved,
+                fail_closed = ?effective,
+                "mesh PeerAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
+                 selector PeerAuthentication the partial label intersection cannot resolve; \
+                 escalating inbound mTLS to the most-restrictive candidate mode (fail closed). \
+                 Set FERRUM_MESH_WORKLOAD_LABELS / mesh_slice.labels to pin this workload's \
+                 identity for deterministic resolution"
+            );
+        }
+        effective
+    }
+
     /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
     /// workload, or `None` when no `ProxyConfig` applies.
     ///
@@ -597,6 +696,37 @@ impl MeshSlice {
         } else {
             request.labels.clone()
         };
+        // `effective_labels` is an ambiguous intersection (not this workload's
+        // authoritative labels) precisely when no explicit request labels were
+        // supplied AND several workloads share the SPIFFE id with DIVERGENT
+        // label sets, so the intersection loses information. In that case
+        // selector-scoped resources rode in as a candidate-any superset above,
+        // and a consumer holding the real labels (the xDS DP) must re-filter
+        // against them instead of trusting the intersection.
+        //
+        // A bare candidate count is NOT sufficient: the common replica/endpoints
+        // case has many `Workload` records for one SPIFFE with IDENTICAL labels.
+        // There the intersection equals every candidate set (no information
+        // lost), so the inferred labels are authoritative and the marker must
+        // stay false — otherwise the xDS DP would prefer its own (possibly stale
+        // or partial) `FERRUM_MESH_WORKLOAD_LABELS` over the CP's correct labels
+        // and could drop selector-scoped DENY/PeerAuth/JWT rules. A single
+        // candidate (or concrete request labels) is likewise authoritative.
+        let labels_ambiguous =
+            request.labels.is_empty() && candidate_label_sets_diverge(&candidate_label_sets);
+        // Candidate-any projection input for selector-scoped resources. When the
+        // labels are INFERRED from an ambiguous shared-SPIFFE match, keep a
+        // resource if it applies to ANY candidate workload (a superset), not
+        // just the (possibly empty) label intersection: the per-pod NodeWaypoint
+        // consumer re-filters against each pod's real labels, and the xDS DP
+        // re-filters against its local `FERRUM_MESH_WORKLOAD_LABELS` after
+        // reverse translation, so narrowing to the intersection here would drop
+        // selector AuthorizationPolicies / PeerAuthentications / RequestAuthen-
+        // tications those consumers still need and fail open. With concrete
+        // `request.labels` there is exactly one precise set. (The mesh_authz
+        // plugin tolerates the resulting superset at construction — see
+        // `validate_scope_filter_identity` — and its cold-path `retain` does the
+        // precise per-proxy narrowing.)
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
@@ -606,7 +736,6 @@ impl MeshSlice {
         } else {
             vec![&effective_labels]
         };
-
         // Resolve the effective applicable Sidecar egress scope for this
         // workload. The returned scope is used downstream to narrow `services`,
         // `service_entries`, and `destination_rules`. Returns `None` when no
@@ -982,6 +1111,7 @@ impl MeshSlice {
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
             labels: effective_labels,
+            labels_ambiguous,
             version,
             workloads,
             services,
@@ -1300,6 +1430,23 @@ fn inferred_workload_label_sets_for_request(
         );
     }
     matches
+}
+
+/// Whether the candidate label sets for a shared SPIFFE actually diverge, so
+/// that their intersection ([`inferred_workload_labels_for_request`]) loses
+/// information and cannot be trusted as the workload's authoritative labels.
+///
+/// Returns `false` for zero/one candidate and for the common replica case where
+/// every matching `Workload` carries the SAME labels: there the intersection
+/// equals each set and is authoritative. Only genuinely divergent sets (where a
+/// selector policy may match one candidate but not another) make the labels
+/// ambiguous and require a label-holding consumer to re-filter the superset.
+fn candidate_label_sets_diverge(candidate_label_sets: &[BTreeMap<String, String>]) -> bool {
+    let mut iter = candidate_label_sets.iter();
+    let Some(first) = iter.next() else {
+        return false;
+    };
+    iter.any(|labels| labels != first)
 }
 
 fn inferred_workload_labels_for_request(
@@ -2322,9 +2469,9 @@ fn sidecar_host_pattern_matches(
 /// Istio Sidecar `egress.hosts` supports a leading-label wildcard:
 ///   - `reviews.alpha.svc.cluster.local` matches only that exact FQDN.
 ///   - `*.foo.com` matches `bar.foo.com` (one label before the suffix) but not
-///     `foo.com` nor `a.b.foo.com`. This is the same single-label wildcard
-///     semantic used elsewhere in the gateway
-///     (see `crate::config::types::wildcard_matches` and the mesh DNS proxy).
+///     `foo.com` nor `a.b.foo.com`. This is the Istio Sidecar and mesh DNS
+///     proxy semantic; proxy listener host matching intentionally uses broader
+///     DNS suffix wildcard semantics.
 ///
 /// Resource hosts may themselves be wildcards (e.g. a `ServiceEntry.hosts`
 /// entry of `*.googleapis.com`). When the pattern is `*` it admits any
@@ -2351,9 +2498,9 @@ fn host_matches_pattern(pattern: &str, candidate: &str) -> bool {
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // `*.foo.com` matches `bar.foo.com` (exactly one extra label) but not
-        // `foo.com` itself nor `a.b.foo.com`. Mirrors `wildcard_matches` in
-        // `src/config/types.rs` so route-side and mesh-side wildcard semantics
-        // stay aligned.
+        // `foo.com` itself nor `a.b.foo.com`. This remains the Istio Sidecar
+        // scope-host semantic even though proxy listener host matching accepts
+        // deeper DNS suffix wildcard matches.
         if candidate == suffix {
             return false;
         }
@@ -2404,6 +2551,30 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
     match &pa.selector {
         Some(selector) if !selector.labels.is_empty() => PeerAuthScope::WorkloadSelector,
         _ => PeerAuthScope::Namespace,
+    }
+}
+
+/// Whether a `WorkloadSelector`-scoped PeerAuthentication's namespace constraint
+/// is compatible with `proxy_namespace`. Used by the ambiguous-slice fail-closed
+/// resolver to escalate ONLY on label divergence: a selector whose namespace does
+/// not match is authoritatively non-applicable (namespace is never ambiguous), so
+/// it must not force a more-restrictive mTLS mode for an unrelated namespace.
+fn peer_auth_selector_namespace_matches(pa: &PeerAuthentication, proxy_namespace: &str) -> bool {
+    let selector_namespace = match &pa.scope {
+        Some(PolicyScope::WorkloadSelector { selector }) => selector.namespace.as_deref(),
+        _ => pa
+            .selector
+            .as_ref()
+            .and_then(|selector| selector.namespace.as_deref()),
+    };
+    // A scope-form selector with no explicit selector namespace is mesh-wide for
+    // namespace purposes; the legacy `pa.selector` form additionally requires the
+    // policy's own namespace to match the workload (Istio scopes a bare selector
+    // to the policy namespace).
+    match (&pa.scope, selector_namespace) {
+        (_, Some(ns)) => ns == proxy_namespace,
+        (Some(PolicyScope::WorkloadSelector { .. }), None) => true,
+        (Some(_), None) | (None, None) => pa.namespace == proxy_namespace,
     }
 }
 
@@ -2823,6 +2994,7 @@ mod tests {
             namespace: "ns".into(),
             workload_spiffe_id: Some("spiffe://td/ns/x/sa/y".into()),
             labels: BTreeMap::from([("app".into(), "web".into())]),
+            labels_ambiguous: false,
             version: "v1".into(),
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             services: vec![make_service("ns", "web")],
@@ -2912,6 +3084,180 @@ mod tests {
         // Symmetric, and identical marker values are equal.
         assert!(!b.content_eq(&a));
         assert!(a.content_eq(&a.clone()));
+    }
+
+    #[test]
+    fn content_eq_detects_labels_ambiguous_change() {
+        // The ambiguous-labels marker can flip while `labels` is unchanged (the
+        // shared-SPIFFE candidate set changes but the intersection does not),
+        // altering how the xDS DP resolves label precedence. It must count as a
+        // content change so the slice is re-broadcast and the DP updates.
+        let a = MeshSlice {
+            labels_ambiguous: true,
+            ..MeshSlice::default()
+        };
+        let b = MeshSlice::default();
+        assert!(
+            !a.content_eq(&b),
+            "a flipped labels_ambiguous marker must be a content change"
+        );
+        assert!(!b.content_eq(&a));
+        assert!(a.content_eq(&a.clone()));
+    }
+
+    fn selector_peer_auth(
+        name: &str,
+        key: &str,
+        value: &str,
+        mode: MtlsMode,
+    ) -> PeerAuthentication {
+        PeerAuthentication {
+            name: name.into(),
+            namespace: "default".into(),
+            scope: None,
+            selector: Some(WorkloadSelector {
+                labels: HashMap::from([(key.to_string(), value.to_string())]),
+                namespace: None,
+            }),
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn fail_closed_mtls_escalates_unresolvable_selector_strict_on_ambiguous_slice() {
+        // Codex P1: an ambiguous shared-SPIFFE slice carries a candidate-only
+        // STRICT PeerAuthentication keyed on the divergent `role=api` as a
+        // superset, but `labels` is only the partial intersection `app=shared`,
+        // which does NOT match the selector. The plain resolver drops it and
+        // falls back to Permissive — a fail-OPEN. The fail-closed resolver must
+        // escalate to STRICT because it cannot prove the selector does not apply.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![selector_peer_auth(
+                "role-api-strict",
+                "role",
+                "api",
+                MtlsMode::Strict,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_effective_mtls_mode(8080),
+            MtlsMode::Permissive,
+            "the plain resolver drops the unresolvable selector (the fail-open this fix closes)"
+        );
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Strict,
+            "the fail-closed resolver must escalate to STRICT for an unresolvable candidate STRICT"
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_is_enforcement_identical_on_non_ambiguous_slice() {
+        // Guardrail: the non-ambiguous case must be byte-identical to the plain
+        // resolver. Same slice as above but NOT flagged ambiguous (the labels are
+        // authoritative), so the selector simply does not apply and Permissive is
+        // correct — no escalation.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: false,
+            peer_authentications: vec![selector_peer_auth(
+                "role-api-strict",
+                "role",
+                "api",
+                MtlsMode::Strict,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_effective_mtls_mode(8080),
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            "fail-closed resolution must equal plain resolution on a non-ambiguous slice"
+        );
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Permissive,
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_does_not_escalate_when_selector_resolved_by_intersection() {
+        // The candidate-only selector IS satisfied by the partial intersection
+        // (`app=shared` selector against `app=shared` labels), so the plain
+        // resolver already enforces STRICT and the fail-closed path is a no-op —
+        // no over-escalation beyond what actually resolved.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![selector_peer_auth(
+                "app-shared-strict",
+                "app",
+                "shared",
+                MtlsMode::Strict,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict,);
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_does_not_escalate_unresolvable_permissive_selector() {
+        // An ambiguous slice whose only unresolvable candidate-only selector is
+        // PERMISSIVE (not STRICT) must NOT escalate past Permissive — the
+        // fail-closed path escalates only toward the MORE restrictive mode, it
+        // does not invent STRICT where no STRICT policy exists.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![selector_peer_auth(
+                "role-api-permissive",
+                "role",
+                "api",
+                MtlsMode::Permissive,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Permissive,
+            "no STRICT candidate exists, so fail-closed resolution stays Permissive"
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_does_not_escalate_selector_in_other_namespace() {
+        // A candidate-only STRICT PeerAuth whose selector targets a DIFFERENT
+        // namespace must NOT escalate: namespace is authoritative (never
+        // ambiguous), so the policy genuinely does not apply to this workload.
+        // Only LABEL divergence within this namespace is escalated fail-closed.
+        let mut pa = selector_peer_auth("other-ns-strict", "role", "api", MtlsMode::Strict);
+        pa.selector = Some(WorkloadSelector {
+            labels: HashMap::from([("role".to_string(), "api".to_string())]),
+            namespace: Some("other-namespace".to_string()),
+        });
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![pa],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Permissive,
+            "a selector in another namespace is authoritatively non-applicable; no escalation"
+        );
     }
 
     #[test]
@@ -3467,6 +3813,116 @@ mod tests {
     }
 
     #[test]
+    fn inferred_labels_keep_candidate_matching_selector_resources_as_superset() {
+        let workload_a = make_workload(
+            "alpha",
+            "shared",
+            HashMap::from([
+                ("app".into(), "shared".into()),
+                ("role".into(), "api".into()),
+            ]),
+        );
+        let workload_b = make_workload(
+            "alpha",
+            "shared",
+            HashMap::from([
+                ("app".into(), "shared".into()),
+                ("role".into(), "worker".into()),
+            ]),
+        );
+        let workload_spiffe_id = workload_a.spiffe_id.to_string();
+        let role_api_selector = WorkloadSelector {
+            labels: HashMap::from([("role".into(), "api".into())]),
+            namespace: Some("alpha".into()),
+        };
+        let mesh = MeshConfig {
+            workloads: vec![workload_a, workload_b],
+            peer_authentications: vec![
+                make_peer_auth("pa-alpha", "alpha", None),
+                make_peer_auth("pa-role-api", "alpha", Some(role_api_selector.clone())),
+            ],
+            request_authentications: vec![
+                make_request_auth(
+                    "ra-alpha",
+                    "alpha",
+                    PolicyScope::Namespace {
+                        namespace: "alpha".into(),
+                    },
+                ),
+                make_request_auth(
+                    "ra-role-api",
+                    "alpha",
+                    PolicyScope::WorkloadSelector {
+                        selector: role_api_selector.clone(),
+                    },
+                ),
+            ],
+            telemetry_resources: vec![
+                make_telemetry(
+                    "tel-alpha",
+                    "alpha",
+                    PolicyScope::Namespace {
+                        namespace: "alpha".into(),
+                    },
+                ),
+                make_telemetry(
+                    "tel-role-api",
+                    "alpha",
+                    PolicyScope::WorkloadSelector {
+                        selector: role_api_selector,
+                    },
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let mut request = slice_request("alpha");
+        request.workload_spiffe_id = Some(workload_spiffe_id);
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert_eq!(
+            slice.labels,
+            BTreeMap::from([("app".into(), "shared".into())]),
+            "only labels common to every matching workload should be authoritative for slice.labels"
+        );
+        assert!(
+            slice.labels_ambiguous,
+            "labels inferred from >1 shared-SPIFFE candidate must be marked ambiguous so the xDS \
+             DP re-filters the candidate-any superset against its own labels"
+        );
+        // Candidate-any superset: the `role=api` selector resources match the
+        // `api` candidate workload, so they are kept for the per-pod NodeWaypoint
+        // and xDS DP-local-label consumers to re-filter — even though
+        // slice.labels carries only the shared intersection. Narrowing them out
+        // here would fail open for those consumers (codex P1s).
+        assert_eq!(slice.peer_authentications.len(), 2);
+        assert!(
+            slice
+                .peer_authentications
+                .iter()
+                .any(|p| p.name == "pa-role-api"),
+            "candidate-matching selector PeerAuthentication kept as superset"
+        );
+        assert_eq!(slice.request_authentications.len(), 2);
+        assert!(
+            slice
+                .request_authentications
+                .iter()
+                .any(|r| r.name == "ra-role-api"),
+            "candidate-matching selector RequestAuthentication kept as superset"
+        );
+        assert_eq!(slice.telemetry_resources.len(), 2);
+        assert!(
+            slice
+                .telemetry_resources
+                .iter()
+                .any(|t| t.name == "tel-role-api"),
+            "candidate-matching selector Telemetry kept as superset"
+        );
+    }
+
+    #[test]
     fn from_gateway_config_trust_bundles_and_multi_cluster_propagated() {
         let mut multi_cluster = make_multi_cluster();
         multi_cluster.east_west_gateways = vec![
@@ -3592,6 +4048,12 @@ mod tests {
         // The slice should inherit labels from the matched workload.
         assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
         assert_eq!(slice.labels.get("tier"), Some(&"frontend".to_string()));
+        // A single matching workload is unambiguous: its labels are
+        // authoritative, so the xDS DP keeps trusting the carrier.
+        assert!(
+            !slice.labels_ambiguous,
+            "single-candidate inherited labels are authoritative, not ambiguous"
+        );
         // The workload-selector policy should match via inherited labels.
         assert_eq!(slice.mesh_policies.len(), 1);
         assert_eq!(slice.mesh_policies[0].name, "selector-policy");
@@ -3643,7 +4105,15 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, request);
 
         assert!(slice.labels.is_empty());
-        assert_eq!(slice.mesh_policies.len(), 1);
+        assert!(
+            slice.labels_ambiguous,
+            "an empty intersection across >1 shared-SPIFFE candidates is still ambiguous"
+        );
+        assert_eq!(
+            slice.mesh_policies.len(),
+            1,
+            "a selector policy matching any shared-SPIFFE candidate is kept (superset) for per-pod / DP-local re-filtering even when the label intersection is empty"
+        );
         assert_eq!(slice.mesh_policies[0].name, "web-selector-policy");
     }
 
@@ -3718,6 +4188,10 @@ mod tests {
         assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
         assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
         assert!(!slice.labels.contains_key("pod-template-hash"));
+        // slice.labels carries only the common intersection, but BOTH selector
+        // policies are kept (candidate-any superset): the per-pod / DP-local
+        // consumers re-filter, so a replica-specific policy must survive for the
+        // replica it targets rather than being dropped CP-side (codex P1).
         assert_eq!(slice.mesh_policies.len(), 2);
         assert!(
             slice
@@ -3729,8 +4203,68 @@ mod tests {
             slice
                 .mesh_policies
                 .iter()
-                .any(|policy| policy.name == "replica-specific-policy")
+                .any(|policy| policy.name == "replica-specific-policy"),
+            "candidate-matching selector policy kept as superset for per-pod / DP-local re-filtering"
         );
+    }
+
+    #[test]
+    fn from_gateway_config_identical_replica_labels_are_not_ambiguous() {
+        // The common replica/endpoints case: several `Workload` records share a
+        // SPIFFE id with IDENTICAL label maps. The intersection equals each set,
+        // so the inferred labels are authoritative — the marker must stay false.
+        // If it were set, the xDS DP would prefer its own (possibly stale or
+        // partial) FERRUM_MESH_WORKLOAD_LABELS over the CP's correct labels and
+        // could drop selector-scoped DENY/PeerAuth/JWT rules (Codex P2).
+        let td = td();
+        let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
+        let labels = HashMap::from([
+            ("app".into(), "web".into()),
+            ("version".into(), "v1".into()),
+        ]);
+        let mut replica_a = make_workload("alpha", "web", labels.clone());
+        let mut replica_b = make_workload("alpha", "web", labels.clone());
+        let mut replica_c = make_workload("alpha", "web", labels);
+        replica_a.spiffe_id = spiffe_id.clone();
+        replica_b.spiffe_id = spiffe_id.clone();
+        replica_c.spiffe_id = spiffe_id.clone();
+        let mesh = MeshConfig {
+            workloads: vec![replica_a, replica_b, replica_c],
+            mesh_policies: vec![make_policy(
+                "app-selector-policy",
+                "alpha",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "web".into())]),
+                        namespace: None,
+                    },
+                },
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: "alpha".into(),
+            workload_spiffe_id: Some(spiffe_id.to_string()),
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
+        };
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
+        assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
+        assert!(
+            !slice.labels_ambiguous,
+            "identical replica labels intersect to the full authoritative set; not ambiguous"
+        );
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "app-selector-policy");
     }
 
     #[test]
@@ -7215,8 +7749,7 @@ mod tests {
         // namespace. Mirrors the canonical Istio Sidecar wildcard semantic.
         assert!(host_matches_pattern("*.foo.com", "bar.foo.com"));
         assert!(host_matches_pattern("*.foo.com", "baz.foo.com"));
-        // Base domain itself does NOT match (consistent with
-        // wildcard_matches in src/config/types.rs).
+        // Base domain itself does NOT match.
         assert!(!host_matches_pattern("*.foo.com", "foo.com"));
         // Multi-level subdomains do NOT match (single-label wildcard).
         assert!(!host_matches_pattern("*.foo.com", "a.b.foo.com"));

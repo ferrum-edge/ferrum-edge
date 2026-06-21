@@ -7,7 +7,7 @@
 
 use super::env_guard::EnvGuard;
 use ferrum_edge::identity::ca::{
-    CaBackend, CaError, CertificateAuthority, IssuanceRequest, bootstrap, internal,
+    CaBackend, CaError, CertificateAuthority, IssuanceRequest, SignedSvid, bootstrap, internal,
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 
@@ -33,6 +33,25 @@ fn leaf_not_after(cert_der: &[u8]) -> chrono::DateTime<chrono::Utc> {
     let (_, parsed) = X509Certificate::from_der(cert_der).expect("issued cert parses");
     chrono::DateTime::<chrono::Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0)
         .expect("issued cert validity is representable")
+}
+
+#[test]
+fn signed_svid_debug_redacts_private_key() {
+    let trust_domain = TrustDomain::new("td.debug-redaction").unwrap();
+    let svid = SignedSvid {
+        spiffe_id: SpiffeId::from_parts(&trust_domain, "ns/test/sa/debug").unwrap(),
+        cert_chain_der: vec![b"leaf".to_vec()],
+        private_key_pkcs8_der: b"secret-test-key".to_vec().into(),
+        not_after: chrono::Utc::now(),
+    };
+
+    let debug = format!("{svid:?}");
+
+    assert!(debug.contains("private_key_pkcs8_der: <redacted>"));
+    assert!(
+        !debug.contains("115, 101, 99, 114, 101, 116"),
+        "Debug output must not expose private-key bytes"
+    );
 }
 
 #[test]

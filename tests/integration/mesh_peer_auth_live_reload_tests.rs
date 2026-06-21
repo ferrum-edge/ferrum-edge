@@ -228,6 +228,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: ferrum_edge::config::types::AuthMode::Single,

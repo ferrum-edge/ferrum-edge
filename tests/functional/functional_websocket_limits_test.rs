@@ -8,9 +8,10 @@ use futures_util::{SinkExt, StreamExt};
 use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 async fn free_port() -> u16 {
@@ -60,6 +61,80 @@ async fn start_ws_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
     handle
 }
 
+#[derive(Clone, Copy)]
+enum RawBackendFirstFrameShape {
+    CoalescedComplete,
+    EmptyResidual,
+    CoalescedPrefix,
+}
+
+async fn start_raw_ws_first_frame_backend(
+    port: u16,
+    shape: RawBackendFirstFrameShape,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .expect("bind raw WS backend");
+        let (mut stream, key) = loop {
+            let Ok((mut stream, _addr)) = listener.accept().await else {
+                return;
+            };
+            let request = read_headers(&mut stream)
+                .await
+                .expect("backend reads gateway handshake");
+            let Some(key) = header_value(&request, "sec-websocket-key") else {
+                continue;
+            };
+            break (stream, key);
+        };
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n\
+             \r\n",
+            derive_accept_key(key.as_bytes())
+        );
+        let frame = first_backend_frame();
+        match shape {
+            RawBackendFirstFrameShape::CoalescedComplete => {
+                let mut bytes = response.into_bytes();
+                bytes.extend_from_slice(&frame);
+                stream
+                    .write_all(&bytes)
+                    .await
+                    .expect("backend writes 101 + full frame");
+            }
+            RawBackendFirstFrameShape::EmptyResidual => {
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("backend writes 101");
+                sleep(Duration::from_millis(75)).await;
+                stream
+                    .write_all(&frame)
+                    .await
+                    .expect("backend writes frame after 101");
+            }
+            RawBackendFirstFrameShape::CoalescedPrefix => {
+                let mut bytes = response.into_bytes();
+                bytes.extend_from_slice(&frame[..3]);
+                stream
+                    .write_all(&bytes)
+                    .await
+                    .expect("backend writes 101 + frame prefix");
+                sleep(Duration::from_millis(75)).await;
+                stream
+                    .write_all(&frame[3..])
+                    .await
+                    .expect("backend writes frame suffix");
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_u8()).await;
+    })
+}
+
 fn gateway_binary_path() -> &'static str {
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
         "./target/debug/ferrum-edge"
@@ -79,6 +154,7 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
+    pool_enable_http2: false
 
 consumers: []
 plugin_configs: []
@@ -87,6 +163,79 @@ plugin_configs: []
 
     let mut file = std::fs::File::create(config_path).expect("create config file");
     file.write_all(config.as_bytes()).expect("write config");
+}
+
+fn first_backend_frame() -> Vec<u8> {
+    vec![0x82, 0x03, 0x01, 0x02, 0x03]
+}
+
+async fn read_headers(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        if find_header_end(&buf).is_some() {
+            return Ok(buf);
+        }
+        let n = timeout(Duration::from_secs(5), stream.read(&mut chunk)).await??;
+        if n == 0 {
+            return Err("connection closed before headers completed".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 8192 {
+            return Err("headers exceeded test limit".into());
+        }
+    }
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn header_value(headers: &[u8], name: &str) -> Option<String> {
+    let text = std::str::from_utf8(headers).ok()?;
+    text.lines().find_map(|line| {
+        let (raw_name, raw_value) = line.split_once(':')?;
+        raw_name
+            .trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| raw_value.trim().to_string())
+    })
+}
+
+async fn raw_ws_client_first_backend_frame(
+    gateway_port: u16,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{gateway_port}")).await?;
+    let request = "GET /ws-echo HTTP/1.1\r\n\
+                   Host: localhost\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Version: 13\r\n\
+                   \r\n";
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_headers(&mut stream).await?;
+    let header_end = find_header_end(&response).ok_or("gateway response headers incomplete")?;
+    let response_text = std::str::from_utf8(&response[..header_end])?;
+    assert!(
+        response_text.starts_with("HTTP/1.1 101"),
+        "gateway response was not a WebSocket 101: {response_text:?}"
+    );
+    let mut frame = vec![0u8; first_backend_frame().len()];
+    let tail = &response[header_end..];
+    let copied = tail.len().min(frame.len());
+    frame[..copied].copy_from_slice(&tail[..copied]);
+    if copied < frame.len() {
+        timeout(
+            Duration::from_secs(5),
+            stream.read_exact(&mut frame[copied..]),
+        )
+        .await??;
+    }
+    Ok(frame)
 }
 
 async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -218,4 +367,38 @@ async fn test_websocket_global_frame_size_limit_rejects_oversized_frame() {
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_websocket_tunnel_preserves_backend_frame_coalesced_with_101() {
+    crate::common::ensure_gateway_built().expect("build gateway");
+
+    for shape in [
+        RawBackendFirstFrameShape::CoalescedComplete,
+        RawBackendFirstFrameShape::EmptyResidual,
+        RawBackendFirstFrameShape::CoalescedPrefix,
+    ] {
+        let backend_port = free_port().await;
+        let backend = start_raw_ws_first_frame_backend(backend_port, shape).await;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.yaml");
+        write_ws_config(&config_path, backend_port);
+
+        let (mut gateway, gateway_port) = start_gateway_with_retry(
+            config_path.to_str().unwrap(),
+            &[("FERRUM_WEBSOCKET_TUNNEL_MODE", "true")],
+        )
+        .await;
+
+        let frame = raw_ws_client_first_backend_frame(gateway_port)
+            .await
+            .expect("client receives backend frame");
+        assert_eq!(frame, first_backend_frame());
+
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        backend.abort();
+    }
 }

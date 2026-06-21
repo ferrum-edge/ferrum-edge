@@ -586,7 +586,8 @@ async fn run_discovery_loop(
     }
 }
 
-/// Check if two target lists are equivalent (same host:port:weight and tags, ignoring order).
+/// Check if two target lists are equivalent (same host:port:policy-port:weight
+/// and tags, ignoring order).
 /// Uses borrowed tuples sorted in place to avoid per-poll string allocations while
 /// preserving multiplicity (duplicate targets are compared correctly).
 pub fn targets_equal(a: &[UpstreamTarget], b: &[UpstreamTarget]) -> bool {
@@ -594,14 +595,22 @@ pub fn targets_equal(a: &[UpstreamTarget], b: &[UpstreamTarget]) -> bool {
         return false;
     }
     // Build sortable borrowed tuples — no String allocations.
-    fn to_key(t: &UpstreamTarget) -> (&str, u16, u32, Vec<(&str, &str)>) {
+    type TargetSortKey<'a> = (&'a str, u16, Option<u16>, u32, Vec<(&'a str, &'a str)>);
+
+    fn to_key(t: &UpstreamTarget) -> TargetSortKey<'_> {
         let mut tag_pairs: Vec<(&str, &str)> = t
             .tags
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         tag_pairs.sort();
-        (t.host.as_str(), t.port, t.weight, tag_pairs)
+        (
+            t.host.as_str(),
+            t.port,
+            t.service_port_policy_key,
+            t.weight,
+            tag_pairs,
+        )
     }
     let mut a_keys: Vec<_> = a.iter().map(to_key).collect();
     let mut b_keys: Vec<_> = b.iter().map(to_key).collect();

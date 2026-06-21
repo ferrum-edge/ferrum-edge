@@ -43,7 +43,7 @@ use crate::modes::mesh::config::{
     MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
-    validate_mesh_condition_ip_block,
+    validate_mesh_condition_ip_block, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -242,14 +242,28 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
 ///
 /// A host-routed inbound `Proxy` carries `listen_port == None`, so without this
 /// the port would fall back to `frontend_listen_port` (the shared `:15006`
-/// listener socket) and a port-scoped rule would never match. Non-mesh and
-/// outbound traffic keep the existing listener/`listen_port` derivation.
+/// listener socket) and a port-scoped rule would never match.
+///
+/// For mesh **outbound** routes, `destination.port` is the captured original
+/// destination port when present. Direct/non-Linux single-port routes fall
+/// back to the router-stamped service port. They must never fall back to the
+/// outbound capture listener port (`:15001`), because that makes port-scoped
+/// ALLOWs over-deny and DENYs under-deny.
 fn mesh_authz_destination_port(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     matched_proxy: Option<&crate::config::types::Proxy>,
     ingress_listener_authz_port: Option<u16>,
+    outbound_destination_authz_port: Option<u16>,
+    orig_dst: Option<std::net::SocketAddr>,
     frontend_listen_port: Option<u16>,
 ) -> Option<u16> {
+    if mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound) {
+        return orig_dst
+            .map(|addr| addr.port())
+            .or(outbound_destination_authz_port)
+            .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port));
+    }
+
     mesh_inbound_app_port(
         mesh_direction,
         matched_proxy.map(|proxy| (proxy.id.as_str(), proxy.backend_port)),
@@ -257,6 +271,10 @@ fn mesh_authz_destination_port(
     )
     .or(frontend_listen_port)
     .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
+}
+
+fn mesh_authz_authorization_path(path: &str) -> String {
+    crate::router_cache::normalize_encoded_slashes(path).into_owned()
 }
 
 /// The authorization destination port for a materialized sidecar inbound route,
@@ -336,6 +354,17 @@ const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"
 
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
+        // Whether the policies arrived via a `mesh_slice` (the slice-apply path
+        // builds this — see `inject_mesh_authz_plugin`) vs. a flat
+        // `mesh_policies` operator config with no slice context. This selects
+        // how `validate_scope_filter_identity` treats a workload-selector policy
+        // whose labels cannot be resolved against the proxy: the slice path
+        // computed authoritative (possibly empty/ambiguous) labels and a
+        // downstream consumer may re-filter, so it tolerates; a flat operator
+        // config has no such recovery and must fail closed instead of silently
+        // dropping the policy (which `evaluate_mesh_authorization_policies`
+        // would then treat as allow-by-default).
+        let from_slice = config.get("mesh_slice").is_some();
         let mut slice = if let Some(value) = config.get("mesh_slice") {
             serde_json::from_value::<MeshSlice>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
@@ -371,6 +400,20 @@ impl MeshAuthz {
             let labels = serde_json::from_value::<BTreeMap<String, String>>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid labels: {e}"))?;
             slice.labels = labels;
+            // An explicit `labels` override is the DP resolving its AUTHORITATIVE
+            // identity (the documented way to pin a workload's labels — see
+            // docs/mesh.md "The marker is cleared on the recovered slice once the
+            // DP has resolved its authoritative labels"). Once provided, the
+            // shared-SPIFFE `labels_ambiguous` intersection marker is stale: these
+            // labels — not the slice's partial intersection — are this workload's
+            // real set, so the cold-path `retain` can narrow the candidate-any
+            // superset deterministically. Leaving the marker set would make the
+            // ambiguous fail-closed branches in `validate_scope_filter_identity`
+            // reject an otherwise-valid workload whose authoritative labels simply
+            // do not match a candidate-only selector policy carried in the superset
+            // (e.g. override `role=worker` while the slice also carried a
+            // `role=api` policy). Clear it so the override governs scoping.
+            slice.labels_ambiguous = false;
         }
 
         validate_policy_ip_inputs(&slice.mesh_policies)?;
@@ -381,7 +424,7 @@ impl MeshAuthz {
             .unwrap_or(false);
 
         if !per_pod_policy_scoping {
-            validate_scope_filter_identity(&slice)?;
+            validate_scope_filter_identity(&slice, from_slice)?;
 
             // Pre-filter the slice's mesh_policies down to those whose `scope`
             // applies to this proxy's workload identity. Done once at
@@ -675,7 +718,24 @@ impl MeshAuthz {
     }
 }
 
-fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
+/// Whether a policy carries at least one ENFORCING rule (`Allow` / `Deny`).
+///
+/// An `Audit`-only policy is non-enforcing per Istio semantics:
+/// `evaluate_mesh_authorization_policies` records `mesh_authz.audit_policy`
+/// metadata and returns `Continue`, so dropping an audit-only policy never
+/// changes the allow/deny outcome (it is NOT the allow-by-default fail-open the
+/// scope-resolution guards below protect against). The construction-time
+/// fail-closed branches must therefore gate on this, exactly as the per-pod
+/// missing-scope check in `MeshAuthz::new` (`has_scoped_policies`) already does
+/// — an unscopable audit-only selector policy is skipped, not rejected.
+fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
+    policy
+        .rules
+        .iter()
+        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+}
+
+fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
 
@@ -704,9 +764,135 @@ fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
                 }
 
                 if !selector.labels.is_empty() && !has_proxy_labels {
+                    if !from_slice && policy_has_enforcing_rule(policy) {
+                        // Operator-direct config (flat `mesh_policies`, no
+                        // `mesh_slice` context): a workload-selector policy
+                        // carries selector labels but the operator supplied no
+                        // proxy `labels`, so the cold-path `retain` would drop
+                        // it and `evaluate_mesh_authorization_policies` would
+                        // then allow the request by default — a silent fail-open
+                        // for a DENY/ALLOW the operator clearly intended to
+                        // apply. There is no downstream consumer to recover the
+                        // labels here (unlike the slice path), so fail closed at
+                        // construction and make the operator supply the proxy's
+                        // identity.
+                        //
+                        // Gated on an ENFORCING rule: an AUDIT-only operator
+                        // selector policy is non-enforcing, so dropping it is a
+                        // no-op, not a fail-open — it falls through to the
+                        // warn-and-tolerate path below (the `!from_slice` audit
+                        // exemption, consistent with the slice-path branches and
+                        // the per-pod missing-scope `has_scoped_policies` check).
+                        return Err(format!(
+                            "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
+                             no proxy labels are configured; set `labels` so the policy can be \
+                             scoped to this workload",
+                            policy.name, selector.labels
+                        ));
+                    }
+                    // Slice-apply path with no resolved proxy labels.
+                    if slice.labels_ambiguous && policy_has_enforcing_rule(policy) {
+                        // The slice marked these labels as an ambiguous
+                        // shared-SPIFFE intersection and shipped the selector
+                        // policy as a candidate-any superset for a label-holding
+                        // consumer to re-filter. Reaching mesh_authz `new()` with
+                        // EMPTY `slice.labels` means that recovery already failed:
+                        // the per-pod NodeWaypoint consumer skips this validation
+                        // entirely (it re-filters per pod), so we are a
+                        // Sidecar/Ambient/xDS DP whose labels are final, and the
+                        // xDS reverse path only leaves `labels` empty when the DP
+                        // also had no local `FERRUM_MESH_WORKLOAD_LABELS` to
+                        // prefer. There is no further consumer; the cold-path
+                        // `retain` would drop the policy and
+                        // `evaluate_mesh_authorization_policies` would then allow
+                        // by default — a silent fail-open for a selector DENY/ALLOW
+                        // that demonstrably applies to a candidate workload. Fail
+                        // closed and make the operator pin the proxy identity.
+                        //
+                        // Gated on an ENFORCING rule: an AUDIT-only selector policy
+                        // is a non-enforcing no-op (it only records audit metadata
+                        // and continues), so dropping it via the cold-path `retain`
+                        // is NOT a fail-open — rejecting plugin construction for it
+                        // would be a regression. It falls through to the
+                        // warn-and-tolerate path below, mirroring the per-pod
+                        // missing-scope `has_scoped_policies` audit exemption.
+                        return Err(format!(
+                            "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
+                             the slice resolved no proxy labels for this ambiguous shared-SPIFFE \
+                             workload; set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS so the \
+                             policy can be scoped to this workload",
+                            policy.name, selector.labels
+                        ));
+                    }
+                    // Reached when the slice is NOT ambiguous (the slice is
+                    // authoritative for THIS workload and a label-based selector
+                    // simply does not apply — single-candidate or label-less
+                    // workload), OR the slice IS ambiguous but the policy is
+                    // AUDIT-only (non-enforcing — gated out of the fail-closed
+                    // branch above). In both cases dropping the policy via the
+                    // cold-path `retain` is correct, not a fail-open: a
+                    // non-applicable authoritative selector or an audit-only no-op
+                    // never opens an allow-by-default hole. Warn for visibility but
+                    // tolerate construction (a hard error would reject the slice or
+                    // drop authz entirely — issue #1708); set `mesh_slice.labels` /
+                    // `FERRUM_MESH_WORKLOAD_LABELS` for deterministic selector
+                    // scoping on Sidecar/Ambient.
+                    //
+                    // A current Ferrum CP cannot reach this branch with an
+                    // ENFORCING genuinely-ambiguous slice: it sets
+                    // `labels_ambiguous` on divergent shared-SPIFFE candidates
+                    // (slice.rs), and the candidate-any projection only keeps a
+                    // selector policy that matches SOME candidate — a single
+                    // label-less candidate `{}` never matches a non-empty selector,
+                    // so the policy is dropped at slice build and never rides in.
+                    // The only way an unmarked empty-label slice carries an
+                    // unsatisfiable enforcing selector policy is a cross-version
+                    // slice from a CP predating the marker (serde defaults
+                    // `labels_ambiguous = false`). Per the Build-Out Policy (no
+                    // legacy shims for old wire/config shapes; CP and DP ship from
+                    // one binary version), that case is out of scope and is not
+                    // failed closed here — set the labels to pin identity.
+                    tracing::warn!(
+                        policy = %policy.name,
+                        "mesh_authz: workload-selector policy has selector labels but the slice \
+                         resolved no proxy labels for this workload; not enforced here — set \
+                         mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS for deterministic scoping"
+                    );
+                } else if slice.labels_ambiguous
+                    && from_slice
+                    && policy_has_enforcing_rule(policy)
+                    && !workload_selector_matches(selector, &slice.namespace, &slice.labels)
+                {
+                    // Ambiguous shared-SPIFFE slice with a NON-EMPTY label
+                    // intersection (e.g. candidates share `app=shared` but only
+                    // one has `role=api`). `slice.labels` here is just that
+                    // partial intersection, NOT this workload's authoritative
+                    // labels, and the slice carried this candidate-only selector
+                    // policy (`role=api`) as a superset. Because the selector is
+                    // not satisfied by the partial intersection, the cold-path
+                    // `retain` below would DROP it; if no other ALLOW remains
+                    // `evaluate_mesh_authorization_policies` then allows by default
+                    // — the non-empty-intersection fail-open. The marker reaching
+                    // here unchanged (xDS preserves it when the DP had no local
+                    // labels to make the intersection authoritative; native
+                    // MeshSubscribe carries it verbatim) proves the labels are not
+                    // final, so we cannot prove this DENY/ALLOW does not apply.
+                    // Fail closed and make the operator pin the proxy identity so
+                    // the candidate-any superset can be re-filtered deterministically.
+                    //
+                    // Gated on an ENFORCING rule: an AUDIT-only candidate-only
+                    // selector policy is a non-enforcing no-op, so dropping it via
+                    // the cold-path `retain` does not open an allow-by-default hole.
+                    // Rejecting plugin construction for it would be a regression, so
+                    // it is tolerated (the `retain` still drops it from evaluation),
+                    // mirroring the per-pod missing-scope `has_scoped_policies` audit
+                    // exemption.
                     return Err(format!(
-                        "mesh_authz: policy '{}' uses workload selector labels but no proxy labels are configured; set mesh_slice.labels or labels",
-                        policy.name
+                        "mesh_authz: policy '{}' uses a workload selector with labels {:?} that the \
+                         ambiguous shared-SPIFFE slice's partial label intersection {:?} cannot \
+                         resolve; set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS so the policy \
+                         can be scoped to this workload",
+                        policy.name, selector.labels, slice.labels
                     ));
                 }
             }
@@ -792,6 +978,8 @@ impl Plugin for MeshAuthz {
             ctx.mesh_direction,
             ctx.matched_proxy.as_deref(),
             ctx.mesh_inbound_listener_authz_port,
+            ctx.mesh_outbound_destination_authz_port,
+            ctx.orig_dst,
             ctx.frontend_listen_port,
         );
         // Istio source IP matchers. `source.ip` is the immediate downstream
@@ -816,7 +1004,7 @@ impl Plugin for MeshAuthz {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
-            path: Some(ctx.path.clone()),
+            path: Some(mesh_authz_authorization_path(&ctx.path)),
             host,
             port,
             headers,
@@ -1253,7 +1441,9 @@ fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
 // no longer fails open.
 #[cfg(test)]
 mod tests {
-    use super::mesh_inbound_app_port;
+    use super::{
+        mesh_authz_authorization_path, mesh_authz_destination_port, mesh_inbound_app_port,
+    };
     use crate::modes::mesh::{
         MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
     };
@@ -1338,5 +1528,67 @@ mod tests {
             mesh_inbound_app_port(Some(MeshTrafficDirection::Inbound), None, None),
             None,
         );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_uses_orig_dst_for_outbound() {
+        let orig_dst = "10.0.0.10:9080".parse().expect("valid socket addr");
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Outbound),
+                None,
+                None,
+                Some(8080),
+                Some(orig_dst),
+                Some(15001),
+            ),
+            Some(9080),
+            "outbound authz must prefer the real captured destination port over route/listener ports"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_uses_selected_outbound_service_port_without_orig_dst() {
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Outbound),
+                None,
+                None,
+                Some(8080),
+                None,
+                Some(15001),
+            ),
+            Some(8080),
+            "single-port direct/non-Linux outbound routes use the router-selected service port"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_does_not_fall_back_to_capture_listener_for_outbound() {
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Outbound),
+                None,
+                None,
+                None,
+                None,
+                Some(15001),
+            ),
+            None,
+            "outbound destination.port must not evaluate as the shared capture listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_authorization_path_normalizes_encoded_slashes() {
+        assert_eq!(
+            mesh_authz_authorization_path("/admin%2fsecret"),
+            "/admin/secret"
+        );
+        assert_eq!(
+            mesh_authz_authorization_path("/admin%252Fsecret"),
+            "/admin/secret"
+        );
+        assert_eq!(mesh_authz_authorization_path("/api%20name"), "/api%20name");
     }
 }

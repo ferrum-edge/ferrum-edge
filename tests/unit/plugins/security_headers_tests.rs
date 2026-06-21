@@ -1,5 +1,7 @@
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
+use ferrum_edge::plugins::{
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -73,7 +75,62 @@ async fn opt_in_hsts_csp_and_custom_headers_are_applied() {
 
 #[test]
 fn security_headers_is_a_security_plugin() {
-    assert!(is_security_plugin("security_headers"));
+    assert_eq!(
+        plugin_failure_policy("security_headers"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
+}
+
+#[test]
+fn may_add_no_transform_reports_conservative_capability() {
+    let mut headers = HashMap::from([("cache-control".to_string(), "max-age=60".to_string())]);
+    let ctx = ctx();
+    let set_only = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "set": { "Cache-Control": "no-transform" }
+    }))
+    .unwrap();
+    assert!(set_only.may_add_response_cache_control_no_transform(&ctx, &headers));
+
+    let remove_then_set = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "remove": ["Cache-Control"],
+        "set": { "Cache-Control": "no-transform" }
+    }))
+    .unwrap();
+    assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
+
+    headers.insert("cache-control".to_string(), "private".to_string());
+    assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
+}
+
+#[test]
+fn may_add_strong_etag_reports_conservative_capability() {
+    let headers = HashMap::from([("etag".to_string(), "W/\"weak\"".to_string())]);
+    let ctx = ctx();
+    let strong = SecurityHeaders::new(&json!({
+        "set": { "ETag": "\"strong\"" }
+    }))
+    .unwrap();
+    assert!(strong.may_add_response_strong_etag(&ctx, &headers));
+
+    let weak = SecurityHeaders::new(&json!({
+        "set": { "ETag": "W/\"weak\"" }
+    }))
+    .unwrap();
+    assert!(!weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let malformed_weak = SecurityHeaders::new(&json!({
+        "set": { "ETag": "w/\"weak\"" }
+    }))
+    .unwrap();
+    assert!(malformed_weak.may_add_response_strong_etag(&ctx, &headers));
+
+    let spaced_weak = SecurityHeaders::new(&json!({
+        "set": { "ETag": "W/ \"weak\"" }
+    }))
+    .unwrap();
+    assert!(spaced_weak.may_add_response_strong_etag(&ctx, &headers));
 }
 
 #[tokio::test]

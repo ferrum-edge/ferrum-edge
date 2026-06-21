@@ -6,7 +6,11 @@ image:
 namespace: ferrum
 
 controlPlane:
-  enabled: true
+  # Disabled by default because CP mode requires an explicit database URL plus
+  # operator-provided JWT secrets. Use examples/development-values.yaml for a
+  # single-node SQLite lab, or examples/production-existing-secrets-values.yaml
+  # for a Secret-backed install shape.
+  enabled: false
   replicas: 1
   grpcPort: 50051
   rbac:
@@ -33,9 +37,55 @@ controlPlane:
     # chart values. Same applies to FERRUM_K8S_WATCH_NAMESPACES: when
     # unset, the controller follows the T2-A CP namespace scope
     # (FERRUM_CP_NAMESPACES).
+  database:
+    # One of: sqlite, postgres, mysql, mongodb. Required when controlPlane.enabled
+    # or ca.enabled is true.
+    type: ""
+    # Direct URL value. Suitable for local/dev only; prefer urlFrom or
+    # existingSecret for shared environments.
+    url: ""
+    # Full Kubernetes EnvVarSource for FERRUM_DB_URL, for example:
+    # urlFrom:
+    #   secretKeyRef:
+    #     name: ferrum-db
+    #     key: url
+    urlFrom: {}
+    # Shorthand Secret reference for FERRUM_DB_URL.
+    existingSecret:
+      name: ""
+      urlKey: url
+    # SQLite convenience form. Renders FERRUM_DB_URL as
+    # sqlite:<path>?mode=<mode>.
+    sqlite:
+      path: ""
+      mode: rwc
+    # Structured network database form. Direct username/password values are
+    # percent-encoded into FERRUM_DB_URL. For Secret-backed database credentials,
+    # use urlFrom or existingSecret with a fully encoded database URL Secret.
+    host: ""
+    port: null
+    name: ""
+    username: ""
+    password: ""
+    params: {}
+  credentials:
+    adminJwtSecret:
+      value: ""
+      existingSecret:
+        name: ""
+        key: admin-jwt-secret
+      valueFrom: {}
+    cpDpGrpcJwtSecret:
+      value: ""
+      existingSecret:
+        name: ""
+        key: cp-dp-grpc-jwt-secret
+      valueFrom: {}
 
 injector:
-  enabled: true
+  # Disabled by default: the webhook requires a serving-cert Secret and should
+  # be enabled only after that Secret and namespace policy are ready.
+  enabled: false
   replicas: 1
   listenPort: 9443
   requireAnnotation: true
@@ -100,7 +150,9 @@ eastWest:
     FERRUM_MESH_TOPOLOGY: east_west_gateway
 
 ca:
-  enabled: true
+  # Disabled by default. This Deployment runs the Ferrum binary in CP mode, so
+  # it shares the controlPlane database/JWT contract when enabled.
+  enabled: false
   env:
     FERRUM_MESH_PRODUCTION_MODE: "true"
 

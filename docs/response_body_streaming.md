@@ -175,7 +175,7 @@ Built-in plugins with per-request refinement:
 | Plugin | Skips buffering when |
 |--------|---------------------|
 | `compression` | `Accept-Encoding` header is absent (nothing to compress) |
-| `ai_token_metrics` | Request is not POST+JSON (not an AI API call) |
+| `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Request is not POST+JSON |
 | `ai_response_guard` | Request is not POST+JSON |
 

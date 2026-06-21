@@ -32,18 +32,17 @@ use std::net::SocketAddr as StdSocketAddr;
 
 use tokio::sync::watch;
 
-/// Idle timeout for a captured UDP session, in milliseconds. Stage 3 only
-/// tracks sessions for DoS accounting (no backend leg yet), so a fixed bound
-/// mirroring the plain-UDP default (60s) is sufficient; Stage 4's egress relay
-/// will adopt the per-proxy `udp_idle_timeout_seconds`.
-#[cfg(target_os = "linux")]
-const CAPTURE_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
-
 /// Configuration for the mesh UDP capture listener.
 pub struct MeshUdpCaptureConfig {
     /// Address+port to bind. The port is the Stage-2 TPROXY listener port
     /// (`FERRUM_MESH_CAPTURE_UDP_PORT`, default 15011).
     pub addr: StdSocketAddr,
+    /// Shared proxy state — threaded in for Stage 4 so the listener can consult
+    /// the `mesh_udp_egress` route table, LB-select a workload, gate on the
+    /// gateway SVID + HBONE capability, and open the datagram-over-HBONE tunnel.
+    /// (Stage 3 dropped captured datagrams and needed no state; this is the
+    /// enabling refactor.)
+    pub state: std::sync::Arc<super::ProxyState>,
     /// Per-listener shutdown receiver (config-driven removal).
     pub shutdown: watch::Receiver<bool>,
     /// Gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`, the recv
@@ -87,6 +86,24 @@ fn is_ipv6_unavailable_error(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Canonicalize an IPv4-mapped-IPv6 `SocketAddr` (`::ffff:a.b.c.d`) to its plain
+/// IPv4 form, leaving genuine IPv6 and plain IPv4 addresses untouched.
+///
+/// The dual-stack `[::]` capture socket reports an IPv4 sender as a V4-mapped
+/// `SocketAddr::V6` (`::ffff:a.b.c.d`), but the orig-dst recovered from the
+/// per-datagram cmsg for that SAME packet is a `SocketAddr::V4`. Left as-is, the
+/// reply path builds an AF_INET socket from the V4 orig-dst and then
+/// `send_to(client)` with a V6-mapped client — a family mismatch that fails the
+/// send, so the pod never sees a reply (codex r2 P1). Canonicalizing the client
+/// here (at capture, BEFORE the session key is built) makes the client family
+/// match the orig-dst family for the reply socket AND keeps the session key
+/// consistent (key + reply agree). `IpAddr::to_canonical()` unmaps only
+/// V4-mapped V6; a real IPv6 client keeps its V6 address.
+#[cfg(target_os = "linux")]
+fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// Start the mesh UDP capture listener (Linux).
 ///
 /// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
@@ -106,6 +123,7 @@ pub async fn start_mesh_udp_capture_listener(
 
     let MeshUdpCaptureConfig {
         addr,
+        state,
         shutdown,
         global_shutdown,
         max_sessions,
@@ -219,7 +237,7 @@ pub async fn start_mesh_udp_capture_listener(
         addr = %addr,
         v4_origdst,
         v6_origdst,
-        "Mesh UDP capture listener started (capture→drop; egress is Stage 4)"
+        "Mesh UDP capture listener started (capture→datagram-over-HBONE egress; Ambient only)"
     );
 
     // Idle-session sweep — reaps captured sessions whose last datagram is older
@@ -278,16 +296,37 @@ pub async fn start_mesh_udp_capture_listener(
                         Ok(n) if n > 0 => {
                             for i in 0..n {
                                 let (data, client) = recv_batch.datagram(i);
-                                let data_len = data.len();
                                 let orig_dst = recv_batch.orig_dst(i);
-                                handle_captured_datagram(
-                                    &sessions,
-                                    &active_sessions,
-                                    client,
-                                    orig_dst,
-                                    data_len,
-                                    max_sessions,
-                                );
+                                let gro = recv_batch.gro_segment_size(i);
+                                // GRO may coalesce many datagrams into one buffer;
+                                // frame EACH segment separately (a coalesced
+                                // superblock is N datagrams, not one — risk #8).
+                                match gro {
+                                    Some(seg) if (seg as usize) < data.len() => {
+                                        for chunk in data.chunks(seg as usize) {
+                                            handle_captured_datagram(
+                                                &sessions,
+                                                &active_sessions,
+                                                &state,
+                                                client,
+                                                orig_dst,
+                                                chunk,
+                                                max_sessions,
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        handle_captured_datagram(
+                                            &sessions,
+                                            &active_sessions,
+                                            &state,
+                                            client,
+                                            orig_dst,
+                                            data,
+                                            max_sessions,
+                                        );
+                                    }
+                                }
                             }
                             total_drained += n;
                             // Bound the per-wakeup drain so one busy socket can't
@@ -305,94 +344,859 @@ pub async fn start_mesh_udp_capture_listener(
     Ok(())
 }
 
-/// Per-(client, orig-dst) capture session. Stage 3 holds no backend leg — it
-/// exists only so the listener can bound concurrent flows and age them out for
-/// DoS resistance. `last_activity` is monotonic millis from
-/// [`crate::socket_opts::monotonic_now_ms`] (never goes backwards under NTP
-/// slew, so idle expiry always fires).
+/// Bounded depth of a per-session egress channel. Captured datagrams are
+/// queued here from the (synchronous, hot-path-light) recv loop and drained by
+/// the async egress task that frames + writes them onto the HBONE tunnel. A
+/// full channel DROPS the datagram (UDP-appropriate backpressure — UDP gives no
+/// delivery guarantee, and blocking the bounded recv-loop drain would let one
+/// slow session starve every other captured flow). Sized generously so a brief
+/// tunnel-dial stall (the channel buffers datagrams until the tunnel is ready)
+/// does not shed a normal burst.
+///
+/// This datagram-count bound is paired with [`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]:
+/// 1024 datagrams of up to 65535 bytes each would let many stalled-dial sessions
+/// buffer ~64 MiB apiece, a memory-exhaustion DoS, so the BYTE cap (not the count
+/// alone) is what bounds per-session memory (codex r3).
+#[cfg(target_os = "linux")]
+const EGRESS_CHANNEL_DEPTH: usize = 1024;
+
+/// Maximum total bytes queued in a per-session egress channel. The mpsc bounds
+/// datagram COUNT; this bounds their aggregate SIZE so a slow/stalled HBONE
+/// dial+write cannot let each admitted session buffer `EGRESS_CHANNEL_DEPTH ×
+/// up-to-65535` bytes (a memory-exhaustion DoS). Together with
+/// `FERRUM_UDP_MAX_SESSIONS` this bounds worst-case queued memory to
+/// `max_sessions × EGRESS_CHANNEL_MAX_QUEUED_BYTES`. A datagram that would push
+/// the session over this cap is DROPPED (UDP-appropriate), tracked lock-free via
+/// the per-session `queued_bytes` atomic (bumped on enqueue, decremented as the
+/// egress task drains), so the cap check stays cheap on the recv-loop hot path.
+/// Mirrors the plain UDP proxy's `PENDING_SESSION_MAX_QUEUED_BYTES`; sized larger
+/// (256 KiB) because this carries an established session's traffic, not just a
+/// connection-setup flight.
+#[cfg(target_os = "linux")]
+const EGRESS_CHANNEL_MAX_QUEUED_BYTES: usize = 256 * 1024;
+
+/// Fallback write deadline for a single framed tunnel `write_all`, used ONLY when
+/// the per-session idle timeout is disabled (`udp_idle_timeout_seconds == 0`). A
+/// stalled HBONE peer (stopped reading / exhausted h2 flow-control) must not let
+/// the framed `write_all` stay pending forever and leak the egress task; bounding
+/// the write tears the session down instead. When an idle timeout IS configured,
+/// that window is reused as the write deadline (a write blocked longer than the
+/// idle window is itself a dead session), so this only covers the
+/// idle-disabled case.
+#[cfg(target_os = "linux")]
+const EGRESS_TUNNEL_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Monotonic, process-wide generator of per-session identity tokens. Stamped on
+/// every admitted session and re-checked at teardown so a task only ever removes
+/// ITS OWN map entry. Wraparound is a non-issue: a `u64` at any realistic admit
+/// rate never recycles a live token within one session's lifetime.
+#[cfg(target_os = "linux")]
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-(client, orig-dst) capture session (Stage 4). `last_activity` is
+/// monotonic millis from [`crate::socket_opts::monotonic_now_ms`] (never goes
+/// backwards under NTP slew, so idle expiry always fires). `tx` hands captured
+/// datagram payloads to the per-session egress task; when the session is reaped
+/// (idle sweep) or the map entry is replaced, dropping `tx` closes the channel,
+/// which ends the egress task and tears the tunnel down (its `poll_shutdown`
+/// sends the h2 end-stream).
 #[cfg(target_os = "linux")]
 struct CaptureSession {
-    last_activity: u64,
+    /// SHARED monotonic-millis activity clock (codex r3). The same `Arc` is held
+    /// by the egress + return-path tasks, which bump it on a delivered datagram
+    /// in EITHER direction, and read by the independent idle sweep. Without the
+    /// share, the sweep clock (refreshed only on client→egress datagrams) and the
+    /// task watchdog clock (bidirectional) disagree, so a session where the
+    /// client goes quiet while the destination keeps replying would have its map
+    /// entry reaped by the sweep mid-flow while the task is still alive. One
+    /// shared atomic keeps both clocks in lockstep.
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Unique identity token for THIS session, stamped at admit from
+    /// [`NEXT_SESSION_ID`]. The egress task removes its own map entry only when
+    /// the stored token still matches (`remove_if`), so a replacement session
+    /// admitted in the gap between the idle sweep dropping this entry's `tx` and
+    /// this task observing the closed channel is never clobbered (codex r1 P2:
+    /// remove-after-replace race).
+    session_id: u64,
+    /// Egress channel to the per-session task. `None` for a session whose
+    /// orig-dst matched no routable `mesh_udp_egress` entry — but such flows are
+    /// never inserted (they drop without a session), so in practice this is
+    /// always `Some` for a live session. Kept as `Option` only so the unit
+    /// tests can exercise the keying/cap logic without a live tunnel.
+    tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    /// SHARED count of bytes currently queued in the egress channel (codex r3).
+    /// Bumped by the recv loop on a successful enqueue, decremented by the egress
+    /// task as it drains each datagram, so a per-session BYTE cap
+    /// ([`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]) can be enforced on the hot path
+    /// without walking the channel. The `Arc` is shared with the egress task.
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-session idle window in milliseconds, derived from the relay proxy's
+    /// `udp_idle_timeout_seconds` at admit (`0` = idle disabled). The cleanup
+    /// sweep reaps a session only after THIS window of inactivity (codex r7):
+    /// the egress task's own watchdog already honors `udp_idle_timeout_seconds`,
+    /// so the independent sweep must use the same window — a fixed 60s window
+    /// would cut a long-lived quiet flow (idle configured > 60s) or a flow whose
+    /// idle is disabled before the task's watchdog (or the operator) intends.
+    idle_timeout_ms: u64,
 }
 
-/// Record a captured datagram against its session, then DROP it (Stage 3).
+/// Record a captured datagram against its session and forward it toward mesh
+/// egress (Stage 4).
 ///
-/// Inserts/refreshes the `(client, orig-dst)` session under the
-/// `max_sessions` cap and logs the drop at `debug!`. A datagram from a NEW flow
-/// once the cap is reached is dropped without inserting (cheap flood shield);
-/// an existing flow is always refreshed (it already holds a slot). Returns
-/// `true` if the datagram was accounted (existing or newly admitted), `false`
-/// if it was shed at the cap — exposed for unit testing the keying/cap logic.
+/// On a NEW `(client, orig-dst)` flow this consults the `mesh_udp_egress` route
+/// table; only a routable (`Relay`) destination admits a session (under the
+/// `max_sessions` cap) and spawns the per-session egress task. A non-routable
+/// orig-dst (no match, or a declared-but-`CloseNotRoutable` pair) DROPS the
+/// datagram WITHOUT creating a session — fail closed, never guessed, and never
+/// holding a slot for un-routable traffic. An EXISTING flow refreshes its
+/// `last_activity` and enqueues the payload (drop-on-full).
+///
+/// Returns `true` if the datagram was accounted (existing or newly admitted),
+/// `false` if it was dropped (no orig-dst, not routable, cap reached, or the
+/// egress channel was full) — exposed for unit testing the keying/cap logic.
 #[cfg(target_os = "linux")]
 fn handle_captured_datagram(
-    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
-    active_sessions: &std::sync::atomic::AtomicU64,
+    sessions: &std::sync::Arc<
+        dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    >,
+    active_sessions: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    state: &std::sync::Arc<super::ProxyState>,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
-    data_len: usize,
+    data: &[u8],
     max_sessions: usize,
 ) -> bool {
-    use dashmap::mapref::entry::Entry;
-    use std::sync::atomic::Ordering;
     use tracing::debug;
+
+    // Canonicalize an IPv4-mapped-V6 client (`::ffff:a.b.c.d`, how the dual-stack
+    // `[::]` socket reports v4 senders) to its V4 form so it matches the V4
+    // orig-dst family on the reply path AND keys the session consistently (codex
+    // r2 P1). Genuine IPv6 clients are unchanged.
+    let client = canonicalize_socket_addr(client);
 
     let Some(orig_dst) = orig_dst else {
         // No orig-dst cmsg ⇒ we cannot tell where the pod dialed, so there is
-        // nothing to route in Stage 4 and nothing meaningful to key on. Drop.
+        // nothing to route and nothing meaningful to key on. Drop.
         debug!(
             client = %client,
-            size = data_len,
+            size = data.len(),
             "Mesh UDP capture: dropping datagram with no original destination cmsg"
         );
         return false;
     };
+    // Canonicalize the orig-dst too: it normally arrives as `SocketAddr::V4`, but
+    // canonicalizing keeps the reply socket's bind family aligned with the
+    // canonicalized client unconditionally (the reply socket is built from
+    // `key.orig_dst`), so `send_to(client)` never trips a family mismatch.
+    let orig_dst = canonicalize_socket_addr(orig_dst);
 
     let key = CaptureSessionKey { client, orig_dst };
+
+    // Routability is resolved ONCE per (potentially new) flow via a closure so
+    // the cap/keying bookkeeping (`admit_or_refresh_session`) stays a pure,
+    // unit-testable function: it only evaluates the closure on the Vacant path
+    // (an existing flow already proved routable when it was admitted). A
+    // captured datagram whose orig-dst matches no declared `(VIP, UDP port)`
+    // pair — or matches a declared-but-`CloseNotRoutable` pair — drops here,
+    // holding no slot and spawning no task (fail closed, never guessed).
+    // Capture the admission epoch alongside the routability decision so the
+    // spawned session task reuses the SAME snapshot for LB/upstream selection
+    // (codex r7 P2): a config reload landing between admission and session setup
+    // must not pair an old route-table entry with a new load-balancer/upstream
+    // snapshot. The closure (and its epoch load) runs ONLY on the Vacant/admit
+    // path, so the refresh hot path keeps its zero-epoch-load cost.
+    let mut admission_epoch: Option<std::sync::Arc<crate::request_epoch::RequestEpoch>> = None;
+    let resolve_entry = || {
+        let epoch = state.request_epoch.load();
+        let entry = match epoch.route_table.mesh_udp_egress_decision(orig_dst) {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => entry.clone(),
+            _ => return None,
+        };
+        admission_epoch = Some(epoch);
+        Some(entry)
+    };
+
+    match admit_or_refresh_session(
+        sessions,
+        active_sessions,
+        key,
+        data,
+        max_sessions,
+        resolve_entry,
+    ) {
+        SessionAdmission::Refreshed => true,
+        SessionAdmission::Admitted {
+            entry,
+            rx,
+            session_id,
+            last_activity,
+            queued_bytes,
+        } => {
+            // Spawn the per-session egress task (tunnel dial + return path); the
+            // session's `tx` (already inserted by the bookkeeping above) feeds it.
+            // The shared `last_activity`/`queued_bytes` atomics keep the task's
+            // bidirectional clock + byte-drain accounting in sync with the sweep
+            // and recv loop.
+            // Reuse the epoch captured at admission for the session's one-shot
+            // LB/upstream selection (codex r7 P2). `admission_epoch` is always
+            // `Some` on the Admitted path (the routability closure set it);
+            // fall back to a fresh load only defensively.
+            let epoch = admission_epoch
+                .take()
+                .unwrap_or_else(|| state.request_epoch.load());
+            spawn_udp_egress_session(
+                state.clone(),
+                sessions.clone(),
+                active_sessions.clone(),
+                key,
+                session_id,
+                entry,
+                rx,
+                last_activity,
+                queued_bytes,
+                epoch,
+            );
+            true
+        }
+        SessionAdmission::Dropped => false,
+    }
+}
+
+/// Outcome of [`admit_or_refresh_session`].
+#[cfg(target_os = "linux")]
+enum SessionAdmission {
+    /// An existing flow's session was refreshed and the datagram enqueued
+    /// (or dropped-on-full, which still counts as "accounted" for the flow).
+    Refreshed,
+    /// A NEW routable flow was admitted: the caller must spawn the egress task
+    /// driven by `rx`, relaying to `entry`'s LB-selected workload. `session_id`
+    /// is the unique token stamped on the inserted map entry, handed to the task
+    /// so its teardown only removes its own entry (`remove_if`). `last_activity`
+    /// and `queued_bytes` are the SHARED atomics stored on the map entry, handed
+    /// to the task so its bidirectional clock and byte-drain accounting update the
+    /// same atomics the sweep / recv-loop read (codex r3).
+    Admitted {
+        entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
+        rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        session_id: u64,
+        last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    },
+    /// The datagram was dropped (not routable, or the session cap was reached).
+    Dropped,
+}
+
+/// Pure cap/keying bookkeeping for one captured datagram, factored out of
+/// [`handle_captured_datagram`] so it is unit-testable without a live
+/// `ProxyState`/tunnel. Refreshes-or-admits the `(client, orig-dst)` session
+/// under `max_sessions` using a SINGLE DashMap `entry()` guard:
+///
+/// - Occupied flow → refresh `last_activity`, enqueue the payload (drop-on-full),
+///   return [`SessionAdmission::Refreshed`].
+/// - Vacant flow → evaluate `resolve_entry` (the routability gate); on `None`
+///   drop without holding a slot; on `Some(entry)` reserve a slot via the cheap
+///   `active_sessions` atomic (NOT `DashMap::len()`, which walks/locks every
+///   shard on the per-datagram flood path the cap defends against), insert the
+///   session with a fresh channel, enqueue the first datagram, and return
+///   [`SessionAdmission::Admitted`] with the receiver for the caller to drive.
+///
+/// Only the atomic (never another `sessions.*` op) is touched while the entry
+/// guard is held, so this cannot self-deadlock the way a nested `len()` did.
+#[cfg(target_os = "linux")]
+fn admit_or_refresh_session<F>(
+    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    active_sessions: &std::sync::atomic::AtomicU64,
+    key: CaptureSessionKey,
+    data: &[u8],
+    max_sessions: usize,
+    resolve_entry: F,
+) -> SessionAdmission
+where
+    F: FnOnce() -> Option<std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>>,
+{
+    use dashmap::mapref::entry::Entry;
+    use std::sync::atomic::Ordering;
+    use tracing::debug;
+
     let now = crate::socket_opts::monotonic_now_ms();
-    // A single `entry()` guard refreshes-or-admits without re-entering the map.
-    // An Occupied flow already holds a slot, so it is always refreshed (even at
-    // the cap). A Vacant flow reserves a slot via the cheap `active_sessions`
-    // atomic — NOT `DashMap::len()`, which walks/locks every shard on the exact
-    // per-datagram flood path the cap defends against (codex r3 P2) — and is
-    // inserted only when under the cap. Only the atomic (never another
-    // `sessions.*` op) is touched while the entry guard is held, so this cannot
-    // self-deadlock the way a nested `len()` did (codex r1 P1).
     match sessions.entry(key) {
         Entry::Occupied(mut occupied) => {
-            occupied.get_mut().last_activity = now;
+            let session = occupied.get_mut();
+            // Refresh the SHARED clock (the sweep + watchdog both read it).
+            session.last_activity.store(now, Ordering::Relaxed);
+            if let Some(tx) = session.tx.as_ref() {
+                // Drop-on-full by datagram COUNT (the channel bound) OR by queued
+                // BYTES (the per-session memory cap) — UDP backpressure is "drop",
+                // and we must never block the bounded recv-loop drain.
+                enqueue_egress_datagram(tx, &session.queued_bytes, data, key.client, key.orig_dst);
+            }
+            SessionAdmission::Refreshed
         }
         Entry::Vacant(vacant) => {
-            // Reserve a slot atomically; hand it back and shed if over the cap
-            // (mirrors `udp_proxy`'s `active_sessions` admit-or-shed).
+            // Routability gate BEFORE reserving a slot.
+            let Some(entry) = resolve_entry() else {
+                debug!(
+                    client = %key.client,
+                    orig_dst = %key.orig_dst,
+                    "Mesh UDP capture: captured datagram is not a routable mesh UDP destination; \
+                     dropping"
+                );
+                return SessionAdmission::Dropped;
+            };
+
+            // Reserve a slot atomically; hand it back and shed if over the cap.
             let prev = active_sessions.fetch_add(1, Ordering::Relaxed);
             if prev >= max_sessions as u64 {
                 active_sessions.fetch_sub(1, Ordering::Relaxed);
                 debug!(
-                    client = %client,
-                    orig_dst = %orig_dst,
+                    client = %key.client,
+                    orig_dst = %key.orig_dst,
                     "Mesh UDP capture: session cap reached, dropping datagram from new flow"
                 );
-                return false;
+                return SessionAdmission::Dropped;
             }
-            vacant.insert(CaptureSession { last_activity: now });
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
+            // SHARED atomics: the activity clock and the queued-byte counter both
+            // live on the map entry AND are handed to the egress task, so the
+            // sweep, the recv loop, and the task all read/write the same state.
+            let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now));
+            let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // The first datagram fits trivially (empty channel, depth >= 1, byte
+            // cap >> one datagram), so account it and enqueue; `rx` is alive
+            // (returned below) so the send cannot fail.
+            enqueue_egress_datagram(&tx, &queued_bytes, data, key.client, key.orig_dst);
+            // Stamp a unique identity token so teardown removes only THIS entry.
+            let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+            // Per-session idle window for the cleanup sweep, from the relay
+            // proxy's `udp_idle_timeout_seconds` (`0` = disabled). Mirrors the
+            // egress task's own watchdog source so the sweep and the watchdog
+            // agree on liveness (codex r7).
+            let idle_timeout_ms = entry
+                .relay_proxy
+                .udp_idle_timeout_seconds
+                .saturating_mul(1000);
+            vacant.insert(CaptureSession {
+                last_activity: last_activity.clone(),
+                session_id,
+                tx: Some(tx),
+                queued_bytes: queued_bytes.clone(),
+                idle_timeout_ms,
+            });
+            SessionAdmission::Admitted {
+                entry,
+                rx,
+                session_id,
+                last_activity,
+                queued_bytes,
+            }
         }
     }
-    let admitted = true;
-
-    // Stage 3: capture → DROP. Egress relay (forward over the mesh transport to
-    // `orig_dst`'s workload) is Stage 4.
-    debug!(
-        client = %client,
-        orig_dst = %orig_dst,
-        size = data_len,
-        "Mesh UDP capture: captured datagram (Stage 3 drop; egress is Stage 4)"
-    );
-    admitted
 }
 
-/// Spawn the idle-session sweep for the capture listener. Removes sessions
-/// whose `last_activity` is older than [`CAPTURE_SESSION_IDLE_TIMEOUT_MS`] on a
-/// fixed interval; exits when the per-listener shutdown fires.
+/// Enqueue one captured datagram onto a session's egress channel, dropping it
+/// (UDP-appropriate) if either the channel's datagram-COUNT bound or the
+/// per-session queued-BYTE cap ([`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]) would be
+/// exceeded (codex r3). Lock-free: a single relaxed `fetch_add` reserves the
+/// byte budget, handed back on a full/closed channel; the egress task decrements
+/// `queued_bytes` as it drains, so the counter tracks the live queue depth in
+/// bytes. Kept cheap so the recv-loop hot path stays allocation-light beyond the
+/// unavoidable payload copy into `Bytes`.
+#[cfg(target_os = "linux")]
+fn enqueue_egress_datagram(
+    tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    queued_bytes: &std::sync::atomic::AtomicUsize,
+    data: &[u8],
+    client: SocketAddr,
+    orig_dst: SocketAddr,
+) {
+    use std::sync::atomic::Ordering;
+    use tracing::debug;
+
+    // Reserve the byte budget first; if it would overflow the cap, hand it back
+    // and drop (do NOT enqueue, or the byte counter and channel would diverge).
+    let prev = queued_bytes.fetch_add(data.len(), Ordering::Relaxed);
+    if prev.saturating_add(data.len()) > EGRESS_CHANNEL_MAX_QUEUED_BYTES {
+        queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+        debug!(
+            client = %client,
+            orig_dst = %orig_dst,
+            "Mesh UDP capture: egress queued-byte cap reached; dropping datagram"
+        );
+        return;
+    }
+    if tx.try_send(bytes::Bytes::copy_from_slice(data)).is_err() {
+        // Channel full (count bound) or closed (task gone): undo the byte
+        // reservation so the counter does not leak, and drop.
+        queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+        debug!(
+            client = %client,
+            orig_dst = %orig_dst,
+            "Mesh UDP capture: egress channel full or closed; dropping datagram"
+        );
+    }
+}
+
+/// Spawn the per-session UDP egress task: open a `udp`-marked datagram-over-HBONE
+/// tunnel to the LB-selected workload, frame + write captured datagrams onto it,
+/// and (return path) read framed replies back off it and send them to the client
+/// SOURCED FROM the captured original destination so the pod sees replies from
+/// the VIP:port it dialed.
+///
+/// All the fail-closed gates from the raw-TCP egress path apply (LB selection,
+/// gateway SVID present, HBONE capability proven, pinned-peer identity intact);
+/// any gate failure logs and ends the session (the recv loop already created the
+/// map entry, so it is cleaned up by the idle sweep — the channel just goes
+/// undrained and fills, which drop-on-full handles harmlessly).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_udp_egress_session(
+    state: std::sync::Arc<super::ProxyState>,
+    sessions: std::sync::Arc<
+        dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    >,
+    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    key: CaptureSessionKey,
+    session_id: u64,
+    entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+) {
+    tokio::spawn(async move {
+        run_udp_egress_session(&state, &entry, key, rx, last_activity, queued_bytes, epoch).await;
+        // Session teardown: remove the map entry and decrement the live count so
+        // a finished/failed flow frees its slot immediately (the idle sweep is a
+        // backstop for sessions whose task is still alive but quiescent).
+        //
+        // CONDITIONAL removal (codex r1 P2): see [`remove_session_if_owned`].
+        remove_session_if_owned(&sessions, &active_sessions, &key, session_id);
+    });
+}
+
+/// Tear down a finished/failed egress session: remove its map entry and
+/// decrement the live-session count, but ONLY if the map entry is still THIS
+/// task's session (its `session_id` matches).
+///
+/// If the idle sweep already reaped this entry and a new datagram on the same
+/// `(client, orig-dst)` admitted a REPLACEMENT session in the gap before this
+/// task observed its closed channel, the map now holds the replacement's
+/// `session_id`, not ours. `remove_if` removes (and we decrement) ONLY when the
+/// stored token is still ours — so we never clobber the replacement and never
+/// double-decrement the cap counter. Factored out (pure over the map + atomic)
+/// so the remove-after-replace race is unit-testable without a live tunnel.
+#[cfg(target_os = "linux")]
+fn remove_session_if_owned(
+    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    active_sessions: &std::sync::atomic::AtomicU64,
+    key: &CaptureSessionKey,
+    session_id: u64,
+) {
+    // `remove_if` returns `Some` only when the predicate held and the entry was
+    // removed; a non-matching (replaced) entry is left intact.
+    if sessions
+        .remove_if(key, |_, session| session.session_id == session_id)
+        .is_some()
+    {
+        active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Body of the per-session egress task. Returns when the session ends (client
+/// idle, tunnel closed, or a fail-closed gate tripped). Never panics.
+#[cfg(target_os = "linux")]
+async fn run_udp_egress_session(
+    state: &std::sync::Arc<super::ProxyState>,
+    entry: &std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
+    key: CaptureSessionKey,
+    mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+) {
+    use super::LoadBalancerConnectionGuard;
+    use crate::load_balancer::LoadBalancerCache;
+    use tracing::{debug, warn};
+
+    // The admission epoch is reused here (codex r7 P2) so route resolution (done
+    // at admission) and LB/upstream selection below see ONE coherent config
+    // snapshot — a reload between the two can't pair an old route entry with a new
+    // LB/upstream view. It is needed only for this one-shot setup and is dropped
+    // right after selection (below) rather than pinning the generation for the
+    // session's lifetime.
+    let proxy = entry.relay_proxy.as_ref();
+
+    // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
+    let Some(selection) = LoadBalancerCache::select_target_from(
+        &epoch.load_balancer,
+        &entry.upstream_id,
+        &proxy.id,
+        None,
+    ) else {
+        warn!(
+            service = %entry.service_fqdn,
+            orig_dst = %key.orig_dst,
+            "Mesh UDP egress has no selectable workload target; ending session"
+        );
+        return;
+    };
+    let target = selection.target;
+
+    // Least-connection accounting parity with the raw-TCP / HTTP relay paths
+    // (mirrors handle_mesh_tcp_egress): acquire the guard immediately after
+    // target selection and HOLD it for the session's lifetime so per-target
+    // active-connection counts include long-lived UDP sessions. Dropped on any
+    // early return below and at session teardown, so least-connections LB sees a
+    // UDP session start/stop exactly once.
+    let balancer = epoch
+        .load_balancer
+        .balancers()
+        .get(&entry.upstream_id)
+        .cloned();
+    // Setup-only snapshot: release the epoch now so a long-lived UDP session does
+    // not pin an old config generation in memory (codex r7 P2).
+    drop(epoch);
+    let _lb_guard =
+        LoadBalancerConnectionGuard::new(Some(std::sync::Arc::clone(&target)), balancer);
+
+    if state.gateway_svid_bundle.load().is_none() {
+        warn!(
+            service = %entry.service_fqdn,
+            "Mesh UDP egress requires a loaded gateway SVID; ending session"
+        );
+        return;
+    }
+
+    // ── Dual-transport datagram tunnel (mirrors the raw-TCP egress branch in
+    // `mesh_tcp_egress::handle_mesh_tcp_egress`) ───────────────────────────────
+    // The materializer stamps exactly one transport tag per target (mutually
+    // exclusive). Ambient relays the datagram tunnel over a fresh HBONE CONNECT
+    // (`:15008`, capability-probe-gated); Sidecar relays it over a fresh
+    // mesh-mTLS CONNECT (`:15006`, NO capability registry — a slice-declared
+    // sidecar speaks mesh-mTLS by construction). Both stamp the `udp` marker so
+    // the destination's transport-agnostic inbound relay unframes the tunnel into
+    // a local `UdpSocket` (`is_udp_hbone_connect` → `handle_hbone_udp_request`).
+    // A target with neither tag fails closed (materializer bug).
+    let tunnel = if crate::proxy::hbone_pool::target_hbone_enabled(&target) {
+        // HBONE capability must be proven (the enrollment pass + widened probe
+        // gate keep these records alive; the dispatch gate fails closed until
+        // proven).
+        if !state
+            .backend_capabilities
+            .get(proxy, Some(&target))
+            .is_some_and(|record| record.hbone.is_supported())
+        {
+            debug!(
+                service = %entry.service_fqdn,
+                target_host = %target.host,
+                target_port = target.port,
+                "Mesh UDP egress target has no proven HBONE capability yet; ending session \
+                 (retry after the next capability refresh)"
+            );
+            return;
+        }
+        // Pinned peer identity: present-but-corrupt fails closed. An absent tag
+        // keeps trust-domain-only verification for operator-supplied targets.
+        let expected_peer = match crate::proxy::hbone_pool::target_expected_peer_spiffe(&target) {
+            Ok(peer) => peer,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    error = %err,
+                    "Mesh UDP egress target carries a corrupt pinned identity; refusing dial"
+                );
+                return;
+            }
+        };
+        let hbone_port = crate::proxy::hbone_pool::target_hbone_port(&target);
+        match state
+            .hbone_pool
+            .get_datagram_tunnel(
+                proxy,
+                &target.host,
+                hbone_port,
+                &target.host,
+                target.port,
+                target.dispatch_policy_port(),
+                expected_peer.as_ref(),
+            )
+            .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    target_port = target.port,
+                    error = %err,
+                    "Mesh UDP egress datagram-over-HBONE tunnel failed; ending session"
+                );
+                return;
+            }
+        }
+    } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(&target) {
+        // `mesh.mtls` targets are only ever produced by the materializer, which
+        // always stamps the destination identity — a missing/corrupt pin is a
+        // config-corruption signal and fails closed rather than dialing unpinned.
+        // No capability registry: a slice-declared sidecar peer speaks mesh-mTLS
+        // by construction (mirrors the raw-TCP mesh-mTLS branch).
+        let expected_peer =
+            match crate::proxy::mesh_mtls_pool::target_mesh_mtls_expected_peer(&target) {
+                Ok(peer) => peer,
+                Err(err) => {
+                    warn!(
+                        service = %entry.service_fqdn,
+                        target_host = %target.host,
+                        error = %err,
+                        "Mesh UDP egress mesh.mtls target carries no/invalid pinned identity; \
+                         refusing dial"
+                    );
+                    return;
+                }
+            };
+        let mtls_port = crate::proxy::mesh_mtls_pool::target_mesh_mtls_port(&target);
+        match state
+            .mesh_mtls_pool
+            .open_datagram_tunnel(
+                proxy,
+                &target.host,
+                target.port,
+                target.dispatch_policy_port(),
+                mtls_port,
+                &expected_peer,
+            )
+            .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    target_port = target.port,
+                    error = %err,
+                    "Mesh UDP egress sidecar mesh-mTLS datagram tunnel failed; ending session"
+                );
+                return;
+            }
+        }
+    } else {
+        warn!(
+            service = %entry.service_fqdn,
+            target_host = %target.host,
+            "Mesh UDP egress target carries neither mesh.hbone nor mesh.mtls; ending session \
+             (materializer bug?)"
+        );
+        return;
+    };
+
+    // ── Return-path socket: a transparent UDP socket bound NON-LOCALLY to the
+    // captured original destination so replies to the pod appear sourced from
+    // the VIP:port it dialed (IP_TRANSPARENT lets us bind a non-local addr;
+    // the reply's source IP AND port then come from this bind). Risk #1. ──────
+    let reply_socket = match build_transparent_reply_socket(key.orig_dst) {
+        Ok(sock) => std::sync::Arc::new(sock),
+        Err(e) => {
+            warn!(
+                service = %entry.service_fqdn,
+                orig_dst = %key.orig_dst,
+                error = %e,
+                "Mesh UDP egress could not bind a transparent reply socket; ending session \
+                 (replies must be sourced from the captured destination)"
+            );
+            return;
+        }
+    };
+
+    debug!(
+        service = %entry.service_fqdn,
+        orig_dst = %key.orig_dst,
+        client = %key.client,
+        target_host = %target.host,
+        target_port = target.port,
+        "Mesh UDP egress session established (datagram-over-mesh CONNECT)"
+    );
+
+    let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel);
+    let idle = udp_session_idle_timeout(proxy);
+    // Single framed-write deadline: reuse the idle window when configured (a write
+    // blocked longer than the whole idle window is a dead session anyway), else a
+    // fixed fallback so a stalled tunnel write can never hang forever (codex r2
+    // P2). Always `Some` — a write is always bounded.
+    let write_deadline = idle.unwrap_or(EGRESS_TUNNEL_WRITE_DEADLINE);
+
+    // Shared last-activity clock (monotonic millis — never rewinds under NTP
+    // slew), passed in from the map entry so the idle SWEEP, the recv loop, and
+    // this task's watchdog all read/write the SAME atomic (codex r3). Bumped on a
+    // delivered datagram in EITHER direction (client→egress sends AND return-path
+    // tunnel→client replies), so a one-way reply stream (client quiet, dest
+    // streaming back) does NOT time out mid-flow AND is not reaped by the sweep
+    // (codex r2 P2 + r3 — mirrors `relay_hbone_udp`).
+    last_activity.store(
+        crate::socket_opts::monotonic_now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // Return path: read framed datagrams off the tunnel and reply to the client
+    // from the transparent socket. Activity here keeps the session alive.
+    let return_client = key.client;
+    let return_socket = reply_socket.clone();
+    let return_activity = last_activity.clone();
+    let return_path = async move {
+        let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
+        loop {
+            match super::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await {
+                Ok(Some(payload)) => {
+                    return_activity.store(
+                        crate::socket_opts::monotonic_now_ms(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    // Best-effort reply; a send error (client gone) ends the
+                    // return path, which tears the session down.
+                    if let Err(e) = return_socket.send_to(&payload, return_client).await {
+                        debug!(
+                            client = %return_client,
+                            error = %e,
+                            "Mesh UDP egress: reply send to client failed; ending return path"
+                        );
+                        break;
+                    }
+                }
+                Ok(None) => break, // tunnel half-closed
+                Err(_) => break,   // tunnel read error
+            }
+        }
+    };
+
+    // Egress loop: drain captured datagrams, frame each, write onto the tunnel.
+    // Idle expiry is enforced by the shared watchdog (NOT a per-`recv` timeout,
+    // which would ignore return-path activity); each framed `write_all` is bounded
+    // by `write_deadline` so a stalled HBONE peer tears the session down instead
+    // of leaking this task (codex r2 P2).
+    let egress_activity = last_activity.clone();
+    // Moved into the egress loop: it is the sole drainer, so it owns releasing
+    // the byte reservations. (The recv loop only ever ADDS to this counter.)
+    let egress_queued_bytes = queued_bytes;
+    let egress_loop = async move {
+        use tokio::io::AsyncWriteExt;
+        let mut frame =
+            bytes::BytesMut::with_capacity(2 + super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
+        while let Some(payload) = rx.recv().await {
+            // This datagram has left the queue: release its byte reservation so
+            // the per-session queued-byte cap tracks the live queue depth (codex
+            // r3). Released for EVERY dequeued datagram regardless of the
+            // write outcome below.
+            egress_queued_bytes.fetch_sub(payload.len(), std::sync::atomic::Ordering::Relaxed);
+            egress_activity.store(
+                crate::socket_opts::monotonic_now_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            frame.clear();
+            if super::mesh_udp_frame::encode_datagram(&mut frame, &payload).is_err() {
+                // A captured datagram cannot exceed MAX_FRAME_PAYLOAD, so this is
+                // unreachable for real traffic; skip rather than tear down.
+                continue;
+            }
+            match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
+                    break;
+                }
+                Err(_) => {
+                    // The HBONE peer stopped reading / flow-control is exhausted;
+                    // the write stalled past the deadline. Tear the session down
+                    // rather than leak a task pinned on a never-completing write.
+                    debug!(
+                        write_deadline_ms = write_deadline.as_millis() as u64,
+                        "Mesh UDP egress: tunnel write stalled past deadline; ending session"
+                    );
+                    break;
+                }
+            }
+        }
+        // Half-close the tunnel write side (h2 end-stream) on the way out.
+        let _ = tunnel_write.shutdown().await;
+    };
+
+    // Idle watchdog: ends the session when neither direction has been active for
+    // `idle`. `None` disables it (the future never resolves, so the two relay arms
+    // drive). Polls at a fraction of the window (clamped 100ms..1s) so an expiry
+    // fires within ~one poll of the deadline (mirrors `relay_hbone_udp`).
+    let watchdog = async move {
+        let Some(idle) = idle else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let idle_ms = idle.as_millis().min(u64::MAX as u128) as u64;
+        let poll_ms = (idle_ms / 4).clamp(100, 1_000);
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
+        loop {
+            interval.tick().await;
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            if crate::socket_opts::monotonic_now_ms().saturating_sub(last) > idle_ms {
+                debug!("Mesh UDP egress: session idle timeout; ending");
+                break;
+            }
+        }
+    };
+
+    // Any arm completing ends the session (and, on return, the caller's
+    // `remove_session_if_owned` frees the slot + decrements `active_sessions`).
+    tokio::select! {
+        _ = return_path => {}
+        _ = egress_loop => {}
+        _ = watchdog => {}
+    }
+}
+
+/// Build a transparent UDP socket bound (non-locally) to `orig_dst` so replies
+/// to the captured client carry `orig_dst` as their source address AND port.
+/// `IP_TRANSPARENT` (Linux, needs `CAP_NET_ADMIN`) is what permits binding to a
+/// non-local address; `SO_REUSEADDR` mirrors the capture socket so multiple
+/// sessions to the same VIP:port coexist. This is the TPROXY return-path
+/// pattern: the kernel emits replies from the bound transparent address rather
+/// than the host's own IP.
+#[cfg(target_os = "linux")]
+fn build_transparent_reply_socket(
+    orig_dst: SocketAddr,
+) -> Result<tokio::net::UdpSocket, anyhow::Error> {
+    use std::net::IpAddr;
+    use std::os::fd::AsRawFd;
+
+    let domain = match orig_dst.ip() {
+        IpAddr::V4(_) => socket2::Domain::IPV4,
+        IpAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let fd = socket.as_raw_fd();
+    match orig_dst.ip() {
+        IpAddr::V4(_) => crate::socket_opts::set_ip_transparent(fd)?,
+        IpAddr::V6(_) => crate::socket_opts::set_ipv6_transparent(fd)?,
+    }
+    // Bind to the captured original destination (the VIP:port the pod dialed).
+    // IP_TRANSPARENT makes this non-local bind succeed; replies sent on this
+    // socket then originate from orig_dst.
+    socket.bind(&orig_dst.into())?;
+    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+}
+
+/// Resolve the per-session idle timeout for an egress session from the relay
+/// proxy's `udp_idle_timeout_seconds` (the materialized relay proxy carries the
+/// repo's stream-proxy default). `0` disables the idle timeout.
+#[cfg(target_os = "linux")]
+fn udp_session_idle_timeout(proxy: &crate::config::types::Proxy) -> Option<std::time::Duration> {
+    let secs = proxy.udp_idle_timeout_seconds;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Spawn the idle-session sweep for the capture listener. Reaps each session
+/// after its own `idle_timeout_ms` of inactivity (derived from the relay proxy's
+/// `udp_idle_timeout_seconds`; `0` = disabled = never idle-reaped) on a fixed
+/// interval; exits when the per-listener shutdown fires.
 #[cfg(target_os = "linux")]
 fn spawn_capture_session_cleanup(
     sessions: std::sync::Arc<
@@ -417,8 +1221,22 @@ fn spawn_capture_session_cleanup(
                     // accumulator is safe; one `fetch_sub` after keeps it lock-free.
                     let mut reaped: u64 = 0;
                     sessions.retain(|_, session| {
-                        let keep = now.saturating_sub(session.last_activity)
-                            <= CAPTURE_SESSION_IDLE_TIMEOUT_MS;
+                        // Read the SHARED activity clock (codex r3): the egress +
+                        // return-path tasks bump it on a delivered datagram in
+                        // EITHER direction, so a session whose client is quiet but
+                        // whose destination keeps replying is NOT reaped mid-flow
+                        // (the watchdog and this sweep now agree on liveness).
+                        let last = session.last_activity.load(Ordering::Relaxed);
+                        // Honor the session's CONFIGURED idle window (codex r7):
+                        // `idle_timeout_ms == 0` means the per-proxy idle is
+                        // DISABLED, so the sweep does not idle-reap it (the egress
+                        // task's teardown + the session cap bound it, matching the
+                        // task watchdog which also never fires when idle is
+                        // disabled). A fixed 60s window would otherwise cut a
+                        // long-lived quiet flow whose idle is configured > 60s or
+                        // disabled, before the watchdog/operator intends.
+                        let keep = session.idle_timeout_ms == 0
+                            || now.saturating_sub(last) <= session.idle_timeout_ms;
                         if !keep {
                             reaped += 1;
                         }
@@ -446,6 +1264,13 @@ fn spawn_capture_session_cleanup(
 pub async fn start_mesh_udp_capture_listener(
     cfg: MeshUdpCaptureConfig,
 ) -> Result<(), anyhow::Error> {
+    // Touch the Stage-4 fields so the non-Linux build doesn't flag them dead
+    // (their only real consumer is the Linux listener / egress path).
+    let _ = &cfg.state;
+    let _ = cfg.max_sessions;
+    let _ = cfg.cleanup_interval_seconds;
+    let _ = cfg.recvmmsg_batch_size;
+    let _ = cfg.session_shard_amount;
     let _ = cfg.shutdown;
     let _ = cfg.global_shutdown;
     // Fire the startup-ready signal before returning: mesh startup's
@@ -481,15 +1306,54 @@ mod tests {
         )
     }
 
+    /// A minimal routable egress entry for the keying/cap tests (no live tunnel
+    /// is dialed — `admit_or_refresh_session` only stores the entry/channel).
+    fn fake_entry() -> std::sync::Arc<crate::router_cache::MeshTcpEgressEntry> {
+        let proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+            "default",
+            "dns",
+            53,
+            "__mesh-out-udp-upstream-default-dns-53",
+        );
+        std::sync::Arc::new(crate::router_cache::MeshTcpEgressEntry {
+            upstream_id: "__mesh-out-udp-upstream-default-dns-53".to_string(),
+            relay_proxy: std::sync::Arc::new(proxy),
+            service_fqdn: "dns.default.svc.cluster.local".to_string(),
+        })
+    }
+
+    /// `resolve_entry` closure that always routes (returns a fake entry).
+    fn routable() -> Option<std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>> {
+        Some(fake_entry())
+    }
+
+    /// `resolve_entry` closure that never routes (no declared mesh UDP dest).
+    fn unroutable() -> Option<std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>> {
+        None
+    }
+
+    fn key(client: &str, dst: &str) -> CaptureSessionKey {
+        CaptureSessionKey {
+            client: client.parse().unwrap(),
+            orig_dst: dst.parse().unwrap(),
+        }
+    }
+
     #[test]
-    fn datagram_without_origdst_is_dropped_unaccounted() {
+    fn unroutable_destination_is_dropped_without_a_slot() {
+        // A captured datagram whose orig-dst matches no mesh UDP destination is
+        // dropped: no session, no slot consumed (fail closed).
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        // No orig-dst ⇒ dropped, not accounted, no session created.
-        assert!(!handle_captured_datagram(
-            &sessions, &active, client, None, 32, 1000
-        ));
+        let outcome = admit_or_refresh_session(
+            &sessions,
+            &active,
+            key("10.0.0.5:40000", "1.1.1.1:53"),
+            b"q",
+            1000,
+            unroutable,
+        );
+        assert!(matches!(outcome, SessionAdmission::Dropped));
         assert_eq!(sessions.len(), 0);
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
@@ -498,75 +1362,70 @@ mod tests {
     fn session_keyed_by_client_and_origdst() {
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        let dst_a: SocketAddr = "10.96.0.10:53".parse().unwrap();
-        let dst_b: SocketAddr = "10.96.0.11:53".parse().unwrap();
+        // Hold the receivers so refreshes' channel sends don't fail (irrelevant
+        // to the keying assertions, but keeps the sessions' channels open).
+        let mut keepalive = Vec::new();
 
         // Same client, two distinct destinations ⇒ two sessions.
-        assert!(handle_captured_datagram(
-            &sessions,
-            &active,
-            client,
-            Some(dst_a),
-            16,
-            1000
-        ));
-        assert!(handle_captured_datagram(
-            &sessions,
-            &active,
-            client,
-            Some(dst_b),
-            16,
-            1000
-        ));
+        for dst in ["10.96.0.10:53", "10.96.0.11:53"] {
+            match admit_or_refresh_session(
+                &sessions,
+                &active,
+                key("10.0.0.5:40000", dst),
+                b"x",
+                1000,
+                routable,
+            ) {
+                SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            }
+        }
         assert_eq!(sessions.len(), 2);
 
-        // A second datagram on the same (client, dst_a) flow refreshes the
-        // existing session — does NOT create a third.
-        assert!(handle_captured_datagram(
+        // A second datagram on an existing (client, dst) flow refreshes — no new
+        // session.
+        let outcome = admit_or_refresh_session(
             &sessions,
             &active,
-            client,
-            Some(dst_a),
-            16,
-            1000
-        ));
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            1000,
+            routable,
+        );
+        assert!(matches!(outcome, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 2);
 
-        // A different client to dst_a is a distinct session.
-        let client2: SocketAddr = "10.0.0.6:50000".parse().unwrap();
-        assert!(handle_captured_datagram(
+        // A different client to the same dst is a distinct session.
+        match admit_or_refresh_session(
             &sessions,
             &active,
-            client2,
-            Some(dst_a),
-            16,
-            1000
-        ));
+            key("10.0.0.6:50000", "10.96.0.10:53"),
+            b"x",
+            1000,
+            routable,
+        ) {
+            SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        }
         assert_eq!(sessions.len(), 3);
     }
 
     #[test]
     fn first_datagram_new_session_does_not_deadlock() {
-        // Regression for codex r1 P1: the first datagram for a fresh
-        // (client, orig-dst) must admit a session WITHOUT re-entering the
-        // DashMap (`len()`) while an entry guard is held — otherwise this call
-        // self-deadlocks and the test hangs. A plain return here is the proof
-        // it no longer nests map ops under a guard.
+        // Regression for codex r1 P1: admitting a fresh flow must not re-enter
+        // the DashMap (`len()`) while an entry guard is held — a plain return
+        // here is the proof it no longer nests map ops under a guard.
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
-        // Cap well above 1 so the new flow is admitted via the count-then-insert
-        // path (the exact path that previously held a guard across `len()`).
-        assert!(handle_captured_datagram(
+        let outcome = admit_or_refresh_session(
             &sessions,
             &active,
-            client,
-            Some(dst),
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
             64,
-            1000
-        ));
+            routable,
+        );
+        assert!(matches!(outcome, SessionAdmission::Admitted { .. }));
         assert_eq!(sessions.len(), 1);
     }
 
@@ -574,41 +1433,657 @@ mod tests {
     fn session_cap_sheds_new_flows_but_serves_existing() {
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
-        let client_a: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        let client_b: SocketAddr = "10.0.0.6:40000".parse().unwrap();
 
         // Cap of 1: first new flow admitted.
-        assert!(handle_captured_datagram(
+        let first = admit_or_refresh_session(
             &sessions,
             &active,
-            client_a,
-            Some(dst),
-            8,
-            1
-        ));
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            1,
+            routable,
+        );
+        let _rx = match first {
+            SessionAdmission::Admitted { rx, .. } => rx,
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
         assert_eq!(sessions.len(), 1);
 
         // Second NEW flow is shed at the cap.
-        assert!(!handle_captured_datagram(
+        let second = admit_or_refresh_session(
             &sessions,
             &active,
-            client_b,
-            Some(dst),
-            8,
-            1
-        ));
+            key("10.0.0.6:40000", "10.96.0.10:53"),
+            b"x",
+            1,
+            routable,
+        );
+        assert!(matches!(second, SessionAdmission::Dropped));
         assert_eq!(sessions.len(), 1);
 
         // The already-admitted flow is still served (refresh), even at the cap.
-        assert!(handle_captured_datagram(
+        let refreshed = admit_or_refresh_session(
             &sessions,
             &active,
-            client_a,
-            Some(dst),
-            8,
-            1
-        ));
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            1,
+            routable,
+        );
+        assert!(matches!(refreshed, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn egress_enqueue_caps_queued_bytes_not_just_count() {
+        // Regression for codex r3: the per-session egress queue is bounded by
+        // BYTES, not just datagram count. With the receiver held (nothing
+        // drains), enqueues are accepted until the byte budget is exhausted, then
+        // dropped — and the byte counter never exceeds the cap nor leaks on a
+        // dropped datagram.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
+        let queued = AtomicUsize::new(0);
+        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
+
+        // 1 KiB datagrams: the BYTE cap (256 KiB) bites long before the 1024-
+        // datagram COUNT cap, proving the byte bound is what limits memory.
+        let chunk = vec![0u8; 1024];
+        let cap_in_chunks = EGRESS_CHANNEL_MAX_QUEUED_BYTES / chunk.len();
+        for _ in 0..cap_in_chunks {
+            enqueue_egress_datagram(&tx, &queued, &chunk, client, dst);
+        }
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            EGRESS_CHANNEL_MAX_QUEUED_BYTES,
+            "queued bytes should fill exactly to the cap"
+        );
+
+        // The next datagram would exceed the cap: dropped, counter unchanged.
+        enqueue_egress_datagram(&tx, &queued, &chunk, client, dst);
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            EGRESS_CHANNEL_MAX_QUEUED_BYTES,
+            "an over-cap datagram must be dropped and must not bump the counter"
+        );
+        assert!(
+            queued.load(Ordering::Relaxed) <= EGRESS_CHANNEL_MAX_QUEUED_BYTES,
+            "the byte counter must never exceed the cap"
+        );
+    }
+
+    #[test]
+    fn egress_enqueue_releases_bytes_when_channel_closed() {
+        // If the egress task is gone (receiver dropped), an enqueue fails and the
+        // byte reservation is handed back so the counter does not leak (codex r3).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
+        drop(rx); // task gone
+        let queued = AtomicUsize::new(0);
+        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
+        enqueue_egress_datagram(&tx, &queued, b"hello", client, dst);
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            0,
+            "a closed-channel enqueue must release its byte reservation"
+        );
+    }
+
+    #[test]
+    fn admitted_sessions_get_distinct_identity_tokens() {
+        // Two admits for the SAME key (the second after the first is removed)
+        // must stamp DISTINCT session_ids, so a teardown carrying the old token
+        // can be told apart from the replacement.
+        let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
+        let k = key("10.0.0.5:40000", "10.96.0.10:53");
+
+        let (first_id, _rx1) =
+            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            };
+        // Simulate the idle sweep reaping the first session.
+        sessions.remove(&k);
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        let (second_id, _rx2) =
+            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            };
+        assert_ne!(first_id, second_id, "replacement must get a fresh token");
+    }
+
+    #[test]
+    fn teardown_does_not_clobber_replacement_session() {
+        // Regression for codex r1 P2 (remove-after-replace race): a stale task's
+        // teardown carrying the OLD session_id must NOT remove a replacement
+        // session that reused the same (client, orig-dst) key, and must NOT
+        // decrement the cap counter for it.
+        let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
+        let k = key("10.0.0.5:40000", "10.96.0.10:53");
+
+        // Admit the original (session_id A), then simulate the idle sweep
+        // reaping it (drop entry + decrement), exactly as the sweep would.
+        let old_id = match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+            SessionAdmission::Admitted { session_id, .. } => session_id,
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
+        sessions.remove(&k);
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // A new datagram on the same key admits a REPLACEMENT (session_id B).
+        let (new_id, _rx) =
+            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            };
+        assert_ne!(old_id, new_id);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // The OLD task finally runs its teardown with the stale token: it must be
+        // a no-op (replacement survives, counter unchanged).
+        remove_session_if_owned(&sessions, &active, &k, old_id);
+        assert_eq!(sessions.len(), 1, "replacement session must survive");
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "cap counter must not be decremented for the replacement"
+        );
+
+        // The replacement's OWN teardown (matching token) removes it and frees
+        // the slot.
+        remove_session_if_owned(&sessions, &active, &k, new_id);
+        assert_eq!(sessions.len(), 0);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn canonicalize_unmaps_v4_mapped_clients_only() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // An IPv4-mapped-V6 client (how the dual-stack `[::]` socket reports a v4
+        // sender) canonicalizes to its plain V4 form, port preserved — so it
+        // matches the V4 orig-dst family on the reply path (codex r2 P1).
+        let mapped: SocketAddr = "[::ffff:10.0.0.5]:40000".parse().unwrap();
+        let canon = canonicalize_socket_addr(mapped);
+        assert_eq!(
+            canon,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 40000)
+        );
+        assert!(canon.is_ipv4(), "v4-mapped client must canonicalize to V4");
+
+        // A plain V4 address is unchanged.
+        let v4: SocketAddr = "10.0.0.6:50000".parse().unwrap();
+        assert_eq!(canonicalize_socket_addr(v4), v4);
+
+        // A genuine IPv6 client is left untouched (NOT a v4-mapped address).
+        let v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            40000,
+        );
+        assert_eq!(canonicalize_socket_addr(v6), v6);
+        assert!(canonicalize_socket_addr(v6).is_ipv6());
+    }
+
+    #[test]
+    fn egress_transport_branch_selects_by_tag() {
+        // The dual-transport branch in `run_udp_egress_session` (#1808, mirroring
+        // raw-TCP egress) keys off the target's transport tag, which the
+        // materializer stamps mutually-exclusively: an Ambient `mesh.hbone` target
+        // takes the HBONE datagram branch; a Sidecar `mesh.mtls` target takes the
+        // mesh-mTLS datagram branch; a target with neither tag ends the session.
+        // These are the exact predicates the branch evaluates, in order.
+        use crate::config::types::UpstreamTarget;
+        let target_with = |tags: &[(&str, &str)]| UpstreamTarget {
+            host: "10.0.0.9".to_string(),
+            port: 53,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            locality: None,
+            path: None,
+        };
+
+        let hbone = target_with(&[(crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
+        assert!(crate::proxy::hbone_pool::target_hbone_enabled(&hbone));
+        assert!(
+            !crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(&hbone),
+            "an Ambient mesh.hbone target must NOT take the mesh-mTLS branch"
+        );
+
+        let mtls = target_with(&[(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG, "true")]);
+        // The HBONE predicate is evaluated FIRST, so a mesh.mtls target must fall
+        // through it to reach the mesh-mTLS branch.
+        assert!(
+            !crate::proxy::hbone_pool::target_hbone_enabled(&mtls),
+            "a Sidecar mesh.mtls target must fall through the HBONE branch"
+        );
+        assert!(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
+            &mtls
+        ));
+
+        // Neither tag → both predicates false → the fail-closed `else` arm.
+        let untagged = target_with(&[]);
+        assert!(!crate::proxy::hbone_pool::target_hbone_enabled(&untagged));
+        assert!(!crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
+            &untagged
+        ));
+
+        // BOTH tags → both predicates true. The materializer stamps exactly one
+        // transport tag, so a both-tags target is only reachable via a
+        // hand-authored / corrupted upstream; the branch is documented
+        // PRECEDENCE (not a rejection): `run_udp_egress_session` evaluates
+        // `target_hbone_enabled` FIRST, so a both-tags target takes the HBONE
+        // branch. That is the safe resolution — a target carrying `mesh.hbone` is
+        // an Ambient HBONE target regardless, and HBONE egress is itself
+        // identity-pinned + capability-gated, so precedence never relaxes a gate.
+        let both = target_with(&[
+            (crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+            (crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG, "true"),
+        ]);
+        assert!(crate::proxy::hbone_pool::target_hbone_enabled(&both));
+        assert!(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
+            &both
+        ));
+    }
+
+    fn admission_name(a: &SessionAdmission) -> &'static str {
+        match a {
+            SessionAdmission::Refreshed => "Refreshed",
+            SessionAdmission::Admitted { .. } => "Admitted",
+            SessionAdmission::Dropped => "Dropped",
+        }
+    }
+}
+
+/// Privileged live verification of the mesh UDP **source-capture** path (F3 §3.3
+/// Stage 3) against a real netfilter `TPROXY` rule + policy routing, inside a
+/// throwaway network namespace (the host's iptables / routing tables are never
+/// touched). Runs in CI's `netns-capture-live` job as root; self-skips (passes)
+/// without root / `unshare` / `iptables` / `ip`.
+///
+/// This is the UDP analogue of `socket_opts::original_dst_live_tests` (which
+/// proves the raw-TCP `SO_ORIGINAL_DST` recovery against an iptables `REDIRECT`).
+/// UDP differs fundamentally: TPROXY does NOT rewrite the datagram's destination
+/// (unlike the TCP REDIRECT model), so the original `service:port` rides a
+/// per-datagram `IP_RECVORIGDSTADDR` cmsg rather than a `getsockopt`. The mesh UDP
+/// destination relay is already e2e-tested without root; the remaining gap this
+/// closes is the live SOURCE-capture path, which needs `CAP_NET_ADMIN` (TPROXY +
+/// `IP_TRANSPARENT`) and so cannot run in the unprivileged test matrix.
+///
+/// ## What this covers
+/// - The exact transparent-capture socket the production listener binds
+///   (`build_bound_socket`'s `IP_TRANSPARENT` + `IP_RECVORIGDSTADDR` recipe), so a
+///   regression in the socket-option recipe surfaces here.
+/// - The Stage-2 TPROXY rule + Stage-3 policy-routing shapes
+///   (`udp_tproxy_commands_for_family`): an `OUTPUT -j MARK` on pod egress, the
+///   fwmark `ip rule` (priority [`crate::capture::TPROXY_ROUTE_RULE_PRIORITY`] →
+///   table [`crate::capture::TPROXY_ROUTE_TABLE`]), the `local 0.0.0.0/0 dev lo`
+///   route that loops the marked datagram back to the INPUT path, and the
+///   PREROUTING mark-match `-j TPROXY --on-port <port> --tproxy-mark <mark>` that
+///   reinjects it onto the transparent socket. All constants are read from
+///   `src/capture/mod.rs` (NOT hardcoded) so a default change keeps this honest.
+/// - The per-datagram orig-dst recovery the listener relies on: a single UDP
+///   datagram sent to a *remote* (non-local) destination is captured and the
+///   recovered original destination equals what the client dialed — the value
+///   `handle_captured_datagram` keys each session by.
+/// - That a reply can be SOURCED from the captured original destination on an
+///   `IP_TRANSPARENT` socket (`build_transparent_reply_socket`'s recipe), the
+///   return-path primitive the egress session uses.
+///
+/// ## What this does NOT cover (deliberately — a thin smoke test)
+/// - No full two-gateway loop: no HBONE / mesh-mTLS tunnel, no egress relay, no
+///   destination workload. The async listener task, LB selection, capability
+///   gating, and tunnel framing are exercised by the unit tests and the existing
+///   root-free destination-relay e2e, not here.
+/// - It drains with one `RecvMmsgBatch` (the listener's recv primitive) rather
+///   than spinning up `start_mesh_udp_capture_listener`, because the orig-dst
+///   recovery + transparent bind is the OS mechanism under test; the async
+///   plumbing around it is covered elsewhere.
+/// - IPv4 only (the netns gets a single fwmark rule + v4 `local` route); the
+///   v6 path shares the same code with a different cmsg level, covered by the
+///   unit-level extraction tests.
+#[cfg(all(test, target_os = "linux"))]
+mod live_netns_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::os::fd::AsRawFd;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    /// Where the transparent capture listener binds inside the netns (the
+    /// production `FERRUM_MESH_CAPTURE_UDP_PORT` shape). Read from
+    /// [`crate::capture::DEFAULT_UDP_OUTBOUND_PORT`] so a default change is
+    /// reflected automatically.
+    const CAPTURE_PORT: u16 = crate::capture::DEFAULT_UDP_OUTBOUND_PORT;
+    /// The remote destination the in-netns client dials. A NON-local address so
+    /// the `OUTPUT ! --dst-type LOCAL` mark rule matches it (exactly as it would
+    /// a real pod dialing a service VIP); TPROXY then delivers it WITHOUT
+    /// rewriting this destination, which is what `IP_RECVORIGDSTADDR` recovers.
+    const REMOTE_DST: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10); // TEST-NET-1 (RFC 5737)
+    /// The remote UDP port the client dials; recovered as the captured orig-dst.
+    const DIAL_PORT: u16 = 5300;
+
+    fn is_root() -> bool {
+        // Safety: `geteuid` is always sound and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Reaps the netns child on drop so the test never leaks it.
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn a child in a fresh netns with loopback up and the Stage-2/Stage-3
+    /// UDP TPROXY datapath installed: pod-egress UDP to a remote dst is MARKed in
+    /// `mangle OUTPUT`, the fwmark `ip rule` + `local` route loop it back to the
+    /// INPUT path, and a PREROUTING mark-match `-j TPROXY` reinjects it onto the
+    /// transparent capture socket on [`CAPTURE_PORT`]. This mirrors the rule set
+    /// `crate::capture::udp_tproxy_commands_for_family` emits for a catch-all
+    /// outbound config (the `OUTPUT_MARK` + `REINJECT` chains, collapsed to bare
+    /// rules for the test). A `default dev lo` route is added FIRST so the initial
+    /// route lookup for the remote dst resolves (a bare netns has no such route —
+    /// a real pod gets one from its CNI); the marked-packet output reroute then
+    /// overrides it with the fwmark rule's local-delivery table. Exits 97 when
+    /// `iptables` / `ip` is unavailable inside the netns so the test can skip; the
+    /// `set -e` aborts (non-97 exit) if any load-bearing rule fails to install.
+    fn spawn_tproxy_netns_child() -> Option<Child> {
+        // Constants pulled from production (NOT hardcoded from memory): a default
+        // change in `src/capture/mod.rs` flows through here.
+        let mark = crate::capture::DEFAULT_TPROXY_MARK;
+        let mask = crate::capture::TPROXY_MARK_MASK;
+        let table = crate::capture::TPROXY_ROUTE_TABLE;
+        let prio = crate::capture::TPROXY_ROUTE_RULE_PRIORITY;
+        let mark_arg = format!("0x{mark:x}/0x{mask:x}");
+        // A default route via `lo` so the INITIAL `ip_route_output` for the
+        // remote dst succeeds (a bare netns has only `lo` up and no route to the
+        // TEST-NET dst, so `send_to` would fail ENETUNREACH BEFORE the mangle
+        // OUTPUT chain ever runs). This route only needs to make the first lookup
+        // resolve; once the OUTPUT MARK fires, the marked-packet output reroute
+        // (`ip_route_me_harder`) consults the higher-priority fwmark `ip rule`
+        // and steers the datagram to table {table}'s `local 0.0.0.0/0 dev lo`
+        // for local delivery instead — exactly the production reroute path. A
+        // real pod gets this initial route from its CNI default route.
+        let script = format!(
+            // Exit-code discipline (codex #1823 review): `exit 97` == a genuine
+            // missing PREREQUISITE (no `iptables`/`ip` binary) → the test SKIPS.
+            // `exit 98` == a LOAD-BEARING route / fwmark-rule / `-j TPROXY` rule
+            // failed to install (e.g. a missing `xt_TPROXY` target or a
+            // mangle-table error on the CI kernel) → the test FAILS, because the
+            // capture path it exists to validate would otherwise pass vacuously.
+            "set -e; \
+             command -v iptables >/dev/null 2>&1 || exit 97; \
+             command -v ip >/dev/null 2>&1 || exit 97; \
+             ip link set lo up 2>/dev/null || true; \
+             ip route add default dev lo || exit 98; \
+             ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 98; \
+             ip route add local 0.0.0.0/0 dev lo table {table} || exit 98; \
+             iptables -t mangle -A OUTPUT -p udp -m addrtype ! --dst-type LOCAL \
+               -j MARK --set-mark {mark_arg} || exit 98; \
+             iptables -t mangle -A PREROUTING -p udp -m mark --mark {mark_arg} \
+               -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 98; \
+             exec sleep 30"
+        );
+        Command::new("unshare")
+            .args(["--net", "sh", "-c", &script])
+            .spawn()
+            .ok()
+    }
+
+    /// Build the transparent capture socket EXACTLY as the production listener's
+    /// `build_bound_socket` does (`SO_REUSEADDR` + `IP_TRANSPARENT` +
+    /// `IP_RECVORIGDSTADDR`, options before bind), bound to the v4 wildcard on
+    /// `CAPTURE_PORT`. Returns the bound std socket so the test can drain it with
+    /// the listener's own `RecvMmsgBatch` primitive.
+    fn build_capture_socket() -> Result<std::net::UdpSocket, String> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|e| format!("socket: {e}"))?;
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking: {e}"))?;
+        let fd = socket.as_raw_fd();
+        crate::socket_opts::set_ip_transparent(fd).map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
+        crate::socket_opts::set_ip_recvorigdstaddr(fd)
+            .map_err(|e| format!("IP_RECVORIGDSTADDR: {e}"))?;
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
+        socket
+            .bind(&bind_addr.into())
+            .map_err(|e| format!("bind {bind_addr}: {e}"))?;
+        Ok(socket.into())
+    }
+
+    #[test]
+    #[ignore = "requires root + iptables/TPROXY + iproute2 to capture UDP in a fresh netns"]
+    fn captured_udp_recovers_pre_tproxy_destination() {
+        if !is_root() {
+            eprintln!("SKIP: not root; cannot create network namespaces / TPROXY rules");
+            return;
+        }
+        let Some(mut child) = spawn_tproxy_netns_child() else {
+            eprintln!("SKIP: `unshare --net` unavailable");
+            return;
+        };
+        // Let the child unshare, bring loopback up, and install the TPROXY +
+        // policy-routing datapath, then `exec sleep 30` (stays alive). If it
+        // EXITS during setup, branch on the exit code: 97 == a missing
+        // prerequisite (no iptables/ip binary) → SKIP; anything else (98 == a
+        // load-bearing route/fwmark/TPROXY rule failed) → FAIL, so a broken
+        // capture setup never passes vacuously (codex #1823). `try_wait` rather
+        // than `kill(pid, 0)`: an exited-but-unreaped child is a zombie that
+        // still answers signal 0, which would wrongly run the scenario in a
+        // namespace without the rules.
+        let mut setup_exit: Option<std::process::ExitStatus> = None;
+        let mut setup_status_unknown = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    setup_exit = Some(status);
+                    break;
+                }
+                Err(_) => {
+                    setup_status_unknown = true;
+                    break;
+                }
+                Ok(None) => {}
+            }
+        }
+        if let Some(status) = setup_exit {
+            // ONLY exit 98 is a load-bearing failure: it is emitted by the script
+            // ITSELF, which means `unshare --net` created the netns and `sh` ran,
+            // but a route / fwmark / `-j TPROXY` rule failed to install — a real
+            // break in the path under test → FAIL (don't pass vacuously). Every
+            // other exit is an ENVIRONMENTAL prerequisite the live job can't meet
+            // → SKIP: 97 = no `iptables`/`ip` binary; anything else means the
+            // script never ran (e.g. `unshare --net` exits 1 without
+            // CAP_SYS_ADMIN, or `sh`/`unshare` missing → 127), so no netns or
+            // UDP capture was exercised. (codex #1823 r1 + r2)
+            if status.code() == Some(98) {
+                panic!(
+                    "netns UDP TPROXY setup failed (exit 98): a load-bearing policy-route / \
+                     fwmark-rule / `-j TPROXY` rule did not install, so the capture path was \
+                     NOT exercised — failing rather than skipping vacuously"
+                );
+            }
+            eprintln!(
+                "SKIP: netns/capture prerequisites unavailable (setup child exited {:?}: \
+                 `unshare --net` denied, or no iptables/ip binary)",
+                status.code()
+            );
+            return;
+        }
+        if setup_status_unknown {
+            // `try_wait` errored — an environmental ambiguity reading the child,
+            // NOT a confirmed load-bearing failure → skip rather than fail.
+            eprintln!("SKIP: could not determine netns setup-child status (try_wait errored)");
+            return;
+        }
+        let pid = child.id();
+        let _guard = ChildGuard(child);
+
+        // Everything runs on one throwaway thread inside the child's netns
+        // (`setns` mutates only the calling thread, which exits right after).
+        let recovered = std::thread::spawn(move || -> Result<Option<SocketAddr>, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open netns handle: {e}"))?;
+            // Safety: `ns` is an open netns handle owned for the call.
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+
+            // Bind the production transparent capture socket inside the netns.
+            let capture = build_capture_socket()?;
+            let capture_fd = capture.as_raw_fd();
+
+            // Client datagram to a REMOTE dst. The MARK rule matches (non-local
+            // dst), the fwmark route loops it to `lo`, and the PREROUTING
+            // mark-match TPROXY reinjects it onto the transparent socket WITHOUT
+            // rewriting REMOTE_DST:DIAL_PORT — which IP_RECVORIGDSTADDR recovers.
+            // A wildcard-bound (ephemeral-port) client is fine: the captured
+            // value under test is the ORIGINAL DESTINATION, not the source.
+            let client = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .map_err(|e| format!("bind client: {e}"))?;
+            let dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
+            client
+                .send_to(b"capture-me", dst)
+                .map_err(|e| format!("client send_to {dst}: {e}"))?;
+
+            // Drain via the listener's own cmsg-aware recv primitive
+            // (`MSG_DONTWAIT`), polling for a short window since the reroute +
+            // reinject is asynchronous to the send.
+            let mut batch = super::super::udp_batch::RecvMmsgBatch::new(8, true);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match batch.recv(capture_fd, 8) {
+                    Ok(n) if n > 0 => {
+                        // A datagram landed on the capture socket; return its
+                        // recovered original destination (the value the listener
+                        // keys each session by).
+                        return Ok(batch.orig_dst(0));
+                    }
+                    _ => {
+                        if Instant::now() >= deadline {
+                            return Err("capture socket received no datagram within the deadline \
+                                 (TPROXY did not reinject the marked datagram)"
+                                .to_string());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        })
+        .join()
+        .expect("netns capture scenario thread must not panic")
+        .expect("live UDP TPROXY capture scenario must complete");
+
+        assert_eq!(
+            recovered,
+            Some(SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT)),
+            "a TPROXY-captured datagram must recover its pre-TPROXY (original) \
+             destination from the IP_RECVORIGDSTADDR cmsg"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root + CAP_NET_ADMIN for IP_TRANSPARENT non-local bind in a fresh netns"]
+    fn reply_socket_binds_non_local_captured_destination() {
+        // The return-path primitive: a reply to the captured client must be
+        // SOURCED from the captured original destination (the VIP:port the pod
+        // dialed), which requires an IP_TRANSPARENT socket bound NON-LOCALLY to
+        // that address. This exercises `build_transparent_reply_socket`'s exact
+        // recipe (SO_REUSEADDR + IP_TRANSPARENT + non-local bind) against a real
+        // kernel inside the netns — proving the bind the egress return path
+        // depends on actually succeeds with CAP_NET_ADMIN.
+        if !is_root() {
+            eprintln!("SKIP: not root; IP_TRANSPARENT non-local bind needs CAP_NET_ADMIN");
+            return;
+        }
+        // A plain `unshare --net` (loopback up) is enough — no iptables needed,
+        // only CAP_NET_ADMIN for the transparent non-local bind. Skip if unshare
+        // is unavailable.
+        let Some(mut child) = Command::new("unshare")
+            .args([
+                "--net",
+                "sh",
+                "-c",
+                "ip link set lo up 2>/dev/null || true; exec sleep 30",
+            ])
+            .spawn()
+            .ok()
+        else {
+            eprintln!("SKIP: `unshare --net` unavailable");
+            return;
+        };
+        // Confirm the netns child is alive (did not immediately fail).
+        std::thread::sleep(Duration::from_millis(200));
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            eprintln!("SKIP: netns child exited before setup completed");
+            let _ = child.wait();
+            return;
+        }
+        let pid = child.id();
+        let _guard = ChildGuard(child);
+
+        let bound = std::thread::spawn(move || -> Result<SocketAddr, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open netns handle: {e}"))?;
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+            // Mirror `build_transparent_reply_socket` for a NON-LOCAL captured
+            // destination (TEST-NET-1 — never assigned to `lo`, so the bind only
+            // succeeds because IP_TRANSPARENT permits binding a non-local addr).
+            let orig_dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .map_err(|e| format!("socket: {e}"))?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking: {e}"))?;
+            crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
+                .map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
+            socket
+                .bind(&orig_dst.into())
+                .map_err(|e| format!("non-local transparent bind {orig_dst}: {e}"))?;
+            let std_sock: std::net::UdpSocket = socket.into();
+            std_sock
+                .local_addr()
+                .map_err(|e| format!("local_addr: {e}"))
+        })
+        .join()
+        .expect("transparent reply-bind thread must not panic")
+        .expect("IP_TRANSPARENT non-local bind must succeed under CAP_NET_ADMIN");
+
+        assert_eq!(
+            bound,
+            SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT),
+            "a transparent reply socket must bind the captured (non-local) original \
+             destination so pod replies are sourced from the VIP:port it dialed"
+        );
     }
 }

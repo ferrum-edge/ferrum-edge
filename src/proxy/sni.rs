@@ -597,7 +597,7 @@ fn u24_to_usize(data: &[u8]) -> usize {
 ///
 /// Matching rules (in priority order):
 /// 1. Exact host match (case-insensitive, SNI is already lowercased)
-/// 2. Wildcard host match (e.g., `*.example.com` matches `foo.example.com`)
+/// 2. Wildcard host match (e.g., `*.example.com` matches any DNS name below `example.com`)
 /// 3. Fallback: first proxy with empty `hosts` (catch-all/default)
 /// 4. If no match and no fallback: `None`
 #[allow(dead_code)] // Public test/library helper; runtime uses the RequestEpoch-indexed variant.

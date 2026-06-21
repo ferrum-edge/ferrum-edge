@@ -1047,6 +1047,8 @@ impl Plugin for Waf {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         // Narrow the pre-flight buffering decision once the response
         // content-type is known: a body whose content-type is not eligible for

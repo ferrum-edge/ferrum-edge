@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
@@ -415,13 +416,17 @@ impl AiResponseGuard {
     /// Detect content matches against all patterns. Returns names of detected matches.
     /// Uses a single `RegexSet` DFA pass per text fragment, O(text_len)
     /// regardless of pattern count.
-    fn detect_matches(&self, texts: &[&str]) -> Vec<String> {
+    ///
+    /// Generic over `AsRef<str>` so callers can pass borrowed `&str` slices
+    /// (`ScanMode::Content`) or `Cow<str>` text (`ScanMode::All`, which must
+    /// collect stringified JSON numbers that have no backing `&str`).
+    fn detect_matches<S: AsRef<str>>(&self, texts: &[S]) -> Vec<String> {
         if self.detection_pattern_count == 0 {
             return Vec::new();
         }
         let mut hit = vec![false; self.detection_pattern_count];
         for text in texts {
-            for idx in self.detection_set.matches(text).into_iter() {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
                 hit[idx] = true;
             }
         }
@@ -434,15 +439,100 @@ impl AiResponseGuard {
         detected
     }
 
-    /// Detect matches in a raw string (for "all" scan mode).
-    /// Single `RegexSet` DFA pass — O(text_len).
-    fn detect_matches_in_str(&self, text: &str) -> Vec<String> {
+    /// `ScanMode::All` JSON detection: the union of two passes over the body.
+    ///
+    /// 1. Decoded walker (`collect_decoded_json_strings`): scans each JSON token
+    ///    after serde has resolved `\uXXXX` and other escapes, so escaped PII in
+    ///    string values, object keys, and numeric scalars is caught exactly as
+    ///    the client will see it (issue #1720).
+    /// 2. Raw-body pass: runs the `RegexSet` over the serialized response bytes.
+    ///    The original all-mode scan was raw-only, and three coverage cases
+    ///    depend on it: operator custom `blocked_patterns` that span JSON context
+    ///    (e.g. `"role"\s*:\s*"tool"`), which testing key and value as separate
+    ///    tokens never reconstructs; numeric/scalar shapes serialized only in the
+    ///    raw bytes; and duplicate object members, whose overwritten value is
+    ///    dropped from the parsed `Value` but is still delivered to the client.
+    ///
+    /// Unioning the two only ever *adds* detections, so this strictly hardens
+    /// all-mode coverage. `raw` may be `None` when the serialized bytes are not
+    /// valid UTF-8 (the body still parsed via `from_slice`), in which case only
+    /// the decoded pass runs.
+    ///
+    /// Accepted trade-off: because pass 1 evaluates each decoded value in
+    /// isolation, an *anchored* custom `blocked_pattern` (e.g. `^done$`) that an
+    /// operator authored against the whole serialized body will additionally fire
+    /// on a lone scalar value (`{"finish_reason":"done"}`). This is intentional
+    /// and load-bearing for `ScanMode::All`: the decoded per-value pass is exactly
+    /// what closes the escaped-PII gap (#1720) — a value encoded as `done`
+    /// must be caught after decoding — so restricting custom patterns to
+    /// whole-body-only would reopen that bypass for them. Operators who need
+    /// strictly whole-body matching can keep the anchor and rely on raw-pass
+    /// semantics in `ScanMode::Content`, or write the pattern to include the JSON
+    /// context (`"finish_reason"\s*:\s*"done"`) so the lone token does not match.
+    fn detect_matches_in_decoded_json(&self, json: &Value, raw: Option<&str>) -> Vec<String> {
         if self.detection_pattern_count == 0 {
             return Vec::new();
         }
+        let mut hit = vec![false; self.detection_pattern_count];
+        // Pass 1: decoded tokens.
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_decoded_json_strings(json, &mut texts);
+        for text in &texts {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
+                hit[idx] = true;
+            }
+        }
+        // Pass 2: raw serialized body (cross-token / contextual / duplicate-key).
+        if let Some(raw) = raw {
+            for idx in self.detection_set.matches(raw).into_iter() {
+                hit[idx] = true;
+            }
+        }
         let mut detected = Vec::new();
-        for idx in self.detection_set.matches(text).into_iter() {
-            if let Some(name) = self.pattern_name(idx) {
+        for (idx, &h) in hit.iter().enumerate() {
+            if h && let Some(name) = self.pattern_name(idx) {
+                detected.push(name.to_string());
+            }
+        }
+        detected
+    }
+
+    /// `ScanMode::All` SSE detection: the union of decoded parsed frames and a
+    /// raw-body pass.
+    ///
+    /// `parse_sse_data_frames` silently drops `data:` payloads that are not JSON
+    /// (a plain `data: user@example.com` frame, or malformed JSON), so scanning
+    /// only the parsed frames would let blocked content in unparseable SSE data
+    /// bypass scan-all policies. Running the `RegexSet` over the raw body too
+    /// restores the original whole-body coverage for those payloads, while the
+    /// decoded-frame pass adds `\uXXXX`-escaped detection (issue #1720).
+    /// `raw` is `None` only when the body is not valid UTF-8.
+    fn detect_matches_in_decoded_sse_frames(
+        &self,
+        frames: &[Value],
+        raw: Option<&str>,
+    ) -> Vec<String> {
+        if self.detection_pattern_count == 0 {
+            return Vec::new();
+        }
+        let mut hit = vec![false; self.detection_pattern_count];
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        for frame in frames {
+            collect_decoded_json_strings(frame, &mut texts);
+        }
+        for text in &texts {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
+                hit[idx] = true;
+            }
+        }
+        if let Some(raw) = raw {
+            for idx in self.detection_set.matches(raw).into_iter() {
+                hit[idx] = true;
+            }
+        }
+        let mut detected = Vec::new();
+        for (idx, &h) in hit.iter().enumerate() {
+            if h && let Some(name) = self.pattern_name(idx) {
                 detected.push(name.to_string());
             }
         }
@@ -466,6 +556,145 @@ impl AiResponseGuard {
                 .to_string();
         }
         result
+    }
+
+    /// Remove every rendered redaction placeholder from `text`.
+    ///
+    /// The residual re-scan (`redact_leaves_residual`) runs the detection
+    /// `RegexSet` over the body *after* redaction. Placeholders embed the
+    /// pattern identity — e.g. the default template makes a blocked phrase
+    /// `cost $5` render as `[REDACTED:blocked_phrase:cost $5]`, and PII/custom
+    /// names render as `[REDACTED:pii:ssn]` / `[REDACTED:<custom name>]`. Those
+    /// marker strings would otherwise re-match the very pattern that produced
+    /// them (the literal phrase is echoed inside the marker, and a custom name
+    /// can coincide with its own regex), making a fully-redactable body look
+    /// like it still carries residual content and forcing a false 502.
+    /// Stripping the placeholders before the residual scan looks only at the
+    /// bytes that will actually be delivered, not at text the redactor itself
+    /// wrote. Placeholders are fixed strings rendered at construction, so this
+    /// is a plain substring removal with no regex on the hot path.
+    fn strip_known_placeholders(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
+            if result.contains(pattern.placeholder.as_str()) {
+                result = result.replace(pattern.placeholder.as_str(), "");
+            }
+        }
+        result
+    }
+
+    /// `ScanMode::All` redact mode: after applying the same redaction the
+    /// response transform performs, decide whether any *unredactable* PII still
+    /// remains, so the caller can fail closed (reject) instead of forwarding the
+    /// body while reporting it `redacted`.
+    ///
+    /// The all-mode redactor (`redact_response_json` + `redact_json_strings`)
+    /// rewrites string values, but cannot rewrite PII carried in an object key,
+    /// a numeric scalar, a cross-token/contextual custom pattern, or a
+    /// duplicate-key value dropped from the parsed tree. Because all-mode
+    /// detection now unions a raw-body pass, those are detected — so without this
+    /// re-scan the plugin would emit a false "redacted" telemetry while still
+    /// delivering the PII.
+    ///
+    /// This mirrors `redact_json_strings`' structural carve-out: top-level
+    /// structural scalar values (`model`, `id`, token counts, …) are deliberately
+    /// preserved even when they incidentally match a PII regex, so they are NOT
+    /// residual leaks. To run the same union detection without those preserved
+    /// scalars re-triggering, the re-scan is done on a copy whose top-level
+    /// structural scalars are blanked to an empty string. Blanking only the
+    /// scalar values keeps the surrounding JSON structure intact, so a contextual
+    /// pattern such as `"role"\s*:` still matches while a preserved
+    /// `"created": 1700000000` no longer does.
+    ///
+    /// The residual scan also strips the redactor's own placeholder markers
+    /// (`strip_known_placeholders`) before matching: a successfully redacted
+    /// phrase renders as e.g. `[REDACTED:blocked_phrase:cost $5]`, whose echoed
+    /// phrase text would otherwise re-match the same pattern and report a false
+    /// residual leak (turning a fully redacted body into a spurious 502).
+    fn redact_leaves_residual(&self, original: &Value) -> bool {
+        if self.detection_pattern_count == 0 {
+            return false;
+        }
+        let mut redacted = original.clone();
+        let known_texts = self.extract_completion_texts(&redacted);
+        if !known_texts.is_empty() {
+            self.redact_response_json(&mut redacted);
+        }
+        redact_json_strings(
+            &mut redacted,
+            &self.pii_patterns,
+            &self.blocked_phrases,
+            true,
+        );
+
+        if let Value::Object(map) = &mut redacted {
+            for (key, value) in map.iter_mut() {
+                if STRUCTURAL_KEYS.contains(&key.as_str())
+                    && (value.is_string() || value.is_number())
+                {
+                    *value = Value::String(String::new());
+                }
+            }
+        }
+
+        // Union the same two passes as `detect_matches_in_decoded_json`, but run
+        // each over text with the redactor's placeholder markers removed so the
+        // markers cannot re-trigger their own pattern.
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_decoded_json_strings(&redacted, &mut texts);
+        for text in &texts {
+            let cleaned = self.strip_known_placeholders(text.as_ref());
+            if self.detection_set.is_match(&cleaned) {
+                return true;
+            }
+        }
+        let serialized = self.strip_known_placeholders(&redacted.to_string());
+        self.detection_set.is_match(&serialized)
+    }
+
+    /// `ScanMode::All` redact mode, SSE bodies: decide whether redaction would
+    /// leave residual detectable content, so the caller can fail closed instead
+    /// of forwarding the original bytes while reporting them `redacted`.
+    ///
+    /// The SSE transform (`redact_sse_body`) only rewrites `data:` payloads that
+    /// parse as JSON. A plaintext or malformed `data:` frame (e.g.
+    /// `data: contact user@example.com`) is matched by the raw-body union in
+    /// detection but cannot be rewritten, so the transform returns `None` and the
+    /// original PII would be delivered. This mirrors the JSON
+    /// `redact_leaves_residual` fail-closed: run the same redaction the transform
+    /// performs, then re-scan the result (with the redactor's own placeholder
+    /// markers stripped). If redaction produced no rewrite at all, or the rewrite
+    /// still matches, residual content remains and the caller must reject.
+    fn redact_sse_leaves_residual(&self, body: &[u8]) -> bool {
+        if self.detection_pattern_count == 0 {
+            return false;
+        }
+        // `redact_sse_body` returns `None` when nothing was rewritten; with
+        // detection already positive that means the matched bytes are not
+        // JSON-redactable (plaintext/malformed frame or a STRUCTURAL_KEYS-only
+        // scalar). Treat "no rewrite while detected" as residual so we fail
+        // closed rather than forward the original PII.
+        let Some(redacted) = self.redact_sse_body(body) else {
+            return true;
+        };
+        let Ok(redacted_str) = std::str::from_utf8(&redacted) else {
+            // Redacted output is not valid UTF-8 — cannot re-scan safely, so
+            // fail closed rather than risk forwarding undetectable residual.
+            return true;
+        };
+        let frames = parse_sse_data_frames(&redacted);
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        for frame in &frames {
+            collect_decoded_json_strings(frame, &mut texts);
+        }
+        for text in &texts {
+            let cleaned = self.strip_known_placeholders(text.as_ref());
+            if self.detection_set.is_match(&cleaned) {
+                return true;
+            }
+        }
+        let cleaned_raw = self.strip_known_placeholders(redacted_str);
+        self.detection_set.is_match(&cleaned_raw)
     }
 
     /// Redact content in LLM response JSON.
@@ -717,10 +946,20 @@ impl AiResponseGuard {
     fn redact_sse_body(&self, body: &[u8]) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
 
-        // Fast-skip: a single DFA pass over the whole body tells us whether
-        // any pattern can match. Mirrors the JSON path so the common
-        // "redact mode but no PII in the stream" case stays zero-copy.
-        if !self.detection_set.is_match(body_str) {
+        // Fast-skip the common "redact mode but no PII in the stream" case.
+        // Scan-all mode unions decoded frame strings (so JSON escapes cannot hide
+        // content) with a raw-body pass (so cross-token/contextual patterns and
+        // unparseable `data:` payloads are not skipped here while the
+        // reject/warn detection path would have flagged them).
+        let has_match = if self.scan_mode == ScanMode::All {
+            let frames = parse_sse_data_frames(body);
+            !self
+                .detect_matches_in_decoded_sse_frames(&frames, Some(body_str))
+                .is_empty()
+        } else {
+            self.detection_set.is_match(body_str)
+        };
+        if !has_match {
             return None;
         }
 
@@ -860,7 +1099,11 @@ impl Plugin for AiResponseGuard {
         // --- SSE path: parse frames, extract accumulated texts, detect ---
         if is_sse {
             let frames = parse_sse_data_frames(body);
-            if frames.is_empty() {
+            // In scan-all mode the raw-body union pass (and the `[done]`-only /
+            // unparseable-frame cases) still need to run even when no `data:`
+            // payload parsed as JSON, so only short-circuit on empty frames for
+            // the structured (`Content`) path.
+            if frames.is_empty() && self.scan_mode != ScanMode::All {
                 return PluginResult::Continue;
             }
 
@@ -890,11 +1133,7 @@ impl Plugin for AiResponseGuard {
             }
 
             let detected = if self.scan_mode == ScanMode::All {
-                let body_str = match std::str::from_utf8(body) {
-                    Ok(s) => s,
-                    Err(_) => return PluginResult::Continue,
-                };
-                self.detect_matches_in_str(body_str)
+                self.detect_matches_in_decoded_sse_frames(&frames, std::str::from_utf8(body).ok())
             } else {
                 let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
                 self.detect_matches(&refs)
@@ -902,6 +1141,35 @@ impl Plugin for AiResponseGuard {
 
             if detected.is_empty() {
                 return PluginResult::Continue;
+            }
+
+            // Scan-all redact mode can detect SSE content the per-frame redactor
+            // cannot rewrite (plaintext/malformed `data:` frames, cross-frame or
+            // structural-scalar matches surfaced by the raw-body union). The
+            // transform (`redact_sse_body`) would return `None` for those, so
+            // forwarding the body while reporting it `redacted` leaks PII. Fail
+            // closed (reject) when redaction would leave residual content, exactly
+            // as the JSON path does below.
+            if self.action == GuardAction::Redact
+                && self.scan_mode == ScanMode::All
+                && self.redact_sse_leaves_residual(body)
+            {
+                debug!(
+                    "ai_response_guard: scan-all redact leaves residual SSE content (types: {:?}), rejecting response",
+                    detected
+                );
+                let types_json: Vec<String> = detected
+                    .iter()
+                    .map(|t| format!("\"{}\"", escape_json_string(t)))
+                    .collect();
+                return PluginResult::Reject {
+                    status_code: 502,
+                    body: format!(
+                        r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                        types_json.join(","),
+                    ),
+                    headers: HashMap::new(),
+                };
             }
 
             return self.respond_to_detection(ctx, &detected);
@@ -969,17 +1237,42 @@ impl Plugin for AiResponseGuard {
 
         // Detect PII and blocked content
         let detected = if self.scan_mode == ScanMode::All {
-            let body_str = match std::str::from_utf8(body) {
-                Ok(s) => s,
-                Err(_) => return PluginResult::Continue,
-            };
-            self.detect_matches_in_str(body_str)
+            self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
         } else {
             self.detect_matches(&texts)
         };
 
         if detected.is_empty() {
             return PluginResult::Continue;
+        }
+
+        // Redact mode in scan-all can detect PII the structured + recursive
+        // redactor cannot rewrite (object keys, numeric scalars, cross-token
+        // custom patterns, duplicate-key values). Forwarding such a body while
+        // reporting it `redacted` would leak PII, so fail closed (reject) when
+        // redaction would leave residual detections rather than emit false
+        // "redacted" telemetry. Bodies whose PII is fully rewritable fall
+        // through to the normal redact path below.
+        if self.action == GuardAction::Redact
+            && self.scan_mode == ScanMode::All
+            && self.redact_leaves_residual(&json)
+        {
+            debug!(
+                "ai_response_guard: scan-all redact leaves residual content (types: {:?}), rejecting response",
+                detected
+            );
+            let types_json: Vec<String> = detected
+                .iter()
+                .map(|t| format!("\"{}\"", escape_json_string(t)))
+                .collect();
+            return PluginResult::Reject {
+                status_code: 502,
+                body: format!(
+                    r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                    types_json.join(","),
+                ),
+                headers: HashMap::new(),
+            };
         }
 
         self.respond_to_detection(ctx, &detected)
@@ -1014,8 +1307,10 @@ impl Plugin for AiResponseGuard {
         let mut json: Value = serde_json::from_slice(body).ok()?;
 
         if self.scan_mode == ScanMode::All {
-            let body_str = std::str::from_utf8(body).ok()?;
-            if !self.detection_set.is_match(body_str) {
+            if self
+                .detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
+                .is_empty()
+            {
                 return None;
             }
             let known_texts = self.extract_completion_texts(&json);
@@ -1033,6 +1328,50 @@ impl Plugin for AiResponseGuard {
         }
 
         serde_json::to_vec(&json).ok()
+    }
+}
+
+/// Collect every decoded JSON token for `ScanMode::All` detection so the
+/// decoded walker matches the coverage of the original raw-body scan.
+///
+/// Serde has already resolved `\uXXXX` and other JSON string escapes here, so
+/// detection sees the same text the client will receive after parsing — the
+/// coverage gap issue #1720 closed.
+///
+/// Collected, mirroring the raw-body scan this supplements:
+/// - String values (borrowed `&str`).
+/// - Object keys (borrowed `&str`) — e.g. `{"a@b.com":"ok"}`, whose key the raw
+///   scan caught but a values-only walk would drop.
+/// - Numeric scalars, stringified to owned `String` — e.g. a numeric SSN
+///   `{"ssn":123456789}` or credit-card number, which a `&str`-only walk cannot
+///   see. Numbers are the load-bearing scalar case for PII.
+///
+/// Booleans and null are intentionally skipped: their canonical forms
+/// (`true`/`false`/`null`) carry no PII, so collecting them would only add
+/// noise. The walker yields `Cow<str>` (`Borrowed` for strings/keys, `Owned`
+/// for stringified numbers) so number text is included without allocating for
+/// the common string case.
+fn collect_decoded_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    match value {
+        Value::String(text) => texts.push(Cow::Borrowed(text.as_str())),
+        Value::Number(n) => texts.push(Cow::Owned(n.to_string())),
+        Value::Array(items) => {
+            for item in items {
+                collect_decoded_json_strings(item, texts);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                // Scan object KEYS too, not just values: in `ScanMode::All` the
+                // previous raw-body scan covered the whole serialized body
+                // (including field names), so a blocked phrase / PII pattern in a
+                // key like `{"user@example.com": "ok"}` must still be detected.
+                texts.push(Cow::Borrowed(key.as_str()));
+                collect_decoded_json_strings(value, texts);
+            }
+        }
+        // Bool / Null carry no PII; deliberately dropped.
+        _ => {}
     }
 }
 

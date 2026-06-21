@@ -98,6 +98,7 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,

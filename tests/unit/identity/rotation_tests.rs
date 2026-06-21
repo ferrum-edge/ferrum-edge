@@ -30,7 +30,7 @@ fn make_bundle(ttl_secs: i64) -> SvidBundle {
     SvidBundle {
         spiffe_id: id,
         cert_chain_der: vec![cert.der().to_vec()],
-        private_key_pkcs8_der: key_pair.serialize_der(),
+        private_key_pkcs8_der: key_pair.serialize_der().into(),
         trust_bundles: TrustBundleSet {
             local: TrustBundle {
                 trust_domain: trust_domain.clone(),

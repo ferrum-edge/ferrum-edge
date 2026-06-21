@@ -302,6 +302,10 @@ impl Plugin for GrpcWebPlugin {
         true
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(META_GRPC_WEB_MODE)
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Always strip the internal mode marker from inbound headers so a client
         // cannot spoof it. The plugin re-injects it in `before_proxy` only when

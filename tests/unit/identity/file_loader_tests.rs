@@ -161,6 +161,8 @@ fn loads_svid_bundle_from_files() {
     );
     assert_eq!(bundle.cert_chain_der.len(), 1);
     assert!(!bundle.private_key_pkcs8_der.is_empty());
+    let debug = format!("{bundle:?}");
+    assert!(debug.contains("private_key_pkcs8_der: <redacted>"));
     assert_eq!(
         bundle.trust_bundles.local.trust_domain.as_str(),
         "corp.example"

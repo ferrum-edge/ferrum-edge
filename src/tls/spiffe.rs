@@ -459,7 +459,7 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
         .map(|d| CertificateDer::from(d.clone()))
         .collect();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        bundle.private_key_pkcs8_der.clone(),
+        bundle.private_key_pkcs8_der.to_vec(),
     ));
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| format!("ring sign init failed: {e}"))?;
@@ -849,7 +849,7 @@ mod tests {
         SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![leaf],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles,
         }
     }
@@ -863,7 +863,7 @@ mod tests {
         SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![leaf],
-            private_key_pkcs8_der: key,
+            private_key_pkcs8_der: key.into(),
             trust_bundles,
         }
     }

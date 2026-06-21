@@ -1,0 +1,32 @@
+# Development control-plane install for kind/minikube.
+#
+# Create the referenced Secret with random values before installing:
+#   kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
+#     --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
+#     --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
+
+controlPlane:
+  enabled: true
+  database:
+    type: sqlite
+    url: sqlite:////tmp/ferrum-mesh-dev.db?mode=rwc
+  credentials:
+    adminJwtSecret:
+      existingSecret:
+        name: ferrum-mesh-dev-credentials
+        key: admin-jwt-secret
+    cpDpGrpcJwtSecret:
+      existingSecret:
+        name: ferrum-mesh-dev-credentials
+        key: cp-dp-grpc-jwt-secret
+  env:
+    FERRUM_MODE: cp
+    FERRUM_XDS_ENABLED: "true"
+    FERRUM_LOG_LEVEL: info
+    FERRUM_CP_NAMESPACES: "*"
+
+injector:
+  enabled: false
+
+ca:
+  enabled: false

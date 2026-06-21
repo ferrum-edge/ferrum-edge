@@ -247,6 +247,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
@@ -281,6 +282,7 @@ impl HboneConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 hbone_port,
                 expected_peer,
                 &key,
@@ -477,6 +479,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
@@ -511,6 +514,7 @@ impl HboneConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 hbone_port,
                 expected_peer,
                 &key,
@@ -562,6 +566,7 @@ impl HboneConnectionPool {
     /// SVID rotation is automatic because every new session dials with the
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_ws_byte_tunnel(
         &self,
         proxy: &Proxy,
@@ -569,6 +574,7 @@ impl HboneConnectionPool {
         hbone_port: u16,
         app_host: &str,
         app_port: u16,
+        app_policy_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
@@ -578,7 +584,7 @@ impl HboneConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -589,6 +595,7 @@ impl HboneConnectionPool {
             expected_peer,
             &pool_config,
             keepalive_override,
+            None,
         )
         .await?;
         let baggage = baggage_header_for_source(&source_identity);
@@ -606,12 +613,139 @@ impl HboneConnectionPool {
         })?
     }
 
+    /// Open a datagram-over-HBONE CONNECT tunnel to a peer's HBONE listener over
+    /// a FRESH SVID-mTLS H2 connection (F3 §3.3 Stage 4), stamping the `udp`
+    /// protocol marker (NOT `hbone`) and the W3C source-identity baggage. The
+    /// connection is DIALED to `dial_host:hbone_port` (the peer's pod address +
+    /// `:15008`/`mesh.hbone_port`); the CONNECT `:authority` is `app_host:app_port`
+    /// — the destination workload's UDP app address+port the peer unframes the
+    /// tunnel into a local `UdpSocket` toward. The returned [`H2ConnectTunnel`]
+    /// carries length-delimited datagrams (see `crate::proxy::mesh_udp_frame`),
+    /// NOT a raw byte stream.
+    ///
+    /// Like [`Self::get_ws_byte_tunnel`] this dials its OWN H2 connection carrying
+    /// exactly ONE CONNECT stream (1:1, dropped when the UDP session ends) rather
+    /// than multiplexing over the pooled HBONE connections. A dedicated connection
+    /// per UDP session is deliberate: it keeps the wire-visible `udp` marker on a
+    /// stream that is unambiguously a datagram tunnel (no risk of a pooled
+    /// connection caching a per-connection `hbone`-vs-`udp` verdict by its first
+    /// marker), and a captured UDP flow is already a distinct session with its own
+    /// lifetime. SVID rotation is automatic (each session dials with the current
+    /// SVID). The dial PINS `expected_peer`; a missing gateway SVID fails closed
+    /// before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
+    /// `hbone` marker on the pooled byte-stream path.
+    //
+    // Callers: the mesh UDP capture egress datapath (Linux-only, `IP_TRANSPARENT`)
+    // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection`]),
+    // so this is reachable on every platform.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_datagram_tunnel(
+        &self,
+        proxy: &Proxy,
+        dial_host: &str,
+        hbone_port: u16,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
+        let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
+        let pool_config = self.pool_config.for_proxy(proxy);
+        // Per-port DestinationRule overrides (`portLevelSettings`) are stored on
+        // the UDP upstream's `port_overrides` and precomputed onto
+        // `dispatch_port_overrides`. Resolve them for the destination's APP port
+        // (the DR keying port), NOT the transport `hbone_port`, mirroring the
+        // WS byte-tunnel path and the byte-stream inbound relay's
+        // `effective_connect_timeout_ms` (codex r5 P2):
+        // - `tcpKeepalive` flows into the dial's socket keepalive;
+        // - `connectTimeout` bounds the WHOLE dial (TCP + TLS + H2 handshake)
+        //   AND the CONNECT-stream response wait.
+        let port_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_policy_port));
+        let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
+        let effective_connect_timeout_ms = port_override
+            .and_then(|o| o.connect_timeout_ms)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        let sender = dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            dial_host,
+            hbone_port,
+            expected_peer,
+            &pool_config,
+            keepalive_override,
+            Some(connect_timeout),
+        )
+        .await?;
+        let baggage = baggage_header_for_source(&source_identity);
+        tokio::time::timeout(
+            connect_timeout,
+            open_h2_connect_stream(
+                sender,
+                app_host,
+                app_port,
+                Some(&baggage),
+                Some(crate::modes::mesh::hbone::UDP_PROTOCOL),
+            ),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectStream {
+            authority: authority_for_host_port(app_host, app_port),
+            message: format!(
+                "timed out after {}ms waiting for datagram-over-HBONE CONNECT response",
+                effective_connect_timeout_ms
+            ),
+        })?
+    }
+
+    /// Capability probe for a UDP egress target: open a `udp`-marked
+    /// datagram-over-HBONE CONNECT exactly as [`Self::get_datagram_tunnel`]
+    /// would, then DROP the tunnel. A UDP egress target's destination relay
+    /// branches on the `udp` marker (`is_udp_hbone_connect`) and unframes the
+    /// stream into a local `UdpSocket`; probing it with the byte-stream
+    /// [`Self::warmup_connection`] (which stamps the `hbone` marker) hits the
+    /// WRONG relay on the destination — the byte-stream path that TCP-connects
+    /// to the app port — so the probe must carry the SAME `udp` marker the
+    /// dispatch datapath uses, or it would prove the wrong capability (codex r1
+    /// P1). Like the dispatch path this dials its OWN H2 connection (no pooled
+    /// `hbone`-vs-`udp` marker ambiguity); the connection is dropped with the
+    /// tunnel when the probe returns.
+    pub async fn warmup_datagram_connection(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        target_policy_port: u16,
+        hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+    ) -> Result<(), HbonePoolError> {
+        // dial_host == app_host == target_host (mirrors the egress datapath,
+        // which dials the peer pod IP and CONNECTs to that same app addr:port).
+        let _tunnel = self
+            .get_datagram_tunnel(
+                proxy,
+                target_host,
+                hbone_port,
+                target_host,
+                target_port,
+                target_policy_port,
+                expected_peer,
+            )
+            .await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn get_or_create_sender(
         &self,
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
         key: &str,
@@ -739,7 +873,7 @@ impl HboneConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_port))
+            .and_then(|m| m.get(&target_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
@@ -953,6 +1087,7 @@ impl HboneConnectionPool {
             expected_peer,
             pool_config,
             keepalive_override,
+            None,
         )
         .await
     }
@@ -1134,6 +1269,12 @@ pub(crate) async fn dial_h2_connect_sender(
     expected_peer: Option<&crate::identity::SpiffeId>,
     pool_config: &PoolConfig,
     keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
+    // Per-port DestinationRule `connectTimeout` override (resolved by the caller
+    // for the destination APP port, the DR keying port — NOT the transport dial
+    // port). `None` keeps the proxy-level `backend_connect_timeout_ms`. Bounds
+    // the WHOLE dial (TCP + TLS + H2 handshake), mirroring the byte-stream
+    // inbound relay's `effective_connect_timeout_ms` (codex r5 P2).
+    connect_timeout_override: Option<Duration>,
 ) -> Result<SendRequest<Bytes>, HbonePoolError> {
     let resolved_ip = dns_cache
         .resolve(
@@ -1148,7 +1289,10 @@ pub(crate) async fn dial_h2_connect_sender(
         })?;
     let sock_addr = std::net::SocketAddr::new(resolved_ip, dial_port);
     let addr = sock_addr.to_string();
-    let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let effective_connect_timeout_ms = connect_timeout_override
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(proxy.backend_connect_timeout_ms);
+    let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
     let connect_started = Instant::now();
 
     let tcp = tokio::time::timeout(
@@ -1158,7 +1302,7 @@ pub(crate) async fn dial_h2_connect_sender(
     .await
     .map_err(|_| HbonePoolError::ConnectTimeout {
         addr: addr.clone(),
-        timeout_ms: proxy.backend_connect_timeout_ms,
+        timeout_ms: effective_connect_timeout_ms,
     })?
     .map_err(|source| HbonePoolError::Connect {
         addr: addr.clone(),
@@ -1191,14 +1335,14 @@ pub(crate) async fn dial_h2_connect_sender(
     else {
         return Err(HbonePoolError::ConnectTimeout {
             addr,
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         });
     };
     let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
         .await
         .map_err(|_| HbonePoolError::ConnectTimeout {
             addr: addr.clone(),
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         })?
         .map_err(|e| HbonePoolError::TlsHandshake {
             host: target_host.to_string(),
@@ -1220,14 +1364,14 @@ pub(crate) async fn dial_h2_connect_sender(
     else {
         return Err(HbonePoolError::ConnectTimeout {
             addr,
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         });
     };
     let (sender, mut connection) = tokio::time::timeout(remaining, builder.handshake(tls_stream))
         .await
         .map_err(|_| HbonePoolError::ConnectTimeout {
             addr,
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         })?
         .map_err(|e| HbonePoolError::H2Handshake {
             host: target_host.to_string(),
@@ -1792,6 +1936,7 @@ mod tests {
         UpstreamTarget {
             host: "orders.default.svc.cluster.local".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: tags
                 .iter()
@@ -1826,6 +1971,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             resolved_tls: BackendTlsConfig::default_verify(),
             dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
             dns_override: None,
             dns_cache_ttl_seconds: None,
             auth_mode: AuthMode::Single,
@@ -2144,7 +2290,7 @@ mod tests {
         SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![leaf.to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],
@@ -2504,6 +2650,7 @@ mod tests {
                 &proxy,
                 "orders.default.svc.cluster.local",
                 8080,
+                8080,
                 ISTIO_HBONE_PORT,
                 None,
                 &key,
@@ -2549,7 +2696,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![b"leaf-cert".to_vec(), b"intermediate".to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],

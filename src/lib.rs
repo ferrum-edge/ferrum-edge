@@ -86,6 +86,32 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── plugins/request_deduplication ─────────────────────────────────────────
+    pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
+        crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
+    }
+
+    pub fn request_deduplication_completed_size_snapshot_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> (usize, usize) {
+        plugin.completed_size_snapshot_for_tests()
+    }
+
+    pub fn request_deduplication_expire_completed_entries_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) {
+        plugin.expire_completed_entries_for_tests();
+    }
+
+    pub fn request_deduplication_redis_payload_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        plugin.redis_payload_for_tests(status_code, headers, body)
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
@@ -340,11 +366,37 @@ pub mod _test_support {
         crate::plugins::response_caching::parse_http_date(value)
     }
 
+    pub fn advance_response_caching_clock_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        duration: std::time::Duration,
+    ) {
+        plugin.advance_clock_for_tests(duration);
+    }
+
+    pub fn response_caching_current_total_size_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> usize {
+        plugin.current_total_size_for_tests()
+    }
+
+    pub fn response_caching_size_accounting_snapshot_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> (usize, usize) {
+        plugin.size_accounting_snapshot_for_tests()
+    }
+
     /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.
     pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        crate::plugins::response_caching::sub_total_size(total, n);
+        use std::sync::atomic::Ordering;
+
+        if n == 0 {
+            return;
+        }
+        let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(n))
+        });
     }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
@@ -559,6 +611,8 @@ pub mod _test_support {
         ws_disconnect_plugins: &[Arc<dyn Plugin>],
         proxy_id: &str,
         session_meta: &crate::proxy::WsSessionMeta,
+        bytes_client_to_backend: u64,
+        bytes_backend_to_client: u64,
         failure: Option<(
             crate::plugins::Direction,
             crate::retry::ErrorClass,
@@ -569,31 +623,11 @@ pub mod _test_support {
             ws_disconnect_plugins,
             proxy_id,
             session_meta,
+            bytes_client_to_backend,
+            bytes_backend_to_client,
             failure,
         )
         .await
-    }
-
-    /// Exercise the startup decision behind the `FERRUM_WEBSOCKET_TUNNEL_MODE`
-    /// frame-loss-risk warning. Builds a `PluginCache` from `config` (the same
-    /// source of truth the gateway uses to decide whether a proxy takes the
-    /// lossy raw-tunnel path) and returns the number of HTTP-family proxies the
-    /// caveat applies to: `0` when tunnel mode is disabled, no HTTP-family proxy
-    /// is present, or every HTTP-family proxy requires WS frame hooks (so no
-    /// warning is emitted).
-    ///
-    /// Returns `Err` only if the config has an invalid plugin configuration that
-    /// `PluginCache` construction rejects — tests pass valid configs.
-    pub fn warn_if_websocket_tunnel_mode_frame_loss_risk_for_test(
-        config: &crate::config::types::GatewayConfig,
-        websocket_tunnel_mode: bool,
-    ) -> Result<usize, String> {
-        let plugin_cache = crate::plugin_cache::PluginCache::new(config)?;
-        Ok(crate::proxy::warn_if_websocket_tunnel_mode_frame_loss_risk(
-            config,
-            &plugin_cache,
-            websocket_tunnel_mode,
-        ))
     }
 
     /// Construct a streaming `ProxyBody` for use in unit/integration tests.

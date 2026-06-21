@@ -17,21 +17,34 @@ pub mod upstream;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
+use crate::identity::{RedactedPrivateKeyDer, SvidPrivateKeyDer};
 
 /// A signed X.509 SVID, returned by [`CertificateAuthority::sign_workload_csr`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SignedSvid {
     /// The SPIFFE ID encoded into the URI SAN of `cert_chain[0]`.
     pub spiffe_id: SpiffeId,
     /// Leaf-first DER-encoded X.509 chain. Length ≥ 1.
     pub cert_chain_der: Vec<Vec<u8>>,
     /// PKCS#8 DER-encoded private key for `cert_chain[0]`.
-    pub private_key_pkcs8_der: Vec<u8>,
+    pub private_key_pkcs8_der: SvidPrivateKeyDer,
     /// notAfter for the leaf certificate. Used by the rotation task.
     pub not_after: DateTime<Utc>,
+}
+
+impl fmt::Debug for SignedSvid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignedSvid")
+            .field("spiffe_id", &self.spiffe_id)
+            .field("cert_chain_der", &self.cert_chain_der)
+            .field("private_key_pkcs8_der", &RedactedPrivateKeyDer)
+            .field("not_after", &self.not_after)
+            .finish()
+    }
 }
 
 /// A request to issue an SVID. Either a CSR (preferred — workload retains

@@ -1235,11 +1235,11 @@ async fn h2_grpc_preserve_true_forwards_client_authority_as_host() {
     );
 }
 
-/// Buffered path (`proxy_grpc_request` → `proxy_grpc_request_core`): when
-/// retries are configured the gateway must collect the request body before
-/// dispatch so it can replay on retry, exercising the buffered code path
-/// rather than the streaming fast path. The override must fire there too —
-/// regression guard against drift between the two functions.
+/// Buffered gRPC path: when retries are configured the gateway must collect
+/// the request body before dispatch so it can replay on retry, exercising the
+/// buffered code path rather than the streaming fast path. The override must
+/// fire there too — regression guard against drift between buffered and
+/// streaming dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_grpc_preserve_false_buffered_path_overrides_host_to_target() {
@@ -1256,8 +1256,7 @@ async fn h2_grpc_preserve_false_buffered_path_overrides_host_to_target() {
         .spawn()
         .expect("spawn backend");
 
-    // Configure retries so the gateway picks the buffered dispatch
-    // (`proxy_grpc_request` → `proxy_grpc_request_core`) instead of the
+    // Configure retries so the gateway picks buffered dispatch instead of the
     // streaming fast path. The first attempt succeeds, so no actual retry
     // fires — we just need the buffered code path executed once.
     let overrides = json!({

@@ -46,7 +46,10 @@ mod inner {
     use mongodb::bson::{
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
-    use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
+    use mongodb::options::{
+        ClientOptions, FindOptions, IndexOptions, ReadPreference, SelectionCriteria, Tls,
+        TlsOptions,
+    };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -64,6 +67,32 @@ mod inner {
     const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
+
+    /// Build an ordering-safe `$gte` lower bound for the string-typed
+    /// `updated_at` field.
+    ///
+    /// Resource `updated_at` values are persisted as RFC 3339 strings via
+    /// chrono's serde impl, which uses `SecondsFormat::AutoSi`: it emits a
+    /// `Z`-suffixed string with **variable** fractional precision (no fraction
+    /// for whole seconds, otherwise 3/6/9 digits). Plain RFC 3339 string
+    /// comparison is therefore not chronologically faithful at the sub-second
+    /// boundary — `.` (0x2E) sorts before `Z` (0x5A), so a whole-second bound
+    /// like `2025-06-15T15:06:40Z` lexicographically *excludes* the
+    /// chronologically-newer `2025-06-15T15:06:40.123Z`.
+    ///
+    /// To keep `$gte` correct across all stored fractional widths, floor the
+    /// bound to its whole second and emit it with no fractional part and no
+    /// zone suffix (`%Y-%m-%dT%H:%M:%S`). Such a string is a prefix of every
+    /// AutoSi representation of that same second (and of any later instant), so
+    /// it lexicographically precedes them all and the boundary second is fully
+    /// included. Instants strictly before the bound's second still sort lower
+    /// and remain excluded. A sub-second bound is rounded down to the start of
+    /// its second — over-inclusive by at most one second, the same safe
+    /// direction as the incremental poll's explicit 1s margin (never drop
+    /// newer rows).
+    fn mongo_updated_at_lower_bound(ts: DateTime<Utc>) -> String {
+        ts.format("%Y-%m-%dT%H:%M:%S").to_string()
+    }
 
     fn is_mongo_command_error_with_code(err: &mongodb::error::Error, code: i32) -> bool {
         matches!(
@@ -337,6 +366,13 @@ mod inner {
             tls_insecure: bool,
         ) -> Result<(Client, Database, bool), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
+            if client_options.selection_criteria.is_some() {
+                warn!(
+                    "MongoDB readPreference from FERRUM_DB_URL is ignored; authoritative config reads use primary"
+                );
+            }
+            client_options.selection_criteria =
+                Some(SelectionCriteria::ReadPreference(ReadPreference::Primary));
 
             if let Some(name) = &settings.app_name {
                 client_options.app_name = Some(name.clone());
@@ -704,6 +740,47 @@ mod inner {
                     );
                 }
             }
+        }
+
+        /// Count `api_specs` rows that the floored `updated_at` prefilter
+        /// over-matched: those in the boundary second `[floor(since), since)`
+        /// whose exact `updated_at` is chronologically `< since`.
+        ///
+        /// `base_filter` is the caller's full list filter (namespace plus any
+        /// proxy_id/tag/etc. predicates) including the floored `updated_at`
+        /// `$gte`; this restricts the scan to the same logical set. The
+        /// `updated_at` predicate is then narrowed to the single boundary
+        /// second so only that window is fetched (one second of resource
+        /// writes, normally empty). Only the `updated_at` field is projected.
+        async fn count_updated_before_in_boundary_second(
+            &self,
+            base_filter: &Document,
+            since: DateTime<Utc>,
+        ) -> Result<i64, anyhow::Error> {
+            // Restrict to `[floor(since), floor(since)+1s)` — the only window
+            // the whole-second floor can over-include.
+            let floor = mongo_updated_at_lower_bound(since);
+            let next = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            let mut filter = base_filter.clone();
+            filter.insert("updated_at", doc! { "$gte": &floor, "$lt": &next });
+
+            let options = FindOptions::builder()
+                .projection(doc! { "_id": 0, "updated_at": 1 })
+                .build();
+            let mut cursor = self.api_specs().find(filter).with_options(options).await?;
+            let mut overage: i64 = 0;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                // Parse the stored RFC 3339 string exactly (faithful across
+                // every AutoSi fractional width) and apply `< since`.
+                if let Ok(raw) = doc.get_str("updated_at")
+                    && let Ok(parsed) = DateTime::parse_from_rfc3339(raw)
+                    && parsed.with_timezone(&Utc) < since
+                {
+                    overage += 1;
+                }
+            }
+            Ok(overage)
         }
 
         /// Delete proxy_group-scoped plugin configs that are no longer referenced
@@ -1231,6 +1308,7 @@ mod inner {
     ) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(event)?;
         doc.insert("_id", event.id.as_str());
+        doc.insert("diff", serde_json::to_string(&event.diff)?);
         doc.insert(
             "ts",
             Bson::DateTime(BsonDateTime::from_millis(event.ts.timestamp_millis())),
@@ -1253,7 +1331,23 @@ mod inner {
             }
             None => {}
         }
-        Ok(mongodb::bson::from_document(doc)?)
+        let diff = match doc.remove("diff") {
+            Some(Bson::String(diff_json)) => Some(serde_json::from_str(&diff_json)?),
+            Some(other) => {
+                doc.insert("diff", other);
+                None
+            }
+            None => Some(serde_json::Value::Object(serde_json::Map::new())),
+        };
+        if diff.is_some() {
+            doc.insert("diff", Bson::Document(Document::new()));
+        }
+
+        let mut event: crate::admin::audit::AuditEvent = mongodb::bson::from_document(doc)?;
+        if let Some(diff) = diff {
+            event.diff = diff;
+        }
+        Ok(event)
     }
 
     fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
@@ -1495,10 +1589,17 @@ mod inner {
             let poll_timestamp = Utc::now();
 
             // Safety margin: 1 second before `since` to avoid missing boundary writes.
-            // The `updated_at` field is stored as an RFC 3339 string (chrono serde),
-            // which is lexicographically sortable, so $gte on strings works correctly.
+            // Resource `updated_at` values are stored as variable-precision
+            // RFC 3339 strings (chrono `AutoSi`), so use a whole-second-floor
+            // lower bound that orders correctly against every fractional width.
+            // See `mongo_updated_at_lower_bound`.
+            //
+            // Unlike `list_api_specs`, the poll path *wants* the floored bound's
+            // over-inclusion: re-emitting an already-known row is idempotent and
+            // the explicit 1s margin above already over-includes by design, so
+            // no exact `>= since` post-filter is applied here.
             let since_with_margin = since - chrono::Duration::seconds(1);
-            let since_str = since_with_margin.to_rfc3339();
+            let since_str = mongo_updated_at_lower_bound(since_with_margin);
             let filter = doc! { "namespace": namespace, "updated_at": { "$gte": &since_str } };
 
             // Load changed resources.
@@ -2550,9 +2651,9 @@ mod inner {
         }
 
         async fn reconnect_read_replica(&self, _replica_url: &str) -> Result<(), anyhow::Error> {
-            // MongoDB driver handles read preference routing internally via
-            // the connection string (e.g., ?readPreference=secondaryPreferred).
-            // No separate replica pool needed.
+            // MongoDB uses one authoritative client and forces primary reads
+            // for the config store. There is no separate admin-read replica
+            // pool to reconnect.
             Ok(())
         }
 
@@ -2936,6 +3037,9 @@ mod inner {
                 Err(e) => return Err(e.into()),
             }
             self.api_specs()
+                .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
+                .await?;
+            self.api_specs()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
@@ -2987,7 +3091,21 @@ mod inner {
             self.audit_events()
                 .create_index(
                     IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "action": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
                         .keys(doc! { "resource_type": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "resource_id": 1 })
                         .build(),
                 )
                 .await?;
@@ -3016,6 +3134,10 @@ mod inner {
             let mut result: Vec<String> = all_namespaces.into_iter().collect();
             result.sort();
             Ok(result)
+        }
+
+        async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+            self.list_namespaces().await
         }
 
         // -------------------------------------------------------------------
@@ -3538,7 +3660,21 @@ mod inner {
                 );
             }
             if let Some(ref since) = filter.updated_since {
-                filter_doc.insert("updated_at", doc! { "$gte": since.to_rfc3339() });
+                // `updated_at` is a variable-precision RFC 3339 string
+                // (chrono `AutoSi`), so no single lexicographic `$gte` bound is
+                // chronologically faithful at the sub-second boundary. Use the
+                // whole-second-floor bound as an index *prefilter* only: it
+                // includes every row that is chronologically `>= since` (never
+                // drops newer rows) at the cost of also matching rows in the
+                // boundary second `[floor(since), since)`. The exact
+                // `updated_at >= since` predicate (the documented/trait
+                // semantics, matching the SQL backend) is then re-applied in
+                // app code below against the parsed `DateTime`. See
+                // `mongo_updated_at_lower_bound`.
+                filter_doc.insert(
+                    "updated_at",
+                    doc! { "$gte": mongo_updated_at_lower_bound(*since) },
+                );
             }
             if let Some(ref tag) = filter.has_tag {
                 // Native array membership query (multikey index used).
@@ -3550,7 +3686,24 @@ mod inner {
             }
 
             // --- COUNT query (same filter, no pagination) --------------------
-            let total = self.api_specs().count_documents(filter_doc.clone()).await? as i64;
+            let prefilter_total =
+                self.api_specs().count_documents(filter_doc.clone()).await? as i64;
+
+            // The floored `updated_at` prefilter is over-inclusive only when
+            // `updated_since` carries a sub-second component: it then also
+            // matches rows in the boundary second `[floor(since), since)`.
+            // Count those spurious rows exactly so `total` reflects the
+            // documented `updated_at >= since` semantics. The boundary window
+            // is at most one second of resource writes (typically empty), so
+            // this is a small, index-bounded scan that fetches only timestamps.
+            let boundary_overage = match filter.updated_since {
+                Some(since) if since.timestamp_subsec_nanos() != 0 => {
+                    self.count_updated_before_in_boundary_second(&filter_doc, since)
+                        .await?
+                }
+                _ => 0,
+            };
+            let total = prefilter_total - boundary_overage;
 
             // --- Data query (sort + skip + limit) ----------------------------
             // Sort document
@@ -3565,10 +3718,41 @@ mod inner {
                 SortOrder::Desc => -1,
             };
 
+            // The floored `updated_at` prefilter over-includes the boundary
+            // second `[floor(since), since)` ONLY when `updated_since` carries a
+            // sub-second component (a whole-second floor is exact). The exact
+            // `updated_at >= since` predicate is faithful across every AutoSi
+            // fractional width, but it can only be applied in app code on the
+            // parsed `DateTime` — it has no ordering-faithful string `$gte` form.
+            //
+            // Pagination must therefore see the *kept* rows, not the raw
+            // prefilter rows. If we let Mongo `.skip()/.limit()` the
+            // over-inclusive set and post-filtered afterwards, a dropped
+            // boundary row would consume a page slot (under-filling the page,
+            // hiding valid rows past the limit) and shift `next_offset`,
+            // producing duplicates on the next page. So when (and only when) the
+            // boundary post-filter can fire, paginate app-side over the kept
+            // rows; otherwise keep the efficient server-side skip/limit. This
+            // matches the SQL backend, which applies the exact `updated_at >= ?`
+            // predicate before `LIMIT/OFFSET`.
+            let exact_postfilter_since = match filter.updated_since {
+                Some(since) if since.timestamp_subsec_nanos() != 0 => Some(since),
+                _ => None,
+            };
+
+            // Push skip/limit to Mongo only when no boundary over-inclusion is
+            // possible. When the exact post-filter can fire (sub-second `since`),
+            // leave skip/limit unset (`None`) and paginate app-side over kept
+            // rows below, so dropped boundary rows never consume a page slot.
+            let (mongo_skip, mongo_limit) = if exact_postfilter_since.is_some() {
+                (None, None)
+            } else {
+                (Some(filter.offset as u64), Some(filter.limit as i64))
+            };
             let options = mongodb::options::FindOptions::builder()
                 .sort(doc! { sort_field: sort_dir })
-                .skip(Some(filter.offset as u64))
-                .limit(Some(filter.limit as i64))
+                .skip(mongo_skip)
+                .limit(mongo_limit)
                 .projection(doc! { "spec_content": 0, "resource_hash": 0 })
                 .build();
             let mut cursor = self
@@ -3576,10 +3760,36 @@ mod inner {
                 .find(filter_doc)
                 .with_options(options)
                 .await?;
+
             let mut specs = Vec::new();
-            while cursor.advance().await? {
-                let doc = cursor.deserialize_current()?;
-                specs.push(doc_to_api_spec_summary(doc)?);
+            if let Some(since) = exact_postfilter_since {
+                // App-side pagination over kept rows.
+                let offset = filter.offset as u64;
+                let limit = filter.limit as usize;
+                let mut kept_seen: u64 = 0;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    let spec = doc_to_api_spec_summary(doc)?;
+                    // Drop boundary-second rows the floored prefilter over-matched.
+                    if spec.updated_at < since {
+                        continue;
+                    }
+                    // Skip the first `offset` kept rows, then collect `limit`.
+                    if kept_seen < offset {
+                        kept_seen += 1;
+                        continue;
+                    }
+                    if specs.len() >= limit {
+                        // Enough kept rows for this page; stop scanning early.
+                        break;
+                    }
+                    specs.push(spec);
+                }
+            } else {
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    specs.push(doc_to_api_spec_summary(doc)?);
+                }
             }
             self.check_slow_query("list_api_specs", start);
             Ok(PaginatedResult {
@@ -4110,6 +4320,222 @@ mod inner {
             );
         }
 
+        /// How a `DateTime<Utc>` is actually persisted into `updated_at`:
+        /// chrono's serde impl (`SecondsFormat::AutoSi`). Mirrors what
+        /// `bson::to_document` writes for resource/api-spec docs, so the bound
+        /// tests below compare against the real stored bytes.
+        fn stored_updated_at(ts: DateTime<Utc>) -> String {
+            serde_json::to_string(&ts)
+                .expect("serialize timestamp")
+                .trim_matches('"')
+                .to_string()
+        }
+
+        #[test]
+        fn mongo_updated_at_lower_bound_floors_to_whole_second() {
+            let whole = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let fractional = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+
+            assert_eq!(mongo_updated_at_lower_bound(whole), "2026-05-18T01:00:00");
+            assert_eq!(
+                mongo_updated_at_lower_bound(fractional),
+                "2026-05-18T01:00:00"
+            );
+            // No zone suffix or fractional part — it must be a prefix of every
+            // AutoSi stored representation of the same (or a later) second.
+            assert!(!mongo_updated_at_lower_bound(fractional).ends_with('Z'));
+            assert!(!mongo_updated_at_lower_bound(fractional).contains('.'));
+        }
+
+        #[test]
+        fn mongo_updated_at_lower_bound_includes_same_second_sub_second_rows() {
+            // Regression: `GET /api-specs?updated_since=...T01:00:00Z` must not
+            // omit a row stored at `...T01:00:00.123Z`. A naive `Z`-suffixed
+            // bound excludes it because `.` (0x2E) sorts before `Z` (0x5A).
+            let bound_instant = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let bound = mongo_updated_at_lower_bound(bound_instant);
+
+            // Stored values at or after the bound, across every AutoSi width.
+            for stored_instant in [
+                "2026-05-18T01:00:00Z",           // exact second, no fraction
+                "2026-05-18T01:00:00.123Z",       // millis
+                "2026-05-18T01:00:00.123456Z",    // micros
+                "2026-05-18T01:00:00.000000001Z", // nanos
+                "2026-05-18T01:00:01Z",           // next second
+                "2026-05-18T01:01:00.5Z",         // later minute, fractional
+            ] {
+                let stored = stored_updated_at(
+                    DateTime::parse_from_rfc3339(stored_instant)
+                        .expect("stored timestamp")
+                        .with_timezone(&Utc),
+                );
+                assert!(
+                    stored.as_str() >= bound.as_str(),
+                    "stored {stored} must be >= bound {bound} (chronologically >= bound)"
+                );
+            }
+
+            // Strictly-earlier instants must remain excluded.
+            for stored_instant in [
+                "2026-05-18T00:59:59.999999999Z",
+                "2026-05-18T00:59:59Z",
+                "2026-05-17T23:59:59.5Z",
+            ] {
+                let stored = stored_updated_at(
+                    DateTime::parse_from_rfc3339(stored_instant)
+                        .expect("stored timestamp")
+                        .with_timezone(&Utc),
+                );
+                assert!(
+                    stored.as_str() < bound.as_str(),
+                    "stored {stored} must be < bound {bound} (chronologically < bound)"
+                );
+            }
+        }
+
+        // Mirrors the exact `updated_at >= since` post-filter that
+        // `list_api_specs` re-applies after the floored index prefilter, plus
+        // the bounded boundary-second overage count. The floored `$gte` bound
+        // matches every chronologically-`>= since` row but over-includes rows
+        // in `[floor(since), since)`; these helpers reproduce the decision the
+        // store makes on parsed timestamps (faithful across AutoSi widths).
+        fn parse_stored(stored: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(stored)
+                .expect("stored timestamp")
+                .with_timezone(&Utc)
+        }
+        fn in_boundary_window(stored: &str, since: DateTime<Utc>) -> bool {
+            // `[floor(since), floor(since)+1s)` — the only over-included window.
+            let lo = mongo_updated_at_lower_bound(since);
+            let hi = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            let s = stored_updated_at(parse_stored(stored));
+            s.as_str() >= lo.as_str() && s.as_str() < hi.as_str()
+        }
+
+        #[test]
+        fn list_api_specs_exact_updated_since_semantics() {
+            // Finding: `GET /api-specs?updated_since=2026-05-18T01:00:00.900Z`
+            // must NOT return/count a spec stored at `2026-05-18T01:00:00.100Z`
+            // even though the floored prefilter (`...T01:00:00`) matches it.
+            let since = parse_stored("2026-05-18T01:00:00.900Z");
+
+            // Spurious boundary-second row: prefilter-matched but `< since`.
+            let earlier = "2026-05-18T01:00:00.100Z";
+            assert!(in_boundary_window(earlier, since));
+            assert!(
+                parse_stored(earlier) < since,
+                "earlier row must be excluded by the exact post-filter"
+            );
+
+            // Same-instant and later rows are retained.
+            for kept in [
+                "2026-05-18T01:00:00.900Z",    // exact boundary
+                "2026-05-18T01:00:00.900001Z", // just after, micros
+                "2026-05-18T01:00:01Z",        // next second
+            ] {
+                assert!(
+                    parse_stored(kept) >= since,
+                    "row {kept} must be retained (chronologically >= since)"
+                );
+            }
+
+            // Whole-second `since`: the floor is already exact, so the boundary
+            // window holds nothing `< since` and no overage is subtracted.
+            let whole = parse_stored("2026-05-18T01:00:00Z");
+            assert_eq!(whole.timestamp_subsec_nanos(), 0);
+            assert!(in_boundary_window("2026-05-18T01:00:00.000000001Z", whole));
+            assert!(
+                parse_stored("2026-05-18T01:00:00.000000001Z") >= whole,
+                "with whole-second since, same-second sub-second rows are kept"
+            );
+        }
+
+        #[test]
+        fn list_api_specs_sub_second_since_paginates_over_kept_rows() {
+            // Finding: with a sub-second `updated_since`, the exact post-filter
+            // runs AFTER Mongo skip/limit, so a dropped boundary-second row would
+            // consume a page slot — under-filling the page and shifting
+            // `next_offset` into duplicates. The fix paginates app-side over the
+            // *kept* rows. This test models that app-side loop against the same
+            // sorted prefilter set the store scans.
+            let since = parse_stored("2026-05-18T01:00:00.500Z");
+
+            // Sorted (updated_at ASC) prefilter set: the floored `$gte` matches
+            // every row at/after `...T01:00:00`. Two boundary rows are `< since`
+            // and must be dropped without consuming page slots.
+            let prefilter_sorted = [
+                "2026-05-18T01:00:00.100Z", // boundary, dropped (< since)
+                "2026-05-18T01:00:00.400Z", // boundary, dropped (< since)
+                "2026-05-18T01:00:00.500Z", // kept[0] (== since)
+                "2026-05-18T01:00:00.700Z", // kept[1]
+                "2026-05-18T01:00:01.000Z", // kept[2]
+                "2026-05-18T01:00:02.000Z", // kept[3]
+                "2026-05-18T01:00:03.000Z", // kept[4]
+            ];
+
+            // App-side pagination identical to the store: drop `< since`, skip
+            // `offset` kept rows, then collect up to `limit` kept rows.
+            let page = |offset: u64, limit: usize| -> Vec<String> {
+                let mut kept_seen: u64 = 0;
+                let mut out: Vec<String> = Vec::new();
+                for stored in prefilter_sorted {
+                    if parse_stored(stored) < since {
+                        continue;
+                    }
+                    if kept_seen < offset {
+                        kept_seen += 1;
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(stored.to_string());
+                }
+                out
+            };
+
+            // Page 1 (offset 0, limit 2) must be FULL with kept rows — the two
+            // dropped boundary rows do not steal slots.
+            let p1 = page(0, 2);
+            assert_eq!(
+                p1,
+                vec![
+                    "2026-05-18T01:00:00.500Z".to_string(),
+                    "2026-05-18T01:00:00.700Z".to_string(),
+                ],
+                "first page must be filled from kept rows only"
+            );
+
+            // `next_offset` = offset + items.len() = 2 (handler computation).
+            // Page 2 must continue WITHOUT repeating page-1 rows.
+            let p2 = page(2, 2);
+            assert_eq!(
+                p2,
+                vec![
+                    "2026-05-18T01:00:01.000Z".to_string(),
+                    "2026-05-18T01:00:02.000Z".to_string(),
+                ],
+                "second page must not duplicate first-page rows"
+            );
+
+            // Final page drains the remainder, no overlap.
+            let p3 = page(4, 2);
+            assert_eq!(
+                p3,
+                vec!["2026-05-18T01:00:03.000Z".to_string()],
+                "tail page returns only the final kept row"
+            );
+
+            // Exactly 5 kept rows total across non-overlapping pages.
+            assert_eq!(p1.len() + p2.len() + p3.len(), 5);
+        }
+
         #[test]
         fn audit_event_to_doc_stores_ts_as_bson_datetime() {
             let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
@@ -4123,7 +4549,15 @@ mod inner {
                 resource_type: "proxy".to_string(),
                 resource_id: "proxy-1".to_string(),
                 namespace: "ferrum".to_string(),
-                diff: serde_json::json!({"changed": true}),
+                diff: serde_json::json!({
+                    "changed": true,
+                    "after": {
+                        "config": {
+                            "$api_key": "[REDACTED]",
+                            "nested.value": true
+                        }
+                    }
+                }),
             };
 
             let doc = audit_event_to_doc(&event).expect("audit event document");
@@ -4134,9 +4568,14 @@ mod inner {
                     ts.timestamp_millis()
                 )))
             );
+            assert!(
+                matches!(doc.get("diff"), Some(Bson::String(_))),
+                "Mongo audit diff must be stored as opaque JSON text"
+            );
 
             let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
             assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
+            assert_eq!(round_trip.diff, event.diff);
         }
 
         // -------------------------------------------------------------------
@@ -4325,6 +4764,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4442,6 +4882,7 @@ mod inner {
                 targets: vec![crate::config::types::UpstreamTarget {
                     host: "target1.example.com".to_string(),
                     port: 8080,
+                    service_port_policy_key: None,
                     weight: 100,
                     tags: std::collections::HashMap::new(),
                     locality: None,
@@ -4466,6 +4907,7 @@ mod inner {
                     "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
                 ],
                 resolved_subset_tls: std::collections::HashMap::new(),
+                dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -4521,6 +4963,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4622,6 +5065,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4720,6 +5164,7 @@ mod inner {
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: std::collections::HashMap::new(),
+                dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -4789,6 +5234,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,

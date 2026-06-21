@@ -126,7 +126,7 @@ proxies:
     backend_port: 443
 ```
 
-**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and wildcards like `*.example.com`). One proxy per port may have empty `hosts` as a catch-all/default.
+**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and DNS suffix wildcards like `*.example.com`, which matches any DNS name below `example.com` but not `example.com` itself). One proxy per port may have empty `hosts` as a catch-all/default.
 
 ```yaml
 proxies:

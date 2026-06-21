@@ -15,6 +15,14 @@ use crate::identity::SpiffeId;
 pub const ISTIO_HBONE_PORT: u16 = 15008;
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const HBONE_PROTOCOL: &str = "hbone";
+/// `x-ferrum-mesh-protocol` value stamped on a datagram-over-HBONE CONNECT
+/// (F3 §3.3 Stage 4). DISTINCT from [`HBONE_PROTOCOL`]: a `udp` CONNECT carries
+/// length-delimited datagrams (see `crate::proxy::mesh_udp_frame`), not a raw
+/// byte stream, so the destination MUST unframe it into a local `UdpSocket`
+/// rather than byte-relaying it to a TCP backend. The two markers are mutually
+/// exclusive; an OLD destination that predates Stage 4 sees an unrecognized
+/// marker and `is_hbone_connect` returns `false`, so it 404s (fail-closed skew).
+pub const UDP_PROTOCOL: &str = "udp";
 
 /// Per-stream identity metadata carried by ambient HBONE requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,7 +93,11 @@ pub fn baggage_header_for_source(source: &SpiffeId) -> String {
 /// HBONE is HTTP/2 CONNECT plus mTLS. This predicate only checks the wire
 /// shape: an HTTP/2 CONNECT, optionally carrying an explicit
 /// `x-ferrum-mesh-protocol`/`x-istio-protocol: hbone` marker used by early
-/// clients and tests. It deliberately says nothing about the authenticated
+/// clients and tests. A marker that is *present* but is anything other than
+/// `hbone` — an unrecognized value, or a non-UTF-8 / unparseable one — is NOT
+/// treated as markerless; it fails closed to the "neither" branch (see
+/// [`is_udp_hbone_connect`]) so a malformed marker can never slip into the
+/// byte-stream relay. It deliberately says nothing about the authenticated
 /// peer — a bare HTTP/2 CONNECT looks identical on the wire whether or not the
 /// mTLS handshake produced a SPIFFE peer identity.
 ///
@@ -102,11 +114,53 @@ pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) 
     if method != Method::CONNECT || version != Version::HTTP_2 {
         return false;
     }
-    let protocol = headers
+    match headers
         .get("x-ferrum-mesh-protocol")
         .or_else(|| headers.get("x-istio-protocol"))
-        .and_then(|value| value.to_str().ok());
-    protocol.is_none_or(|value| value.eq_ignore_ascii_case(HBONE_PROTOCOL))
+    {
+        // No marker at all → the markerless default IS byte-stream HBONE.
+        None => true,
+        // A PRESENT marker is byte-stream HBONE only if it parses as exactly
+        // `hbone`. A present-but-unparseable (non-UTF-8 / non-visible-ASCII) or
+        // otherwise unrecognized value is NOT treated as markerless — it fails
+        // closed to the "neither" branch so a malformed marker can never collapse
+        // into the byte-stream relay (the dispatcher then 405s the unrecognized
+        // CONNECT). This keeps `is_hbone_connect`/`is_udp_hbone_connect` disjoint
+        // AND exhaustive: header-absence and present-but-unrecognized are distinct.
+        Some(value) => value
+            .to_str()
+            .ok()
+            .is_some_and(|value| value.eq_ignore_ascii_case(HBONE_PROTOCOL)),
+    }
+}
+
+/// Detect a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4): an HTTP/2 CONNECT
+/// carrying an EXPLICIT `x-ferrum-mesh-protocol: udp` (or `x-istio-protocol: udp`)
+/// marker.
+///
+/// This is intentionally NARROWER than [`is_hbone_connect`]: where the HBONE
+/// predicate accepts a marker-LESS CONNECT (`None` → byte-stream HBONE), the UDP
+/// predicate requires the EXPLICIT `udp` marker. That keeps the two transports
+/// disjoint — a bare CONNECT is byte-stream HBONE (`is_hbone_connect` true,
+/// `is_udp_hbone_connect` false); a `udp`-marked CONNECT is datagram UDP
+/// (`is_hbone_connect` FALSE because the marker isn't `hbone`,
+/// `is_udp_hbone_connect` true). A destination that predates Stage 4 has no
+/// `udp` branch, so a `udp` CONNECT falls through both its `is_hbone_connect`
+/// check (false) and its (absent) UDP check → 404, the fail-closed skew posture.
+///
+/// Like [`is_hbone_connect`] this is a WIRE-SHAPE predicate only and says
+/// nothing about the authenticated peer. The relay path must still require an
+/// authenticated mesh peer (`peer_spiffe_id.is_some()`) before unframing a
+/// `udp` CONNECT into a local socket — a marker alone never authorizes a tunnel.
+pub fn is_udp_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) -> bool {
+    if method != Method::CONNECT || version != Version::HTTP_2 {
+        return false;
+    }
+    headers
+        .get("x-ferrum-mesh-protocol")
+        .or_else(|| headers.get("x-istio-protocol"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(UDP_PROTOCOL))
 }
 
 /// Predicate combining the [`is_hbone_connect`] wire shape **and** an
@@ -1341,6 +1395,169 @@ mod tests {
             Version::HTTP_2,
             &tcp_headers,
             Some(&peer),
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // is_udp_hbone_connect (F3 §3.3 Stage 4 datagram marker)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn is_udp_hbone_connect_requires_explicit_udp_marker() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers
+        ));
+        // Case-insensitive like the hbone marker.
+        let mut upper = HeaderMap::new();
+        upper.insert("x-ferrum-mesh-protocol", "UDP".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &upper
+        ));
+        // x-istio-protocol fallback also honored.
+        let mut istio = HeaderMap::new();
+        istio.insert("x-istio-protocol", "udp".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &istio
+        ));
+    }
+
+    #[test]
+    fn is_udp_hbone_connect_rejects_markerless_and_hbone() {
+        // A marker-LESS CONNECT is byte-stream HBONE, NOT udp.
+        let empty = HeaderMap::new();
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &empty
+        ));
+        // An explicit `hbone` marker is byte-stream, NOT udp.
+        let mut hbone = HeaderMap::new();
+        hbone.insert("x-ferrum-mesh-protocol", "hbone".parse().unwrap());
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &hbone
+        ));
+    }
+
+    #[test]
+    fn udp_and_hbone_predicates_are_disjoint() {
+        // The two transports must never both fire for one request — the skew
+        // posture relies on it (an old dest with no udp branch sees
+        // is_hbone_connect==false for a udp CONNECT and 404s).
+        let mut udp = HeaderMap::new();
+        udp.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &udp
+        ));
+        assert!(!is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &udp));
+
+        let markerless = HeaderMap::new();
+        assert!(is_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &markerless
+        ));
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &markerless
+        ));
+    }
+
+    #[test]
+    fn connect_marker_classification_is_exhaustive_and_fail_closed() {
+        // Stage 6 fail-closed contract: every CONNECT marker maps to EXACTLY ONE
+        // of {byte-stream HBONE, datagram UDP, neither}, and the two relay
+        // predicates are never simultaneously true. An UNKNOWN / future / typo /
+        // malformed marker (a not-yet-implemented transport like "quic", a stray
+        // "tcp", an empty value, or a non-UTF-8 value) must take NEITHER branch;
+        // the dispatcher then rejects the unrecognized CONNECT — the
+        // non-WebSocket-CONNECT gate in `handle_proxy_request_inner`
+        // (`!is_hbone_connect_any`) returns 405 before routing — so a marker we
+        // don't recognize is never relayed onto either transport. This pins the
+        // whole marker space in one place; `udp_and_hbone_predicates_are_disjoint`
+        // covers only the udp / markerless rows.
+        //
+        // (marker value, expect is_hbone_connect, expect is_udp_hbone_connect)
+        let cases: &[(Option<&str>, bool, bool)] = &[
+            (None, true, false),             // markerless → byte-stream HBONE
+            (Some("hbone"), true, false),    // explicit hbone → byte-stream
+            (Some("HBONE"), true, false),    // case-insensitive
+            (Some("udp"), false, true),      // udp → datagram relay
+            (Some("UDP"), false, true),      // case-insensitive
+            (Some("tcp"), false, false),     // unknown → neither (CONNECT → 405)
+            (Some("quic"), false, false),    // future transport → neither (→405)
+            (Some("dtls"), false, false),    // DTLS has no own marker (rides "udp")
+            (Some("garbage"), false, false), // typo → neither (→405)
+            (Some(""), false, false),        // present-but-blank → neither (→405)
+        ];
+
+        for &(marker, expect_hbone, expect_udp) in cases {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = marker {
+                headers.insert("x-ferrum-mesh-protocol", value.parse().unwrap());
+            }
+            let is_hbone = is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers);
+            let is_udp = is_udp_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers);
+            assert_eq!(
+                is_hbone, expect_hbone,
+                "is_hbone_connect({marker:?}) mismatch"
+            );
+            assert_eq!(
+                is_udp, expect_udp,
+                "is_udp_hbone_connect({marker:?}) mismatch"
+            );
+            // Dispatch-safety invariant: a request can NEVER match both relay
+            // predicates, so it can never take both branches, for any marker.
+            assert!(
+                !(is_hbone && is_udp),
+                "marker {marker:?} matched BOTH relay predicates"
+            );
+        }
+
+        // A PRESENT but non-UTF-8 / non-visible-ASCII marker is NOT markerless:
+        // `to_str()` fails on it, so it must fail closed to the neither branch
+        // rather than collapsing to the markerless byte-stream default (codex P2).
+        // `Option<&str>` can't carry these bytes, so assert them directly.
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert(
+            "x-ferrum-mesh-protocol",
+            http::HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+        );
+        assert!(
+            !is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &non_utf8),
+            "a non-UTF-8 marker must NOT be treated as markerless byte-stream HBONE"
+        );
+        assert!(
+            !is_udp_hbone_connect(&Method::CONNECT, Version::HTTP_2, &non_utf8),
+            "a non-UTF-8 marker must NOT be treated as udp"
+        );
+    }
+
+    #[test]
+    fn is_udp_hbone_connect_rejects_non_connect_and_non_h2() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
+        assert!(!is_udp_hbone_connect(
+            &Method::POST,
+            Version::HTTP_2,
+            &headers
+        ));
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_11,
+            &headers
         ));
     }
 

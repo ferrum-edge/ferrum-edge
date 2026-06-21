@@ -10,8 +10,13 @@
 //! response formats. Auto-detection inspects the JSON structure to determine
 //! the provider when `provider` is set to `"auto"` (the default).
 //!
-//! Also supports SSE (Server-Sent Events) streaming responses (`text/event-stream`).
-//! For streaming responses, the plugin parses each `data:` line as JSON, extracts
+//! Also supports SSE (Server-Sent Events) streaming responses (`text/event-stream`),
+//! but only when `buffer_streaming_responses` is explicitly enabled — buffering an
+//! SSE stream to extract its final usage event defeats live token delivery, so it
+//! is opt-in. By default a streamed request (client `Accept: text/event-stream` or a
+//! `stream: true` request another AI plugin flagged) is never buffered, on every
+//! backend dispatch path. For streaming responses, the plugin parses each `data:`
+//! line as JSON, extracts
 //! the model name from the first chunk, and looks for a final `usage` object in
 //! the last chunk (OpenAI sends usage in the final SSE event when
 //! `stream_options.include_usage` is set). For Anthropic streaming, the plugin
@@ -31,6 +36,7 @@ use super::utils::ai_providers::{
     extract_response_usage, parse_ai_provider,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::sse::is_sse_request;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct AiTokenMetrics {
@@ -44,6 +50,7 @@ pub struct AiTokenMetrics {
     model_key: String,
     estimated_cost_key: String,
     streaming_key: String,
+    buffer_streaming_responses: bool,
     cost_per_prompt_token: Option<f64>,
     cost_per_completion_token: Option<f64>,
 }
@@ -85,6 +92,8 @@ impl AiTokenMetrics {
         };
         let cost_per_prompt_token = optional_f64(config, "cost_per_prompt_token")?;
         let cost_per_completion_token = optional_f64(config, "cost_per_completion_token")?;
+        let buffer_streaming_responses =
+            optional_bool(config, "buffer_streaming_responses")?.unwrap_or(false);
 
         // Reject negative or non-finite cost rates — they would produce
         // nonsensical (negative or NaN/Inf) cost metrics that pollute
@@ -123,9 +132,20 @@ impl AiTokenMetrics {
             model_key,
             estimated_cost_key,
             streaming_key,
+            buffer_streaming_responses,
             cost_per_prompt_token,
             cost_per_completion_token,
         })
+    }
+
+    /// Whether the request signals a streamed (SSE) response that must not be
+    /// buffered: either the client sent `Accept: text/event-stream`, or an
+    /// earlier request plugin (e.g. `ai_prompt_shield`) detected `stream: true`
+    /// in the request body and set the shared `ai_request_streaming` marker.
+    #[inline]
+    fn request_prefers_streaming(&self, ctx: &RequestContext) -> bool {
+        is_sse_request(ctx)
+            || ctx.metadata.get("ai_request_streaming").map(String::as_str) == Some("true")
     }
 
     /// Parse an SSE (text/event-stream) response body to extract token usage.
@@ -339,6 +359,23 @@ fn optional_f64(config: &Value, field: &'static str) -> Result<Option<f64>, Stri
         .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a number"))
 }
 
+/// Whether the request carries a native gRPC `content-type` (`application/grpc`,
+/// optionally with a `+subtype`/`;param`/OWS suffix; excluding
+/// `application/grpc-web` and bogus suffixes like `application/grpcfoo`).
+///
+/// Delegates to the canonical, delimiter-aware
+/// [`crate::proxy::backend_dispatch::is_native_grpc_content_type`] classifier so
+/// the buffering decision stays aligned with the dispatch path: a value the
+/// dispatcher routes as plain HTTP (e.g. `application/grpcfoo`) must NOT be
+/// treated as native gRPC here, otherwise a JSON LLM response from a tolerant
+/// upstream would be opted out of buffering and its token usage skipped. Operates
+/// on raw bytes with no allocation, so it is safe on the decision hot path.
+fn is_native_grpc_request(ctx: &RequestContext) -> bool {
+    ctx.headers.get("content-type").is_some_and(|content_type| {
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+    })
+}
+
 #[async_trait]
 impl Plugin for AiTokenMetrics {
     fn name(&self) -> &str {
@@ -357,8 +394,47 @@ impl Plugin for AiTokenMetrics {
         true
     }
 
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // The pre-header buffering decision drives EVERY backend dispatch path —
+        // including the retry, native-gRPC, and HTTP/3-backend paths that never
+        // consult the header-time `should_buffer_response_body_for_content_type`
+        // refinement below. Gate it on the request shape so those paths preserve
+        // streaming too, mirroring `ai_response_guard`:
+        //
+        //   * Native gRPC requests are never buffered — this plugin only parses
+        //     JSON / SSE LLM bodies, never `application/grpc` framing, so holding
+        //     a server-streaming gRPC response to EOF would add latency and
+        //     memory pressure for no token data.
+        //   * A client asking for a stream (`Accept: text/event-stream`) or a
+        //     request another plugin flagged as `stream: true`
+        //     (`ai_request_streaming`) keeps streaming unless the operator opted
+        //     into `buffer_streaming_responses`. Otherwise the SSE response would
+        //     be collected until `max_response_body_size_bytes` (502) instead of
+        //     streaming tokens to the client — the exact regression #1726 fixes.
+        if is_native_grpc_request(ctx) {
+            return false;
+        }
+        if !self.buffer_streaming_responses && self.request_prefers_streaming(ctx) {
+            return false;
+        }
         true
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && content_type.is_some_and(|ct| {
+                if is_event_stream_content_type(ct) {
+                    self.buffer_streaming_responses
+                } else {
+                    is_json_content_type(ct)
+                }
+            })
     }
 
     async fn on_response_body(

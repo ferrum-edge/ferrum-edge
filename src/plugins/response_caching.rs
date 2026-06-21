@@ -15,8 +15,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -37,6 +37,7 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 const CACHE_BASE_KEY: &str = "cache_base_key";
 const CACHE_STATUS: &str = "cache_status";
 const CACHE_PREDICT_KEY: &str = "cache_predict_key";
+const CACHE_REQUEST_STARTED_MONOTONIC_NANOS: &str = "cache_request_started_monotonic_nanos";
 /// JSON-serialized snapshot of the request header values `before_proxy` saw
 /// while building the cache key. `on_final_response_body` reads it back to
 /// build the storage cache key from the *same* header view, even when an
@@ -44,6 +45,8 @@ const CACHE_PREDICT_KEY: &str = "cache_predict_key";
 /// headers map — see [`ResponseCaching::stash_request_headers_snapshot`]
 /// and the bug it fixes.
 const CACHE_REQUEST_HEADERS_SNAPSHOT: &str = "cache_request_headers_snapshot";
+
+static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -72,6 +75,19 @@ fn cache_key_identity_part(identity: &str) -> String {
     let digest = sha256_hex(identity);
     let mut part = String::with_capacity(7 + digest.len());
     part.push_str("sha256-");
+    part.push_str(&digest);
+    part
+}
+
+/// Render the exact raw query string as a bounded cache-key part.
+///
+/// The raw query is hashed as received, without parsing, sorting,
+/// percent-decoding, or normalizing, so duplicate keys, pair order,
+/// percent-encoding, and bare/empty values remain distinct.
+fn cache_key_query_part(raw_query: &str) -> String {
+    let digest = sha256_hex(raw_query);
+    let mut part = String::with_capacity(2 + digest.len());
+    part.push_str("q-");
     part.push_str(&digest);
     part
 }
@@ -134,6 +150,15 @@ fn merge_vary_header(vary_headers: &mut Vec<String>, header: &str) -> bool {
     true
 }
 
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    })
+}
+
 fn vary_index_prune_slack(cache_len: usize) -> usize {
     if cache_len == 0 { 0 } else { cache_len / 4 + 1 }
 }
@@ -169,24 +194,32 @@ struct CacheEntry {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Bytes,
-    inserted_at: Instant,
-    ttl: Duration,
+    stored_at: Duration,
+    freshness_lifetime: Duration,
+    corrected_initial_age: Duration,
     /// Byte length of the base-key prefix of this entry's full cache key.
     ///
     /// A full cache key is always its base key optionally followed by
     /// `:<vary dimensions>` (see [`ResponseCaching::build_cache_key`]), so
     /// `&key[..base_key_len]` recovers the base key without re-parsing the
-    /// colon-delimited (and query-colon-bearing) structure. [`prune_vary_index`]
-    /// uses it to reclaim `vary_index` mappings whose base key has no surviving
-    /// variant.
+    /// colon-delimited (and query-colon-bearing) structure.
+    /// [`prune_vary_index_locked`] uses it to reclaim `vary_index` mappings
+    /// whose base key has no surviving variant.
     ///
-    /// [`prune_vary_index`]: ResponseCaching::prune_vary_index
+    /// [`prune_vary_index_locked`]: ResponseCaching::prune_vary_index_locked
     base_key_len: usize,
 }
 
 impl CacheEntry {
-    fn is_expired(&self) -> bool {
-        self.inserted_at.elapsed() >= self.ttl
+    fn current_age(&self, now: Duration) -> Duration {
+        duration_saturating_add(
+            self.corrected_initial_age,
+            now.saturating_sub(self.stored_at),
+        )
+    }
+
+    fn is_fresh_at(&self, now: Duration) -> bool {
+        self.current_age(now) < self.freshness_lifetime
     }
 
     /// Approximate memory footprint of this entry (for total size tracking).
@@ -242,6 +275,51 @@ fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> 
     let head = value.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix)
         .then_some(&value[prefix.len()..])
+}
+
+fn duration_saturating_add(lhs: Duration, rhs: Duration) -> Duration {
+    lhs.checked_add(rhs).unwrap_or(Duration::MAX)
+}
+
+fn duration_from_nanos_u128(nanos: u128) -> Duration {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let secs = nanos / NANOS_PER_SECOND;
+    if secs > u64::MAX as u128 {
+        return Duration::MAX;
+    }
+
+    duration_saturating_add(
+        Duration::from_secs(secs as u64),
+        Duration::from_nanos((nanos % NANOS_PER_SECOND) as u64),
+    )
+}
+
+fn duration_from_monotonic_nanos_str(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u128>()
+        .ok()
+        .map(duration_from_nanos_u128)
+}
+
+fn parse_age_header(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() || !value.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    match value.parse::<u64>() {
+        Ok(seconds) => Some(Duration::from_secs(seconds)),
+        Err(_) => Some(Duration::MAX),
+    }
+}
+
+fn age_header_value(age: Duration) -> String {
+    age.as_secs().to_string()
+}
+
+fn duration_since_http_date(now: DateTime<Utc>, date: DateTime<Utc>) -> Duration {
+    now.signed_duration_since(date).to_std().unwrap_or_default()
 }
 
 /// Plugin configuration.
@@ -476,6 +554,8 @@ pub struct ResponseCaching {
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
     total_size: Arc<AtomicUsize>,
+    accounting_lock: Arc<Mutex<()>>,
+    clock_offset_nanos: Arc<AtomicU64>,
     uncacheable_predictor: UncacheablePredictor,
 }
 
@@ -496,18 +576,79 @@ impl ResponseCaching {
             cache: Arc::new(DashMap::new()),
             vary_index: Arc::new(DashMap::new()),
             total_size: Arc::new(AtomicUsize::new(0)),
+            accounting_lock: Arc::new(Mutex::new(())),
+            clock_offset_nanos: Arc::new(AtomicU64::new(0)),
             uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100)),
         })
+    }
+
+    fn accounting_guard(&self) -> MutexGuard<'_, ()> {
+        self.accounting_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Current value of the running cache-size accountant.
     ///
     /// Exposed for tests so they can assert the size accounting never
     /// underflow-wraps under concurrent stores/invalidations (finding #62).
-    #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn current_total_size_for_tests(&self) -> usize {
+    pub(crate) fn current_total_size_for_tests(&self) -> usize {
         self.total_size.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn size_accounting_snapshot_for_tests(&self) -> (usize, usize) {
+        let _guard = self.accounting_guard();
+        (
+            self.total_size.load(Ordering::Relaxed),
+            self.actual_total_size_locked(),
+        )
+    }
+
+    fn actual_total_size_locked(&self) -> usize {
+        self.cache
+            .iter()
+            .map(|entry| entry.value().approx_size())
+            .sum()
+    }
+
+    fn sub_total_size_locked(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let current = self.total_size.load(Ordering::Relaxed);
+        self.total_size
+            .store(current.saturating_sub(n), Ordering::Relaxed);
+    }
+
+    /// Advance this plugin instance's clock without sleeping.
+    ///
+    /// Routed through `_test_support` so external tests can validate cache
+    /// freshness and Age arithmetic deterministically without pausing the runtime.
+    #[allow(dead_code)]
+    pub(crate) fn advance_clock_for_tests(&self, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        let _ =
+            self.clock_offset_nanos
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(nanos))
+                });
+    }
+
+    fn clock_offset(&self) -> Duration {
+        duration_from_nanos_u128(self.clock_offset_nanos.load(Ordering::Relaxed) as u128)
+    }
+
+    fn now_monotonic(&self) -> Duration {
+        duration_saturating_add(CACHE_CLOCK_EPOCH.elapsed(), self.clock_offset())
+    }
+
+    fn now_wall(&self) -> DateTime<Utc> {
+        match chrono::Duration::from_std(self.clock_offset()) {
+            Ok(offset) => Utc::now() + offset,
+            Err(_) => Utc::now(),
+        }
     }
 
     /// Build the base cache key (proxy_id + Host + method + path + query + consumer).
@@ -539,25 +680,13 @@ impl ResponseCaching {
             .map(|h| cache_key_host_part(h))
             .unwrap_or_default();
 
-        let mut query_part = String::new();
-        if self.config.cache_key_include_query && !ctx.query_params.is_empty() {
-            let mut params: Vec<(&String, &String)> = ctx.query_params.iter().collect();
-            params.sort_by_key(|(k, _)| k.as_str());
-            for (index, (key, value)) in params.iter().enumerate() {
-                if index > 0 {
-                    query_part.push('&');
-                }
-                // Encode as length-prefixed fields to avoid delimiter
-                // ambiguity after query percent-decoding.
-                query_part.push_str(&key.len().to_string());
-                query_part.push(':');
-                query_part.push_str(key);
-                query_part.push('=');
-                query_part.push_str(&value.len().to_string());
-                query_part.push(':');
-                query_part.push_str(value);
-            }
-        }
+        let query_part = if self.config.cache_key_include_query {
+            ctx.raw_query_string()
+                .map(cache_key_query_part)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // Bind the cache entry to the authenticated principal whenever the
         // request is authenticated by ANY mechanism — a gateway Consumer
@@ -744,7 +873,11 @@ impl ResponseCaching {
         false
     }
 
-    fn not_modified_headers(&self, entry: &CacheEntry) -> HashMap<String, String> {
+    fn not_modified_headers(
+        &self,
+        entry: &CacheEntry,
+        current_age: Duration,
+    ) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         for key in [
             "cache-control",
@@ -760,6 +893,7 @@ impl ResponseCaching {
             }
         }
 
+        self.add_age_header(&mut headers, current_age);
         if self.config.add_cache_status_header {
             headers.insert("x-cache-status".to_string(), "REVALIDATED".to_string());
         }
@@ -768,6 +902,11 @@ impl ResponseCaching {
     }
 
     fn invalidate_base_key(&self, base_key: &str) {
+        let _guard = self.accounting_guard();
+        self.invalidate_base_key_locked(base_key);
+    }
+
+    fn invalidate_base_key_locked(&self, base_key: &str) {
         let mut variant_prefix = String::with_capacity(base_key.len() + 1);
         variant_prefix.push_str(base_key);
         variant_prefix.push(':');
@@ -782,40 +921,99 @@ impl ResponseCaching {
         });
 
         if removed_size > 0 {
-            sub_total_size(&self.total_size, removed_size);
+            self.sub_total_size_locked(removed_size);
         }
         self.vary_index.remove(base_key);
     }
 
+    fn invalidate_cache_key(&self, base_key: &str, cache_key: &str) {
+        let _guard = self.accounting_guard();
+        self.invalidate_cache_key_locked(base_key, cache_key);
+    }
+
+    fn invalidate_cache_key_locked(&self, base_key: &str, cache_key: &str) {
+        let Some((_, entry)) = self.cache.remove(cache_key) else {
+            return;
+        };
+
+        self.sub_total_size_locked(entry.approx_size());
+        if cache_key == base_key {
+            self.vary_index.remove(base_key);
+        }
+    }
+
+    fn invalidate_zero_freshness_response(
+        &self,
+        base_key: &str,
+        predict_key: Option<&str>,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+        lookup_headers: &RestoredRequestHeadersView,
+    ) {
+        if let Some(predict_key) = predict_key {
+            self.invalidate_cache_key(base_key, predict_key);
+        }
+
+        match self.merged_vary_headers(response_headers) {
+            Some(mut vary_headers) => {
+                self.merge_existing_vary_headers(base_key, &mut vary_headers);
+                self.merge_present_sensitive_vary_headers(
+                    &mut vary_headers,
+                    &lookup_headers.headers,
+                );
+                let response_key = self.build_cache_key_with_ready_values(
+                    ctx,
+                    &vary_headers,
+                    &lookup_headers.headers,
+                    Some(&lookup_headers.cache_key_ready_headers),
+                );
+                if predict_key != Some(response_key.as_str()) {
+                    self.invalidate_cache_key(base_key, &response_key);
+                }
+            }
+            None => self.invalidate_base_key(base_key),
+        }
+    }
+
+    fn mark_uncacheable_if_no_cached_entry(&self, predict_key: Option<&str>) {
+        let Some(predict_key) = predict_key else {
+            return;
+        };
+        if !self.cache.contains_key(predict_key) {
+            self.uncacheable_predictor.mark_uncacheable(predict_key);
+        }
+    }
+
     /// Evict expired entries when cache exceeds max_entries.
-    fn evict_if_needed(&self) {
+    fn evict_if_needed_locked(&self) {
         if self.cache.len() <= self.config.max_entries {
             return;
         }
 
+        let now = self.now_monotonic();
         let mut removed_size = 0usize;
         self.cache.retain(|_, entry| {
-            if entry.is_expired() {
+            if !entry.is_fresh_at(now) {
                 removed_size += entry.approx_size();
                 false
             } else {
                 true
             }
         });
-        sub_total_size(&self.total_size, removed_size);
+        self.sub_total_size_locked(removed_size);
 
         if self.cache.len() > self.config.max_entries {
-            let mut entries: Vec<(String, Instant)> = self
+            let mut entries: Vec<(String, Duration)> = self
                 .cache
                 .iter()
-                .map(|entry| (entry.key().clone(), entry.value().inserted_at))
+                .map(|entry| (entry.key().clone(), entry.value().stored_at))
                 .collect();
-            entries.sort_by_key(|(_, inserted_at)| *inserted_at);
+            entries.sort_by_key(|(_, stored_at)| *stored_at);
 
             let to_remove = self.cache.len() - self.config.max_entries;
             for (key, _) in entries.into_iter().take(to_remove) {
                 if let Some((_, removed)) = self.cache.remove(&key) {
-                    sub_total_size(&self.total_size, removed.approx_size());
+                    self.sub_total_size_locked(removed.approx_size());
                 }
             }
         }
@@ -842,7 +1040,7 @@ impl ResponseCaching {
     /// deliberately batched with slack so a saturated, high-cardinality cache
     /// reclaims stale mappings in groups instead of cloning every live base key
     /// on every store.
-    fn prune_vary_index(&self) {
+    fn prune_vary_index_locked(&self) {
         let cache_len = self.cache.len();
         if self.vary_index.len() <= cache_len.saturating_add(vary_index_prune_slack(cache_len)) {
             return;
@@ -878,6 +1076,7 @@ impl ResponseCaching {
     /// Invalidate cache entries matching a path pattern.
     /// Called when an unsafe method (POST/PUT/PATCH/DELETE) hits a path.
     fn invalidate_path(&self, ctx: &RequestContext) {
+        let _guard = self.accounting_guard();
         let proxy_id = ctx
             .matched_proxy
             .as_ref()
@@ -904,18 +1103,67 @@ impl ResponseCaching {
         });
 
         if removed_size > 0 {
-            sub_total_size(&self.total_size, removed_size);
+            self.sub_total_size_locked(removed_size);
         }
         // A path sweep can strand many base keys' `vary_index` mappings at once
         // (every principal/variant of the invalidated path); reclaim them now
         // rather than waiting for the next store.
-        self.prune_vary_index();
+        self.prune_vary_index_locked();
     }
 
     fn add_cache_status_header(&self, headers: &mut HashMap<String, String>, value: &str) {
         if self.config.add_cache_status_header {
             headers.insert("x-cache-status".to_string(), value.to_string());
         }
+    }
+
+    fn add_age_header(&self, headers: &mut HashMap<String, String>, current_age: Duration) {
+        headers.insert("age".to_string(), age_header_value(current_age));
+    }
+
+    fn stash_request_started_at(&self, ctx: &mut RequestContext, request_time: Duration) {
+        ctx.metadata.insert(
+            CACHE_REQUEST_STARTED_MONOTONIC_NANOS.to_string(),
+            request_time.as_nanos().to_string(),
+        );
+    }
+
+    fn response_delay(&self, ctx: &RequestContext, response_time: Duration) -> Duration {
+        ctx.metadata
+            .get(CACHE_REQUEST_STARTED_MONOTONIC_NANOS)
+            .and_then(|value| duration_from_monotonic_nanos_str(value))
+            .map(|request_time| response_time.saturating_sub(request_time))
+            .unwrap_or_default()
+    }
+
+    fn freshness_lifetime(&self, directives: CacheControlDirectives) -> Duration {
+        if let Some(s_maxage) = directives.s_maxage {
+            Duration::from_secs(s_maxage)
+        } else if let Some(max_age) = directives.max_age {
+            Duration::from_secs(max_age)
+        } else {
+            Duration::from_secs(self.config.ttl_seconds)
+        }
+    }
+
+    fn corrected_initial_age(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+        response_time_monotonic: Duration,
+        response_time_wall: DateTime<Utc>,
+    ) -> Duration {
+        let apparent_age = header_value(response_headers, "date")
+            .and_then(parse_http_date)
+            .map(|date| duration_since_http_date(response_time_wall, date))
+            .unwrap_or_default();
+
+        let age_value = header_value(response_headers, "age")
+            .and_then(parse_age_header)
+            .unwrap_or_default();
+        let corrected_age_value =
+            duration_saturating_add(age_value, self.response_delay(ctx, response_time_monotonic));
+        apparent_age.max(corrected_age_value)
     }
 
     fn shared_cache_allows_authorized_response(
@@ -1041,7 +1289,7 @@ impl ResponseCaching {
 
 /// Check if a cache key's path segment matches the invalidation path.
 ///
-/// Cache key format: `proxy_id:host_hash:method:path:query:consumer[:vary...]`.
+/// Cache key format: `proxy_id:host_hash:method:path:query_hash:consumer[:vary...]`.
 /// The `path` segment has any `:` percent-encoded (see
 /// [`encode_path_for_cache_key`]) so it cannot be confused with a structural
 /// delimiter. Returns true if the cached path equals the encoded `target_path`
@@ -1085,27 +1333,6 @@ fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
         .split(',')
         .map(str::trim)
         .any(|candidate| candidate == "*" || normalize_etag(candidate) == normalize_etag(etag))
-}
-
-/// Subtract `n` from the running cache-size accountant without ever wrapping.
-///
-/// Inserts use `fetch_add` while several removal paths (`invalidate_base_key`,
-/// `evict_if_needed`, expired-entry removal, the insert-replace path) subtract.
-/// A plain `fetch_sub` underflows to ~`usize::MAX` if accounting ever drifts
-/// (a double-subtract or a lost add), and because the store path rejects when
-/// `current_total + entry_size > max`, that wrap would permanently wedge the
-/// cap and disable all future stores. Saturating at `0` keeps any drift
-/// bounded and self-correcting instead of self-disabling.
-pub(crate) fn sub_total_size(total: &AtomicUsize, n: usize) {
-    if n == 0 {
-        return;
-    }
-    // `fetch_update` with a saturating closure cannot fail to converge: the
-    // closure always returns `Some`, so the CAS loop terminates and never
-    // produces an `Err`.
-    let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_sub(n))
-    });
 }
 
 /// Parse an HTTP-date for conditional-request handling.
@@ -1198,6 +1425,7 @@ impl Plugin for ResponseCaching {
         let base_key = self.build_base_cache_key(ctx, headers);
         ctx.metadata
             .insert(CACHE_BASE_KEY.to_string(), base_key.clone());
+        self.stash_request_started_at(ctx, self.now_monotonic());
         // Snapshot every header value that could end up in the cache key
         // so `on_final_response_body` can rebuild the same key from
         // metadata. The transformed `headers` view is only available
@@ -1208,17 +1436,6 @@ impl Plugin for ResponseCaching {
         // make the lookup and storage keys disagree and cache every hit
         // would miss.
         self.stash_request_headers_snapshot(ctx, headers);
-
-        if self.config.respect_no_cache
-            && let Some(cc) = headers.get("cache-control")
-        {
-            let directives = parse_cache_control(cc);
-            if directives.no_cache || directives.no_store {
-                ctx.metadata
-                    .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
-                return PluginResult::Continue;
-            }
-        }
 
         let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
         // A request that carries credentials/session headers must never probe
@@ -1231,6 +1448,17 @@ impl Plugin for ResponseCaching {
         // can mark the correct variant-specific key in the uncacheable predictor.
         ctx.metadata
             .insert(CACHE_PREDICT_KEY.to_string(), cache_key.clone());
+
+        if self.config.respect_no_cache
+            && let Some(cc) = headers.get("cache-control")
+        {
+            let directives = parse_cache_control(cc);
+            if directives.no_cache || directives.no_store {
+                ctx.metadata
+                    .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
+                return PluginResult::Continue;
+            }
+        }
 
         // Fast-path: skip cache lookup if this specific variant is predicted uncacheable.
         // Uses the full cache_key (including Vary dimensions) so that one uncacheable
@@ -1245,11 +1473,11 @@ impl Plugin for ResponseCaching {
         }
 
         if let Some(entry) = self.cache.get(&cache_key) {
-            if entry.is_expired() {
+            let now = self.now_monotonic();
+            let current_age = entry.current_age(now);
+            if !entry.is_fresh_at(now) {
                 drop(entry);
-                if let Some((_, removed)) = self.cache.remove(&cache_key) {
-                    sub_total_size(&self.total_size, removed.approx_size());
-                }
+                self.invalidate_cache_key(&base_key, &cache_key);
             } else {
                 debug!(cache_key = %cache_key, "response_caching: cache HIT");
 
@@ -1259,11 +1487,12 @@ impl Plugin for ResponseCaching {
                     return PluginResult::RejectBinary {
                         status_code: 304,
                         body: Bytes::new(),
-                        headers: self.not_modified_headers(&entry),
+                        headers: self.not_modified_headers(&entry, current_age),
                     };
                 }
 
                 let mut headers = entry.headers.clone();
+                self.add_age_header(&mut headers, current_age);
                 self.add_cache_status_header(&mut headers, "HIT");
                 ctx.metadata
                     .insert(CACHE_STATUS.to_string(), "HIT".to_string());
@@ -1310,18 +1539,14 @@ impl Plugin for ResponseCaching {
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.
-        let predict_key = ctx
-            .metadata
-            .get(CACHE_PREDICT_KEY)
-            .cloned()
-            .unwrap_or_else(|| base_key.clone());
+        let predict_key = ctx.metadata.get(CACHE_PREDICT_KEY).cloned();
 
         if !self
             .config
             .cacheable_status_codes
             .contains(&response_status)
         {
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1336,16 +1561,7 @@ impl Plugin for ResponseCaching {
 
         if directives.no_store || directives.private || directives.no_cache {
             self.invalidate_base_key(&base_key);
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
-            return PluginResult::Continue;
-        }
-
-        // Never cache responses with Set-Cookie headers. These are
-        // per-client and replaying them from a shared cache would leak
-        // session cookies to other users (RFC 7234 §8).
-        if response_headers.contains_key("set-cookie") {
-            debug!("response_caching: skipping cache — response contains Set-Cookie header");
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1354,23 +1570,45 @@ impl Plugin for ResponseCaching {
         // both see the transformed values, not the untransformed
         // `ctx.headers`. See `restore_request_headers_view` for why.
         let lookup_headers = self.restore_request_headers_view(ctx);
+        let freshness_lifetime = self.freshness_lifetime(directives);
 
-        if !self.shared_cache_allows_authorized_response(ctx, directives) {
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+        if freshness_lifetime.is_zero() {
+            self.invalidate_zero_freshness_response(
+                &base_key,
+                predict_key.as_deref(),
+                ctx,
+                response_headers,
+                &lookup_headers,
+            );
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
-        let ttl = if let Some(s_maxage) = directives.s_maxage {
-            Duration::from_secs(s_maxage)
-        } else if let Some(max_age) = directives.max_age {
-            Duration::from_secs(max_age)
-        } else {
-            Duration::from_secs(self.config.ttl_seconds)
-        };
+        // Never cache responses with Set-Cookie headers. These are
+        // per-client and replaying them from a shared cache would leak
+        // session cookies to other users (RFC 7234 §8).
+        if response_headers.contains_key("set-cookie") {
+            debug!("response_caching: skipping cache — response contains Set-Cookie header");
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
+            return PluginResult::Continue;
+        }
 
-        if ttl.is_zero() {
-            self.invalidate_base_key(&base_key);
-            self.uncacheable_predictor.mark_uncacheable(&predict_key);
+        if !self.shared_cache_allows_authorized_response(ctx, directives) {
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
+            return PluginResult::Continue;
+        }
+
+        let response_time_monotonic = self.now_monotonic();
+        let response_time_wall = self.now_wall();
+        let corrected_initial_age = self.corrected_initial_age(
+            ctx,
+            response_headers,
+            response_time_monotonic,
+            response_time_wall,
+        );
+
+        if corrected_initial_age >= freshness_lifetime {
+            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -1378,7 +1616,7 @@ impl Plugin for ResponseCaching {
             Some(vary_headers) => vary_headers,
             None => {
                 self.invalidate_base_key(&base_key);
-                self.uncacheable_predictor.mark_uncacheable(&predict_key);
+                self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
                 return PluginResult::Continue;
             }
         };
@@ -1461,46 +1699,75 @@ impl Plugin for ResponseCaching {
             status_code: response_status,
             headers: cached_response_headers,
             body: Bytes::copy_from_slice(body),
-            inserted_at: Instant::now(),
-            ttl,
+            stored_at: response_time_monotonic,
+            freshness_lifetime,
+            corrected_initial_age,
             // `cache_key` is `base_key` plus an optional `:<vary>` suffix, so
-            // `base_key.len()` is the prefix that `prune_vary_index` slices back
-            // out to recover this entry's base key.
+            // `base_key.len()` is the prefix that `prune_vary_index_locked`
+            // slices back out to recover this entry's base key.
             base_key_len: base_key.len(),
         };
         let entry_size = entry.approx_size();
 
-        let current_total = self.total_size.load(Ordering::Relaxed);
-        if current_total.saturating_add(entry_size) > self.config.max_total_size_bytes {
-            debug!(
-                cache_key = %cache_key,
-                current_total = current_total,
-                entry_size = entry_size,
-                max_total = self.config.max_total_size_bytes,
-                "response_caching: total cache size would exceed limit, skipping cache"
-            );
-            return PluginResult::Continue;
-        }
+        {
+            // Lock ordering: acquire `accounting_lock` before mutating
+            // `cache`, `vary_index`, or `total_size`, and never acquire it
+            // while holding a DashMap entry guard. Cache-hit reads do not take
+            // this lock.
+            let _guard = self.accounting_guard();
+            let old_size = self
+                .cache
+                .get(&cache_key)
+                .map(|old_entry| old_entry.approx_size())
+                .unwrap_or(0);
+            let current_total = self.total_size.load(Ordering::Relaxed);
+            let next_total = current_total
+                .saturating_sub(old_size)
+                .saturating_add(entry_size);
 
-        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
-            sub_total_size(&self.total_size, old.approx_size());
+            if entry_size > self.config.max_total_size_bytes
+                || next_total > self.config.max_total_size_bytes
+            {
+                debug!(
+                    cache_key = %cache_key,
+                    current_total = current_total,
+                    old_size = old_size,
+                    entry_size = entry_size,
+                    next_total = next_total,
+                    max_total = self.config.max_total_size_bytes,
+                    "response_caching: total cache size would exceed limit, skipping cache"
+                );
+                return PluginResult::Continue;
+            }
+
+            if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
+                debug_assert_eq!(
+                    old.approx_size(),
+                    old_size,
+                    "response_caching replacement size must match admitted old entry"
+                );
+            }
+            self.total_size.store(next_total, Ordering::Relaxed);
+            self.vary_index.insert(base_key, vary_headers);
+            self.evict_if_needed_locked();
+            // The store above is the only path that grows `vary_index`; prune
+            // here so a high-cardinality principal stream can't leak it
+            // unboundedly.
+            self.prune_vary_index_locked();
         }
-        self.total_size.fetch_add(entry_size, Ordering::Relaxed);
-        // Response was cacheable — remove from predictor if previously marked uncacheable
-        self.uncacheable_predictor.mark_cacheable(&predict_key);
-        self.vary_index.insert(base_key, vary_headers);
+        // Response was cacheable; remove the exact cache key from the predictor
+        // even for client no-cache bypass refreshes, which return before
+        // `CACHE_PREDICT_KEY` is available.
+        self.uncacheable_predictor.mark_cacheable(&cache_key);
 
         debug!(
             cache_key = %cache_key,
             entry_size = entry_size,
-            ttl_secs = ttl.as_secs(),
+            freshness_lifetime_secs = freshness_lifetime.as_secs(),
+            corrected_initial_age_secs = corrected_initial_age.as_secs(),
             "response_caching: cached response"
         );
 
-        self.evict_if_needed();
-        // The store above is the only path that grows `vary_index`; prune here
-        // so a high-cardinality principal stream can't leak it unboundedly.
-        self.prune_vary_index();
         PluginResult::Continue
     }
 }
@@ -1656,8 +1923,8 @@ mod tests {
         // by base key. `vary_index` was only ever pruned in
         // `invalidate_base_key`, so a stream of distinct principals (JWT `sub`s,
         // ephemeral SPIFFE IDs) would leak it without bound even though
-        // `self.cache` stays capped at `max_entries`. `prune_vary_index` must
-        // reclaim mappings whose base key has no surviving cache variant.
+        // `self.cache` stays capped at `max_entries`. `prune_vary_index_locked`
+        // must reclaim mappings whose base key has no surviving cache variant.
         let max_entries = 4;
         let plugin = plugin_with_config(json!({
             "ttl_seconds": 60,
@@ -1704,7 +1971,7 @@ mod tests {
             plugin.cache.len() + vary_index_prune_slack(plugin.cache.len());
         assert!(
             plugin.vary_index.len() <= max_vary_index_entries,
-            "vary_index leaked past cache+slack bound ({}): {} entries — prune_vary_index did not reclaim stale base keys",
+            "vary_index leaked past cache+slack bound ({}): {} entries — prune_vary_index_locked did not reclaim stale base keys",
             max_vary_index_entries,
             plugin.vary_index.len()
         );

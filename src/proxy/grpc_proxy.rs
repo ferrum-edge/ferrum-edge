@@ -214,6 +214,8 @@ thread_local! {
 /// lookups are fine.
 fn with_grpc_pool_key<R>(
     proxy: &Proxy,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
     svid_generation: Option<u64>,
     f: impl FnOnce(&mut String) -> R,
 ) -> R {
@@ -224,6 +226,8 @@ fn with_grpc_pool_key<R>(
             &proxy.backend_host,
             proxy.backend_port,
             proxy,
+            client_cert_path,
+            client_key_path,
             svid_generation,
         );
         f(&mut buf)
@@ -235,6 +239,8 @@ fn write_grpc_pool_key(
     host: &str,
     port: u16,
     proxy: &Proxy,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
     svid_generation: Option<u64>,
 ) {
     use std::fmt::Write;
@@ -257,8 +263,8 @@ fn write_grpc_pool_key(
     append_backend_tls_pool_key_fields(
         buf,
         &proxy.resolved_tls,
-        proxy.resolved_tls.client_cert_path.as_deref(),
-        proxy.resolved_tls.client_key_path.as_deref(),
+        client_cert_path,
+        client_key_path,
         proxy.resolved_tls.verify_server_cert,
         svid_generation,
     );
@@ -271,6 +277,8 @@ fn grpc_pool_key_owned(proxy: &Proxy, svid_generation: Option<u64>) -> String {
         &proxy.backend_host,
         proxy.backend_port,
         proxy,
+        proxy.resolved_tls.client_cert_path.as_deref(),
+        proxy.resolved_tls.client_key_path.as_deref(),
         svid_generation,
     );
     buf
@@ -435,7 +443,15 @@ impl GrpcConnectionPool {
     /// but retained for parity with the HTTP2 pool's internal API surface.
     #[allow(dead_code)]
     fn write_pool_key(buf: &mut String, proxy: &Proxy) {
-        write_grpc_pool_key(buf, &proxy.backend_host, proxy.backend_port, proxy, None);
+        write_grpc_pool_key(
+            buf,
+            &proxy.backend_host,
+            proxy.backend_port,
+            proxy,
+            proxy.resolved_tls.client_cert_path.as_deref(),
+            proxy.resolved_tls.client_key_path.as_deref(),
+            None,
+        );
     }
 
     /// Allocating version of the pool key — only used for warmup deduplication
@@ -462,6 +478,22 @@ impl GrpcConnectionPool {
         write_grpc_shard_key_inplace(buf, base_len, shard);
     }
 
+    fn with_pool_key<R>(
+        &self,
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        f: impl FnOnce(&mut String) -> R,
+    ) -> R {
+        let manager = self.pool.manager();
+        with_grpc_pool_key(
+            proxy,
+            manager.effective_client_cert_path(proxy),
+            manager.effective_client_key_path(proxy),
+            svid_generation,
+            f,
+        )
+    }
+
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
@@ -480,7 +512,7 @@ impl GrpcConnectionPool {
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
-        let phase1 = with_grpc_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
+        let phase1 = self.with_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
             let base_len = key_buf.len();
 
             // Round-robin counter is per-host, but on FIRST access we seed it
@@ -566,7 +598,7 @@ impl GrpcConnectionPool {
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
                 // build is identical to phase 1's prelude.
-                let recovered = with_grpc_pool_key(proxy, svid_generation, |key_buf| {
+                let recovered = self.with_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
@@ -608,38 +640,38 @@ impl GrpcPoolManager {
         proxy: &Proxy,
         svid_generation: Option<u64>,
     ) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
-        self.tls_configs
-            .get_or_try_build(grpc_pool_key_owned(proxy, svid_generation), || {
-                let crls = self.crls.load_full();
-                let mut tls_config = BackendTlsConfigBuilder {
-                    proxy,
-                    policy: self.tls_policy.as_deref(),
-                    global_ca: self
-                        .global_env_config
-                        .tls_ca_bundle_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_no_verify: self.global_env_config.tls_no_verify,
-                    global_client_cert: self
-                        .global_env_config
-                        .backend_tls_client_cert_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_client_key: self
-                        .global_env_config
-                        .backend_tls_client_key_path
-                        .as_deref()
-                        .map(Path::new),
-                    crls: crls.as_ref().as_slice(),
-                }
-                .build_rustls()
-                .map_err(|e| {
-                    GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
-                })?;
+        let cache_key = self.pool_key_owned(proxy, svid_generation);
+        self.tls_configs.get_or_try_build(cache_key, || {
+            let crls = self.crls.load_full();
+            let mut tls_config = BackendTlsConfigBuilder {
+                proxy,
+                policy: self.tls_policy.as_deref(),
+                global_ca: self
+                    .global_env_config
+                    .tls_ca_bundle_path
+                    .as_deref()
+                    .map(Path::new),
+                global_no_verify: self.global_env_config.tls_no_verify,
+                global_client_cert: self
+                    .global_env_config
+                    .backend_tls_client_cert_path
+                    .as_deref()
+                    .map(Path::new),
+                global_client_key: self
+                    .global_env_config
+                    .backend_tls_client_key_path
+                    .as_deref()
+                    .map(Path::new),
+                crls: crls.as_ref().as_slice(),
+            }
+            .build_rustls()
+            .map_err(|e| {
+                GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
+            })?;
 
-                tls_config.alpn_protocols = vec![b"h2".to_vec()];
-                Ok(tls_config)
-            })
+            tls_config.alpn_protocols = vec![b"h2".to_vec()];
+            Ok(tls_config)
+        })
     }
 
     async fn create_connection(
@@ -922,7 +954,7 @@ impl PoolManager for GrpcPoolManager {
     type Connection = http2::SendRequest<GrpcBody>;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
-        write_grpc_pool_key(
+        self.write_pool_key(
             buf,
             host,
             port,
@@ -957,13 +989,54 @@ impl GrpcPoolManager {
         self.backend_svid_generation.load(Ordering::Acquire)
     }
 
-    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
-        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
+    fn effective_client_cert_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
+        proxy.resolved_tls.client_cert_path.as_deref().or(self
             .global_env_config
             .backend_tls_client_cert_path
-            .as_deref());
+            .as_deref())
+    }
+
+    fn effective_client_key_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
+        proxy.resolved_tls.client_key_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_key_path
+            .as_deref())
+    }
+
+    fn write_pool_key(
+        &self,
+        buf: &mut String,
+        host: &str,
+        port: u16,
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+    ) {
+        write_grpc_pool_key(
+            buf,
+            host,
+            port,
+            proxy,
+            self.effective_client_cert_path(proxy),
+            self.effective_client_key_path(proxy),
+            svid_generation,
+        );
+    }
+
+    fn pool_key_owned(&self, proxy: &Proxy, svid_generation: Option<u64>) -> String {
+        let mut buf = String::with_capacity(128);
+        self.write_pool_key(
+            &mut buf,
+            &proxy.backend_host,
+            proxy.backend_port,
+            proxy,
+            svid_generation,
+        );
+        buf
+    }
+
+    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
         backend_svid_generation_for_client_cert(
-            effective_client_cert_path,
+            self.effective_client_cert_path(proxy),
             self.workload_svid_cert_path.as_deref(),
             self.current_svid_generation(),
         )
@@ -1446,103 +1519,6 @@ pub enum GrpcResponseKind {
     Buffered(GrpcResponse),
     /// Response headers received; body and trailers stream frame-by-frame.
     Streaming(GrpcStreamingResponse),
-}
-
-/// Proxy a gRPC request to the backend using hyper's HTTP/2 client.
-///
-/// Collects the incoming request body, then delegates to the core send logic.
-/// Returns the collected request body bytes alongside the result so the caller
-/// can replay them on retry.
-///
-/// When `stream_response` is true, the response body is NOT buffered — it is
-/// returned as a live `Incoming` stream so frames flow frame-by-frame to the
-/// downstream client. This is only safe when retries are NOT configured (the
-/// body has already been consumed by the time we know if a retry is needed).
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub async fn proxy_grpc_request(
-    req: Request<Incoming>,
-    proxy: &Proxy,
-    backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
-    dns_cache: &DnsCache,
-    proxy_headers: &HashMap<String, String>,
-    stream_response: bool,
-    max_grpc_recv_size_bytes: usize,
-    max_response_body_size_bytes: usize,
-) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
-    // Collect the incoming body for potential retry replay
-    let (parts, body) = req.into_parts();
-    let body_bytes = if max_grpc_recv_size_bytes > 0 {
-        // Use http_body_util::Limited to enforce max gRPC recv size during body collection
-        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        match BodyExt::collect(limited).await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                if is_length_limit_error(e.as_ref()) {
-                    return (
-                        Err(GrpcProxyError::ResourceExhausted(format!(
-                            "gRPC request payload size exceeds maximum of {} bytes",
-                            max_grpc_recv_size_bytes
-                        ))),
-                        Bytes::new(),
-                    );
-                }
-                return (
-                    Err(GrpcProxyError::Internal(format!(
-                        "Failed to read request body: {}",
-                        e
-                    ))),
-                    Bytes::new(),
-                );
-            }
-        }
-    } else {
-        match BodyExt::collect(body).await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                return (
-                    Err(GrpcProxyError::Internal(format!(
-                        "Failed to read request body: {}",
-                        e
-                    ))),
-                    Bytes::new(),
-                );
-            }
-        }
-    };
-
-    // Request body has been collected into `body_bytes` above. Preserve it
-    // for the retry loop regardless of whether the response is streamed —
-    // retries fire on connection errors BEFORE any response is received, so
-    // response-body streaming does not prevent retry, and the request body
-    // is what we need to replay on a fresh attempt.
-    //
-    // Previously this code returned `Bytes::new()` on the streaming path,
-    // which bundled two orthogonal concerns (request replay vs response
-    // streaming) and forced the caller to buffer the response whenever
-    // retry was enabled. That in turn held gRPC trailers behind the last
-    // data frame on buffered-response paths, inflating server-streaming
-    // RPC p99 latency (500 KB p50 = 9 ms, p99 = 732 ms under 100 conc).
-    // Move method+headers into the core call instead of cloning. `parts` is
-    // not used after this await, so the deep HeaderMap clone (O(header count))
-    // and the Method clone are pure waste. `body_bytes.clone()` is just an Arc
-    // refcount bump (Bytes is shared) and is necessary because we still need
-    // to return the original body for retry replay.
-    let result = proxy_grpc_request_core(
-        parts.method,
-        parts.headers,
-        body_bytes.clone(),
-        proxy,
-        backend_url,
-        grpc_pool,
-        dns_cache,
-        proxy_headers,
-        stream_response,
-        max_response_body_size_bytes,
-    )
-    .await;
-    (result, body_bytes)
 }
 
 /// Proxy a gRPC request using pre-collected body bytes.
@@ -2294,11 +2270,6 @@ mod tests {
     //! * Fix 3: the buffered-response `Vec<u8>` starting capacity moved
     //!   from `unwrap_or(256)` to a 16 KiB default so that large responses
     //!   with no `content-length` stop hitting ~14 reallocations.
-    //! * Fix 4: the streaming-response decision in `proxy_grpc_request` no
-    //!   longer conflates "retry preserves request body" with "retry
-    //!   prevents response streaming". The `proxy_grpc_request` wrapper
-    //!   unconditionally returns collected `body_bytes` so the outer
-    //!   retry loop in `mod.rs` has them.
 
     // -----------------------------------------------------------------------
     // GRPC_POOL_KEY_BUF thread-local helper tests
@@ -2340,6 +2311,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             resolved_tls: BackendTlsConfig::default_verify(),
             dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
             dns_override: None,
             dns_cache_ttl_seconds: None,
             auth_mode: AuthMode::Single,
@@ -2386,6 +2358,30 @@ mod tests {
         assert!(
             key.ends_with("|svidg=23"),
             "workload SVID generation must be represented in the gRPC pool key: {key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_manager_pool_key_uses_global_mtls_fallback() {
+        let proxy = grpc_pool_test_proxy();
+        let env_config = crate::config::EnvConfig {
+            backend_tls_client_cert_path: Some("/global/grpc-client.pem".to_string()),
+            backend_tls_client_key_path: Some("/global/grpc-client.key".to_string()),
+            ..Default::default()
+        };
+        let pool = GrpcConnectionPool::new(
+            PoolConfig::default(),
+            env_config,
+            DnsCache::new(DnsConfig::default()),
+            None,
+            Arc::new(Vec::new()),
+        );
+
+        let key = pool.with_pool_key(&proxy, None, |buf| buf.clone());
+
+        assert!(
+            key.contains("|/global/grpc-client.pem|/global/grpc-client.key|"),
+            "runtime gRPC pool key must include global backend mTLS fallback: {key}"
         );
     }
 
@@ -2519,11 +2515,25 @@ mod tests {
     /// as `grpc_pool_key_owned()`. If these ever diverge the gRPC pool would
     /// silently fragment (one allocation path inserts keys, the other looks
     /// them up -- a mismatch would never hit a cached connection).
+    fn with_grpc_test_pool_key<R>(
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        f: impl FnOnce(&mut String) -> R,
+    ) -> R {
+        with_grpc_pool_key(
+            proxy,
+            proxy.resolved_tls.client_cert_path.as_deref(),
+            proxy.resolved_tls.client_key_path.as_deref(),
+            svid_generation,
+            f,
+        )
+    }
+
     #[test]
     fn with_grpc_pool_key_matches_grpc_pool_key_owned() {
         let proxy = grpc_pool_test_proxy();
         let owned = grpc_pool_key_owned(&proxy, None);
-        let from_thread_local = with_grpc_pool_key(&proxy, None, |buf| buf.clone());
+        let from_thread_local = with_grpc_test_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(
             owned, from_thread_local,
             "thread-local key must equal grpc_pool_key_owned bytes — \
@@ -2564,15 +2574,15 @@ mod tests {
     #[test]
     fn with_grpc_pool_key_is_idempotent_after_buffer_growth() {
         let proxy = grpc_pool_test_proxy();
-        let k1 = with_grpc_pool_key(&proxy, None, |buf| buf.clone());
+        let k1 = with_grpc_test_pool_key(&proxy, None, |buf| buf.clone());
         // Force the buffer to grow in between by running a different proxy
         // with a longer host through the helper.
         let mut other = grpc_pool_test_proxy();
         other.backend_host =
             "very-long-grpc-backend-hostname-that-grows-the-buffer.subdomain.example.com"
                 .to_string();
-        let _ = with_grpc_pool_key(&other, None, |buf| buf.clone());
-        let k2 = with_grpc_pool_key(&proxy, None, |buf| buf.clone());
+        let _ = with_grpc_test_pool_key(&other, None, |buf| buf.clone());
+        let k2 = with_grpc_test_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(k1, k2, "same proxy must always yield the same key");
     }
 
@@ -2590,7 +2600,7 @@ mod tests {
         // the key. The thread-local was constructed with capacity 128
         // (well above the typical key length), so this should not realloc.
         let (first_ptr, first_capacity) =
-            with_grpc_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            with_grpc_test_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
         assert!(
             first_capacity >= 128,
             "expected pre-sized capacity (>=128), got {first_capacity}"
@@ -2600,8 +2610,9 @@ mod tests {
         // optimization regresses to per-call `String::with_capacity(...)`,
         // the pointer would change on every iteration.
         for i in 0..1024 {
-            let (ptr, cap) =
-                with_grpc_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            let (ptr, cap) = with_grpc_test_pool_key(&proxy, None, |buf| {
+                (buf.as_ptr() as usize, buf.capacity())
+            });
             assert_eq!(
                 ptr, first_ptr,
                 "iteration {i}: heap pointer changed (was {first_ptr:#x}, now {ptr:#x}) — \
@@ -2624,8 +2635,8 @@ mod tests {
     #[test]
     fn with_grpc_pool_key_base_len_is_stable() {
         let proxy = grpc_pool_test_proxy();
-        let len1 = with_grpc_pool_key(&proxy, None, |buf| buf.len());
-        let len2 = with_grpc_pool_key(&proxy, None, |buf| buf.len());
+        let len1 = with_grpc_test_pool_key(&proxy, None, |buf| buf.len());
+        let len2 = with_grpc_test_pool_key(&proxy, None, |buf| buf.len());
         assert_eq!(
             len1, len2,
             "base_len must be deterministic across calls — \
@@ -2742,68 +2753,6 @@ mod tests {
         );
     }
 
-    /// Fix 4: `proxy_grpc_request` must ALWAYS return the collected
-    /// `body_bytes` on the SUCCESS path — even when `stream_response=true`
-    /// — so the outer retry loop can replay the request body. The old
-    /// code had `if stream_response { (result, Bytes::new()) } else
-    /// { (result, body_bytes) }` which forced the caller to disable
-    /// streaming whenever retry was configured.
-    ///
-    /// The error paths (body collection failure, length limit exceeded)
-    /// legitimately return `Bytes::new()` because no body was collected.
-    /// Those return sites are INSIDE `Err(...)` match arms — fine.
-    ///
-    /// The regression we guard against is the OLD `if stream_response`
-    /// branching on the success path. We look for any `if stream_response`
-    /// in the function body (outside error handling) — Fix 4 eliminated
-    /// that branch entirely.
-    #[test]
-    fn proxy_grpc_request_always_preserves_body_bytes_for_retry() {
-        let src = include_str!("grpc_proxy.rs");
-        let fn_start = src
-            .find("pub async fn proxy_grpc_request(")
-            .expect("proxy_grpc_request signature not found");
-        let tail = &src[fn_start..];
-        let fn_end = tail
-            .find("\n}\n")
-            .expect("failed to locate end of proxy_grpc_request body");
-        let body = &tail[..fn_end];
-
-        // Flag the OLD return-splitting pattern:
-        //   if stream_response {
-        //       ...
-        //       (result, Bytes::new())
-        //   } else {
-        //       ...
-        //       (result, body_bytes)
-        //   }
-        // In the fixed version, there is a single return of
-        // `(result, body_bytes)` and no `if stream_response` branch
-        // inside `proxy_grpc_request` itself. The `stream_response`
-        // parameter is still passed THROUGH to `proxy_grpc_request_core`
-        // (one line with `stream_response,` as an argument) but must
-        // not appear as a top-level `if stream_response {` branch.
-        for (i, line) in body.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                continue;
-            }
-            // Match the OLD pattern specifically — the FIXED code passes
-            // `stream_response,` as an argument to the core helper,
-            // which is permitted. Only a conditional branch on it is
-            // the regression.
-            assert!(
-                !trimmed.starts_with("if stream_response"),
-                "regression at line {} of proxy_grpc_request: found \
-                 `if stream_response` branch. Fix 4 removed this split \
-                 so retry replay always has access to the collected \
-                 request body. Offending line:\n  {}",
-                i + 1,
-                line
-            );
-        }
-    }
-
     /// F11: the buffered gRPC path must apply a CLIENT-SUPPLIED `grpc-timeout`
     /// as ONE end-to-end budget (a single shared `timeout_at` deadline spanning
     /// the header wait + body collection), while the OPERATOR
@@ -2811,8 +2760,7 @@ mod tests {
     /// `tokio::time::timeout` in each phase.
     ///
     /// Guarded structurally because the unit harness has no mock H2 backend to
-    /// drive paused-clock timing (mirrors the source-introspection precedent in
-    /// `proxy_grpc_request_always_preserves_body_bytes_for_retry`).
+    /// drive paused-clock timing.
     #[test]
     fn proxy_grpc_request_core_shares_one_client_deadline_but_per_phase_fallback() {
         let src = include_str!("grpc_proxy.rs");

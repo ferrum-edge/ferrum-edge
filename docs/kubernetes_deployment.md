@@ -20,12 +20,90 @@ Recommended pattern:
 - Expose `50051` only to Data Plane pods.
 - For raw TCP/UDP proxy listeners, add each configured `listen_port` to the pod and service spec explicitly.
 
+## Ferrum Mesh Helm Chart Contract
+
+The `charts/ferrum-mesh` chart defaults to scaffolding only. It creates the
+shared ServiceAccount, but runtime components that need external material are
+disabled by default:
+
+- `controlPlane.enabled=false`
+- `injector.enabled=false`
+- `ca.enabled=false`
+
+This is intentional. `FERRUM_MODE=cp` cannot start without all of:
+
+- `FERRUM_DB_TYPE`
+- `FERRUM_DB_URL`
+- `FERRUM_ADMIN_JWT_SECRET`
+- `FERRUM_CP_DP_GRPC_JWT_SECRET`
+
+The chart validates these requirements during `helm template` and `helm
+install` when `controlPlane.enabled=true` or `ca.enabled=true`. Do not put these
+reserved variables under `controlPlane.env`; use the first-class chart values so
+the rendered Deployment has a clear secret contract:
+
+```yaml
+controlPlane:
+  enabled: true
+  database:
+    type: postgres
+    existingSecret:
+      name: ferrum-mesh-production-db
+      urlKey: url
+  credentials:
+    adminJwtSecret:
+      existingSecret:
+        name: ferrum-mesh-production-credentials
+        key: admin-jwt-secret
+    cpDpGrpcJwtSecret:
+      existingSecret:
+        name: ferrum-mesh-production-credentials
+        key: cp-dp-grpc-jwt-secret
+```
+
+Development installs can use SQLite with operator-generated random JWT
+secrets:
+
+```bash
+kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
+  --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
+  --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
+
+helm install ferrum ./charts/ferrum-mesh -n ferrum --create-namespace \
+  -f charts/ferrum-mesh/examples/development-values.yaml
+```
+
+Production-style installs should use existing Secrets for both JWT material and
+the database URL:
+
+```bash
+kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n ferrum create secret generic ferrum-mesh-production-db \
+  --from-literal=url='postgres://ferrum:<percent-encoded-password>@postgres.ferrum.svc:5432/ferrum'
+kubectl -n ferrum create secret generic ferrum-mesh-production-credentials \
+  --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
+  --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
+
+helm install ferrum ./charts/ferrum-mesh -n ferrum \
+  -f charts/ferrum-mesh/examples/production-existing-secrets-values.yaml
+```
+
+The chart never generates JWT secrets. That avoids predictable credentials and
+also avoids Helm upgrade churn from random template functions. If you need
+structured database settings instead of a single URL Secret, `controlPlane.database`
+also supports `host`, `port`, `name`, direct `username` / `password`, and
+`params`; direct credentials are percent-encoded into `FERRUM_DB_URL`. For
+Secret-backed database credentials, store the fully percent-encoded URL in a
+Secret and reference it through `controlPlane.database.existingSecret` or
+`controlPlane.database.urlFrom`.
+
 ## Mesh Injector Chart Defaults
 
-The `charts/ferrum-mesh` injector Deployment defaults to a non-root, read-only
-runtime with `allowPrivilegeEscalation: false`, all Linux capabilities dropped,
-`RuntimeDefault` seccomp, and CPU/memory requests and limits. Override
-`injector.podSecurityContext`, `injector.securityContext`, or
+When `injector.enabled=true`, the `charts/ferrum-mesh` injector Deployment runs
+with a non-root, read-only runtime, `allowPrivilegeEscalation: false`, all Linux
+capabilities dropped, `RuntimeDefault` seccomp, and CPU/memory requests and
+limits. Override `injector.podSecurityContext`, `injector.securityContext`, or
 `injector.resources` only when your custom image or cluster policy requires it.
 
 The injector webhook also ships with a default `namespaceSelector` that excludes
@@ -37,9 +115,10 @@ Managed clusters may expose additional platform namespaces such as
 `injector.namespaceSelector` or label them `ferrum.io/injection=disabled` before
 enabling broader injection.
 
-The chart mounts the injector serving certificate through a Secret volume; the
-injector process does not read Kubernetes Secrets through the API, so the default
-service account does not need Secret RBAC for that mount.
+The chart mounts the injector serving certificate through a Secret volume when
+the injector is enabled; the injector process does not read Kubernetes Secrets
+through the API, so the default service account does not need Secret RBAC for
+that mount.
 
 ## Liveness and Readiness Probes
 
@@ -292,8 +371,8 @@ metadata:
   name: ferrum-edge-secrets
 type: Opaque
 stringData:
-  # For Atlas: mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum?readPreference=secondaryPreferred
-  db-url: mongodb://ferrum:change-me@mongodb.default.svc.cluster.local:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred
+  # For Atlas: mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum
+  db-url: mongodb://ferrum:change-me@mongodb.default.svc.cluster.local:27017/ferrum?replicaSet=rs0
   admin-jwt-secret: change-me
 ```
 
@@ -315,7 +394,7 @@ env:
 ```
 
 **Notes:**
-- `FERRUM_DB_READ_REPLICA_URL` is not needed — use `readPreference=secondaryPreferred` in the connection string
+- `FERRUM_DB_READ_REPLICA_URL` is SQL-only and not used by MongoDB; Ferrum's MongoDB config store forces primary reads
 - `FERRUM_DB_POOL_*` settings are ignored for MongoDB
 - For MongoDB on Kubernetes, consider the [MongoDB Community Kubernetes Operator](https://github.com/mongodb/mongodb-kubernetes-operator)
 - See [docs/mongodb.md](mongodb.md) for the full deployment guide

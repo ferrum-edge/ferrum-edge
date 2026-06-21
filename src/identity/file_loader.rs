@@ -99,7 +99,7 @@ pub fn load_svid_bundle_from_sources(
         }),
         spiffe_id,
         cert_chain_der,
-        private_key_pkcs8_der,
+        private_key_pkcs8_der: private_key_pkcs8_der.into(),
     })
 }
 

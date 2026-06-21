@@ -173,7 +173,17 @@ async fn grpc_streaming_2xx_then_stall_trips_circuit_breaker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_streaming_2xx_then_stall_trips_circuit_breaker() {
-    let ca = TestCa::new("h2-stall-cb").expect("ca");
+    h2_streaming_status_then_stall_trips_circuit_breaker(200).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_streaming_non_failure_4xx_then_stall_trips_circuit_breaker() {
+    h2_streaming_status_then_stall_trips_circuit_breaker(404).await;
+}
+
+async fn h2_streaming_status_then_stall_trips_circuit_breaker(status: u16) {
+    let ca = TestCa::new(&format!("h2-stall-cb-{status}")).expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
@@ -182,10 +192,10 @@ async fn h2_streaming_2xx_then_stall_trips_circuit_breaker() {
     let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
         .expect("h2 tls backend")
         .step(H2Step::ExpectHeaders(MatchHeaders::any()))
-        // 200 headers WITHOUT content-length → the gateway streams (StreamingH2),
+        // Headers WITHOUT content-length → the gateway streams (StreamingH2),
         // flushing headers to the client before the body, then stalls.
         .step(H2Step::RespondHeaders(vec![
-            (":status", "200".into()),
+            (":status", status.to_string()),
             ("content-type", "text/plain".into()),
         ]))
         .step(H2Step::Sleep(Duration::from_millis(
@@ -230,8 +240,8 @@ async fn h2_streaming_2xx_then_stall_trips_circuit_breaker() {
     // Warmup probes the backend on its own connection, so use relative deltas.
     let streams_before = backend.received_stream_count();
 
-    // Request 1: 2xx headers stream to the client, body stalls → gateway
-    // read-timeout cuts it → breaker records a failure at body completion → trips.
+    // Request 1: streamable headers plus a body stall → gateway read-timeout
+    // cuts it → breaker records a failure at body completion → trips.
     let started = Instant::now();
     let _ = client.get(&format!("{base}/api/stall")).await;
     let first_elapsed = started.elapsed();
@@ -257,7 +267,7 @@ async fn h2_streaming_2xx_then_stall_trips_circuit_breaker() {
         backend.received_stream_count(),
         streams_after_1,
         "circuit breaker must short-circuit the 2nd request — it must NOT reach the backend \
-         (a new backend stream means the 2xx-then-stall did not record a breaker failure)"
+         (a new backend stream means the {status}-then-stall did not record a breaker failure)"
     );
     assert_eq!(
         second.status,

@@ -37,7 +37,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::identity::TrustDomain;
-use crate::modes::mesh::config::{JwtAuthority, MultiClusterConfig, TrustBundle, TrustBundleSet};
+use crate::modes::mesh::config::{
+    JwtAuthority, MAX_MESH_REMOTE_CLUSTERS, MultiClusterConfig, TrustBundle, TrustBundleSet,
+};
 use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
 };
@@ -502,35 +504,48 @@ pub struct FederationPollerHandles {
 fn poll_targets_for_multi_cluster(
     multi_cluster: &MultiClusterConfig,
 ) -> Vec<RemoteClusterPollTarget> {
-    multi_cluster
-        .remote_clusters
-        .iter()
-        .filter_map(|remote| {
-            let endpoint = remote.federation_endpoint.as_deref()?.trim();
-            if endpoint.is_empty() {
-                return None;
-            }
-            // SSRF + plaintext defense: reject endpoints pointing at link-
-            // local / loopback / cloud-metadata / non-https hosts at slice
-            // apply time so a misconfigured (or compromised) CP cannot
-            // weaponize the poller. Bad targets are dropped with a warn;
-            // the rest of the federation surface continues to function.
-            if let Err(err) = validate_federation_endpoint(endpoint) {
-                warn!(
-                    cluster = %remote.name,
-                    trust_domain = %remote.trust_domain,
-                    error = %err,
-                    "Dropping federation_endpoint that failed SSRF/scheme validation"
-                );
-                return None;
-            }
-            Some(RemoteClusterPollTarget {
-                cluster_name: remote.name.clone(),
-                trust_domain: remote.trust_domain.clone(),
-                endpoint: endpoint.to_string(),
-            })
-        })
-        .collect()
+    let mut targets = Vec::with_capacity(
+        multi_cluster
+            .remote_clusters
+            .len()
+            .min(MAX_MESH_REMOTE_CLUSTERS),
+    );
+    for remote in &multi_cluster.remote_clusters {
+        let Some(endpoint) = remote.federation_endpoint.as_deref().map(str::trim) else {
+            continue;
+        };
+        if endpoint.is_empty() {
+            continue;
+        }
+        // SSRF + plaintext defense: reject endpoints pointing at link-
+        // local / loopback / cloud-metadata / non-https hosts at slice
+        // apply time so a misconfigured (or compromised) CP cannot
+        // weaponize the poller. Bad targets are dropped with a warn;
+        // the rest of the federation surface continues to function.
+        if let Err(err) = validate_federation_endpoint(endpoint) {
+            warn!(
+                cluster = %remote.name,
+                trust_domain = %remote.trust_domain,
+                error = %err,
+                "Dropping federation_endpoint that failed SSRF/scheme validation"
+            );
+            continue;
+        }
+        if targets.len() >= MAX_MESH_REMOTE_CLUSTERS {
+            warn!(
+                cluster = %remote.name,
+                max_remote_clusters = MAX_MESH_REMOTE_CLUSTERS,
+                "Skipping federation_endpoint beyond remote-cluster target cap"
+            );
+            continue;
+        }
+        targets.push(RemoteClusterPollTarget {
+            cluster_name: remote.name.clone(),
+            trust_domain: remote.trust_domain.clone(),
+            endpoint: endpoint.to_string(),
+        });
+    }
+    targets
 }
 
 /// Spawn the federation poller. Returns `None` when the poller is disabled or
@@ -1390,6 +1405,34 @@ mod tests {
         let targets = poll_targets_for_multi_cluster(&mc);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].cluster_name, "with-endpoint");
+    }
+
+    #[test]
+    fn poll_targets_cap_federation_endpoints() {
+        use crate::modes::mesh::config::RemoteCluster;
+        let mc = MultiClusterConfig {
+            remote_clusters: (0..=MAX_MESH_REMOTE_CLUSTERS)
+                .map(|index| RemoteCluster {
+                    name: format!("cluster-{index}"),
+                    trust_domain: td(&format!("remote-{index}.test")),
+                    network: None,
+                    control_plane_url: None,
+                    federation_endpoint: Some(format!(
+                        "https://remote-{index}.example/.well-known/spiffe"
+                    )),
+                })
+                .collect(),
+            ..MultiClusterConfig::default()
+        };
+
+        let targets = poll_targets_for_multi_cluster(&mc);
+
+        assert_eq!(targets.len(), MAX_MESH_REMOTE_CLUSTERS);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.cluster_name != format!("cluster-{MAX_MESH_REMOTE_CLUSTERS}"))
+        );
     }
 
     #[test]

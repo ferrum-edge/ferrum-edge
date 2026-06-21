@@ -152,6 +152,8 @@ pub const MAX_HTTP2_WINDOW_SIZE: u32 = 128 * 1024 * 1024;
 pub const MIN_HTTP2_MAX_FRAME_SIZE: u32 = 16_384;
 /// Maximum HTTP/2 max frame size (1 MiB practical operational limit).
 pub const MAX_HTTP2_MAX_FRAME_SIZE: u32 = 1_048_576;
+/// Maximum value for proxy pool integer fields stored in SQL INTEGER columns.
+pub const MAX_POOL_SQL_INTEGER_VALUE: u64 = i32::MAX as u64;
 /// Maximum HTTP/3 connections per backend (reasonable operational limit).
 pub const MAX_HTTP3_CONNECTIONS_PER_BACKEND: usize = 256;
 
@@ -235,6 +237,11 @@ pub struct SubsetTrafficPolicy {
     /// Override the upstream's load balancer algorithm for this subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
+    /// Hash-key source for subset-scoped consistent hashing. Uses the same
+    /// format as [`Upstream::hash_on`]: `"ip"`, `"header:<name>"`, or
+    /// `"cookie:<name>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_on: Option<String>,
     /// Override the upstream's backend TLS posture for targets selected via
     /// this subset (Istio `subsets[].trafficPolicy.tls`). The cold-path
     /// `apply_destination_rules` overlays this on the upstream-level TLS and
@@ -562,6 +569,73 @@ impl ResolvedPortOverride {
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
     }
+
+    /// Field-by-field seed of the `connectionPool.http` fields from a
+    /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
+    ///
+    /// For each of the six `connectionPool.http` fields, the per-port value wins
+    /// when set; otherwise the fallback's value is inherited. This mirrors the
+    /// NON-SD apply-time layering EXACTLY: there, the top-level
+    /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
+    /// per-port `portLevelSettings.connectionPool.http` then overlays only the
+    /// fields it sets (see `apply_connection_pool_http_to_port_override` in
+    /// `src/modes/mesh/mod.rs`). SD upstreams cannot fan out at apply time, so
+    /// the top-level overlay is carried separately on
+    /// `Proxy.dispatch_port_override_fallback` and merged HERE at dispatch — so
+    /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
+    /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
+    ///
+    /// Only the six `connectionPool.http` fields are merged; the fallback only
+    /// ever carries those (it is built solely from the DR top-level
+    /// `connectionPool.http` block), so non-`connectionPool.http` fields
+    /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
+    /// this per-port entry already has them.
+    pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
+        self.http_max_requests_per_connection = self
+            .http_max_requests_per_connection
+            .or(fallback.http_max_requests_per_connection);
+        self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
+        self.h2_max_concurrent_streams = self
+            .h2_max_concurrent_streams
+            .or(fallback.h2_max_concurrent_streams);
+        self.h2_upgrade_policy = self.h2_upgrade_policy.or(fallback.h2_upgrade_policy);
+        self.max_retries = self.max_retries.or(fallback.max_retries);
+        self.http1_max_pending_requests = self
+            .http1_max_pending_requests
+            .or(fallback.http1_max_pending_requests);
+    }
+}
+
+/// Project an upstream's service-discovery TOP-LEVEL `connectionPool.http`
+/// overlay (`Upstream.dispatch_port_override_fallback`) into the resolved
+/// [`ResolvedPortOverride`] shape carried on a referencing `Proxy`
+/// (`Proxy.dispatch_port_override_fallback`).
+///
+/// Returns `None` for the common non-SD case (no top-level overlay) and for an
+/// overlay that resolves empty. Shared by config-build projection
+/// ([`GatewayConfig::resolve_dispatch_port_overrides`]) and the route-override
+/// path (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that
+/// swaps the destination upstream recomputes (or clears) the fallback exactly
+/// like `dispatch_port_overrides`, never leaking one upstream's overlay onto a
+/// different destination.
+pub(crate) fn dispatch_port_override_fallback_from_upstream(
+    upstream: &Upstream,
+) -> Option<ResolvedPortOverride> {
+    // TOP-LEVEL `connectionPool.http` overlay ONLY.
+    // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
+    // per-port lookup in `resolve_effective_proxy_for_target`: discovered mesh
+    // targets carry their owning declared Service port in
+    // `UpstreamTarget.service_port_policy_key`, while ordinary targets key by
+    // their resolved dial port.
+    // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
+    // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
+    // different port (codex r3). Immediate route-rebuild on a DR-only edit remains
+    // tracked separately because this is a `#[serde(skip)]` DR-derived field, like
+    // the established per-port `dispatch_port_overrides`.
+    upstream
+        .dispatch_port_override_fallback
+        .as_ref()
+        .and_then(ResolvedPortOverride::from_upstream_override)
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -638,6 +712,14 @@ impl ResolvedSubsetTrafficPolicy {
 pub struct UpstreamTarget {
     pub host: String,
     pub port: u16,
+    /// Internal DestinationRule policy key for discovered mesh targets whose
+    /// declared Service port differs from the resolved workload dial port.
+    ///
+    /// `port` remains the actual connection destination. This field is derived
+    /// during materialization and skipped by serde so file/admin config cannot
+    /// set it.
+    #[serde(default, skip)]
+    pub service_port_policy_key: Option<u16>,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]
@@ -649,6 +731,18 @@ pub struct UpstreamTarget {
     /// target is selected by the load balancer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+impl UpstreamTarget {
+    /// DestinationRule `portLevelSettings` key that governs this target.
+    ///
+    /// Static targets and ordinary discovery targets use their dial port. Mesh
+    /// Service discovery can stamp the owning declared Service port when
+    /// Kubernetes `targetPort` resolves to a different workload port.
+    #[inline]
+    pub fn dispatch_policy_port(&self) -> u16 {
+        self.service_port_policy_key.unwrap_or(self.port)
+    }
 }
 
 /// Parsed locality preference used by the load balancer.
@@ -1179,6 +1273,21 @@ pub struct Upstream {
     /// `Upstream.subsets[].traffic_policy.tls`.
     #[serde(skip)]
     pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
+    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
+    /// overlay for a **service-discovery** upstream.
+    ///
+    /// Non-SD upstreams fan the top-level `connectionPool.http` block out onto
+    /// every served `port_overrides` entry at apply time. SD upstreams cannot —
+    /// their target ports are resolved at runtime, not at apply — so the
+    /// top-level overlay is captured here instead and applied by the
+    /// LB-**selected** target port at dispatch. `resolve_dispatch_port_overrides`
+    /// projects this onto `Proxy.dispatch_port_override_fallback`, which the
+    /// HTTP-family dispatch resolvers (`resolve_effective_proxy_for_target` /
+    /// `cap_proxy_retry_for_target`) consult only when the selected port has no
+    /// explicit per-port override — so an explicit `portLevelSettings` entry
+    /// still wins. Not serialized — derived from the matching DestinationRule.
+    #[serde(default, skip)]
+    pub dispatch_port_override_fallback: Option<UpstreamPortOverride>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
     /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -1659,7 +1768,7 @@ pub struct Proxy {
     pub namespace: String,
     /// Optional list of hostnames this proxy matches on.
     /// Empty means match all hosts (catch-all).
-    /// Supports exact hostnames and single-level wildcard prefixes (e.g., "*.example.com").
+    /// Supports exact hostnames and DNS suffix wildcard prefixes (e.g., "*.example.com").
     /// For HTTP-family proxies, either `hosts` or `listen_path` must be set
     /// (both may be set together).
     #[serde(default)]
@@ -1738,6 +1847,23 @@ pub struct Proxy {
     /// `apply_destination_rules` has written into `Upstream.port_overrides`.
     #[serde(skip)]
     pub dispatch_port_overrides: Option<HashMap<u16, ResolvedPortOverride>>,
+    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
+    /// overlay for a **service-discovery** upstream, projected from
+    /// `Upstream.dispatch_port_override_fallback` by
+    /// `GatewayConfig::resolve_dispatch_port_overrides()`.
+    ///
+    /// SD upstreams have no apply-time port set to fan the top-level overlay
+    /// onto (targets resolve at runtime), so `dispatch_port_overrides` is empty
+    /// for the discovered ports. The HTTP-family dispatch resolvers
+    /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
+    /// fall back to this overlay when the LB-selected target port has no
+    /// explicit per-port override — so an explicit `portLevelSettings` entry for
+    /// that port still wins. `None` for the common (non-SD, or SD without a
+    /// top-level `connectionPool.http`) case, so the hot path skips it with a
+    /// single field read. `#[serde(skip)]` (derived-only) like
+    /// `dispatch_port_overrides`; DB/file loaders start it `None`.
+    #[serde(skip)]
+    pub dispatch_port_override_fallback: Option<ResolvedPortOverride>,
     #[serde(default)]
     pub dns_override: Option<String>,
     #[serde(default)]
@@ -2079,6 +2205,29 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    /// Optional proxy frontend TLS certificate source delivered with the
+    /// namespace-scoped gateway config. Kubernetes Gateway listeners populate
+    /// this from `certificateRefs` as `k8s://<namespace>/<secret>#tls.crt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_cert_path: Option<String>,
+    /// Optional proxy frontend TLS private-key source paired with
+    /// `frontend_tls_cert_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_key_path: Option<String>,
+    /// Namespace of the Gateway that materialized `frontend_tls_*`.
+    ///
+    /// The Secret itself can be cross-namespace when authorized by
+    /// ReferenceGrant, so CP/DP namespace filtering must use this owner
+    /// namespace instead of inferring ownership from a `k8s://secret-ns/...`
+    /// source URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_source_namespace: Option<String>,
+    /// Gateway-managed frontend TLS material indexed by owning Gateway
+    /// namespace. Multi-namespace CPs keep all Gateway TLS entries here until
+    /// the per-DP namespace filter projects the matching entry into
+    /// `frontend_tls_*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontend_tls_namespace_sources: Vec<FrontendTlsNamespaceSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the
@@ -2088,6 +2237,14 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendTlsNamespaceSource {
+    pub namespace: String,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -2206,6 +2363,318 @@ fn contains_encoded_slash(path: &str) -> bool {
     false
 }
 
+/// Whether a proxy's retry policy can actually trigger for at least one request
+/// the proxy can admit.
+///
+/// Mirrors the runtime gates so config validation does not reject combinations
+/// that can never retry:
+/// - `max_retries == 0` never retries.
+/// - `retry_on_connect_failure` is method-agnostic (a connect failure never
+///   reaches the HTTP layer), so it makes retry effective for *any* admitted
+///   method.
+/// - Status-code retries only fire for methods listed in `retryable_methods`,
+///   and method admission (`allowed_methods`) runs before backend dispatch. So
+///   status retries are only effective when `retryable_methods` overlaps the
+///   methods the proxy is allowed to serve.
+pub(crate) fn proxy_retry_is_effective(
+    retry: Option<&RetryConfig>,
+    allowed_methods: Option<&[String]>,
+) -> bool {
+    let Some(retry) = retry else {
+        return false;
+    };
+    if retry.max_retries == 0 {
+        return false;
+    }
+    if retry.retry_on_connect_failure {
+        return true;
+    }
+    if retry.retryable_status_codes.is_empty() || retry.retryable_methods.is_empty() {
+        return false;
+    }
+    match allowed_methods {
+        // `allowed_methods == None` means "allow all", so any retryable method
+        // can be admitted.
+        None => true,
+        Some(allowed) => retry.retryable_methods.iter().any(|retryable| {
+            allowed
+                .iter()
+                .any(|served| served.eq_ignore_ascii_case(retryable))
+        }),
+    }
+}
+
+/// The DestinationRule `connectionPool.http.maxRetries` cap the runtime applies
+/// to the SELECTED dispatch target's port, if any.
+///
+/// Mirrors [`crate::proxy::cap_proxy_retry_for_target`]'s field-level fallback:
+/// the per-port `max_retries` wins when set, otherwise the service-discovery
+/// top-level overlay (`dispatch_port_override_fallback`) is inherited — so a
+/// per-port entry that sets only an unrelated field does not wipe the inherited
+/// cap. Returns `None` when the port has no governing cap.
+fn proxy_retry_cap_for_port(proxy: &Proxy, port: u16) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+        .and_then(|o| o.max_retries)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|o| o.max_retries)
+        })
+}
+
+/// Whether `retry` is still effective for a request dispatched to a mesh target,
+/// after applying the per-port retry cap the runtime applies before deciding
+/// whether retry disables HBONE / SVID-mTLS dispatch.
+///
+/// The conflicting target's dispatch port (`conflict.port`) drives the per-port
+/// cap. It is `Some` for static targets and for mesh service-discovery upstreams
+/// whose selected declared Service port is known at admission. It remains `None`
+/// when admission cannot prove a concrete policy port, but the runtime's
+/// [`crate::proxy::cap_proxy_retry_for_target`] still applies the top-level
+/// service-discovery `connectionPool.http.maxRetries` overlay
+/// (`Proxy.dispatch_port_override_fallback`) to every discovered target whose
+/// per-port lookup misses. So a top-level DestinationRule `maxRetries = 0` on a
+/// mesh SD upstream disarms retry for every discovered target at dispatch time
+/// and must NOT be rejected here even when no concrete port is known yet.
+pub(crate) fn retry_is_effective_for_mesh_target(
+    proxy: &Proxy,
+    retry: Option<&RetryConfig>,
+    allowed_methods: Option<&[String]>,
+    conflict: &MeshTransportConflict,
+) -> bool {
+    let Some(retry) = retry else {
+        return false;
+    };
+    if !proxy_retry_is_effective(Some(retry), allowed_methods) {
+        return false;
+    }
+    // Mirror `cap_proxy_retry_for_target`'s field-level fallback: the per-port
+    // `max_retries` for the selected policy port wins when present, otherwise
+    // the service-discovery top-level overlay (`dispatch_port_override_fallback`)
+    // is inherited. When no policy port is known, only the top-level fallback can
+    // be proven to govern — but it governs every discovered target, so honoring
+    // it here matches the runtime.
+    let cap = conflict
+        .port
+        .and_then(|port| proxy_retry_cap_for_port(proxy, port))
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.max_retries)
+        });
+    match cap {
+        // A cap of 0 disarms retry for this target at runtime, so the HBONE/mTLS
+        // dispatch path is preserved and there is no 502.
+        Some(cap) => cap > 0,
+        None => true,
+    }
+}
+
+fn mesh_sd_policy_port(
+    upstream: &Upstream,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<u16> {
+    let mesh_sd = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
+    if let Some(port) = mesh_sd.port {
+        return Some(port);
+    }
+    let namespace = mesh_sd.namespace.as_deref().unwrap_or(&upstream.namespace);
+    mesh_model?
+        .services
+        .iter()
+        .find(|service| {
+            service.name.as_str() == mesh_sd.service_name.as_str()
+                && service.namespace.as_str() == namespace
+        })
+        .and_then(|service| service.ports.first())
+        .map(|port| port.port)
+}
+
+/// Every mesh transport an upstream's selected targets require.
+///
+/// Returns one [`MeshTransportConflict`] per selectable target that needs a mesh
+/// transport (`"mesh.hbone"` / `"mesh.mtls"`), each carrying a human-readable
+/// detail and the target's dispatch port. Uses the *runtime* tag predicates
+/// ([`crate::proxy::hbone_pool::target_hbone_enabled`] /
+/// [`crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled`]) so it matches the
+/// boolish truthiness (`true`/`yes`/`on`/`1`) the dispatch path actually honors.
+///
+/// Every selectable mesh target is returned (not just the first) because the load
+/// balancer can pick any of them, and each target's policy port carries its own
+/// `cap_proxy_retry_for_target` cap: a config that zeroes retry on one mesh
+/// target's port but leaves another mesh target uncapped still 502s when the LB
+/// selects the uncapped one. Callers pair this with
+/// [`retry_is_effective_for_mesh_target`] per entry.
+///
+/// Mesh service-discovery upstreams (`service_discovery.provider = Mesh`) are
+/// treated as HBONE-requiring even with no static targets, because discovered
+/// targets are stamped `mesh.hbone=true` by the mesh discoverer.
+fn upstream_required_mesh_transports(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Vec<MeshTransportConflict> {
+    // Mesh service-discovery upstreams publish HBONE-required targets
+    // dynamically; their static `targets` list is typically empty at admission.
+    if upstream
+        .service_discovery
+        .as_ref()
+        .is_some_and(|sd| sd.provider == SdProvider::Mesh)
+    {
+        let policy_port = mesh_sd_policy_port(upstream, mesh_model);
+        return vec![MeshTransportConflict {
+            transport: "mesh.hbone",
+            detail: "mesh service discovery".to_string(),
+            // Mirror mesh service discovery: explicit `mesh.port` wins, otherwise
+            // the first declared Service port owns the discovered targets. If no
+            // mesh model is available here, fall back to top-level SD policy only.
+            port: policy_port,
+        }];
+    }
+
+    let subset = selected_subset.and_then(|subset_name| {
+        upstream
+            .subsets
+            .as_ref()
+            .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
+    });
+    let target_selected = |target: &UpstreamTarget| match subset {
+        Some(subset) => subset
+            .labels
+            .iter()
+            .all(|(key, value)| target.tags.get(key).is_some_and(|tag| tag == value)),
+        None => true,
+    };
+
+    let mut conflicts = Vec::new();
+    for target in upstream.targets.iter().filter(|t| target_selected(t)) {
+        let transport = if crate::proxy::hbone_pool::target_hbone_enabled(target) {
+            Some("mesh.hbone")
+        } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+            Some("mesh.mtls")
+        } else {
+            None
+        };
+        if let Some(transport) = transport {
+            conflicts.push(MeshTransportConflict {
+                transport,
+                detail: format!("target '{}:{}'", target.host, target.port),
+                port: Some(target.dispatch_policy_port()),
+            });
+        }
+    }
+    conflicts
+}
+
+/// The first selectable mesh target of `upstream` whose required transport still
+/// conflicts with `retry` after that target's own per-port cap is applied, or
+/// `None` if no selectable mesh target keeps retry effective (so runtime never
+/// 502s).
+///
+/// This is the admission-time equivalent of the runtime sequence: the load
+/// balancer selects one target, [`crate::proxy::cap_proxy_retry_for_target`]
+/// caps retry for that target's port, and only then does an effective retry
+/// disable HBONE/SVID-mTLS dispatch. Because the LB may select *any* mesh target,
+/// the conflict is reported when *any* selectable mesh target survives its cap.
+pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
+    proxy: &Proxy,
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    retry: Option<&RetryConfig>,
+    allowed_methods: Option<&[String]>,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<MeshTransportConflict> {
+    upstream_required_mesh_transports(upstream, selected_subset, mesh_model)
+        .into_iter()
+        .find(|conflict| {
+            retry_is_effective_for_mesh_target(proxy, retry, allowed_methods, conflict)
+        })
+}
+
+/// Project a single referenced upstream's per-port / top-level retry caps onto a
+/// throwaway proxy clone so the per-resource admission paths
+/// (`Proxy::after_validate`, API-spec import, batch import) model the same
+/// `cap_proxy_retry_for_target` cap the runtime applies before deciding whether
+/// retry disables HBONE/SVID-mTLS dispatch.
+///
+/// `Proxy.dispatch_port_overrides` / `Proxy.dispatch_port_override_fallback` are
+/// `#[serde(skip)]` DR-derived projections that only
+/// [`GatewayConfig::resolve_dispatch_port_overrides`] populates over a full
+/// config. A proxy that arrives straight off the admin request body therefore has
+/// both fields `None`, so without this projection
+/// [`retry_is_effective_for_mesh_target`] cannot see a `maxRetries = 0` cap on the
+/// mesh port and would over-reject a config the runtime serves correctly. Mirrors
+/// the per-upstream projection in `resolve_dispatch_port_overrides`.
+pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) -> Proxy {
+    let mut resolved = proxy.clone();
+    resolved.dispatch_port_overrides = if upstream.port_overrides.is_empty() {
+        None
+    } else {
+        let ports: HashMap<u16, ResolvedPortOverride> = upstream
+            .port_overrides
+            .iter()
+            .filter_map(|(port, ovr)| {
+                ResolvedPortOverride::from_upstream_override(ovr).map(|r| (*port, r))
+            })
+            .collect();
+        (!ports.is_empty()).then_some(ports)
+    };
+    resolved.dispatch_port_override_fallback =
+        dispatch_port_override_fallback_from_upstream(upstream);
+    resolved
+}
+
+/// A mesh-transport requirement that conflicts with an effective retry policy.
+pub(crate) struct MeshTransportConflict {
+    /// The conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`).
+    transport: &'static str,
+    /// Human-readable source of the requirement (a target or `mesh service
+    /// discovery`).
+    detail: String,
+    /// The dispatch policy port of the conflicting target, when known. Mesh
+    /// service discovery can provide this before targets exist when admission
+    /// has the selected declared Service port. Callers use this to apply the
+    /// same per-port retry cap the runtime applies via
+    /// [`crate::proxy::cap_proxy_retry_for_target`] before treating retry as
+    /// effective for this target.
+    port: Option<u16>,
+}
+
+/// A `mesh_route_dispatch` upstream override destination paired with the
+/// effective retry policy the runtime applies when that rule matches.
+struct MeshRouteOverrideDest {
+    /// The override `upstream_id` (`route_override_upstream_id`).
+    upstream_id: String,
+    /// The retry policy in force for requests this rule routes: the rule's own
+    /// `retry`, `None` when the rule disables retry, or the proxy's base retry
+    /// when the rule leaves retry untouched.
+    effective_retry: Option<RetryConfig>,
+    /// The upstream subset the runtime selects for this override. A rule that
+    /// keeps the proxy's default upstream preserves `proxy.upstream_subset`
+    /// (`apply_route_overrides_inner` only clears it when the upstream changes);
+    /// a different-upstream rule drops the subset (the new upstream has its own
+    /// targets), so this is `None` there. Used so the conflict check filters the
+    /// same target set the load balancer would.
+    selected_subset: Option<String>,
+}
+
+/// Build the canonical retry/mesh-transport conflict error message.
+pub(crate) fn mesh_transport_retry_conflict_message(
+    proxy_id: &str,
+    upstream_id: &str,
+    conflict: &MeshTransportConflict,
+) -> String {
+    format!(
+        "Proxy '{}' enables retry but upstream_id '{}' {} requires {} dispatch; retry over required mesh transports is not supported",
+        proxy_id, upstream_id, conflict.detail, conflict.transport
+    )
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -2220,18 +2689,24 @@ impl GatewayConfig {
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Split proxies into two buckets: those with an explicit listen_path and
-        // host-only proxies. Only proxies in the same bucket AND the same path
-        // (for the path bucket) can conflict.
-        let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
-        let mut host_only: Vec<&Proxy> = Vec::new();
+        // Split proxies into namespace-scoped buckets: those with an explicit
+        // listen_path and host-only proxies. Only proxies in the same namespace,
+        // the same bucket, AND the same path (for the path bucket) can conflict.
+        let mut by_path: HashMap<(&str, &str), Vec<&Proxy>> = HashMap::new();
+        let mut host_only: HashMap<&str, Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             match proxy.listen_path.as_deref() {
-                Some(path) => by_path.entry(path).or_default().push(proxy),
-                None => host_only.push(proxy),
+                Some(path) => by_path
+                    .entry((proxy.namespace.as_str(), path))
+                    .or_default()
+                    .push(proxy),
+                None => host_only
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .push(proxy),
             }
         }
 
@@ -2297,7 +2772,7 @@ impl GatewayConfig {
             })
             .unwrap_or_default();
 
-        for (path, group) in &by_path {
+        for ((_, path), group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
@@ -2310,7 +2785,7 @@ impl GatewayConfig {
                     {
                         continue;
                     }
-                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                    if ambiguous_path_host_overlap(&proxy_a.hosts, &proxy_b.hosts) {
                         if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
                             errors.push(format!(
                                 "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
@@ -2327,13 +2802,15 @@ impl GatewayConfig {
             }
         }
 
-        for (i, proxy_a) in host_only.iter().enumerate() {
-            for proxy_b in host_only.iter().skip(i + 1) {
-                if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
-                    errors.push(format!(
-                        "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
-                        proxy_b.id, proxy_a.id
-                    ));
+        for group in host_only.values() {
+            for (i, proxy_a) in group.iter().enumerate() {
+                for proxy_b in group.iter().skip(i + 1) {
+                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                        errors.push(format!(
+                            "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
+                            proxy_b.id, proxy_a.id
+                        ));
+                    }
                 }
             }
         }
@@ -2451,6 +2928,10 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
+        self.frontend_tls_namespace_sources
+            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        self.frontend_tls_namespace_sources
+            .dedup_by(|left, right| left.namespace == right.namespace);
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();
@@ -2578,12 +3059,24 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
+        // Service-discovery top-level `connectionPool.http` fallback, applied by
+        // the LB-selected port at dispatch when that port has no explicit
+        // per-port override. Keyed by upstream id, separate from the per-port
+        // map above so an explicit `portLevelSettings` entry still wins.
+        let fallback_by_upstream: HashMap<&str, ResolvedPortOverride> = self
+            .upstreams
+            .iter()
+            .filter_map(|u| {
+                dispatch_port_override_fallback_from_upstream(u)
+                    .map(|resolved| (u.id.as_str(), resolved))
+            })
+            .collect();
+
         for proxy in &mut self.proxies {
-            proxy.dispatch_port_overrides = proxy
-                .upstream_id
-                .as_deref()
-                .and_then(|uid| by_upstream.get(uid))
-                .cloned();
+            let uid = proxy.upstream_id.as_deref();
+            proxy.dispatch_port_overrides = uid.and_then(|uid| by_upstream.get(uid)).cloned();
+            proxy.dispatch_port_override_fallback =
+                uid.and_then(|uid| fallback_by_upstream.get(uid)).cloned();
         }
     }
 
@@ -2741,6 +3234,12 @@ impl GatewayConfig {
     /// In database mode the DB enforces this via foreign key constraints.
     /// In file mode there's no DB, so this catches dangling references
     /// at config load time.
+    ///
+    /// This also rejects retry-enabled proxies whose effective upstream targets
+    /// require a mesh transport (`mesh.hbone` / `mesh.mtls`). At runtime the
+    /// dispatch path forces those transports off whenever retry is effective and
+    /// then fails closed with a 502 (see issue #1669), so the combination is a
+    /// silent reachability gap that we reject at admission instead.
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         let upstreams_by_id: HashMap<&str, &Upstream> =
             self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
@@ -2761,6 +3260,18 @@ impl GatewayConfig {
                                 ));
                             }
                         }
+                        if let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
+                            proxy,
+                            upstream,
+                            proxy.upstream_subset.as_deref(),
+                            proxy.retry.as_ref(),
+                            proxy.allowed_methods.as_deref(),
+                            self.mesh.as_deref(),
+                        ) {
+                            errors.push(mesh_transport_retry_conflict_message(
+                                &proxy.id, uid, &required,
+                            ));
+                        }
                     }
                     None => {
                         errors.push(format!(
@@ -2770,6 +3281,38 @@ impl GatewayConfig {
                     }
                 }
             }
+
+            // Route-level upstream overrides (mesh_route_dispatch) can send
+            // matched traffic to a *different* upstream than `proxy.upstream_id`.
+            // A retry-enabled proxy whose default upstream is plain but whose
+            // route rules target a mesh-tagged upstream would otherwise load and
+            // then 502 those matched requests. Validate the override
+            // destinations against the same conflict check, using each rule's
+            // EFFECTIVE retry (the rule can add/replace/disable retry, which the
+            // runtime applies via `route_override_retry` before dispatch).
+            for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
+                if let Some(upstream) = upstreams_by_id.get(override_dest.upstream_id.as_str())
+                    && let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
+                        // The runtime recomputes `dispatch_port_overrides` from the
+                        // OVERRIDE destination upstream when a rule swaps the
+                        // upstream (`apply_route_overrides_inner`), so the per-port
+                        // retry cap must come from that upstream, not the proxy's
+                        // default-upstream-derived caps.
+                        &proxy_with_resolved_port_caps(proxy, upstream),
+                        upstream,
+                        override_dest.selected_subset.as_deref(),
+                        override_dest.effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                        self.mesh.as_deref(),
+                    )
+                {
+                    errors.push(mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        override_dest.upstream_id.as_str(),
+                        &required,
+                    ));
+                }
+            }
         }
 
         if errors.is_empty() {
@@ -2777,6 +3320,145 @@ impl GatewayConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Collect the upstream overrides this proxy's enabled `mesh_route_dispatch`
+    /// plugin instances can route matched traffic to (via
+    /// `route_override_upstream_id`), each paired with the EFFECTIVE retry the
+    /// runtime applies for that rule.
+    ///
+    /// Both proxy-scoped/proxy_group associations (`proxy.plugins`) and **global**
+    /// `mesh_route_dispatch` plugin configs are considered, because the plugin
+    /// cache merges global plugins into every proxy's chain — a global dispatch
+    /// rule routes matched requests even when the proxy has no local association.
+    /// The one exception: when this proxy attaches its own enabled
+    /// `mesh_route_dispatch` instance, `PluginCache::build_cache` shadows the
+    /// globals of the same name, so they never run for this proxy and their rules
+    /// must NOT be collected (otherwise a conflict in a shadowed global produces a
+    /// spurious admission rejection).
+    ///
+    /// The rule's effective retry mirrors `MeshRouteDispatchPlugin`'s
+    /// `route_override_retry` semantics: a rule with `retry` replaces the base
+    /// policy, `retry_disabled` clears it, and an unset rule inherits the proxy's
+    /// base `retry`. A rule that names the proxy's own default upstream is skipped
+    /// *only* when it leaves retry untouched (the default-upstream check already
+    /// covers that base retry); a same-upstream rule that adds or replaces retry
+    /// is still collected, because the runtime applies `route_override_retry`
+    /// before dispatch regardless of whether the upstream changed. Returns an
+    /// empty vec when no rule contributes a conflict to check.
+    fn mesh_route_dispatch_override_destinations(
+        &self,
+        proxy: &Proxy,
+    ) -> Vec<MeshRouteOverrideDest> {
+        let mut overrides: Vec<MeshRouteOverrideDest> = Vec::new();
+        let default_uid = proxy.upstream_id.as_deref().unwrap_or("");
+        let mut collect = |plugin: &PluginConfig| {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                return;
+            }
+            let Ok(dispatch) =
+                crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(
+                    &plugin.config,
+                )
+            else {
+                return;
+            };
+            for rule in &dispatch.rules {
+                // A redirect rule answers the request itself
+                // (`build_redirect_response` short-circuits before any
+                // `route_override_upstream_id` is set), so it never dispatches to
+                // `destination.upstream_id` even when one is present. Collecting it
+                // would spuriously reject a retry-enabled proxy whose redirect rule
+                // names a mesh upstream that no matched request ever reaches.
+                if rule.redirect.is_some() {
+                    continue;
+                }
+                let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
+                    continue;
+                };
+                // A rule that points at the proxy's own default upstream but
+                // leaves retry untouched is already covered by the
+                // default-upstream conflict check; skip it to avoid a duplicate.
+                // When the rule changes retry (adds its own or disables it),
+                // runtime still overwrites `proxy.retry` via `route_override_retry`
+                // before dispatch, so it must be evaluated even for the default
+                // upstream.
+                let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+                if override_uid == default_uid && !rule_changes_retry {
+                    continue;
+                }
+                // Effective retry the runtime would apply for this matched rule.
+                //
+                // Residual (accepted): a rule's own request-method predicate
+                // (`rule.match.methods`) is intentionally NOT modeled here, so two
+                // narrow over-rejections remain. (1) When the rule restricts itself
+                // to methods outside its own `retryable_methods` (status-code
+                // retries only), no request reaching the override can retry. (2)
+                // When the rule's method predicate is disjoint from the proxy's
+                // `allowed_methods` (e.g. proxy allows only POST, rule matches only
+                // GET), method admission rejects every such request before plugins
+                // run, so the override is unreachable. Both could be filtered by
+                // intersecting the rule's method predicate, but `match.methods`
+                // supports prefix/regex matchers (see `MethodMatcher`) that cannot
+                // be statically intersected with the concrete `allowed_methods`
+                // list, and the lenient case-insensitive `allowed_methods` admission
+                // vs the rule's case-sensitive `Exact` matching makes even an
+                // exact-only model unsafe (it would introduce fresh under-rejection).
+                // `proxy_retry_is_effective` still gates on `allowed_methods`, so the
+                // residual is confined to these method-gated mesh-override rules.
+                let effective_retry = if rule.retry.is_some() {
+                    rule.retry.clone()
+                } else if rule.retry_disabled {
+                    None
+                } else {
+                    proxy.retry.clone()
+                };
+                // Runtime preserves `proxy.upstream_subset` only when the rule
+                // keeps the default upstream; a different-upstream override drops
+                // it.
+                let selected_subset = if override_uid == default_uid {
+                    proxy.upstream_subset.clone()
+                } else {
+                    None
+                };
+                if !overrides.iter().any(|existing| {
+                    existing.upstream_id == override_uid
+                        && existing.effective_retry == effective_retry
+                        && existing.selected_subset == selected_subset
+                }) {
+                    overrides.push(MeshRouteOverrideDest {
+                        upstream_id: override_uid.to_string(),
+                        effective_retry,
+                        selected_subset,
+                    });
+                }
+            }
+        };
+        // A proxy-scoped or proxy_group-scoped `mesh_route_dispatch` instance
+        // attached via `proxy.plugins` shadows every global of the same name
+        // (`PluginCache::build_cache` removes globals whose `name()` matches a
+        // local instance), so the globals' rules never run for this proxy.
+        let mut shadows_global_dispatch = false;
+        for assoc in &proxy.plugins {
+            if let Some(plugin) = self
+                .plugin_configs
+                .iter()
+                .find(|pc| pc.id == assoc.plugin_config_id)
+            {
+                if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
+                    shadows_global_dispatch = true;
+                }
+                collect(plugin);
+            }
+        }
+        if !shadows_global_dispatch {
+            for plugin in &self.plugin_configs {
+                if plugin.scope == PluginScope::Global {
+                    collect(plugin);
+                }
+            }
+        }
+        overrides
     }
 
     /// Validate plugin resource invariants and proxy/plugin associations.
@@ -3117,7 +3799,7 @@ fn default_udp_idle_timeout() -> u64 {
 ///
 /// Valid formats:
 /// - Exact hostname: `api.example.com` (lowercase, no scheme/port/path)
-/// - Wildcard: `*.example.com` (single-level wildcard prefix)
+/// - Wildcard: `*.example.com` (DNS suffix wildcard prefix)
 pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host entry must not be empty".to_string());
@@ -3228,6 +3910,38 @@ pub fn hosts_overlap(a: &[String], b: &[String]) -> bool {
     // Check wildcard-to-exact and wildcard-to-wildcard overlaps
     for host_a in a {
         for host_b in b {
+            if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn ambiguous_path_host_overlap(a: &[String], b: &[String]) -> bool {
+    // Empty = catch-all. The catch-all tier sits behind exact and wildcard
+    // routes, but two same-path catch-all/specific routes are still ambiguous
+    // for configuration ownership and should fail closed.
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+
+    let a_set: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let b_set: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    if a_set.intersection(&b_set).next().is_some() {
+        return true;
+    }
+
+    for host_a in a {
+        for host_b in b {
+            let wildcard_a = host_a.starts_with("*.");
+            let wildcard_b = host_b.starts_with("*.");
+            if wildcard_a != wildcard_b {
+                // Exact-host routes are checked before wildcard-host routes in
+                // RouterCache, so this overlap is deterministic.
+                continue;
+            }
             if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
                 return true;
             }
@@ -3825,8 +4539,21 @@ impl Proxy {
                 MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE, v
             ));
         }
-        if let Some(0) = self.pool_http2_max_concurrent_streams {
-            errors.push("pool_http2_max_concurrent_streams must be at least 1 (got 0)".to_string());
+        if let Some(v) = self.pool_http2_max_concurrent_streams
+            && (v == 0 || u64::from(v) > MAX_POOL_SQL_INTEGER_VALUE)
+        {
+            errors.push(format!(
+                "pool_http2_max_concurrent_streams must be between 1 and {} (got {})",
+                MAX_POOL_SQL_INTEGER_VALUE, v
+            ));
+        }
+        if let Some(v) = self.pool_max_requests_per_connection
+            && v > MAX_POOL_SQL_INTEGER_VALUE
+        {
+            errors.push(format!(
+                "pool_max_requests_per_connection must be between 0 and {} (got {})",
+                MAX_POOL_SQL_INTEGER_VALUE, v
+            ));
         }
 
         // HTTP/3 connections per backend
@@ -4692,6 +5419,51 @@ impl Upstream {
                         errors.push(format!(
                             "subsets[{}].labels value must not exceed {} characters",
                             i, MAX_TAG_LENGTH
+                        ));
+                    }
+                }
+                if let Some(hash_on) = subset
+                    .traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.hash_on.as_ref())
+                {
+                    // Bound the length the same way upstream-level `hash_on` is
+                    // (MAX_HASH_ON_LENGTH): the value is persisted, cloned into
+                    // the LB cache, and read per request, so an unbounded
+                    // `header:`+megabytes string must be rejected at admission.
+                    if let Err(e) = validate_string_field(
+                        &format!("subsets[{i}].traffic_policy.hash_on"),
+                        hash_on,
+                        MAX_HASH_ON_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    let trimmed = hash_on.trim();
+                    if !trimmed.is_empty()
+                        && trimmed != "ip"
+                        && !trimmed.starts_with("header:")
+                        && !trimmed.starts_with("cookie:")
+                    {
+                        errors.push(format!(
+                            "subsets[{}].traffic_policy.hash_on must be 'ip', \
+                             'header:<name>', or 'cookie:<name>' (got '{}')",
+                            i, trimmed
+                        ));
+                    }
+                    if let Some(name) = trimmed.strip_prefix("header:")
+                        && name.trim().is_empty()
+                    {
+                        errors.push(format!(
+                            "subsets[{}].traffic_policy.hash_on 'header:' requires a non-empty header name",
+                            i
+                        ));
+                    }
+                    if let Some(name) = trimmed.strip_prefix("cookie:")
+                        && name.trim().is_empty()
+                    {
+                        errors.push(format!(
+                            "subsets[{}].traffic_policy.hash_on 'cookie:' requires a non-empty cookie name",
+                            i
                         ));
                     }
                 }
@@ -5790,24 +6562,17 @@ pub(crate) fn json_depth(value: &serde_json::Value) -> usize {
 }
 
 /// Check if a wildcard pattern matches a hostname.
-/// `*.example.com` matches `foo.example.com` but not `example.com` or `a.b.example.com`.
+/// `*.example.com` matches any DNS name below `example.com`, including
+/// `foo.example.com` and `a.b.example.com`, but not `example.com` itself.
 pub fn wildcard_matches(pattern: &str, hostname: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // Don't match the base domain itself
         if hostname == suffix {
             return false;
         }
-        // Must end with .suffix and have exactly one label before it
-        if let Some(prefix) = hostname.strip_suffix(suffix) {
-            // prefix should be "something." with no additional dots
-            if prefix.ends_with('.')
-                && !prefix[..prefix.len() - 1].is_empty()
-                && !prefix[..prefix.len() - 1].contains('.')
-            {
-                return true;
-            }
-        }
-        false
+        hostname
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
     } else {
         pattern == hostname
     }

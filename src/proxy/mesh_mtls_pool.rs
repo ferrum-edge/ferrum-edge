@@ -394,6 +394,7 @@ impl MeshMtlsConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         app_port: u16,
+        app_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
@@ -428,6 +429,7 @@ impl MeshMtlsConnectionPool {
             proxy,
             target_host,
             app_port,
+            app_policy_port,
             mtls_port,
             expected_peer,
             &key,
@@ -463,6 +465,7 @@ impl MeshMtlsConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
@@ -475,7 +478,7 @@ impl MeshMtlsConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_port))
+            .and_then(|m| m.get(&target_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -486,6 +489,7 @@ impl MeshMtlsConnectionPool {
             Some(expected_peer),
             &pool_config,
             keepalive_override,
+            None,
         )
         .await?;
         tokio::time::timeout(
@@ -498,6 +502,112 @@ impl MeshMtlsConnectionPool {
             message: format!(
                 "timed out after {}ms waiting for sidecar mesh-mTLS CONNECT response",
                 proxy.backend_connect_timeout_ms
+            ),
+        })?
+    }
+
+    /// Open a datagram-over-mesh-mTLS CONNECT tunnel to a peer sidecar's inbound
+    /// mTLS listener (`:15006`, or the `mesh.mtls_port`-tagged override) over a
+    /// FRESH SVID-mTLS H2 connection — the Sidecar counterpart of
+    /// [`HboneConnectionPool::get_datagram_tunnel`] (F3 §3.3 Stage 4 Sidecar
+    /// relay). `target_host:target_port` is the destination workload's address
+    /// and UDP app port; the CONNECT `:authority` is that app addr+port the
+    /// peer's transport-agnostic inbound relay unframes the tunnel into a local
+    /// `UdpSocket` toward.
+    ///
+    /// Unlike [`Self::open_connect_tunnel`] (raw-TCP byte stream), this stamps
+    /// the `udp` protocol marker (`crate::modes::mesh::hbone::UDP_PROTOCOL`)
+    /// AND the W3C source-identity baggage, EXACTLY the way
+    /// [`HboneConnectionPool::get_datagram_tunnel`] does for the Ambient HBONE
+    /// path: the destination's relay branches on the `udp` marker
+    /// (`is_udp_hbone_connect`) to unframe length-delimited datagrams (see
+    /// `crate::proxy::mesh_udp_frame`) into a `UdpSocket`, rather than
+    /// byte-relaying to a TCP backend. The returned [`H2ConnectTunnel`] carries
+    /// length-delimited datagrams, NOT a raw byte stream.
+    ///
+    /// Like [`Self::open_connect_tunnel`] each UDP session gets its OWN
+    /// mesh-mTLS H2 connection carrying exactly ONE CONNECT stream (1:1, dropped
+    /// when the session ends), NOT multiplexed over the pooled
+    /// [`MeshMtlsSender`] connections — a captured UDP flow is a distinct
+    /// session with its own lifetime, and a dedicated connection keeps the
+    /// wire-visible `udp` marker on a stream that is unambiguously a datagram
+    /// tunnel. SVID rotation is automatic (each session dials with the current
+    /// SVID). Honors the destination app port's DR `connectTimeout` /
+    /// `tcpKeepalive` overrides the same way `get_datagram_tunnel` does. NO
+    /// capability probe: a slice-declared sidecar peer speaks mesh-mTLS by
+    /// construction. Fail-closed: a missing gateway SVID errors before the dial,
+    /// and the dial PINS `expected_peer`.
+    #[allow(dead_code)]
+    pub async fn open_datagram_tunnel(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        target_policy_port: u16,
+        mtls_port: u16,
+        expected_peer: &SpiffeId,
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
+        // Fail closed when no gateway SVID is loaded — never dial a mesh peer
+        // identity-less (parity with `open_connect_tunnel` and `get_sender`).
+        // This also drives the rotation/retired-fingerprint bookkeeping.
+        let _ = self.current_svid_fingerprint_cached()?;
+        // The datagram path (unlike the byte-stream / WS mesh-mTLS paths) carries
+        // the W3C source-identity baggage, so read the source SPIFFE id from the
+        // current SVID bundle. `current_svid_fingerprint_cached` above already
+        // proved a bundle is present, but the slot can rotate to empty between the
+        // two loads, so this re-checks and fails closed rather than dialing
+        // identity-less. The `MeshMtlsConnectionPool` identity cache stores only
+        // the fingerprint (no SPIFFE id — the other transports need none), so the
+        // id is read directly off the bundle here.
+        let source_identity = {
+            let snapshot = self.gateway_svid.load_full();
+            let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
+            bundle.spiffe_id.clone()
+        };
+        let pool_config = self.pool_config.for_proxy(proxy);
+        // Per-port DestinationRule overrides are resolved for the destination's
+        // APP port (`target_port`, the DR keying port), not the transport
+        // `mtls_port` — mirrors `get_datagram_tunnel`:
+        // - `tcpKeepalive` flows into the dial's socket keepalive;
+        // - `connectTimeout` bounds the WHOLE dial AND the CONNECT-stream wait.
+        let port_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&target_policy_port));
+        let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
+        let effective_connect_timeout_ms = port_override
+            .and_then(|o| o.connect_timeout_ms)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
+        let sender = dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            target_host,
+            mtls_port,
+            Some(expected_peer),
+            &pool_config,
+            keepalive_override,
+            Some(connect_timeout),
+        )
+        .await?;
+        let baggage = crate::modes::mesh::hbone::baggage_header_for_source(&source_identity);
+        tokio::time::timeout(
+            connect_timeout,
+            open_h2_connect_stream(
+                sender,
+                target_host,
+                target_port,
+                Some(&baggage),
+                Some(crate::modes::mesh::hbone::UDP_PROTOCOL),
+            ),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectStream {
+            authority: authority_for_host_port(target_host, target_port),
+            message: format!(
+                "timed out after {}ms waiting for sidecar mesh-mTLS datagram CONNECT response",
+                effective_connect_timeout_ms
             ),
         })?
     }
@@ -539,7 +649,8 @@ impl MeshMtlsConnectionPool {
         &self,
         proxy: &Proxy,
         dial_host: &str,
-        app_port: u16,
+        _app_port: u16,
+        app_policy_port: u16,
         mtls_port: u16,
         authority: &str,
         path_and_query: &str,
@@ -557,7 +668,7 @@ impl MeshMtlsConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -568,6 +679,7 @@ impl MeshMtlsConnectionPool {
             Some(expected_peer),
             &pool_config,
             keepalive_override,
+            None,
         )
         .await?;
         tokio::time::timeout(
@@ -597,7 +709,8 @@ impl MeshMtlsConnectionPool {
         &self,
         proxy: &Proxy,
         target_host: &str,
-        app_port: u16,
+        _app_port: u16,
+        app_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
         key: &str,
@@ -644,7 +757,7 @@ impl MeshMtlsConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
@@ -1041,6 +1154,7 @@ mod tests {
         UpstreamTarget {
             host: "10.0.0.1".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: tags
                 .iter()
@@ -1103,6 +1217,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn open_datagram_tunnel_fails_closed_without_svid() {
+        // The Sidecar UDP datagram tunnel (#1808) must fail closed before dialing
+        // when no gateway SVID is loaded, exactly like `open_connect_tunnel` —
+        // never dial a mesh peer identity-less. This also proves the new function
+        // is wired and reachable (it stamps the `udp` marker on the CONNECT, the
+        // Sidecar counterpart of `HboneConnectionPool::get_datagram_tunnel`).
+        let pool = MeshMtlsConnectionPool::new(
+            PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "backend_host": "10.0.0.1",
+            "backend_port": 8080,
+        }))
+        .expect("minimal proxy");
+        let peer = test_peer();
+        // `H2ConnectTunnel` (the Ok type) is not `Debug`, so match rather than
+        // `expect_err`.
+        match pool
+            .open_datagram_tunnel(
+                &proxy,
+                "10.0.0.1",
+                53,
+                53,
+                ISTIO_SIDECAR_INBOUND_PORT,
+                &peer,
+            )
+            .await
+        {
+            Err(HbonePoolError::NoSvid) => {}
+            Err(other) => panic!("expected NoSvid, got {other:?}"),
+            Ok(_) => panic!("a missing gateway SVID must fail the datagram dial closed"),
+        }
+    }
+
     #[test]
     fn pool_key_partitions_by_peer_identity_and_svid() {
         let pool_config = PoolConfig::default();
@@ -1161,7 +1313,7 @@ mod tests {
         SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![leaf.to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],

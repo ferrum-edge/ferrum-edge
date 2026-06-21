@@ -38,6 +38,7 @@ impl super::ServiceDiscoverer for DnsSdDiscoverer {
             .map(|(host, port, weight)| UpstreamTarget {
                 host,
                 port,
+                service_port_policy_key: None,
                 weight: if weight > 0 {
                     weight as u32
                 } else {

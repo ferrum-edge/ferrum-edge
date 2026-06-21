@@ -121,11 +121,20 @@ struct UdpSession {
     /// connection toward the global pressure-shedding threshold so pure-UDP
     /// gateways and mixed deployments contribute correctly to overload state
     /// (parity with TCP/H3, which carry their own `ConnectionGuard` in the
-    /// per-connection task). Field is prefixed with `_` because it is held
-    /// solely for its `Drop` side-effect — the counter decrements automatically
-    /// when the session is removed (idle expiry, backend disconnect, or
-    /// ungraceful drop on listener shutdown).
-    _overload_guard: Option<crate::overload::ConnectionGuard>,
+    /// per-connection task). Removal paths take the guard before the final
+    /// `Arc<UdpSession>` drops so listener-local caches cannot pin the global
+    /// overload counter past session expiry.
+    overload_guard: std::sync::Mutex<Option<crate::overload::ConnectionGuard>>,
+}
+
+impl UdpSession {
+    fn release_overload_guard(&self) {
+        let mut guard = self
+            .overload_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take();
+    }
 }
 
 /// UDP session map using ahash (AES-NI accelerated) for faster per-datagram lookups.
@@ -751,6 +760,42 @@ async fn direct_send_to_client(
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct UdpReplySendDrops {
+    datagrams: u64,
+    bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl UdpReplySendDrops {
+    fn record_stats(&mut self, stats: super::udp_batch::SendMmsgFlush) {
+        self.datagrams = self.datagrams.saturating_add(stats.datagrams as u64);
+        self.bytes = self.bytes.saturating_add(stats.bytes as u64);
+    }
+
+    fn record_datagram(&mut self, len: usize) {
+        self.datagrams = self.datagrams.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(len as u64);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn flush_sendmmsg_best_effort(
+    send_batch: &mut super::udp_batch::SendMmsgBatch,
+    fd: std::os::fd::RawFd,
+    drops: &mut UdpReplySendDrops,
+) -> std::io::Result<super::udp_batch::SendMmsgFlush> {
+    let pending = send_batch.pending_stats();
+    match send_batch.flush(fd) {
+        Ok(flushed) => Ok(flushed),
+        Err(e) => {
+            drops.record_stats(pending);
+            Err(e)
+        }
+    }
+}
+
 /// Try to enqueue a datagram into the GSO batch; on batch-full or size-mismatch,
 /// flush and retry, and on GSO socket failure drain the buffered datagrams
 /// through the sendmmsg fallback.
@@ -774,6 +819,7 @@ async fn try_gso_send_or_fallback(
     gso_failed: &mut bool,
     proxy_id: &str,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
+    send_drops: &mut UdpReplySendDrops,
 ) {
     use std::os::unix::io::AsRawFd;
 
@@ -795,6 +841,7 @@ async fn try_gso_send_or_fallback(
                     "GSO post-flush push refused datagram, sending directly"
                 );
                 if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
+                    send_drops.record_datagram(data.len());
                     warn!(
                         proxy_id = %proxy_id,
                         client = %client_addr,
@@ -822,11 +869,11 @@ async fn try_gso_send_or_fallback(
                 if gso_batch.is_empty() {
                     break;
                 }
-                let _ = send_batch.flush(frontend.as_raw_fd());
+                let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
             }
             // Now push the current datagram, flushing once if necessary.
             if !send_batch.push_with_local(data, client_addr, local_ip) {
-                let _ = send_batch.flush(frontend.as_raw_fd());
+                let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
                 if !send_batch.push_with_local(data, client_addr, local_ip) {
                     debug!(
                         proxy_id = %proxy_id,
@@ -837,6 +884,7 @@ async fn try_gso_send_or_fallback(
                     if let Err(e) =
                         direct_send_to_client(frontend, data, client_addr, local_ip).await
                     {
+                        send_drops.record_datagram(data.len());
                         warn!(
                             proxy_id = %proxy_id,
                             client = %client_addr,
@@ -1824,10 +1872,12 @@ async fn process_new_session_datagram(
     }
 
     let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
+    let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
         let (backend_host, backend_port) =
             resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
+        preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
             PROTOCOL_UDP_DTLS
         } else {
@@ -1876,6 +1926,7 @@ async fn process_new_session_datagram(
         listener_shutdown,
         global_shutdown,
         overload,
+        preselected_backend_target,
     )
     .await?;
     reservation.disarm();
@@ -1942,9 +1993,6 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
-    session
-        .last_activity
-        .store(coarse_epoch_millis(), Ordering::Relaxed);
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)
             .await
@@ -1958,6 +2006,9 @@ async fn forward_client_datagram_to_backend(
 
     match send_result {
         Ok(_) => {
+            session
+                .last_activity
+                .store(coarse_epoch_millis(), Ordering::Relaxed);
             session
                 .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -2023,6 +2074,7 @@ fn spawn_session_cleanup(
                             session.stop_notify.notify_waiters();
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
+                            session.release_overload_guard();
                             metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
@@ -3060,6 +3112,7 @@ async fn create_session(
     listener_shutdown: &watch::Receiver<bool>,
     global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
+    preselected_backend_target: Option<(String, u16)>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -3117,8 +3170,8 @@ async fn create_session(
         }
     }
 
-    // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
+    let (backend_host, backend_port) =
+        resolve_or_reuse_backend_target(preselected_backend_target, &proxy, &epoch.load_balancer)?;
 
     // Circuit breaker check — reject before creating backend socket if open.
     // When admitted, capture whether this is a half-open probe so downstream
@@ -3342,7 +3395,9 @@ async fn create_session(
         // session so per-session pressure shedding works the same as TCP/H3.
         // Decrements automatically on session drop (idle expiry, backend
         // disconnect, listener shutdown).
-        _overload_guard: Some(crate::overload::ConnectionGuard::new(overload)),
+        overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
+            overload,
+        ))),
     });
 
     sessions.insert(client_addr, session.clone());
@@ -3563,6 +3618,8 @@ async fn create_session(
             let mut batch_bytes: u64 = len as u64;
             let mut batch_bytes_received: u64 = len as u64;
             let now = coarse_epoch_millis();
+            #[cfg(target_os = "linux")]
+            let mut send_drops = UdpReplySendDrops::default();
 
             // --- Batched send path (Linux, plain UDP only) ---
             // When GSO is available, concatenate same-size datagrams into a single
@@ -3594,6 +3651,7 @@ async fn create_session(
                             &mut gso_failed,
                             &reply_proxy_id,
                             session_local_ip,
+                            &mut send_drops,
                         )
                         .await;
                     } else {
@@ -3687,6 +3745,7 @@ async fn create_session(
                                             &mut gso_failed,
                                             &reply_proxy_id,
                                             session_local_ip,
+                                            &mut send_drops,
                                         )
                                         .await;
                                     } else if !send_batch.push_with_local(
@@ -3696,12 +3755,18 @@ async fn create_session(
                                     ) {
                                         // Batch full — flush and push again.
                                         use std::os::unix::io::AsRawFd;
-                                        let _ = send_batch.flush(frontend.as_raw_fd());
-                                        send_batch.push_with_local(
+                                        let _ = flush_sendmmsg_best_effort(
+                                            &mut send_batch,
+                                            frontend.as_raw_fd(),
+                                            &mut send_drops,
+                                        );
+                                        if !send_batch.push_with_local(
                                             &buf[..len2],
                                             client_addr,
                                             session_local_ip,
-                                        );
+                                        ) {
+                                            send_drops.record_datagram(len2);
+                                        }
                                     }
                                 }
                             } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
@@ -3740,6 +3805,7 @@ async fn create_session(
                                     .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
                                     .is_some()
                                 {
+                                    reply_session.release_overload_guard();
                                     reply_metrics
                                         .active_sessions
                                         .fetch_sub(1, Ordering::Relaxed);
@@ -3808,7 +3874,11 @@ async fn create_session(
                                 break;
                             }
                             use std::os::unix::io::AsRawFd;
-                            let _ = send_batch.flush(frontend.as_raw_fd());
+                            let _ = flush_sendmmsg_best_effort(
+                                &mut send_batch,
+                                frontend.as_raw_fd(),
+                                &mut send_drops,
+                            );
                         }
                     }
                 }
@@ -3817,7 +3887,7 @@ async fn create_session(
                     use std::os::unix::io::AsRawFd;
                     let fd = frontend.as_raw_fd();
                     loop {
-                        match send_batch.flush(fd) {
+                        match flush_sendmmsg_best_effort(&mut send_batch, fd, &mut send_drops) {
                             Ok(_) if send_batch.is_empty() => break,
                             Ok(_) => continue, // partial send — retry remaining
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
@@ -3854,6 +3924,11 @@ async fn create_session(
             reply_session
                 .bytes_received
                 .fetch_add(batch_bytes_received, Ordering::Relaxed);
+            #[cfg(target_os = "linux")]
+            if send_batched {
+                batch_dgrams = batch_dgrams.saturating_sub(send_drops.datagrams);
+                batch_bytes = batch_bytes.saturating_sub(send_drops.bytes);
+            }
             reply_metrics
                 .datagrams_out
                 .fetch_add(batch_dgrams, Ordering::Relaxed);
@@ -3882,6 +3957,7 @@ async fn create_session(
             .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
             .is_some()
         {
+            reply_session.release_overload_guard();
             reply_metrics
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
@@ -3955,6 +4031,17 @@ fn resolve_backend_target(
     }
 }
 
+fn resolve_or_reuse_backend_target(
+    preselected: Option<(String, u16)>,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+) -> Result<(String, u16), anyhow::Error> {
+    match preselected {
+        Some(target) => Ok(target),
+        None => resolve_backend_target(proxy, lb_snapshot),
+    }
+}
+
 /// Coarse-grained epoch millisecond timestamp updated periodically.
 /// Avoids calling `SystemTime::now()` on every datagram in the hot path.
 /// Resolution is ~100ms which is more than sufficient for session idle timeout
@@ -4001,16 +4088,20 @@ mod tests {
         STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext, UdpSession,
         build_dtls_stream_summary, build_udp_stream_summary, cached_backend_dtls_config,
         dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
-        reserve_udp_session_slot, udp_session_shard_amount,
+        forward_client_datagram_to_backend, reserve_udp_session_slot,
+        resolve_or_reuse_backend_target, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
+    use crate::load_balancer::LoadBalancerCache;
     use crate::plugins::{Plugin, StreamTransactionSummary};
+    use crate::proxy::GatewayConfig;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
+    use tokio::net::UdpSocket;
 
     fn make_udp_session() -> UdpSession {
         UdpSession {
@@ -4046,12 +4137,46 @@ mod tests {
             idle_timeout_ms: 60_000,
             stop_reply_task: std::sync::atomic::AtomicBool::new(false),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
-            // Tests build sessions without an overload state; the
-            // `Option<ConnectionGuard>` keeps the type constructible without
-            // pulling in `OverloadState` for unit tests that exercise summary
-            // emission only.
-            _overload_guard: None,
+            // Tests build sessions without an overload state; the guard slot
+            // stays empty for unit tests that exercise summary emission only.
+            overload_guard: std::sync::Mutex::new(None),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_backend_forward_does_not_refresh_last_activity() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut raw_session = make_udp_session();
+        raw_session.backend_socket = Some(socket);
+        raw_session
+            .last_activity
+            .store(1_710_000_000_500, Ordering::Relaxed);
+        let session = Arc::new(raw_session);
+        super::COARSE_EPOCH_MS.store(1_710_000_001_000, Ordering::Relaxed);
+
+        let err = forward_client_datagram_to_backend(&session, b"payload")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("send to backend failed"),
+            "expected unconnected UDP socket send failure, got {err}"
+        );
+        assert_eq!(
+            session.last_activity.load(Ordering::Relaxed),
+            1_710_000_000_500,
+            "failed client-to-backend forwards must not refresh idle activity"
+        );
+        assert_eq!(
+            session.bytes_sent.load(Ordering::Relaxed),
+            128,
+            "failed sends must not increment bytes_sent"
+        );
+        assert_eq!(
+            session.last_request_size.load(Ordering::Relaxed),
+            64,
+            "failed sends must not update last_request_size"
+        );
     }
 
     fn test_dtls_proxy() -> Proxy {
@@ -4622,7 +4747,9 @@ backend_tls_verify_server_cert: false
             idle_timeout_ms: 60_000,
             stop_reply_task: std::sync::atomic::AtomicBool::new(false),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
-            _overload_guard: Some(crate::overload::ConnectionGuard::new(state)),
+            overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
+                state,
+            ))),
         }
     }
 
@@ -4643,6 +4770,30 @@ backend_tls_verify_server_cert: false
             state.active_connections.load(Ordering::Relaxed),
             0,
             "dropping the UDP session must release the global connection slot"
+        );
+    }
+
+    #[test]
+    fn udp_session_overload_guard_can_release_before_last_arc_drop() {
+        let state = Arc::new(crate::overload::OverloadState::new());
+        let session = Arc::new(make_udp_session_with_overload(&state));
+        let cached = Arc::clone(&session);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        session.release_overload_guard();
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            0,
+            "session expiry must release overload pressure even if a cache still holds an Arc"
+        );
+
+        cached.release_overload_guard();
+        drop(session);
+        drop(cached);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            0,
+            "early release must be idempotent and not double-decrement on drop"
         );
     }
 
@@ -4668,6 +4819,33 @@ backend_tls_verify_server_cert: false
             udp_session_shard_amount(0),
             crate::util::sharding::pool_shard_amount(0)
         );
+    }
+
+    #[test]
+    fn preselected_udp_backend_target_is_reused() {
+        let config = GatewayConfig::default();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let proxy: Proxy = serde_yaml::from_str(
+            r#"
+id: udp-proxy
+backend_scheme: udp
+backend_host: direct.local
+backend_port: 5353
+listen_port: 5300
+"#,
+        )
+        .unwrap();
+
+        let (host, port) = resolve_or_reuse_backend_target(
+            Some(("admitted.local".to_string(), 5354)),
+            &proxy,
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(host, "admitted.local");
+        assert_eq!(port, 5354);
     }
 
     #[test]

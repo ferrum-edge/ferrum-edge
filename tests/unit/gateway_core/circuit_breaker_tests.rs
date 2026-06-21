@@ -3,6 +3,7 @@
 use ferrum_edge::circuit_breaker::{CircuitBreaker, CircuitBreakerCache, target_key};
 use ferrum_edge::config::types::CircuitBreakerConfig;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn default_config() -> CircuitBreakerConfig {
     CircuitBreakerConfig {
@@ -108,6 +109,33 @@ fn test_half_open_probe_failure_reopens() {
     // Probe fails (was admitted as half-open probe)
     cb.record_failure(500, false, true);
     assert_eq!(cb.state_name(), "open");
+}
+
+#[test]
+fn open_state_half_open_straggler_does_not_refresh_recovery_timeout() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let opened_at = cb.last_failure_epoch_ms();
+    assert!(opened_at > 0);
+
+    std::thread::sleep(Duration::from_millis(10));
+    cb.record_failure(500, false, true);
+
+    assert_eq!(
+        cb.last_failure_epoch_ms(),
+        opened_at,
+        "OPEN-state half-open probe stragglers must not restart the recovery timer"
+    );
 }
 
 #[test]

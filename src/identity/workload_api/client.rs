@@ -339,7 +339,7 @@ fn svid_response_to_bundle(
     Ok(SvidBundle {
         spiffe_id,
         cert_chain_der,
-        private_key_pkcs8_der: first.x509_svid_key,
+        private_key_pkcs8_der: first.x509_svid_key.into(),
         trust_bundles,
     })
 }
@@ -520,7 +520,10 @@ mod tests {
 
         assert_eq!(bundle.spiffe_id, expected);
         assert_eq!(bundle.cert_chain_der, vec![wanted_leaf]);
-        assert_eq!(bundle.private_key_pkcs8_der, wanted_key);
+        assert_eq!(
+            bundle.private_key_pkcs8_der.as_slice(),
+            wanted_key.as_slice()
+        );
     }
 
     #[test]

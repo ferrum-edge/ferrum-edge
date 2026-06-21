@@ -228,7 +228,7 @@ async fn run_cp_grpc_tls_accept_loop(
 /// Resolve which namespaces the CP polling loop should load on each tick.
 ///
 /// `Single(ns)` / `Set({ns, ...})` return the explicit list directly; `All`
-/// dynamically discovers namespaces from `db.list_namespaces()` so the CP
+/// dynamically discovers namespaces from authoritative primary reads so the CP
 /// picks up new tenants without a restart. Returns at least one namespace
 /// — when `All` is configured but the database is empty, we still load the
 /// gateway's `FERRUM_NAMESPACE` so the admin API works on a fresh cluster.
@@ -243,14 +243,14 @@ async fn resolve_polled_namespaces(
         return explicit;
     }
     // CpScope::All — discover dynamically.
-    match db.list_namespaces().await {
+    match db.list_namespaces_authoritative().await {
         Ok(ns) => merge_discovered_namespaces(ns, retain_on_success, fallback),
         Err(e) => {
             let retained = previous_on_error.unwrap_or(retain_on_success);
             let ns = normalize_namespace_list(retained);
             if !ns.is_empty() {
                 warn!(
-                    "CP scope=All: list_namespaces() failed ({}); keeping previous {} namespace(s): [{}]",
+                    "CP scope=All: authoritative namespace discovery failed ({}); keeping previous {} namespace(s): [{}]",
                     e,
                     ns.len(),
                     ns.join(", ")
@@ -258,7 +258,7 @@ async fn resolve_polled_namespaces(
                 ns
             } else {
                 warn!(
-                    "CP scope=All: list_namespaces() failed ({}); falling back to FERRUM_NAMESPACE='{}'",
+                    "CP scope=All: authoritative namespace discovery failed ({}); falling back to FERRUM_NAMESPACE='{}'",
                     e, fallback
                 );
                 vec![fallback.to_string()]
@@ -371,6 +371,7 @@ async fn load_incremental_config_multi(
     let split_upstreams = split_ids(known_upstream_ids, upstream_ns);
 
     let empty: HashSet<String> = HashSet::new();
+    let mut combined_poll_timestamp = None;
     let mut combined = IncrementalResult {
         added_or_modified_proxies: Vec::new(),
         removed_proxy_ids: Vec::new(),
@@ -421,13 +422,25 @@ async fn load_incremental_config_multi(
         combined
             .removed_upstream_ids
             .append(&mut delta.removed_upstream_ids);
-        // Use the latest namespace's poll timestamp as the combined value;
-        // the small skew between namespaces is bounded by the per-call
-        // duration and absorbed by the 1-second safety margin in
-        // `load_incremental_config`.
-        combined.poll_timestamp = delta.poll_timestamp;
+        // Keep the earliest per-namespace poll start. Writes that land in an
+        // early-polled namespace while later namespaces are still being read
+        // must remain behind the next `since` watermark.
+        let poll_timestamp =
+            min_incremental_poll_timestamp(combined_poll_timestamp, delta.poll_timestamp);
+        combined_poll_timestamp = Some(poll_timestamp);
+        combined.poll_timestamp = poll_timestamp;
     }
     Ok(combined)
+}
+
+fn min_incremental_poll_timestamp(
+    current: Option<chrono::DateTime<chrono::Utc>>,
+    next: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    match current {
+        Some(current) if current <= next => current,
+        _ => next,
+    }
 }
 
 /// Load and merge per-namespace `GatewayConfig`s into a single combined config.
@@ -692,11 +705,15 @@ pub async fn run(
 
             if let Some(ref replica_url) = effective_replica_url {
                 match store.connect_read_replica(replica_url).await {
-                    Ok(()) => info!("Read replica connected for config polling"),
-                    Err(e) => warn!(
-                        "Read replica connection failed, polling will use primary: {}",
-                        e
-                    ),
+                    Ok(()) => info!("Read replica connected for admin reads"),
+                    Err(e) => {
+                        let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
+                        warn!(
+                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds: {}",
+                            db_backend::redact_url(replica_url),
+                            safe_error
+                        );
+                    }
                 }
             }
             Box::new(store)
@@ -723,9 +740,9 @@ pub async fn run(
     // subscribe AND which namespaces the polling loop loads from the DB.
     let cp_scope = CpScope::from_env(&env_config.cp_namespaces, &env_config.namespace);
     info!("CP mode: serving {}", cp_scope.describe());
-    if env_config.cp_require_namespace_claim {
+    if cp_scope.namespace_claim_required(env_config.cp_require_namespace_claim) {
         info!(
-            "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true — DP ConfigSync JWTs without an `ns` claim will be rejected"
+            "CP namespace authorization requires JWT `ns` claims for ConfigSync, MeshConfigSync, and xDS streams"
         );
     }
 
@@ -790,6 +807,8 @@ pub async fn run(
             .registry(mesh_registry.clone())
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
+            .scope(cp_scope.clone())
+            .require_ns_claim(env_config.cp_require_namespace_claim)
             .sidecar_enforced(env_config.mesh_sidecar_enforced)
             .sidecar_enforced_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
@@ -810,6 +829,9 @@ pub async fn run(
             .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone())
+            .with_scope(cp_scope.clone())
+            .with_require_namespace_claim(env_config.cp_require_namespace_claim)
+            .with_namespace_broadcasts(broadcasts.clone())
             .with_max_streams_per_node(env_config.xds_max_streams_per_node),
         )
     } else {
@@ -1145,6 +1167,13 @@ pub async fn run(
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
             watch_node_locality: env_config.k8s_node_locality_enabled,
+            gateway_api_data_plane_service_namespace: env_config
+                .gateway_api_data_plane_service_namespace
+                .clone(),
+            gateway_api_data_plane_service_name: env_config
+                .gateway_api_data_plane_service_name
+                .clone(),
+            gateway_api_status_address: env_config.gateway_api_status_address.clone(),
             // Effective Sidecar ingress materialization gate (F6 §6.2): ingress
             // is materialized only when enforcement is on AND not dry-run,
             // mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run`
@@ -1160,7 +1189,8 @@ pub async fn run(
         match crate::k8s_controller::start_k8s_controller(
             controller_config,
             config_arc.clone(),
-            update_tx.clone(),
+            broadcasts.clone(),
+            cp_scope.clone(),
             dp_registry.clone(),
             mesh_update_tx.clone(),
             mesh_registry.clone(),
@@ -1254,9 +1284,11 @@ pub async fn run(
 
         // Track the last known set of resolved IPs for the DB hostname.
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
-        let mut last_replica_ips: Option<Vec<IpAddr>> = None;
+        let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
+            Arc::new(tokio::sync::Mutex::new(None));
         let mut force_full_reload = false;
         let mut last_polled_namespaces = initial_polled_namespaces;
+        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
         // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
@@ -1309,34 +1341,16 @@ pub async fn run(
                         }
                     }
 
-                    // Check if the read replica FQDN now resolves to different IPs
-                    if let Some(ref replica_hostname) = replica_hostname
-                        && let Some(ref replica_url) = replica_url_for_reconnect
-                        && let Ok(ips) = dns_cache_for_poll.resolve_all(replica_hostname, None, None).await
-                    {
-                        let needs_reconnect = match &last_replica_ips {
-                            Some(prev) => {
-                                let mut prev_sorted = prev.clone();
-                                prev_sorted.sort();
-                                let mut cur_sorted = ips.clone();
-                                cur_sorted.sort();
-                                prev_sorted != cur_sorted
-                            }
-                            None => false,
-                        };
-                        if needs_reconnect {
-                            info!(
-                                "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting replica pool",
-                                replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
-                            );
-                            if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
-                                error!(
-                                    "Failed to reconnect read replica pool after DNS change for '{}': {}",
-                                    replica_hostname, e
-                                );
-                            }
-                        }
-                        last_replica_ips = Some(ips);
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                            db_poll.clone(),
+                            Some(replica_url.as_str()),
+                            replica_hostname.as_deref(),
+                            &dns_cache_for_poll,
+                            last_replica_ips.clone(),
+                            replica_reconnect_in_flight.clone(),
+                        )
+                        .await;
                     }
 
                     if force_full_reload {
@@ -1385,6 +1399,7 @@ pub async fn run(
                                         ns,
                                         &new_config,
                                         &dp_registry_poll,
+                                        &poll_scope,
                                     );
                                 }
                                 MeshGrpcServer::broadcast_full_with_registry(
@@ -1396,7 +1411,7 @@ pub async fn run(
                             }
                             Err(e) => {
                                 error!(
-                                    "Failed full config reload after DB DNS reconnect; keeping existing config and retrying: {}",
+                                    "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
                                     e
                                 );
                                 db_available_poll.store(false, Ordering::Relaxed);
@@ -1406,10 +1421,10 @@ pub async fn run(
                     } else if let Some(since) = last_poll_at {
                         // Resolve the polled namespace list. For `Single`
                         // / `Set` this is the explicit list (no DB call).
-                        // For `All`, list_namespaces() runs once per tick
-                        // — bounded cost vs. the per-resource queries that
-                        // dominate poll time. Snapshot the current config
-                        // for per-namespace deletion routing.
+                        // For `All`, authoritative namespace discovery runs
+                        // once per tick — bounded cost vs. the per-resource
+                        // queries that dominate poll time. Snapshot the current
+                        // config for per-namespace deletion routing.
                         let current_snapshot = config_poll.load_full();
                         let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
@@ -1489,6 +1504,7 @@ pub async fn run(
                                                 &version,
                                                 &dp_registry_poll,
                                                 source_trust_bundles.as_deref(),
+                                                &poll_scope,
                                             );
                                         }
                                         last_gateway_trust_bundles =
@@ -1650,6 +1666,7 @@ pub async fn run(
                                         &version,
                                         &dp_registry_poll,
                                         trust_bundles_for_broadcast,
+                                        &poll_scope,
                                     );
                                 }
                                 if trust_bundles_changed {
@@ -1666,7 +1683,7 @@ pub async fn run(
                             }
                             Err(e) => {
                                 warn!(
-                                    "Incremental poll failed, falling back to full reload: {}",
+                                    "Authoritative primary incremental poll failed, falling back to full reload: {}",
                                     e
                                 );
                                 // Fallback to full config load + full snapshot broadcast
@@ -1689,6 +1706,7 @@ pub async fn run(
                                                 ns,
                                                 &new_config,
                                                 &dp_registry_poll,
+                                                &poll_scope,
                                             );
                                         }
                                         MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
@@ -1718,6 +1736,7 @@ pub async fn run(
                                                                 ns,
                                                                 &new_config,
                                                                 &dp_registry_poll,
+                                                                &poll_scope,
                                                             );
                                                         }
                                                         MeshGrpcServer::broadcast_full_with_registry(&mesh_update_tx, new_config_arc, &mesh_registry_poll);
@@ -1726,7 +1745,7 @@ pub async fn run(
                                                     Err(e3) => {
                                                         db_available_poll.store(false, Ordering::Relaxed);
                                                         warn!(
-                                                            "Failover reload also failed (serving cached): {}",
+                                                            "Authoritative primary failover reload also failed (serving cached): {}",
                                                             e3
                                                         );
                                                     }
@@ -1735,7 +1754,7 @@ pub async fn run(
                                             Err(_) => {
                                                 db_available_poll.store(false, Ordering::Relaxed);
                                                 warn!(
-                                                    "Full config reload also failed (serving cached): {}",
+                                                    "Authoritative primary full config reload also failed (serving cached): {}",
                                                     e2
                                                 );
                                             }
@@ -1745,6 +1764,7 @@ pub async fn run(
                             }
                         }
                     }
+
                 }
                 _ = cp_poll_shutdown.changed() => {
                     info!("CP database polling shutting down");
@@ -1842,12 +1862,10 @@ pub async fn run(
                 let _ = shutdown_tx.send(true);
             }
         };
-        let listener_drain =
-            crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic);
-        match tokio::time::timeout(Duration::from_secs(5), listener_drain).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => error!("CP listener task failed: {}", err),
-            Err(_) => warn!("CP listeners did not drain within 5s, proceeding with shutdown"),
+        match crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+        {
+            Ok(()) => {}
+            Err(err) => error!("CP listener task failed: {}", err),
         }
     }
 
@@ -1929,6 +1947,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             resolved_tls: Default::default(),
             dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
             dns_override: None,
             dns_cache_ttl_seconds: None,
             auth_mode: AuthMode::Single,
@@ -2102,6 +2121,20 @@ mod tests {
         let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
         update_known_ids(&mut known, &vec![], &[]);
         assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn multi_namespace_poll_timestamp_keeps_earliest_namespace_start() {
+        let base = Utc::now();
+        let first_namespace = base + chrono::Duration::seconds(2);
+        let later_namespace = base + chrono::Duration::seconds(5);
+        let earliest_namespace = base + chrono::Duration::seconds(1);
+
+        let first = min_incremental_poll_timestamp(None, first_namespace);
+        let second = min_incremental_poll_timestamp(Some(first), later_namespace);
+        let third = min_incremental_poll_timestamp(Some(second), earliest_namespace);
+
+        assert_eq!(third, earliest_namespace);
     }
 
     // apply_incremental_to_config

@@ -1629,6 +1629,8 @@ impl Plugin for AiSemanticFirewall {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
             return false;

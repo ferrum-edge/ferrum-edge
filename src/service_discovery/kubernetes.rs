@@ -229,6 +229,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                                     targets.push(UpstreamTarget {
                                         host: address.to_string(),
                                         port,
+                                        service_port_policy_key: None,
                                         weight: self.default_weight,
                                         tags: HashMap::new(),
                                         locality: None,

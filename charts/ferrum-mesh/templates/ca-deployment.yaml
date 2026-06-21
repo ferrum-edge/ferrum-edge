@@ -26,10 +26,13 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           env:
+            {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
             - name: FERRUM_MODE
               value: cp
             {{- range $name, $value := .Values.ca.env }}
+            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
 {{- end }}

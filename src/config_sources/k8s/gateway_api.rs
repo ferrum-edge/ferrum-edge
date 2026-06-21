@@ -4,18 +4,22 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::types::BackendScheme;
+use crate::config::types::{BackendScheme, FrontendTlsNamespaceSource, MAX_TARGET_WEIGHT};
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
 };
+use crate::plugins::utils::route_header_transform::route_header_transform_rules_to_json;
 
 use super::{
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
-    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
-    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field,
-    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id, service_dns_name,
-    string_array, string_field, upstream_for_route,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
+    GatewayApiNamespaceSelector, GatewayApiNamespaceSelectorExpression,
+    GatewayApiNamespaceSelectorOperator, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
+    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
+    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    mesh_route_dispatch_plugin_from_rules, optional_port_field, optional_target_weight_field,
+    port_from_u64, proxy_for_route, resource_id, route_request_transformer_plugin_for_proxy,
+    service_dns_name, string_array, string_field, upstream_for_route,
 };
 use crate::config::types::{PluginConfig, Proxy};
 
@@ -24,6 +28,8 @@ use crate::config::types::{PluginConfig, Proxy};
 const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
 const ZERO_WEIGHT_BACKEND_PORT: u16 = 65535;
 const GATEWAY_API_DISPATCH_PRECEDENCE_KEY: &str = "_ferrum_gateway_api_precedence";
+const GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY: &str =
+    "_ferrum_gateway_api_replace_prefix_match";
 
 /// `Gateway.spec.gatewayClassName` values that mark a GAMMA Waypoint
 /// Gateway. Both the Istio canonical value and a Ferrum-native alias are
@@ -69,8 +75,42 @@ struct RouteMatchEntryDescriptor {
 struct RouteHostScope {
     proxy_hosts: Vec<String>,
     conflict_hostname: String,
+    parent_refs: Vec<String>,
     suffix: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidBackendRefReason {
+    InvalidKind,
+    BackendNotFound,
+    RefNotPermitted,
+}
+
+#[derive(Default)]
+struct RouteBackendResolution {
+    backends: Vec<RouteBackend>,
+    invalid: Option<InvalidBackendRefReason>,
+    invalid_weight: u32,
+    valid_weight: u32,
+}
+
+enum GatewayFrontendTlsSelection {
+    None,
+    Single {
+        cert_source: String,
+        key_source: String,
+    },
+    InvalidCertificateRef,
+    UnsupportedMultiple,
+}
+
+struct RouteBackendGroup {
+    total_weight: u32,
+    backends: Vec<RouteBackend>,
+    expanded_endpoints: bool,
+}
+
+const GATEWAY_API_BACKEND_WEIGHT_SCALE: u32 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GatewayApiDispatchRulePrecedence {
@@ -94,8 +134,11 @@ pub(super) fn translate(
             if is_waypoint_gateway(object) {
                 add_waypoint_binding(acc, object);
             }
-            for service in mesh_services_from_gateway(object)? {
-                acc.mesh.services.push(service);
+            if acc.gateway_is_managed_by_ferrum(object) {
+                let terminating_tls_ready = materialize_gateway_frontend_tls(acc, object);
+                for service in mesh_services_from_gateway(acc, object, terminating_tls_ready)? {
+                    acc.mesh.services.push(service);
+                }
             }
             Ok(true)
         }
@@ -159,6 +202,7 @@ pub(super) fn collect_reference_grant(
                 invalid_resource(object, "ReferenceGrant spec.to[].kind is required")
             })?;
             let to_group = string_field(to, "group").unwrap_or_default();
+            let to_name = string_field(to, "name").map(ToOwned::to_owned);
             acc.add_reference_grant(
                 from_namespace.to_string(),
                 from_group.to_string(),
@@ -166,10 +210,359 @@ pub(super) fn collect_reference_grant(
                 object.metadata.namespace.clone(),
                 to_group.to_string(),
                 to_kind.to_string(),
+                to_name,
             );
         }
     }
     Ok(())
+}
+
+pub(super) fn collect_gateway_listener_policy(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) -> Result<(), K8sTranslateError> {
+    let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for listener in listeners {
+        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        let requires_frontend_tls = listener_is_terminating_tls(listener);
+        let materializable = listener_is_materializable(acc, object, listener);
+        let policy = GatewayApiListenerPolicy {
+            namespaces: allowed_route_namespaces(listener),
+            hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
+            port: listener.get("port").and_then(Value::as_u64),
+            route_kinds: listener_allowed_route_kinds(listener),
+            materializable,
+            routes_materializable: materializable,
+            requires_frontend_tls,
+        };
+        acc.gateway_api_listener_policies.insert(
+            GatewayApiListenerKey {
+                namespace: object.metadata.namespace.clone(),
+                gateway: object.metadata.name.clone(),
+                listener: listener_name.to_string(),
+            },
+            policy,
+        );
+    }
+    Ok(())
+}
+
+fn listener_is_materializable(acc: &K8sAccumulator, object: &K8sObject, listener: &Value) -> bool {
+    if !listener_is_terminating_tls(listener) {
+        return true;
+    }
+    let Some(sources) = listener_frontend_tls_sources(acc, object, listener) else {
+        return false;
+    };
+    let mut selected: Option<(String, String)> = None;
+    for source in sources {
+        if selected
+            .as_ref()
+            .is_some_and(|existing| existing != &source)
+        {
+            return false;
+        }
+        selected.get_or_insert(source);
+    }
+    selected.is_some()
+}
+
+fn materialize_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8sObject) -> bool {
+    let (cert_source, key_source) = match gateway_frontend_tls_sources(acc, object) {
+        GatewayFrontendTlsSelection::Single {
+            cert_source,
+            key_source,
+        } => (cert_source, key_source),
+        GatewayFrontendTlsSelection::InvalidCertificateRef => {
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} has at least one unresolved TLS certificateRef; leaving frontend TLS unmaterialized",
+                object.metadata.namespace, object.metadata.name
+            ));
+            return false;
+        }
+        GatewayFrontendTlsSelection::UnsupportedMultiple => {
+            disable_gateway_frontend_tls_route_materialization(acc, object);
+            acc.warnings.push(format!(
+                "Gateway API Gateway {}/{} has multiple distinct TLS certificateRefs, but Ferrum currently supports one frontend TLS certificate per data plane; leaving listener references unresolved",
+                object.metadata.namespace, object.metadata.name
+            ));
+            return false;
+        }
+        GatewayFrontendTlsSelection::None => return false,
+    };
+
+    let source_namespace = object.metadata.namespace.clone();
+    let source = gateway_frontend_tls_namespace_source(
+        acc,
+        object,
+        source_namespace,
+        cert_source,
+        key_source,
+    );
+
+    if acc.config.frontend_tls_cert_path.is_none() && acc.config.frontend_tls_key_path.is_none() {
+        acc.config.frontend_tls_cert_path = Some(source.cert_path.clone());
+        acc.config.frontend_tls_key_path = Some(source.key_path.clone());
+        acc.config.frontend_tls_source_namespace = Some(source.namespace.clone());
+    }
+    true
+}
+
+fn gateway_frontend_tls_namespace_source(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    source_namespace: String,
+    cert_source: String,
+    key_source: String,
+) -> FrontendTlsNamespaceSource {
+    if let Some(existing) = acc
+        .config
+        .frontend_tls_namespace_sources
+        .iter()
+        .find(|source| source.namespace == source_namespace)
+        .cloned()
+    {
+        if existing.cert_path == cert_source && existing.key_path == key_source {
+            return existing;
+        }
+        // The current DP config has one frontend TLS serving slot per Gateway
+        // namespace. Keep that slot stable, but do not withdraw otherwise valid
+        // listeners solely because another Gateway in the namespace uses a
+        // different valid certificateRef.
+        disable_gateway_frontend_tls_route_materialization(acc, object);
+        acc.warnings.push(format!(
+            "Gateway API Gateway {}/{} requested additional frontend TLS certificate source {}, but namespace {} already serves Gateway TLS source {}; preserving listener status but leaving route traffic on this listener unmaterialized until multi-certificate serving is supported",
+            object.metadata.namespace,
+            object.metadata.name,
+            cert_source,
+            source_namespace,
+            existing.cert_path
+        ));
+        return existing;
+    }
+
+    let source = FrontendTlsNamespaceSource {
+        namespace: source_namespace,
+        cert_path: cert_source,
+        key_path: key_source,
+    };
+    acc.config
+        .frontend_tls_namespace_sources
+        .push(source.clone());
+    acc.config
+        .frontend_tls_namespace_sources
+        .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    source
+}
+
+fn disable_gateway_frontend_tls_route_materialization(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+) {
+    for listener in object
+        .spec
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !listener_is_terminating_tls(listener) {
+            continue;
+        }
+        let listener_name = string_field(listener, "name").unwrap_or("listener");
+        if let Some(policy) = acc
+            .gateway_api_listener_policies
+            .get_mut(&GatewayApiListenerKey {
+                namespace: object.metadata.namespace.clone(),
+                gateway: object.metadata.name.clone(),
+                listener: listener_name.to_string(),
+            })
+        {
+            policy.routes_materializable = false;
+        }
+    }
+}
+
+fn gateway_frontend_tls_sources(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> GatewayFrontendTlsSelection {
+    let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
+        return GatewayFrontendTlsSelection::None;
+    };
+    let mut selected: Option<(String, String)> = None;
+    let mut saw_terminating_tls = false;
+    let mut saw_invalid_ref = false;
+    for listener in listeners
+        .iter()
+        .filter(|listener| listener_is_terminating_tls(listener))
+    {
+        saw_terminating_tls = true;
+        let Some(listener_sources) = listener_frontend_tls_sources(acc, object, listener) else {
+            saw_invalid_ref = true;
+            continue;
+        };
+        for sources in listener_sources {
+            if selected
+                .as_ref()
+                .is_some_and(|existing| existing != &sources)
+            {
+                return GatewayFrontendTlsSelection::UnsupportedMultiple;
+            }
+            selected.get_or_insert(sources);
+        }
+    }
+    selected
+        .map(
+            |(cert_source, key_source)| GatewayFrontendTlsSelection::Single {
+                cert_source,
+                key_source,
+            },
+        )
+        .unwrap_or(if saw_invalid_ref && saw_terminating_tls {
+            GatewayFrontendTlsSelection::InvalidCertificateRef
+        } else {
+            GatewayFrontendTlsSelection::None
+        })
+}
+
+fn listener_is_terminating_tls(listener: &Value) -> bool {
+    let Some(protocol) = string_field(listener, "protocol") else {
+        return false;
+    };
+    if !protocol.eq_ignore_ascii_case("HTTPS") && !protocol.eq_ignore_ascii_case("TLS") {
+        return false;
+    }
+    let Some(tls) = listener.get("tls") else {
+        return true;
+    };
+    string_field(tls, "mode")
+        .unwrap_or("Terminate")
+        .eq_ignore_ascii_case("Terminate")
+}
+
+fn listener_frontend_tls_sources(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    listener: &Value,
+) -> Option<Vec<(String, String)>> {
+    let certificate_refs = listener
+        .get("tls")
+        .and_then(|tls| tls.get("certificateRefs"))
+        .and_then(Value::as_array)?;
+    if certificate_refs.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for reference in certificate_refs {
+        out.push(gateway_tls_secret_ref(acc, object, reference)?);
+    }
+    Some(out)
+}
+
+fn gateway_tls_secret_ref(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    reference: &Value,
+) -> Option<(String, String)> {
+    let group = string_field(reference, "group").unwrap_or_default();
+    let kind = string_field(reference, "kind").unwrap_or("Secret");
+    if !group.is_empty() || kind != "Secret" {
+        return None;
+    }
+    let name = string_field(reference, "name")?;
+    let namespace = string_field(reference, "namespace").unwrap_or(&object.metadata.namespace);
+    if namespace != object.metadata.namespace
+        && !acc.reference_grant_allows(
+            &object.metadata.namespace,
+            "gateway.networking.k8s.io",
+            "Gateway",
+            namespace,
+            "",
+            "Secret",
+            Some(name),
+        )
+    {
+        return None;
+    }
+    if !acc.secret_is_valid_tls_certificate(namespace, name) {
+        return None;
+    }
+    let digest = acc.secret_tls_material_digest(namespace, name)?;
+    Some((
+        format!("k8s://{namespace}/{name}#tls.crt?sha256={digest}"),
+        format!("k8s://{namespace}/{name}#tls.key?sha256={digest}"),
+    ))
+}
+
+fn allowed_route_namespaces(listener: &Value) -> GatewayApiAllowedRoutesNamespaces {
+    let Some(namespaces) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("namespaces"))
+    else {
+        return GatewayApiAllowedRoutesNamespaces::Same;
+    };
+    match string_field(namespaces, "from").unwrap_or("Same") {
+        "All" => GatewayApiAllowedRoutesNamespaces::All,
+        "Selector" => GatewayApiAllowedRoutesNamespaces::Selector(namespace_selector(
+            namespaces.get("selector"),
+        )),
+        _ => GatewayApiAllowedRoutesNamespaces::Same,
+    }
+}
+
+fn namespace_selector(selector: Option<&Value>) -> GatewayApiNamespaceSelector {
+    let match_labels = selector
+        .and_then(|selector| selector.get("matchLabels"))
+        .and_then(Value::as_object)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|label_value| (key.clone(), label_value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let match_expressions = selector
+        .and_then(|selector| selector.get("matchExpressions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(namespace_selector_expression)
+        .collect();
+    GatewayApiNamespaceSelector {
+        match_labels,
+        match_expressions,
+    }
+}
+
+fn namespace_selector_expression(value: &Value) -> Option<GatewayApiNamespaceSelectorExpression> {
+    let key = string_field(value, "key")?.to_string();
+    let operator = match string_field(value, "operator")? {
+        "In" => GatewayApiNamespaceSelectorOperator::In,
+        "NotIn" => GatewayApiNamespaceSelectorOperator::NotIn,
+        "Exists" => GatewayApiNamespaceSelectorOperator::Exists,
+        "DoesNotExist" => GatewayApiNamespaceSelectorOperator::DoesNotExist,
+        _ => return None,
+    };
+    let values = value
+        .get("values")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect();
+    Some(GatewayApiNamespaceSelectorExpression {
+        key,
+        operator,
+        values,
+    })
 }
 
 /// True when this Gateway is a GAMMA Waypoint Gateway (gatewayClassName is
@@ -267,6 +660,7 @@ fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
 pub(crate) fn route_conflicts(
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
+    acc: Option<&K8sAccumulator>,
 ) -> Vec<GatewayApiRouteConflict> {
     let mut candidates_by_key: HashMap<
         GatewayApiRouteConflictKey,
@@ -284,7 +678,7 @@ pub(crate) fn route_conflicts(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp);
-        for key in route_conflict_keys(object) {
+        for key in route_conflict_keys_for_acc(object, acc) {
             candidates_by_key
                 .entry(key)
                 .or_default()
@@ -318,8 +712,21 @@ pub(crate) fn route_conflicts(
 }
 
 pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
-    let hostnames = route_hostnames(object);
-    let parent_refs = route_parent_ref_keys(object);
+    route_conflict_keys_for_acc(object, None)
+}
+
+pub(crate) fn route_conflict_keys_for_acc(
+    object: &K8sObject,
+    acc: Option<&K8sAccumulator>,
+) -> Vec<GatewayApiRouteConflictKey> {
+    let requested_hostnames = route_hostnames(object);
+    let hostnames = acc
+        .and_then(|acc| {
+            route_effective_hostnames(object, acc, &requested_hostnames, None)
+                .map(|hostnames| conflict_hostnames_for_proxy_hosts(&hostnames))
+        })
+        .unwrap_or_else(|| requested_hostnames.clone());
+    let default_parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
     let mut keys = Vec::new();
 
@@ -331,8 +738,20 @@ pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConf
         .flatten()
     {
         for descriptor in route_match_descriptors(object, rule) {
-            for parent_ref in &parent_refs {
-                for hostname in &hostnames {
+            for hostname in &hostnames {
+                let parent_refs = acc
+                    .map(|acc| {
+                        route_allowed_parent_ref_keys_for_hostname(
+                            object,
+                            acc,
+                            &requested_hostnames,
+                            None,
+                            hostname,
+                        )
+                    })
+                    .filter(|refs| !refs.is_empty())
+                    .unwrap_or_else(|| default_parent_refs.clone());
+                for parent_ref in &parent_refs {
                     keys.push(GatewayApiRouteConflictKey {
                         route_family: route_family.clone(),
                         parent_ref: parent_ref.clone(),
@@ -399,6 +818,11 @@ fn merge_http_route_proxy(
         .iter()
         .find(|plugin| plugin.plugin_name == "mesh_route_dispatch");
     let existing_id = acc.config.proxies[existing_index].id.clone();
+    let mut route_action_plugins: Vec<PluginConfig> = route_plugins
+        .iter()
+        .filter(|plugin| plugin.plugin_name != "mesh_route_dispatch")
+        .filter_map(|plugin| retarget_route_action_plugin(plugin.clone(), &existing_id))
+        .collect();
     let existing_dispatch_index = dispatch_plugin_index(&acc.config.plugin_configs, &existing_id);
     if new_dispatch.is_none() && existing_dispatch_index.is_none() {
         return false;
@@ -441,6 +865,20 @@ fn merge_http_route_proxy(
         set_dispatch_reject_unmatched(&mut acc.config.plugin_configs[index], false);
     }
 
+    route_action_plugins.retain(|plugin| {
+        !acc.config.plugin_configs.iter().any(|existing| {
+            existing.plugin_name == plugin.plugin_name
+                && existing.proxy_id.as_deref() == Some(existing_id.as_str())
+        })
+    });
+    if !route_action_plugins.is_empty() {
+        attach_route_plugins_to_proxy(
+            &mut acc.config.proxies[existing_index],
+            &route_action_plugins,
+        );
+        acc.config.plugin_configs.extend(route_action_plugins);
+    }
+
     true
 }
 
@@ -470,6 +908,16 @@ fn retarget_dispatch_plugin(mut plugin: PluginConfig, proxy_id: &str) -> PluginC
     plugin.id = format!("istio-vs-mrd-{proxy_id}");
     plugin.proxy_id = Some(proxy_id.to_string());
     plugin
+}
+
+fn retarget_route_action_plugin(mut plugin: PluginConfig, proxy_id: &str) -> Option<PluginConfig> {
+    plugin.id = match plugin.plugin_name.as_str() {
+        "request_transformer" => format!("__istio_vs_req_xform_{proxy_id}"),
+        "response_transformer" => format!("__istio_vs_resp_xform_{proxy_id}"),
+        _ => return None,
+    };
+    plugin.proxy_id = Some(proxy_id.to_string());
+    Some(plugin)
 }
 
 fn append_dispatch_rules(plugin: &mut PluginConfig, rules: Vec<Value>) {
@@ -618,6 +1066,7 @@ fn replace_proxy_default_route(existing: &mut Proxy, proxy: &Proxy) {
     existing.backend_host.clone_from(&proxy.backend_host);
     existing.backend_port = proxy.backend_port;
     existing.upstream_id.clone_from(&proxy.upstream_id);
+    existing.preserve_host_header = proxy.preserve_host_header;
     existing.retry.clone_from(&proxy.retry);
     existing.backend_read_timeout_ms = proxy.backend_read_timeout_ms;
 }
@@ -791,26 +1240,30 @@ fn route_hostnames(object: &K8sObject) -> Vec<String> {
 }
 
 fn route_parent_ref_keys(object: &K8sObject) -> Vec<String> {
+    route_parent_ref_keys_for_namespace(object, None)
+}
+
+fn route_parent_ref_keys_for_namespace(
+    object: &K8sObject,
+    namespace_filter: Option<&str>,
+) -> Vec<String> {
     let mut refs: Vec<String> = object
         .spec
         .get("parentRefs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|parent| {
-            let group = string_field(parent, "group").unwrap_or("gateway.networking.k8s.io");
-            let kind = string_field(parent, "kind").unwrap_or("Gateway");
+        .filter_map(|parent| {
             let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
-            let name = string_field(parent, "name").unwrap_or("*");
-            let section = string_field(parent, "sectionName").unwrap_or("*");
-            let port = parent
-                .get("port")
-                .and_then(Value::as_u64)
-                .map_or_else(|| "*".to_string(), |port| port.to_string());
-            format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
+            if namespace_filter.is_some_and(|filter| namespace != filter) {
+                return None;
+            }
+            Some(route_parent_ref_key_for_parent(object, parent))
         })
         .collect();
-    if refs.is_empty() {
+    if refs.is_empty()
+        && namespace_filter.is_none_or(|namespace| namespace == object.metadata.namespace)
+    {
         refs.push(format!(
             "gateway.networking.k8s.io/Gateway/{}/{}/*/*",
             object.metadata.namespace, "*"
@@ -819,6 +1272,198 @@ fn route_parent_ref_keys(object: &K8sObject) -> Vec<String> {
     refs.sort();
     refs.dedup();
     refs
+}
+
+fn route_allowed_parent_ref_keys_for_namespace(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    namespace_filter: Option<&str>,
+) -> Vec<String> {
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    };
+    if parent_refs.is_empty() {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    }
+
+    let mut refs: Vec<String> = parent_refs
+        .iter()
+        .filter_map(|parent| {
+            if !parent_ref_is_gateway(parent) {
+                return None;
+            }
+            let namespace = string_field(parent, "namespace").unwrap_or(&object.metadata.namespace);
+            if namespace_filter.is_some_and(|filter| namespace != filter) {
+                return None;
+            }
+            route_parent_ref_disallow_error(acc, object, parent)
+                .is_none()
+                .then(|| route_parent_ref_key_for_parent(object, parent))
+        })
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn route_allowed_parent_ref_keys_for_hostname(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+    namespace_filter: Option<&str>,
+    conflict_hostname: &str,
+) -> Vec<String> {
+    let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    };
+    if parent_refs.is_empty() {
+        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+    }
+
+    let mut refs = Vec::new();
+    for parent_ref in parent_refs {
+        if !parent_ref_is_gateway(parent_ref) {
+            continue;
+        }
+        let Some(gateway_name) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        let gateway_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if namespace_filter.is_some_and(|namespace| namespace != gateway_namespace)
+            || route_parent_ref_disallow_error(acc, object, parent_ref).is_some()
+        {
+            continue;
+        }
+
+        let parent_ref_intersects_hostname =
+            acc.gateway_api_listener_policies
+                .iter()
+                .any(|(key, policy)| {
+                    key.namespace == gateway_namespace
+                        && key.gateway == gateway_name
+                        && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                        && route_listener_policy_materializes_route(
+                            acc,
+                            object,
+                            gateway_namespace,
+                            policy,
+                        )
+                        && route_hostnames.iter().any(|route_hostname| {
+                            intersect_hostnames(
+                                route_hostname.as_str(),
+                                policy.hostname.as_deref().unwrap_or("*"),
+                            )
+                            .as_deref()
+                                == Some(conflict_hostname)
+                        })
+                });
+        if parent_ref_intersects_hostname {
+            refs.push(route_parent_ref_key_for_parent(object, parent_ref));
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn route_parent_ref_key_for_parent(object: &K8sObject, parent_ref: &Value) -> String {
+    let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+    let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+    let namespace = string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+    let name = string_field(parent_ref, "name").unwrap_or("*");
+    let section = string_field(parent_ref, "sectionName").unwrap_or("*");
+    let port = parent_ref
+        .get("port")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "*".to_string(), |port| port.to_string());
+    format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
+}
+
+fn route_materialized_parent_ref_keys_for_namespace(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    namespace_filter: Option<&str>,
+) -> Vec<String> {
+    let mut refs = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        if group != "gateway.networking.k8s.io" || kind != "Gateway" {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if namespace_filter.is_some_and(|filter| parent_namespace != filter) {
+            continue;
+        }
+        let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+        if acc
+            .gateway_api_listener_policies
+            .iter()
+            .any(|(key, policy)| {
+                key.namespace == parent_namespace
+                    && key.gateway == parent_gateway
+                    && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                    && route_listener_policy_materializes_route(
+                        acc,
+                        object,
+                        parent_namespace,
+                        policy,
+                    )
+            })
+        {
+            refs.push(route_parent_ref_key_for_parent(object, parent_ref));
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn l4_route_listener_ports_for_namespace(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    namespace_filter: Option<&str>,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !parent_ref_is_gateway(parent_ref) {
+            continue;
+        }
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if namespace_filter.is_some_and(|filter| parent_namespace != filter) {
+            continue;
+        }
+        let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace == parent_namespace
+                && key.gateway == parent_gateway
+                && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                && route_listener_policy_materializes_route(acc, object, parent_namespace, policy)
+                && let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok())
+            {
+                ports.push(port);
+            }
+        }
+    }
+    ports.sort();
+    ports.dedup();
+    ports
 }
 
 fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -851,7 +1496,11 @@ fn compare_conflict_candidates(
     )
 }
 
-fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8sTranslateError> {
+fn mesh_services_from_gateway(
+    acc: &mut K8sAccumulator,
+    object: &K8sObject,
+    namespace_tls_ready: bool,
+) -> Result<Vec<MeshService>, K8sTranslateError> {
     let mut services = Vec::new();
     object
         .spec
@@ -860,6 +1509,17 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8
         .into_iter()
         .flatten()
         .try_for_each(|listener| {
+            if listener_is_terminating_tls(listener)
+                && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
+            {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    string_field(listener, "name").unwrap_or("listener")
+                ));
+                return Ok(());
+            }
             let Some(raw_port) = listener.get("port").and_then(Value::as_u64) else {
                 return Ok(());
             };
@@ -896,44 +1556,467 @@ fn ensure_route_parent_refs_allowed(
         return Ok(());
     }
 
+    let mut saw_gateway_parent = false;
+    let mut saw_allowed_gateway_parent = false;
+    let mut first_error = None;
     for parent_ref in parent_refs {
-        let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-        let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
-        if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
+        if !parent_ref_is_gateway(parent_ref) {
             continue;
         }
-        let parent_namespace =
-            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-        if parent_namespace != object.metadata.namespace {
-            return Err(invalid_resource(
-                object,
-                format!(
-                    "{} parentRef.namespace '{}' is not permitted; only same-namespace Gateway attachments are accepted",
-                    object.kind, parent_namespace
-                ),
-            ));
+        saw_gateway_parent = true;
+        if let Some(error) = route_parent_ref_disallow_error(acc, object, parent_ref) {
+            first_error.get_or_insert(error);
+        } else {
+            saw_allowed_gateway_parent = true;
         }
+    }
 
-        if let Some(section_name) = string_field(parent_ref, "sectionName")
-            && !gateway_has_listener(acc, parent_namespace, section_name)
-        {
-            return Err(invalid_resource(
+    if saw_gateway_parent && !saw_allowed_gateway_parent {
+        return Err(first_error.unwrap_or_else(|| {
+            invalid_resource(
                 object,
-                format!(
-                    "{} parentRef.sectionName '{}' does not match any known Gateway listener in namespace '{}'",
-                    object.kind, section_name, parent_namespace
-                ),
-            ));
-        }
+                format!("{} has no permitted Gateway parentRefs", object.kind),
+            )
+        }));
     }
 
     Ok(())
 }
 
-fn gateway_has_listener(acc: &K8sAccumulator, namespace: &str, listener_name: &str) -> bool {
-    acc.mesh.services.iter().any(|service| {
-        service.namespace == namespace && service.name.ends_with(&format!("-{listener_name}"))
-    })
+fn parent_ref_is_gateway(parent_ref: &Value) -> bool {
+    let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+    let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+    parent_kind == "Gateway" && parent_group == "gateway.networking.k8s.io"
+}
+
+fn route_parent_ref_disallow_error(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    parent_ref: &Value,
+) -> Option<K8sTranslateError> {
+    let parent_namespace =
+        string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+    let listener_match = gateway_parent_ref_listener_match(acc, parent_namespace, parent_ref);
+    if parent_ref.get("sectionName").is_some() && listener_match != Some(true) {
+        return Some(invalid_resource(
+            object,
+            format!(
+                "{} parentRef does not match any known Gateway listener in namespace '{}'",
+                object.kind, parent_namespace
+            ),
+        ));
+    }
+    if parent_ref.get("port").is_some() && listener_match == Some(false) {
+        return Some(invalid_resource(
+            object,
+            format!(
+                "{} parentRef does not match any known Gateway listener in namespace '{}'",
+                object.kind, parent_namespace
+            ),
+        ));
+    }
+    if !route_namespace_allowed_by_listener(acc, object, parent_namespace, parent_ref) {
+        return Some(invalid_resource(
+            object,
+            format!(
+                "{} parentRef.namespace '{}' is not permitted by the target Gateway listener",
+                object.kind, parent_namespace
+            ),
+        ));
+    }
+    None
+}
+
+fn gateway_parent_ref_listener_match(
+    acc: &K8sAccumulator,
+    parent_namespace: &str,
+    parent_ref: &Value,
+) -> Option<bool> {
+    let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+    let mut saw_gateway = false;
+    for (key, policy) in &acc.gateway_api_listener_policies {
+        if key.namespace != parent_namespace || key.gateway != parent_gateway {
+            continue;
+        }
+        saw_gateway = true;
+        if parent_ref_matches_listener_policy(parent_ref, key, policy) {
+            return Some(true);
+        }
+    }
+    saw_gateway.then_some(false)
+}
+
+fn route_namespace_allowed_by_listener(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    parent_ref: &Value,
+) -> bool {
+    if let Some(listener_name) = string_field(parent_ref, "sectionName") {
+        let Some(policy) = acc
+            .gateway_api_listener_policies
+            .get(&GatewayApiListenerKey {
+                namespace: parent_namespace.to_string(),
+                gateway: string_field(parent_ref, "name").unwrap_or("*").to_string(),
+                listener: listener_name.to_string(),
+            })
+        else {
+            return false;
+        };
+        return route_listener_policy_allows_route(acc, route, parent_namespace, policy);
+    }
+    let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+    let mut saw_listener = false;
+    for (key, policy) in &acc.gateway_api_listener_policies {
+        if key.namespace == parent_namespace && key.gateway == parent_gateway {
+            saw_listener = true;
+            if route_listener_policy_allows_route(acc, route, parent_namespace, policy) {
+                return true;
+            }
+        }
+    }
+    !saw_listener && route.metadata.namespace == parent_namespace
+}
+
+fn route_listener_policy_allows_route(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    policy.route_kinds.contains(route.kind.as_str())
+        && route_namespace_matches_policy(acc, route, parent_namespace, policy)
+}
+
+fn route_listener_policy_materializes_route(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    policy.routes_materializable
+        && route_listener_policy_allows_route(acc, route, parent_namespace, policy)
+}
+
+fn route_namespace_matches_policy(
+    acc: &K8sAccumulator,
+    route: &K8sObject,
+    parent_namespace: &str,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    match &policy.namespaces {
+        GatewayApiAllowedRoutesNamespaces::Same => route.metadata.namespace == parent_namespace,
+        GatewayApiAllowedRoutesNamespaces::All => true,
+        GatewayApiAllowedRoutesNamespaces::Selector(selector) => acc
+            .namespace_labels
+            .get(&route.metadata.namespace)
+            .is_some_and(|labels| namespace_selector_matches(labels, selector)),
+    }
+}
+
+fn namespace_selector_matches(
+    labels: &HashMap<String, String>,
+    selector: &GatewayApiNamespaceSelector,
+) -> bool {
+    selector
+        .match_labels
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+        && selector
+            .match_expressions
+            .iter()
+            .all(|expression| namespace_selector_expression_matches(labels, expression))
+}
+
+fn namespace_selector_expression_matches(
+    labels: &HashMap<String, String>,
+    expression: &GatewayApiNamespaceSelectorExpression,
+) -> bool {
+    match expression.operator {
+        GatewayApiNamespaceSelectorOperator::In => labels
+            .get(&expression.key)
+            .is_some_and(|value| expression.values.iter().any(|allowed| allowed == value)),
+        GatewayApiNamespaceSelectorOperator::NotIn => labels
+            .get(&expression.key)
+            .is_none_or(|value| expression.values.iter().all(|blocked| blocked != value)),
+        GatewayApiNamespaceSelectorOperator::Exists => labels.contains_key(&expression.key),
+        GatewayApiNamespaceSelectorOperator::DoesNotExist => !labels.contains_key(&expression.key),
+    }
+}
+
+fn route_materialization_namespaces(object: &K8sObject, acc: &K8sAccumulator) -> Vec<String> {
+    let mut saw_gateway_parent = false;
+    let mut saw_known_parent_listener = false;
+    let mut saw_section_name_parent = false;
+    let mut namespaces = Vec::new();
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let parent_kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        let parent_group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        if parent_kind != "Gateway" || parent_group != "gateway.networking.k8s.io" {
+            continue;
+        }
+        saw_gateway_parent = true;
+        saw_section_name_parent |= parent_ref.get("sectionName").is_some();
+        let parent_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        let parent_gateway = string_field(parent_ref, "name").unwrap_or("*");
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace == parent_namespace
+                && key.gateway == parent_gateway
+                && parent_ref_matches_listener_policy(parent_ref, key, policy)
+            {
+                saw_known_parent_listener = true;
+                if route_listener_policy_materializes_route(acc, object, parent_namespace, policy) {
+                    namespaces.push(parent_namespace.to_string());
+                }
+            }
+        }
+    }
+    namespaces.sort();
+    namespaces.dedup();
+    if namespaces.is_empty()
+        && (!saw_gateway_parent || (!saw_known_parent_listener && !saw_section_name_parent))
+    {
+        namespaces.push(object.metadata.namespace.clone());
+    }
+    namespaces
+}
+
+fn route_effective_hostnames(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+    parent_namespace_filter: Option<&str>,
+) -> Option<Vec<String>> {
+    let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let mut saw_matching_listener = false;
+    let mut effective = Vec::new();
+
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io")
+            != "gateway.networking.k8s.io"
+            || string_field(parent_ref, "kind").unwrap_or("Gateway") != "Gateway"
+        {
+            continue;
+        }
+        let Some(gateway_name) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        let gateway_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if parent_namespace_filter.is_some_and(|namespace| namespace != gateway_namespace) {
+            continue;
+        }
+
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace != gateway_namespace
+                || key.gateway != gateway_name
+                || !parent_ref_matches_listener_policy(parent_ref, key, policy)
+                || !route_listener_policy_materializes_route(acc, object, gateway_namespace, policy)
+            {
+                continue;
+            }
+            saw_matching_listener = true;
+            let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+            for route_hostname in &route_hostnames {
+                if let Some(hostname) =
+                    intersect_hostnames(route_hostname.as_str(), listener_hostname)
+                {
+                    effective.push(hostname);
+                }
+            }
+        }
+    }
+
+    if !saw_matching_listener {
+        return Some(requested_hostnames.to_vec());
+    }
+    if effective.iter().any(|hostname| hostname == "*") {
+        return Some(Vec::new());
+    }
+    effective.sort();
+    effective.dedup();
+    if effective.is_empty() {
+        None
+    } else {
+        Some(effective)
+    }
+}
+
+fn route_redirect_default_listener_port(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+    parent_namespace_filter: Option<&str>,
+) -> Option<u16> {
+    let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let mut ports = HashSet::new();
+
+    for parent_ref in object
+        .spec
+        .get("parentRefs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io")
+            != "gateway.networking.k8s.io"
+            || string_field(parent_ref, "kind").unwrap_or("Gateway") != "Gateway"
+        {
+            continue;
+        }
+        let Some(gateway_name) = string_field(parent_ref, "name") else {
+            continue;
+        };
+        let gateway_namespace =
+            string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+        if parent_namespace_filter.is_some_and(|namespace| namespace != gateway_namespace) {
+            continue;
+        }
+
+        for (key, policy) in &acc.gateway_api_listener_policies {
+            if key.namespace != gateway_namespace
+                || key.gateway != gateway_name
+                || !parent_ref_matches_listener_policy(parent_ref, key, policy)
+                || !route_listener_policy_materializes_route(acc, object, gateway_namespace, policy)
+            {
+                continue;
+            }
+            let listener_hostname = policy.hostname.as_deref().unwrap_or("*");
+            if !route_hostnames.iter().any(|route_hostname| {
+                intersect_hostnames(route_hostname.as_str(), listener_hostname).is_some()
+            }) {
+                continue;
+            }
+            if let Some(port) = policy.port.and_then(|port| u16::try_from(port).ok()) {
+                ports.insert(port);
+            }
+        }
+    }
+
+    let mut iter = ports.into_iter();
+    let port = iter.next()?;
+    iter.next().is_none().then_some(port)
+}
+
+fn parent_ref_matches_listener_policy(
+    parent_ref: &Value,
+    key: &GatewayApiListenerKey,
+    policy: &GatewayApiListenerPolicy,
+) -> bool {
+    if let Some(section_name) = string_field(parent_ref, "sectionName")
+        && section_name != key.listener
+    {
+        return false;
+    }
+    if let Some(parent_port) = parent_ref.get("port").and_then(Value::as_u64)
+        && policy.port != Some(parent_port)
+    {
+        return false;
+    }
+    true
+}
+
+fn hostnames_for_listener_intersection(requested_hostnames: &[String]) -> Vec<String> {
+    if requested_hostnames.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        requested_hostnames.to_vec()
+    }
+}
+
+fn conflict_hostnames_for_proxy_hosts(proxy_hosts: &[String]) -> Vec<String> {
+    if proxy_hosts.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        proxy_hosts.to_vec()
+    }
+}
+
+fn normalize_gateway_hostname(hostname: &str) -> String {
+    hostname.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn intersect_hostnames(route_hostname: &str, listener_hostname: &str) -> Option<String> {
+    if route_hostname == "*" {
+        return Some(listener_hostname.to_string());
+    }
+    if listener_hostname == "*" {
+        return Some(route_hostname.to_string());
+    }
+    match (
+        wildcard_hostname_suffix(route_hostname),
+        wildcard_hostname_suffix(listener_hostname),
+    ) {
+        (None, None) => (route_hostname == listener_hostname).then(|| route_hostname.to_string()),
+        (Some(route_suffix), None) => hostname_matches_wildcard(listener_hostname, route_suffix)
+            .then(|| listener_hostname.to_string()),
+        (None, Some(listener_suffix)) => hostname_matches_wildcard(route_hostname, listener_suffix)
+            .then(|| route_hostname.to_string()),
+        (Some(route_suffix), Some(listener_suffix)) => {
+            if route_suffix == listener_suffix || suffix_is_within(route_suffix, listener_suffix) {
+                Some(route_hostname.to_string())
+            } else if suffix_is_within(listener_suffix, route_suffix) {
+                Some(listener_hostname.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn wildcard_hostname_suffix(hostname: &str) -> Option<&str> {
+    hostname.strip_prefix("*.")
+}
+
+fn hostname_matches_wildcard(hostname: &str, suffix: &str) -> bool {
+    hostname != suffix && suffix_is_within(hostname, suffix)
+}
+
+fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn resource_suffix_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn route_scoped_suffix(
+    route_kind: &str,
+    rule_index: usize,
+    match_index: Option<usize>,
+    namespace_suffix: Option<&str>,
+) -> String {
+    match (match_index, namespace_suffix) {
+        (Some(match_index), Some(namespace_suffix)) => {
+            format!("{route_kind}-{rule_index}-{match_index}-{namespace_suffix}")
+        }
+        (Some(match_index), None) => format!("{route_kind}-{rule_index}-{match_index}"),
+        (None, Some(namespace_suffix)) => format!("{route_kind}-{rule_index}-{namespace_suffix}"),
+        (None, None) => format!("{route_kind}-{rule_index}"),
+    }
 }
 
 type HttpRouteResources = (Vec<Proxy>, Vec<PluginConfig>);
@@ -943,13 +2026,12 @@ fn http_route_resources(
     acc: &mut K8sAccumulator,
 ) -> Result<HttpRouteResources, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
-    let hostnames: Vec<String> = string_array(&object.spec, "hostnames")
+    let requested_hostnames: Vec<String> = string_array(&object.spec, "hostnames")
         .into_iter()
-        .map(|hostname| hostname.to_ascii_lowercase())
+        .map(|hostname| normalize_gateway_hostname(&hostname))
         .collect();
-    let conflict_hostnames = route_hostnames(object);
-    let parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
+    let config_namespaces = route_materialization_namespaces(object, acc);
     let losing_conflict_keys: HashSet<GatewayApiRouteConflictKey> = acc
         .gateway_api_conflict_losers
         .get(&K8sResourceKey::from_object(object))
@@ -960,157 +2042,241 @@ fn http_route_resources(
     let mut proxies = Vec::new();
     let mut plugins = Vec::new();
 
-    for (rule_index, rule) in object
-        .spec
-        .get("rules")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let entry_descriptors = route_match_entry_descriptors(object, rule);
-        let descriptors = dedup_route_match_descriptors(
-            entry_descriptors
-                .iter()
-                .map(|entry| entry.descriptor.clone())
-                .collect(),
-        );
-        if descriptors.is_empty() {
+    for config_namespace in &config_namespaces {
+        let parent_refs =
+            route_allowed_parent_ref_keys_for_namespace(object, acc, Some(config_namespace));
+        if parent_refs.is_empty() {
             continue;
         }
-        let mut match_paths: Vec<String> = descriptors
-            .iter()
-            .map(|descriptor| descriptor.listen_path.clone())
-            .collect();
-        match_paths.sort();
-        match_paths.dedup();
-
-        let backends = route_backends(object, rule, acc)?;
-        let (backend_host, backend_port, upstream_id, mut pending_upstream) = if backends.is_empty()
-        {
-            if !has_only_zero_weight_backend_refs(rule) {
-                continue;
-            }
-            (
-                ZERO_WEIGHT_BACKEND_HOST.to_string(),
-                ZERO_WEIGHT_BACKEND_PORT,
-                None,
-                None,
-            )
-        } else if backends.len() == 1 {
-            let Some(backend) = backends.into_iter().next() else {
-                continue;
-            };
-            (backend.host, backend.port, None, None)
-        } else {
-            let route_suffix = format!("{route_kind}-{rule_index}");
-            let upstream_id = resource_id(
-                "gwapi-route-upstream",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &route_suffix,
-            );
-            let upstream = upstream_for_route(
-                upstream_id.clone(),
-                object.metadata.namespace.clone(),
-                backends,
-            );
-            (String::new(), 0, Some(upstream_id), Some(upstream))
+        let materialized_parent_refs =
+            route_materialized_parent_ref_keys_for_namespace(object, acc, Some(config_namespace));
+        let proxies_before_namespace = proxies.len();
+        let Some(hostnames) = route_effective_hostnames(
+            object,
+            acc,
+            &requested_hostnames,
+            Some(config_namespace.as_str()),
+        ) else {
+            continue;
         };
+        let conflict_hostnames = conflict_hostnames_for_proxy_hosts(&hostnames);
+        let parent_refs_by_hostname: HashMap<String, Vec<String>> = conflict_hostnames
+            .iter()
+            .map(|hostname| {
+                (
+                    hostname.clone(),
+                    route_allowed_parent_ref_keys_for_hostname(
+                        object,
+                        acc,
+                        &requested_hostnames,
+                        Some(config_namespace),
+                        hostname,
+                    ),
+                )
+            })
+            .collect();
+        let route_namespace_suffix = (config_namespaces.len() > 1)
+            .then(|| format!("ns-{}", resource_suffix_component(config_namespace)));
+        let default_redirect_port = route_redirect_default_listener_port(
+            object,
+            acc,
+            &requested_hostnames,
+            Some(config_namespace.as_str()),
+        );
 
-        let match_count = match_paths.len();
-        for (match_index, listen_path) in match_paths.into_iter().enumerate() {
-            let entry_descriptors_for_path: Vec<_> = entry_descriptors
-                .iter()
-                .filter(|entry| entry.descriptor.listen_path == listen_path)
-                .cloned()
-                .collect();
-            let descriptors_for_path = dedup_route_match_descriptors(
-                entry_descriptors_for_path
+        for (rule_index, rule) in object
+            .spec
+            .get("rules")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let entry_descriptors = route_match_entry_descriptors(object, rule);
+            let descriptors = dedup_route_match_descriptors(
+                entry_descriptors
                     .iter()
                     .map(|entry| entry.descriptor.clone())
                     .collect(),
             );
-            let host_scopes = route_host_scopes_for_path(
-                &hostnames,
-                &conflict_hostnames,
-                &parent_refs,
-                &route_family,
-                &descriptors_for_path,
-                &losing_conflict_keys,
-            );
-            if host_scopes.is_empty() {
+            if descriptors.is_empty() {
                 continue;
             }
-            if let Some(upstream) = pending_upstream.take() {
-                acc.upsert_upstream(upstream);
-            }
-            let suffix = if match_count == 1 {
-                format!("{route_kind}-{rule_index}")
-            } else {
-                format!("{route_kind}-{rule_index}-{match_index}")
-            };
+            let mut match_paths: Vec<String> = descriptors
+                .iter()
+                .map(|descriptor| descriptor.listen_path.clone())
+                .collect();
+            match_paths.sort();
+            match_paths.dedup();
 
-            for host_scope in host_scopes {
-                let scoped_suffix = host_scope.suffix.as_ref().map_or_else(
-                    || suffix.clone(),
-                    |host_suffix| format!("{suffix}-{host_suffix}"),
-                );
-                let proxy_id = resource_id(
-                    "gwapi-route",
-                    &object.metadata.namespace,
-                    &object.metadata.name,
-                    &scoped_suffix,
-                );
-                let mut proxy = proxy_for_route(RouteProxySpec {
-                    id: proxy_id.clone(),
-                    namespace: object.metadata.namespace.clone(),
-                    hosts: host_scope.proxy_hosts,
-                    listen_path: Some(listen_path.clone()),
-                    strip_listen_path: false,
-                    backend_host: backend_host.clone(),
-                    backend_port,
-                    upstream_id: upstream_id.clone(),
-                    backend_scheme: BackendScheme::Http,
-                    listen_port: None,
-                    retry: None,
-                    backend_read_timeout_ms: None,
-                });
+            let request_transform = gateway_request_header_modifier_rules(rule);
+            let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
+            let backend_resolution = route_backends(object, rule, acc)?;
+            let invalid_backend_fault = backend_resolution.invalid.map(|reason| {
+                invalid_backend_fault_value_with_percentage(
+                    reason,
+                    invalid_backend_percentage(
+                        backend_resolution.valid_weight,
+                        backend_resolution.invalid_weight,
+                    ),
+                )
+            });
+            let has_route_actions = !request_transform.is_empty()
+                || redirect.is_some()
+                || invalid_backend_fault.is_some();
 
-                if object.kind == "HTTPRoute" {
-                    let skipped_descriptors = skipped_descriptors_for_host(
-                        &parent_refs,
-                        &route_family,
-                        &host_scope.conflict_hostname,
-                        &descriptors_for_path,
-                        &losing_conflict_keys,
-                    );
-                    let (rules, has_path_only_match) = http_route_dispatch_rules_for_proxy(
-                        object,
-                        rule,
-                        rule_index,
-                        Some(listen_path.as_str()),
-                        MeshRouteDispatchDestination {
-                            backend_host: backend_host.as_str(),
-                            backend_port,
-                            upstream_id: upstream_id.as_deref(),
-                        },
-                        &skipped_descriptors,
-                        &entry_descriptors_for_path,
-                    );
-                    if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
-                        &proxy_id,
-                        &object.metadata.namespace,
-                        rules,
-                        !has_path_only_match,
-                    ) {
-                        sort_dispatch_rules(&mut plugin);
-                        attach_route_plugins_to_proxy(&mut proxy, std::slice::from_ref(&plugin));
-                        plugins.push(plugin);
+            let (backend_host, backend_port, upstream_id, mut pending_upstream) =
+                if backend_resolution.backends.is_empty() {
+                    if !has_only_zero_weight_backend_refs(rule) && !has_route_actions {
+                        continue;
                     }
-                }
+                    (
+                        ZERO_WEIGHT_BACKEND_HOST.to_string(),
+                        ZERO_WEIGHT_BACKEND_PORT,
+                        None,
+                        None,
+                    )
+                } else if backend_resolution.backends.len() == 1 {
+                    let Some(backend) = backend_resolution.backends.into_iter().next() else {
+                        continue;
+                    };
+                    (backend.host, backend.port, None, None)
+                } else {
+                    let route_suffix = route_scoped_suffix(
+                        &route_kind,
+                        rule_index,
+                        None,
+                        route_namespace_suffix.as_deref(),
+                    );
+                    let upstream_id = resource_id(
+                        "gwapi-route-upstream",
+                        &object.metadata.namespace,
+                        &object.metadata.name,
+                        &route_suffix,
+                    );
+                    let upstream = upstream_for_route(
+                        upstream_id.clone(),
+                        config_namespace.clone(),
+                        backend_resolution.backends,
+                    );
+                    (String::new(), 0, Some(upstream_id), Some(upstream))
+                };
 
-                proxies.push(proxy);
+            let match_count = match_paths.len();
+            for (match_index, listen_path) in match_paths.into_iter().enumerate() {
+                let entry_descriptors_for_path: Vec<_> = entry_descriptors
+                    .iter()
+                    .filter(|entry| entry.descriptor.listen_path == listen_path)
+                    .cloned()
+                    .collect();
+                let descriptors_for_path = dedup_route_match_descriptors(
+                    entry_descriptors_for_path
+                        .iter()
+                        .map(|entry| entry.descriptor.clone())
+                        .collect(),
+                );
+                let host_scopes = route_host_scopes_for_path(
+                    &hostnames,
+                    &conflict_hostnames,
+                    &parent_refs,
+                    &parent_refs_by_hostname,
+                    &route_family,
+                    &descriptors_for_path,
+                    &losing_conflict_keys,
+                );
+                if host_scopes.is_empty() {
+                    continue;
+                }
+                if let Some(upstream) = pending_upstream.take() {
+                    acc.upsert_upstream(upstream);
+                }
+                let suffix = route_scoped_suffix(
+                    &route_kind,
+                    rule_index,
+                    (match_count > 1).then_some(match_index),
+                    route_namespace_suffix.as_deref(),
+                );
+
+                for host_scope in host_scopes {
+                    let scoped_suffix = host_scope.suffix.as_ref().map_or_else(
+                        || suffix.clone(),
+                        |host_suffix| format!("{suffix}-{host_suffix}"),
+                    );
+                    let proxy_id = resource_id(
+                        "gwapi-route",
+                        &object.metadata.namespace,
+                        &object.metadata.name,
+                        &scoped_suffix,
+                    );
+                    let mut proxy = proxy_for_route(RouteProxySpec {
+                        id: proxy_id.clone(),
+                        namespace: config_namespace.clone(),
+                        hosts: host_scope.proxy_hosts,
+                        listen_path: Some(listen_path.clone()),
+                        strip_listen_path: false,
+                        preserve_host_header: true,
+                        backend_host: backend_host.clone(),
+                        backend_port,
+                        upstream_id: upstream_id.clone(),
+                        backend_scheme: BackendScheme::Http,
+                        listen_port: None,
+                        retry: None,
+                        backend_read_timeout_ms: None,
+                    });
+
+                    if object.kind == "HTTPRoute" {
+                        let skipped_descriptors = skipped_descriptors_for_host(
+                            &host_scope.parent_refs,
+                            &route_family,
+                            &host_scope.conflict_hostname,
+                            &descriptors_for_path,
+                            &losing_conflict_keys,
+                        );
+                        let (rules, has_path_only_match) = http_route_dispatch_rules_for_proxy(
+                            object,
+                            rule,
+                            rule_index,
+                            Some(listen_path.as_str()),
+                            MeshRouteDispatchDestination {
+                                backend_host: backend_host.as_str(),
+                                backend_port,
+                                upstream_id: upstream_id.as_deref(),
+                            },
+                            &skipped_descriptors,
+                            &entry_descriptors_for_path,
+                            &request_transform,
+                            redirect.as_ref(),
+                            invalid_backend_fault.as_ref(),
+                        );
+                        let rules_have_request_transform =
+                            dispatch_rules_carry_field(&rules, "request_transform");
+                        if let Some(mut plugin) = mesh_route_dispatch_plugin_from_rules(
+                            &proxy_id,
+                            config_namespace,
+                            rules,
+                            !has_path_only_match,
+                        ) {
+                            sort_dispatch_rules(&mut plugin);
+                            let mut route_plugins = Vec::new();
+                            if rules_have_request_transform {
+                                route_plugins.push(route_request_transformer_plugin_for_proxy(
+                                    &proxy_id,
+                                    config_namespace,
+                                ));
+                            }
+                            route_plugins.push(plugin);
+                            attach_route_plugins_to_proxy(&mut proxy, &route_plugins);
+                            plugins.extend(route_plugins);
+                        }
+                    }
+
+                    proxies.push(proxy);
+                }
+            }
+        }
+        if proxies.len() > proxies_before_namespace {
+            for parent_ref in materialized_parent_refs {
+                acc.record_gateway_api_materialized_route_parent(object, parent_ref);
             }
         }
     }
@@ -1122,17 +2288,34 @@ fn route_host_scopes_for_path(
     spec_hostnames: &[String],
     conflict_hostnames: &[String],
     parent_refs: &[String],
+    parent_refs_by_hostname: &HashMap<String, Vec<String>>,
     route_family: &str,
     descriptors_for_path: &[RouteMatchDescriptor],
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> Vec<RouteHostScope> {
     if losing_conflict_keys.is_empty() {
+        if conflict_hostnames.len() > 1 {
+            return conflict_hostnames
+                .iter()
+                .enumerate()
+                .map(|(index, hostname)| RouteHostScope {
+                    proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
+                    conflict_hostname: hostname.clone(),
+                    parent_refs: parent_refs_by_hostname
+                        .get(hostname)
+                        .cloned()
+                        .unwrap_or_else(|| parent_refs.to_vec()),
+                    suffix: Some(format!("host{index}")),
+                })
+                .collect();
+        }
         return vec![RouteHostScope {
             proxy_hosts: spec_hostnames.to_vec(),
             conflict_hostname: conflict_hostnames
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "*".to_string()),
+            parent_refs: parent_refs.to_vec(),
             suffix: None,
         }];
     }
@@ -1141,9 +2324,14 @@ fn route_host_scopes_for_path(
         .iter()
         .enumerate()
         .filter_map(|(index, hostname)| {
+            let scoped_parent_refs = parent_refs_by_hostname
+                .get(hostname)
+                .filter(|refs| !refs.is_empty())
+                .cloned()
+                .unwrap_or_else(|| parent_refs.to_vec());
             let has_surviving_match = descriptors_for_path.iter().any(|descriptor| {
                 !descriptor_conflicts_for_host(
-                    parent_refs,
+                    &scoped_parent_refs,
                     route_family,
                     hostname,
                     descriptor,
@@ -1157,6 +2345,7 @@ fn route_host_scopes_for_path(
             Some(RouteHostScope {
                 proxy_hosts: proxy_hosts_for_conflict_hostname(spec_hostnames, hostname),
                 conflict_hostname: hostname.clone(),
+                parent_refs: scoped_parent_refs,
                 suffix: Some(format!("host{index}")),
             })
         })
@@ -1200,15 +2389,16 @@ fn descriptor_conflicts_for_host(
     descriptor: &RouteMatchDescriptor,
     losing_conflict_keys: &HashSet<GatewayApiRouteConflictKey>,
 ) -> bool {
-    parent_refs.iter().any(|parent_ref| {
-        losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
-            route_family: route_family.to_string(),
-            parent_ref: parent_ref.clone(),
-            hostname: hostname.to_string(),
-            listen_path: descriptor.listen_path.clone(),
-            match_signature: route_conflict_match_signature(descriptor),
+    !parent_refs.is_empty()
+        && parent_refs.iter().all(|parent_ref| {
+            losing_conflict_keys.contains(&GatewayApiRouteConflictKey {
+                route_family: route_family.to_string(),
+                parent_ref: parent_ref.clone(),
+                hostname: hostname.to_string(),
+                listen_path: descriptor.listen_path.clone(),
+                match_signature: route_conflict_match_signature(descriptor),
+            })
         })
-    })
 }
 
 fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
@@ -1224,6 +2414,7 @@ fn has_only_zero_weight_backend_refs(rule: &Value) -> bool {
         .all(|backend_ref| backend_ref.get("weight").and_then(Value::as_u64) == Some(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn http_route_dispatch_rules_for_proxy(
     object: &K8sObject,
     rule: &Value,
@@ -1232,11 +2423,49 @@ fn http_route_dispatch_rules_for_proxy(
     route_destination: MeshRouteDispatchDestination<'_>,
     skipped_descriptors: &HashSet<RouteMatchDescriptor>,
     entry_descriptors: &[RouteMatchEntryDescriptor],
+    request_transform: &[Value],
+    redirect: Option<&Value>,
+    fault: Option<&Value>,
 ) -> (Vec<Value>, bool) {
+    let has_route_actions = !request_transform.is_empty() || redirect.is_some() || fault.is_some();
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
+        if has_route_actions {
+            let default_match = gateway_api_default_path_prefix_match();
+            return (
+                vec![gateway_api_dispatch_route_rule(
+                    object,
+                    default_match.clone(),
+                    rule_index,
+                    0,
+                    route_destination,
+                    request_transform,
+                    redirect,
+                    fault,
+                    &default_match,
+                )],
+                true,
+            );
+        }
         return (Vec::new(), true);
     };
     if matches.is_empty() {
+        if has_route_actions {
+            let default_match = gateway_api_default_path_prefix_match();
+            return (
+                vec![gateway_api_dispatch_route_rule(
+                    object,
+                    default_match.clone(),
+                    rule_index,
+                    0,
+                    route_destination,
+                    request_transform,
+                    redirect,
+                    fault,
+                    &default_match,
+                )],
+                true,
+            );
+        }
         return (Vec::new(), true);
     }
 
@@ -1309,34 +2538,341 @@ fn http_route_dispatch_rules_for_proxy(
 
         if match_criteria.is_empty() {
             has_path_only_match = true;
+            if has_route_actions {
+                rules.push(gateway_api_dispatch_route_rule(
+                    object,
+                    Value::Object(match_criteria),
+                    rule_index,
+                    match_index,
+                    route_destination,
+                    request_transform,
+                    redirect,
+                    fault,
+                    entry,
+                ));
+            }
             continue;
         }
 
-        let mut destination = serde_json::Map::new();
-        if let Some(uid) = route_destination.upstream_id {
-            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
-        } else {
-            destination.insert(
-                "backend_host".to_string(),
-                Value::String(route_destination.backend_host.to_string()),
-            );
-            destination.insert(
-                "backend_port".to_string(),
-                serde_json::json!(route_destination.backend_port),
-            );
-        }
-
-        let mut route_rule = serde_json::Map::new();
-        route_rule.insert("match".to_string(), Value::Object(match_criteria));
-        route_rule.insert("destination".to_string(), Value::Object(destination));
-        route_rule.insert(
-            GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),
-            gateway_api_dispatch_rule_precedence(object, entry, rule_index, match_index),
-        );
-        rules.push(Value::Object(route_rule));
+        rules.push(gateway_api_dispatch_route_rule(
+            object,
+            Value::Object(match_criteria),
+            rule_index,
+            match_index,
+            route_destination,
+            request_transform,
+            redirect,
+            fault,
+            entry,
+        ));
     }
 
     (rules, has_path_only_match)
+}
+
+fn gateway_api_default_path_prefix_match() -> Value {
+    serde_json::json!({"path": {"type": "PathPrefix", "value": "/"}})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gateway_api_dispatch_route_rule(
+    object: &K8sObject,
+    match_criteria: Value,
+    rule_index: usize,
+    match_index: usize,
+    route_destination: MeshRouteDispatchDestination<'_>,
+    request_transform: &[Value],
+    redirect: Option<&Value>,
+    fault: Option<&Value>,
+    precedence_entry: &Value,
+) -> Value {
+    let mut destination = serde_json::Map::new();
+    if let Some(uid) = route_destination.upstream_id {
+        destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+    } else {
+        destination.insert(
+            "backend_host".to_string(),
+            Value::String(route_destination.backend_host.to_string()),
+        );
+        destination.insert(
+            "backend_port".to_string(),
+            serde_json::json!(route_destination.backend_port),
+        );
+    }
+
+    let mut route_rule = serde_json::Map::new();
+    route_rule.insert("match".to_string(), match_criteria);
+    route_rule.insert("destination".to_string(), Value::Object(destination));
+    if !request_transform.is_empty() {
+        route_rule.insert(
+            "request_transform".to_string(),
+            Value::Array(request_transform.to_vec()),
+        );
+    }
+    if let Some(redirect) = redirect {
+        route_rule.insert(
+            "redirect".to_string(),
+            gateway_redirect_value_for_match(redirect, precedence_entry),
+        );
+    }
+    if let Some(fault) = fault {
+        route_rule.insert("fault".to_string(), fault.clone());
+    }
+    route_rule.insert(
+        GATEWAY_API_DISPATCH_PRECEDENCE_KEY.to_string(),
+        gateway_api_dispatch_rule_precedence(object, precedence_entry, rule_index, match_index),
+    );
+    Value::Object(route_rule)
+}
+
+fn dispatch_rules_carry_field(rules: &[Value], field: &str) -> bool {
+    rules.iter().any(|rule| {
+        rule.as_object()
+            .and_then(|object| object.get(field))
+            .is_some_and(|value| value.as_array().is_none_or(|array| !array.is_empty()))
+    })
+}
+
+fn gateway_request_header_modifier_rules(rule: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(filters) = rule.get("filters").and_then(Value::as_array) else {
+        return out;
+    };
+
+    for filter in filters {
+        if string_field(filter, "type") != Some("RequestHeaderModifier") {
+            continue;
+        }
+        let Some(modifier) = filter
+            .get("requestHeaderModifier")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+
+        let set = gateway_header_name_value_entries(modifier.get("set"));
+        let add = gateway_header_name_value_entries(modifier.get("add"));
+        let remove = gateway_header_remove_entries(modifier.get("remove"));
+        out.extend(route_header_transform_rules_to_json(
+            (!set.is_empty()).then_some(&set),
+            (!add.is_empty()).then_some(&add),
+            (!remove.is_empty()).then_some(remove.as_slice()),
+        ));
+    }
+
+    out
+}
+
+fn gateway_header_name_value_entries(value: Option<&Value>) -> serde_json::Map<String, Value> {
+    let mut entries = serde_json::Map::new();
+    let Some(items) = value.and_then(Value::as_array) else {
+        return entries;
+    };
+    for item in items {
+        let Some(name) = string_field(item, "name") else {
+            continue;
+        };
+        let Some(value) = string_field(item, "value") else {
+            continue;
+        };
+        entries.insert(name.to_string(), Value::String(value.to_string()));
+    }
+    entries
+}
+
+fn gateway_header_remove_entries(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn gateway_request_redirect_value(
+    object: &K8sObject,
+    rule: &Value,
+    default_listener_port: Option<u16>,
+) -> Result<Option<Value>, K8sTranslateError> {
+    let Some(filters) = rule.get("filters").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    for filter in filters {
+        if string_field(filter, "type") != Some("RequestRedirect") {
+            continue;
+        }
+        let Some(redirect) = filter.get("requestRedirect").and_then(Value::as_object) else {
+            continue;
+        };
+        let mut out = serde_json::Map::new();
+
+        let redirect_scheme = redirect.get("scheme").and_then(Value::as_str);
+        if let Some(scheme) = redirect_scheme
+            && !scheme.is_empty()
+        {
+            out.insert("scheme".to_string(), Value::String(scheme.to_string()));
+        }
+
+        let redirect_port =
+            gateway_redirect_port(object, redirect, redirect_scheme, default_listener_port)?;
+        let authority = redirect
+            .get("hostname")
+            .and_then(Value::as_str)
+            .filter(|host| !host.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(authority) = authority {
+            out.insert("authority".to_string(), Value::String(authority));
+        }
+        if let Some(port) = redirect_port {
+            out.insert("port".to_string(), serde_json::json!(port));
+        }
+
+        if let Some((path, replace_prefix_match)) = gateway_redirect_path(redirect) {
+            out.insert("uri".to_string(), Value::String(path.to_string()));
+            if replace_prefix_match {
+                out.insert(
+                    GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY.to_string(),
+                    Value::Bool(true),
+                );
+            }
+        }
+
+        let status_code = match redirect.get("statusCode") {
+            Some(value) => {
+                let Some(code) = value.as_u64() else {
+                    return Err(invalid_resource(
+                        object,
+                        "HTTPRoute RequestRedirect statusCode must be an integer in the 300-399 range",
+                    ));
+                };
+                if !(300..=399).contains(&code) {
+                    return Err(invalid_resource(
+                        object,
+                        "HTTPRoute RequestRedirect statusCode must be in the 300-399 range",
+                    ));
+                }
+                code
+            }
+            None => 302,
+        };
+        out.insert("redirect_code".to_string(), serde_json::json!(status_code));
+
+        return Ok(Some(Value::Object(out)));
+    }
+
+    Ok(None)
+}
+
+fn gateway_redirect_port(
+    object: &K8sObject,
+    redirect: &serde_json::Map<String, Value>,
+    redirect_scheme: Option<&str>,
+    default_listener_port: Option<u16>,
+) -> Result<Option<u16>, K8sTranslateError> {
+    let Some(port) = redirect.get("port") else {
+        return Ok(default_port_for_scheme(redirect_scheme).or(default_listener_port));
+    };
+    let Some(port) = port.as_u64() else {
+        return Err(invalid_resource(
+            object,
+            "HTTPRoute RequestRedirect port must be an integer in the 1-65535 range",
+        ));
+    };
+    if port == 0 || port > u64::from(u16::MAX) {
+        return Err(invalid_resource(
+            object,
+            "HTTPRoute RequestRedirect port must be in the 1-65535 range",
+        ));
+    }
+    Ok(Some(port as u16))
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
+    }
+}
+
+fn gateway_redirect_path(redirect: &serde_json::Map<String, Value>) -> Option<(&str, bool)> {
+    let path = redirect.get("path")?.as_object()?;
+    let path_type = path.get("type").and_then(Value::as_str).unwrap_or_default();
+    match path_type {
+        "ReplaceFullPath" => path
+            .get("replaceFullPath")
+            .and_then(Value::as_str)
+            .map(|path| (path, false)),
+        "ReplacePrefixMatch" => path
+            .get("replacePrefixMatch")
+            .and_then(Value::as_str)
+            .map(|path| (path, true)),
+        _ => None,
+    }
+}
+
+fn gateway_redirect_value_for_match(redirect: &Value, match_entry: &Value) -> Value {
+    let mut value = redirect.clone();
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
+    let replace_prefix = obj
+        .remove(GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if replace_prefix && let Some(prefix) = gateway_match_path_prefix(match_entry) {
+        obj.insert(
+            "match_prefix".to_string(),
+            Value::String(prefix.to_string()),
+        );
+    }
+    value
+}
+
+fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
+    let Some(path) = match_entry.get("path") else {
+        return Some("/");
+    };
+    let path = path.as_object()?;
+    if path
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("PathPrefix")
+        != "PathPrefix"
+    {
+        return None;
+    }
+    path.get("value").and_then(Value::as_str)
+}
+
+fn invalid_backend_fault_value_with_percentage(
+    reason: InvalidBackendRefReason,
+    percentage: f64,
+) -> Value {
+    let body = match reason {
+        InvalidBackendRefReason::InvalidKind => "Gateway API backendRef kind is unsupported",
+        InvalidBackendRefReason::BackendNotFound => "Gateway API backendRef Service was not found",
+        InvalidBackendRefReason::RefNotPermitted => {
+            "Gateway API backendRef is not permitted by ReferenceGrant"
+        }
+    };
+    serde_json::json!({
+        "abort": {
+            "status_code": 500,
+            "percentage": percentage,
+            "body": serde_json::json!({"error": body}).to_string(),
+        }
+    })
+}
+
+fn invalid_backend_percentage(valid_weight: u32, invalid_weight: u32) -> f64 {
+    let total = valid_weight.saturating_add(invalid_weight);
+    if total == 0 || invalid_weight >= total {
+        return 100.0;
+    }
+    (f64::from(invalid_weight) / f64::from(total)) * 100.0
 }
 
 fn gateway_api_dispatch_rule_precedence(
@@ -1470,8 +3006,11 @@ fn route_backends(
     object: &K8sObject,
     rule: &Value,
     acc: &mut K8sAccumulator,
-) -> Result<Vec<RouteBackend>, K8sTranslateError> {
-    let mut backends = Vec::new();
+) -> Result<RouteBackendResolution, K8sTranslateError> {
+    let mut backend_groups = Vec::new();
+    let mut invalid = None;
+    let mut invalid_weight = 0u32;
+    let mut valid_weight = 0u32;
     let mut skipped_zero = 0usize;
     for backend_ref in rule
         .get("backendRefs")
@@ -1487,7 +3026,15 @@ fn route_backends(
         let backend_name = string_field(backend_ref, "name")
             .ok_or_else(|| invalid_resource(object, "backendRefs[].name is required"))?;
         let backend_namespace =
-            checked_backend_namespace(object, backend_ref, acc, object.kind.as_str())?;
+            match checked_backend_namespace(object, backend_ref, acc, object.kind.as_str()) {
+                Ok(namespace) => namespace,
+                Err(error) if error_is_backend_ref_resolution(&error) => {
+                    invalid.get_or_insert(backend_ref_resolution_reason(&error));
+                    invalid_weight = invalid_weight.saturating_add(weight);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         let backend_port =
             optional_port_field(object, backend_ref.get("port"), "backendRefs[].port")?.unwrap_or(
                 if object.kind == "GRPCRoute" {
@@ -1496,16 +3043,44 @@ fn route_backends(
                     80
                 },
             );
-        backends.push(RouteBackend {
-            host: service_dns_name(
-                backend_name,
-                &backend_namespace,
-                &acc.options.cluster_domain,
-            ),
-            port: backend_port,
+        if acc.has_observed_services()
+            && (!acc.service_exists(&backend_namespace, backend_name)
+                || !acc.service_port_exists(&backend_namespace, backend_name, backend_port))
+        {
+            invalid.get_or_insert(InvalidBackendRefReason::BackendNotFound);
+            invalid_weight = invalid_weight.saturating_add(weight);
+            continue;
+        }
+        valid_weight = valid_weight.saturating_add(weight);
+        let endpoint_backends = acc.endpoint_route_backends_for_service(
+            &backend_namespace,
+            backend_name,
+            backend_port,
             weight,
+        );
+        if !endpoint_backends.is_empty() {
+            backend_groups.push(RouteBackendGroup {
+                total_weight: weight,
+                expanded_endpoints: endpoint_backends.len() > 1,
+                backends: endpoint_backends,
+            });
+            continue;
+        }
+        backend_groups.push(RouteBackendGroup {
+            total_weight: weight,
+            expanded_endpoints: false,
+            backends: vec![RouteBackend {
+                host: service_dns_name(
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                port: backend_port,
+                weight,
+            }],
         });
     }
+    let backends = flatten_route_backend_groups(backend_groups);
     if skipped_zero > 0 {
         if backends.is_empty() {
             acc.warnings.push(format!(
@@ -1519,7 +3094,110 @@ fn route_backends(
             ));
         }
     }
-    Ok(backends)
+    if invalid.is_some() {
+        acc.warnings.push(format!(
+            "{} {}/{} has unresolved backendRef(s); materializing fail-closed route action",
+            object.kind, object.metadata.namespace, object.metadata.name
+        ));
+    }
+    Ok(RouteBackendResolution {
+        backends,
+        invalid,
+        invalid_weight,
+        valid_weight,
+    })
+}
+
+fn flatten_route_backend_groups(groups: Vec<RouteBackendGroup>) -> Vec<RouteBackend> {
+    let has_expanded_endpoint_group = groups.iter().any(|group| group.expanded_endpoints);
+    if !has_expanded_endpoint_group {
+        return groups
+            .into_iter()
+            .flat_map(|group| group.backends)
+            .collect();
+    }
+
+    let max_group_targets = groups
+        .iter()
+        .map(|group| group.backends.len())
+        .max()
+        .unwrap_or(1);
+    let scale = GATEWAY_API_BACKEND_WEIGHT_SCALE
+        .max(u32::try_from(max_group_targets).unwrap_or(u32::MAX).max(1));
+    let mut flattened = Vec::new();
+    for group in groups {
+        let total_weight = scaled_backend_weight(group.total_weight, scale);
+        if group.expanded_endpoints {
+            let len = group.backends.len();
+            for (index, mut backend) in group.backends.into_iter().enumerate() {
+                backend.weight = distributed_backend_weight(total_weight, len, index);
+                flattened.push(backend);
+            }
+        } else {
+            for mut backend in group.backends {
+                backend.weight = total_weight;
+                flattened.push(backend);
+            }
+        }
+    }
+    normalize_backend_weights_to_target_limit(&mut flattened);
+    flattened
+}
+
+fn scaled_backend_weight(weight: u32, scale: u32) -> u32 {
+    u32::try_from(u64::from(weight).saturating_mul(u64::from(scale))).unwrap_or(u32::MAX)
+}
+
+fn distributed_backend_weight(total_weight: u32, count: usize, index: usize) -> u32 {
+    let Ok(count) = u32::try_from(count) else {
+        return 1;
+    };
+    if count == 0 {
+        return total_weight;
+    }
+    let base = total_weight / count;
+    let remainder = total_weight % count;
+    base + u32::from(u32::try_from(index).is_ok_and(|idx| idx < remainder))
+}
+
+fn normalize_backend_weights_to_target_limit(backends: &mut [RouteBackend]) {
+    let max_weight = backends
+        .iter()
+        .map(|backend| backend.weight)
+        .max()
+        .unwrap_or(0);
+    if max_weight <= MAX_TARGET_WEIGHT {
+        return;
+    }
+    for backend in backends {
+        if backend.weight == 0 {
+            continue;
+        }
+        let normalized = (u64::from(backend.weight) * u64::from(MAX_TARGET_WEIGHT)
+            / u64::from(max_weight))
+        .max(1);
+        backend.weight = u32::try_from(normalized).unwrap_or(MAX_TARGET_WEIGHT);
+    }
+}
+
+fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains("ReferenceGrant") || message.contains("only core Service")
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
+fn backend_ref_resolution_reason(error: &K8sTranslateError) -> InvalidBackendRefReason {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. }
+            if message.contains("only core Service") =>
+        {
+            InvalidBackendRefReason::InvalidKind
+        }
+        _ => InvalidBackendRefReason::RefNotPermitted,
+    }
 }
 
 fn backend_weight(object: &K8sObject, backend_ref: &Value) -> Result<u32, K8sTranslateError> {
@@ -1532,6 +3210,14 @@ fn l4_route_proxies(
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
     ensure_route_parent_refs_allowed(object, acc)?;
+    ensure_l4_parent_refs_are_same_namespace(object)?;
+    let materialized_parent_refs = route_materialized_parent_ref_keys_for_namespace(
+        object,
+        acc,
+        Some(&object.metadata.namespace),
+    );
+    let materialized_listener_ports =
+        l4_route_listener_ports_for_namespace(object, acc, Some(&object.metadata.namespace));
     let mut proxies = Vec::new();
     for (rule_index, rule) in object
         .spec
@@ -1561,31 +3247,70 @@ fn l4_route_proxies(
             "TCPRoute/TLSRoute backendRefs[].port",
         )?;
 
-        proxies.push(proxy_for_route(RouteProxySpec {
-            id: resource_id(
-                "gwapi-l4",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &rule_index.to_string(),
-            ),
-            namespace: object.metadata.namespace.clone(),
-            hosts: string_array(&object.spec, "hostnames"),
-            listen_path: None,
-            strip_listen_path: false,
-            backend_host: service_dns_name(
-                backend_name,
-                &backend_namespace,
-                &acc.options.cluster_domain,
-            ),
-            backend_port,
-            upstream_id: None,
-            backend_scheme: scheme,
-            listen_port: Some(backend_port),
-            retry: None,
-            backend_read_timeout_ms: None,
-        }));
+        let listen_ports = if materialized_listener_ports.is_empty() {
+            vec![backend_port]
+        } else {
+            materialized_listener_ports.clone()
+        };
+        for (listen_port_index, listen_port) in listen_ports.iter().copied().enumerate() {
+            let suffix = if listen_ports.len() == 1 {
+                rule_index.to_string()
+            } else {
+                format!("{rule_index}-{listen_port_index}")
+            };
+            proxies.push(proxy_for_route(RouteProxySpec {
+                id: resource_id(
+                    "gwapi-l4",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &suffix,
+                ),
+                namespace: object.metadata.namespace.clone(),
+                hosts: string_array(&object.spec, "hostnames"),
+                listen_path: None,
+                strip_listen_path: false,
+                preserve_host_header: false,
+                backend_host: service_dns_name(
+                    backend_name,
+                    &backend_namespace,
+                    &acc.options.cluster_domain,
+                ),
+                backend_port,
+                upstream_id: None,
+                backend_scheme: scheme,
+                listen_port: Some(listen_port),
+                retry: None,
+                backend_read_timeout_ms: None,
+            }));
+        }
+    }
+    if !proxies.is_empty() {
+        for parent_ref in materialized_parent_refs {
+            acc.record_gateway_api_materialized_route_parent(object, parent_ref);
+        }
     }
     Ok(proxies)
+}
+
+fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
+    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for parent_ref in parent_refs {
+        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
+        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
+        if group == "gateway.networking.k8s.io" && kind == "Gateway" {
+            let parent_namespace =
+                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
+            if parent_namespace != object.metadata.namespace {
+                return Err(invalid_resource(
+                    object,
+                    "TCPRoute/TLSRoute cross-namespace parentRefs are not supported by Ferrum yet",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn checked_backend_namespace(
@@ -1611,6 +3336,7 @@ fn checked_backend_namespace(
         backend_namespace,
         to_group,
         to_kind,
+        string_field(backend_ref, "name"),
     ) {
         Ok(backend_namespace.to_string())
     } else {
@@ -1709,6 +3435,47 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
+fn listener_route_kinds_for_protocol(protocol: Option<&str>) -> Vec<&'static str> {
+    match protocol.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "HTTP" | "HTTPS" => vec!["HTTPRoute", "GRPCRoute"],
+        "GRPC" | "GRPCS" => vec!["GRPCRoute"],
+        "TCP" => vec!["TCPRoute"],
+        "TLS" => vec!["TLSRoute"],
+        _ => Vec::new(),
+    }
+}
+
+fn listener_allowed_route_kinds(listener: &Value) -> HashSet<String> {
+    let protocol_kinds = listener_route_kinds_for_protocol(string_field(listener, "protocol"));
+    if protocol_kinds.is_empty() {
+        return HashSet::new();
+    }
+    let Some(kinds) = listener
+        .get("allowedRoutes")
+        .and_then(|allowed_routes| allowed_routes.get("kinds"))
+        .and_then(Value::as_array)
+    else {
+        return protocol_kinds.into_iter().map(ToOwned::to_owned).collect();
+    };
+    kinds
+        .iter()
+        .filter_map(|kind| listener_allowed_route_kind(kind, &protocol_kinds))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> Option<&'a str> {
+    let group = string_field(kind, "group").unwrap_or("gateway.networking.k8s.io");
+    let kind = string_field(kind, "kind")?;
+    if group != "gateway.networking.k8s.io" {
+        return None;
+    }
+    protocol_kinds
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1753,6 +3520,713 @@ mod tests {
         }
     }
 
+    fn tls_secret(name: &str, namespace: &str, valid: bool) -> K8sObject {
+        use base64::Engine as _;
+
+        let (cert, key) = if valid {
+            (
+                include_str!("../../../tests/certs/server.crt"),
+                include_str!("../../../tests/certs/server.key"),
+            )
+        } else {
+            ("Hello world", "Hello world")
+        };
+        let mut secret = object_in_namespace(
+            "Secret",
+            namespace,
+            serde_json::json!({
+                "type": "kubernetes.io/tls",
+                "data": {
+                    "tls.crt": base64::engine::general_purpose::STANDARD.encode(cert),
+                    "tls.key": base64::engine::general_purpose::STANDARD.encode(key),
+                }
+            }),
+        );
+        secret.api_version = "v1".to_string();
+        secret.metadata.name = name.to_string();
+        secret
+    }
+
+    fn tls_secret_with_mismatched_key(name: &str, namespace: &str) -> K8sObject {
+        use base64::Engine as _;
+
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let mut secret = tls_secret(name, namespace, true);
+        secret.spec["data"]["tls.key"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD.encode(key_pair.serialize_pem())
+        );
+        secret
+    }
+
+    #[test]
+    fn gateway_https_listener_certificate_ref_sets_frontend_tls_sources() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "gateway-cert"
+                        }]
+                    }
+                }]
+            }),
+        );
+
+        let secret = tls_secret("gateway-cert", "default", true);
+        let result =
+            translate_k8s_objects(&[gateway, secret], options()).expect("translation succeeds");
+        assert!(
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/gateway-cert#tls.crt?sha256="))
+        );
+        assert!(
+            result
+                .config
+                .frontend_tls_key_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/gateway-cert#tls.key?sha256="))
+        );
+        assert_eq!(
+            result.config.frontend_tls_source_namespace.as_deref(),
+            Some("default")
+        );
+        assert_eq!(result.config.frontend_tls_namespace_sources.len(), 1);
+        assert_eq!(
+            result.config.frontend_tls_namespace_sources[0].namespace,
+            "default"
+        );
+    }
+
+    #[test]
+    fn gateway_frontend_tls_sources_are_partitioned_by_gateway_namespace() {
+        let mut gateway_a = object_in_namespace(
+            "Gateway",
+            "ns-a",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-a"}]}
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "gateway-a".to_string();
+        let mut gateway_b = object_in_namespace(
+            "Gateway",
+            "ns-b",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-b"}]}
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "gateway-b".to_string();
+        let secret_a = tls_secret("cert-a", "ns-a", true);
+        let secret_b = tls_secret("cert-b", "ns-b", true);
+
+        let result = translate_k8s_objects(
+            &[gateway_a, gateway_b, secret_a, secret_b],
+            options().with_source_namespaces(vec!["ns-a".to_string(), "ns-b".to_string()]),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.frontend_tls_namespace_sources.len(), 2);
+        let source_a = result
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .find(|source| source.namespace == "ns-a")
+            .expect("ns-a TLS source should be retained");
+        let source_b = result
+            .config
+            .frontend_tls_namespace_sources
+            .iter()
+            .find(|source| source.namespace == "ns-b")
+            .expect("ns-b TLS source should be retained");
+        assert!(
+            source_a
+                .cert_path
+                .starts_with("k8s://ns-a/cert-a#tls.crt?sha256=")
+        );
+        assert!(
+            source_b
+                .cert_path
+                .starts_with("k8s://ns-b/cert-b#tls.crt?sha256=")
+        );
+    }
+
+    #[test]
+    fn gateway_frontend_tls_ignores_gateway_owned_by_other_controller() {
+        let mut other_class = object(
+            "GatewayClass",
+            serde_json::json!({"controllerName": "example.com/other-controller"}),
+        );
+        other_class.metadata.name = "other".to_string();
+        other_class.metadata.namespace.clear();
+
+        let other_gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "other",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "other-cert"}]}
+                }]
+            }),
+        );
+        let ferrum_gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "ferrum-cert"}]}
+                }]
+            }),
+        );
+        let other_cert = tls_secret("other-cert", "default", true);
+        let ferrum_cert = tls_secret("ferrum-cert", "default", true);
+
+        let result = translate_k8s_objects(
+            &[
+                other_class,
+                other_gateway,
+                other_cert,
+                ferrum_gateway,
+                ferrum_cert,
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/ferrum-cert#tls.crt?sha256=")),
+            "only Ferrum-owned Gateways should materialize frontend TLS"
+        );
+    }
+
+    #[test]
+    fn gateway_https_listener_certificate_ref_requires_observed_valid_secret() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "gateway-cert"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let malformed = tls_secret("gateway-cert", "default", false);
+
+        let missing_secret = translate_k8s_objects(std::slice::from_ref(&gateway), options())
+            .expect("translation succeeds");
+        assert_eq!(missing_secret.config.frontend_tls_cert_path, None);
+        assert_eq!(missing_secret.config.frontend_tls_key_path, None);
+
+        let malformed_secret = translate_k8s_objects(&[gateway.clone(), malformed], options())
+            .expect("translation succeeds");
+        assert_eq!(malformed_secret.config.frontend_tls_cert_path, None);
+        assert_eq!(malformed_secret.config.frontend_tls_key_path, None);
+
+        let mismatched = tls_secret_with_mismatched_key("gateway-cert", "default");
+        let mismatched_secret =
+            translate_k8s_objects(&[gateway, mismatched], options()).expect("translation succeeds");
+        assert_eq!(mismatched_secret.config.frontend_tls_cert_path, None);
+        assert_eq!(mismatched_secret.config.frontend_tls_key_path, None);
+    }
+
+    #[test]
+    fn gateway_https_listener_certificate_refs_fail_closed_when_any_ref_is_unresolved() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [
+                            {"name": "gateway-cert"},
+                            {"name": "missing-cert"}
+                        ]
+                    }
+                }]
+            }),
+        );
+        let valid = tls_secret("gateway-cert", "default", true);
+
+        let result = translate_k8s_objects(&[gateway, valid], options())
+            .expect("translation should leave unresolved TLS unmaterialized");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn gateway_https_listener_without_certificate_refs_fails_closed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {}
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway], options())
+            .expect("translation should leave listener TLS unmaterialized");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty()),
+            "invalid terminating TLS listener must not be exposed as a data-plane service"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn gateway_https_listener_without_tls_block_fails_closed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS"
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway], options())
+            .expect("translation should leave listener TLS unmaterialized");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert_eq!(result.config.frontend_tls_key_path, None);
+        assert!(result.config.frontend_tls_namespace_sources.is_empty());
+        assert!(
+            result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty()),
+            "HTTPS listeners without TLS material must not be exposed as plaintext services"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved TLS certificateRef"))
+        );
+    }
+
+    #[test]
+    fn http_route_attaches_but_does_not_materialize_for_invalid_tls_listener() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {}
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "https"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("invalid TLS listener should not reject route attachment");
+
+        assert!(result.config.proxies.is_empty());
+        assert!(
+            result
+                .config
+                .mesh
+                .as_ref()
+                .is_none_or(|mesh| mesh.services.is_empty())
+        );
+    }
+
+    #[test]
+    fn gateway_valid_tls_listener_materializes_when_sibling_tls_listener_is_invalid() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https-valid",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "valid-cert"}]}
+                    },
+                    {
+                        "name": "https-invalid",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "missing-cert"}]}
+                    }
+                ]
+            }),
+        );
+        let cert = tls_secret("valid-cert", "default", true);
+
+        let result = translate_k8s_objects(&[gateway, cert], options())
+            .expect("valid sibling TLS listener should materialize");
+
+        assert!(
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/valid-cert#tls.crt?sha256="))
+        );
+        let mesh = result.config.mesh.as_ref().expect("mesh emitted");
+        assert!(
+            mesh.services
+                .iter()
+                .any(|service| service.name == "sample-https-valid")
+        );
+        assert!(
+            mesh.services
+                .iter()
+                .all(|service| service.name != "sample-https-invalid")
+        );
+    }
+
+    #[test]
+    fn same_namespace_gateway_tls_conflicts_keep_listener_status_but_do_not_materialize_routes() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https-a",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-a"}]}
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+        let mut gateway_b = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https-b",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "cert-b"}]}
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "edge-b".to_string();
+        let cert_a = tls_secret("cert-a", "default", true);
+        let cert_b = tls_secret("cert-b", "default", true);
+        let route_b = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "edge-b", "sectionName": "https-b"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/b"}}],
+                    "backendRefs": [{"name": "backend", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway_a, cert_a, gateway_b, cert_b, route_b], options())
+                .expect("translation should keep valid same-namespace TLS listener status");
+
+        assert!(
+            result
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://default/cert-a#tls.crt?sha256="))
+        );
+        assert_eq!(result.config.frontend_tls_namespace_sources.len(), 1);
+        assert!(
+            result.config.mesh.as_ref().is_some_and(|mesh| mesh
+                .services
+                .iter()
+                .any(|service| service.name == "edge-a-https-a")),
+            "the first valid TLS listener should stay materialized"
+        );
+        assert!(
+            result.config.mesh.as_ref().is_some_and(|mesh| mesh
+                .services
+                .iter()
+                .any(|service| service.name == "edge-b-https-b")),
+            "status-only later valid TLS listeners should not be withdrawn solely because the namespace already has a serving cert"
+        );
+        assert!(
+            result.config.proxies.is_empty(),
+            "routes attached to the later listener must not be materialized against the wrong serving certificate"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("route traffic on this listener unmaterialized"))
+        );
+    }
+
+    #[test]
+    fn gateway_cross_namespace_certificate_ref_requires_reference_grant() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "gateway-cert",
+                            "namespace": "certs"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let grant = object_in_namespace(
+            "ReferenceGrant",
+            "certs",
+            serde_json::json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "namespace": "default"
+                }],
+                "to": [{
+                    "group": "",
+                    "kind": "Secret",
+                    "name": "gateway-cert"
+                }]
+            }),
+        );
+        let secret = tls_secret("gateway-cert", "certs", true);
+
+        let without_grant = translate_k8s_objects(std::slice::from_ref(&gateway), options())
+            .expect("translation succeeds");
+        assert_eq!(without_grant.config.frontend_tls_cert_path, None);
+
+        let with_grant = translate_k8s_objects(
+            &[gateway, grant, secret],
+            options().with_source_namespaces(vec!["default".to_string(), "certs".to_string()]),
+        )
+        .expect("translation succeeds");
+        assert!(
+            with_grant
+                .config
+                .frontend_tls_cert_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://certs/gateway-cert#tls.crt?sha256="))
+        );
+        assert!(
+            with_grant
+                .config
+                .frontend_tls_key_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("k8s://certs/gateway-cert#tls.key?sha256="))
+        );
+        assert_eq!(
+            with_grant.config.frontend_tls_source_namespace.as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn gateway_tls_secret_data_changes_frontend_tls_source_digest() {
+        use base64::Engine as _;
+
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {"certificateRefs": [{"name": "gateway-cert"}]}
+                }]
+            }),
+        );
+        let original = tls_secret("gateway-cert", "default", true);
+        let mut rotated = tls_secret("gateway-cert", "default", true);
+        rotated.spec["data"]["tls.crt"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD
+                .encode("-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n")
+        );
+
+        let original_result =
+            translate_k8s_objects(&[gateway.clone(), original], options()).expect("original");
+        let rotated_result =
+            translate_k8s_objects(&[gateway, rotated], options()).expect("rotated");
+
+        assert_ne!(
+            original_result.config.frontend_tls_cert_path,
+            rotated_result.config.frontend_tls_cert_path,
+            "Secret data changes must alter the stable source string so CP broadcasts a snapshot"
+        );
+    }
+
+    #[test]
+    fn gateway_multiple_distinct_certificate_refs_are_not_silently_collapsed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "https-a",
+                        "port": 443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "gateway-cert-a"}]}
+                    },
+                    {
+                        "name": "https-b",
+                        "port": 8443,
+                        "protocol": "HTTPS",
+                        "tls": {"certificateRefs": [{"name": "gateway-cert-b"}]}
+                    }
+                ]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "https-a"}],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        let cert_a = tls_secret("gateway-cert-a", "default", true);
+        let cert_b = tls_secret("gateway-cert-b", "default", true);
+
+        let result = translate_k8s_objects(&[gateway, cert_a, cert_b, route], options())
+            .expect("translation");
+
+        assert_eq!(result.config.frontend_tls_cert_path, None);
+        assert!(
+            result.config.proxies.is_empty(),
+            "routes attached to unsupported TLS listeners must fail closed"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multiple distinct TLS certificateRefs"))
+        );
+    }
+
+    fn core_service(name: &str, spec: Value) -> K8sObject {
+        let mut service = object("Service", spec);
+        service.api_version = "v1".to_string();
+        service.metadata.name = name.to_string();
+        service
+    }
+
+    fn endpoint_slice_for_service(service_name: &str, endpoints: Vec<Value>) -> K8sObject {
+        let mut slice = object(
+            "EndpointSlice",
+            serde_json::json!({
+                "addressType": "IPv4",
+                "ports": [{"name": "first-port", "port": 3000}],
+                "endpoints": endpoints
+            }),
+        );
+        slice.api_version = "discovery.k8s.io/v1".to_string();
+        slice.metadata.name = format!("{service_name}-manual");
+        slice.metadata.labels.insert(
+            "kubernetes.io/service-name".to_string(),
+            service_name.to_string(),
+        );
+        slice
+    }
+
+    fn namespace(name: &str, labels: &[(&str, &str)]) -> K8sObject {
+        let mut ns = object("Namespace", Value::Object(serde_json::Map::new()));
+        ns.api_version = "v1".to_string();
+        ns.metadata.name = name.to_string();
+        ns.metadata.namespace = String::new();
+        ns.metadata.labels = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        ns
+    }
+
     fn route_with_name_and_created_at(name: &str, created_at: &str) -> K8sObject {
         let mut route = object(
             "HTTPRoute",
@@ -1768,6 +4242,35 @@ mod tests {
         route.metadata.name = name.to_string();
         route.metadata.creation_timestamp = Some(created_at.to_string());
         route
+    }
+
+    fn assert_invalid_backend_fault_route(
+        result: &crate::config_sources::k8s::K8sTranslation,
+        expected_body: &str,
+    ) {
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            ZERO_WEIGHT_BACKEND_HOST
+        );
+        assert_eq!(
+            result.config.proxies[0].backend_port,
+            ZERO_WEIGHT_BACKEND_PORT
+        );
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("invalid backend route should carry mesh_route_dispatch");
+        let abort = &plugin.config["rules"][0]["fault"]["abort"];
+        assert_eq!(abort["status_code"], 500);
+        assert_eq!(abort["percentage"], 100.0);
+        let body = abort["body"]
+            .as_str()
+            .expect("fault body should be a string");
+        let body: Value = serde_json::from_str(body).expect("fault body should be valid JSON");
+        assert_eq!(body["error"].as_str(), Some(expected_body));
     }
 
     #[test]
@@ -1795,6 +4298,141 @@ mod tests {
         );
         assert!(!result.config.proxies[0].strip_listen_path);
         assert_eq!(result.config.proxies[0].backend_port, 8080);
+    }
+
+    #[test]
+    fn http_route_proxy_hosts_are_limited_to_gateway_listener_hostname_intersections() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "specific",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "very.specific.com"
+                    },
+                    {
+                        "name": "wildcard",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "*.wildcard.io"
+                    }
+                ]
+            }),
+        );
+        let exact_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                "hostnames": [
+                    "non.matching.com",
+                    "*.nonmatchingwildcard.io",
+                    "very.specific.com"
+                ],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/s1"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        let wildcard_listener_route = {
+            let mut route = object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "sample", "sectionName": "wildcard"}],
+                    "hostnames": ["wildcard.io", "foo.wildcard.io"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s2"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            );
+            route.metadata.name = "wildcard-listener".to_string();
+            route
+        };
+        let wildcard_route_specific_listener = {
+            let mut route = object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                    "hostnames": ["*.specific.com"],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s3"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            );
+            route.metadata.name = "wildcard-route".to_string();
+            route
+        };
+        let omitted_route_hostname = {
+            let mut route = object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/s4"}}],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            );
+            route.metadata.name = "omitted-hostname".to_string();
+            route
+        };
+
+        let result = translate_k8s_objects(
+            &[
+                gateway,
+                exact_route,
+                wildcard_listener_route,
+                wildcard_route_specific_listener,
+                omitted_route_hostname,
+            ],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_proxy_hosts(&result.config.proxies, "/s1", &["very.specific.com"]);
+        assert_proxy_hosts(&result.config.proxies, "/s2", &["foo.wildcard.io"]);
+        assert_proxy_hosts(&result.config.proxies, "/s3", &["very.specific.com"]);
+        assert_proxy_hosts(&result.config.proxies, "/s4", &["very.specific.com"]);
+    }
+
+    #[test]
+    fn http_route_without_gateway_listener_hostname_intersection_materializes_no_proxy() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "specific",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "very.specific.com"
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample", "sectionName": "specific"}],
+                "hostnames": ["specific.but.wrong.com", "wildcard.io"],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/s5"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("translation should skip the non-intersecting route");
+
+        assert!(
+            result.config.proxies.is_empty(),
+            "route with no listener hostname intersection must fail closed"
+        );
     }
 
     #[test]
@@ -1873,26 +4511,176 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_http_route_drops_match_when_any_parent_ref_loses() {
+    fn conflicting_http_route_keeps_surviving_parent_ref() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "api.example.com"
+                }]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+
+        let mut gateway_b = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "other.example.com"
+                }]
+            }),
+        );
+        gateway_b.metadata.name = "edge-b".to_string();
+
         let mut winner = route_with_name_and_created_at("api-old", "2026-01-01T00:00:00Z");
+        winner.spec["hostnames"] = serde_json::json!(["api.example.com"]);
         winner.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}]);
 
         let mut loser = route_with_name_and_created_at("api-new", "2026-01-02T00:00:00Z");
+        loser.spec["hostnames"] = serde_json::json!(["api.example.com", "other.example.com"]);
         loser.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}, {"name": "edge-b"}]);
 
-        let result =
-            translate_k8s_objects(&[loser, winner], options()).expect("translation succeeds");
+        let result = translate_k8s_objects(&[gateway_a, gateway_b, loser, winner], options())
+            .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies.len(), 2);
         assert!(
-            result.config.proxies[0].id.contains("api-old"),
-            "route losing on one parentRef must not materialize an unscoped proxy"
+            result.config.proxies.iter().any(|proxy| {
+                proxy.id.contains("api-old")
+                    && proxy.hosts == vec!["api.example.com".to_string()]
+                    && proxy.listen_path.as_deref() == Some("/api")
+            }),
+            "winner should keep the conflicted edge-a hostname"
+        );
+        assert!(
+            result.config.proxies.iter().any(|proxy| {
+                proxy.id.contains("api-new")
+                    && proxy.hosts == vec!["other.example.com".to_string()]
+                    && proxy.listen_path.as_deref() == Some("/api")
+            }),
+            "loser should still materialize the surviving edge-b hostname"
         );
         assert!(result.config.validate_unique_listen_paths().is_ok());
         assert!(result.warnings.iter().any(|warning| {
             warning.contains("api-new")
                 && warning.contains("parent=gateway.networking.k8s.io/Gateway/default/edge-a/*/*")
                 && warning.contains("winner is default/api-old")
+        }));
+    }
+
+    #[test]
+    fn conflicting_http_route_materializes_surviving_parent_namespace() {
+        let mut gateway_a = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
+            }),
+        );
+        gateway_a.metadata.name = "edge-a".to_string();
+
+        let mut gateway_b = gateway_a.clone();
+        gateway_b.metadata.name = "edge-b".to_string();
+        gateway_b.metadata.namespace = "other".to_string();
+        gateway_b.spec["listeners"][0]["allowedRoutes"] =
+            serde_json::json!({"namespaces": {"from": "All"}});
+
+        let mut winner = route_with_name_and_created_at("api-old", "2026-01-01T00:00:00Z");
+        winner.spec["parentRefs"] = serde_json::json!([{"name": "edge-a"}]);
+
+        let mut loser = route_with_name_and_created_at("api-new", "2026-01-02T00:00:00Z");
+        loser.spec["parentRefs"] = serde_json::json!([
+            {"name": "edge-a"},
+            {"name": "edge-b", "namespace": "other"}
+        ]);
+
+        let result = translate_k8s_objects(
+            &[gateway_a, gateway_b, loser, winner],
+            options().with_source_namespaces(vec!["default".to_string(), "other".to_string()]),
+        )
+        .expect("translation succeeds");
+
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.namespace == "default"
+                && proxy.id.contains("api-old")
+                && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.namespace == "other"
+                && proxy.id.contains("api-new")
+                && proxy.listen_path.as_deref() == Some("/api")
+        }));
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+    }
+
+    #[test]
+    fn http_route_conflicts_use_listener_hostname_intersection() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "api",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": "api.example.com"
+                }]
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        let mut wildcard = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        wildcard.spec["hostnames"] = serde_json::json!(["*.example.com"]);
+        wildcard.spec["parentRefs"] = serde_json::json!([{"name": "edge", "sectionName": "api"}]);
+
+        let mut exact = route_with_name_and_created_at("api-b", "2026-01-02T00:00:00Z");
+        exact.spec["hostnames"] = serde_json::json!(["api.example.com"]);
+        exact.spec["parentRefs"] = serde_json::json!([{"name": "edge", "sectionName": "api"}]);
+
+        let result =
+            translate_k8s_objects(&[gateway, exact, wildcard], options()).expect("translation");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert!(
+            result.config.proxies[0].id.contains("api-a"),
+            "older route should win after both routes intersect the same listener hostname"
+        );
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("api-b")
+                && warning.contains("host=api.example.com")
+                && warning.contains("winner is default/api-a")
+        }));
+    }
+
+    #[test]
+    fn http_route_listener_exact_and_wildcard_hosts_validate_together() {
+        let mut exact = route_with_name_and_created_at("backend-v2", "2026-01-01T00:00:00Z");
+        exact.spec["hostnames"] = serde_json::json!(["foo.bar.com"]);
+
+        let mut wildcard = route_with_name_and_created_at("backend-v3", "2026-01-01T00:00:01Z");
+        wildcard.spec["hostnames"] = serde_json::json!(["*.bar.com"]);
+
+        let result = translate_k8s_objects(&[exact, wildcard], options()).expect("translation");
+
+        assert_eq!(result.config.proxies.len(), 2);
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "exact host and wildcard host routes on one path are resolved by router host precedence"
+        );
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.listen_path.as_deref() == Some("/api")
+                && proxy.hosts == vec!["foo.bar.com".to_string()]
+        }));
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.listen_path.as_deref() == Some("/api")
+                && proxy.hosts == vec!["*.bar.com".to_string()]
         }));
     }
 
@@ -1967,6 +4755,91 @@ mod tests {
         assert!(
             rules[1]["destination"]["backend_port"].as_u64() == Some(8081),
             "POST route must keep its own backend destination"
+        );
+    }
+
+    #[test]
+    fn http_route_matching_across_routes_splits_host_subsets_before_merging() {
+        let mut part1 = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["example.com", "example.net"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "backendRefs": [{"name": "backend-v1", "port": 8080}]
+                }]
+            }),
+        );
+        part1.metadata.name = "matching-part1".to_string();
+        part1.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+
+        let mut part2 = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [
+                        {"path": {"type": "PathPrefix", "value": "/v2"}},
+                        {"headers": [{"name": "Version", "value": "two"}]}
+                    ],
+                    "backendRefs": [{"name": "backend-v2", "port": 8081}]
+                }]
+            }),
+        );
+        part2.metadata.name = "matching-part2".to_string();
+        part2.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result = translate_k8s_objects(&[part1, part2], options()).expect("translation");
+
+        assert!(
+            result.config.validate_unique_listen_paths().is_ok(),
+            "Gateway API routes with overlapping host subsets must not produce duplicate host/path proxies"
+        );
+        let example_com_root = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| {
+                proxy.listen_path.as_deref() == Some("/")
+                    && proxy.hosts == vec!["example.com".to_string()]
+            })
+            .expect("example.com root proxy");
+        let example_net_root = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| {
+                proxy.listen_path.as_deref() == Some("/")
+                    && proxy.hosts == vec!["example.net".to_string()]
+            })
+            .expect("example.net root proxy");
+        assert_eq!(example_com_root.backend_port, 8080);
+        assert_eq!(example_net_root.backend_port, 8080);
+        let plugin = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.proxy_id.as_deref() == Some(example_com_root.id.as_str())
+            })
+            .expect("example.com root proxy should carry the Version=two override");
+        let rules = plugin.config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["version"].as_str(),
+            Some("two")
+        );
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(8081));
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|plugin| { plugin.proxy_id.as_deref() != Some(example_net_root.id.as_str()) }),
+            "example.net fallback must not inherit the example.com-only header override"
         );
     }
 
@@ -2190,13 +5063,39 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_http_route_drops_match_with_surviving_parent_ref() {
-        let older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+    fn conflicting_http_route_keeps_surviving_listener_parent_ref() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "http-a",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "api.example.com"
+                    },
+                    {
+                        "name": "http-b",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "hostname": "other.example.com"
+                    }
+                ]
+            }),
+        );
+        let mut older = route_with_name_and_created_at("api-a", "2026-01-01T00:00:00Z");
+        older.spec["hostnames"] = serde_json::json!(["api.example.com"]);
+        older.spec["parentRefs"] = serde_json::json!([{"name": "sample", "sectionName": "http-a"}]);
+
         let mut mixed_parent_route = object(
             "HTTPRoute",
             serde_json::json!({
-                "hostnames": ["api.example.com"],
-                "parentRefs": [{"name": "edge"}, {"name": "edge-alt"}],
+                "hostnames": ["api.example.com", "other.example.com"],
+                "parentRefs": [
+                    {"name": "sample", "sectionName": "http-a"},
+                    {"name": "sample", "sectionName": "http-b"}
+                ],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
                     "backendRefs": [{"name": "api-b", "port": 8080}]
@@ -2206,15 +5105,19 @@ mod tests {
         mixed_parent_route.metadata.name = "api-b".to_string();
         mixed_parent_route.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
 
-        let result = translate_k8s_objects(&[older, mixed_parent_route], options())
+        let result = translate_k8s_objects(&[gateway, older, mixed_parent_route], options())
             .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies.len(), 2);
         assert!(result.config.proxies.iter().any(|proxy| {
-            proxy.id.contains("api-a") && proxy.listen_path.as_deref() == Some("/api")
+            proxy.id.contains("api-a")
+                && proxy.hosts == vec!["api.example.com".to_string()]
+                && proxy.listen_path.as_deref() == Some("/api")
         }));
-        assert!(!result.config.proxies.iter().any(|proxy| {
-            proxy.id.contains("api-b") && proxy.listen_path.as_deref() == Some("/api")
+        assert!(result.config.proxies.iter().any(|proxy| {
+            proxy.id.contains("api-b")
+                && proxy.hosts == vec!["other.example.com".to_string()]
+                && proxy.listen_path.as_deref() == Some("/api")
         }));
         assert!(result.config.validate_unique_listen_paths().is_ok());
     }
@@ -2327,9 +5230,269 @@ mod tests {
             result.config.proxies[0].upstream_id.as_deref(),
             Some(result.config.upstreams[0].id.as_str())
         );
+        assert!(
+            result.config.proxies[0].preserve_host_header,
+            "Gateway API HTTPRoute backends must see the original request Host"
+        );
         assert_eq!(result.config.upstreams[0].targets.len(), 2);
         assert_eq!(result.config.upstreams[0].targets[0].weight, 90);
         assert_eq!(result.config.upstreams[0].targets[1].port, 8081);
+    }
+
+    #[test]
+    fn http_route_selectorless_service_uses_ready_endpoint_slice_target_port() {
+        let service = core_service(
+            "manual",
+            serde_json::json!({
+                "clusterIP": "10.96.0.10",
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let endpoint_slice = endpoint_slice_for_service(
+            "manual",
+            vec![serde_json::json!({
+                "addresses": ["10.1.0.10"],
+                "conditions": {"ready": true}
+            })],
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/manual"}}],
+                    "backendRefs": [{"name": "manual", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, endpoint_slice, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("manual EndpointSlice service should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_host, "10.1.0.10");
+        assert_eq!(result.config.proxies[0].backend_port, 3000);
+        assert!(
+            result.config.upstreams.is_empty(),
+            "single ready endpoint can be dialed directly"
+        );
+    }
+
+    #[test]
+    fn http_route_headless_service_uses_ready_endpoint_slice_targets() {
+        let service = core_service(
+            "headless",
+            serde_json::json!({
+                "clusterIP": "None",
+                "selector": {"app": "headless"},
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let endpoint_slice = endpoint_slice_for_service(
+            "headless",
+            vec![
+                serde_json::json!({
+                    "addresses": ["10.1.0.11"],
+                    "conditions": {"ready": true}
+                }),
+                serde_json::json!({
+                    "addresses": ["10.1.0.12"],
+                    "conditions": {"ready": true}
+                }),
+            ],
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/headless"}}],
+                    "backendRefs": [{"name": "headless", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, endpoint_slice, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("headless EndpointSlice service should translate");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.upstreams.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].upstream_id.as_deref(),
+            Some(result.config.upstreams[0].id.as_str())
+        );
+        assert_eq!(result.config.upstreams[0].targets.len(), 2);
+        assert_eq!(result.config.upstreams[0].targets[0].host, "10.1.0.11");
+        assert_eq!(result.config.upstreams[0].targets[0].port, 3000);
+        assert_eq!(result.config.upstreams[0].targets[1].host, "10.1.0.12");
+        assert_eq!(result.config.upstreams[0].targets[1].port, 3000);
+    }
+
+    #[test]
+    fn http_route_endpoint_expansion_preserves_backend_ref_weight_totals() {
+        let manual = core_service(
+            "manual",
+            serde_json::json!({
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let manual_slice = endpoint_slice_for_service(
+            "manual",
+            vec![
+                serde_json::json!({
+                    "addresses": ["10.1.0.21"],
+                    "conditions": {"ready": true}
+                }),
+                serde_json::json!({
+                    "addresses": ["10.1.0.22"],
+                    "conditions": {"ready": true}
+                }),
+            ],
+        );
+        let direct = core_service(
+            "direct",
+            serde_json::json!({
+                "clusterIP": "10.96.0.20",
+                "selector": {"app": "direct"},
+                "ports": [{"port": 8080}]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/weighted"}}],
+                    "backendRefs": [
+                        {"name": "manual", "port": 8080, "weight": 1},
+                        {"name": "direct", "port": 8080, "weight": 1}
+                    ]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[manual, manual_slice, direct, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("mixed endpoint and service backends should translate");
+
+        let upstream = result.config.upstreams.first().expect("weighted upstream");
+        assert_eq!(upstream.targets.len(), 3);
+        let expanded_total: u32 = upstream
+            .targets
+            .iter()
+            .filter(|target| target.host.starts_with("10.1.0."))
+            .map(|target| target.weight)
+            .sum();
+        let direct_weight = upstream
+            .targets
+            .iter()
+            .find(|target| target.host == "direct.default.svc.cluster.local")
+            .map(|target| target.weight)
+            .expect("direct service target");
+        assert_eq!(expanded_total, direct_weight);
+        assert!(
+            upstream
+                .targets
+                .iter()
+                .filter(|target| target.host.starts_with("10.1.0."))
+                .all(|target| target.weight > 0)
+        );
+    }
+
+    #[test]
+    fn http_route_endpoint_expansion_normalizes_scaled_weights_under_target_limit() {
+        let manual = core_service(
+            "manual",
+            serde_json::json!({
+                "ports": [{
+                    "name": "first-port",
+                    "port": 8080,
+                    "targetPort": 3000
+                }]
+            }),
+        );
+        let manual_slice = endpoint_slice_for_service(
+            "manual",
+            vec![
+                serde_json::json!({
+                    "addresses": ["10.1.0.31"],
+                    "conditions": {"ready": true}
+                }),
+                serde_json::json!({
+                    "addresses": ["10.1.0.32"],
+                    "conditions": {"ready": true}
+                }),
+            ],
+        );
+        let direct = core_service(
+            "direct",
+            serde_json::json!({
+                "clusterIP": "10.96.0.30",
+                "selector": {"app": "direct"},
+                "ports": [{"port": 8080}]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/weighted"}}],
+                    "backendRefs": [
+                        {"name": "direct", "port": 8080, "weight": 90},
+                        {"name": "manual", "port": 8080, "weight": 10}
+                    ]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[manual, manual_slice, direct, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("mixed endpoint and service backends should translate");
+
+        let upstream = result.config.upstreams.first().expect("weighted upstream");
+        assert!(
+            upstream
+                .targets
+                .iter()
+                .all(|target| target.weight <= MAX_TARGET_WEIGHT),
+            "scaled Gateway API weights must remain within Ferrum's upstream target limit"
+        );
+        let expanded_total: u32 = upstream
+            .targets
+            .iter()
+            .filter(|target| target.host.starts_with("10.1.0."))
+            .map(|target| target.weight)
+            .sum();
+        let direct_weight = upstream
+            .targets
+            .iter()
+            .find(|target| target.host == "direct.default.svc.cluster.local")
+            .map(|target| target.weight)
+            .expect("direct service target");
+        let ratio = f64::from(direct_weight) / f64::from(expanded_total);
+        assert!(
+            (ratio - 9.0).abs() < 0.02,
+            "normalized weights should preserve the 90:10 backendRef ratio, got {ratio}"
+        );
     }
 
     #[test]
@@ -2456,6 +5619,496 @@ mod tests {
     }
 
     #[test]
+    fn http_route_request_header_modifier_emits_dispatch_transform_and_consumer() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/set"}}],
+                        "filters": [{
+                            "type": "RequestHeaderModifier",
+                            "requestHeaderModifier": {
+                                "set": [{"name": "X-Set", "value": "set"}],
+                                "add": [{"name": "X-Add", "value": "add"}],
+                                "remove": ["X-Remove"]
+                            }
+                        }],
+                        "backendRefs": [{"name": "api", "port": 8080}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "request_transformer"),
+            "route-level transforms need a request_transformer consumer"
+        );
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for route actions");
+        let request_transform = dispatch.config["rules"][0]["request_transform"]
+            .as_array()
+            .expect("request transform rules");
+        assert_eq!(request_transform.len(), 3);
+        assert_eq!(request_transform[0]["operation"], "update");
+        assert_eq!(request_transform[1]["operation"], "add");
+        assert_eq!(request_transform[2]["operation"], "remove");
+    }
+
+    #[test]
+    fn merged_http_route_preserves_request_header_transformer_consumer() {
+        let mut plain = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/merge"},
+                        "method": "GET"
+                    }],
+                    "backendRefs": [{"name": "plain", "port": 8080}]
+                }]
+            }),
+        );
+        plain.metadata.name = "plain".to_string();
+        plain.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut transformed = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["api.example.com"],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/merge"},
+                        "method": "POST"
+                    }],
+                    "filters": [{
+                        "type": "RequestHeaderModifier",
+                        "requestHeaderModifier": {
+                            "set": [{"name": "X-Merged", "value": "yes"}]
+                        }
+                    }],
+                    "backendRefs": [{"name": "transformed", "port": 8081}]
+                }]
+            }),
+        );
+        transformed.metadata.name = "transformed".to_string();
+        transformed.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result =
+            translate_k8s_objects(&[plain, transformed], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let proxy_id = result.config.proxies[0].id.as_str();
+        let request_transformer = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "request_transformer")
+            .expect("merged route-level transform must keep a consumer");
+        assert_eq!(request_transformer.proxy_id.as_deref(), Some(proxy_id));
+        assert_eq!(
+            request_transformer.id,
+            format!("__istio_vs_req_xform_{proxy_id}")
+        );
+        assert!(
+            result.config.proxies[0]
+                .plugins
+                .iter()
+                .any(|association| { association.plugin_config_id == request_transformer.id })
+        );
+    }
+
+    #[test]
+    fn http_route_request_redirect_without_backend_materializes_dispatch_redirect() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {"hostname": "example.org"}
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("/redirect")
+        );
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["authority"], "example.org");
+        assert_eq!(redirect["redirect_code"], 302);
+    }
+
+    #[test]
+    fn http_route_request_redirect_port_without_hostname_preserves_request_host() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "scheme": "https",
+                                "port": 8443,
+                                "statusCode": 301
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["scheme"], "https");
+        assert_eq!(redirect["port"], 8443);
+        assert_eq!(redirect["redirect_code"], 301);
+        assert!(
+            redirect.get("authority").is_none(),
+            "port-only redirect must preserve the request host at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_request_redirect_scheme_derives_default_port() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/secure"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "scheme": "https",
+                                "statusCode": 301
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["scheme"], "https");
+        assert_eq!(redirect["port"], 443);
+        assert!(
+            redirect.get("authority").is_none(),
+            "scheme-derived port must still preserve the request host at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_request_redirect_hostname_keeps_default_port_structured() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/secure"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "hostname": "example.org",
+                                "scheme": "https",
+                                "statusCode": 301
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect-only route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["authority"], "example.org");
+        assert_eq!(redirect["scheme"], "https");
+        assert_eq!(redirect["port"], 443);
+    }
+
+    #[test]
+    fn http_route_status_only_request_redirect_materializes_dispatch_redirect() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {"statusCode": 301}
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("status-only redirect route should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["redirect_code"], 301);
+        assert!(
+            redirect
+                .as_object()
+                .is_some_and(|object| object.keys().all(|key| key == "redirect_code")),
+            "status-only redirect must preserve request URL at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_request_redirect_without_port_uses_attached_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 8080,
+                    "protocol": "HTTP"
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/redirect"}}],
+                    "filters": [{
+                        "type": "RequestRedirect",
+                        "requestRedirect": {"statusCode": 301}
+                    }]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["redirect_code"], 301);
+        assert_eq!(redirect["port"], 8080);
+        assert!(
+            redirect.get("authority").is_none(),
+            "listener-derived port must still preserve the request host at the DP"
+        );
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_preserves_match_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/old"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                },
+                                "statusCode": 302
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/old");
+        assert!(
+            redirect.as_object().is_some_and(
+                |object| !object.contains_key(GATEWAY_API_REDIRECT_REPLACE_PREFIX_MATCH_KEY)
+            ),
+            "private translator marker must not reach DP config"
+        );
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_defaults_match_path_type_to_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"value": "/old"}}],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                }
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/old");
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_defaults_missing_match_to_root_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                }
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("default-match prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let redirect = &dispatch.config["rules"][0]["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/");
+    }
+
+    #[test]
+    fn http_route_replace_prefix_redirect_defaults_predicate_only_match_to_root_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{
+                            "headers": [{"name": "x-mode", "value": "preview"}]
+                        }],
+                        "filters": [{
+                            "type": "RequestRedirect",
+                            "requestRedirect": {
+                                "path": {
+                                    "type": "ReplacePrefixMatch",
+                                    "replacePrefixMatch": "/new"
+                                }
+                            }
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("predicate-only prefix redirect route should materialize");
+
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("dispatch plugin should be emitted for redirect");
+        let rule = &dispatch.config["rules"][0];
+        assert_eq!(rule["match"]["headers"]["x-mode"], "preview");
+        let redirect = &rule["redirect"];
+        assert_eq!(redirect["uri"], "/new");
+        assert_eq!(redirect["match_prefix"], "/");
+    }
+
+    #[test]
     fn http_route_dispatch_skips_partially_supported_predicate_matches() {
         let result = translate_k8s_objects(
             &[object(
@@ -2509,7 +6162,8 @@ mod tests {
     }
 
     #[test]
-    fn http_route_rejects_cross_namespace_gateway_parent_ref() {
+    fn http_route_rejects_cross_namespace_gateway_parent_ref_when_listener_does_not_allow_route_namespace()
+     {
         let err = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -2530,7 +6184,392 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("only same-namespace Gateway attachments are accepted")
+                .contains("not permitted by the target Gateway listener")
+        );
+    }
+
+    #[test]
+    fn http_route_accepts_cross_namespace_gateway_parent_ref_when_listener_allows_route_namespace()
+    {
+        let gateway = object_in_namespace(
+            "Gateway",
+            "platform",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"}
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "namespace": "platform",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[gateway, route],
+            options().with_source_namespaces(vec!["default".to_string(), "platform".to_string()]),
+        )
+        .expect("listener allowed cross-namespace parentRef");
+
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/admin"))
+            .expect("route proxy materialized");
+        assert_eq!(proxy.namespace, "platform");
+        assert_eq!(proxy.backend_host, "admin.default.svc.cluster.local");
+    }
+
+    #[test]
+    fn http_route_materializes_for_each_valid_parent_gateway_namespace() {
+        let gateway_a = object_in_namespace(
+            "Gateway",
+            "platform-a",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"}
+                    }
+                }]
+            }),
+        );
+        let gateway_b = object_in_namespace(
+            "Gateway",
+            "platform-b",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"}
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [
+                    {"name": "sample", "namespace": "platform-a", "sectionName": "web"},
+                    {"name": "sample", "namespace": "platform-b", "sectionName": "web"}
+                ],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/multi"}}],
+                    "backendRefs": [{"name": "multi", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[gateway_a, gateway_b, route],
+            options().with_source_namespaces(vec![
+                "default".to_string(),
+                "platform-a".to_string(),
+                "platform-b".to_string(),
+            ]),
+        )
+        .expect("route should materialize for each valid parent namespace");
+
+        let mut namespaces: Vec<_> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.namespace.as_str())
+            .collect();
+        namespaces.sort();
+        assert_eq!(namespaces, vec!["platform-a", "platform-b"]);
+        assert_ne!(result.config.proxies[0].id, result.config.proxies[1].id);
+    }
+
+    #[test]
+    fn http_route_allowed_routes_selector_honors_match_expressions_without_pod_discovery() {
+        let gateway = object_in_namespace(
+            "Gateway",
+            "platform",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {
+                            "from": "Selector",
+                            "selector": {
+                                "matchExpressions": [
+                                    {"key": "env", "operator": "In", "values": ["prod"]},
+                                    {"key": "team", "operator": "Exists"}
+                                ]
+                            }
+                        }
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "namespace": "platform",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/selected"}}],
+                    "backendRefs": [{"name": "selected", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[
+                namespace("default", &[("env", "prod"), ("team", "payments")]),
+                namespace("platform", &[("env", "platform")]),
+                gateway,
+                route,
+            ],
+            options().with_source_namespaces(vec!["default".to_string(), "platform".to_string()]),
+        )
+        .expect("selector expression route should translate without pod discovery");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("/selected")
+        );
+        assert_eq!(result.config.proxies[0].namespace, "platform");
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_when_listener_allowed_kinds_exclude_http_route() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "GRPCRoute"}]
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("listener allowedRoutes.kinds should exclude HTTPRoute");
+
+        assert!(
+            err.to_string()
+                .contains("not permitted by the target Gateway listener")
+        );
+    }
+
+    #[test]
+    fn http_route_materializes_allowed_parent_when_sibling_parent_ref_is_not_allowed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [
+                    {
+                        "name": "web",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "hostname": "ok.example.com",
+                        "allowedRoutes": {
+                            "namespaces": {"from": "All"},
+                            "kinds": [{"kind": "HTTPRoute"}]
+                        }
+                    },
+                    {
+                        "name": "grpc",
+                        "port": 8080,
+                        "protocol": "HTTP",
+                        "hostname": "blocked.example.com",
+                        "allowedRoutes": {
+                            "namespaces": {"from": "All"},
+                            "kinds": [{"kind": "GRPCRoute"}]
+                        }
+                    }
+                ]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["ok.example.com", "blocked.example.com"],
+                "parentRefs": [
+                    {"name": "sample", "sectionName": "web"},
+                    {"name": "sample", "sectionName": "grpc"}
+                ],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/ok"}}],
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("allowed parentRef should materialize");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].hosts,
+            vec!["ok.example.com".to_string()]
+        );
+        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/ok"));
+        assert!(result.materialized_route_parents.iter().any(|parent| {
+            parent.route.kind == "HTTPRoute"
+                && parent.route.name == "sample"
+                && parent.parent_ref == "gateway.networking.k8s.io/Gateway/default/sample/web/*"
+        }));
+        assert!(!result.materialized_route_parents.iter().any(|parent| {
+            parent.route.kind == "HTTPRoute"
+                && parent.route.name == "sample"
+                && parent.parent_ref == "gateway.networking.k8s.io/Gateway/default/sample/grpc/*"
+        }));
+    }
+
+    #[test]
+    fn grpc_route_can_attach_to_http_listener_when_allowed() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "GRPCRoute"}]
+                    }
+                }]
+            }),
+        );
+        let route = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "web"
+                }],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/grpc"},
+                        "method": {
+                            "service": "ferrum.echo.v1.Echo",
+                            "method": "Ping"
+                        }
+                    }],
+                    "backendRefs": [{"name": "grpc", "port": 50051}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[gateway, route], options())
+            .expect("HTTP listeners should allow GRPCRoute when requested");
+
+        assert_eq!(result.config.proxies.len(), 1);
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_when_section_name_listener_is_absent() {
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "sectionName": "missing"
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[route], options())
+            .expect_err("explicit missing listener selector should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("does not match any known Gateway listener")
+        );
+    }
+
+    #[test]
+    fn http_route_rejects_parent_ref_when_port_does_not_match_listener() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "web",
+                    "port": 80,
+                    "protocol": "HTTP"
+                }]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "port": 81
+                }],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                    "backendRefs": [{"name": "admin", "port": 8080}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(&[gateway, route], options())
+            .expect_err("parentRef port should match a Gateway listener");
+
+        assert!(
+            err.to_string()
+                .contains("does not match any known Gateway listener")
         );
     }
 
@@ -2915,6 +6954,85 @@ mod tests {
     }
 
     #[test]
+    fn tcp_route_uses_materialized_gateway_listener_port() {
+        let gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 15432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+                }]
+            }),
+        );
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "parentRefs": [{"name": "sample"}],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let result =
+            translate_k8s_objects(&[gateway, route], options()).expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_port, 5432);
+        assert_eq!(result.config.proxies[0].listen_port, Some(15432));
+        assert_eq!(
+            result.config.proxies[0].backend_scheme,
+            Some(BackendScheme::Tcp)
+        );
+    }
+
+    #[test]
+    fn tcp_route_rejects_cross_namespace_parent_ref_until_l4_parent_materialization_exists() {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tcp",
+                    "port": 5432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {
+                        "namespaces": {"from": "All"},
+                        "kinds": [{"kind": "TCPRoute"}]
+                    }
+                }]
+            }),
+        );
+        gateway.metadata.namespace = "infra".to_string();
+        let route = object(
+            "TCPRoute",
+            serde_json::json!({
+                "parentRefs": [{
+                    "name": "sample",
+                    "namespace": "infra"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "db", "port": 5432}]
+                }]
+            }),
+        );
+
+        let err = translate_k8s_objects(
+            &[gateway, route],
+            options().with_source_namespaces(vec!["default".to_string(), "infra".to_string()]),
+        )
+        .expect_err("cross-namespace L4 parentRefs should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("cross-namespace parentRefs are not supported")
+        );
+    }
+
+    #[test]
     fn tcp_route_skips_zero_weight_backend_refs() {
         let result = translate_k8s_objects(
             &[object(
@@ -2997,6 +7115,7 @@ mod tests {
             &[object(
                 "Gateway",
                 serde_json::json!({
+                    "gatewayClassName": "ferrum",
                     "listeners": [{"name": "http", "port": 70000, "protocol": "HTTP"}]
                 }),
             )],
@@ -3031,8 +7150,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_namespace_backend_ref_without_reference_grant() {
-        let err = translate_k8s_objects(
+    fn unresolved_cross_namespace_backend_ref_materializes_fail_closed_route() {
+        let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
                 serde_json::json!({
@@ -3047,11 +7166,74 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("cross-namespace backendRef must fail closed");
+        .expect("cross-namespace backendRef should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
+        );
+    }
+
+    #[test]
+    fn existing_service_with_missing_backend_ref_port_materializes_fail_closed_route() {
+        let service = core_service(
+            "api",
+            serde_json::json!({
+                "ports": [{"name": "http", "port": 8080}]
+            }),
+        );
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 9090}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(&[service, route], options())
+            .expect("missing Service port should translate to invalid backend behavior");
+
+        assert_invalid_backend_fault_route(&result, "Gateway API backendRef Service was not found");
+    }
+
+    #[test]
+    fn mixed_valid_and_invalid_backend_refs_preserve_invalid_weight_as_fault_percentage() {
+        let result = translate_k8s_objects(
+            &[object(
+                "HTTPRoute",
+                serde_json::json!({
+                    "rules": [{
+                        "matches": [{"path": {"type": "PathPrefix", "value": "/mixed"}}],
+                        "backendRefs": [
+                            {"name": "valid", "port": 8080, "weight": 3},
+                            {"name": "blocked", "namespace": "other", "port": 8080, "weight": 1}
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("mixed backendRefs should translate with weighted fault");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].backend_host,
+            "valid.default.svc.cluster.local"
+        );
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("mixed invalid backendRefs need dispatch fault");
+        let abort = &dispatch.config["rules"][0]["fault"]["abort"];
+        assert_eq!(abort["status_code"], 500);
+        assert_eq!(abort["percentage"], 25.0);
+        let body: Value = serde_json::from_str(abort["body"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            body["error"].as_str(),
+            Some("Gateway API backendRef is not permitted by ReferenceGrant")
         );
     }
 
@@ -3088,7 +7270,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_namespace_backend_ref_when_reference_grant_from_group_mismatches() {
+    fn mismatched_reference_grant_from_group_materializes_fail_closed_route() {
         let route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -3117,17 +7299,17 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(&[route, grant], options())
-            .expect_err("ReferenceGrant group must match route API group");
+        let result = translate_k8s_objects(&[route, grant], options())
+            .expect("ReferenceGrant group mismatch should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 
     #[test]
-    fn rejects_cross_namespace_backend_ref_when_reference_grant_to_group_mismatches() {
+    fn mismatched_reference_grant_to_group_materializes_fail_closed_route() {
         let route = object(
             "HTTPRoute",
             serde_json::json!({
@@ -3156,18 +7338,18 @@ mod tests {
             }),
         );
 
-        let err = translate_k8s_objects(&[route, grant], options())
-            .expect_err("ReferenceGrant target group must match backendRef group");
+        let result = translate_k8s_objects(&[route, grant], options())
+            .expect("ReferenceGrant target group mismatch should translate fail-closed");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 
     #[test]
-    fn rejects_unsupported_backend_ref_kind() {
-        let err = translate_k8s_objects(
+    fn unsupported_backend_ref_kind_materializes_fail_closed_route() {
+        let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
                 serde_json::json!({
@@ -3184,12 +7366,9 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("non-Service backendRefs must fail closed");
+        .expect("non-Service backendRefs should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("only core Service backendRefs are supported")
-        );
+        assert_invalid_backend_fault_route(&result, "Gateway API backendRef kind is unsupported");
     }
 
     #[test]
@@ -3265,12 +7444,12 @@ mod tests {
         );
         let options = options().with_source_namespaces(vec!["default".to_string()]);
 
-        let err = translate_k8s_objects(&[route, grant], options)
-            .expect_err("ReferenceGrant from an excluded namespace must not authorize the route");
+        let result = translate_k8s_objects(&[route, grant], options)
+            .expect("excluded ReferenceGrant should translate to a fail-closed route");
 
-        assert!(
-            err.to_string()
-                .contains("requires a matching ReferenceGrant")
+        assert_invalid_backend_fault_route(
+            &result,
+            "Gateway API backendRef is not permitted by ReferenceGrant",
         );
     }
 
@@ -3401,6 +7580,20 @@ mod tests {
         assert_eq!(
             result.config.proxies[0].backend_host,
             "db.default.svc.corp.example"
+        );
+    }
+
+    fn assert_proxy_hosts(proxies: &[Proxy], listen_path: &str, expected_hosts: &[&str]) {
+        let proxy = proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some(listen_path))
+            .unwrap_or_else(|| panic!("missing proxy for {listen_path}"));
+        assert_eq!(
+            proxy.hosts,
+            expected_hosts
+                .iter()
+                .map(|host| host.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }

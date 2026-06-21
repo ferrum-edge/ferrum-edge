@@ -3,6 +3,7 @@ use ferrum_edge::config::db_backend::{
     IncrementalResult, extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // extract_db_hostname — tests for MongoDB URLs
@@ -44,6 +45,39 @@ fn extract_hostname_mongodb_with_options() {
     assert_eq!(extract_db_hostname(url), Some("mongo.internal".to_string()));
 }
 
+#[test]
+fn extract_hostname_mongodb_multi_host_uses_first_dns_host() {
+    let url = "mongodb://user:pass@mongo1.internal:27017,mongo2.internal:27017,mongo3.internal:27017/ferrum?replicaSet=rs0";
+    assert_eq!(
+        extract_db_hostname(url),
+        Some("mongo1.internal".to_string())
+    );
+}
+
+#[test]
+fn extract_hostname_mongodb_multi_host_first_ip_literal_returns_none() {
+    let url = "mongodb://user:pass@192.0.2.10:27017,mongo2.internal:27017/ferrum?replicaSet=rs0";
+    assert_eq!(extract_db_hostname(url), None);
+}
+
+#[test]
+fn extract_hostname_mongodb_multi_host_without_ports_uses_first_host() {
+    // Seed lists that omit explicit ports are accepted by the `url` crate as a
+    // single comma-joined host; DNS rotation must still track the first seed
+    // host rather than the unresolvable combined authority.
+    let url = "mongodb://user:pass@mongo1.internal,mongo2.internal,mongo3.internal/ferrum";
+    assert_eq!(
+        extract_db_hostname(url),
+        Some("mongo1.internal".to_string())
+    );
+}
+
+#[test]
+fn extract_hostname_mongodb_multi_host_without_ports_first_ip_returns_none() {
+    let url = "mongodb://user:pass@192.0.2.10,mongo2.internal/ferrum?replicaSet=rs0";
+    assert_eq!(extract_db_hostname(url), None);
+}
+
 // ---------------------------------------------------------------------------
 // redact_url — tests for MongoDB URLs
 // ---------------------------------------------------------------------------
@@ -64,6 +98,194 @@ fn redact_mongodb_srv_url() {
     let redacted = redact_url(url);
     assert!(!redacted.contains("pass"));
     assert!(redacted.contains("cluster0.abc123.mongodb.net"));
+}
+
+#[test]
+fn redact_url_hides_sensitive_query_credentials() {
+    let url = concat!(
+        "postgres://db.example.com:5432/ferrum?",
+        "user=alice&password=supersecret&sslpassword=tls-secret&",
+        "token=bearer-token&sslmode=require"
+    );
+    let redacted = redact_url(url);
+
+    assert!(!redacted.contains("alice"));
+    assert!(!redacted.contains("supersecret"));
+    assert!(!redacted.contains("tls-secret"));
+    assert!(!redacted.contains("bearer-token"));
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("user").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("password").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("sslpassword").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("token").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+}
+
+#[test]
+fn redact_url_hides_mongodb_and_sqlite_query_secrets() {
+    let mongo =
+        redact_url("mongodb://mongo.example.com:27017/ferrum?authSource=admin&password=leakytoken");
+    assert!(!mongo.contains("leakytoken"));
+    let parsed_mongo = url::Url::parse(&mongo).expect("redacted MongoDB URL should parse");
+    let mongo_pairs: HashMap<String, String> = parsed_mongo.query_pairs().into_owned().collect();
+    assert_eq!(
+        mongo_pairs.get("authSource").map(String::as_str),
+        Some("admin")
+    );
+    assert_eq!(mongo_pairs.get("password").map(String::as_str), Some("***"));
+
+    let sqlite = redact_url("sqlite://ferrum.db?key=supersecret&mode=rwc");
+    assert!(!sqlite.contains("supersecret"));
+    let parsed_sqlite = url::Url::parse(&sqlite).expect("redacted SQLite URL should parse");
+    let sqlite_pairs: HashMap<String, String> = parsed_sqlite.query_pairs().into_owned().collect();
+    assert_eq!(sqlite_pairs.get("key").map(String::as_str), Some("***"));
+    assert_eq!(sqlite_pairs.get("mode").map(String::as_str), Some("rwc"));
+}
+
+#[test]
+fn redact_url_handles_mongodb_multi_host_replica_set_urls() {
+    let redacted = redact_url(
+        "mongodb://user:secretpass@host1:27017,host2:27017,host3:27017/ferrum?replicaSet=rs0&password=query-secret",
+    );
+
+    assert!(!redacted.contains("user"));
+    assert!(!redacted.contains("secretpass"));
+    assert!(!redacted.contains("query-secret"));
+    assert!(redacted.starts_with("mongodb://***@host1:27017,host2:27017,host3:27017/ferrum?"));
+    assert!(redacted.contains("replicaSet=rs0"));
+    assert!(redacted.contains("password=***"));
+}
+
+#[test]
+fn redact_url_matches_sensitive_query_keys_case_insensitively() {
+    let redacted = redact_url("postgres://db.example.com/ferrum?Password=secret&Api_Key=token");
+    assert!(!redacted.contains("secret"));
+    assert!(!redacted.contains("token"));
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("Password").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("Api_Key").map(String::as_str), Some("***"));
+}
+
+#[test]
+fn redact_url_hides_mongodb_keyfile_password_alias() {
+    // MongoDB's `tlsCertificateKeyFilePassword` carries the private key file's
+    // passphrase; it is recognized as a DB TLS URL option and logged via
+    // `redact_url` on the FERRUM_DB_TLS_MODE warning path, so it must be
+    // redacted even though it is not in the exact-key list.
+    let redacted = redact_url(concat!(
+        "mongodb://mongo.example.com:27017/ferrum?",
+        "tls=true&tlsCertificateKeyFile=/certs/client.pem&",
+        "tlsCertificateKeyFilePassword=keyfile-secret"
+    ));
+    assert!(
+        !redacted.contains("keyfile-secret"),
+        "key-file password leaked: {redacted}"
+    );
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs
+            .get("tlsCertificateKeyFilePassword")
+            .map(String::as_str),
+        Some("***")
+    );
+    // The certificate/key file *path* is not a secret and must be preserved so
+    // the redacted log remains actionable.
+    assert_eq!(
+        pairs.get("tlsCertificateKeyFile").map(String::as_str),
+        Some("/certs/client.pem")
+    );
+    assert_eq!(pairs.get("tls").map(String::as_str), Some("true"));
+}
+
+#[test]
+fn redact_url_redacts_credential_substring_aliases() {
+    // OAuth-style aliases reach the substring matcher after separator
+    // normalization.
+    let redacted = redact_url(concat!(
+        "postgres://db.example.com/ferrum?",
+        "Client-Secret=cs&access.token=at&Refresh_Token=rt&credential=cr&sslmode=require"
+    ));
+    for leaked in ["=cs", "=at", "=rt", "=cr"] {
+        assert!(!redacted.contains(leaked), "leaked {leaked}: {redacted}");
+    }
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("Client-Secret").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("access.token").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("Refresh_Token").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("credential").map(String::as_str), Some("***"));
+    // Non-secret TLS options remain untouched.
+    assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+}
+
+#[test]
+fn redact_url_redacts_mongodb_semicolon_separated_options() {
+    // MongoDB accepts `;` as an option separator; the `url` crate's query parser
+    // only splits on `&`, so a `;`-joined credential must still be redacted.
+    // No-port seed list parses successfully and flows through the OK arm.
+    let redacted = redact_url(
+        "mongodb://u:p@db0,db1/ferrum?replicaSet=rs0;password=query-secret;authSource=admin",
+    );
+    assert!(
+        !redacted.contains("query-secret"),
+        "semicolon password leaked: {redacted}"
+    );
+    assert!(redacted.contains("replicaSet=rs0"));
+    assert!(redacted.contains("password=***"));
+    assert!(redacted.contains("authSource=admin"));
+
+    // Explicit ports make the authority unparseable, exercising the multi-host
+    // fallback redactor on the same `;`-separated option string.
+    let redacted_ports =
+        redact_url("mongodb://u:p@db0:27017,db1:27017/ferrum?replicaSet=rs0;password=query-secret");
+    assert!(
+        !redacted_ports.contains("query-secret"),
+        "semicolon password leaked via fallback: {redacted_ports}"
+    );
+    assert!(redacted_ports.contains("password=***"));
+    assert!(redacted_ports.contains("replicaSet=rs0"));
+}
+
+#[test]
+fn redact_url_redacts_mongodb_auth_mechanism_properties_tokens() {
+    // MONGODB-AWS temporary credentials carry the session token inside the
+    // `authMechanismProperties` value; the key itself is not sensitive, so the
+    // credential-bearing property values must be redacted.
+    let redacted = redact_url(concat!(
+        "mongodb://u:p@db0,db1/ferrum?authMechanism=MONGODB-AWS&",
+        "authMechanismProperties=AWS_SESSION_TOKEN:sessiontoken,",
+        "AWS_SECRET_ACCESS_KEY:topsecret,CANONICALIZE_HOST_NAME:true"
+    ));
+    assert!(
+        !redacted.contains("sessiontoken"),
+        "AWS session token leaked: {redacted}"
+    );
+    assert!(
+        !redacted.contains("topsecret"),
+        "AWS secret access key leaked: {redacted}"
+    );
+    assert!(redacted.contains("AWS_SESSION_TOKEN:***"));
+    assert!(redacted.contains("AWS_SECRET_ACCESS_KEY:***"));
+    // Benign properties remain for observability.
+    assert!(redacted.contains("CANONICALIZE_HOST_NAME:true"));
+
+    // Same option carried through the multi-host fallback (explicit ports).
+    let redacted_ports = redact_url(concat!(
+        "mongodb://u:p@db0:27017,db1:27017/ferrum?authMechanism=MONGODB-AWS&",
+        "authMechanismProperties=AWS_SESSION_TOKEN:sessiontoken"
+    ));
+    assert!(
+        !redacted_ports.contains("sessiontoken"),
+        "AWS session token leaked via fallback: {redacted_ports}"
+    );
+    assert!(redacted_ports.contains("AWS_SESSION_TOKEN:***"));
 }
 
 // ---------------------------------------------------------------------------

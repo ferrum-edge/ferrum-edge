@@ -141,6 +141,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
                 proxy,
                 &target.host,
                 target.port,
+                target.dispatch_policy_port(),
                 hbone_port,
                 expected_peer.as_ref(),
             )
@@ -180,7 +181,14 @@ pub(crate) async fn handle_mesh_tcp_egress(
         let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(&target);
         match state
             .mesh_mtls_pool
-            .open_connect_tunnel(proxy, &target.host, target.port, mtls_port, &expected_peer)
+            .open_connect_tunnel(
+                proxy,
+                &target.host,
+                target.port,
+                target.dispatch_policy_port(),
+                mtls_port,
+                &expected_peer,
+            )
             .await
         {
             Ok(tunnel) => (tunnel, "mtls"),

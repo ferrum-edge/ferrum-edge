@@ -8,6 +8,8 @@ use ferrum_edge::admin::{
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::TransactionSummary;
+use ferrum_edge::plugins::mesh::prometheus_helpers::mesh_request_key;
+use ferrum_edge::plugins::mesh::service_graph::record_transaction_with_mesh_key;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -152,7 +154,7 @@ fn seed_service_graph_edge(source_principal: &str, destination_principal: &str) 
         ),
     ]);
 
-    ferrum_edge::plugins::mesh::service_graph::record_transaction(&TransactionSummary {
+    let summary = TransactionSummary {
         namespace: "default".to_string(),
         proxy_id: Some("reviews".to_string()),
         proxy_name: Some("reviews".to_string()),
@@ -160,7 +162,9 @@ fn seed_service_graph_edge(source_principal: &str, destination_principal: &str) 
         latency_total_ms: 7.5,
         metadata,
         ..TransactionSummary::default()
-    });
+    };
+    let mesh_key = mesh_request_key(&summary);
+    record_transaction_with_mesh_key(&summary, mesh_key.as_ref());
 }
 
 async fn fetch_service_graph(base_url: &str, token: &str) -> (reqwest::StatusCode, Value) {

@@ -227,6 +227,38 @@ pub fn policy_deny_principal(
     }
 }
 
+/// Build an AUDIT-only `MeshPolicy` for a specific SPIFFE ID glob. AUDIT is
+/// non-enforcing per Istio semantics (records metadata and continues), so it is
+/// used to assert the construction-time fail-closed scope guards EXEMPT
+/// audit-only selector policies.
+pub fn policy_audit_principal(
+    name: &str,
+    namespace: &str,
+    scope: PolicyScope,
+    principal_glob: &str,
+) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(principal_glob.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new(DEFAULT_TRUST_DOMAIN).expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Audit,
+        }],
+    }
+}
+
 /// Build an ALLOW policy that also constrains the request path/method.
 pub fn policy_allow_request(
     name: &str,
@@ -312,6 +344,7 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -359,6 +392,7 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         targets: vec![UpstreamTarget {
             host: host.to_string(),
             port,
+            service_port_policy_key: None,
             weight: MAX_TARGET_WEIGHT.min(1),
             tags: HashMap::new(),
             locality: None,
@@ -381,6 +415,7 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -403,6 +438,10 @@ pub fn gateway_config_with_mesh(
         plugin_configs: Vec::new(),
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
+        frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
     }

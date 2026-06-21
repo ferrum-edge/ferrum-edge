@@ -551,6 +551,59 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Create a one-off connection manager that is not stored in the shared hot-path cache.
+    ///
+    /// Redis transactions that rely on connection-local state (`WATCH`/`MULTI`/`EXEC`)
+    /// must not share the cached multiplexed manager with unrelated concurrent commands,
+    /// because another command sequence on that same manager can interleave `UNWATCH` or
+    /// `EXEC` and break the optimistic transaction boundary.
+    async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
+        let url = self.resolve_url().await;
+        let client = match self.build_client(&url) {
+            Ok(client) => client,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    error = %e,
+                    "Failed to create dedicated Redis client"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                return None;
+            }
+        };
+
+        let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
+        match tokio::time::timeout(connect_timeout, redis::aio::ConnectionManager::new(client))
+            .await
+        {
+            Ok(Ok(manager)) => {
+                self.available.store(true, Ordering::Relaxed);
+                Some(manager)
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    error = %e,
+                    "Failed to connect dedicated Redis client"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                None
+            }
+            Err(_) => {
+                warn!(
+                    redis_url = %self.config.url,
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Timed out connecting dedicated Redis client"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                None
+            }
+        }
+    }
+
     /// Clear the cached connection so the next `get_connection()` call
     /// re-resolves DNS and creates a fresh connection.
     fn clear_connection(&self) {
@@ -917,6 +970,113 @@ impl RedisRateLimitClient {
                     key = %key,
                     error = %e,
                     "Redis SET+EXPIRE failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Set a raw byte value only if the key does not already exist, with a TTL.
+    ///
+    /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
+    /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    pub async fn set_bytes_nx_with_expire(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<bool, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<Option<String>, redis::RedisError> = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_seconds as i64)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(value) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(value.is_some())
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis SET NX EX failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Delete a key only when its current byte value exactly matches `expected`.
+    ///
+    /// Uses optimistic transactions (`WATCH` + `MULTI`/`EXEC`) instead of Lua so
+    /// RESP-compatible Redis backends that do not support scripting can still
+    /// use ownership-token lock release.
+    pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        let mut conn = self.get_dedicated_connection().await.ok_or(())?;
+
+        let watch_result: Result<(), redis::RedisError> =
+            redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
+        if let Err(e) = watch_result {
+            warn!(
+                key = %key,
+                error = %e,
+                "Redis WATCH failed"
+            );
+            self.mark_unavailable();
+            return Err(());
+        }
+
+        let current: Result<Option<Vec<u8>>, redis::RedisError> =
+            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        match current {
+            Ok(Some(current)) if current == expected => {}
+            Ok(_) => {
+                let _: Result<(), redis::RedisError> =
+                    redis::cmd("UNWATCH").query_async(&mut conn).await;
+                self.available.store(true, Ordering::Relaxed);
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-delete GET failed"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+        }
+
+        let result: Result<Option<(i64,)>, redis::RedisError> = redis::pipe()
+            .atomic()
+            .cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(Some((deleted,))) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(deleted > 0)
+            }
+            Ok(None) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-delete transaction failed"
                 );
                 self.mark_unavailable();
                 Err(())

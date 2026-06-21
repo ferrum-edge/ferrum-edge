@@ -315,6 +315,9 @@ async fn run_cross_protocol_backend_admission_or_reject<S>(
     state: &ProxyState,
     cb_target_key: Option<&str>,
     cb_is_half_open_probe: bool,
+    pending_slot_to_release_before_reject: Option<
+        &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
+    >,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, CrossProtocolOutcome>, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -338,6 +341,9 @@ where
                 cb_target_key,
                 cb_is_half_open_probe,
             );
+            if let Some(slot) = pending_slot_to_release_before_reject {
+                drop(slot.take());
+            }
             let mut headers = rejection.headers;
             crate::proxy::apply_after_proxy_hooks_to_rejection(
                 plugins,
@@ -789,6 +795,255 @@ async fn collect_reqwest_response_body_with_limit(
     }
 }
 
+/// Acquire the shared reqwest client for one H3→HTTP plain-bridge attempt,
+/// resolved from this attempt's effective (per-port) proxy. On pool failure it
+/// records the 502 backend outcome and writes the Bad-Gateway response, then
+/// hands the caller the outcome to return (mirrors the original single-shot
+/// client fetch, now invoked per attempt so a retry that rotated to a different
+/// port gets that port's TLS/ALPN/idle client). Returns `Ok(Ok(client))` on
+/// success, `Ok(Err(outcome))` when the caller should return the written
+/// error, or `Err(_)` only on a stream-write failure.
+///
+/// Both callers run backend admission AND
+/// `record_cross_protocol_connection_start` for the selected target BEFORE this
+/// helper, so a client-build/pool failure here must take the FULL normal outcome
+/// path, exactly like the `http1MaxPendingRequests` overflow shed below: (1)
+/// record the backend-admission outcome (so the 502 connection failure feeds
+/// adaptive concurrency and the permits are released), and (2) END the
+/// least-connections connection via `record_backend_outcome` (conn_end = true)
+/// to BALANCE the connection-start. Using `record_backend_outcome_no_conn_end`
+/// instead would leave the connection-start unended — permanently inflating the
+/// target's active-connection count — and drop the admission permits unrecorded.
+#[allow(clippy::too_many_arguments)]
+async fn get_cross_protocol_client<S>(
+    state: &ProxyState,
+    dispatch_proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+    stream: &mut RequestStream<S, Bytes>,
+    pending_slot_to_release_before_error: Option<
+        &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
+    >,
+) -> Result<Result<reqwest::Client, CrossProtocolOutcome>, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    match state.connection_pool.get_client(dispatch_proxy).await {
+        Ok(c) => Ok(Ok(c)),
+        Err(e) => {
+            error!(
+                proxy_id = %dispatch_proxy.id,
+                "cross-protocol H3→HTTP: failed to get client from pool: {}", e
+            );
+            record_cross_protocol_client_acquire_failure(
+                state,
+                dispatch_proxy,
+                epoch,
+                upstream_balancer,
+                current_target,
+                current_cb_target_key,
+                cb_is_half_open_probe,
+                backend_start,
+                backend_admission_permits,
+                backend_admission_elapsed,
+            );
+            if let Some(slot) = pending_slot_to_release_before_error {
+                drop(slot.take());
+            }
+            let mut outcome = write_error(
+                stream,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"Bad Gateway"}"#,
+                backend_start,
+                0,
+            )
+            .await?;
+            outcome.connection_error = true;
+            Ok(Err(outcome))
+        }
+    }
+}
+
+/// Record the observability accounting for an H3→HTTP plain-bridge client-acquire
+/// (pool/build) failure, BEFORE the Bad-Gateway response is written. Stream-free
+/// so the accounting is unit-testable in isolation.
+///
+/// Both callers run backend admission AND
+/// `record_cross_protocol_connection_start` for the selected target BEFORE the
+/// client acquire, so this failure must take the FULL normal outcome path,
+/// exactly like the `http1MaxPendingRequests` overflow shed: (1) record the
+/// backend-admission outcome (so the 502 connection failure feeds adaptive
+/// concurrency and the permits are released), and (2) END the least-connections
+/// connection via `record_backend_outcome` (conn_end = true) to BALANCE the
+/// connection-start. Using `record_backend_outcome_no_conn_end` instead would
+/// leave the connection-start unended — permanently inflating the target's
+/// active-connection count — and drop the admission permits unrecorded.
+#[allow(clippy::too_many_arguments)]
+fn record_cross_protocol_client_acquire_failure(
+    state: &ProxyState,
+    dispatch_proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) {
+    // Feed the 502 connection failure to adaptive concurrency and release the
+    // admission permits acquired by the caller for this attempt.
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        502,
+        true,
+        None,
+        backend_admission_elapsed,
+    );
+    // END the least-connections connection (conn_end = true) to balance the
+    // `record_cross_protocol_connection_start` the caller issued for this target,
+    // and feed the 502 connection failure to the backend circuit breaker /
+    // passive health / adaptive concurrency — mirroring the H1/H2 reqwest path's
+    // connection-start/connection-end balance and the pending-overflow shed.
+    record_backend_outcome(
+        state,
+        dispatch_proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        current_cb_target_key,
+        502,
+        true,
+        None,
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
+}
+
+/// Run gateway-local dispatch-policy checks that must happen before backend
+/// admission for one H3→HTTP plain-bridge attempt.
+#[allow(clippy::too_many_arguments)]
+async fn run_plain_attempt_local_policy_or_reject<S>(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    dispatch_proxy: &Proxy,
+    stream: &mut RequestStream<S, Bytes>,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    current_url: &str,
+    effective_host: &str,
+    dispatch_port: u16,
+    bytes_sent: u64,
+    halt_request_body_before_reject: bool,
+) -> Result<
+    Result<Option<crate::backend_pending_limit::BackendPendingGuard>, CrossProtocolOutcome>,
+    anyhow::Error,
+>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    if dispatch_proxy.resolved_tls.sni.is_some() {
+        warn!(
+            proxy_id = %dispatch_proxy.id,
+            backend_tls_sni = ?dispatch_proxy.resolved_tls.sni,
+            reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+            "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
+        );
+        record_backend_outcome_no_conn_end(
+            state,
+            dispatch_proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            502,
+            false,
+            Some(ErrorClass::DispatchPolicyRejected),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        if halt_request_body_before_reject {
+            crate::http3::stream_util::halt_request_body(stream);
+        }
+        let mut outcome = write_error_with_header(
+            stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway"}"#,
+            Some((
+                "gateway-error-reason",
+                crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
+            )),
+            backend_start,
+            bytes_sent,
+        )
+        .await?;
+        outcome.backend_target = Some(strip_query_from_backend_url(current_url));
+        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+        return Ok(Err(outcome));
+    }
+
+    let pending_cap =
+        crate::proxy::resolve_backend_http1_max_pending_requests(dispatch_proxy, dispatch_port)
+            .filter(|_| {
+                crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
+            });
+    match state
+        .backend_pending_limit
+        .try_acquire(effective_host, dispatch_port, pending_cap)
+    {
+        Ok(slot) => Ok(Ok(slot)),
+        Err(limit) => {
+            warn!(
+                proxy_id = %dispatch_proxy.id,
+                backend_host = %effective_host,
+                backend_port = dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            record_backend_outcome_no_conn_end(
+                state,
+                dispatch_proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
+                current_target,
+                current_cb_target_key,
+                503,
+                false,
+                Some(ErrorClass::DispatchPolicyRejected),
+                cb_is_half_open_probe,
+                false,
+                backend_start.elapsed(),
+            );
+            if halt_request_body_before_reject {
+                crate::http3::stream_util::halt_request_body(stream);
+            }
+            let mut outcome = write_error(
+                stream,
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"Upstream pending request queue full"}"#,
+                backend_start,
+                bytes_sent,
+            )
+            .await?;
+            outcome.backend_target = Some(strip_query_from_backend_url(current_url));
+            outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+            Ok(Err(outcome))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_plain<S>(
     state: &ProxyState,
@@ -819,77 +1074,30 @@ async fn dispatch_plain<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    if proxy.resolved_tls.sni.is_some() {
-        warn!(
-            proxy_id = %proxy.id,
-            backend_tls_sni = ?proxy.resolved_tls.sni,
-            reason = crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
-            "cross-protocol H3→HTTP bridge cannot honor backend TLS SNI override; returning 502"
-        );
-        record_backend_outcome_no_conn_end(
-            state,
-            proxy,
-            &epoch.load_balancer,
-            upstream_balancer,
-            upstream_target,
-            cb_target_key,
-            502,
-            false,
-            None,
-            cb_is_half_open_probe,
-            false,
-            backend_start.elapsed(),
-        );
-        let mut outcome = write_error_with_header(
-            stream,
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"Bad Gateway"}"#,
-            Some((
-                "gateway-error-reason",
-                crate::proxy::BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON,
-            )),
-            backend_start,
-            raw_prebuffered_body_bytes,
-        )
-        .await?;
-        outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
-        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
-        return Ok(outcome);
-    }
-
-    let client = match state.connection_pool.get_client(proxy).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                proxy_id = %proxy.id,
-                "cross-protocol H3→HTTP: failed to get client from pool: {}", e
-            );
-            record_backend_outcome_no_conn_end(
-                state,
-                proxy,
-                &epoch.load_balancer,
-                upstream_balancer,
-                upstream_target,
-                cb_target_key,
-                502,
-                true,
-                None,
-                cb_is_half_open_probe,
-                false,
-                backend_start.elapsed(),
-            );
-            let mut outcome = write_error(
-                stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Bad Gateway"}"#,
-                backend_start,
-                0,
-            )
-            .await?;
-            outcome.connection_error = true;
-            return Ok(outcome);
-        }
-    };
+    // Honor DestinationRule per-port `connectionPool.http` effective-proxy
+    // overrides for the LB-selected target, mirroring the H1/H2 plain dispatch
+    // path (`proxy_to_backend` / `proxy_to_backend_retry`). The effective proxy
+    // (per-port `idleTimeout` / `http2MaxRequests` / TLS / `h2UpgradePolicy` /
+    // `connectTimeout`, plus the service-discovery top-level fallback) is
+    // RE-RESOLVED per attempt INSIDE the retry loop below (against the failed
+    // attempt's `current_target`), so a retry that rotates to a different port
+    // gets THAT port's policy — the shared reqwest client (`get_client`), the
+    // per-request `connectTimeout` (`build_plain_request_builder`), the SNI
+    // reject, and the `http1MaxPendingRequests` gate all see the selected port's
+    // posture (codex r1 #1806, mirrors how the H1/H2 path re-enters
+    // `resolve_effective_proxy_for_target` per `proxy_to_backend_retry` call).
+    //
+    // The entry-level resolution (against the FIRST `upstream_target`) backs the
+    // proxy-LEVEL decisions below (retry policy / response buffering — both
+    // port-independent) and the post-dispatch outcome recording. The per-ATTEMPT
+    // re-resolution inside the loop (`attempt_effective_proxy` /
+    // `dispatch_proxy`) drives the actual dial. `base_proxy` is the unresolved
+    // route proxy used to re-resolve each attempt's port. Borrowed (zero-alloc)
+    // when no override applies.
+    let base_proxy = proxy;
+    let entry_effective_proxy =
+        crate::proxy::resolve_effective_proxy_for_target(base_proxy, upstream_target);
+    let proxy: &Proxy = entry_effective_proxy.as_ref();
 
     let req_method = match parse_reqwest_method(method) {
         Some(m) => m,
@@ -931,13 +1139,57 @@ where
                 let final_backend_admission_elapsed: Duration;
 
                 let response = loop {
+                    // Re-resolve the effective proxy for THIS attempt's target
+                    // port (finding 5): a retry that rotated to a different port
+                    // must dial with that port's TLS / `h2UpgradePolicy` ALPN /
+                    // `idleTimeout` / `connectTimeout` / pending-cap DR policy.
+                    // This has to run before backend admission so local
+                    // dispatch-policy rejections cannot be masked by admission
+                    // plugins at their own limit.
+                    let attempt_effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
+                        base_proxy,
+                        current_target.as_deref(),
+                    );
+                    let dispatch_proxy: &Proxy = attempt_effective_proxy.as_ref();
+
+                    let effective_host = current_target
+                        .as_deref()
+                        .map(|t| t.host.as_str())
+                        .unwrap_or(dispatch_proxy.backend_host.as_str());
+                    let dispatch_port = current_target
+                        .as_deref()
+                        .map(|t| t.port)
+                        .unwrap_or(dispatch_proxy.backend_port);
+
+                    let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
+                        state,
+                        epoch,
+                        dispatch_proxy,
+                        stream,
+                        upstream_balancer,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                        backend_start,
+                        &current_url,
+                        effective_host,
+                        dispatch_port,
+                        bytes_sent,
+                        false,
+                    )
+                    .await?
+                    {
+                        Ok(slot) => slot,
+                        Err(outcome) => return Ok(outcome),
+                    };
+
                     let backend_admission_start = Instant::now();
                     let mut backend_admission_permits =
                         match run_cross_protocol_backend_admission_or_reject(
                             backend_admission_plugins,
                             plugins,
                             ctx,
-                            proxy,
+                            dispatch_proxy,
                             current_target.as_deref(),
                             HttpFlavor::Plain,
                             stream,
@@ -946,6 +1198,7 @@ where
                             state,
                             current_cb_target_key.as_deref(),
                             cb_retry_probe_slot_available,
+                            Some(&mut pending_slot),
                         )
                         .await?
                         {
@@ -958,14 +1211,30 @@ where
                         current_target.as_deref(),
                     );
 
-                    let effective_host = current_target
-                        .as_deref()
-                        .map(|t| t.host.as_str())
-                        .unwrap_or(proxy.backend_host.as_str());
+                    let client = match get_cross_protocol_client(
+                        state,
+                        dispatch_proxy,
+                        epoch,
+                        upstream_balancer,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                        backend_start,
+                        &mut backend_admission_permits,
+                        backend_admission_start.elapsed(),
+                        stream,
+                        Some(&mut pending_slot),
+                    )
+                    .await?
+                    {
+                        Ok(client) => client,
+                        Err(outcome) => return Ok(outcome),
+                    };
+
                     let send_result = build_plain_request_builder(
                         &client,
                         state,
-                        proxy,
+                        dispatch_proxy,
                         req_method.clone(),
                         proxy_headers,
                         &current_url,
@@ -977,7 +1246,7 @@ where
                     .body(buffered_body.clone())
                     .send()
                     .await;
-
+                    drop(pending_slot);
                     match send_result {
                         Ok(response) => {
                             let attempt_result = crate::retry::BackendResponse {
@@ -1194,13 +1463,55 @@ where
                     )
                     .await;
                 }
+                // Re-resolve the effective proxy for this (single-attempt)
+                // streaming dispatch's target port — same per-target resolution
+                // the buffered retry loop performs (findings 4 & 5). Resolve
+                // before backend admission so local dispatch-policy rejects
+                // preserve H1/H2 ordering on the H3 bridge too.
+                let attempt_effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
+                    base_proxy,
+                    current_target.as_deref(),
+                );
+                let dispatch_proxy: &Proxy = attempt_effective_proxy.as_ref();
+
+                let effective_host = current_target
+                    .as_deref()
+                    .map(|t| t.host.as_str())
+                    .unwrap_or(dispatch_proxy.backend_host.as_str());
+                let dispatch_port = current_target
+                    .as_deref()
+                    .map(|t| t.port)
+                    .unwrap_or(dispatch_proxy.backend_port);
+
+                let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
+                    state,
+                    epoch,
+                    dispatch_proxy,
+                    stream,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &current_url,
+                    effective_host,
+                    dispatch_port,
+                    0,
+                    true,
+                )
+                .await?
+                {
+                    Ok(slot) => slot,
+                    Err(outcome) => return Ok(outcome),
+                };
+
                 let backend_admission_start = Instant::now();
                 let mut backend_admission_permits =
                     match run_cross_protocol_backend_admission_or_reject(
                         backend_admission_plugins,
                         plugins,
                         ctx,
-                        proxy,
+                        dispatch_proxy,
                         current_target.as_deref(),
                         HttpFlavor::Plain,
                         stream,
@@ -1209,6 +1520,7 @@ where
                         state,
                         current_cb_target_key.as_deref(),
                         cb_retry_probe_slot_available,
+                        Some(&mut pending_slot),
                     )
                     .await?
                     {
@@ -1221,14 +1533,30 @@ where
                     current_target.as_deref(),
                 );
 
-                let effective_host = current_target
-                    .as_deref()
-                    .map(|t| t.host.as_str())
-                    .unwrap_or(proxy.backend_host.as_str());
+                let client = match get_cross_protocol_client(
+                    state,
+                    dispatch_proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_start.elapsed(),
+                    stream,
+                    Some(&mut pending_slot),
+                )
+                .await?
+                {
+                    Ok(client) => client,
+                    Err(outcome) => return Ok(outcome),
+                };
+
                 let req_builder = build_plain_request_builder(
                     &client,
                     state,
-                    proxy,
+                    dispatch_proxy,
                     req_method,
                     proxy_headers,
                     &current_url,
@@ -1400,6 +1728,7 @@ where
                     loop {
                         tokio::select! {
                             result = &mut send_future => {
+                                drop(pending_slot.take());
                                 if !reader_done {
                                     let backend_succeeded = result.is_ok();
                                     if backend_succeeded && drain_ms > 0 {
@@ -1584,6 +1913,13 @@ where
         return Ok(outcome);
     }
 
+    // Capture original response invariants before `after_proxy` rewrites the
+    // headers below. On this H3 cross-protocol path the body is later either
+    // streamed or buffered, so a response transformer that strips `Content-Range`
+    // or `Cache-Control` ahead of compression would otherwise let compression
+    // mislabel or rewrite a representation it must preserve.
+    crate::http3::server::stamp_h3_original_response_metadata(ctx, status, &response_headers);
+
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
     // cross-protocol path. A rejection here cancels the backend response
@@ -1650,6 +1986,7 @@ where
         proxy,
         plugins,
         if has_retry { None } else { Some(&*ctx) },
+        status,
         &response_headers,
     );
 
@@ -1726,7 +2063,8 @@ where
 
             for plugin in plugins {
                 if let Some(transformed) = plugin
-                    .transform_response_body(
+                    .transform_response_body_with_context(
+                        &mut *ctx,
                         &response_body,
                         content_type_of(&response_headers),
                         &response_headers,
@@ -2179,6 +2517,7 @@ where
         state,
         current_cb_target_key.as_deref(),
         cb_retry_probe_slot_available,
+        None,
     )
     .await?
     {
@@ -2313,6 +2652,7 @@ where
                 state,
                 current_cb_target_key.as_deref(),
                 cb_retry_probe_slot_available,
+                None,
             )
             .await?
             {
@@ -2520,7 +2860,8 @@ where
             // headers after reconciliation below.
             for plugin in plugins.iter() {
                 if let Some(transformed) = plugin
-                    .transform_response_body(
+                    .transform_response_body_with_context(
+                        &mut *ctx,
                         &response_body,
                         content_type_of(&plugin_response_headers),
                         &plugin_response_headers,
@@ -3226,6 +3567,15 @@ where
     )
 }
 
+fn inspected_emitted_response_limit_exceeded(
+    bytes_streamed: u64,
+    next_len: usize,
+    max_response_body_size_bytes: usize,
+) -> bool {
+    max_response_body_size_bytes > 0
+        && bytes_streamed.saturating_add(next_len as u64) > max_response_body_size_bytes as u64
+}
+
 /// Drive a response-stream [`ResponseStreamInspector`] over a reqwest backend
 /// response, writing released bytes to the H3 client stream. The cross-protocol
 /// (H3 client → HTTP/1/2 backend) counterpart of the native-H3 inspected loop and
@@ -3269,6 +3619,19 @@ where
                 match inspector.on_chunk(&chunk).await {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                out.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit during cross-protocol H3 stream",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let out_len = out.len() as u64;
                             if stream.send_data(out).await.is_err() {
                                 client_disconnected = true;
@@ -3282,6 +3645,19 @@ where
                         if let Some(fb) = final_bytes
                             && !fb.is_empty()
                         {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                fb.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit during cross-protocol H3 stream termination",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let fb_len = fb.len() as u64;
                             if stream.send_data(fb).await.is_ok() {
                                 bytes_streamed += fb_len;
@@ -3300,6 +3676,19 @@ where
                 match inspector.on_end().await {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                out.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit at end of cross-protocol H3 stream",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let out_len = out.len() as u64;
                             if stream.send_data(out).await.is_err() {
                                 client_disconnected = true;
@@ -3313,6 +3702,19 @@ where
                         if let Some(fb) = final_bytes
                             && !fb.is_empty()
                         {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                fb.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit during end-of-stream termination",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let fb_len = fb.len() as u64;
                             if stream.send_data(fb).await.is_ok() {
                                 bytes_streamed += fb_len;
@@ -4014,14 +4416,15 @@ mod tests {
     use super::{
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
         apply_h3_grpc_reject_metadata, build_plain_request_builder,
-        cross_protocol_header_write_disconnect_outcome, normalize_h3_grpc_reject,
-        reject_body_as_h3_grpc_message,
+        cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
+        normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
+        record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
         release_cross_protocol_circuit_breaker_probe_on_admission_reject,
         sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
         should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
-    use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy};
+    use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
     use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{Plugin, PluginResult, RequestContext, security_headers::SecurityHeaders};
     use crate::proxy::ProxyState;
@@ -4116,6 +4519,18 @@ mod tests {
         assert!(should_finish_h3_stream_without_trailers(None));
         assert!(should_finish_h3_stream_without_trailers(Some(&empty)));
         assert!(!should_finish_h3_stream_without_trailers(Some(&non_empty)));
+    }
+
+    #[test]
+    fn inspected_emitted_response_limit_tracks_transformed_output() {
+        assert!(!inspected_emitted_response_limit_exceeded(900, 200, 0));
+        assert!(!inspected_emitted_response_limit_exceeded(900, 100, 1_000));
+        assert!(inspected_emitted_response_limit_exceeded(900, 101, 1_000));
+        assert!(inspected_emitted_response_limit_exceeded(
+            u64::MAX - 1,
+            10,
+            1_024
+        ));
     }
 
     #[tokio::test]
@@ -4709,6 +5124,10 @@ mod tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };
@@ -4780,6 +5199,150 @@ mod tests {
                 .can_execute(&proxy.id, target_key, &config)
                 .is_ok(),
             "neutral client-fault release must allow the next half-open probe"
+        );
+    }
+
+    fn target_for_test(port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            host: "backend.example".to_string(),
+            port,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        }
+    }
+
+    /// #1806 codex r2 finding 1: both H3→HTTP plain-bridge callers run backend
+    /// admission AND `record_cross_protocol_connection_start` for the selected
+    /// target BEFORE acquiring the reqwest client. A client-build/pool failure
+    /// must therefore END the least-connections connection (balancing the start —
+    /// no active-count leak) AND feed the 502 connection failure to the backend
+    /// outcome path. Previously this path used `record_backend_outcome_no_conn_end`
+    /// and skipped the admission outcome, permanently inflating the target's
+    /// active-connection count and never feeding the 502 to adaptive concurrency.
+    #[tokio::test]
+    async fn client_acquire_failure_balances_connection_start_and_records_outcome() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "consumers": [],
+            "plugin_configs": [],
+            "proxies": [{
+                "id": "lc-proxy",
+                "listen_path": "/",
+                "backend_scheme": "http",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "upstream_id": "lc-upstream"
+            }],
+            "upstreams": [{
+                "id": "lc-upstream",
+                "targets": [{"host": "10.0.0.1", "port": 8080}],
+                "algorithm": "least_connections"
+            }]
+        }))
+        .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let (state, _) = ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+
+        let selection = crate::proxy::backend_dispatch::select_upstream_target(
+            proxy,
+            &state,
+            &epoch,
+            "192.0.2.10",
+            &HashMap::new(),
+            None,
+        );
+        let balancer = selection
+            .balancer
+            .clone()
+            .expect("least-connections upstream proxy should resolve a balancer");
+        let target = selection
+            .target
+            .clone()
+            .expect("a target should be selected");
+
+        let active = || {
+            balancer
+                .active_connections
+                .iter()
+                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<i64>()
+        };
+
+        // The caller issues the connection-start before the client acquire.
+        record_cross_protocol_connection_start(Some(&balancer), Some(target.as_ref()));
+        assert_eq!(active(), 1, "connection-start increments the gauge");
+
+        // No admission permits in this minimal setup, but the outcome path must
+        // still balance the connection-start (conn_end = true).
+        let mut permits = None;
+        record_cross_protocol_client_acquire_failure(
+            &state,
+            proxy,
+            &epoch,
+            Some(&balancer),
+            Some(target.as_ref()),
+            None,
+            false,
+            Instant::now(),
+            &mut permits,
+            std::time::Duration::ZERO,
+        );
+
+        assert_eq!(
+            active(),
+            0,
+            "client-acquire failure must END the connection to balance the start (no active-count leak)"
+        );
+    }
+
+    /// #1806: the H3→HTTP plain bridge resolves the per-target effective proxy
+    /// (the same `resolve_effective_proxy_for_target` the H1/H2 plain path uses)
+    /// before building its reqwest client and request, so every
+    /// `connectionPool.http` DR override applies on the bridge. This asserts the
+    /// resolution `dispatch_plain` performs at entry: a per-port override wins
+    /// for its port; a port with no explicit entry picks up the
+    /// service-discovery top-level fallback.
+    #[test]
+    fn h3_plain_bridge_resolves_effective_proxy_for_selected_target() {
+        let mut proxy = minimal_proxy();
+        proxy.backend_connect_timeout_ms = 5_000;
+        proxy.upstream_id = Some("u1".to_string());
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(750),
+                h2_max_concurrent_streams: Some(32),
+                ..Default::default()
+            },
+        )]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            connect_timeout_ms: Some(1_500),
+            ..Default::default()
+        });
+
+        // Selected port 8080 → explicit per-port override applied.
+        let target = target_for_test(8080);
+        let effective = crate::proxy::resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert_eq!(
+            effective.backend_connect_timeout_ms, 750,
+            "the bridge must apply the per-port connectTimeout that build_plain_request_builder reads"
+        );
+        assert_eq!(effective.pool_http2_max_concurrent_streams, Some(32));
+
+        // A port with no explicit entry → service-discovery top-level fallback.
+        let sd_target = target_for_test(9090);
+        let effective_sd =
+            crate::proxy::resolve_effective_proxy_for_target(&proxy, Some(&sd_target));
+        assert_eq!(
+            effective_sd.backend_connect_timeout_ms, 1_500,
+            "the bridge must apply the SD top-level fallback on a runtime-resolved port"
         );
     }
 

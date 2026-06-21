@@ -193,7 +193,7 @@ impl WorkloadApiService {
         let proto_svid = X509svid {
             spiffe_id: svid.spiffe_id.to_string(),
             x509_svid: chain_concat,
-            x509_svid_key: svid.private_key_pkcs8_der,
+            x509_svid_key: svid.private_key_pkcs8_der.to_vec(),
             bundle: bundle_concat,
             // The SPIFFE Workload API `hint` field is an operator-specified
             // workload-matching hint (string), not a timestamp. We have no
@@ -241,7 +241,7 @@ impl WorkloadApiService {
         let proto_svid = X509svid {
             spiffe_id: svid.spiffe_id.to_string(),
             x509_svid: chain_concat,
-            x509_svid_key: svid.private_key_pkcs8_der,
+            x509_svid_key: svid.private_key_pkcs8_der.to_vec(),
             bundle: bundle_concat,
             hint: String::new(),
         };

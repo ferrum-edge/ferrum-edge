@@ -8,10 +8,12 @@
 //! The node agent does NOT run proxy listeners. Traffic capture is its sole
 //! responsibility.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -46,6 +48,10 @@ const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
+const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
+    LazyLock::new(DashMap::new);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -480,6 +486,16 @@ async fn run_with_backend(
         config.node_name
     );
 
+    // Periodic re-drive of transiently-failed enrollments. Failed pods are not
+    // in `pod_states`, and the watcher/CNI arms only enroll on fresh events, so
+    // without this a transient eBPF attach/map failure (after cgroup+veth
+    // resolved) would become an indefinite capture gap until the next pod event.
+    // `retry_backed_off_pod_enrollments` is a cheap no-op when no failures are
+    // pending. Consume the immediate first tick that `interval` fires so the
+    // first real pass waits a full backoff window rather than firing instantly.
+    let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
+    retry_interval.tick().await;
+
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -522,14 +538,14 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::InitDone)) => {
                         if let Some(seen) = init_seen.take() {
-                            let stale_uids: Vec<String> = pod_states
-                                .iter()
-                                .filter(|entry| !seen.contains(entry.key().as_str()))
-                                .map(|entry| entry.key().clone())
-                                .collect();
+                            let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
                                 handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
+                            // Also drop owned failure snapshots for pods that
+                            // vanished across the relist; otherwise the retry
+                            // loop replays them indefinitely (see helper docs).
+                            prune_failed_enrollments_from_relist(&pod_states, &seen);
                         }
                         startup_ready.store(true, Ordering::Release);
                         info!("Node agent initial pod sync complete; /health now reports ready");
@@ -547,7 +563,7 @@ async fn run_with_backend(
             cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
-                        process_cni_work_item(
+                        let enrolled_uid = process_cni_work_item(
                             backend.as_mut(),
                             &pod_states,
                             config,
@@ -555,6 +571,7 @@ async fn run_with_backend(
                             &client,
                             work,
                         ).await;
+                        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
@@ -564,6 +581,17 @@ async fn run_with_backend(
                         debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
                     }
                 }
+            }
+            _ = retry_interval.tick() => {
+                // Re-drive any pod whose transient enrollment failure has aged
+                // past the backoff window. Cheap no-op when none are pending.
+                retry_backed_off_pod_enrollments(
+                    backend.as_mut(),
+                    &pod_states,
+                    config,
+                    metrics.as_ref(),
+                    false,
+                );
             }
         }
     }
@@ -584,6 +612,60 @@ async fn run_with_backend(
     }
 
     Ok(())
+}
+
+fn watcher_init_stale_uids(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    seen: &HashSet<String>,
+) -> Vec<String> {
+    pod_states
+        .iter()
+        .filter(|entry| !seen.contains(entry.key().as_str()))
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+/// Drop transient-failure records (in `FAILED_POD_ENROLLMENT_ATTEMPTS`) for pods
+/// that vanished across a watcher reconnect/relist. The InitDone stale sweep only
+/// reconciles enrolled pods (`watcher_init_stale_uids` walks `pod_states`), but a
+/// pod that failed enrollment before it was inserted into `pod_states` keeps an
+/// owned snapshot *outside* `pod_states`. If that pod is gone after the relist,
+/// nothing else clears the record, so the periodic retry loop would replay it
+/// forever — warning and bumping `attach_errors` every ~30s for a UID the API no
+/// longer reports. Pruning here against the relist `seen` set closes that loop.
+///
+/// Records are scoped by the `pod_states` key prefix so a sibling node-agent
+/// runtime (or, under `cargo test`, another test's pods) is never pruned.
+fn prune_failed_enrollments_from_relist(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    seen: &HashSet<String>,
+) {
+    if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
+        return;
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    // Collect first so we never remove while iterating the same DashMap.
+    let stale_keys: Vec<String> = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .iter()
+        .filter_map(|entry| {
+            let pod_uid = entry.key().strip_prefix(&key_prefix)?;
+            (!seen.contains(pod_uid)).then(|| entry.key().clone())
+        })
+        .collect();
+
+    for state_key in stale_keys {
+        forget_failed_pod_enrollment(&state_key);
+    }
+}
+
+fn mark_relist_seen_from_cni_add(
+    init_seen: &mut Option<HashSet<String>>,
+    enrolled_uid: Option<&str>,
+) {
+    if let (Some(seen), Some(uid)) = (init_seen.as_mut(), enrolled_uid) {
+        seen.insert(uid.to_string());
+    }
 }
 
 /// Apply one CNI plugin RPC to the same state the kube-rs watcher
@@ -609,9 +691,9 @@ async fn process_cni_work_item(
     metrics: &NodeAgentMetrics,
     kube_client: &Client,
     work: CniWorkItem,
-) {
+) -> Option<String> {
     let CniWorkItem { request, respond } = work;
-    let response = apply_cni_request_with_kube_metadata(
+    let (response, enrolled_uid) = apply_cni_request_with_kube_metadata(
         backend,
         pod_states,
         config,
@@ -625,6 +707,7 @@ async fn process_cni_work_item(
     // applied the side-effect. The metric/log already reflect the
     // outcome from the server's side.
     let _ = respond.send(response);
+    enrolled_uid
 }
 
 async fn apply_cni_request_with_kube_metadata(
@@ -634,9 +717,12 @@ async fn apply_cni_request_with_kube_metadata(
     metrics: &NodeAgentMetrics,
     kube_client: &Client,
     request: &CniRpcRequest,
-) -> CniRpcResponse {
+) -> (CniRpcResponse, Option<String>) {
     if request.verb != RpcVerb::Add {
-        return apply_cni_request(backend, pod_states, config, metrics, request);
+        return (
+            apply_cni_request(backend, pod_states, config, metrics, request),
+            None,
+        );
     }
 
     let pod_api: Api<Pod> = Api::namespaced(kube_client.clone(), &request.pod_namespace);
@@ -649,7 +735,10 @@ async fn apply_cni_request_with_kube_metadata(
                 error = %err,
                 "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
             );
-            apply_cni_request(backend, pod_states, config, metrics, request)
+            (
+                apply_cni_request(backend, pod_states, config, metrics, request),
+                None,
+            )
         }
         Err(_elapsed) => {
             debug!(
@@ -658,7 +747,10 @@ async fn apply_cni_request_with_kube_metadata(
                 timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
                 "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
             );
-            apply_cni_request(backend, pod_states, config, metrics, request)
+            (
+                apply_cni_request(backend, pod_states, config, metrics, request),
+                None,
+            )
         }
     }
 }
@@ -670,21 +762,28 @@ fn apply_cni_add_from_pod(
     metrics: &NodeAgentMetrics,
     request: &CniRpcRequest,
     pod: &Pod,
-) -> CniRpcResponse {
+) -> (CniRpcResponse, Option<String>) {
     let Some(api_uid) = pod_uid(pod) else {
-        return CniRpcResponse::Rejected {
-            reason: "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
-                .to_string(),
-        };
+        return (
+            CniRpcResponse::Rejected {
+                reason:
+                    "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
+                        .to_string(),
+            },
+            None,
+        );
     };
     if let Some(request_uid) = request.pod_uid.as_deref()
         && request_uid != api_uid
     {
-        return CniRpcResponse::Rejected {
-            reason: format!(
-                "CNI pod UID {request_uid} does not match Kubernetes API pod UID {api_uid}; kube-rs watcher will reconcile"
-            ),
-        };
+        return (
+            CniRpcResponse::Rejected {
+                reason: format!(
+                    "CNI pod UID {request_uid} does not match Kubernetes API pod UID {api_uid}; kube-rs watcher will reconcile"
+                ),
+            },
+            None,
+        );
     }
 
     let labels: HashMap<String, String> = pod
@@ -731,7 +830,17 @@ fn apply_cni_add_from_pod(
         veth_iface_override: None,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
-    CniRpcResponse::Ok
+    // Surface the UID that was actually inserted into `pod_states` (the
+    // Kubernetes API `metadata.uid`, which may differ from — or be present when
+    // the CRI omitted — `request.pod_uid`) so a CNI ADD during the watcher
+    // Init/InitDone relist window marks the enrolled pod seen and survives the
+    // stale sweep. `None` when enrollment did not land (e.g. attach failure).
+    let enrolled_uid = if pod_states.contains_key(api_uid.as_str()) {
+        Some(api_uid)
+    } else {
+        None
+    };
+    (CniRpcResponse::Ok, enrolled_uid)
 }
 
 /// Pure-function core of [`process_cni_work_item`] so tests can drive
@@ -1192,6 +1301,247 @@ pub struct PodEvent<'a> {
     pub veth_iface_override: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PodEnrollmentAttemptSignature {
+    namespace: String,
+    service_account: Option<String>,
+    pod_ip: Option<std::net::Ipv4Addr>,
+    cgroup_path: Option<String>,
+    veth_iface: Option<String>,
+    labels_fingerprint: u64,
+    annotations_fingerprint: u64,
+}
+
+/// Owned snapshot of everything needed to rebuild a `PodEvent` and re-drive
+/// `handle_pod_added` for a pod whose enrollment failed transiently. A failed
+/// enrollment is suppressed for `POD_ENROLLMENT_RETRY_BACKOFF` to avoid the
+/// per-Apply churn that issue #1733 fixed, but failed pods are NOT inserted
+/// into `pod_states` (insertion only happens once `state.attached` is true), so
+/// they cannot be reconciled from `pod_states`. Without an owned record, a
+/// transient eBPF attach/map failure that lands *after* the cgroup and veth
+/// resolved would become an indefinite capture gap whenever no further pod
+/// event arrives for that pod. We keep this snapshot so the periodic retry loop
+/// in `run_with_backend` can rebuild the event and try again every ~30s until
+/// it succeeds (or the pod is removed / no longer matches enrollment).
+///
+/// `veth_iface_override` is intentionally not captured: production always sets
+/// it to `None` and relies on the live procfs/sysfs resolver, so the rebuilt
+/// `PodEvent` re-resolves the interface on each retry.
+#[derive(Debug, Clone)]
+struct RetryablePodEnrollment {
+    pod_uid: String,
+    pod_name: String,
+    namespace: String,
+    service_account: Option<String>,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+    pod_ip: Option<String>,
+    pod_pid: Option<u32>,
+}
+
+impl RetryablePodEnrollment {
+    fn from_event(event: &PodEvent<'_>) -> Self {
+        Self {
+            pod_uid: event.pod_uid.to_string(),
+            pod_name: event.pod_name.to_string(),
+            namespace: event.namespace.to_string(),
+            service_account: event.service_account.map(ToOwned::to_owned),
+            labels: event.labels.clone(),
+            annotations: event.annotations.clone(),
+            pod_ip: event.pod_ip_str.map(ToOwned::to_owned),
+            pod_pid: event.pod_pid,
+        }
+    }
+
+    /// Reconstruct a borrowed `PodEvent` from this owned snapshot for replaying
+    /// through `handle_pod_added`. The returned event borrows from `self`, so
+    /// `self` must outlive the event.
+    fn as_event(&self) -> PodEvent<'_> {
+        PodEvent {
+            pod_uid: &self.pod_uid,
+            pod_name: &self.pod_name,
+            namespace: &self.namespace,
+            service_account: self.service_account.as_deref(),
+            labels: &self.labels,
+            annotations: &self.annotations,
+            pod_ip_str: self.pod_ip.as_deref(),
+            pod_pid: self.pod_pid,
+            // Production always re-resolves the veth on retry (see struct docs).
+            veth_iface_override: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FailedPodEnrollmentAttempt {
+    signature: PodEnrollmentAttemptSignature,
+    last_attempt: Instant,
+    /// Owned snapshot used to re-drive enrollment after the backoff window
+    /// expires. `Some` for every real failure recorded by `handle_pod_added`;
+    /// the periodic retry loop skips records that lack a snapshot.
+    snapshot: Option<RetryablePodEnrollment>,
+}
+
+/// Prefix shared by every `FAILED_POD_ENROLLMENT_ATTEMPTS` key belonging to a
+/// given `pod_states`. The map is a process-global static; including the
+/// `pod_states` pointer scopes records to the owning node-agent runtime so the
+/// periodic retry loop never re-drives another runtime's (or, under `cargo
+/// test`, another test's) pods.
+fn pod_state_key_prefix(pod_states: &DashMap<String, PodAttachmentState>) -> String {
+    format!("{:p}:", pod_states)
+}
+
+fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str) -> String {
+    format!("{}{pod_uid}", pod_state_key_prefix(pod_states))
+}
+
+fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by_key(|(left_key, _)| *left_key);
+    let mut hasher = DefaultHasher::new();
+    for (key, value) in entries {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn pod_enrollment_attempt_signature(
+    event: &PodEvent<'_>,
+    pod_ip: Option<std::net::Ipv4Addr>,
+    cgroup_path: &Option<String>,
+    veth_iface: &Option<String>,
+) -> PodEnrollmentAttemptSignature {
+    PodEnrollmentAttemptSignature {
+        namespace: event.namespace.to_string(),
+        service_account: event.service_account.map(ToOwned::to_owned),
+        pod_ip,
+        cgroup_path: cgroup_path.clone(),
+        veth_iface: veth_iface.clone(),
+        labels_fingerprint: map_fingerprint(event.labels),
+        annotations_fingerprint: map_fingerprint(event.annotations),
+    }
+}
+
+fn recently_failed_pod_enrollment(
+    state_key: &str,
+    signature: &PodEnrollmentAttemptSignature,
+) -> bool {
+    let Some(previous) = FAILED_POD_ENROLLMENT_ATTEMPTS.get(state_key) else {
+        return false;
+    };
+    if &previous.value().signature != signature {
+        return false;
+    }
+    if previous.last_attempt.elapsed() >= POD_ENROLLMENT_RETRY_BACKOFF {
+        drop(previous);
+        FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+        return false;
+    }
+    true
+}
+
+fn remember_failed_pod_enrollment(
+    state_key: &str,
+    signature: PodEnrollmentAttemptSignature,
+    snapshot: RetryablePodEnrollment,
+) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.insert(
+        state_key.to_string(),
+        FailedPodEnrollmentAttempt {
+            signature,
+            last_attempt: Instant::now(),
+            snapshot: Some(snapshot),
+        },
+    );
+}
+
+fn forget_failed_pod_enrollment(state_key: &str) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+}
+
+fn forget_pod_enrollment_attempt(state_key: &str) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+}
+
+/// Re-drive enrollment for every pod that failed transiently and whose backoff
+/// window has elapsed.
+///
+/// Failed enrollments are remembered in `FAILED_POD_ENROLLMENT_ATTEMPTS` and
+/// suppressed for `POD_ENROLLMENT_RETRY_BACKOFF` so we don't churn on every
+/// Apply (issue #1733). But failed pods are never inserted into `pod_states`
+/// (insertion only happens once `state.attached` is true), so nothing
+/// reconciles them from `pod_states`. Before this loop, a transient eBPF
+/// attach/map failure that struck *after* the cgroup and veth resolved became
+/// an indefinite capture gap if no further pod/CNI event arrived for that pod.
+///
+/// This helper closes that gap. It collects the eligible `(state_key,
+/// snapshot)` pairs *first* (an owned `Vec`) so we never mutate
+/// `FAILED_POD_ENROLLMENT_ATTEMPTS` while iterating it, drops each stale record,
+/// then replays it via `handle_pod_added`. Dropping the record first is exactly
+/// what `recently_failed_pod_enrollment` does once the window has elapsed (clear
+/// then proceed), so the re-drive isn't suppressed by its own backoff entry. On
+/// repeated failure `handle_pod_added` re-remembers with a fresh `last_attempt`,
+/// so the pod keeps retrying roughly every `POD_ENROLLMENT_RETRY_BACKOFF` until
+/// it enrolls, is removed, or no longer matches enrollment criteria — strictly
+/// better-bounded than the pre-#1733 every-Apply churn.
+///
+/// `force` bypasses the elapsed-time gate; production passes `false`. Tests pass
+/// `true` to exercise the replay deterministically without real sleeps (the
+/// 30-second window is otherwise unreachable without wall-clock time).
+fn retry_backed_off_pod_enrollments(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    force: bool,
+) {
+    if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
+        return;
+    }
+
+    // Only re-drive records owned by *this* `pod_states`. The map is a global
+    // static, so without scoping a node-agent runtime (or a sibling test) would
+    // replay another runtime's pods against the wrong state map.
+    let key_prefix = pod_state_key_prefix(pod_states);
+
+    // Collect (state_key, snapshot) first so we never hold DashMap shard guards
+    // across the replay (which itself mutates FAILED_POD_ENROLLMENT_ATTEMPTS via
+    // handle_pod_added). `force` bypasses the elapsed gate for tests.
+    let due: Vec<(String, RetryablePodEnrollment)> = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .iter()
+        .filter(|entry| entry.key().starts_with(&key_prefix))
+        .filter(|entry| {
+            force || entry.value().last_attempt.elapsed() >= POD_ENROLLMENT_RETRY_BACKOFF
+        })
+        .filter_map(|entry| {
+            entry
+                .value()
+                .snapshot
+                .clone()
+                .map(|snapshot| (entry.key().clone(), snapshot))
+        })
+        .collect();
+
+    for (state_key, snapshot) in due {
+        // Drop the stale record before replaying. In production this is what
+        // `recently_failed_pod_enrollment` would do once the window elapsed
+        // (clear, then proceed); doing it here lets the re-drive proceed even
+        // under a forced (test) retry whose `last_attempt` is still fresh. If
+        // the re-drive fails again, `handle_pod_added` re-remembers with a fresh
+        // `last_attempt`; if it succeeds, the record stays cleared.
+        forget_failed_pod_enrollment(&state_key);
+        let event = snapshot.as_event();
+        debug!(
+            pod_uid = event.pod_uid,
+            pod_name = event.pod_name,
+            namespace = event.namespace,
+            "Re-driving backed-off pod enrollment after retry window"
+        );
+        handle_pod_added(backend, pod_states, config, metrics, &event);
+    }
+}
+
 /// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
 /// Kubernetes-assigned value; treating it as a path component without checks
 /// would let an empty, slash-, backslash-, or `..`-bearing value write or
@@ -1303,6 +1653,7 @@ fn handle_pod_added(
     event: &PodEvent<'_>,
 ) {
     let (pod_uid, pod_name, namespace) = (event.pod_uid, event.pod_name, event.namespace);
+    let state_key = pod_state_key(pod_states, pod_uid);
     let decision = pod_watcher::evaluate_enrollment(
         event.labels,
         event.annotations,
@@ -1310,6 +1661,7 @@ fn handle_pod_added(
         &config.excluded_namespaces,
     );
     if decision != EnrollmentDecision::Enroll {
+        forget_pod_enrollment_attempt(&state_key);
         if pod_states.contains_key(pod_uid) {
             handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         }
@@ -1342,7 +1694,8 @@ fn handle_pod_added(
             drop(state);
             handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         } else {
-            reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+            let stale_pod_ip =
+                reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
             reconcile_existing_pod_include_ports(
                 backend,
                 metrics,
@@ -1359,9 +1712,37 @@ fn handle_pod_added(
                 &mut state,
             );
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
+            drop(state);
+            if let Some(ip) = stale_pod_ip {
+                remove_pod_ip_if_unowned(
+                    backend,
+                    pod_states,
+                    metrics,
+                    pod_uid,
+                    ip,
+                    "pod IP changed",
+                );
+            }
             return;
         }
     }
+
+    let attempt_signature =
+        pod_enrollment_attempt_signature(event, pod_ip, &cgroup_path, &veth_iface);
+    if recently_failed_pod_enrollment(&state_key, &attempt_signature) {
+        debug!(
+            pod_uid,
+            pod_name, namespace, "Skipping repeated pod enrollment attempt during retry backoff"
+        );
+        return;
+    }
+
+    // Owned event snapshot stored alongside the failed-enrollment record so the
+    // periodic retry loop in `run_with_backend` can re-drive this enrollment
+    // once the backoff window expires, even if no further pod/CNI event arrives
+    // for this pod. Cheap to build but only needed on the cold failure paths
+    // below, so each `remember_failed_pod_enrollment` call clones it.
+    let enrollment_snapshot = RetryablePodEnrollment::from_event(event);
 
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
@@ -1437,6 +1818,11 @@ fn handle_pod_added(
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                remember_failed_pod_enrollment(
+                    &state_key,
+                    attempt_signature,
+                    enrollment_snapshot.clone(),
+                );
                 return;
             };
 
@@ -1444,6 +1830,11 @@ fn handle_pod_added(
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                remember_failed_pod_enrollment(
+                    &state_key,
+                    attempt_signature,
+                    enrollment_snapshot.clone(),
+                );
                 return;
             }
             if let Some(ip) = pod_ip {
@@ -1455,6 +1846,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    remember_failed_pod_enrollment(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                    );
                     return;
                 }
             }
@@ -1471,6 +1867,7 @@ fn handle_pod_added(
             );
         } else {
             cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         }
     } else {
         warn!(
@@ -1478,10 +1875,12 @@ fn handle_pod_added(
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         return;
     }
 
     if state.attached {
+        forget_failed_pod_enrollment(&state_key);
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
         // succeeded (programs attached, pod-IP + identity written), so a failed
@@ -1505,12 +1904,10 @@ fn reconcile_existing_pod_ip(
     pod_uid: &str,
     pod_ip: Option<std::net::Ipv4Addr>,
     state: &mut PodAttachmentState,
-) {
-    let Some(new_ip) = pod_ip else {
-        return;
-    };
+) -> Option<std::net::Ipv4Addr> {
+    let new_ip = pod_ip?;
     if state.pod_ip == Some(new_ip) {
-        return;
+        return None;
     }
 
     let info = PodInfo {
@@ -1520,14 +1917,9 @@ fn reconcile_existing_pod_ip(
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     }
-    if let Some(old_ip) = state.pod_ip
-        && let Err(e) = backend.remove_pod_ip(old_ip)
-    {
-        warn!(pod_uid, %old_ip, error = %e, "Failed to remove stale pod IP from map");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-    }
+    let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
     // Keep the in-netns capture registry's pod IP in sync (line 2 of the entry)
     // so the mesh proxy reopens its in-netns listener with the new
@@ -1539,6 +1931,42 @@ fn reconcile_existing_pod_ip(
     ) {
         publish_pod_registry(dir, pod_uid, cgroup, Some(new_ip));
     }
+    old_ip
+}
+
+fn remove_pod_ip_if_unowned(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    ip: std::net::Ipv4Addr,
+    removal_reason: &'static str,
+) {
+    if let Some(owner_pod_uid) = other_pod_owning_ip(pod_states, pod_uid, ip) {
+        debug!(
+            pod_uid,
+            owner_pod_uid,
+            %ip,
+            removal_reason,
+            "Skipping pod IP map removal; IP is owned by another tracked pod"
+        );
+        return;
+    }
+    if let Err(e) = backend.remove_pod_ip(ip) {
+        warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IP from map");
+        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn other_pod_owning_ip(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+    ip: std::net::Ipv4Addr,
+) -> Option<String> {
+    pod_states.iter().find_map(|entry| {
+        (entry.key().as_str() != pod_uid && entry.value().pod_ip == Some(ip))
+            .then(|| entry.key().clone())
+    })
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -1750,6 +2178,25 @@ fn reconcile_existing_pod_workload_identity(
     }
     let current_set: HashSet<u64> = current.iter().copied().collect();
 
+    // Fast path: skip the SVID build + per-leaf map churn when the observed
+    // cgroup tree exactly matches what we have already written. We compare the
+    // full descendant inode set (the same depth-bounded BFS the writes use),
+    // not a shallow direct-children fingerprint, so deeply-nested container
+    // cgroup churn is still observed; and we compare against the *written* set
+    // (`workload_identity_cgroup_ids`, which only holds ids the backend
+    // accepted), not a separately-seeded baseline, so an earlier partial write
+    // is retried instead of being permanently skipped. The tree walk above is
+    // retained deliberately: a cheaper signal cannot detect either case
+    // without failing closed for an un-enrolled container cgroup.
+    if current_set.len() == state.workload_identity_cgroup_ids.len()
+        && state
+            .workload_identity_cgroup_ids
+            .iter()
+            .all(|cgroup_id| current_set.contains(cgroup_id))
+    {
+        return;
+    }
+
     // Drop entries no longer present in the tree (e.g. a restarted container's
     // old leaf cgroup) from both the BPF map and our tracking set.
     state.workload_identity_cgroup_ids.retain(|cgroup_id| {
@@ -1830,6 +2277,8 @@ pub fn handle_pod_removed(
     metrics: &NodeAgentMetrics,
     pod_uid: &str,
 ) {
+    let state_key = pod_state_key(pod_states, pod_uid);
+    forget_pod_enrollment_attempt(&state_key);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -1851,10 +2300,8 @@ pub fn handle_pod_removed(
         if let Err(e) = backend.detach_pod(pod_uid) {
             warn!(pod_uid, error = %e, "Failed to detach BPF programs");
         }
-        if let Some(ip) = state.pod_ip
-            && let Err(e) = backend.remove_pod_ip(ip)
-        {
-            warn!(pod_uid, %ip, error = %e, "Failed to remove pod IP from map");
+        if let Some(ip) = state.pod_ip {
+            remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
         // Pair with `apply_include_outbound_ports` — only annotated pods ever
         // carried entries. Use the stashed cgroup ids (pod inode + descendant
@@ -3513,6 +3960,219 @@ mod tests {
         assert!(!state.workload_identity_cgroup_ids.contains(&container1_ino));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_skips_workload_identity_writes_when_cgroup_set_unchanged() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "22222222-2222-2222-2222-222222222222";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container1 = pod_cgroup.join("crio-aaaa.scope");
+        std::fs::create_dir_all(&container1).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let identity_ops_after_enroll = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert!(identity_ops_after_enroll >= 2);
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let identity_ops_after_unchanged_apply = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert_eq!(
+            identity_ops_after_unchanged_apply, identity_ops_after_enroll,
+            "unchanged Apply must skip the workload identity writes"
+        );
+
+        let container2 = pod_cgroup.join("crio-bbbb.scope");
+        std::fs::create_dir_all(&container2).unwrap();
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let identity_ops_after_changed_apply = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert!(
+            identity_ops_after_changed_apply > identity_ops_after_unchanged_apply,
+            "new container cgroup must still trigger workload identity reconciliation"
+        );
+    }
+
+    /// Regression: a container cgroup created *below an intermediate child*
+    /// (a grandchild of the pod cgroup) must still trigger reconciliation even
+    /// though the pod cgroup's direct children are unchanged. A shallow
+    /// direct-children fingerprint would miss this and leave the new container
+    /// without a `FERRUM_WORKLOAD_IDENTITY` entry (fail-closed).
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_workload_identity_detects_nested_grandchild_cgroup() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "33333333-3333-3333-3333-333333333333";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        // Container lives under an intermediate `burstable` QoS child, so the
+        // pod cgroup's only direct child stays `burstable` across both Applies.
+        let intermediate = pod_cgroup.join("burstable");
+        std::fs::create_dir_all(intermediate.join("crio-aaaa.scope")).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.6"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let ops_after_enroll = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+
+        // Add a second container as another grandchild. Pod's direct children
+        // ({burstable}) are unchanged, but the full descendant set grew.
+        std::fs::create_dir_all(intermediate.join("crio-bbbb.scope")).unwrap();
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let ops_after_grandchild = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert!(
+            ops_after_grandchild > ops_after_enroll,
+            "a deeply-nested (grandchild) container cgroup must trigger reconciliation"
+        );
+    }
+
+    /// Regression: when enrollment writes some cgroups but the backend rejects
+    /// one (e.g. a transient BPF map error), the missing entry must be retried
+    /// on the next Apply with an unchanged tree, instead of being permanently
+    /// skipped by a baseline that was seeded from the partial write.
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_workload_identity_retries_partial_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend {
+            // Fail exactly the first identity write (the pod cgroup root); the
+            // container leaf write that follows succeeds.
+            fail_workload_identity_writes: 1,
+            ..MockEbpfBackend::default()
+        };
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "44444444-4444-4444-4444-444444444444";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container = pod_cgroup.join("crio-aaaa.scope");
+        std::fs::create_dir_all(&container).unwrap();
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        let container_ino = std::fs::metadata(&container).unwrap().ino();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.7"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        // Enrollment: the pod-root write fails, the container write succeeds.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(
+            backend.workload_identities.contains_key(&container_ino),
+            "container cgroup should enroll despite the pod-root write failing"
+        );
+        assert!(
+            !backend.workload_identities.contains_key(&pod_ino),
+            "pod-root cgroup write was injected to fail on first enrollment"
+        );
+
+        // Next Apply over the same (unchanged) tree must retry the missing
+        // pod-root write rather than treating the tree as fully enrolled.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(
+            backend.workload_identities.contains_key(&pod_ino),
+            "partial workload-identity write must be retried on the next Apply"
+        );
+    }
+
     #[test]
     fn handle_pod_added_missing_cgroup_does_not_poison_state() {
         let mut backend = MockEbpfBackend::default();
@@ -3546,6 +4206,326 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         assert!(!pod_states.contains_key("pod-uid-1"));
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_added_repeated_missing_cgroup_is_backed_off_but_late_cgroup_retries() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert_eq!(
+            metrics.attach_errors.load(Ordering::Relaxed),
+            1,
+            "unchanged failed Apply should not inflate attach_errors during backoff"
+        );
+
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(pod_states.contains_key("pod-uid-1"));
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retryable_pod_enrollment_reconstructs_equivalent_event() {
+        // The owned snapshot stored for a failed enrollment must rebuild a
+        // PodEvent that matches the original (minus the test-only veth override,
+        // which production never sets and the retry path always re-resolves).
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::from([(
+            "ferrum.io/include-outbound-ports".to_string(),
+            "8080".to_string(),
+        )]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "ns-a",
+            service_account: Some("sa-a"),
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: Some(4242),
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        let snapshot = RetryablePodEnrollment::from_event(&event);
+        let rebuilt = snapshot.as_event();
+
+        assert_eq!(rebuilt.pod_uid, "pod-uid-1");
+        assert_eq!(rebuilt.pod_name, "test-pod");
+        assert_eq!(rebuilt.namespace, "ns-a");
+        assert_eq!(rebuilt.service_account, Some("sa-a"));
+        assert_eq!(rebuilt.labels, &labels);
+        assert_eq!(rebuilt.annotations, &annotations);
+        assert_eq!(rebuilt.pod_ip_str, Some("10.0.0.5"));
+        assert_eq!(rebuilt.pod_pid, Some(4242));
+        // Production re-resolves the veth on every retry, so the snapshot never
+        // carries the override.
+        assert_eq!(rebuilt.veth_iface_override, None);
+    }
+
+    #[test]
+    fn backed_off_pod_enrollment_is_retried_after_backoff_window() {
+        // A transient inbound-tc attach failure lands AFTER the pod's cgroup and
+        // veth have resolved. The pod is therefore never inserted into
+        // `pod_states`, so nothing reconciles it from `pod_states`; only the
+        // stored failed-enrollment snapshot + the periodic retry loop can
+        // recover it. Drive that failure, confirm the gap, clear the transient
+        // condition, then re-drive via the retry helper (force-bypassing the
+        // 30s window so the test stays deterministic with no real sleeps).
+        //
+        // We use the production veth resolver (via the test override guard)
+        // rather than `PodEvent::veth_iface_override`, because the stored retry
+        // snapshot always carries `veth_iface_override: None` (matching
+        // production, which re-resolves the veth on each retry). With the guard,
+        // both the initial attempt and the re-drive resolve the same synthetic
+        // interface, so the only failure is the injected attach_tc error.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        backend.fail_attach_tc = true;
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        // cgroup present => cgroup_path resolves; guard => veth resolves; so the
+        // only failure is the injected attach_tc error (strictly post-resolve).
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            // None mirrors production and the retry snapshot; veth resolves via
+            // the override guard above.
+            veth_iface_override: None,
+        };
+
+        // First enrollment fails transiently at attach_tc.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "transiently-failed pod must not be inserted into pod_states"
+        );
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        assert!(
+            FAILED_POD_ENROLLMENT_ATTEMPTS
+                .get(&state_key)
+                .map(|r| r.snapshot.is_some())
+                .unwrap_or(false),
+            "a failed record carrying an owned snapshot must exist for the retry loop"
+        );
+
+        // The transient condition clears (e.g., the kernel/map is now writable).
+        backend.fail_attach_tc = false;
+
+        // The retry loop re-drives the stored snapshot. `force = true` bypasses
+        // the 30s elapsed gate that is otherwise unreachable without wall time.
+        retry_backed_off_pod_enrollments(&mut backend, &pod_states, &config, &metrics, true);
+
+        assert!(
+            pod_states.contains_key("pod-uid-1"),
+            "pod must enroll once the transient failure clears and the retry runs"
+        );
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+        assert!(
+            !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&state_key),
+            "successful re-drive must clear the failed-enrollment record"
+        );
+
+        // Clean up the global between tests sharing this static. Keying is by
+        // pod_states pointer, but be explicit so a reused address can't leak.
+        forget_failed_pod_enrollment(&state_key);
+    }
+
+    #[test]
+    fn retry_backed_off_pod_enrollments_is_noop_when_none_pending() {
+        // With no pending failures the retry pass must do nothing (no enroll, no
+        // error churn) — the empty-map fast path.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        retry_backed_off_pod_enrollments(&mut backend, &pod_states, &config, &metrics, true);
+
+        assert!(pod_states.is_empty());
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn relist_prunes_failed_enrollment_for_vanished_pod_but_keeps_present_one() {
+        // Codex finding: a pod that fails enrollment before it is inserted into
+        // `pod_states` keeps an owned snapshot in FAILED_POD_ENROLLMENT_ATTEMPTS.
+        // The InitDone sweep only reconciles `pod_states`, so if that pod
+        // disappears across a watcher relist nothing clears the record and the
+        // retry loop replays it forever (warn + attach_errors every ~30s for a
+        // UID the API no longer reports). Pruning against the relist `seen` set
+        // must drop the vanished pod's record — but never one still in `seen`.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        backend.fail_attach_tc = true; // transient failure lands post-resolve.
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        // Both pods resolve a cgroup so the only failure is the injected attach.
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podgone-uid")).unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podstays-uid")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let mut failed_event = |uid: &'static str, ip: &'static str| {
+            let event = PodEvent {
+                pod_uid: uid,
+                pod_name: "p",
+                namespace: "default",
+                service_account: None,
+                labels: &labels,
+                annotations: &HashMap::new(),
+                pod_ip_str: Some(ip),
+                pod_pid: None,
+                veth_iface_override: None,
+            };
+            handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        };
+        failed_event("gone-uid", "10.0.0.1");
+        failed_event("stays-uid", "10.0.0.2");
+
+        let gone_key = pod_state_key(&pod_states, "gone-uid");
+        let stays_key = pod_state_key(&pod_states, "stays-uid");
+        assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key));
+        assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key));
+
+        // Relist saw `stays-uid` but not `gone-uid`.
+        let mut seen = HashSet::new();
+        seen.insert("stays-uid".to_string());
+        prune_failed_enrollments_from_relist(&pod_states, &seen);
+
+        assert!(
+            !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key),
+            "failed record for a pod absent from the relist must be pruned"
+        );
+        assert!(
+            FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key),
+            "failed record for a pod still present in the relist must be retained for retry"
+        );
+
+        // Clean up the global between tests sharing this static.
+        forget_failed_pod_enrollment(&gone_key);
+        forget_failed_pod_enrollment(&stays_key);
+    }
+
+    #[test]
+    fn handle_pod_added_repeated_missing_veth_skips_bpf_attach_retry() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let cgroup_attachments_after_first = backend.cgroup_attachments.len();
+        assert!(cgroup_attachments_after_first > 0);
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(
+            backend.cgroup_attachments.len(),
+            cgroup_attachments_after_first,
+            "unchanged failed Apply should not retry cgroup attaches during backoff"
+        );
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
     }
 
@@ -3717,6 +4697,61 @@ mod tests {
         assert_eq!(backend.detached_pods, vec!["pod-uid-1"]);
         assert!(!backend.pod_ips.contains_key(&ip));
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_removed_keeps_ip_owned_by_another_pod() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+
+        for pod_uid in ["pod-uid-old", "pod-uid-new"] {
+            pod_states.insert(
+                pod_uid.to_string(),
+                PodAttachmentState {
+                    pod_uid: pod_uid.to_string(),
+                    pod_name: pod_uid.to_string(),
+                    namespace: "default".to_string(),
+                    pod_ip: Some(ip),
+                    cgroup_path: Some(format!("/sys/fs/cgroup/kubepods/{pod_uid}")),
+                    veth_iface: Some(format!("veth-{pod_uid}")),
+                    attached: true,
+                    include_ports_cgroup_ids: Vec::new(),
+                    include_ports_policy: None,
+                    workload_identity_cgroup_ids: Vec::new(),
+                },
+            );
+        }
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-old");
+
+        assert!(!pod_states.contains_key("pod-uid-old"));
+        assert!(pod_states.contains_key("pod-uid-new"));
+        assert!(
+            backend.pod_ips.contains_key(&ip),
+            "delayed delete for old pod must not clobber recycled IP owned by new pod"
+        );
     }
 
     #[test]
@@ -3906,6 +4941,125 @@ mod tests {
         assert!(pod_states.contains_key("pod-uid-1"));
         assert!(backend.detached_pods.is_empty());
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
+    }
+
+    fn enrolled_pod_state(uid: &str) -> PodAttachmentState {
+        PodAttachmentState {
+            pod_uid: uid.to_string(),
+            pod_name: "alpha".to_string(),
+            namespace: "default".to_string(),
+            pod_ip: None,
+            cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
+            veth_iface: Some("veth123".to_string()),
+            attached: true,
+            include_ports_cgroup_ids: Vec::new(),
+            include_ports_policy: None,
+            workload_identity_cgroup_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cni_add_during_relist_marks_tracked_pod_seen() {
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
+        let mut init_seen = Some(HashSet::new());
+
+        // The CNI apply path reports the UID it actually enrolled.
+        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-1"));
+
+        let seen = init_seen.take().expect("relist in progress");
+        assert!(
+            watcher_init_stale_uids(&pod_states, &seen).is_empty(),
+            "CNI-enrolled pod should survive the current watcher InitDone sweep"
+        );
+    }
+
+    #[test]
+    fn unrelated_cni_add_during_relist_does_not_mask_stale_pod() {
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
+        let mut init_seen = Some(HashSet::new());
+
+        // A CNI ADD that enrolled a *different* pod marks only that UID.
+        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-2"));
+
+        let seen = init_seen.take().expect("relist in progress");
+        assert_eq!(
+            watcher_init_stale_uids(&pod_states, &seen),
+            vec!["pod-uid-1".to_string()],
+            "unrelated CNI ADD must not protect a stale watcher entry"
+        );
+    }
+
+    #[test]
+    fn cni_add_with_metadata_free_request_marks_enrolled_api_uid_seen() {
+        // Codex finding: when the CRI omits K8S_POD_UID, the pod still enrolls
+        // under the Kubernetes API metadata.uid. The relist-preservation must
+        // mark *that* UID so InitDone does not tear the CNI fast-path enrollment
+        // back down. `apply_cni_add_from_pod` surfaces the enrolled UID even
+        // though `request.pod_uid` is None.
+        use crate::cni::rpc::{CniRpcRequest, RpcVerb};
+        use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podapi-uid-x")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("alpha".to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some("api-uid-x".to_string()),
+                labels: Some(
+                    [("ferrum.io/mesh".to_string(), "enabled".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: Some("10.0.0.9".to_string()),
+                ..Default::default()
+            }),
+        };
+        // CRI omitted the pod UID.
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: None,
+            container_id: "ctr-1".to_string(),
+            netns_path: Some("/var/run/netns/cni-1".to_string()),
+            args: HashMap::new(),
+        };
+
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert!(matches!(response, CniRpcResponse::Ok));
+        assert_eq!(enrolled_uid.as_deref(), Some("api-uid-x"));
+        assert!(pod_states.contains_key("api-uid-x"));
+
+        // And it survives the InitDone sweep once marked.
+        let mut init_seen = Some(HashSet::new());
+        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
+        let seen = init_seen.take().expect("relist in progress");
+        assert!(watcher_init_stale_uids(&pod_states, &seen).is_empty());
     }
 
     /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
@@ -4248,6 +5402,76 @@ mod tests {
         assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_ip, Some(ip));
         assert!(backend.pod_ips.contains_key(&ip));
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn handle_pod_added_keeps_old_ip_when_another_pod_owns_it() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let old_ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let new_ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+
+        for (pod_uid, veth) in [("pod-uid-1", "veth-a"), ("pod-uid-2", "veth-b")] {
+            pod_states.insert(
+                pod_uid.to_string(),
+                PodAttachmentState {
+                    pod_uid: pod_uid.to_string(),
+                    pod_name: pod_uid.to_string(),
+                    namespace: "default".to_string(),
+                    pod_ip: Some(old_ip),
+                    cgroup_path: None,
+                    veth_iface: Some(veth.to_string()),
+                    attached: true,
+                    include_ports_cgroup_ids: Vec::new(),
+                    include_ports_policy: None,
+                    workload_identity_cgroup_ids: Vec::new(),
+                },
+            );
+        }
+        backend
+            .update_pod_ip(
+                old_ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.8"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-a"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_ip, Some(new_ip));
+        assert_eq!(pod_states.get("pod-uid-2").unwrap().pod_ip, Some(old_ip));
+        assert!(
+            backend.pod_ips.contains_key(&old_ip),
+            "old IP should stay mapped because pod-uid-2 still owns it"
+        );
+        assert!(backend.pod_ips.contains_key(&new_ip));
     }
 
     #[tokio::test]

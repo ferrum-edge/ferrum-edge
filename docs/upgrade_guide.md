@@ -174,6 +174,42 @@ The old binary + old database is a fully consistent state. No data is lost.
 
 CP/DP upgrades follow the same database strategy for the CP, with the added consideration of rolling out DP nodes. The key property that makes this safe: **DPs cache their config in memory and continue serving traffic even if the CP is temporarily unavailable.**
 
+### Helm Chart Runtime Defaults
+
+The `charts/ferrum-mesh` chart no longer enables CP, injector, or CA runtime
+Deployments by default. A default install is scaffolding-only until you opt into
+the desired component. This prevents a fresh default Helm install from rendering
+a CP pod that immediately fails startup because `FERRUM_DB_TYPE`,
+`FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, and
+`FERRUM_CP_DP_GRPC_JWT_SECRET` are absent.
+
+Before upgrading an existing Helm install that relied on the old defaults, set
+the component switches and move reserved CP settings into the new structured
+values:
+
+```yaml
+controlPlane:
+  enabled: true
+  database:
+    type: postgres
+    existingSecret:
+      name: ferrum-mesh-production-db
+      urlKey: url
+  credentials:
+    adminJwtSecret:
+      existingSecret:
+        name: ferrum-mesh-production-credentials
+        key: admin-jwt-secret
+    cpDpGrpcJwtSecret:
+      existingSecret:
+        name: ferrum-mesh-production-credentials
+        key: cp-dp-grpc-jwt-secret
+```
+
+Do not keep `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, or
+`FERRUM_CP_DP_GRPC_JWT_SECRET` under `controlPlane.env`; Helm validation now
+rejects those reserved entries with a template-time error.
+
 ### Version Negotiation (Built-In Safety Net)
 
 Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake. The **major and minor** version components must match — patch-level differences (e.g., `0.9.0` vs `0.9.1`) are allowed.

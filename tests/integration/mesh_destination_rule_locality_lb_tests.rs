@@ -103,6 +103,7 @@ fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: host_fqdn.to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: MAX_TARGET_WEIGHT.min(1),
             tags: HashMap::new(),
             locality: Some("us-west/us-west-1/a".to_string()),
@@ -125,6 +126,7 @@ fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -575,6 +577,7 @@ fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
             UpstreamTarget {
                 host: host_fqdn.to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-west/us-west-1/a".to_string()),
@@ -583,6 +586,7 @@ fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
             UpstreamTarget {
                 host: host_fqdn.to_string(),
                 port: 9090,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-west/us-west-1/a".to_string()),
@@ -606,6 +610,7 @@ fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -718,6 +723,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
             UpstreamTarget {
                 host: "exact.local".to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-west/us-west-1/a".to_string()),
@@ -726,6 +732,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
             UpstreamTarget {
                 host: "other.local".to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east/us-east-1/a".to_string()),
@@ -734,6 +741,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
             UpstreamTarget {
                 host: "fallback-9090.local".to_string(),
                 port: 9090,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east/us-east-1/a".to_string()),
@@ -757,6 +765,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,

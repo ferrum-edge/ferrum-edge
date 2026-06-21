@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "controlPlane": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "grpcPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] },
+            "url": { "type": "string" },
+            "urlFrom": { "type": "object" },
+            "existingSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "urlKey": { "type": "string" }
+              }
+            },
+            "sqlite": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": { "type": "string" },
+                "mode": { "type": "string", "enum": ["", "ro", "rw", "rwc", "memory"] }
+              }
+            },
+            "host": { "type": "string" },
+            "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "name": { "type": "string" },
+            "username": { "type": "string" },
+            "usernameFrom": { "type": "object" },
+            "password": { "type": "string" },
+            "passwordFrom": { "type": "object" },
+            "existingCredentialsSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "usernameKey": { "type": "string" },
+                "passwordKey": { "type": "string" }
+              }
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": {
+                "type": ["string", "number", "integer", "boolean"]
+              }
+            }
+          }
+        },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "adminJwtSecret": { "$ref": "#/definitions/secretSource" },
+            "cpDpGrpcJwtSecret": { "$ref": "#/definitions/secretSource" }
+          }
+        }
+      }
+    },
+    "injector": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "ca": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    }
+  },
+  "definitions": {
+    "secretSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "string" },
+        "existingSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        },
+        "valueFrom": { "type": "object" }
+      }
+    }
+  }
+}

@@ -1769,6 +1769,7 @@ impl<S: FrameSource> Coalescing<S> {
 
     fn flush_buffer(&mut self) -> Option<Frame<Bytes>> {
         if self.buffer.is_empty() {
+            self.flush_timer_armed = false;
             return None;
         }
 
@@ -1777,6 +1778,9 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn buffer_data(&mut self, data: &Bytes) {
+        if data.is_empty() {
+            return;
+        }
         self.buffer.extend_from_slice(data);
         if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
@@ -3008,6 +3012,40 @@ mod tests {
                 assert_eq!(frame.data_ref().unwrap().as_ref(), b"bbbccc");
             }
             other => panic!("expected timer-driven flush of phase-2 data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coalescing_empty_frame_does_not_stale_arm_flush_timer() {
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::new()))),
+                MockStep::Pending,
+                MockStep::Frame(Ok(Frame::data(Bytes::from("real")))),
+                MockStep::Pending,
+            ]),
+            1_000,
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(
+            matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending),
+            "real data after an empty frame must arm a fresh timer instead of inheriting the stale one"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"real");
+            }
+            other => panic!("expected timer-driven flush of real data, got {other:?}"),
         }
     }
 

@@ -1241,7 +1241,12 @@ async fn streaming_jsonrpc_does_not_force_response_buffering() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!plugin.should_buffer_response_body(&ctx));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers
+    ));
 }
 
 #[test]

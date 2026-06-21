@@ -15,10 +15,9 @@
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
 //! so the hot path does zero filtering.
 //!
-//! Security plugins (auth, ACL, IP restriction, WAF, and mesh policy gates)
-//! that fail config validation cause the gateway to refuse startup — they
-//! never silently degrade.
-//! Non-security plugins that fail validation are skipped with a warning.
+//! Enabled plugin configs that fail validation cause startup or config reload
+//! publication to fail; the gateway keeps the last known-good plugin cache on
+//! reload. Disabled plugin configs are not instantiated.
 
 pub mod a2a_gateway;
 pub mod access_control;
@@ -182,6 +181,35 @@ pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 
 /// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
 pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
+
+/// How plugin construction or validation failures affect cache publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginFailurePolicy {
+    /// Reject startup/reload instead of serving without the configured plugin.
+    FailClosed,
+    /// Reject reload publication so callers continue serving the last cache.
+    /// Startup also rejects because there is no previous cache to keep.
+    KeepLastKnownGood,
+    /// Log the construction failure and omit the plugin from the published cache.
+    OptionalFailOpen,
+}
+
+/// Cold-path plugin registration metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginRegistration {
+    pub name: &'static str,
+    pub failure_policy: PluginFailurePolicy,
+}
+
+const fn builtin_plugin(
+    name: &'static str,
+    failure_policy: PluginFailurePolicy,
+) -> PluginRegistration {
+    PluginRegistration {
+        name,
+        failure_policy,
+    }
+}
 
 /// Direction of a UDP datagram being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +651,12 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Mesh outbound service port selected by the router after host/path
+    /// routing and optional original-destination disambiguation. Used by
+    /// `mesh_authz` for Istio `destination.port` when an outbound request has
+    /// no captured original destination, such as direct dials to a single-port
+    /// service in dev/non-Linux setups. `None` outside mesh outbound routes.
+    pub mesh_outbound_destination_authz_port: Option<u16>,
     /// Authorization destination port for a matched Sidecar `ingress[]` route
     /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
     /// the request handler from `select_mesh_inbound_port_route` when the matched
@@ -705,6 +739,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
     }
@@ -770,6 +805,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
         }
     }
@@ -977,6 +1013,34 @@ impl RequestContext {
         let dispatch_port_overrides_changed = dispatch_port_overrides_override
             .as_ref()
             .is_some_and(|overrides| *overrides != proxy.dispatch_port_overrides);
+        // Recompute the service-discovery top-level `connectionPool.http`
+        // fallback for the override's destination, exactly mirroring
+        // `dispatch_port_overrides` above: a direct-backend override clears it
+        // (no upstream → no overlay), an upstream-id override recomputes it from
+        // the NEW upstream. Without this, a route from an SD upstream LEAKS its
+        // top-level fallback onto a different destination, and a route TO an SD
+        // upstream LOSES that destination's fallback (see #1806 codex r1).
+        let dispatch_port_override_fallback_override = if upstream_id_changed {
+            if direct_backend_override {
+                Some(None)
+            } else {
+                Some(
+                    self.route_override_upstream_id
+                        .as_deref()
+                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
+                        .and_then(|upstream| {
+                            crate::config::types::dispatch_port_override_fallback_from_upstream(
+                                upstream,
+                            )
+                        }),
+                )
+            }
+        } else {
+            None
+        };
+        let dispatch_port_override_fallback_changed = dispatch_port_override_fallback_override
+            .as_ref()
+            .is_some_and(|fallback| *fallback != proxy.dispatch_port_override_fallback);
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
@@ -1003,6 +1067,7 @@ impl RequestContext {
             && !backend_port_changed
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
+            && !dispatch_port_override_fallback_changed
             && !backend_read_timeout_changed
             && !retry_changed
             && !preserve_host_changed
@@ -1037,6 +1102,9 @@ impl RequestContext {
         }
         if let Some(dispatch_port_overrides) = dispatch_port_overrides_override {
             overridden.dispatch_port_overrides = dispatch_port_overrides;
+        }
+        if let Some(dispatch_port_override_fallback) = dispatch_port_override_fallback_override {
+            overridden.dispatch_port_override_fallback = dispatch_port_override_fallback;
         }
         if let Some(timeout) = self.route_override_backend_read_timeout_ms {
             overridden.backend_read_timeout_ms = timeout;
@@ -1106,10 +1174,13 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    // Reserved gateway-asserted identity headers are never
-                    // trusted from clients. They are injected after
-                    // authentication from `identified_consumer`.
-                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id") {
+                    // Reserved gateway-asserted headers are never trusted from
+                    // clients. Identity headers are injected after
+                    // authentication; path-param headers are injected after
+                    // route matching from regex captures.
+                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id")
+                        || key.starts_with("x-path-param-")
+                    {
                         continue;
                     }
                     let separator = repeated_request_header_separator(key);
@@ -1803,14 +1874,29 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    let precompute_mesh_key = plugins
+        .iter()
+        .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+    let mesh_key = if precompute_mesh_key {
+        crate::plugins::mesh::prometheus_helpers::mesh_request_key(summary)
+    } else {
+        None
+    };
     for plugin in plugins {
-        plugin.log(summary).await;
+        plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
     if let Some(mirror_result) = ctx.collect_mirror_result().await {
         let mirror_summary = summary.as_mirror_entry(mirror_result);
+        let mirror_mesh_key = if precompute_mesh_key {
+            crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
+        } else {
+            None
+        };
         for plugin in plugins {
-            plugin.log(&mirror_summary).await;
+            plugin
+                .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
+                .await;
         }
     }
 }
@@ -2338,6 +2424,81 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin may add a `Cache-Control:
+    /// no-transform` response directive in a later `after_proxy` hook.
+    ///
+    /// Compression uses this to avoid committing `Content-Encoding` before a
+    /// later response-header plugin marks the final representation as
+    /// no-transform.
+    fn may_add_response_cache_control_no_transform(
+        &self,
+        _ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin may add a strong `ETag` response
+    /// validator in a later `after_proxy` hook.
+    ///
+    /// Compression uses this to avoid transforming a representation before a
+    /// later response-header plugin attaches a strong validator for the
+    /// untransformed bytes.
+    fn may_add_response_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Applies this plugin's deterministic `after_proxy` response-header
+    /// mutations to a simulated header map.
+    ///
+    /// The proxy uses this for preflight decisions that need to reason about
+    /// later header hooks without actually running plugin side effects early.
+    /// Implementations MUST keep this pure with respect to the real request:
+    /// the caller passes a cloned context when mutation is needed to mirror
+    /// runtime consumption of route overrides.
+    fn simulate_after_proxy_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
+    /// Returns `true` when this plugin reads
+    /// `ferrum:later_no_transform_response` from request metadata before
+    /// committing response headers.
+    ///
+    /// The proxy uses this to avoid simulating later response-header hooks for
+    /// plugins that cannot act on the result. Compression is the built-in
+    /// consumer because it must not commit `Content-Encoding` before a later
+    /// hook marks the final representation `Cache-Control: no-transform`.
+    fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin reads `ferrum:later_strong_etag_response`
+    /// from request metadata before committing response headers.
+    ///
+    /// Compression is the built-in consumer because it must not commit
+    /// `Content-Encoding` before a later hook attaches a strong `ETag`.
+    fn needs_later_response_strong_etag(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can release response body buffering if a
+    /// later hook will add a strong `ETag`.
+    fn should_release_response_body_for_later_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin should also run its `after_proxy`
     /// header decoration logic for gateway-generated rejection responses.
     ///
@@ -2375,6 +2536,40 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when a plugin that otherwise buffers this response can
+    /// release it before the proxy applies the conservative content-type relabel
+    /// guard.
+    ///
+    /// Only use this for response-header invariants that make buffering
+    /// unnecessary independent of the final `Content-Type` (for example range
+    /// or `Cache-Control: no-transform` responses for compression). Returning
+    /// `false` keeps the existing content-type guard behavior.
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can release a buffered response because
+    /// a later `after_proxy` hook will add `Cache-Control: no-transform`.
+    ///
+    /// This is narrower than
+    /// [`should_release_response_body_before_content_type_rewrite`]: the proxy
+    /// has already established that a later hook can mark the final
+    /// representation as no-transform, and asks only whether that invariant
+    /// makes this plugin's buffered transform unnecessary.
+    fn should_release_response_body_for_later_no_transform(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Content-type-aware refinement of [`should_buffer_response_body`].
     ///
     /// Evaluated once per response *after* the backend response headers arrive,
@@ -2383,6 +2578,11 @@ pub trait Plugin: Send + Sync {
     /// would otherwise buffer and then immediately discard. The response
     /// `Content-Type` is unknown at the pre-flight `should_buffer_response_body`
     /// decision, which is why this is a separate hook.
+    ///
+    /// The full `response_headers` map (and `response_status`) are also passed so
+    /// a plugin can release a response it will decline to transform once headers
+    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
+    /// responses, so it must not pin them onto the buffered path either.
     ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
@@ -2395,6 +2595,8 @@ pub trait Plugin: Send + Sync {
         &self,
         ctx: &RequestContext,
         _content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
     }
@@ -2520,6 +2722,23 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Context-aware variant of `transform_response_body`.
+    ///
+    /// Existing plugins can keep overriding `transform_response_body`. Plugins
+    /// that need to use decisions or metadata from earlier response hooks can
+    /// override this method and the proxy will call it when a mutable request
+    /// context is available.
+    async fn transform_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.transform_response_body(body, content_type, response_headers)
+            .await
+    }
+
     /// Called after all `transform_response_body` hooks on buffered responses.
     ///
     /// Use this hook when the plugin must inspect or act on the final
@@ -2537,6 +2756,16 @@ pub trait Plugin: Send + Sync {
 
     /// Called for transaction logging.
     async fn log(&self, _summary: &TransactionSummary) {}
+
+    /// Called for transaction logging with a precomputed mesh RED key when
+    /// multiple built-in mesh observability sinks need the same labels.
+    async fn log_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        _mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
+    ) {
+        self.log(summary).await;
+    }
 
     /// Returns `true` if this plugin participates in the authentication phase.
     ///
@@ -3038,7 +3267,7 @@ pub fn create_plugin_with_http_client(
             // `plugin_cache::try_create_plugin`. Returning `Ok(None)` here routes
             // the retired name to that fatal fail-closed path regardless of any
             // custom plugin registered under the same name.
-            if is_removed_security_plugin(name) {
+            if removed_plugin_registration(name).is_some() {
                 return Ok(None);
             }
             // Fall through to custom plugins registry
@@ -3065,130 +3294,146 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
     }
 }
 
-/// List of all available plugin names (built-in + custom).
-/// Returns true if the named plugin is security-critical.
-///
-/// Validation failures for these plugins are fatal at startup — the gateway
-/// refuses to start rather than serving traffic without the intended security.
-pub fn is_security_plugin(name: &str) -> bool {
-    matches!(
-        name,
-        "key_auth"
-            | "basic_auth"
-            | "ldap_auth"
-            | "jwt_auth"
-            | "hmac_auth"
-            | "jwks_auth"
-            | "oauth2_introspection"
-            | "oidc_relying_party"
-            | "mtls_auth"
-            | "mesh_authz"
-            | "opa"
-            | "mesh_outbound_registry"
-            | "access_control"
-            | "tcp_connection_throttle"
-            | "adaptive_concurrency"
-            | "rate_limiting"
-            | "ip_restriction"
-            | "waf"
-            | "ai_semantic_firewall"
-            | "security_headers"
-            | "openapi_validator"
-            | "mcp_gateway"
-            | "a2a_gateway"
-            | "soap_ws_security"
-    )
-}
-
 /// Removed built-in plugins that were historically security-sensitive.
 ///
 /// These names are intentionally fail-closed during config load so upgrades
 /// cannot silently drop authentication/authorization protections.
-pub fn is_removed_security_plugin(name: &str) -> bool {
-    matches!(name, "oauth2_auth" | "semantic_ai_firewall")
+pub const REMOVED_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
+    builtin_plugin("oauth2_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("semantic_ai_firewall", PluginFailurePolicy::FailClosed),
+];
+
+/// Built-in plugin factory registrations, excluding build-time custom plugins.
+pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
+    builtin_plugin(
+        "transaction_log_schema",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("tcp_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("kafka_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin(
+        "transaction_debugger",
+        PluginFailurePolicy::OptionalFailOpen,
+    ),
+    builtin_plugin("jwks_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("oauth2_introspection", PluginFailurePolicy::FailClosed),
+    builtin_plugin("oidc_relying_party", PluginFailurePolicy::FailClosed),
+    builtin_plugin("jwt_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("key_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("basic_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ldap_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("hmac_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("mtls_auth", PluginFailurePolicy::FailClosed),
+    builtin_plugin("spiffe_identity", PluginFailurePolicy::FailClosed),
+    builtin_plugin("mesh_authz", PluginFailurePolicy::FailClosed),
+    builtin_plugin("opa", PluginFailurePolicy::FailClosed),
+    builtin_plugin("mesh_outbound_registry", PluginFailurePolicy::FailClosed),
+    builtin_plugin("compression", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("cors", PluginFailurePolicy::FailClosed),
+    builtin_plugin("security_headers", PluginFailurePolicy::FailClosed),
+    builtin_plugin("access_control", PluginFailurePolicy::FailClosed),
+    builtin_plugin("tcp_connection_throttle", PluginFailurePolicy::FailClosed),
+    builtin_plugin("adaptive_concurrency", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ip_restriction", PluginFailurePolicy::FailClosed),
+    builtin_plugin("bot_detection", PluginFailurePolicy::FailClosed),
+    builtin_plugin("correlation_id", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "request_transformer",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin(
+        "response_transformer",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("mesh_route_dispatch", PluginFailurePolicy::FailClosed),
+    builtin_plugin("graphql", PluginFailurePolicy::FailClosed),
+    builtin_plugin("grpc_method_router", PluginFailurePolicy::FailClosed),
+    builtin_plugin("grpc_deadline", PluginFailurePolicy::FailClosed),
+    builtin_plugin("grpc_web", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("rate_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("request_size_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("waf", PluginFailurePolicy::FailClosed),
+    builtin_plugin("response_size_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("body_validator", PluginFailurePolicy::FailClosed),
+    builtin_plugin("openapi_validator", PluginFailurePolicy::FailClosed),
+    builtin_plugin("request_termination", PluginFailurePolicy::FailClosed),
+    builtin_plugin("response_caching", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("response_mock", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "serverless_function",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("prometheus_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("proxy_alerts", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("otel_tracing", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ai_token_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ai_request_guard", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_rate_limiter", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_prompt_shield", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_semantic_firewall", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
+    builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ws_frame_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_rate_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("udp_rate_limiting", PluginFailurePolicy::FailClosed),
+    builtin_plugin("udp_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("statsd_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("loki_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("sse", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("request_mirror", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("load_testing", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("geo_restriction", PluginFailurePolicy::FailClosed),
+    builtin_plugin("request_deduplication", PluginFailurePolicy::FailClosed),
+    builtin_plugin("soap_ws_security", PluginFailurePolicy::FailClosed),
+    builtin_plugin("spec_expose", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("api_chargeback", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "api_chargeback_sink",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
+    builtin_plugin("workload_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("__mesh_bpf_metrics", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
+];
+
+pub fn builtin_plugin_registration(name: &str) -> Option<&'static PluginRegistration> {
+    BUILTIN_PLUGIN_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.name == name)
+}
+
+pub fn removed_plugin_registration(name: &str) -> Option<&'static PluginRegistration> {
+    REMOVED_PLUGIN_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.name == name)
+}
+
+pub fn plugin_failure_policy(name: &str) -> Option<PluginFailurePolicy> {
+    builtin_plugin_registration(name)
+        .map(|registration| registration.failure_policy)
+        .or_else(|| {
+            removed_plugin_registration(name).map(|registration| registration.failure_policy)
+        })
+        .or_else(|| crate::custom_plugins::custom_plugin_failure_policy(name))
+}
+
+/// Returns true when `name` is handled by the built-in plugin factory.
+pub fn is_builtin_plugin_name(name: &str) -> bool {
+    builtin_plugin_registration(name).is_some()
 }
 
 pub fn available_plugins() -> Vec<&'static str> {
-    let mut plugins = vec![
-        "transaction_log_schema",
-        "stdout_logging",
-        "http_logging",
-        "tcp_logging",
-        "kafka_logging",
-        "ws_logging",
-        "transaction_debugger",
-        "jwks_auth",
-        "oauth2_introspection",
-        "oidc_relying_party",
-        "jwt_auth",
-        "key_auth",
-        "basic_auth",
-        "ldap_auth",
-        "hmac_auth",
-        "mtls_auth",
-        "spiffe_identity",
-        "mesh_authz",
-        "opa",
-        "mesh_outbound_registry",
-        "compression",
-        "cors",
-        "security_headers",
-        "access_control",
-        "tcp_connection_throttle",
-        "adaptive_concurrency",
-        "ip_restriction",
-        "bot_detection",
-        "correlation_id",
-        "request_transformer",
-        "response_transformer",
-        "mesh_route_dispatch",
-        "graphql",
-        "grpc_method_router",
-        "grpc_deadline",
-        "grpc_web",
-        "rate_limiting",
-        "request_size_limiting",
-        "waf",
-        "response_size_limiting",
-        "body_validator",
-        "openapi_validator",
-        "request_termination",
-        "response_caching",
-        "response_mock",
-        "serverless_function",
-        "prometheus_metrics",
-        "proxy_alerts",
-        "otel_tracing",
-        "ai_token_metrics",
-        "ai_request_guard",
-        "ai_rate_limiter",
-        "ai_prompt_shield",
-        "ai_semantic_firewall",
-        "ai_response_guard",
-        "ai_semantic_cache",
-        "ai_federation",
-        "mcp_gateway",
-        "a2a_gateway",
-        "ws_message_size_limiting",
-        "ws_frame_logging",
-        "ws_rate_limiting",
-        "udp_rate_limiting",
-        "udp_logging",
-        "statsd_logging",
-        "loki_logging",
-        "sse",
-        "request_mirror",
-        "load_testing",
-        "geo_restriction",
-        "request_deduplication",
-        "soap_ws_security",
-        "spec_expose",
-        "api_chargeback",
-        "api_chargeback_sink",
-        "workload_metrics",
-        "__mesh_bpf_metrics",
-        "fault_injection",
-    ];
+    let mut plugins: Vec<_> = BUILTIN_PLUGIN_REGISTRATIONS
+        .iter()
+        .map(|registration| registration.name)
+        .collect();
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins
 }
@@ -3247,6 +3492,117 @@ mod tests {
             Some("/certs/canary-ca.pem")
         );
         assert!(!result.resolved_tls.verify_server_cert);
+    }
+
+    #[test]
+    fn upstream_override_recomputes_dispatch_port_override_fallback() {
+        // codex r1 #1806 finding 1: a route override that swaps the destination
+        // upstream must recompute the SD top-level `connectionPool.http`
+        // fallback from the NEW upstream — picking up the new destination's
+        // fallback, never leaking the old one.
+        use crate::config::types::UpstreamPortOverride;
+
+        // Source proxy points at SD upstream `stable` which carries no top-level
+        // overlay; assert the override TO `canary` picks up canary's overlay.
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+
+        let mut canary: Upstream = serde_json::from_value(json!({
+            "id": "canary",
+            "targets": [{"host": "canary.svc", "port": 9090}],
+        }))
+        .expect("minimal upstream should deserialize");
+        // SD top-level overlay (serde-skipped field, set directly).
+        canary.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(16),
+            h2_max_concurrent_streams: Some(64),
+            ..Default::default()
+        });
+        let mut upstreams = HashMap::new();
+        upstreams.insert("canary".to_string(), Arc::new(canary));
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_upstream_id = Some("canary".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &upstreams);
+        assert_eq!(result.upstream_id.as_deref(), Some("canary"));
+        let fallback = result
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("override TO an SD upstream must pick up that upstream's fallback");
+        assert_eq!(fallback.http1_max_pending_requests, Some(16));
+        assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
+    }
+
+    #[test]
+    fn upstream_override_clears_fallback_when_new_upstream_has_none() {
+        // codex r1 #1806 finding 1 (no-leak): a proxy carrying an SD fallback
+        // routed TO a different upstream WITHOUT one must have it CLEARED — the
+        // old upstream's overlay must not leak onto the new destination.
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+        // The referencing proxy already carries `stable`'s projected fallback.
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            http1_max_pending_requests: Some(99),
+            ..Default::default()
+        });
+
+        // `plain` has no top-level overlay.
+        let plain: Upstream = serde_json::from_value(json!({
+            "id": "plain",
+            "targets": [{"host": "plain.svc", "port": 9090}],
+        }))
+        .expect("minimal upstream should deserialize");
+        let mut upstreams = HashMap::new();
+        upstreams.insert("plain".to_string(), Arc::new(plain));
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_upstream_id = Some("plain".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &upstreams);
+        assert_eq!(result.upstream_id.as_deref(), Some("plain"));
+        assert!(
+            result.dispatch_port_override_fallback.is_none(),
+            "routing to an upstream without a fallback must CLEAR the inherited one (no leak)"
+        );
+    }
+
+    #[test]
+    fn direct_backend_override_clears_dispatch_port_override_fallback() {
+        // codex r1 #1806 finding 1: a direct-backend override (no upstream)
+        // must clear the SD fallback, mirroring how it clears
+        // `dispatch_port_overrides`.
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(3),
+            ..Default::default()
+        });
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_backend_host = Some("direct.svc".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &HashMap::new());
+        assert_eq!(result.upstream_id, None);
+        assert!(
+            result.dispatch_port_override_fallback.is_none(),
+            "a direct-backend override must clear the SD fallback"
+        );
     }
 
     #[test]

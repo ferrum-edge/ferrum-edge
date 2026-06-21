@@ -26,29 +26,58 @@ use crate::config::types::{
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, GatewayTrustBundlePoll, IncrementalResult,
-    PaginatedResult, SortOrder, extract_db_hostname, extract_known_ids, redact_url,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder, extract_db_hostname, extract_known_ids,
+    redact_url,
 };
 
 struct PluginConfigRef {
     id: String,
     scope: PluginScope,
     proxy_id: Option<String>,
+}
+
+type ProxyPluginAssociations = HashMap<String, Vec<PluginAssociation>>;
+type PluginConfigRefs = HashMap<String, PluginConfigRef>;
+
+#[derive(Debug)]
+pub(crate) struct ProxyPluginAssociationLoadError {
+    message: String,
+}
+
+impl ProxyPluginAssociationLoadError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl std::fmt::Display for ProxyPluginAssociationLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProxyPluginAssociationLoadError {}
+
+pub(crate) fn is_proxy_plugin_association_load_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProxyPluginAssociationLoadError>()
+        .is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,6 +121,18 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
     }
 
     entries
+}
+
+fn proxy_route_key_hash(listen_path: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    match listen_path {
+        Some(path) => {
+            hasher.update(b"path\0");
+            hasher.update(path.as_bytes());
+        }
+        None => hasher.update(b"host-only\0"),
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn format_consumer_identity_conflict(
@@ -327,7 +368,8 @@ pub(crate) fn statement_timeout_sql(
 #[derive(Clone)]
 pub struct DatabaseStore {
     pool: Arc<ArcSwap<AnyPool>>,
-    read_replica_pool: Option<Arc<ArcSwap<AnyPool>>>,
+    read_replica_url: Option<String>,
+    read_replica_pool: Arc<ArcSwapOption<AnyPool>>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -346,6 +388,17 @@ pub struct DatabaseStore {
     /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
     /// same cleared-state after recovery.
     migrations_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminReadSource {
+    Primary,
+    ReadReplica,
+}
+
+struct AdminReadPool {
+    pool: AnyPool,
+    source: AdminReadSource,
 }
 
 impl DatabaseStore {
@@ -375,6 +428,148 @@ impl DatabaseStore {
             }
         }
         result
+    }
+
+    fn proxy_route_lock_insert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT IGNORE INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
+                .to_string(),
+            "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
+                .to_string(),
+            _ => self.q("INSERT INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace, route_key_hash) DO NOTHING"),
+        }
+    }
+
+    fn listen_path_candidate_sql(
+        &self,
+        listen_path: Option<&str>,
+        exclude_id: Option<&str>,
+    ) -> String {
+        let path_filter = if listen_path.is_some() {
+            "listen_path = ?"
+        } else {
+            "listen_path IS NULL"
+        };
+        let exclude_filter = if exclude_id.is_some() {
+            " AND id != ?"
+        } else {
+            ""
+        };
+        self.q(&format!(
+            "SELECT id, hosts FROM proxies WHERE namespace = ? \
+             AND backend_scheme NOT IN ('tcp', 'tcps', 'udp', 'dtls') \
+             AND {path_filter}{exclude_filter}"
+        ))
+    }
+
+    async fn listen_path_candidate_rows_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        listen_path: Option<&str>,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<AnyRow>, anyhow::Error> {
+        let sql = self.listen_path_candidate_sql(listen_path, exclude_id);
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(path) = listen_path {
+            query = query.bind(path);
+        }
+        if let Some(eid) = exclude_id {
+            query = query.bind(eid);
+        }
+        Ok(query.fetch_all(&mut **tx).await?)
+    }
+
+    fn listen_path_rows_are_unique(
+        listen_path: Option<&str>,
+        hosts: &[String],
+        rows: &[AnyRow],
+    ) -> bool {
+        if listen_path.is_none() && hosts.is_empty() {
+            return false;
+        }
+        if rows.is_empty() {
+            return true;
+        }
+        if listen_path.is_some() && hosts.is_empty() {
+            return false;
+        }
+
+        for row in rows {
+            let existing_hosts: Vec<String> = row
+                .try_get::<String, _>("hosts")
+                .ok()
+                .and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    async fn lock_proxy_route_bucket_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        listen_path: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let route_key_hash = proxy_route_key_hash(listen_path);
+        let now = Utc::now().to_rfc3339();
+        let insert_sql = self.proxy_route_lock_insert_sql();
+        sqlx::query(&insert_sql)
+            .bind(namespace)
+            .bind(&route_key_hash)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+
+        if self.db_type != "sqlite" {
+            let lock_sql = self.q("SELECT route_key_hash FROM proxy_route_locks \
+                 WHERE namespace = ? AND route_key_hash = ? FOR UPDATE");
+            sqlx::query(&lock_sql)
+                .bind(namespace)
+                .bind(&route_key_hash)
+                .fetch_optional(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_proxy_route_unique_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        proxy: &Proxy,
+        exclude_id: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        if proxy.effective_scheme().is_stream() {
+            return Ok(());
+        }
+
+        let listen_path = proxy.listen_path.as_deref();
+        self.lock_proxy_route_bucket_tx(tx, &proxy.namespace, listen_path)
+            .await?;
+        let rows = self
+            .listen_path_candidate_rows_tx(tx, &proxy.namespace, listen_path, exclude_id)
+            .await?;
+        if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows) {
+            anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
+        }
+
+        Ok(())
     }
 
     async fn delete_consumer_credential_index_tx(
@@ -517,7 +712,8 @@ impl DatabaseStore {
 
         let store = Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
-            read_replica_pool: None,
+            read_replica_url: None,
+            read_replica_pool: Arc::new(ArcSwapOption::empty()),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -573,7 +769,8 @@ impl DatabaseStore {
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
-            read_replica_pool: None,
+            read_replica_url: None,
+            read_replica_pool: Arc::new(ArcSwapOption::empty()),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -651,6 +848,306 @@ impl DatabaseStore {
         }
     }
 
+    fn proxy_plugin_association_query_error(
+        operation: &str,
+        namespace: Option<&str>,
+        source: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        let message = match namespace {
+            Some(namespace) => format!(
+                "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
+                operation, namespace, source
+            ),
+            None => format!(
+                "operation={} resource=proxy_plugins: failed to query proxy/plugin associations: {}",
+                operation, source
+            ),
+        };
+        anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
+    }
+
+    fn proxy_plugin_association_proxy_id(
+        row: &AnyRow,
+        operation: &str,
+    ) -> Result<String, anyhow::Error> {
+        row.try_get::<String, _>("proxy_id").map_err(|e| {
+            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+                "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
+                operation,
+                e
+            )))
+        })
+    }
+
+    fn proxy_plugin_association_plugin_config_id(
+        row: &AnyRow,
+        operation: &str,
+        proxy_id: &str,
+    ) -> Result<String, anyhow::Error> {
+        row.try_get::<String, _>("plugin_config_id").map_err(|e| {
+            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+                "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                operation,
+                proxy_id,
+                e
+            )))
+        })
+    }
+
+    fn push_proxy_plugin_association_row(
+        associations: &mut ProxyPluginAssociations,
+        row: &AnyRow,
+        operation: &str,
+    ) -> Result<(), anyhow::Error> {
+        let proxy_id = Self::proxy_plugin_association_proxy_id(row, operation)?;
+        let plugin_config_id =
+            Self::proxy_plugin_association_plugin_config_id(row, operation, &proxy_id)?;
+        associations
+            .entry(proxy_id)
+            .or_default()
+            .push(PluginAssociation { plugin_config_id });
+        Ok(())
+    }
+
+    fn ensure_no_unmatched_proxy_plugin_associations(
+        operation: &str,
+        associations: &ProxyPluginAssociations,
+    ) -> Result<(), anyhow::Error> {
+        if let Some(proxy_id) = associations.keys().next() {
+            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+                format!(
+                    "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
+                    operation, proxy_id
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn load_proxy_plugin_associations_for_namespace(
+        &self,
+        namespace: &str,
+        operation: &str,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        let sql = self.q("SELECT pp.proxy_id, pp.plugin_config_id \
+             FROM proxy_plugins pp \
+             INNER JOIN proxies p ON pp.proxy_id = p.id \
+             WHERE p.namespace = ?");
+        let rows: Vec<AnyRow> = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&self.pool())
+            .await
+            .map_err(|e| {
+                Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
+            })?;
+
+        let mut associations = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+        }
+        Ok(associations)
+    }
+
+    async fn load_proxy_plugin_associations_for_proxy_ids(
+        &self,
+        proxy_ids: &[String],
+        operation: &str,
+        use_primary: bool,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        if proxy_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let pool = if use_primary {
+            self.pool()
+        } else {
+            self.rpool()
+        };
+        self.load_proxy_plugin_associations_for_proxy_ids_from_pool(proxy_ids, operation, &pool)
+            .await
+    }
+
+    async fn load_proxy_plugin_associations_for_proxy_ids_from_pool(
+        &self,
+        proxy_ids: &[String],
+        operation: &str,
+        pool: &AnyPool,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        if proxy_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut associations: ProxyPluginAssociations = HashMap::new();
+        for chunk in proxy_ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
+                placeholders
+            ));
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query
+                .fetch_all(pool)
+                .await
+                .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
+            for row in &rows {
+                Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+            }
+        }
+
+        Ok(associations)
+    }
+
+    async fn reject_invalid_loaded_proxy_plugin_associations(
+        &self,
+        operation: &str,
+        proxy: &Proxy,
+    ) -> Result<(), anyhow::Error> {
+        let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(std::slice::from_ref(proxy));
+        let plugin_refs = self
+            .load_plugin_config_refs(&plugin_config_ids, &proxy.namespace)
+            .await?;
+        let errors = Self::validate_loaded_proxy_plugin_associations_with_refs(
+            &proxy.id,
+            &proxy.plugins,
+            &plugin_refs,
+        );
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+            format!(
+                "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
+                operation,
+                proxy.id,
+                proxy.namespace,
+                errors.join("; ")
+            ),
+        )))
+    }
+
+    async fn reject_invalid_loaded_proxy_plugin_association_page(
+        &self,
+        operation: &str,
+        namespace: &str,
+        proxies: &[Proxy],
+        pool: &AnyPool,
+    ) -> Result<(), anyhow::Error> {
+        let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(proxies);
+        let plugin_refs = self
+            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, pool)
+            .await?;
+        let mut errors = Vec::new();
+        for proxy in proxies {
+            errors.extend(Self::validate_loaded_proxy_plugin_associations_with_refs(
+                &proxy.id,
+                &proxy.plugins,
+                &plugin_refs,
+            ));
+        }
+        if errors.is_empty() {
+            return Ok(());
+        }
+
+        Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+            format!(
+                "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
+                operation,
+                namespace,
+                errors.join("; ")
+            ),
+        )))
+    }
+
+    fn loaded_proxy_plugin_config_ids(proxies: &[Proxy]) -> Vec<String> {
+        let mut requested_ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for proxy in proxies {
+            for assoc in &proxy.plugins {
+                if seen_ids.insert(assoc.plugin_config_id.as_str()) {
+                    requested_ids.push(assoc.plugin_config_id.clone());
+                }
+            }
+        }
+        requested_ids
+    }
+
+    fn validate_loaded_proxy_plugin_associations_with_refs(
+        proxy_id: &str,
+        associations: &[PluginAssociation],
+        plugin_refs: &PluginConfigRefs,
+    ) -> Vec<String> {
+        let mut seen_assoc_ids: HashSet<&str> = HashSet::new();
+        let mut errors = Vec::new();
+
+        for assoc in associations {
+            if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
+                errors.push(format!(
+                    "Proxy '{}' references plugin_config '{}' more than once",
+                    proxy_id, assoc.plugin_config_id
+                ));
+            } else {
+                match plugin_refs.get(assoc.plugin_config_id.as_str()) {
+                    Some(plugin) => match plugin.scope {
+                        PluginScope::Global => {
+                            errors.push(format!(
+                                "Proxy '{}' references global plugin_config '{}'",
+                                proxy_id, plugin.id
+                            ));
+                        }
+                        PluginScope::ProxyGroup => {
+                            if plugin.proxy_id.is_some() {
+                                errors.push(format!(
+                                    "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                    proxy_id,
+                                    plugin.id,
+                                    plugin.proxy_id.as_deref().unwrap_or("<none>")
+                                ));
+                            }
+                        }
+                        PluginScope::Proxy => {
+                            if plugin.proxy_id.as_deref() != Some(proxy_id) {
+                                errors.push(format!(
+                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    proxy_id,
+                                    plugin.id,
+                                    plugin.proxy_id.as_deref().unwrap_or("<none>")
+                                ));
+                            }
+                        }
+                    },
+                    None => errors.push(format!(
+                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        proxy_id, assoc.plugin_config_id
+                    )),
+                }
+            }
+        }
+
+        errors
+    }
+
+    fn reject_invalid_gateway_plugin_references(
+        operation: &str,
+        config: &GatewayConfig,
+    ) -> Result<(), anyhow::Error> {
+        if let Err(errors) = config.validate_plugin_references() {
+            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+                format!(
+                    "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
+                    operation,
+                    errors.join("; ")
+                ),
+            )));
+        }
+        Ok(())
+    }
+
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
@@ -675,6 +1172,10 @@ impl DatabaseStore {
 
         ValidationPipeline::new(&mut config)
             .normalize_fields()
+            .run()?;
+        Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
+
+        ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
             .validate_all_fields_with_ip_policy(
                 self.cert_expiry_warning_days,
@@ -702,9 +1203,6 @@ impl DatabaseStore {
             .validate_mesh_route_dispatch_references(ValidationAction::FatalStatic(
                 "Database has invalid mesh_route_dispatch upstream reference(s)",
             ))
-            .validate_plugin_references(ValidationAction::FatalStatic(
-                "Database has invalid plugin reference(s)",
-            ))
             .validate_plugin_configs(ValidationAction::Warn)
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
@@ -726,44 +1224,12 @@ impl DatabaseStore {
         let start = Instant::now();
 
         // Batch-load proxy_plugins for proxies in this namespace (eliminates N+1).
-        let assoc_rows: Vec<AnyRow> =
-            match sqlx::query(&self.q("SELECT pp.proxy_id, pp.plugin_config_id FROM proxy_plugins pp INNER JOIN proxies p ON pp.proxy_id = p.id WHERE p.namespace = ?"))
-                .bind(namespace)
-                .fetch_all(&self.rpool())
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    error!("Failed to load proxy_plugins associations: {}", e);
-                    Vec::new()
-                }
-            };
-
-        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
-            std::collections::HashMap::new();
-        for r in &assoc_rows {
-            let proxy_id: String = match r.try_get("proxy_id") {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Failed to read proxy_id from proxy_plugins row: {}", e);
-                    continue;
-                }
-            };
-            let plugin_config_id: String = match r.try_get("plugin_config_id") {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "Failed to read plugin_config_id from proxy_plugins row (proxy_id={}): {}",
-                        proxy_id, e
-                    );
-                    continue;
-                }
-            };
-            plugins_by_proxy
-                .entry(proxy_id)
-                .or_default()
-                .push(PluginAssociation { plugin_config_id });
-        }
+        // Association rows are part of the security/policy graph, so any
+        // query or decode error rejects the whole candidate instead of
+        // publishing proxies with silently empty plugin lists.
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_namespace(namespace, "load_full_config")
+            .await?;
 
         // Load proxies in chunks to avoid unbounded SELECT * at scale.
         let mut proxies = Vec::new();
@@ -776,7 +1242,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -789,6 +1255,7 @@ impl DatabaseStore {
             }
             offset += self.full_load_page_size;
         }
+        Self::ensure_no_unmatched_proxy_plugin_associations("load_full_config", &plugins_by_proxy)?;
 
         self.check_slow_query("load_proxies", start);
         Ok(proxies)
@@ -806,7 +1273,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -837,7 +1304,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -959,6 +1426,8 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
+            .await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
@@ -1095,11 +1564,20 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        let old_upstream_id: Option<String> =
+            sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ?"))
+                .bind(&proxy.id)
+                .bind(&proxy.namespace)
+                .fetch_optional(&mut *tx)
+                .await?
+                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
+        self.ensure_proxy_route_unique_tx(&mut tx, proxy, Some(&proxy.id))
+            .await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -1148,6 +1626,7 @@ impl DatabaseStore {
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
+        .bind(&proxy.namespace)
         .execute(&mut *tx)
         .await?;
 
@@ -1170,6 +1649,13 @@ impl DatabaseStore {
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
 
+        if let Some(old_upstream_id) = old_upstream_id.as_deref()
+            && proxy.upstream_id.as_deref() != Some(old_upstream_id)
+        {
+            self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+                .await?;
+        }
+
         tx.commit().await?;
 
         self.check_slow_query("update_proxy", start);
@@ -1184,7 +1670,7 @@ impl DatabaseStore {
         // cascade-delete that upstream if it becomes orphaned. Also capture the
         // api_spec row, if this proxy owns one, before the FK cascade removes it.
         let proxy_row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ?"))
+            sqlx::query(&self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -1194,6 +1680,7 @@ impl DatabaseStore {
             return Ok(false);
         };
         let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
+        let proxy_namespace: String = proxy_row.try_get("namespace")?;
 
         let spec_row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT id, namespace FROM api_specs WHERE proxy_id = ?"))
@@ -1215,8 +1702,9 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
 
-        let result = sqlx::query(&self.q("DELETE FROM proxies WHERE id = ?"))
+        let result = sqlx::query(&self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
             .bind(id)
+            .bind(&proxy_namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -1242,24 +1730,7 @@ impl DatabaseStore {
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
-            let ref_rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                    .bind(uid)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            let dispatch_ref = if ref_rows.is_empty() {
-                self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, uid)
-                    .await?
-            } else {
-                None
-            };
-            if ref_rows.is_empty() && dispatch_ref.is_none() {
-                info!("Cascade-deleting orphaned upstream {}", uid);
-                sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
-                    .bind(uid)
-                    .execute(&mut *tx)
-                    .await?;
-            }
+            self.cleanup_orphaned_upstream_tx(&mut tx, uid).await?;
         }
 
         tx.commit().await?;
@@ -1276,21 +1747,74 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<(), anyhow::Error> {
-        let orphaned_ids: Vec<String> = sqlx::query(&self.q(
-            "SELECT pc.id FROM plugin_configs pc \
+        let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
+            "SELECT pc.id, pc.namespace FROM plugin_configs pc \
                  WHERE pc.scope = 'proxy_group' \
                  AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp WHERE pp.plugin_config_id = pc.id)",
         ))
         .fetch_all(&mut **tx)
         .await?
         .iter()
-        .filter_map(|row| row.try_get::<String, _>("id").ok())
+        .filter_map(|row| {
+            Some((
+                row.try_get::<String, _>("id").ok()?,
+                row.try_get::<String, _>("namespace").ok()?,
+            ))
+        })
         .collect();
 
-        for id in &orphaned_ids {
+        for (id, namespace) in &orphaned_configs {
             info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
-            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
+            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
+                .bind(namespace)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_orphaned_upstream_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        upstream_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let upstream_row: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT namespace, api_spec_id FROM upstreams WHERE id = ? LIMIT 1"),
+        )
+        .bind(upstream_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(upstream_row) = upstream_row else {
+            return Ok(());
+        };
+        let namespace: String = upstream_row.try_get("namespace")?;
+        let api_spec_id: Option<String> = upstream_row.try_get("api_spec_id")?;
+        if api_spec_id.is_some() {
+            return Ok(());
+        }
+
+        let ref_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+        )
+        .bind(upstream_id)
+        .bind(&namespace)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let dispatch_ref = if ref_rows.is_empty() {
+            self.find_mesh_route_dispatch_upstream_ref_tx(tx, upstream_id, &namespace)
+                .await?
+        } else {
+            None
+        };
+
+        if ref_rows.is_empty() && dispatch_ref.is_none() {
+            info!("Cleaning up orphaned upstream {}", upstream_id);
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
+                .bind(upstream_id)
+                .bind(&namespace)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -1300,6 +1824,29 @@ impl DatabaseStore {
 
     pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
         let start = Instant::now();
+        let proxy = self.load_proxy_with_associations(id, "get_proxy").await?;
+        if let Some(proxy) = proxy.as_ref() {
+            self.reject_invalid_loaded_proxy_plugin_associations("get_proxy", proxy)
+                .await?;
+        }
+        self.check_slow_query("get_proxy", start);
+        Ok(proxy)
+    }
+
+    pub async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        let start = Instant::now();
+        let proxy = self
+            .load_proxy_with_associations(id, "get_proxy_for_write")
+            .await?;
+        self.check_slow_query("get_proxy_for_write", start);
+        Ok(proxy)
+    }
+
+    async fn load_proxy_with_associations(
+        &self,
+        id: &str,
+        operation: &str,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool())
@@ -1310,34 +1857,15 @@ impl DatabaseStore {
             None => return Ok(None),
         };
 
-        let assoc_rows: Vec<AnyRow> = match sqlx::query(
-            &self.q("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?"),
-        )
-        .bind(id)
-        .fetch_all(&self.pool())
-        .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!("Failed to load plugin associations for proxy {}: {}", id, e);
-                Vec::new()
-            }
-        };
-
-        let plugins: Vec<PluginAssociation> = assoc_rows
-            .iter()
-            .filter_map(|r| match r.try_get::<String, _>("plugin_config_id") {
-                Ok(plugin_config_id) => Some(PluginAssociation { plugin_config_id }),
-                Err(e) => {
-                    warn!("Failed to read plugin_config_id for proxy {}: {}", id, e);
-                    None
-                }
-            })
-            .collect();
+        let proxy_ids = [id.to_string()];
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_proxy_ids(&proxy_ids, operation, true)
+            .await?;
+        let plugins = plugins_by_proxy.remove(id).unwrap_or_default();
+        Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
 
         let mut proxy = row_to_proxy(&row, id.to_string(), plugins)?;
         proxy.normalize_fields();
-        self.check_slow_query("get_proxy", start);
         Ok(Some(proxy))
     }
 
@@ -1398,7 +1926,7 @@ impl DatabaseStore {
         self.delete_consumer_credential_index_tx(&mut tx, &consumer.id)
             .await?;
         sqlx::query(&self.q(
-            "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=?",
+            "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
         ))
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
@@ -1406,6 +1934,7 @@ impl DatabaseStore {
         .bind(&acl_groups_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&consumer.id)
+        .bind(&consumer.namespace)
         .execute(&mut *tx)
         .await?;
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
@@ -1419,10 +1948,23 @@ impl DatabaseStore {
     pub async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM consumers WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_consumer", start);
+            return Ok(false);
+        };
         self.delete_consumer_credential_index_tx(&mut tx, id)
             .await?;
-        let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ?"))
+        let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ? AND namespace = ?"))
             .bind(id)
+            .bind(&namespace)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -1486,7 +2028,7 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&pc.plugin_name)
         .bind(&config_json)
@@ -1496,6 +2038,7 @@ impl DatabaseStore {
         .bind(pc.priority_override.map(|v| v as i32))
         .bind(Utc::now().to_rfc3339())
         .bind(&pc.id)
+        .bind(&pc.namespace)
         .execute(&self.pool())
         .await?;
 
@@ -1506,6 +2049,18 @@ impl DatabaseStore {
     pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM plugin_configs WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_plugin_config", start);
+            return Ok(false);
+        };
 
         let affected_proxy_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
@@ -1525,20 +2080,23 @@ impl DatabaseStore {
 
         if !affected_proxy_ids.is_empty() {
             let updated_at = Utc::now().to_rfc3339();
-            let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ?");
+            let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
             for proxy_id in affected_proxy_ids {
                 sqlx::query(&sql)
                     .bind(&updated_at)
                     .bind(proxy_id)
+                    .bind(&namespace)
                     .execute(&mut *tx)
                     .await?;
             }
         }
 
-        let result = sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let result =
+            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
+                .bind(id)
+                .bind(&namespace)
+                .execute(&mut *tx)
+                .await?;
 
         tx.commit().await?;
 
@@ -1579,7 +2137,7 @@ impl DatabaseStore {
             .bind(namespace)
             .bind(self.full_load_page_size)
             .bind(offset)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
             let fetched = rows.len();
             for row in rows {
@@ -1604,12 +2162,44 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_proxies_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_proxies_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_proxies_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_proxies_paginated_from_admin_read(namespace, limit, offset, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_proxies_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_proxies_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM proxies WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -1619,7 +2209,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         // Batch-load proxy_plugins for only the proxies in this page
@@ -1628,48 +2218,33 @@ impl DatabaseStore {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
 
-        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
-            std::collections::HashMap::new();
-        if !proxy_ids.is_empty() {
-            let placeholders = std::iter::repeat_n("?", proxy_ids.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = self.q(&format!(
-                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
-                placeholders
-            ));
-            let mut query = sqlx::query(&sql);
-            for id in &proxy_ids {
-                query = query.bind(id);
-            }
-            match query.fetch_all(&self.rpool()).await {
-                Ok(assoc_rows) => {
-                    for r in &assoc_rows {
-                        if let (Ok(pid), Ok(pcid)) = (
-                            r.try_get::<String, _>("proxy_id"),
-                            r.try_get::<String, _>("plugin_config_id"),
-                        ) {
-                            plugins_by_proxy
-                                .entry(pid)
-                                .or_default()
-                                .push(PluginAssociation {
-                                    plugin_config_id: pcid,
-                                });
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to load proxy_plugins for paginated list: {}", e);
-                }
-            }
-        }
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_proxy_ids_from_pool(
+                &proxy_ids,
+                "list_proxies_paginated",
+                pool,
+            )
+            .await?;
 
         let mut proxies = Vec::new();
         for row in rows {
             let id: String = row.try_get("id")?;
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-            proxies.push(row_to_proxy(&row, id, plugins)?);
+            let mut proxy = row_to_proxy(&row, id, plugins)?;
+            proxy.normalize_fields();
+            proxies.push(proxy);
         }
+        Self::ensure_no_unmatched_proxy_plugin_associations(
+            "list_proxies_paginated",
+            &plugins_by_proxy,
+        )?;
+        self.reject_invalid_loaded_proxy_plugin_association_page(
+            "list_proxies_paginated",
+            namespace,
+            &proxies,
+            pool,
+        )
+        .await?;
 
         self.check_slow_query("list_proxies_paginated", start);
         Ok(PaginatedResult {
@@ -1685,12 +2260,49 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_consumers_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_consumers_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_consumers_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_consumers_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_consumers_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_consumers_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM consumers WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -1700,7 +2312,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut consumers = Vec::new();
@@ -1722,12 +2334,56 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_plugin_configs_paginated_from_admin_read(
+                namespace,
+                limit,
+                offset,
+                &admin_read.pool,
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_plugin_configs_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_plugin_configs_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_plugin_configs_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!(
+                        "Admin read fallback to primary succeeded for list_plugin_configs_paginated"
+                    );
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_plugin_configs_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM plugin_configs WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -1738,7 +2394,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut configs = Vec::new();
@@ -1760,12 +2416,49 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_upstreams_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_upstreams_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_upstreams_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_upstreams_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_upstreams_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_upstreams_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM upstreams WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -1775,7 +2468,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut upstreams = Vec::new();
@@ -1877,7 +2570,7 @@ impl DatabaseStore {
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
@@ -1895,6 +2588,7 @@ impl DatabaseStore {
         .bind(&backend_tls_san_allow_list_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
+        .bind(&upstream.namespace)
         .execute(&self.pool())
         .await?;
 
@@ -1907,7 +2601,7 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled != 0"),
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled = 1"),
         )
         .bind("mesh_route_dispatch")
         .fetch_all(&mut **tx)
@@ -1924,11 +2618,13 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         upstream_id: &str,
+        namespace: &str,
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
         let plugins = self.mesh_route_dispatch_plugin_configs_tx(tx).await?;
-        Ok(plugins
-            .into_iter()
-            .find(|plugin| mesh_route_dispatch_references_upstream_id(plugin, upstream_id)))
+        Ok(plugins.into_iter().find(|plugin| {
+            plugin.namespace == namespace
+                && mesh_route_dispatch_references_upstream_id(plugin, upstream_id)
+        }))
     }
 
     /// Delete an upstream only if it is not referenced by any proxy.
@@ -1938,13 +2634,27 @@ impl DatabaseStore {
     pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM upstreams WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_upstream", start);
+            return Ok(false);
+        };
 
         // Check reference within the transaction to prevent races
-        let ref_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await?;
+        let ref_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+        )
+        .bind(id)
+        .bind(&namespace)
+        .fetch_all(&mut *tx)
+        .await?;
         if !ref_rows.is_empty() {
             tx.rollback().await?;
             anyhow::bail!(
@@ -1953,7 +2663,7 @@ impl DatabaseStore {
             );
         }
         if let Some(plugin) = self
-            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id)
+            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id, &namespace)
             .await?
         {
             tx.rollback().await?;
@@ -1964,8 +2674,9 @@ impl DatabaseStore {
             );
         }
 
-        let result = sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
+        let result = sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
             .bind(id)
+            .bind(&namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -1985,29 +2696,8 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
-        let ref_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                .bind(old_upstream_id)
-                .fetch_all(&mut *tx)
-                .await?;
-
-        let dispatch_ref = if ref_rows.is_empty() {
-            self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, old_upstream_id)
-                .await?
-        } else {
-            None
-        };
-
-        if ref_rows.is_empty() && dispatch_ref.is_none() {
-            info!(
-                "Cleaning up orphaned upstream {} after proxy reassignment",
-                old_upstream_id
-            );
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
-                .bind(old_upstream_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+            .await?;
 
         tx.commit().await?;
 
@@ -2054,82 +2744,18 @@ impl DatabaseStore {
         }
 
         let start = Instant::now();
-        let base_filter = "namespace = ? \
-              AND backend_scheme NOT IN ('tcp', 'tcps', 'udp', 'dtls')";
-        let path_filter = if listen_path.is_some() {
-            "listen_path = ?"
-        } else {
-            "listen_path IS NULL"
-        };
-
-        let rows: Vec<AnyRow> = match (exclude_id, listen_path) {
-            (Some(eid), Some(path)) => sqlx::query(&self.q(&format!(
-                "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter} AND id != ?"
-            )))
-            .bind(namespace)
-            .bind(path)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?,
-            (Some(eid), None) => sqlx::query(&self.q(&format!(
-                "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter} AND id != ?"
-            )))
-            .bind(namespace)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?,
-            (None, Some(path)) => {
-                sqlx::query(&self.q(&format!(
-                    "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter}"
-                )))
-                .bind(namespace)
-                .bind(path)
-                .fetch_all(&self.pool())
-                .await?
-            }
-            (None, None) => {
-                sqlx::query(&self.q(&format!(
-                    "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter}"
-                )))
-                .bind(namespace)
-                .fetch_all(&self.pool())
-                .await?
-            }
-        };
+        let sql = self.listen_path_candidate_sql(listen_path, exclude_id);
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(path) = listen_path {
+            query = query.bind(path);
+        }
+        if let Some(eid) = exclude_id {
+            query = query.bind(eid);
+        }
+        let rows: Vec<AnyRow> = query.fetch_all(&self.pool()).await?;
 
         self.check_slow_query("check_listen_path_unique", start);
-
-        // No other proxy with this listen_path bucket — unique
-        if rows.is_empty() {
-            return Ok(true);
-        }
-
-        // `Some(path) + empty hosts` is a catch-all for the path — any existing
-        // row in this bucket is a conflict regardless of its hosts.
-        if listen_path.is_some() && hosts.is_empty() {
-            return Ok(false);
-        }
-
-        // Otherwise check if any existing proxy's hosts overlap with the new hosts
-        for row in &rows {
-            let existing_hosts: Vec<String> = row
-                .try_get::<String, _>("hosts")
-                .ok()
-                .and_then(|s| match serde_json::from_str(&s) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        Ok(Self::listen_path_rows_are_unique(listen_path, hosts, &rows))
     }
 
     /// Check if a proxy name is unique (when present).
@@ -2429,8 +3055,14 @@ impl DatabaseStore {
                         }
                     }
                     PluginScope::ProxyGroup => {
-                        // ProxyGroup plugins have no proxy_id — any proxy can
-                        // reference them via its plugins association list.
+                        if plugin.proxy_id.is_some() {
+                            errors.push(format!(
+                                "Proxy '{}' references proxy_group plugin_config '{}' with proxy_id '{}'",
+                                proxy_id,
+                                plugin.id,
+                                plugin.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
                 },
                 None => errors.push(format!(
@@ -2552,7 +3184,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
-                .fetch_all(&self.rpool())
+                .fetch_all(&self.pool())
                 .await?;
 
         if rows.is_empty() {
@@ -2565,74 +3197,14 @@ impl DatabaseStore {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
 
-        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
-            std::collections::HashMap::new();
-
-        if !changed_ids.is_empty() {
-            let changed_id_list: Vec<&str> = changed_ids.iter().map(|s| s.as_str()).collect();
-
-            let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 500 {
-                // Too many IDs for an IN clause — fetch all and filter in memory
-                match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                    .fetch_all(&self.rpool())
-                    .await
-                {
-                    Ok(all_rows) => all_rows
-                        .into_iter()
-                        .filter(|r| {
-                            r.try_get::<String, _>("proxy_id")
-                                .map(|id| changed_ids.contains(&id))
-                                .unwrap_or(false)
-                        })
-                        .collect(),
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch proxy_plugins for incremental update: {}. \
-                             Plugin associations may be stale until next full reload.",
-                            e
-                        );
-                        Vec::new()
-                    }
-                }
-            } else {
-                // Build parameterized IN clause for targeted fetch
-                let placeholders: String = changed_id_list
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = self.q(&format!(
-                    "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
-                    placeholders
-                ));
-                let mut query = sqlx::query(&sql);
-                for id in &changed_id_list {
-                    query = query.bind(*id);
-                }
-                match query.fetch_all(&self.rpool()).await {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch proxy_plugins for incremental update: {}. \
-                             Plugin associations may be stale until next full reload.",
-                            e
-                        );
-                        Vec::new()
-                    }
-                }
-            };
-
-            for r in &assoc_rows {
-                if let Ok(proxy_id) = r.try_get::<String, _>("proxy_id")
-                    && let Ok(plugin_config_id) = r.try_get::<String, _>("plugin_config_id")
-                {
-                    plugins_by_proxy
-                        .entry(proxy_id)
-                        .or_default()
-                        .push(PluginAssociation { plugin_config_id });
-                }
-            }
-        }
+        let changed_id_list: Vec<String> = changed_ids.iter().cloned().collect();
+        let mut plugins_by_proxy = self
+            .load_proxy_plugin_associations_for_proxy_ids(
+                &changed_id_list,
+                "load_incremental_config",
+                true,
+            )
+            .await?;
 
         let mut proxies = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -2640,6 +3212,10 @@ impl DatabaseStore {
             let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
             proxies.push(row_to_proxy(row, id, plugins)?);
         }
+        Self::ensure_no_unmatched_proxy_plugin_associations(
+            "load_incremental_config",
+            &plugins_by_proxy,
+        )?;
 
         self.check_slow_query("load_proxies_since", start);
         Ok(proxies)
@@ -2656,7 +3232,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
-                .fetch_all(&self.rpool())
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut consumers = Vec::with_capacity(rows.len());
@@ -2679,7 +3255,7 @@ impl DatabaseStore {
         )
         .bind(namespace)
         .bind(since_str)
-        .fetch_all(&self.rpool())
+        .fetch_all(&self.pool())
         .await?;
 
         let mut configs = Vec::with_capacity(rows.len());
@@ -2701,7 +3277,7 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
-                .fetch_all(&self.rpool())
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut upstreams = Vec::with_capacity(rows.len());
@@ -2724,7 +3300,7 @@ impl DatabaseStore {
         let sql = self.q(table.select_ids_sql());
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
-            .fetch_all(&self.rpool())
+            .fetch_all(&self.pool())
             .await?;
 
         let mut ids = HashSet::with_capacity(rows.len());
@@ -2745,42 +3321,58 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
-    ) -> Result<std::collections::HashMap<String, PluginConfigRef>, anyhow::Error> {
+    ) -> Result<PluginConfigRefs, anyhow::Error> {
+        let pool = self.pool();
+        self.load_plugin_config_refs_from_pool(ids, namespace, &pool)
+            .await
+    }
+
+    async fn load_plugin_config_refs_from_pool(
+        &self,
+        ids: &[String],
+        namespace: &str,
+        pool: &AnyPool,
+    ) -> Result<PluginConfigRefs, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = self.q(&format!(
-            "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
-            placeholders
-        ));
+        let mut plugin_refs = std::collections::HashMap::new();
+        for chunk in ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
+                placeholders
+            ));
 
-        let mut query = sqlx::query(&sql);
-        query = query.bind(namespace);
-        for id in ids {
-            query = query.bind(id);
-        }
+            let mut query = sqlx::query(&sql);
+            query = query.bind(namespace);
+            for id in chunk {
+                query = query.bind(id);
+            }
 
-        let rows = query.fetch_all(&self.pool()).await?;
-        let mut plugin_refs = std::collections::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let scope = match row.try_get::<String, _>("scope")?.as_str() {
-                "proxy" => PluginScope::Proxy,
-                "proxy_group" => PluginScope::ProxyGroup,
-                _ => PluginScope::Global,
-            };
-            plugin_refs.insert(
-                id.clone(),
-                PluginConfigRef {
-                    id,
-                    scope,
-                    proxy_id: row.try_get("proxy_id").ok(),
-                },
-            );
+            let rows = query.fetch_all(pool).await?;
+            for row in rows {
+                let id: String = row.try_get("id")?;
+                let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                    "proxy" => PluginScope::Proxy,
+                    "proxy_group" => PluginScope::ProxyGroup,
+                    _ => PluginScope::Global,
+                };
+                let proxy_id = row
+                    .try_get::<Option<String>, _>("proxy_id")?
+                    .filter(|id| !id.trim().is_empty());
+                plugin_refs.insert(
+                    id.clone(),
+                    PluginConfigRef {
+                        id,
+                        scope,
+                        proxy_id,
+                    },
+                );
+            }
         }
 
         Ok(plugin_refs)
@@ -2804,6 +3396,7 @@ impl DatabaseStore {
     /// Maximum records per database transaction for batch operations.
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
+    const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
 
     /// Fallback page size used only when no runtime override has been set
     /// via `set_full_load_page_size()`. Matches the default for
@@ -2855,6 +3448,9 @@ impl DatabaseStore {
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
         for proxy in proxies {
+            self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
+                .await?;
+
             let circuit_breaker_json = proxy
                 .circuit_breaker
                 .as_ref()
@@ -2995,11 +3591,12 @@ impl DatabaseStore {
             .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
-        let touch_proxy_sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ?");
+        let touch_proxy_sql =
+            self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
             let mut seen = HashSet::new();
-            let mut touched_proxy_ids: HashSet<&str> = HashSet::new();
+            let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
             for proxy in chunk {
                 for assoc in &proxy.plugins {
                     if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
@@ -3019,15 +3616,16 @@ impl DatabaseStore {
                         .bind(&assoc.plugin_config_id)
                         .execute(&mut *tx)
                         .await?;
-                    touched_proxy_ids.insert(proxy.id.as_str());
+                    touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
                 }
             }
-            if !touched_proxy_ids.is_empty() {
+            if !touched_proxies.is_empty() {
                 let touch_ts = Utc::now().to_rfc3339();
-                for proxy_id in touched_proxy_ids {
+                for (proxy_id, namespace) in touched_proxies {
                     sqlx::query(&touch_proxy_sql)
                         .bind(&touch_ts)
                         .bind(proxy_id)
+                        .bind(namespace)
                         .execute(&mut *tx)
                         .await?;
                 }
@@ -3401,12 +3999,13 @@ impl DatabaseStore {
         }
     }
 
-    /// Connect a read replica pool for config polling.
+    /// Connect a read replica pool for admin read offload.
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
+        self.read_replica_url = Some(replica_url.to_string());
 
         let final_url = Self::append_connect_timeout(
             replica_url,
@@ -3415,44 +4014,81 @@ impl DatabaseStore {
         );
 
         let pool = self.build_pool_options().connect(&final_url).await?;
+        sqlx::query("SELECT 1").fetch_one(&pool).await?;
 
-        self.read_replica_pool = Some(Arc::new(ArcSwap::from_pointee(pool)));
+        self.read_replica_pool.store(Some(Arc::new(pool)));
         info!(
-            "Read replica connected (db_type={}, url={})",
+            "Read replica connected for admin reads (db_type={}, url={})",
             self.db_type,
             Self::redact_url(replica_url)
         );
         Ok(())
     }
 
-    /// Get a snapshot of the read replica pool, falling back to the primary.
+    /// Get a snapshot of the read pool for admin-only list/read APIs.
     ///
-    /// Used by config polling (load_full_config, load_incremental_config) to
-    /// offload read traffic from the primary. If no read replica is configured
-    /// or the replica pool has been closed, returns the primary pool.
-    fn rpool(&self) -> AnyPool {
-        if let Some(ref rp) = self.read_replica_pool {
-            let replica = (**rp.load()).clone();
-            if replica.is_closed() {
-                self.pool()
-            } else {
-                replica
+    /// Runtime configuration polling is intentionally excluded from this path:
+    /// authoritative startup loads, incremental changed-row queries, deletion
+    /// scans, and association validation must read from the primary pool so
+    /// replica lag cannot hide changes or advance cursors incorrectly.
+    fn admin_read_pool(&self) -> AdminReadPool {
+        if self.read_replica_url.is_some()
+            && let Some(replica) = self.read_replica_pool.load_full()
+        {
+            let pool = replica.as_ref().clone();
+            if !pool.is_closed() {
+                return AdminReadPool {
+                    pool,
+                    source: AdminReadSource::ReadReplica,
+                };
             }
+            self.mark_read_replica_unavailable("admin_read_pool", "replica pool is closed");
+        }
+
+        AdminReadPool {
+            pool: self.pool(),
+            source: AdminReadSource::Primary,
+        }
+    }
+
+    /// Snapshot the admin read pool. This is intentionally admin-only; runtime
+    /// polling must call [`Self::pool`] directly.
+    fn rpool(&self) -> AnyPool {
+        self.admin_read_pool().pool
+    }
+
+    fn mark_read_replica_unavailable(
+        &self,
+        operation: &'static str,
+        error: impl std::fmt::Display,
+    ) {
+        let old_pool = self.read_replica_pool.swap(None);
+        if old_pool.is_some() {
+            warn!(
+                operation,
+                error = %error,
+                "Read replica marked unavailable; admin reads will use primary until reconnect succeeds"
+            );
         } else {
-            self.pool()
+            warn!(
+                operation,
+                error = %error,
+                "Read replica unavailable; admin reads are using primary"
+            );
+        }
+        if let Some(pool) = old_pool {
+            tokio::spawn(async move {
+                pool.close().await;
+            });
         }
     }
 
     /// Atomically replace the read replica pool with a freshly connected one.
     ///
-    /// Called by the DB polling loop when DnsCache detects that the read replica
-    /// FQDN now resolves to a different set of IPs.
+    /// Called by the DB polling loop when DnsCache detects that the read
+    /// replica FQDN now resolves to a different set of IPs, by the TLS reload
+    /// watcher, and after startup if the initial replica connection failed.
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
-        let rp = match &self.read_replica_pool {
-            Some(rp) => rp,
-            None => return Ok(()), // no replica configured
-        };
-
         sqlx::any::install_default_drivers();
 
         let final_url = Self::append_connect_timeout(
@@ -3461,17 +4097,25 @@ impl DatabaseStore {
             self.pool_config.connect_timeout_seconds,
         );
 
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
-
-        let old_pool = rp.swap(Arc::new(new_pool));
         info!(
-            "Read replica pool reconnected (db_type={}). Old pool closing in background.",
-            self.db_type
+            "Attempting read replica reconnect for admin reads (db_type={}, url={})",
+            self.db_type,
+            Self::redact_url(replica_url)
+        );
+        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
+
+        let old_pool = self.read_replica_pool.swap(Some(Arc::new(new_pool)));
+        info!(
+            "Read replica restored for admin reads (db_type={}). Old pool closing in background.",
+            self.db_type,
         );
 
-        tokio::spawn(async move {
-            old_pool.close().await;
-        });
+        if let Some(old_pool) = old_pool {
+            tokio::spawn(async move {
+                old_pool.close().await;
+            });
+        }
 
         Ok(())
     }
@@ -3517,21 +4161,56 @@ impl DatabaseStore {
         crate::config::db_backend::redact_url(url)
     }
 
-    /// Returns true if a read replica pool is configured.
+    /// Returns true if a read replica URL is configured.
     #[allow(dead_code)] // Public API for tests and future consumers
     pub fn has_read_replica_pool(&self) -> bool {
-        self.read_replica_pool.is_some()
+        self.read_replica_url.is_some()
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     pub async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self.list_namespaces_from_admin_read(&admin_read.pool).await {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_namespaces", &error);
+                warn!("Read replica admin query failed; retrying list_namespaces against primary");
+                let primary_pool = self.pool();
+                let retry = self.list_namespaces_from_admin_read(&primary_pool).await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_namespaces");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return all distinct namespaces from the authoritative primary pool.
+    pub async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        let pool = self.pool();
+        self.list_namespaces_from_pool(&pool).await
+    }
+
+    async fn list_namespaces_from_admin_read(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces_from_pool(pool).await
+    }
+
+    async fn list_namespaces_from_pool(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
         let sql = "SELECT DISTINCT namespace FROM proxies \
                    UNION SELECT DISTINCT namespace FROM consumers \
                    UNION SELECT DISTINCT namespace FROM plugin_configs \
                    UNION SELECT DISTINCT namespace FROM upstreams \
                    ORDER BY 1";
-        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.rpool()).await?;
+        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
         for row in rows {
             if let Ok(ns) = row.try_get::<String, _>("namespace") {
@@ -3632,6 +4311,7 @@ impl DatabaseStore {
         // and the `replace_api_spec_bundle` UPDATE path).
         {
             let p = &bundle.proxy;
+            self.ensure_proxy_route_unique_tx(&mut tx, p, None).await?;
             let hosts_json = serde_json::to_string(&p.hosts)?;
             let circuit_breaker_json = p
                 .circuit_breaker
@@ -3846,9 +4526,9 @@ impl DatabaseStore {
             && current_resource_hash.as_deref() == Some(desired_resource_hash.as_str())
         {
             // Bundle is unchanged — only update the api_specs metadata row.
-            let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+            let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
             let server_urls_json =
-                serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+                serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
             let spec_format_str = match spec.spec_format {
                 crate::config::types::SpecFormat::Json => "json",
                 crate::config::types::SpecFormat::Yaml => "yaml",
@@ -3983,6 +4663,8 @@ impl DatabaseStore {
         // hand-added plugins whose proxy_id FK points at this row are unaffected).
         {
             let p = &bundle.proxy;
+            self.ensure_proxy_route_unique_tx(&mut tx, p, Some(&p.id))
+                .await?;
             let hosts_json = serde_json::to_string(&p.hosts)?;
             let circuit_breaker_json = p
                 .circuit_breaker
@@ -4172,9 +4854,9 @@ impl DatabaseStore {
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
 
         // Update the api_specs row (no CASCADE delete needed since proxy survives).
-        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
         let server_urls_json =
-            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+            serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
         let spec_format_str = match spec.spec_format {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
@@ -4368,7 +5050,7 @@ impl DatabaseStore {
         }
 
         let plugin_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled != 0"),
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled = 1"),
         )
         .bind("mesh_route_dispatch")
         .fetch_all(&mut **tx)
@@ -4404,9 +5086,9 @@ impl DatabaseStore {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
         };
-        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
         let server_urls_json =
-            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+            serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
         sqlx::query(&self.q("INSERT INTO api_specs \
              (id, namespace, proxy_id, spec_version, spec_format, spec_content, \
               content_encoding, uncompressed_size, content_hash, title, info_version, \
@@ -4492,6 +5174,38 @@ impl DatabaseStore {
         crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
         anyhow::Error,
     > {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_api_specs_from_admin_read(namespace, filter, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_api_specs", &error);
+                warn!("Read replica admin query failed; retrying list_api_specs against primary");
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_api_specs_from_admin_read(namespace, filter, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_api_specs");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_api_specs_from_admin_read(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+        pool: &AnyPool,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
         use crate::config::db_backend::{ApiSpecSortBy, PaginatedResult, SortOrder};
 
         // Build WHERE clause dynamically.
@@ -4572,7 +5286,7 @@ impl DatabaseStore {
         if let Some(ref v) = has_tag_val {
             count_query = count_query.bind(v);
         }
-        let count_row = count_query.fetch_one(&self.rpool()).await?;
+        let count_row = count_query.fetch_one(pool).await?;
         let total: i64 = count_row.try_get("cnt")?;
 
         // --- Data query (ORDER BY + LIMIT + OFFSET) --------------------------
@@ -4617,7 +5331,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.rpool())
+            .fetch_all(pool)
             .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -4787,6 +5501,37 @@ impl DatabaseStore {
         namespace: &str,
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_audit_events_from_admin_read(namespace, filter, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_audit_events", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_audit_events against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_audit_events_from_admin_read(namespace, filter, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_audit_events");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_audit_events_from_admin_read(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         let start = std::time::Instant::now();
         let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
 
@@ -4832,7 +5577,7 @@ impl DatabaseStore {
         if let Some(ref value) = filter.end {
             count_query = count_query.bind(audit_ts_string(value));
         }
-        let total: i64 = count_query.fetch_one(&self.rpool()).await?.try_get("cnt")?;
+        let total: i64 = count_query.fetch_one(pool).await?.try_get("cnt")?;
 
         let sql = self.q(&format!(
             "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
@@ -4861,7 +5606,7 @@ impl DatabaseStore {
         let rows = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.rpool())
+            .fetch_all(pool)
             .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -4891,13 +5636,18 @@ impl DatabaseBackend for DatabaseStore {
         self.has_read_replica_pool()
     }
 
+    fn read_replica_available(&self) -> bool {
+        self.read_replica_pool
+            .load_full()
+            .is_some_and(|pool| !pool.is_closed())
+    }
+
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
         let primary = self.pool.load();
         let size = primary.size();
         let idle = primary.num_idle() as u32;
 
-        let replica = self.read_replica_pool.as_ref().map(|rp| {
-            let rp = rp.load();
+        let replica = self.read_replica_pool.load_full().map(|rp| {
             Box::new(crate::config::db_backend::DbPoolStatsInner {
                 size: rp.size(),
                 idle: rp.num_idle() as u32,
@@ -4980,6 +5730,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
         DatabaseStore::get_proxy(self, id).await
+    }
+
+    async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        DatabaseStore::get_proxy_for_write(self, id).await
     }
 
     async fn check_proxy_exists(
@@ -5258,6 +6012,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::list_namespaces(self).await
+    }
+
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        DatabaseStore::list_namespaces_authoritative(self).await
     }
 
     async fn submit_api_spec_bundle(
@@ -5579,6 +6337,7 @@ fn row_to_proxy(
         // Populated by `GatewayConfig::resolve_dispatch_port_overrides()` after
         // upstreams are loaded and any mesh DR overrides applied.
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -5668,7 +6427,7 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
             .try_get::<Option<i32>, _>("priority_override")
             .ok()
             .flatten()
-            .map(|v| v as u16),
+            .map(|v| v.clamp(0, 10_000) as u16),
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
@@ -5741,10 +6500,17 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
             Err(_) => None,
         };
 
-    let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> = row
-        .try_get::<String, _>("hash_on_cookie_config")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
+    let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> =
+        match row.try_get::<Option<String>, _>("hash_on_cookie_config") {
+            Ok(Some(s)) => Some(serde_json::from_str(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
+                    id_preview,
+                    e
+                )
+            })?),
+            Ok(None) | Err(_) => None,
+        };
 
     // Parse backend TLS fields
     let backend_tls_verify_server_cert: bool = row
@@ -5812,6 +6578,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // `apply_destination_rules`; SQL backends do not persist them, so SQL
         // rows always start with an empty map.
         resolved_subset_tls: std::collections::HashMap::new(),
+        dispatch_port_override_fallback: None,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
@@ -5956,35 +6723,54 @@ fn audit_ts_string(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+fn serialize_api_spec_string_list(
+    spec_id: &str,
+    field: &str,
+    values: &[String],
+) -> Result<String, anyhow::Error> {
+    serde_json::to_string(values).map_err(|e| {
+        anyhow::anyhow!(
+            "ApiSpec {}: failed to serialize {} JSON: {}",
+            spec_id,
+            field,
+            e
+        )
+    })
+}
+
 fn row_namespace_or_default(row: &AnyRow) -> String {
     row.try_get::<String, _>("namespace")
         .unwrap_or_else(|_| crate::config::types::default_namespace())
 }
 
-/// Parse a datetime column from a database row, falling back to `Utc::now()` if
-/// the column is missing or the value cannot be parsed. Database stores timestamps
-/// as RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
+/// Parse a datetime column from a database row. Database stores timestamps as
+/// RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
 fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
-    row.try_get::<String, _>(column)
-        .ok()
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok()
-                .or_else(|| {
-                    // SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
-                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .map(|ndt| ndt.and_utc())
-                        .ok()
-                })
-        })
-        .unwrap_or_else(|| {
-            debug!(
-                "Could not parse '{}' column, falling back to Utc::now()",
-                column
+    match row.try_get::<String, _>(column) {
+        Ok(raw) => chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|_| {
+                // SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
+                chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S")
+                    .map(|ndt| ndt.and_utc())
+            })
+            .unwrap_or_else(|_| {
+                warn!(
+                    column,
+                    value = %raw,
+                    "Could not parse datetime column, falling back to Utc::now()"
+                );
+                Utc::now()
+            }),
+        Err(error) => {
+            warn!(
+                column,
+                error = %error,
+                "Could not read datetime column, falling back to Utc::now()"
             );
             Utc::now()
-        })
+        }
+    }
 }
 
 #[cfg(test)]

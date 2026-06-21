@@ -239,6 +239,7 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             targets.push(UpstreamTarget {
                 host: address.to_string(),
                 port,
+                service_port_policy_key: None,
                 weight,
                 tags,
                 locality: None,

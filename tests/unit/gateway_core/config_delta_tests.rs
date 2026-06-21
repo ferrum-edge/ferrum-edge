@@ -28,6 +28,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -90,6 +91,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Ut
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: updated_at,
         updated_at,
@@ -100,6 +102,7 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 100,
         tags: HashMap::new(),
         locality: None,

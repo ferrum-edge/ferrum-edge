@@ -9,6 +9,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
+/// User-facing proxy route conflict message shared by preflight and persistence checks.
+pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
+    "A proxy with overlapping hosts and listen_path already exists";
+
 // ---------------------------------------------------------------------------
 // ApiSpec list filter types (Wave 5)
 // ---------------------------------------------------------------------------
@@ -128,7 +132,7 @@ pub struct DbPoolStats {
     pub max_connections: u32,
     /// Minimum configured idle connections (`FERRUM_DB_POOL_MIN_CONNECTIONS`).
     pub min_connections: u32,
-    /// Read replica pool stats, if a replica is configured.
+    /// Read replica pool stats, if a configured admin-read replica is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_replica: Option<Box<DbPoolStatsInner>>,
 }
@@ -177,6 +181,11 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Returns true if a read replica is configured.
     fn has_read_replica(&self) -> bool;
+
+    /// Returns true if a configured read replica currently has an active pool.
+    fn read_replica_available(&self) -> bool {
+        self.has_read_replica()
+    }
 
     /// Return connection pool statistics for observability.
     ///
@@ -243,6 +252,12 @@ pub trait DatabaseBackend: Send + Sync {
     async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
     async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error>;
     async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
+    /// Load an existing proxy for write prechecks/audit without rejecting
+    /// repairable proxy-plugin reference corruption. Backends that store
+    /// associations inline can use the normal read path.
+    async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        self.get_proxy(id).await
+    }
     /// Check whether a proxy with the given ID exists in `namespace`.
     /// Returns `true` only when the row is in the requested namespace, so
     /// admin-side reference checks cannot be satisfied by a row that lives
@@ -424,7 +439,7 @@ pub trait DatabaseBackend: Send + Sync {
     /// database TLS parameters derived from `FERRUM_DB_TLS_MODE`.
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error>;
 
-    /// Atomically replace the read replica pool with a freshly connected one.
+    /// Atomically replace the admin-read replica pool with a freshly connected one.
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error>;
 
     /// Try to reconnect to any available database URL (primary first, then failover).
@@ -481,8 +496,16 @@ pub trait DatabaseBackend: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
+
+    /// Return all distinct namespaces using the authoritative primary read path.
+    ///
+    /// Runtime config polling uses this when `FERRUM_CP_NAMESPACES=*` so namespace
+    /// discovery cannot lag behind primary resource reads.
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces().await
+    }
 
     // -----------------------------------------------------------------------
     // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC
@@ -628,7 +651,10 @@ pub fn extract_known_ids(
 /// Returns `None` for SQLite URLs (file-based, no network host) or
 /// if the host portion is already an IP address literal.
 pub fn extract_db_hostname(db_url: &str) -> Option<String> {
-    let parsed = url::Url::parse(db_url).ok()?;
+    let parsed = match url::Url::parse(db_url) {
+        Ok(parsed) => parsed,
+        Err(_) => return extract_mongodb_multi_host_hostname(db_url),
+    };
 
     let scheme = parsed.scheme().to_lowercase();
     if scheme.contains("sqlite") {
@@ -636,6 +662,15 @@ pub fn extract_db_hostname(db_url: &str) -> Option<String> {
     }
 
     let host = parsed.host_str()?;
+
+    // MongoDB seed lists without explicit ports (e.g.
+    // `mongodb://user:pass@mongo1,mongo2/ferrum`) are accepted by `url` as a
+    // single comma-joined host. Re-route through the multi-host extractor so
+    // DNS rotation tracks the first seed host instead of an unresolvable
+    // combined authority.
+    if host.contains(',') {
+        return extract_mongodb_multi_host_hostname(db_url);
+    }
 
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if bare.parse::<std::net::IpAddr>().is_ok() {
@@ -649,14 +684,214 @@ pub fn extract_db_hostname(db_url: &str) -> Option<String> {
 pub fn redact_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("***"));
+            if parsed.password().is_some() && parsed.set_password(Some("***")).is_err() {
+                return "<invalid-url>".to_string();
             }
-            if !parsed.username().is_empty() {
-                let _ = parsed.set_username("***");
+            if !parsed.username().is_empty() && parsed.set_username("***").is_err() {
+                return "<invalid-url>".to_string();
+            }
+            if let Some(query) = parsed.query() {
+                // Redact via the shared option-aware scrubber rather than
+                // `query_pairs()`, which only splits on `&` and would leak
+                // credentials carried in MongoDB `;`-separated options or in
+                // `authMechanismProperties` token lists.
+                let redacted_query = redact_query_string(query);
+                parsed.set_query(Some(&redacted_query));
             }
             parsed.to_string()
         }
-        Err(_) => "<invalid-url>".to_string(),
+        Err(_) => redact_mongodb_multi_host_url(url).unwrap_or_else(|| "<invalid-url>".to_string()),
     }
+}
+
+/// Redact configured database URLs if a driver error includes them verbatim.
+pub fn redact_error_text(error: impl std::fmt::Display, urls: &[&str]) -> String {
+    let mut text = error.to_string();
+    for url in urls {
+        text = text.replace(url, &redact_url(url));
+    }
+    text
+}
+
+fn extract_mongodb_multi_host_hostname(db_url: &str) -> Option<String> {
+    let authority = mongodb_multi_host_authority(db_url)?;
+    let hosts = strip_mongodb_userinfo(authority);
+    let first_host = hosts.split(',').next()?.trim();
+    if first_host.is_empty() {
+        return None;
+    }
+
+    let host = if let Some(rest) = first_host.strip_prefix('[') {
+        rest.split(']').next()?
+    } else {
+        first_host.split(':').next().unwrap_or(first_host)
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+
+    Some(host.to_string())
+}
+
+fn redact_mongodb_multi_host_url(raw_url: &str) -> Option<String> {
+    let scheme_len = mongodb_multi_host_scheme_len(raw_url)?;
+    let rest = &raw_url[scheme_len..];
+    let authority_end = rest
+        .find(|ch| ['/', '?', '#'].contains(&ch))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if !authority.contains(',') {
+        return None;
+    }
+
+    let redacted_authority = if let Some(at) = authority.rfind('@') {
+        format!("***@{}", &authority[at + 1..])
+    } else {
+        authority.to_string()
+    };
+    let suffix = redact_url_suffix_query(&rest[authority_end..]);
+    Some(format!(
+        "{}{}{}",
+        &raw_url[..scheme_len],
+        redacted_authority,
+        suffix
+    ))
+}
+
+fn mongodb_multi_host_authority(db_url: &str) -> Option<&str> {
+    let scheme_len = mongodb_multi_host_scheme_len(db_url)?;
+    let rest = &db_url[scheme_len..];
+    let authority_end = rest
+        .find(|ch| ['/', '?', '#'].contains(&ch))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    authority.contains(',').then_some(authority)
+}
+
+fn mongodb_multi_host_scheme_len(db_url: &str) -> Option<usize> {
+    const MONGODB_SCHEME: &str = "mongodb://";
+    db_url
+        .get(..MONGODB_SCHEME.len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case(MONGODB_SCHEME))
+        .map(str::len)
+}
+
+fn strip_mongodb_userinfo(authority: &str) -> &str {
+    authority
+        .rfind('@')
+        .map(|at| &authority[at + 1..])
+        .unwrap_or(authority)
+}
+
+fn redact_url_suffix_query(suffix: &str) -> String {
+    let Some(query_start) = suffix.find('?') else {
+        return suffix.to_string();
+    };
+    let (before_query, query_and_fragment) = suffix.split_at(query_start + 1);
+    let (query, fragment) = match query_and_fragment.find('#') {
+        Some(fragment_start) => query_and_fragment.split_at(fragment_start),
+        None => (query_and_fragment, ""),
+    };
+    let redacted_query = redact_query_string(query);
+    format!("{before_query}{redacted_query}{fragment}")
+}
+
+/// Redact credential-bearing values from a URL query string.
+///
+/// Splits on both `&` and `;`. MongoDB documents `;` as an accepted option
+/// separator, and `url`'s `form_urlencoded` parser only splits on `&`, so a
+/// `;`-joined option such as `replicaSet=rs0;password=secret` would otherwise be
+/// treated as a single non-sensitive `replicaSet` value and leak the password.
+/// Re-serialization normalizes the separator to `&`, which every driver accepts.
+fn redact_query_string(query: &str) -> String {
+    query
+        .split(['&', ';'])
+        .filter(|option| !option.is_empty())
+        .map(redact_query_option)
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Redact a single `name[=value]` query option according to its key.
+fn redact_query_option(option: &str) -> String {
+    let (key, value) = match option.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (option, None),
+    };
+
+    let Some(value) = value else {
+        return key.to_string();
+    };
+
+    if is_sensitive_url_query_key(key) {
+        return format!("{key}=***");
+    }
+
+    // MongoDB's `authMechanismProperties` carries a comma-separated list of
+    // `NAME:VALUE` properties; with MONGODB-AWS the AWS session token rides in
+    // `AWS_SESSION_TOKEN:<secret>`. The key itself is not sensitive, so redact
+    // any credential-bearing property value within it while keeping benign
+    // properties (e.g. `CANONICALIZE_HOST_NAME:true`) for observability.
+    if normalize_query_key(key) == "authmechanismproperties" {
+        return format!("{key}={}", redact_mechanism_properties(value));
+    }
+
+    format!("{key}={value}")
+}
+
+/// Redact credential-bearing properties inside a MongoDB
+/// `authMechanismProperties` value (`NAME:VALUE` pairs separated by `,`).
+fn redact_mechanism_properties(value: &str) -> String {
+    value
+        .split(',')
+        .map(|property| match property.split_once(':') {
+            Some((name, _)) if is_sensitive_url_query_key(name) => format!("{name}:***"),
+            _ => property.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    // Exact (separator-insensitive) matches for credential-bearing keys that do
+    // not contain one of the `SENSITIVE_SUBSTRINGS` below. Compared against the
+    // normalized key, so `api_key`, `api-key`, and `apiKey` all match `apikey`.
+    const SENSITIVE_KEYS: &[&str] = &[
+        "apikey",
+        "key",
+        "pass",
+        "privatekey",
+        "sslkey",
+        "user",
+        "username",
+    ];
+
+    // Driver query parameters frequently embed credentials under
+    // option-specific aliases (e.g. MongoDB's `tlsCertificateKeyFilePassword`,
+    // PostgreSQL's `sslpassword`, OAuth-style `client_secret`/`access_token`).
+    // Matching these credential-bearing substrings after normalization keeps
+    // such aliases redacted even when they are not in the exact-key list. Only
+    // unambiguously secret substrings are listed; path or identifier options
+    // like `tlsCertificateKeyFile` (a file path) must not be matched here, so
+    // `key`/`user` are intentionally excluded from the substring set.
+    const SENSITIVE_SUBSTRINGS: &[&str] = &["password", "passwd", "secret", "token", "credential"];
+
+    let normalized = normalize_query_key(key);
+    SENSITIVE_KEYS
+        .iter()
+        .any(|sensitive| normalized == *sensitive)
+        || SENSITIVE_SUBSTRINGS
+            .iter()
+            .any(|sensitive| normalized.contains(sensitive))
+}
+
+/// Normalize a query-parameter key for sensitivity matching: lowercase and
+/// strip `-`/`_`/`.` separators so aliases like `client-secret`, `client_secret`,
+/// and `clientSecret` all compare equal.
+fn normalize_query_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }

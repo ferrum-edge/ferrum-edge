@@ -327,6 +327,13 @@ pub struct SendMmsgBatch {
     count: usize,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct SendMmsgFlush {
+    pub datagrams: usize,
+    pub bytes: usize,
+}
+
 // SAFETY: Same reasoning as RecvMmsgBatch — raw pointers in iovecs/msgs point
 // into Vec buffers owned by the same struct, only dereferenced inside flush()
 // which rebuilds them first. Exclusively owned by a single tokio task.
@@ -399,16 +406,27 @@ impl SendMmsgBatch {
         self.count == 0
     }
 
+    /// Return the queued datagram and byte counts that would be lost if a
+    /// final best-effort flush fails and the caller drops the remainder.
+    pub fn pending_stats(&self) -> SendMmsgFlush {
+        SendMmsgFlush {
+            datagrams: self.count,
+            bytes: self.lens.iter().take(self.count).sum(),
+        }
+    }
+
     /// Send all queued datagrams in a single `sendmmsg` syscall.
     ///
-    /// Returns the number of datagrams successfully sent. On partial send,
+    /// Returns the datagrams/bytes successfully sent. On partial send,
     /// the caller should handle the unsent remainder (or accept the loss for
     /// UDP best-effort semantics).
     ///
-    /// Resets the batch count to 0 after the call.
-    pub fn flush(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+    /// Successful partial sends keep the unsent remainder queued at the front
+    /// for a retry. Errors clear the queue because UDP is best-effort and
+    /// preserving stale datagrams would reorder/requeue across iterations.
+    pub fn flush(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<SendMmsgFlush> {
         if self.count == 0 {
-            return Ok(0);
+            return Ok(SendMmsgFlush::default());
         }
 
         // Rebuild pointer arrays before the syscall.
@@ -519,6 +537,7 @@ impl SendMmsgBatch {
         }
 
         let sent = ret as usize;
+        let sent_bytes = self.lens.iter().take(sent).sum();
         let remaining = self.count - sent;
         if remaining > 0 {
             // Shift unsent datagrams to the front so a retry sends them.
@@ -531,7 +550,31 @@ impl SendMmsgBatch {
             }
         }
         self.count = remaining;
-        Ok(sent)
+        Ok(SendMmsgFlush {
+            datagrams: sent,
+            bytes: sent_bytes,
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod sendmmsg_batch_tests {
+    use std::net::SocketAddr;
+
+    use super::SendMmsgBatch;
+
+    #[test]
+    fn pending_stats_reports_queued_datagrams_and_bytes() {
+        let mut batch = SendMmsgBatch::new(4);
+        let dest: SocketAddr = "127.0.0.1:5353".parse().expect("valid socket addr");
+
+        assert_eq!(batch.pending_stats().datagrams, 0);
+        assert!(batch.push_with_local(b"abc", dest, None));
+        assert!(batch.push_with_local(b"de", dest, None));
+
+        let stats = batch.pending_stats();
+        assert_eq!(stats.datagrams, 2);
+        assert_eq!(stats.bytes, 5);
     }
 }
 

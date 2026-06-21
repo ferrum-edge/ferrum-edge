@@ -31,6 +31,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -607,7 +608,7 @@ fn test_wildcard_does_not_match_base_domain() {
 }
 
 #[test]
-fn test_wildcard_does_not_match_multi_level() {
+fn test_wildcard_matches_multi_level() {
     let config = test_config(vec![test_proxy_with_hosts(
         "wildcard",
         "/",
@@ -615,9 +616,9 @@ fn test_wildcard_does_not_match_multi_level() {
     )]);
     let cache = RouterCache::new(&config, 100);
 
-    // *.example.com should NOT match a.b.example.com (multi-level)
+    // *.example.com matches any subdomain below example.com.
     let matched = cache.find_proxy(Some("a.b.example.com"), "/");
-    assert!(matched.is_none());
+    assert!(matched.is_some());
 }
 
 #[test]

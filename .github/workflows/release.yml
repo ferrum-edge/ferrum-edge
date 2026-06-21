@@ -70,6 +70,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          fi
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -91,6 +94,10 @@ jobs:
         run: cross build --features cloud-secrets --release --target ${{ matrix.target }}
         env:
           RUSTC_WRAPPER: ""
+          RUSTFLAGS: ""
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
 
       - name: Build release binary (cargo)
         if: matrix.target != 'aarch64-unknown-linux-gnu'

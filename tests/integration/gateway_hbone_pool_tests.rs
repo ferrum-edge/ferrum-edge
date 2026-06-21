@@ -66,7 +66,7 @@ fn bundle_for(id: SpiffeId, leaf_der: Vec<u8>, key_der: Vec<u8>, root_der: Vec<u
     SvidBundle {
         spiffe_id: id.clone(),
         cert_chain_der: vec![leaf_der],
-        private_key_pkcs8_der: key_der,
+        private_key_pkcs8_der: key_der.into(),
         trust_bundles: TrustBundleSet::local_only(TrustBundle {
             trust_domain: id.trust_domain().clone(),
             x509_authorities: vec![root_der],
@@ -104,6 +104,7 @@ fn proxy_for_test() -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -352,7 +353,7 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_source_baggage() {
     let proxy = proxy_for_test();
     let mut tunnel = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        pool.get_tunnel(&proxy, "127.0.0.1", 8080, server_addr.port(), None),
+        pool.get_tunnel(&proxy, "127.0.0.1", 8080, 8080, server_addr.port(), None),
     )
     .await
     .expect("timely hbone tunnel open")
@@ -427,7 +428,7 @@ async fn hbone_fast_path_hit_refreshes_recency_and_keeps_busy_connection_alive()
     async fn drive_busy_round_trip(pool: &HboneConnectionPool, proxy: &Proxy, server_port: u16) {
         let mut tunnel = tokio::time::timeout(
             Duration::from_secs(10),
-            pool.get_tunnel(proxy, "127.0.0.1", 8080, server_port, None),
+            pool.get_tunnel(proxy, "127.0.0.1", 8080, 8080, server_port, None),
         )
         .await
         .expect("timely hbone tunnel open")
@@ -521,7 +522,7 @@ async fn hbone_warmup_requires_connect_acceptance() {
     let proxy = proxy_for_test();
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        pool.warmup_connection(&proxy, "127.0.0.1", 8080, server_addr.port(), None),
+        pool.warmup_connection(&proxy, "127.0.0.1", 8080, 8080, server_addr.port(), None),
     )
     .await
     .expect("timely hbone warmup")

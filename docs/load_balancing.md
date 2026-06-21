@@ -126,7 +126,7 @@ The optional `path` field on a target overrides the proxy's `backend_path` when 
 
 Upstreams can define named `subsets` for Istio DestinationRule-style routing. A proxy selects a subset with `upstream_subset`; the referenced name must exist on the proxy's `upstream_id`, and the gateway rejects invalid references during config/admin validation.
 
-Subset matching is exact label matching: a target belongs to a subset when its `tags` contain every key/value pair from the subset's `labels`. Subsets can optionally override the parent upstream's load-balancing algorithm with `traffic_policy.load_balancer_algorithm`. Weighted round-robin state and consistent-hash rings are isolated per subset, so subset traffic does not perturb parent or sibling subset selection.
+Subset matching is exact label matching: a target belongs to a subset when its `tags` contain every key/value pair from the subset's `labels`. Subsets can optionally override the parent upstream's load-balancing algorithm with `traffic_policy.load_balancer_algorithm`, and subset-scoped consistent hashing can set `traffic_policy.hash_on` using the same `ip`, `header:<name>`, or `cookie:<name>` syntax as upstream-level `hash_on`. Weighted round-robin state and consistent-hash rings are isolated per subset, so subset traffic does not perturb parent or sibling subset selection.
 
 If all targets in a defined subset are unhealthy, Ferrum falls back to the parent upstream and marks the selection degraded. Unknown subset names never silently fall through to the full upstream.
 
@@ -151,7 +151,8 @@ upstreams:
       - name: "v2"
         labels: {version: "v2"}
         traffic_policy:
-          load_balancer_algorithm: least_connections
+          load_balancer_algorithm: consistent_hashing
+          hash_on: "header:x-session"
 ```
 
 ```yaml

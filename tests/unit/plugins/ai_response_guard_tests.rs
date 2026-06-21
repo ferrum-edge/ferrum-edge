@@ -228,6 +228,196 @@ async fn test_pii_detection_redact() {
 }
 
 #[tokio::test]
+async fn test_all_mode_decodes_json_escaped_pii_for_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"content":"Contact user\u0040example.com"}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    let transformed = plugin
+        .transform_response_body(body, Some("application/json"), &headers)
+        .await
+        .expect("expected escaped email to be redacted");
+    let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "Contact [REDACTED:pii:email]"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_detects_blocked_phrase_in_object_key() {
+    // codex: ScanMode::All must scan object KEYS, not just string values — the
+    // previous raw-body scan covered the whole serialized body (field names
+    // included), so a blocked phrase hidden in a JSON key must still be caught.
+    let plugin = make_plugin(json!({
+        "blocked_phrases": ["harmful content"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"harmful content":"ok"}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a blocked phrase in a JSON object key must be detected in scan-all mode"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_detects_pii_in_numeric_scalar() {
+    // codex: ScanMode::All previously scanned the raw serialized body, which
+    // matched a numeric SSN like {"ssn":123456789}. The decoded walker must
+    // include numeric scalars (stringified) or this content fails open.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"ssn":123456789}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a numeric SSN scalar must be detected in scan-all mode"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_detects_cross_token_custom_pattern() {
+    // codex: a custom blocked_patterns regex written for the documented
+    // whole-body scan (e.g. matching JSON field/value context) must keep
+    // matching in scan-all mode. The decoded walker feeds the key and value as
+    // separate fragments, so only a raw-body union pass reconstructs the
+    // `"role":"tool"` context.
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "tool_role", "regex": "\"role\"\\s*:\\s*\"tool\""}
+        ],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"role":"tool","content":"ok"}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a cross-token custom pattern must still match the serialized JSON in scan-all mode"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_detects_pii_in_duplicate_key() {
+    // codex: a duplicate object member's overwritten value is dropped from the
+    // parsed Value but is still delivered to the client. The raw-body union
+    // pass must still catch PII in {"x":"user@example.com","x":"ok"}.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // serde_json keeps only the last "x"; the email survives only in the raw bytes.
+    let body = br#"{"x":"user@example.com","x":"ok"}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "PII in an overwritten duplicate key must be detected via the raw-body union pass"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_redact_fails_closed_on_unredactable_residual() {
+    // The scan-all redactor rewrites string values but cannot rewrite a numeric
+    // scalar. Detection now flags it (union), so forwarding the body while
+    // reporting it "redacted" would leak PII — redact mode must fail closed
+    // (reject) on residual unredactable detections.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"ssn":123456789}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "redact mode must reject when a detected numeric PII scalar cannot be redacted"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_redact_passes_when_residual_is_redactable() {
+    // Counterpart to the fail-closed test: when the detected PII lives in a
+    // string value the redactor CAN rewrite, redact mode proceeds normally
+    // (Continue + redacted telemetry) instead of over-rejecting.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"content":"reach me at user@example.com"}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "redact mode must not reject when the PII is fully redactable"
+    );
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    let transformed = plugin
+        .transform_response_body(body, Some("application/json"), &headers)
+        .await
+        .expect("expected redacted body");
+    let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "reach me at [REDACTED:pii:email]"
+    );
+}
+
+#[tokio::test]
 async fn test_blocked_phrase_detection() {
     let config = json!({
         "blocked_phrases": ["harmful content"],
@@ -825,6 +1015,32 @@ async fn test_sse_pii_redaction() {
 }
 
 #[tokio::test]
+async fn test_sse_scan_all_decodes_escaped_pii_for_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"Contact user\\u0040example.com\"}}]}\n\ndata: [DONE]\n\n";
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    let transformed = plugin
+        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected escaped email to be redacted");
+    let transformed_str = String::from_utf8(transformed).unwrap();
+    assert!(transformed_str.contains("[REDACTED:pii:email]"));
+    assert!(!transformed_str.contains("\\u0040"));
+    assert!(transformed_str.contains("[DONE]"));
+}
+
+#[tokio::test]
 async fn test_sse_clean_response_passes() {
     let plugin = make_plugin(json!({
         "pii_patterns": ["ssn", "credit_card"],
@@ -971,6 +1187,55 @@ async fn test_sse_scan_all_mode() {
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "scan_all mode should detect PII anywhere in SSE body"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_detects_pii_in_unparseable_frame() {
+    // codex: parse_sse_data_frames silently drops non-JSON `data:` payloads, so
+    // scanning only the parsed frames lets PII in a plain/malformed frame slip
+    // past scan-all. The raw-body union pass must still catch it even when one
+    // clean JSON frame precedes the unparseable one.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    // First frame is valid JSON (no PII); the second `data:` payload is plain
+    // text carrying an email and is dropped by the JSON frame parser.
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\
+data: contact user@example.com\n\ndata: [DONE]\n\n";
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "PII in an unparseable SSE data frame must be detected via the raw-body union pass"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_detects_pii_when_no_frame_parses() {
+    // Extreme of the previous case: the only `data:` payload is plain text PII
+    // (no JSON frame at all). The early `frames.is_empty()` short-circuit must
+    // not skip scan-all detection.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = "data: contact user@example.com\n\ndata: [DONE]\n\n";
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "plain-text PII in an SSE stream with no JSON frames must be detected in scan-all mode"
     );
 }
 

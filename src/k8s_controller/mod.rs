@@ -20,13 +20,13 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info};
 
 use crate::config::types::GatewayConfig;
-use crate::grpc::cp_server::DpNodeRegistry;
+use crate::grpc::cp_server::{CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::MeshConfigBroadcast;
-use crate::grpc::proto::ConfigUpdate;
 use istio_status::IstioStatusWriter;
 use metrics::ControllerMetrics;
-use reconciler::{ReconcileBroadcasters, ReconcilerConfig, spawn_reconcile_loop};
+pub use reconciler::ReconcileBroadcasters;
+use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
 use status::GatewayApiStatusWriter;
 use watcher::{WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
@@ -47,6 +47,9 @@ pub struct K8sControllerConfig {
     pub watch_gateway_api: bool,
     pub pod_discovery_enabled: bool,
     pub watch_node_locality: bool,
+    pub gateway_api_data_plane_service_namespace: Option<String>,
+    pub gateway_api_data_plane_service_name: Option<String>,
+    pub gateway_api_status_address: Option<String>,
     /// Effective Sidecar `ingress[]` materialization gate
     /// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`).
     /// Threaded to the Istio status writer so it reports `ingress_modeled` only
@@ -75,10 +78,12 @@ impl K8sControllerHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_k8s_controller(
     controller_config: K8sControllerConfig,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<ConfigUpdate>,
+    broadcasts: Arc<NamespaceBroadcasts>,
+    cp_scope: CpScope,
     dp_registry: Arc<DpNodeRegistry>,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
@@ -89,6 +94,10 @@ pub async fn start_k8s_controller(
         watch_gateway_api = controller_config.watch_gateway_api,
         pod_discovery_enabled = controller_config.pod_discovery_enabled,
         watch_node_locality = controller_config.watch_node_locality,
+        gateway_api_data_plane_service_namespace = ?controller_config
+            .gateway_api_data_plane_service_namespace,
+        gateway_api_data_plane_service_name = ?controller_config.gateway_api_data_plane_service_name,
+        gateway_api_status_address = ?controller_config.gateway_api_status_address,
         istio_root_namespace = %controller_config.istio_root_namespace,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
@@ -103,6 +112,13 @@ pub async fn start_k8s_controller(
         watch_istio: controller_config.watch_istio,
         watch_gateway_api: controller_config.watch_gateway_api,
         watch_core: controller_config.pod_discovery_enabled,
+        watch_gateway_api_data_plane_service: controller_config.watch_gateway_api
+            && controller_config
+                .gateway_api_data_plane_service_namespace
+                .is_some()
+            && controller_config
+                .gateway_api_data_plane_service_name
+                .is_some(),
         watch_node_locality: controller_config.watch_node_locality,
         // Without Istio CRDs there is no Telemetry resource that would
         // consume meshConfig providers, so the configmaps watch and its
@@ -110,6 +126,9 @@ pub async fn start_k8s_controller(
         watch_mesh_config: controller_config.watch_istio && controller_config.watch_mesh_config,
     };
     let istio_root_namespace = controller_config.istio_root_namespace.clone();
+    let gateway_api_data_plane_service_namespace = controller_config
+        .gateway_api_data_plane_service_namespace
+        .clone();
 
     let watcher_handles = start_crd_watchers(
         client.clone(),
@@ -117,6 +136,7 @@ pub async fn start_k8s_controller(
         watcher_selection,
         controller_config.watch_namespaces.clone(),
         istio_root_namespace.clone(),
+        gateway_api_data_plane_service_namespace.clone(),
         shutdown.clone(),
     )
     .await;
@@ -132,6 +152,10 @@ pub async fn start_k8s_controller(
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
         pod_discovery_enabled: controller_config.pod_discovery_enabled,
+        gateway_api_data_plane_service_namespace: controller_config
+            .gateway_api_data_plane_service_namespace,
+        gateway_api_data_plane_service_name: controller_config.gateway_api_data_plane_service_name,
+        gateway_api_status_address: controller_config.gateway_api_status_address,
         mesh_sidecar_ingress_enforced: controller_config.mesh_sidecar_ingress_enforced,
     };
     let gateway_status_writer = controller_config
@@ -149,7 +173,8 @@ pub async fn start_k8s_controller(
         store_set.clone(),
         config_arc,
         ReconcileBroadcasters {
-            update_tx,
+            broadcasts,
+            cp_scope,
             dp_registry,
             mesh_update_tx,
             mesh_registry,
@@ -167,6 +192,7 @@ pub async fn start_k8s_controller(
         watcher_selection,
         controller_config.watch_namespaces,
         istio_root_namespace,
+        gateway_api_data_plane_service_namespace,
         shutdown,
         Duration::from_secs(300),
     );

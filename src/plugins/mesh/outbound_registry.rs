@@ -31,7 +31,8 @@
 //!   registry-build helper records the short, namespace-qualified, `.svc`,
 //!   and FQDN forms.
 //! - Wildcard ServiceEntry hosts (`*.example.com`) match one DNS label below
-//!   the suffix, consistent with Ferrum's host wildcard semantics.
+//!   the suffix, following Istio mesh registry semantics. Proxy listener host
+//!   routing uses broader DNS suffix wildcard semantics.
 //! - An empty registry is valid and fails closed: every request is rejected,
 //!   but the plugin remains installed so REGISTRY_ONLY never silently falls
 //!   back to ALLOW_ANY.

@@ -294,7 +294,7 @@ See [docs/plugins.md](docs/plugins.md) for detailed configuration of each plugin
 
 Nine plugins for AI and agent gateway use cases — cost visibility, budget enforcement, semantic policy, request policy, PII protection, output guardrails, multi-provider routing, MCP tool routing, and response caching:
 
-- **`ai_token_metrics`** — Extract token usage from LLM responses for observability (supports SSE streaming)
+- **`ai_token_metrics`** — Extract token usage from LLM responses for observability (SSE metrics require explicit buffered opt-in)
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
 - **`ai_rate_limiter`** — Rate-limit by token consumption instead of request count (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn

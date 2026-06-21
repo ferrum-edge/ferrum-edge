@@ -613,18 +613,26 @@ pub(crate) async fn handle_h3_websocket(
     let backend_conn_guard;
     let backend_handshake = loop {
         // Enforce DestinationRule `connectionPool.tcp.maxConnections` for this
-        // destination port BEFORE dialing — same semantics and ordering as the
-        // H1/H2 path in `src/proxy/mod.rs`. No cap => `Ok(None)`, a single
-        // check with no map touch.
-        let (ws_dial_host, ws_dial_port) = match &current_target {
-            Some(target) => (target.host.as_str(), target.port),
-            None => (proxy.backend_host.as_str(), proxy.backend_port),
+        // destination policy port BEFORE dialing — same semantics and ordering
+        // as the H1/H2 path in `src/proxy/mod.rs`. No cap => `Ok(None)`, a
+        // single check with no map touch.
+        let (ws_dial_host, ws_dial_port, ws_policy_port) = match &current_target {
+            Some(target) => (
+                target.host.as_str(),
+                target.port,
+                target.dispatch_policy_port(),
+            ),
+            None => (
+                proxy.backend_host.as_str(),
+                proxy.backend_port,
+                proxy.backend_port,
+            ),
         };
         let ws_max_connections =
-            crate::proxy::resolve_backend_max_connections(&proxy, ws_dial_port);
+            crate::proxy::resolve_backend_max_connections(&proxy, ws_policy_port);
         let conn_slot = match state.backend_conn_limit.try_acquire(
             ws_dial_host,
-            ws_dial_port,
+            ws_policy_port,
             ws_max_connections,
         ) {
             Ok(slot) => slot,
@@ -951,24 +959,12 @@ pub(crate) async fn handle_h3_websocket(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
-            target.port,
+            target,
         );
-        let strategy = if has_port_override {
-            crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_from(
-                &epoch.load_balancer,
-                upstream_id,
-            )
-        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = crate::load_balancer::LoadBalancerCache::get_upstream_from(
                 &epoch.load_balancer,
@@ -1162,6 +1158,7 @@ pub(crate) async fn handle_h3_websocket(
         max_ws_frame,
         ws_write_buf,
         false, // H3 always frame-parses; tunnel mode is H1-only
+        crate::proxy::WS_DRAIN_GRACE,
         // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked.
         // TODO(h3-ws-rfc9220-masked-close): strict enforcement (closing
         // with 1002 on a masked frame) is still a documented compliance

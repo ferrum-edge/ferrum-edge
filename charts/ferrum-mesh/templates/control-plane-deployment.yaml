@@ -29,9 +29,12 @@ spec:
             - name: grpc
               containerPort: {{ .Values.controlPlane.grpcPort }}
           env:
+            {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
             {{- range $name, $value := .Values.controlPlane.env }}
+            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
 ---
 apiVersion: v1

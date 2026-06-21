@@ -159,7 +159,9 @@ pipeline:
 > it under the accept-side cookie, so `resolve_stream` matches the mirrored
 > record. Pod-UID resolution (`identities_by_pod_uid`) is also wired — the
 > resolver lazily enrolls `pod_uid`→identity by hash-joining the slice's
-> `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped record. Two
+> `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped record. If two
+> SPIFFE IDs collide on that truncated hash, the proxy marks the hash unusable
+> and fails closed instead of picking either identity. Two
 > caveats remain: **(1) IPv4 only** — aya's IPv6 `sock_ops` ctx accessors trip
 > the verifier, so IPv6 (and the v6 half of dual-stack) accepts get no
 > accept-side record and stay fail-closed; **(2)** the full

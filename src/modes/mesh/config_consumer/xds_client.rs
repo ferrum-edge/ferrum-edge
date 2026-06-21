@@ -9,12 +9,12 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use super::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
-    refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
-    wait_for_shutdown, wait_optional_tls_reload,
+    BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
+    next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
+    tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer,
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer_and_namespace,
 };
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
@@ -65,14 +65,16 @@ type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 struct AdsAuth {
     jwt_secret: GrpcJwtSecret,
     node_id: String,
+    namespace: String,
 }
 
 impl AdsAuth {
     fn bearer_token(&self) -> Result<BearerToken, tonic::Status> {
-        let auth_token = generate_dp_jwt_with_issuer(
+        let auth_token = generate_dp_jwt_with_issuer_and_namespace(
             self.jwt_secret.as_str(),
             &self.node_id,
             self.jwt_secret.issuer(),
+            Some(&self.namespace),
         )
         .map_err(|e| tonic::Status::unauthenticated(format!("failed to mint xDS JWT: {e}")))?;
         format!("Bearer {auth_token}").parse().map_err(|e| {
@@ -149,13 +151,17 @@ impl ClientSubscriptionState {
         node_id: &str,
         cluster: &str,
         workload_spiffe_id: Option<&str>,
+        waypoint_name: Option<&str>,
     ) -> Vec<DiscoveryRequest> {
         // Carry the workload SPIFFE in `Node.metadata` so a Ferrum CP can
         // identify this workload even when `node_id` is a hostname (the common
         // default). The CP needs it to compute Sidecar-aware narrowing and the
         // un-narrowed local-inbound-service view; without it a restrictive
         // Sidecar would narrow the local service out of the ECDS carriers.
-        let node_metadata = crate::xds::carrier::encode_node_metadata(workload_spiffe_id);
+        let node_metadata = crate::xds::carrier::encode_node_metadata_with_waypoint(
+            workload_spiffe_id,
+            waypoint_name,
+        );
         INITIAL_TYPE_URL_ORDER
             .iter()
             .map(|type_url| {
@@ -381,9 +387,11 @@ impl ResourceAccumulator {
         if !is_known_type_url(type_url) {
             return Err(format!("unknown xDS type_url '{type_url}'"));
         }
-        if !resources.is_empty() && version.trim().is_empty() {
+        if version.trim().is_empty()
+            && (is_required_mesh_slice_type(type_url) || !resources.is_empty())
+        {
             return Err(format!(
-                "xDS response for type_url '{type_url}' has resources but empty version_info"
+                "xDS response for type_url '{type_url}' has empty version_info"
             ));
         }
 
@@ -579,11 +587,7 @@ pub async fn start_xds_client_with_shutdown(
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
         let mut stream_shutdown_rx = shutdown_rx.clone();
-        let should_race_primary = should_race_primary_retry(
-            is_fallback,
-            config.primary_retry_secs,
-            state.has_first_slice(),
-        );
+        let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -594,7 +598,10 @@ pub async fn start_xds_client_with_shutdown(
                     tls_config.as_ref(),
                     &mut stream_state,
                 ) => result,
-                _ = tokio::time::sleep(Duration::from_secs(config.primary_retry_secs)) => {
+                _ = wait_for_first_slice_then_primary_retry(
+                    state.clone(),
+                    Duration::from_secs(config.primary_retry_secs),
+                ) => {
                     info!(
                         primary_retry_secs = config.primary_retry_secs,
                         cp_url = %cp_url,
@@ -676,6 +683,11 @@ pub async fn start_xds_client_with_shutdown(
     }
 }
 
+async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
+    state.wait_for_first_slice().await;
+    tokio::time::sleep(interval).await;
+}
+
 async fn connect_ads(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -703,6 +715,7 @@ async fn connect_ads(
     let auth = AdsAuth {
         jwt_secret: jwt_secret.clone(),
         node_id: config.node_id.clone(),
+        namespace: config.namespace.clone(),
     };
     let consumer = XdsConfigConsumer::new(config.clone(), state);
 
@@ -734,7 +747,8 @@ async fn run_ads_stream_with_auth(
             }
             Ok(req)
         },
-    );
+    )
+    .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
 
     let (tx, rx) = mpsc::channel(config.stream_channel_capacity.max(1));
     let request_stream = ReceiverStream::new(rx);
@@ -757,6 +771,7 @@ async fn run_ads_stream_with_auth(
         &config.node_id,
         &config.cluster,
         config.workload_spiffe_id.as_deref(),
+        config.waypoint_name.as_deref(),
     ) {
         tx.send(request)
             .await
@@ -1345,10 +1360,38 @@ fn reverse_translate(
         // (a selector DENY or Strict-mTLS rule keyed on those labels would stop
         // matching). So fall back to the local labels when the carrier is empty
         // or absent; only a non-empty carrier replaces them.
-        labels: recovered
-            .labels
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| config.labels.clone()),
+        //
+        // EXCEPTION (ambiguous shared-SPIFFE): when the CP marked the labels as
+        // an ambiguous intersection (`LabelsAmbiguous` carrier), the non-empty
+        // carrier is the intersection of several workloads sharing this SPIFFE,
+        // NOT this DP's real labels. Treating it as authoritative would replace
+        // the DP's own `FERRUM_MESH_WORKLOAD_LABELS` with a partial set and drop
+        // the candidate-only selector policies the slice deliberately carried as
+        // a superset — fail-open whenever the intersection is non-empty. So when
+        // ambiguous AND the DP has its own local labels, prefer the DP's labels
+        // so it re-filters the superset against its real identity. The DP keeps
+        // the (informational) intersection only when it has no local labels at
+        // all.
+        labels: pick_recovered_labels(
+            recovered.labels.filter(|l| !l.is_empty()),
+            recovered.labels_ambiguous,
+            &config.labels,
+        ),
+        // Clear the marker only when the recovered `labels` above are actually
+        // authoritative for THIS DP: either the CP labels were unambiguous, or
+        // the CP marked them ambiguous but the DP had its own local labels that
+        // `pick_recovered_labels` preferred over the partial intersection. When
+        // the CP marked them ambiguous AND the DP had no local labels, the
+        // recovered `labels` are only the (partial/empty) intersection — NOT
+        // authoritative — so the marker is PRESERVED. Clearing it there would
+        // defeat the mesh_authz ambiguous-slice fail-closed check: the cold-path
+        // retain would silently drop the candidate-only selector policies the
+        // slice carried as a superset and fall back to allow-by-default
+        // (fail-open). Downstream consumers (mesh_authz cold-path retain) treat
+        // a still-set marker as "labels not final; fail closed for selectors
+        // that the partial labels cannot satisfy".
+        labels_ambiguous: recovered.labels_ambiguous
+            && !recovered_labels_are_authoritative(recovered.labels_ambiguous, &config.labels),
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
@@ -1430,6 +1473,67 @@ fn reverse_translate(
     })
 }
 
+/// Resolve the recovered slice's effective labels for this DP.
+///
+/// `carrier_labels` is the non-empty `WorkloadLabels` carrier (already filtered
+/// to `None` when empty/absent); `ambiguous` is the `LabelsAmbiguous` marker;
+/// `local_labels` is the DP's own `FERRUM_MESH_WORKLOAD_LABELS`.
+///
+/// - Not ambiguous: a non-empty carrier is authoritative (the CP computed real
+///   labels); otherwise fall back to the DP's local labels.
+/// - Ambiguous: the carrier is a shared-SPIFFE INTERSECTION — the labels common
+///   to every candidate sharing this SPIFFE, NOT this DP's full real label set.
+///   That intersection is still AUTHORITATIVE for the keys it carries: the CP
+///   proved every candidate has them, so a selector scoped on an intersection key
+///   (e.g. `app=shared`) applies to this DP regardless of which candidate it is.
+///   When the DP supplies its own local labels (e.g. the disambiguating
+///   `role=api`), MERGE them ONTO the intersection rather than replacing it: the
+///   merged set resolves the divergent keys via the DP's authoritative local
+///   labels while preserving the common keys the CP proved apply, so a selector
+///   DENY / PeerAuth STRICT / JWT rule scoped to a common key stays enforced
+///   instead of being dropped (the wholesale-replace fail-open). Local labels win
+///   on a key collision (the DP's own identity is final for keys it declares). If
+///   the DP has no local labels either, keep the informational intersection.
+fn pick_recovered_labels(
+    carrier_labels: Option<BTreeMap<String, String>>,
+    ambiguous: bool,
+    local_labels: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if ambiguous && !local_labels.is_empty() {
+        // Start from the common intersection (authoritative per-key for the keys
+        // every candidate shares) and overlay the DP's local labels so divergent
+        // keys resolve to this workload's real values while the common keys
+        // survive. `extend` makes `local_labels` win on collision.
+        let mut merged = carrier_labels.unwrap_or_default();
+        merged.extend(local_labels.iter().map(|(k, v)| (k.clone(), v.clone())));
+        return merged;
+    }
+    carrier_labels.unwrap_or_else(|| local_labels.clone())
+}
+
+/// Whether the labels [`pick_recovered_labels`] produced are AUTHORITATIVE for
+/// this DP, so the `labels_ambiguous` marker can be cleared in the recovered
+/// slice.
+///
+/// Recovery is authoritative when the CP did not mark the labels ambiguous (the
+/// non-empty carrier — or the DP's own local labels for an empty carrier — is
+/// trustworthy), or when the CP marked them ambiguous but the DP supplied its
+/// own local `FERRUM_MESH_WORKLOAD_LABELS` that [`pick_recovered_labels`] then
+/// preferred over the partial intersection. When the CP marked the labels
+/// ambiguous AND the DP had no local labels, `pick_recovered_labels` falls back
+/// to the partial intersection (or empty), which is NOT this workload's real
+/// label set: the candidate-only selector policies the slice carried as a
+/// superset cannot be re-filtered here, so the marker MUST be preserved so the
+/// mesh_authz ambiguous-slice fail-closed check still runs instead of letting
+/// the cold-path `retain` silently drop those selector DENY/ALLOW/PeerAuth/JWT
+/// rules and fall back to allow-by-default.
+fn recovered_labels_are_authoritative(
+    ambiguous: bool,
+    local_labels: &BTreeMap<String, String>,
+) -> bool {
+    !ambiguous || !local_labels.is_empty()
+}
+
 /// Slice fields recovered from Ferrum mesh-slice ECDS carriers (GAP-1a).
 ///
 /// `services` is `Option` so the caller can distinguish "the CP shipped a
@@ -1448,6 +1552,7 @@ struct RecoveredSliceCarriers {
     sidecar_ingress_declared: bool,
     declared_ingress_http_ports: usize,
     labels: Option<BTreeMap<String, String>>,
+    labels_ambiguous: bool,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
@@ -1680,6 +1785,7 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
+        MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
         MeshSliceCarrier::PeerAuthentications(value) => recovered.peer_authentications = value,
         MeshSliceCarrier::RequestAuthentications(value) => {
@@ -1969,7 +2075,7 @@ mod tests {
     #[test]
     fn initial_requests_are_ordered_cds_first() {
         let requests =
-            ClientSubscriptionState::new().build_initial_requests("node-a", "default", None);
+            ClientSubscriptionState::new().build_initial_requests("node-a", "default", None, None);
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -2005,16 +2111,15 @@ mod tests {
             "host-1",
             "default",
             Some(spiffe),
+            Some("waypoint"),
         );
         let node = requests[0].node.as_ref().expect("node present");
-        assert_eq!(
-            crate::xds::carrier::decode_node_metadata(&node.metadata)
-                .workload_spiffe_id
-                .as_deref(),
-            Some(spiffe)
-        );
+        let metadata = crate::xds::carrier::decode_node_metadata(&node.metadata);
+        assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
+        assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
         // Without a workload SPIFFE, metadata stays empty (prior wire shape).
-        let none = ClientSubscriptionState::new().build_initial_requests("host-1", "default", None);
+        let none =
+            ClientSubscriptionState::new().build_initial_requests("host-1", "default", None, None);
         assert!(none[0].node.as_ref().unwrap().metadata.is_empty());
     }
 
@@ -2027,11 +2132,35 @@ mod tests {
     }
 
     #[test]
-    fn primary_retry_waits_for_initial_mesh_slice() {
-        assert!(!should_race_primary_retry(true, 300, false));
-        assert!(should_race_primary_retry(true, 300, true));
-        assert!(!should_race_primary_retry(false, 300, true));
-        assert!(!should_race_primary_retry(true, 0, true));
+    fn primary_retry_races_on_fallback_when_configured() {
+        assert!(should_race_primary_retry(true, 300));
+        assert!(!should_race_primary_retry(false, 300));
+        assert!(!should_race_primary_retry(true, 0));
+    }
+
+    #[tokio::test]
+    async fn primary_retry_waits_until_first_slice_on_fallback_stream() {
+        let state = MeshRuntimeState::new();
+        let retry = tokio::spawn(wait_for_first_slice_then_primary_retry(
+            state.clone(),
+            Duration::from_millis(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !retry.is_finished(),
+            "timer must not run before the first slice arrives"
+        );
+
+        state.install_slice(MeshSlice {
+            version: "first".to_string(),
+            ..MeshSlice::default()
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("primary retry wait should complete after first slice")
+            .expect("primary retry wait task should join");
     }
 
     #[test]
@@ -2071,7 +2200,7 @@ mod tests {
         state.record_response(CDS_TYPE_URL, "v1", "n1");
         state.mark_acked(CDS_TYPE_URL);
 
-        let requests = state.build_initial_requests("node-a", "default", None);
+        let requests = state.build_initial_requests("node-a", "default", None, None);
         let cds = requests
             .iter()
             .find(|request| request.type_url == CDS_TYPE_URL)
@@ -2112,7 +2241,7 @@ mod tests {
         assert!(
             state
                 .subscriptions
-                .build_initial_requests("node-a", "default", None)
+                .build_initial_requests("node-a", "default", None, None)
                 .iter()
                 .all(|request| request.version_info.is_empty())
         );
@@ -3084,7 +3213,7 @@ mod tests {
         state.reset_for_new_stream();
         let initial = state
             .subscriptions
-            .build_initial_requests("node-a", "default", None);
+            .build_initial_requests("node-a", "default", None, None);
         let cds = initial
             .iter()
             .find(|r| r.type_url == CDS_TYPE_URL)
@@ -3367,6 +3496,25 @@ mod tests {
             .expect_err("non-empty response with empty version must be rejected");
 
         assert!(err.contains("empty version_info"));
+    }
+
+    #[test]
+    fn empty_required_response_requires_version_info() {
+        let mut accumulator = ResourceAccumulator::new();
+        let err = accumulator
+            .apply_sotw_response(CDS_TYPE_URL, &[], "")
+            .expect_err("empty required response with empty version must be rejected");
+
+        assert!(err.contains("empty version_info"));
+    }
+
+    #[test]
+    fn empty_optional_response_may_omit_version_info() {
+        let mut accumulator = ResourceAccumulator::new();
+
+        accumulator
+            .apply_sotw_response(SDS_TYPE_URL, &[], "")
+            .expect("empty optional response can omit version");
     }
 
     #[test]
@@ -4416,6 +4564,207 @@ mod tests {
             recovered.resolve_effective_mtls_mode(8080),
             MtlsMode::Strict,
             "the authoritative carrier labels must match the selector-scoped PeerAuthentication"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_ambiguous_carrier_labels_defer_to_local_dp_labels() {
+        use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+
+        // Ambiguous shared-SPIFFE: the carrier labels are the INTERSECTION
+        // (`app=shared`), the slice carries a candidate-any selector
+        // PeerAuthentication keyed on the divergent `role=api`, and the
+        // `labels_ambiguous` marker is set. The DP holds its real labels
+        // (`app=shared, role=api`). Recovery must DEFER to the DP labels (not
+        // the partial intersection), so the `role=api` STRICT policy still
+        // matches — otherwise it would be dropped (the non-empty-intersection
+        // fail-open this fix closes).
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![PeerAuthentication {
+                name: "role-api-strict".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                    namespace: None,
+                }),
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.labels = BTreeMap::from([
+            ("app".to_string(), "shared".to_string()),
+            ("role".to_string(), "api".to_string()),
+        ]);
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert_eq!(
+            recovered.labels,
+            BTreeMap::from([
+                ("app".to_string(), "shared".to_string()),
+                ("role".to_string(), "api".to_string()),
+            ]),
+            "ambiguous intersection carrier must defer to the DP's authoritative local labels"
+        );
+        assert!(
+            !recovered.labels_ambiguous,
+            "the DP's recovered labels are authoritative; the marker is cleared after recovery"
+        );
+        assert_eq!(
+            recovered.resolve_effective_mtls_mode(8080),
+            MtlsMode::Strict,
+            "the candidate-only role=api PeerAuthentication must still match the DP's real labels"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_ambiguous_carrier_labels_merge_common_intersection_with_partial_local() {
+        use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+
+        // Codex P1 (xds_client.rs:1487): the ambiguous-intersection carrier
+        // labels common to every candidate (`app=shared`) are authoritative for
+        // THOSE keys. When the DP supplies ONLY the disambiguating label
+        // (`role=api`) and NOT the common one, recovery must MERGE the
+        // intersection with the local labels rather than REPLACE the intersection
+        // wholesale — otherwise a selector policy scoped to the common
+        // `app=shared` (which the CP proved applies to every candidate) is dropped
+        // (the wholesale-replace fail-open). The slice carries TWO candidate-any
+        // selector PeerAuths: one on the common `app=shared` (must survive) and one
+        // on the divergent `role=api` (resolved by the local label).
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![
+                PeerAuthentication {
+                    name: "app-shared-strict".to_string(),
+                    namespace: "default".to_string(),
+                    scope: None,
+                    selector: Some(WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "shared".to_string())]),
+                        namespace: None,
+                    }),
+                    mtls_mode: MtlsMode::Strict,
+                    port_overrides: HashMap::new(),
+                },
+                PeerAuthentication {
+                    name: "role-api-permissive".to_string(),
+                    namespace: "default".to_string(),
+                    scope: None,
+                    selector: Some(WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: None,
+                    }),
+                    mtls_mode: MtlsMode::Permissive,
+                    port_overrides: HashMap::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        // DP supplies ONLY the disambiguating label, NOT the common `app=shared`.
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.labels = BTreeMap::from([("role".to_string(), "api".to_string())]);
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert_eq!(
+            recovered.labels,
+            BTreeMap::from([
+                ("app".to_string(), "shared".to_string()),
+                ("role".to_string(), "api".to_string()),
+            ]),
+            "the common intersection must be MERGED with the partial local labels, not replaced"
+        );
+        assert!(
+            !recovered.labels_ambiguous,
+            "the DP supplied local labels, so the merged set is authoritative and the marker clears"
+        );
+        // The WorkloadSelector tier wins; the more-restrictive Strict wins a
+        // same-tier tie — so the common `app=shared` STRICT must still resolve.
+        assert_eq!(
+            recovered.resolve_effective_mtls_mode(8080),
+            MtlsMode::Strict,
+            "the common-key app=shared STRICT PeerAuthentication must survive the merge"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_preserves_ambiguous_marker_when_dp_has_no_local_labels() {
+        use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+
+        // Ambiguous shared-SPIFFE slice with an EMPTY label intersection (the
+        // candidates diverge with no common label), and the DP supplies NO local
+        // `FERRUM_MESH_WORKLOAD_LABELS`. `pick_recovered_labels` then falls back
+        // to the (empty) intersection, which is NOT authoritative, so the
+        // recovered slice MUST keep `labels_ambiguous = true` — otherwise the
+        // mesh_authz ambiguous-slice fail-closed check never runs and the
+        // candidate-only selector policy is silently dropped (fail-open).
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            labels: BTreeMap::new(),
+            labels_ambiguous: true,
+            peer_authentications: vec![PeerAuthentication {
+                name: "role-api-strict".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                    namespace: None,
+                }),
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        // DP config: no local labels to make the intersection authoritative.
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.labels = BTreeMap::new();
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert!(
+            recovered.labels.is_empty(),
+            "with no local DP labels the recovered labels stay the empty intersection"
+        );
+        assert!(
+            recovered.labels_ambiguous,
+            "the marker must be PRESERVED when the recovered labels are not authoritative"
         );
     }
 

@@ -1,7 +1,7 @@
 use ferrum_edge::proxy::{
     build_forwarded_value, check_host_authority_consistency, check_protocol_headers,
     is_h2_websocket_connect, is_hbone_connect_request, is_valid_websocket_key,
-    normalize_request_host_for_routing, ws_accept_from_key,
+    normalize_request_host_for_routing, websocket_origin_allowed, ws_accept_from_key,
 };
 use hyper::header::HeaderValue;
 
@@ -519,6 +519,19 @@ fn allows_content_length_large_valid() {
 }
 
 #[test]
+fn rejects_content_length_overflowing_usize() {
+    let mut headers = hyper::HeaderMap::new();
+    let overflowing = format!("{}0", usize::MAX);
+    headers.insert(
+        "content-length",
+        HeaderValue::from_str(&overflowing).unwrap(),
+    );
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("exceeds supported integer range"));
+}
+
+#[test]
 fn allows_content_length_with_ows_valid_digits() {
     // OWS is trimmed before digit validation
     let mut headers = hyper::HeaderMap::new();
@@ -552,6 +565,93 @@ fn rejects_comma_separated_content_length_with_non_numeric() {
     let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
+}
+
+// ============================================================================
+// websocket_origin_allowed tests
+// ============================================================================
+
+#[test]
+fn websocket_origin_allows_default_port_variants() {
+    let allowed = vec!["https://good.example".to_string()];
+
+    assert!(websocket_origin_allowed(&allowed, "https://good.example"));
+    assert!(websocket_origin_allowed(
+        &allowed,
+        "https://good.example:443"
+    ));
+    assert!(websocket_origin_allowed(
+        &["http://good.example:80".to_string()],
+        "http://good.example"
+    ));
+}
+
+#[test]
+fn websocket_origin_preserves_non_default_ports() {
+    let allowed = vec!["https://good.example:8443".to_string()];
+
+    assert!(websocket_origin_allowed(
+        &allowed,
+        "https://GOOD.example:8443"
+    ));
+    assert!(!websocket_origin_allowed(&allowed, "https://good.example"));
+    assert!(!websocket_origin_allowed(
+        &["https://good.example".to_string()],
+        "https://good.example:8443"
+    ));
+}
+
+#[test]
+fn websocket_origin_falls_back_to_exact_match_for_unparseable_values() {
+    let allowed = vec!["null".to_string()];
+
+    assert!(websocket_origin_allowed(&allowed, "NULL"));
+    assert!(!websocket_origin_allowed(&allowed, "https://null"));
+}
+
+#[test]
+fn websocket_origin_does_not_normalize_path_query_or_fragment() {
+    let allowed = vec!["https://good.example".to_string()];
+
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://good.example/path"
+    ));
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://good.example?x=1"
+    ));
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://good.example#frag"
+    ));
+}
+
+#[test]
+fn websocket_origin_rejects_userinfo_smuggling() {
+    let allowed = vec!["https://good.example".to_string()];
+
+    // An Origin carrying userinfo must not be normalized down to the
+    // allow-listed host and waved through admission. RFC 6454 serialized
+    // origins never contain credentials, so these fail closed.
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://attacker@good.example"
+    ));
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://attacker:secret@good.example"
+    ));
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://attacker@good.example:443"
+    ));
+    // A userinfo-bearing entry on the allow-list side must not match a
+    // bare origin either.
+    assert!(!websocket_origin_allowed(
+        &["https://user@good.example".to_string()],
+        "https://good.example"
+    ));
 }
 
 // ============================================================================

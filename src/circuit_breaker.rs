@@ -340,11 +340,12 @@ impl CircuitBreaker {
         }
 
         let packed = self.packed.load(Ordering::Acquire);
-        self.last_failure_epoch_ms
-            .store(now_epoch_ms(), Ordering::Relaxed);
+        let failure_time = now_epoch_ms();
 
         match packed_state(packed) {
             STATE_CLOSED => {
+                self.last_failure_epoch_ms
+                    .store(failure_time, Ordering::Relaxed);
                 // A half-open probe whose failure arrives only AFTER the breaker
                 // has already left HALF_OPEN — a sibling reached the success
                 // threshold and closed it, or this is a stale straggler from a
@@ -425,11 +426,17 @@ impl CircuitBreaker {
                     }
                 }
             }
-            STATE_HALF_OPEN => self.reopen_after_probe_failure(),
+            STATE_HALF_OPEN => {
+                self.last_failure_epoch_ms
+                    .store(failure_time, Ordering::Relaxed);
+                self.reopen_after_probe_failure();
+            }
             STATE_OPEN if is_half_open_probe => {
                 // A concurrent record_failure already reopened the circuit between
                 // our can_execute() (when it was HALF_OPEN) and now. Release our
-                // slot (a no-op if the reopen already cleared the count).
+                // slot (a no-op if the reopen already cleared the count). Do not
+                // refresh last_failure_epoch_ms: the reopen that published OPEN
+                // already started the recovery timeout.
                 self.release_half_open_slot();
             }
             _ => {}
@@ -534,6 +541,13 @@ impl CircuitBreaker {
     #[allow(dead_code)]
     pub fn half_open_in_flight(&self) -> u32 {
         packed_count(self.packed.load(Ordering::Acquire))
+    }
+
+    /// Last failure timestamp in epoch milliseconds (for testing).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn last_failure_epoch_ms(&self) -> u64 {
+        self.last_failure_epoch_ms.load(Ordering::Relaxed)
     }
 
     /// Current state name (for metrics/logging).

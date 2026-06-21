@@ -7,12 +7,26 @@
 //!
 //! This mode exits after completion (no long-running process).
 
+use sqlx::Executor;
 use tracing::{error, info};
 
 use crate::config::EnvConfig;
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::migrations::MigrationRunner;
 use crate::config::types::CURRENT_CONFIG_VERSION;
+
+fn sql_migration_pool_options(db_type: &str) -> sqlx::any::AnyPoolOptions {
+    let mut options = sqlx::any::AnyPoolOptions::new().max_connections(5);
+    if db_type == "sqlite" {
+        options = options.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("PRAGMA foreign_keys = ON").await?;
+                Ok(())
+            })
+        });
+    }
+    options
+}
 
 pub async fn run(
     env_config: EnvConfig,
@@ -79,8 +93,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     // Connect without running migrations automatically
     sqlx::any::install_default_drivers();
 
-    let pool = sqlx::any::AnyPoolOptions::new()
-        .max_connections(5)
+    let pool = sql_migration_pool_options(db_type)
         .connect(&effective_url)
         .await?;
 
@@ -170,8 +183,7 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
 
     sqlx::any::install_default_drivers();
 
-    let pool = sqlx::any::AnyPoolOptions::new()
-        .max_connections(5)
+    let pool = sql_migration_pool_options(db_type)
         .connect(&effective_url)
         .await?;
 
@@ -275,4 +287,27 @@ fn run_config_migration(env_config: &EnvConfig, dry_run: bool) -> Result<(), any
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn sqlite_migration_pool_enables_foreign_keys_per_connection() {
+        sqlx::any::install_default_drivers();
+        let pool = sql_migration_pool_options("sqlite")
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite migration pool");
+
+        let row = sqlx::query("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .expect("read foreign_keys pragma");
+        let enabled: i64 = row.try_get(0).expect("pragma integer");
+
+        assert_eq!(enabled, 1);
+    }
 }

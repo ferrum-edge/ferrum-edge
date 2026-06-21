@@ -15,6 +15,17 @@ license = "PolyForm-Noncommercial-1.0.0"
 # `poll_data_drains_buffered_body_before_quic_close`); to run them locally,
 # invoke `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
 # The same tests are part of hyperium/h3#339 and run on the upstream PR's CI.
+#
+# The vendored tungstenite/tokio-tungstenite crates live at
+# `vendor/tungstenite-0.29.0-ferrum-patched/` and
+# `vendor/tokio-tungstenite-0.29.0-ferrum-patched/`. They backport
+# snapview/tungstenite-rs#556 and snapview/tokio-tungstenite#380 so the
+# WebSocket tunnel fast path can take over the raw backend stream without
+# dropping bytes buffered during the 101 response parse. To run their tests
+# directly:
+# `cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer`
+# and
+# `cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer`.
 
 [[bin]]
 name = "ferrum-edge"
@@ -124,6 +135,10 @@ instant-distance = "0.6.1"
 # CachePadded for hot-path atomics in OverloadState. Already transitive via
 # tokio/dashmap; the explicit pin makes the surface intentional.
 crossbeam-utils = "0.8"
+# Lock-free bounded MPMC ring (ArrayQueue) backing the router-cache eviction
+# sample reservoir. Already transitive via sqlx-core; the explicit pin makes the
+# surface intentional.
+crossbeam-queue = "0.3"
 bytes = "1"
 thiserror = "2"
 anyhow = "1"
@@ -354,6 +369,21 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 # suppression in PR #506 stays — it is correct independently of whether the
 # underlying h3 library can recover the response.
 # See `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md`.
+#
+# We also carry vendored copies of tungstenite 0.29.0 and tokio-tungstenite
+# 0.29.0 with the upstream-proposed lossless raw-takeover APIs:
+# `WebSocket::into_inner_with_read_buffer()` and
+# `WebSocketStream::into_inner_with_read_buffer()`. Without these, tunnel mode
+# loses backend bytes coalesced with the 101 response because plain
+# `into_inner()` drops tungstenite's internal read buffer.
+#
+# Retirement plan: when both upstream changes ship in compatible published
+# releases consumed by ferrum-edge, remove both `[patch.crates-io]` lines, drop
+# the two vendor directories, bump dependency versions/lockfile normally, and
+# keep the gateway call site using the same upstream API. See
+# `docs/upstream-tungstenite-patches/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
+tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
+tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }

@@ -31,7 +31,10 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
-use crate::proxy::headers::{is_backend_request_strip_header, parse_connection_listed_headers};
+use crate::proxy::headers::{
+    is_backend_request_strip_header, is_backend_response_strip_header,
+    parse_connection_listed_headers,
+};
 use crate::tls::backend::{
     BackendSvidGeneration, SvidGenerationMatcher, append_backend_tls_pool_key_fields,
     append_optional_pool_key_component, append_pool_key_component,
@@ -407,6 +410,42 @@ fn connection_listed_headers_if_present(headers: &http::HeaderMap) -> Vec<http::
     } else {
         Vec::new()
     }
+}
+
+fn collect_h3_response_headers(source: &http::HeaderMap) -> HashMap<String, String> {
+    let mut headers: HashMap<String, String> = HashMap::with_capacity(source.keys_len());
+    // RFC 9110 §7.6.1: snapshot the Connection-listed names before
+    // iterating so any header NAMED in `Connection` is also skipped during
+    // collection. Hyper rejects `Connection` on H2/H3 frames (RFC 9114 §4.2),
+    // so this is typically empty for native H3 backends; the snapshot exists
+    // for defence in depth.
+    let connection_listed = connection_listed_headers_if_present(source);
+    for (name, value) in source {
+        if is_backend_response_strip_header(name.as_str()) {
+            continue;
+        }
+        // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
+        if connection_listed.iter().any(|n| n == name) {
+            continue;
+        }
+        if let Ok(value_str) = value.to_str() {
+            let sep = if name == http::header::SET_COOKIE {
+                "\n"
+            } else {
+                ", "
+            };
+            match headers.get_mut(name.as_str()) {
+                Some(existing) => {
+                    existing.push_str(sep);
+                    existing.push_str(value_str);
+                }
+                None => {
+                    headers.insert(name.as_str().to_string(), value_str.to_string());
+                }
+            }
+        }
+    }
+    headers
 }
 
 /// Whether `e` is a connection-level graceful-close signal that may legally
@@ -817,6 +856,10 @@ impl AsRef<dyn std::error::Error + Send + Sync + 'static> for H3PoolError {
 
 /// Result type alias for the H3 pool.
 pub type H3PoolResult<T> = std::result::Result<T, H3PoolError>;
+
+fn should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire: bool) -> bool {
+    !fast_path_failed_pre_wire
+}
 
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
 ///
@@ -1363,6 +1406,7 @@ impl Http3ConnectionPool {
         // the backend on this stream, so replaying it on another connection
         // would double-execute a possibly non-idempotent request and bypass the
         // gateway's retry_on_methods policy — surface it immediately instead.
+        let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request(
@@ -1381,6 +1425,7 @@ impl Http3ConnectionPool {
                 Err(_) => {
                     // Pre-wire cached failure — fall through to the full
                     // retry/reconnect path below which allocates pool keys.
+                    fast_path_failed_pre_wire = true;
                 }
             }
         }
@@ -1389,8 +1434,17 @@ impl Http3ConnectionPool {
         // and new connection creation.
         let key = self.pool_key_with_generation(proxy, start, svid_generation);
 
-        // Try cached connection on the selected index first
-        if let Some(pooled) = self.pool.cached(&key) {
+        let mut try_fallback_indices = fast_path_failed_pre_wire;
+        if fast_path_failed_pre_wire {
+            self.pool.invalidate(&key);
+        }
+
+        // Try cached connection on the selected index first, unless the
+        // thread-local fast path already tried that same entry and failed
+        // before the request reached the wire.
+        if should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire)
+            && let Some(pooled) = self.pool.cached(&key)
+        {
             let mut sr = pooled.send_request;
             match Self::do_request(
                 &mut sr,
@@ -1408,31 +1462,34 @@ impl Http3ConnectionPool {
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
+                    try_fallback_indices = true;
+                }
+            }
+        }
 
-                    // Try other cached indices before creating a new connection
-                    for offset in 1..conns_per_backend {
-                        let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key =
-                            self.pool_key_with_generation(proxy, fallback_index, svid_generation);
-                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
-                            let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::do_request(
-                                &mut fallback_sr,
-                                proxy,
-                                method,
-                                backend_url,
-                                headers,
-                                body.clone(),
-                                max_response_body_size_bytes,
-                            )
-                            .await
-                            {
-                                Ok(result) => return Ok(result),
-                                Err(e) if e.request_on_wire() => return Err(e),
-                                Err(_) => {
-                                    self.pool.invalidate(&fallback_key);
-                                }
-                            }
+        if try_fallback_indices {
+            // Try other cached indices before creating a new connection.
+            for offset in 1..conns_per_backend {
+                let fallback_index = (start + offset) % conns_per_backend;
+                let fallback_key =
+                    self.pool_key_with_generation(proxy, fallback_index, svid_generation);
+                if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                    let mut fallback_sr = fallback_pooled.send_request;
+                    match Self::do_request(
+                        &mut fallback_sr,
+                        proxy,
+                        method,
+                        backend_url,
+                        headers,
+                        body.clone(),
+                        max_response_body_size_bytes,
+                    )
+                    .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(e) if e.request_on_wire() => return Err(e),
+                        Err(_) => {
+                            self.pool.invalidate(&fallback_key);
                         }
                     }
                 }
@@ -1837,29 +1894,7 @@ impl Http3ConnectionPool {
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            // Skip hop-by-hop headers during collection (avoids allocating
-            // String keys that would be immediately removed by the caller).
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         let content_length: Option<u64> = response_headers
             .get("content-length")
@@ -1955,29 +1990,7 @@ impl Http3ConnectionPool {
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            // Skip hop-by-hop headers during collection (avoids allocating
-            // String keys that would be immediately removed by the caller).
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         Ok(H3StreamingResponse {
             status,
@@ -2085,29 +2098,7 @@ impl Http3ConnectionPool {
                 .await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            // Skip hop-by-hop headers during collection (avoids allocating
-            // String keys that would be immediately removed by the caller).
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         Ok(H3StreamingResponse {
             status,
@@ -2203,27 +2194,7 @@ impl Http3ConnectionPool {
                 .await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
-        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
-        // iterating so any header NAMED in `Connection` is also skipped
-        // during collection. Hyper rejects `Connection` on H2/H3 frames
-        // (RFC 9114 §4.2), so this is typically empty for native H3
-        // backends — the snapshot exists for defence in depth.
-        let connection_listed = connection_listed_headers_if_present(response.headers());
-        for (name, value) in response.headers() {
-            match name.as_str() {
-                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-                | "trailer" | "transfer-encoding" | "upgrade" => continue,
-                _ => {}
-            }
-            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
-            if connection_listed.iter().any(|n| n == name) {
-                continue;
-            }
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         Ok(H3StreamingResponse {
             status,
@@ -2612,6 +2583,7 @@ impl Http3ConnectionPool {
         // POST-WIRE failure means the request already reached the backend on
         // this stream, so return it immediately rather than replaying it (see
         // `request()`).
+        let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
@@ -2626,14 +2598,23 @@ impl Http3ConnectionPool {
             {
                 Ok(result) => return Ok(result),
                 Err(e) if e.request_on_wire() => return Err(e),
-                Err(_) => {}
+                Err(_) => {
+                    fast_path_failed_pre_wire = true;
+                }
             }
         }
 
         // Slow path: allocate pool key String
         let key = self.pool_key_with_generation(proxy, start, svid_generation);
 
-        if let Some(pooled) = self.pool.cached(&key) {
+        let mut try_fallback_indices = fast_path_failed_pre_wire;
+        if fast_path_failed_pre_wire {
+            self.pool.invalidate(&key);
+        }
+
+        if should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire)
+            && let Some(pooled) = self.pool.cached(&key)
+        {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
                 &mut sr,
@@ -2650,29 +2631,32 @@ impl Http3ConnectionPool {
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
+                    try_fallback_indices = true;
+                }
+            }
+        }
 
-                    for offset in 1..conns_per_backend {
-                        let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key =
-                            self.pool_key_with_generation(proxy, fallback_index, svid_generation);
-                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
-                            let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::do_request_streaming(
-                                &mut fallback_sr,
-                                proxy,
-                                method,
-                                backend_url,
-                                headers,
-                                body.clone(),
-                            )
-                            .await
-                            {
-                                Ok(result) => return Ok(result),
-                                Err(e) if e.request_on_wire() => return Err(e),
-                                Err(_) => {
-                                    self.pool.invalidate(&fallback_key);
-                                }
-                            }
+        if try_fallback_indices {
+            for offset in 1..conns_per_backend {
+                let fallback_index = (start + offset) % conns_per_backend;
+                let fallback_key =
+                    self.pool_key_with_generation(proxy, fallback_index, svid_generation);
+                if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                    let mut fallback_sr = fallback_pooled.send_request;
+                    match Self::do_request_streaming(
+                        &mut fallback_sr,
+                        proxy,
+                        method,
+                        backend_url,
+                        headers,
+                        body.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(e) if e.request_on_wire() => return Err(e),
+                        Err(_) => {
+                            self.pool.invalidate(&fallback_key);
                         }
                     }
                 }
@@ -2956,12 +2940,7 @@ impl Http3Client {
         let status = response.status().as_u16();
 
         // Collect response headers
-        let mut response_headers = std::collections::HashMap::new();
-        for (name, value) in response.headers() {
-            if let Ok(value_str) = value.to_str() {
-                response_headers.insert(name.as_str().to_string(), value_str.to_string());
-            }
-        }
+        let response_headers = collect_h3_response_headers(response.headers());
 
         // Collect response body
         let content_length: Option<u64> = response_headers
@@ -3066,6 +3045,36 @@ mod h3_pool_error_tests {
     use super::*;
 
     #[test]
+    fn collect_h3_response_headers_matches_h1_h2_folding() {
+        let mut source = http::HeaderMap::new();
+        source.append(
+            "cache-control",
+            http::HeaderValue::from_static("no-transform"),
+        );
+        source.append(
+            "cache-control",
+            http::HeaderValue::from_static("max-age=60"),
+        );
+        source.append("set-cookie", http::HeaderValue::from_static("session=a"));
+        source.append("set-cookie", http::HeaderValue::from_static("theme=dark"));
+        source.insert("connection", http::HeaderValue::from_static("x-hop"));
+        source.insert("x-hop", http::HeaderValue::from_static("strip-me"));
+
+        let headers = collect_h3_response_headers(&source);
+
+        assert_eq!(
+            headers.get("cache-control").map(String::as_str),
+            Some("no-transform, max-age=60")
+        );
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("session=a\ntheme=dark")
+        );
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-hop"));
+    }
+
+    #[test]
     fn pre_wire_marks_request_not_committed() {
         let e = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
         assert!(
@@ -3102,6 +3111,18 @@ mod h3_pool_error_tests {
 
         let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
         assert!(post.promote_on_wire_if(true).request_on_wire());
+    }
+
+    #[test]
+    fn fast_path_pre_wire_failure_skips_selected_slow_cache_probe() {
+        assert!(
+            should_probe_selected_h3_cache_after_fast_path(false),
+            "cache misses or absent fast-path entries should still probe the selected slow-path key"
+        );
+        assert!(
+            !should_probe_selected_h3_cache_after_fast_path(true),
+            "a pre-wire fast-path failure already tried the selected entry, so the slow path must skip it"
+        );
     }
 
     #[test]

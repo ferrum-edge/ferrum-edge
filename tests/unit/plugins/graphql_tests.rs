@@ -925,6 +925,19 @@ async fn test_fragment_spread_counts_toward_depth_limit() {
 }
 
 #[tokio::test]
+async fn test_fragment_syntax_without_structured_operation_is_rejected() {
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "fragment OnlyFragment on Query { viewer { id } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
 async fn test_fragment_spread_under_depth_limit_allowed() {
     // The same query passes when the limit accommodates the resolved depth,
     // confirming the expansion is accurate rather than blanket-rejecting

@@ -38,6 +38,7 @@ pub struct WatcherSelection {
     pub watch_istio: bool,
     pub watch_gateway_api: bool,
     pub watch_core: bool,
+    pub watch_gateway_api_data_plane_service: bool,
     pub watch_node_locality: bool,
     pub watch_mesh_config: bool,
 }
@@ -215,6 +216,51 @@ pub const K8S_CORE_RESOURCES: &[CoreResourceSpec] = &[
     },
 ];
 
+pub const K8S_NAMESPACE_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "",
+    version: "v1",
+    kind: "Namespace",
+    plural: "namespaces",
+    namespaced: false,
+    field_selector: None,
+}];
+
+pub const GATEWAY_API_CORE_RESOURCES: &[CoreResourceSpec] = &[
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Secret",
+        plural: "secrets",
+        namespaced: true,
+        field_selector: None,
+    },
+    CoreResourceSpec {
+        group: "",
+        version: "v1",
+        kind: "Service",
+        plural: "services",
+        namespaced: true,
+        field_selector: None,
+    },
+    CoreResourceSpec {
+        group: "discovery.k8s.io",
+        version: "v1",
+        kind: "EndpointSlice",
+        plural: "endpointslices",
+        namespaced: true,
+        field_selector: None,
+    },
+];
+
+pub const GATEWAY_API_DATA_PLANE_STATUS_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
+    group: "discovery.k8s.io",
+    version: "v1",
+    kind: "EndpointSlice",
+    plural: "endpointslices",
+    namespaced: true,
+    field_selector: None,
+}];
+
 pub const K8S_NODE_LOCALITY_RESOURCES: &[CoreResourceSpec] = &[CoreResourceSpec {
     group: "",
     version: "v1",
@@ -293,6 +339,25 @@ fn crd_watch_namespaces(
     }
 }
 
+fn gateway_api_data_plane_status_watch_namespaces(
+    namespaces: &[String],
+    data_plane_service_namespace: Option<&str>,
+) -> Vec<String> {
+    if namespaces.is_empty() {
+        return Vec::new();
+    }
+    let mut status_namespaces = namespaces.to_vec();
+    if let Some(namespace) = data_plane_service_namespace
+        && !namespace.is_empty()
+        && !status_namespaces
+            .iter()
+            .any(|existing| existing == namespace)
+    {
+        status_namespaces.push(namespace.to_string());
+    }
+    status_namespaces
+}
+
 fn build_apis_for_resource(
     client: &Client,
     ar: &ApiResource,
@@ -331,6 +396,7 @@ pub async fn start_crd_watchers(
     selection: WatcherSelection,
     namespaces: Vec<String>,
     istio_root_namespace: String,
+    gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
@@ -511,6 +577,29 @@ pub async fn start_crd_watchers(
                 .map(|resource| (resource, namespaces.clone())),
         );
     }
+    if selection.watch_gateway_api {
+        core_watch_plan.extend(
+            K8S_NAMESPACE_RESOURCES
+                .iter()
+                .map(|resource| (resource, Vec::new())),
+        );
+        core_watch_plan.extend(
+            GATEWAY_API_CORE_RESOURCES
+                .iter()
+                .map(|resource| (resource, namespaces.clone())),
+        );
+    }
+    if selection.watch_gateway_api_data_plane_service {
+        let status_namespaces = gateway_api_data_plane_status_watch_namespaces(
+            &namespaces,
+            gateway_api_data_plane_service_namespace.as_deref(),
+        );
+        core_watch_plan.extend(
+            GATEWAY_API_DATA_PLANE_STATUS_RESOURCES
+                .iter()
+                .map(|resource| (resource, status_namespaces.clone())),
+        );
+    }
     if selection.watch_mesh_config {
         core_watch_plan.extend(
             ISTIO_MESH_CONFIG_RESOURCES
@@ -658,12 +747,14 @@ pub async fn start_crd_watchers(
     handles
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_crd_reprobe_task(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
     namespaces: Vec<String>,
     istio_root_namespace: String,
+    gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -688,6 +779,7 @@ pub fn spawn_crd_reprobe_task(
                         selection,
                         namespaces.clone(),
                         istio_root_namespace.clone(),
+                        gateway_api_data_plane_service_namespace.clone(),
                         shutdown.clone(),
                     ).await;
                     // New handles run independently; we don't need to track
@@ -765,6 +857,22 @@ mod tests {
     }
 
     #[test]
+    fn data_plane_status_watch_namespaces_include_configured_service_namespace() {
+        assert_eq!(
+            gateway_api_data_plane_status_watch_namespaces(&["routes".to_string()], Some("ferrum")),
+            vec!["routes".to_string(), "ferrum".to_string()]
+        );
+        assert_eq!(
+            gateway_api_data_plane_status_watch_namespaces(&["ferrum".to_string()], Some("ferrum")),
+            vec!["ferrum".to_string()]
+        );
+        assert!(
+            gateway_api_data_plane_status_watch_namespaces(&[], Some("ferrum")).is_empty(),
+            "empty watch namespace list keeps Api::all semantics"
+        );
+    }
+
+    #[test]
     fn k8s_core_resources_cover_required_namespaced_pod_discovery_inputs() {
         let kinds: HashSet<&str> = K8S_CORE_RESOURCES
             .iter()
@@ -798,6 +906,16 @@ mod tests {
     }
 
     #[test]
+    fn gateway_api_data_plane_status_resources_watch_endpoint_slices() {
+        let kinds: HashSet<&str> = GATEWAY_API_DATA_PLANE_STATUS_RESOURCES
+            .iter()
+            .map(|resource| resource.kind)
+            .collect();
+
+        assert_eq!(kinds, HashSet::from(["EndpointSlice"]));
+    }
+
+    #[test]
     fn gateway_api_watches_gateway_class_cluster_scoped() {
         let gateway_class = GATEWAY_API_CRDS
             .iter()
@@ -806,6 +924,23 @@ mod tests {
 
         assert!(!gateway_class.namespaced);
         assert_eq!(gateway_class.plural, "gatewayclasses");
+    }
+
+    #[test]
+    fn gateway_api_core_resources_cover_backend_refs_and_certificate_refs() {
+        let kinds: HashSet<&str> = GATEWAY_API_CORE_RESOURCES
+            .iter()
+            .map(|resource| resource.kind)
+            .collect();
+        assert_eq!(kinds, HashSet::from(["Secret", "Service", "EndpointSlice"]));
+
+        for resource in GATEWAY_API_CORE_RESOURCES {
+            assert!(
+                resource.namespaced,
+                "{} Gateway API core watch should be namespaced",
+                resource.kind
+            );
+        }
     }
 
     #[test]

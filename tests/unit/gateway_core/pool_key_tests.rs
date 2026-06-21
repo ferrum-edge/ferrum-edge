@@ -45,6 +45,7 @@ fn minimal_proxy() -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default_verify(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -1390,6 +1391,7 @@ fn backend_capability_key_uses_target_host_and_port() {
     let target = UpstreamTarget {
         host: "target.backend.internal".to_string(),
         port: 9443,
+        service_port_policy_key: None,
         weight: 1,
         tags: Default::default(),
         locality: None,
@@ -1525,6 +1527,7 @@ fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
     let target = UpstreamTarget {
         host: "lb-member.internal".to_string(),
         port: 7443,
+        service_port_policy_key: None,
         weight: 1,
         tags: Default::default(),
         locality: None,

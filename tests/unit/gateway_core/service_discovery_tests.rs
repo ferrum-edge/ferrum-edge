@@ -52,6 +52,7 @@ fn make_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -62,6 +63,7 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: None,
@@ -446,6 +448,14 @@ fn test_targets_equal_different_length() {
 fn test_targets_equal_different_content() {
     let a = vec![make_target("h1", 80)];
     let b = vec![make_target("h2", 80)];
+    assert!(!ferrum_edge::service_discovery::targets_equal(&a, &b));
+}
+
+#[test]
+fn test_targets_equal_different_policy_port() {
+    let mut a = vec![make_target("h1", 8080)];
+    a[0].service_port_policy_key = Some(80);
+    let b = vec![make_target("h1", 8080)];
     assert!(!ferrum_edge::service_discovery::targets_equal(&a, &b));
 }
 

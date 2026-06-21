@@ -73,10 +73,37 @@ impl V001SqlBuilder {
     }
 
     pub(super) async fn apply(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+        // MySQL auto-commits DDL, so a mid-V001 failure cannot be rolled back.
+        // Keep every statement idempotent and only let MigrationRunner record
+        // V001 after this full apply path returns successfully.
         self.enable_sqlite_foreign_keys(pool).await?;
         self.create_tables(pool).await?;
         self.create_indexes(pool).await?;
         self.create_unique_indexes(pool).await?;
+        Ok(())
+    }
+
+    /// Idempotently ensure baseline tables that were folded into V001 *after*
+    /// some databases had already recorded V001 in `_ferrum_migrations`.
+    ///
+    /// During build-out, schema additions are folded into the V001 baseline
+    /// rather than carried as upgrade migrations (see the project build-out
+    /// policy). The migration runner skips V001 entirely once version 1 is
+    /// recorded, so a table added to V001 here would never be created on an
+    /// already-initialized database — yet the proxy persistence path writes to
+    /// `proxy_route_locks` on every create/update/batch/API-spec proxy write.
+    /// Re-running this idempotent `CREATE TABLE IF NOT EXISTS` pass on every
+    /// startup guarantees the table exists regardless of whether V001 was
+    /// recorded before or after it was folded in. Every statement here must be
+    /// idempotent (no error on re-run) so the pass is safe on fresh databases
+    /// that have just applied V001 in full.
+    pub(super) async fn ensure_compatibility_tables(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(self.create_proxy_route_locks_sql())
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
@@ -96,6 +123,7 @@ impl V001SqlBuilder {
             self.create_consumers_sql(),
             self.create_consumer_credential_index_sql(),
             self.create_proxies_sql(),
+            self.create_proxy_route_locks_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
             // api_specs must come AFTER proxies (api_specs.proxy_id FKs
@@ -185,7 +213,7 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts ON audit_events (namespace, ts)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts_id ON audit_events (namespace, ts, id)",
             "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
             "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
         ];
@@ -284,7 +312,7 @@ impl V001SqlBuilder {
                 subsets TEXT,
                 backend_tls_client_cert_path VARCHAR(2048),
                 backend_tls_client_key_path VARCHAR(2048),
-                backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
+                backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
                 backend_tls_sni VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 backend_tls_san_allow_list MEDIUMTEXT,
@@ -539,6 +567,28 @@ impl V001SqlBuilder {
         }
     }
 
+    fn create_proxy_route_locks_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS proxy_route_locks (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                route_key_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (namespace, route_key_hash)
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS proxy_route_locks (
+                namespace TEXT NOT NULL,
+                route_key_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, route_key_hash)
+            )
+            "#
+        }
+    }
+
     fn create_proxy_plugins_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"
@@ -777,6 +827,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_mysql_upstreams_tls_verify_column_matches_reader_type() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_upstreams_sql();
+        assert!(
+            sql.contains("backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1"),
+            "upstream TLS verify flag must match row_to_upstream's i32 reader"
+        );
+        assert!(
+            !sql.contains("backend_tls_verify_server_cert TINYINT"),
+            "upstream TLS verify flag must not use a narrower MySQL-only type"
+        );
+    }
+
     // ------------------------------------------------------------------
     // mesh_route_dispatch index — partial on Postgres/SQLite (matches
     // MongoDB's `partialFilterExpression: {enabled: true}`), full on
@@ -904,6 +968,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_proxy_route_lock_table_uses_compact_route_hash_key() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_proxy_route_locks_sql();
+            assert!(
+                sql.contains("proxy_route_locks"),
+                "{dialect} must create the route-lock table"
+            );
+            assert!(
+                sql.contains("route_key_hash"),
+                "{dialect} must key route locks by the compact route hash"
+            );
+            assert!(
+                sql.contains("PRIMARY KEY (namespace, route_key_hash)"),
+                "{dialect} must serialize writers per namespace and route bucket"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Collation regression tests
     //
@@ -1021,6 +1105,13 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_proxy_route_locks_collation_on_key_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_proxy_route_locks_sql();
+        assert_columns_have_collation(sql, "proxy_route_locks", &["namespace", "route_key_hash"]);
+    }
+
+    #[test]
     fn test_non_mysql_dialects_have_no_mysql_collation_clause() {
         for dialect in ["postgres", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
@@ -1028,6 +1119,7 @@ mod tests {
                 builder.create_upstreams_sql(),
                 builder.create_consumers_sql(),
                 builder.create_proxies_sql(),
+                builder.create_proxy_route_locks_sql(),
                 builder.create_plugin_configs_sql(),
                 builder.create_proxy_plugins_sql(),
                 builder.create_api_specs_sql(),

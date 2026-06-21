@@ -553,6 +553,34 @@ impl WorkloadMetrics {
             );
         }
     }
+
+    async fn log_with_precomputed_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
+    ) {
+        // Service graph aggregates all mesh RED data; trace export below honors sampling.
+        crate::plugins::mesh::service_graph::record_transaction_with_mesh_key(summary, mesh_key);
+        if !self.should_export_metadata(&summary.metadata) {
+            return;
+        }
+        let direction = summary
+            .metadata
+            .get(MESH_DIRECTION_METADATA)
+            .and_then(|value| parse_mesh_direction_metadata(value));
+        if !self.direction_emit.emits_for(direction) {
+            return;
+        }
+        let kind = match direction {
+            Some(MeshTrafficDirection::Outbound) => SpanKind::Client,
+            _ => SpanKind::Server,
+        };
+        self.export_span(SpanData::from_transaction_summary_with_kind(
+            summary,
+            &self.service_name,
+            kind,
+        ));
+    }
 }
 
 #[async_trait]
@@ -669,27 +697,17 @@ impl Plugin for WorkloadMetrics {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        // Service graph aggregates all mesh RED data; trace export below honors sampling.
-        crate::plugins::mesh::service_graph::record_transaction(summary);
-        if !self.should_export_metadata(&summary.metadata) {
-            return;
-        }
-        let direction = summary
-            .metadata
-            .get(MESH_DIRECTION_METADATA)
-            .and_then(|value| parse_mesh_direction_metadata(value));
-        if !self.direction_emit.emits_for(direction) {
-            return;
-        }
-        let kind = match direction {
-            Some(MeshTrafficDirection::Outbound) => SpanKind::Client,
-            _ => SpanKind::Server,
-        };
-        self.export_span(SpanData::from_transaction_summary_with_kind(
-            summary,
-            &self.service_name,
-            kind,
-        ));
+        let mesh_key = crate::plugins::mesh::prometheus_helpers::mesh_request_key(summary);
+        self.log_with_precomputed_mesh_key(summary, mesh_key.as_ref())
+            .await;
+    }
+
+    async fn log_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
+    ) {
+        self.log_with_precomputed_mesh_key(summary, mesh_key).await;
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

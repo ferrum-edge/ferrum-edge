@@ -70,6 +70,34 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
     Arc::new(arc_swap::ArcSwap::new(crls))
 }
 
+/// Build a throwaway server config for listeners that must bind before real
+/// dynamic TLS material exists. Callers should disable accepting handshakes
+/// until the shared frontend TLS slot receives a real certificate.
+pub(crate) fn temporary_disabled_listener_tls_config() -> Result<Arc<ServerConfig>, anyhow::Error> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
+    let cert = params.self_signed(&key_pair)?;
+
+    let cert_pem = cert.pem();
+    let mut cert_reader = cert_pem.as_bytes();
+    let certs: Vec<_> = certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let key_pem = key_pair.serialize_pem();
+    let mut key_reader = key_pem.as_bytes();
+    let key = private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("temporary listener TLS key was not generated"))?;
+
+    Ok(Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| anyhow::anyhow!("failed to apply default TLS versions: {error}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| anyhow::anyhow!("temporary listener TLS config is invalid: {error}"))?,
+    ))
+}
+
 /// Accept a frontend TLS stream, optionally bounding the handshake duration.
 ///
 /// The HTTP header read timeout starts only after TLS negotiation succeeds, so
@@ -986,7 +1014,7 @@ fn certified_key_from_svid_bundle(
         return Err(anyhow::anyhow!("SVID bundle carries an empty cert chain"));
     }
     let key = PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-        bundle.private_key_pkcs8_der.clone(),
+        bundle.private_key_pkcs8_der.to_vec(),
     ));
     rustls::sign::CertifiedKey::from_der(cert_chain, key, provider).map_err(|error| {
         anyhow::anyhow!("SVID leaf and private key do not form a valid pair: {error}")
@@ -1616,7 +1644,7 @@ mod tests {
             spiffe_id: crate::identity::SpiffeId::from_parts(&trust_domain, "ns/test/sa/test")
                 .expect("spiffe id"),
             cert_chain_der: vec![cert.der().as_ref().to_vec()],
-            private_key_pkcs8_der: key_pair.serialize_der(),
+            private_key_pkcs8_der: key_pair.serialize_der().into(),
             trust_bundles: crate::identity::TrustBundleSet::local_only(
                 crate::identity::TrustBundle {
                     trust_domain,
@@ -1686,7 +1714,7 @@ mod tests {
         );
 
         let mut broken = test_svid_bundle("broken");
-        broken.private_key_pkcs8_der = vec![0u8; 8];
+        broken.private_key_pkcs8_der = vec![0u8; 8].into();
         slot.store(Arc::new(Some(broken)));
         assert!(
             resolver.resolve_current().is_none(),

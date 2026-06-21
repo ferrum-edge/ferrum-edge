@@ -17,6 +17,7 @@ fn make_upstream(id: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "reviews.default.svc.cluster.local".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: Default::default(),
             locality: None,
@@ -39,6 +40,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: Default::default(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),

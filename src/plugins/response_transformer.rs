@@ -42,9 +42,10 @@ use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::route_header_transform::{
-    RouteHeaderTransformRule, apply_route_header_transforms,
+    RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
 };
 use super::{Plugin, PluginResult, RequestContext};
+use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
 pub mod runtime_overlay;
 
@@ -102,6 +103,108 @@ impl ResponseTransformer {
         ctx.route_override_response_transform
             .as_ref()
             .is_some_and(|rules| rules.iter().any(|rule| rule.key == "content-type"))
+    }
+
+    fn static_rules_may_add_cache_control_no_transform(&self) -> bool {
+        self.header_rules.iter().any(|rule| match rule.operation {
+            HeaderOp::Add | HeaderOp::Update => {
+                rule.key == "cache-control"
+                    && rule
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| cache_control_has_directive(value, "no-transform"))
+            }
+            HeaderOp::Remove => false,
+            HeaderOp::Rename => rule.new_key.as_deref() == Some("cache-control"),
+        })
+    }
+
+    fn route_rules_may_add_cache_control_no_transform(ctx: &RequestContext) -> bool {
+        ctx.route_override_response_transform
+            .as_ref()
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| match rule.operation {
+                    RouteHeaderTransformOp::Add | RouteHeaderTransformOp::Update => {
+                        rule.key == "cache-control"
+                            && rule.value.as_deref().is_some_and(|value| {
+                                cache_control_has_directive(value, "no-transform")
+                            })
+                    }
+                    RouteHeaderTransformOp::Remove => false,
+                })
+            })
+    }
+
+    fn static_rules_may_add_strong_etag(&self) -> bool {
+        self.header_rules.iter().any(|rule| match rule.operation {
+            HeaderOp::Add | HeaderOp::Update => {
+                rule.key == "etag" && rule.value.as_deref().is_some_and(etag_value_is_strong)
+            }
+            HeaderOp::Remove => false,
+            HeaderOp::Rename => rule.new_key.as_deref() == Some("etag"),
+        })
+    }
+
+    fn route_rules_may_add_strong_etag(ctx: &RequestContext) -> bool {
+        ctx.route_override_response_transform
+            .as_ref()
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| match rule.operation {
+                    RouteHeaderTransformOp::Add | RouteHeaderTransformOp::Update => {
+                        rule.key == "etag"
+                            && rule.value.as_deref().is_some_and(etag_value_is_strong)
+                    }
+                    RouteHeaderTransformOp::Remove => false,
+                })
+            })
+    }
+
+    fn apply_static_header_rules(
+        &self,
+        response_headers: &mut HashMap<String, String>,
+        emit_debug: bool,
+    ) {
+        for rule in &self.header_rules {
+            match rule.operation {
+                HeaderOp::Add => {
+                    if let Some(value) = rule.value.as_ref() {
+                        response_headers.entry(rule.key.clone()).or_insert_with(|| {
+                            if emit_debug {
+                                debug!("response_transformer: added header {}={}", rule.key, value);
+                            }
+                            value.clone()
+                        });
+                    }
+                }
+                HeaderOp::Update => {
+                    if let Some(value) = rule.value.as_ref() {
+                        response_headers.insert(rule.key.clone(), value.clone());
+                        if emit_debug {
+                            debug!("response_transformer: set header {}={}", rule.key, value);
+                        }
+                    }
+                }
+                HeaderOp::Remove => {
+                    response_headers.remove(&rule.key);
+                    if emit_debug {
+                        debug!("response_transformer: removed header {}", rule.key);
+                    }
+                }
+                HeaderOp::Rename => {
+                    if let Some(new_key) = rule.new_key.as_ref()
+                        && let Some(value) = response_headers.remove(&rule.key)
+                    {
+                        if emit_debug {
+                            debug!(
+                                "response_transformer: renamed header {} -> {}",
+                                rule.key, new_key
+                            );
+                        }
+                        response_headers.insert(new_key.clone(), value);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -362,6 +465,40 @@ impl Plugin for ResponseTransformer {
                 || Self::route_rules_may_modify_content_type(ctx))
     }
 
+    fn may_add_response_cache_control_no_transform(
+        &self,
+        ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.rules_enabled()
+            && (self.static_rules_may_add_cache_control_no_transform()
+                || Self::route_rules_may_add_cache_control_no_transform(ctx))
+    }
+
+    fn may_add_response_strong_etag(
+        &self,
+        ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.rules_enabled()
+            && (self.static_rules_may_add_strong_etag()
+                || Self::route_rules_may_add_strong_etag(ctx))
+    }
+
+    fn simulate_after_proxy_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if !self.rules_enabled() {
+            return;
+        }
+        self.apply_static_header_rules(response_headers, false);
+        if let Some(route_rules) = ctx.route_override_response_transform.take() {
+            apply_route_header_transforms(route_rules.as_ref(), response_headers);
+        }
+    }
+
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Honor the RTDS runtime kill-switch here, mirroring the early
         // `return None` in `transform_response_body`. When the overlay disables
@@ -393,39 +530,7 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
-        for rule in &self.header_rules {
-            match rule.operation {
-                HeaderOp::Add => {
-                    if let Some(ref val) = rule.value {
-                        response_headers.entry(rule.key.clone()).or_insert_with(|| {
-                            debug!("response_transformer: added header {}={}", rule.key, val);
-                            val.clone()
-                        });
-                    }
-                }
-                HeaderOp::Update => {
-                    if let Some(ref val) = rule.value {
-                        response_headers.insert(rule.key.clone(), val.clone());
-                        debug!("response_transformer: set header {}={}", rule.key, val);
-                    }
-                }
-                HeaderOp::Remove => {
-                    response_headers.remove(&rule.key);
-                    debug!("response_transformer: removed header {}", rule.key);
-                }
-                HeaderOp::Rename => {
-                    if let Some(ref new_key) = rule.new_key
-                        && let Some(val) = response_headers.remove(&rule.key)
-                    {
-                        debug!(
-                            "response_transformer: renamed header {} -> {}",
-                            rule.key, new_key
-                        );
-                        response_headers.insert(new_key.clone(), val);
-                    }
-                }
-            }
-        }
+        self.apply_static_header_rules(response_headers, true);
         // Per-rule overrides published by `mesh_route_dispatch` run AFTER
         // static rules so route-level writes win on conflict — see module
         // docstring. Take the Arc out so a later response_transformer

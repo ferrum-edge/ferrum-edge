@@ -142,6 +142,10 @@ pub fn create_plugin(
     Ok(Some(Arc::new(ExampleAuditPlugin::new(config)?)))
 }
 
+pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
+    crate::plugins::PluginFailurePolicy::OptionalFailOpen
+}
+
 /// Database migrations for this plugin.
 ///
 /// These migrations are automatically discovered by the build script and run

@@ -241,7 +241,7 @@ impl InternalCa {
             cert_chain_der: chain,
             // Filled in by callers that own the keypair (Csr path needs no
             // key; Generate path returns the freshly-generated PKCS#8 DER).
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             not_after,
         })
     }
@@ -300,7 +300,7 @@ impl CertificateAuthority for InternalCa {
                     Ok(SignedSvid {
                         spiffe_id,
                         cert_chain_der: vec![leaf_der, self.root_cert_der.clone()],
-                        private_key_pkcs8_der: Vec::new(),
+                        private_key_pkcs8_der: Vec::new().into(),
                         not_after,
                     })
                 }
@@ -316,7 +316,7 @@ impl CertificateAuthority for InternalCa {
                     let serialized_key = key_pair.serialize_der();
 
                     let mut svid = self.sign_with_keypair(&spiffe_id, ttl, &key_pair)?;
-                    svid.private_key_pkcs8_der = serialized_key;
+                    svid.private_key_pkcs8_der = serialized_key.into();
                     crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
                         &svid.spiffe_id,
                         "internal",

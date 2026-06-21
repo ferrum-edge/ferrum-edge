@@ -75,6 +75,7 @@ fn create_http3_test_proxy() -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: ferrum_edge::config::types::AuthMode::Single,
@@ -433,7 +434,6 @@ async fn test_http3_proxy_state_creation() {
         backend_svid_rotation_tx,
         backend_svid_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         bpf_metrics_state: None,
-        tunnel_mode_frame_loss_warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         backend_conn_limit: Arc::new(
             ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new(),
         ),
@@ -716,7 +716,6 @@ async fn test_http3_full_integration() {
         backend_svid_rotation_tx,
         backend_svid_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         bpf_metrics_state: None,
-        tunnel_mode_frame_loss_warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         backend_conn_limit: Arc::new(
             ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new(),
         ),
@@ -787,6 +786,7 @@ async fn test_http3_streaming_decision_logic() {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: ferrum_edge::config::types::AuthMode::Single,

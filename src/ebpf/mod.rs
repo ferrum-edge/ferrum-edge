@@ -538,6 +538,17 @@ pub struct MockEbpfBackend {
     pub fail_update_capture_config: bool,
     pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
+    /// When non-zero, the next N `update_workload_identity` calls return an
+    /// error (decrementing the counter), letting tests exercise partial-write
+    /// retry behaviour where some pod cgroups enroll and others fail.
+    pub fail_workload_identity_writes: usize,
+    /// When `true`, every `attach_tc` call returns an error, letting tests
+    /// simulate a transient inbound-tc attach failure that strikes *after* a
+    /// pod's cgroup and veth have already resolved — the exact scenario the
+    /// post-enrollment retry loop (see `node_agent::retry_backed_off_pod_enrollments`)
+    /// exists to recover from. Flip it back to `false` to model the transient
+    /// condition clearing so a re-driven enrollment can succeed.
+    pub fail_attach_tc: bool,
 }
 
 impl EbpfBackend for MockEbpfBackend {
@@ -567,6 +578,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn attach_tc(&mut self, _pod_uid: &str, iface: &str, program: &str) -> Result<(), String> {
+        if self.fail_attach_tc {
+            return Err(format!("injected tc attach failure for {iface}/{program}"));
+        }
         self.tc_attachments
             .push((iface.to_string(), program.to_string()));
         Ok(())
@@ -628,6 +642,12 @@ impl EbpfBackend for MockEbpfBackend {
         cgroup_id: u64,
         identity: &WorkloadIdentity,
     ) -> Result<(), String> {
+        if self.fail_workload_identity_writes > 0 {
+            self.fail_workload_identity_writes -= 1;
+            return Err(format!(
+                "injected workload identity write failure for cgroup {cgroup_id}"
+            ));
+        }
         self.operations
             .push(format!("update_workload_identity:{cgroup_id}"));
         self.workload_identities.insert(cgroup_id, *identity);

@@ -466,7 +466,7 @@ mod tests {
         SvidBundle {
             spiffe_id,
             cert_chain_der: vec![cert_der.clone()],
-            private_key_pkcs8_der: key_pair.serialize_der(),
+            private_key_pkcs8_der: key_pair.serialize_der().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain,
                 x509_authorities: vec![cert_der],

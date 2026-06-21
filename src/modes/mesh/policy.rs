@@ -546,8 +546,8 @@ fn format_u16(buf: &mut [u8; 5], port: u16) -> &str {
             value /= 10;
         }
     }
-    // SAFETY: only ASCII digits written above, which are valid UTF-8.
-    std::str::from_utf8(&buf[idx..]).expect("ASCII digits are valid UTF-8")
+    // SAFETY: only ASCII digits are written above, so this subslice is valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(&buf[idx..]) }
 }
 
 fn normalize_hostname(host: &str) -> Option<String> {

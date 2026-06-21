@@ -122,6 +122,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: host_fqdn.to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: MAX_TARGET_WEIGHT.min(1),
             tags: HashMap::new(),
             locality: None,
@@ -140,6 +141,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         port_overrides: HashMap::new(),
         source_locality: None,
         locality_lb_strict: false,

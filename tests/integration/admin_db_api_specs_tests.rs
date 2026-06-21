@@ -2756,15 +2756,16 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         .await
         .expect("initial submit failed");
 
-    // Create a global plugin and associate it with the proxy manually (simulating
-    // an operator adding a shared plugin after spec creation via direct admin API).
-    let global_plugin_id = uid("global-plugin");
-    let global_plugin = PluginConfig {
-        id: global_plugin_id.clone(),
+    // Create a proxy-group plugin and associate it with the proxy manually
+    // (simulating an operator adding a shared plugin after spec creation via
+    // direct admin API).
+    let manual_plugin_id = uid("proxy-group-plugin");
+    let manual_plugin = PluginConfig {
+        id: manual_plugin_id.clone(),
         namespace: ns.to_string(),
         plugin_name: "cors".to_string(),
         config: serde_json::json!({}),
-        scope: PluginScope::Global,
+        scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,
         priority_override: None,
@@ -2773,9 +2774,9 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         updated_at: chrono::Utc::now(),
     };
     store
-        .create_plugin_config(&global_plugin)
+        .create_plugin_config(&manual_plugin)
         .await
-        .expect("create global plugin failed");
+        .expect("create proxy-group plugin failed");
 
     // Add the junction row manually (direct DB update to proxy.plugins).
     let proxy_with_manual = {
@@ -2785,7 +2786,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
             .expect("get_proxy failed")
             .expect("proxy must exist");
         p.plugins.push(PluginAssociation {
-            plugin_config_id: global_plugin_id.clone(),
+            plugin_config_id: manual_plugin_id.clone(),
         });
         p
     };
@@ -2817,17 +2818,17 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         .await
         .expect("replace failed");
 
-    // The global plugin itself must still exist (not deleted).
-    let global_row = store
-        .get_plugin_config(&global_plugin_id)
+    // The proxy-group plugin itself must still exist (not deleted).
+    let manual_row = store
+        .get_plugin_config(&manual_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
-        global_row.is_some(),
-        "global plugin must still exist after replace"
+        manual_row.is_some(),
+        "proxy-group plugin must still exist after replace"
     );
 
-    // The proxy's plugin associations must include the global plugin.
+    // The proxy's plugin associations must include the manual proxy-group plugin.
     let proxy_after = store
         .get_proxy(&proxy_id)
         .await
@@ -2839,8 +2840,8 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         .map(|a| a.plugin_config_id.as_str())
         .collect();
     assert!(
-        plugin_ids.contains(&global_plugin_id.as_str()),
-        "manual global plugin association must be preserved after replace; \
+        plugin_ids.contains(&manual_plugin_id.as_str()),
+        "manual proxy-group plugin association must be preserved after replace; \
          proxy.plugins = {:?}",
         plugin_ids
     );
@@ -3286,6 +3287,83 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
         "orphaned upstream must be cascade-deleted after last referencing proxy is removed; \
          got Some({:?})",
         upstream_after_p2_delete
+    );
+}
+
+#[tokio::test]
+async fn update_proxy_reassignment_cleans_up_orphaned_old_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let old_upstream_id = uid("old-upstream");
+    let shared_old_upstream_id = uid("shared-old-upstream");
+    let new_upstream_id = uid("new-upstream");
+    for upstream_id in [&old_upstream_id, &shared_old_upstream_id, &new_upstream_id] {
+        store
+            .create_upstream(&make_upstream(upstream_id, ns))
+            .await
+            .expect("create upstream");
+    }
+
+    let proxy_id = uid("proxy-reassign");
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.upstream_id = Some(old_upstream_id.clone());
+    store.create_proxy(&proxy).await.expect("create proxy");
+
+    proxy.upstream_id = Some(new_upstream_id.clone());
+    store
+        .update_proxy(&proxy)
+        .await
+        .expect("reassign proxy upstream");
+
+    let old_after_reassign = store
+        .get_upstream(&old_upstream_id)
+        .await
+        .expect("get old upstream after reassignment");
+    assert!(
+        old_after_reassign.is_none(),
+        "old upstream must be deleted when reassignment leaves it orphaned"
+    );
+
+    let new_after_reassign = store
+        .get_upstream(&new_upstream_id)
+        .await
+        .expect("get new upstream after reassignment");
+    assert!(
+        new_after_reassign.is_some(),
+        "new upstream must survive because the proxy now references it"
+    );
+
+    let first_shared_proxy_id = uid("first-shared-proxy");
+    let second_shared_proxy_id = uid("second-shared-proxy");
+    let mut first_shared_proxy = make_proxy(&first_shared_proxy_id, ns);
+    first_shared_proxy.upstream_id = Some(shared_old_upstream_id.clone());
+    store
+        .create_proxy(&first_shared_proxy)
+        .await
+        .expect("create first shared proxy");
+
+    let mut second_shared_proxy = make_proxy(&second_shared_proxy_id, ns);
+    second_shared_proxy.upstream_id = Some(shared_old_upstream_id.clone());
+    store
+        .create_proxy(&second_shared_proxy)
+        .await
+        .expect("create second shared proxy");
+
+    first_shared_proxy.upstream_id = Some(new_upstream_id);
+    store
+        .update_proxy(&first_shared_proxy)
+        .await
+        .expect("reassign first shared proxy");
+
+    let shared_old_after_reassign = store
+        .get_upstream(&shared_old_upstream_id)
+        .await
+        .expect("get shared old upstream after reassignment");
+    assert!(
+        shared_old_after_reassign.is_some(),
+        "old upstream must survive while another proxy still references it"
     );
 }
 

@@ -184,6 +184,114 @@ fn east_west_gateway_skips_remote_gateway_from_other_namespace() {
     );
 }
 
+#[test]
+fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
+    // An explicit EastWestGateway that owns a local service's FQDN SNI host
+    // must win over the automatic local-service proxy: materializing both
+    // would emit two passthrough proxies claiming the same SNI on the shared
+    // listen port, which `validate_stream_proxies` rejects as overlapping —
+    // silently dropping the operator's explicit route. The auto proxy for the
+    // overlapping FQDN is suppressed so exactly one (the explicit) survives.
+    let workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.5"],
+    );
+    let service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
+    let mut mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-1".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![east_west_gateway(
+            "explicit-reviews",
+            vec!["reviews.default.svc.cluster.local"],
+        )],
+    });
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("prepared");
+
+    // The explicit gateway proxy is present...
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|p| p.id.starts_with("__mesh-east-west-")
+                && p.hosts
+                    .iter()
+                    .any(|h| h == "reviews.default.svc.cluster.local")),
+        "explicit east-west gateway proxy must own the reviews SNI"
+    );
+    // ...and the auto local-service proxy for the same FQDN is suppressed, so
+    // only one proxy claims that SNI on the shared listen port.
+    let claimants = prepared
+        .proxies
+        .iter()
+        .filter(|p| {
+            p.listen_port == Some(15443)
+                && p.hosts
+                    .iter()
+                    .any(|h| h == "reviews.default.svc.cluster.local")
+        })
+        .count();
+    assert_eq!(
+        claimants, 1,
+        "explicit override must suppress the auto proxy so exactly one proxy claims the SNI"
+    );
+}
+
+#[test]
+fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
+    // Two EastWestGateway entries in the same namespace that reuse the same
+    // `name` collapse onto one generated proxy id (last wins). The override
+    // set must reflect only the surviving gateway's SNI hosts: an overwritten
+    // entry that claimed `reviews.default.svc.cluster.local` must NOT suppress
+    // the auto local-service proxy for `reviews`, or that service silently
+    // disappears from east-west routing. The surviving entry claims `ratings`.
+    let reviews_wl = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.5"],
+    );
+    let reviews_svc = service_for("reviews", DEFAULT_NAMESPACE, &[&reviews_wl]);
+    let mut mesh = mesh_config_with(vec![reviews_wl], vec![reviews_svc], Vec::new());
+    // Both gateways share name "dup" → same generated proxy id; only the last
+    // (claiming `ratings`) materializes a proxy. The first (claiming `reviews`)
+    // is overwritten and owns no surviving explicit proxy.
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-1".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            east_west_gateway("dup", vec!["reviews.default.svc.cluster.local"]),
+            east_west_gateway("dup", vec!["ratings.default.svc.cluster.local"]),
+        ],
+    });
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("prepared");
+
+    // The auto local-service proxy for `reviews` must still be materialized
+    // because the overwritten duplicate-name entry never produced a surviving
+    // explicit proxy that owns the SNI.
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|p| p.id.starts_with("__mesh-ew-svc-")
+                && p.hosts
+                    .iter()
+                    .any(|h| h == "reviews.default.svc.cluster.local")),
+        "auto local-service proxy for reviews must survive when only an overwritten duplicate-name gateway claimed it, got {:?}",
+        prepared
+            .proxies
+            .iter()
+            .map(|p| (&p.id, &p.hosts))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ── Egress gateway materialization ────────────────────────────────────────
 
 fn egress_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
@@ -392,7 +500,10 @@ fn egress_gateway_materialises_tcp_stream_proxy_for_external_tcp_service_entry()
     let upstream = prepared
         .upstreams
         .iter()
-        .find(|u| u.id.contains("redis-ext"))
+        // The SE name "redis-ext" is encoded into the egress id with the
+        // injective, `-`-free scheme (#1727), so its `-` becomes the `_dash_`
+        // token and the name segment is "redis_dash_ext".
+        .find(|u| u.id.contains("redis_dash_ext"))
         .expect("stream egress upstream materialised");
     assert!(
         !upstream.targets.is_empty(),

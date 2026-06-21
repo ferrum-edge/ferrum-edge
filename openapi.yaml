@@ -5741,9 +5741,10 @@ components:
           type: [integer, "null"]
           format: uint32
           minimum: 1
+          maximum: 2147483647
           description: |
             Maximum concurrent HTTP/2 streams per backend connection (overrides global).
-            Must be at least 1. Default: 1000.
+            Range: 1–2147483647. Default: 1000.
         pool_http3_connections_per_backend:
           type: [integer, "null"]
           minimum: 1
@@ -5755,13 +5756,15 @@ components:
         pool_max_requests_per_connection:
           type: [integer, "null"]
           format: uint64
-          minimum: 1
+          minimum: 0
+          maximum: 2147483647
           description: |
             Reserved for Istio DestinationRule
             `connectionPool.http.maxRequestsPerConnection`. The field is
             validated and persisted for schema compatibility, but currently has
             no runtime effect because reqwest/hyper do not expose a stable
-            per-connection request cap for the shared client pool.
+            per-connection request cap for the shared client pool. Range:
+            0–2147483647, where 0 preserves Istio's explicit unlimited value.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -6205,15 +6208,12 @@ components:
           description: >-
             Plugin-specific JSON configuration. Validated on create/update and
             again when the plugin is instantiated at config reload time.
-            Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
-            oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
-            mtls_auth, access_control,
-            tcp_connection_throttle, adaptive_concurrency, ip_restriction, waf, security_headers, mesh_authz, opa,
-            mesh_outbound_registry, openapi_validator, ai_semantic_firewall, mcp_gateway, a2a_gateway) are validation-fatal: invalid config blocks
+            Enabled plugin configs are validation-fatal when the plugin cache is
+            built: unknown plugin names or invalid plugin-specific config block
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
-            prior good config). Non-security plugins with invalid config are
-            logged and skipped instead. See
+            prior good config). Disabled plugin configs are not instantiated.
+            See
             `PluginConfigs` section for per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
@@ -7575,6 +7575,14 @@ components:
             Optional load-balancer algorithm override for this subset. When set,
             the subset uses this algorithm instead of the parent upstream's
             algorithm.
+        hash_on:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: |
+            Optional hash-key source for subset-scoped consistent hashing. Uses
+            the same syntax as `Upstream.hash_on`: `ip`, `header:<name>`, or
+            `cookie:<name>`.
 
     LoadBalancerAlgorithm:
       type: string
@@ -12077,7 +12085,7 @@ components:
 
     CompressionConfig:
       type: object
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression."
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression."
       properties:
         algorithms:
           type: array
@@ -12096,10 +12104,6 @@ components:
           items:
             type: string
           description: "Content-type whitelist. Defaults to 10 common text/application types"
-        disable_on_etag:
-          type: boolean
-          default: false
-          description: "Skip compression when the response has an ETag header"
         remove_accept_encoding:
           type: boolean
           default: true
@@ -13405,13 +13409,13 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, query, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
       properties:
         ttl_seconds:
           type: integer
           format: uint64
           default: 300
-          description: "Default TTL in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true."
+          description: "Default freshness lifetime in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true. Upstream Age and Date still reduce remaining freshness."
         max_entries:
           type: integer
           format: uint64
@@ -13426,7 +13430,7 @@ components:
           type: integer
           format: uint64
           default: 104857600
-          description: Maximum total in-memory cache size across all entries (100 MiB by default)
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached.
         cacheable_methods:
           type: array
           items:
@@ -13457,7 +13461,7 @@ components:
         cache_key_include_query:
           type: boolean
           default: true
-          description: Include sorted query parameters in the cache key
+          description: Include the exact raw query string in the cache key as a SHA-256 hash. The query string is not parsed, sorted, percent-decoded, or normalized.
         cache_key_include_consumer:
           type: boolean
           default: false
@@ -13465,7 +13469,7 @@ components:
         add_cache_status_header:
           type: boolean
           default: true
-          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses"
+          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header."
         invalidate_on_unsafe_methods:
           type: boolean
           default: true
@@ -14093,6 +14097,10 @@ components:
           type: string
           default: ai
           description: Prefix for metadata keys
+        buffer_streaming_responses:
+          type: boolean
+          default: false
+          description: Buffer text/event-stream responses so final SSE usage events can be parsed; disables streaming delivery for those responses
         cost_per_prompt_token:
           type: number
           format: double
@@ -15298,7 +15306,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Returns cached responses for duplicate requests within a TTL window. Supports centralized Redis-backed mode for cross-instance deduplication."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and are not backward-compatible with pre-fingerprint values. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
       properties:
         header_name:
           type: string
@@ -15319,8 +15327,19 @@ components:
             greater than zero.
         max_entries:
           type: integer
+          minimum: 1
           default: 10000
-          description: Maximum number of cached deduplication entries (local mode only)
+          description: Maximum number of tracked local deduplication entries. Active in-flight entries count but are not evicted while live.
+        max_entry_size_bytes:
+          type: integer
+          minimum: 1
+          default: 1048576
+          description: Maximum retained size of one completed response entry. Oversized retained responses are returned normally, clear in-flight state, and are not retained or serialized for Redis. Redis payloads are also skipped when their serialized value exceeds this cap.
+        max_total_size_bytes:
+          type: integer
+          minimum: 1
+          default: 104857600
+          description: Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode, skipped responses clear in-flight state immediately; in Redis mode, a local-total-cap skip keeps local and distributed in-flight locks until inflight_ttl_seconds if Redis publication fails.
         applicable_methods:
           type: array
           items:
@@ -15339,7 +15358,7 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+          description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized completed responses plus distributed in-flight locks). Any RESP-compatible server works."
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."

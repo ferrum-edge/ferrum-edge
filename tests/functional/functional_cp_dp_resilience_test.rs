@@ -90,6 +90,7 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -387,6 +388,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
             "ferrum".to_string(),
             0,
             None,
+            None,
         )
         .await;
     });
@@ -524,6 +526,7 @@ async fn test_multi_cp_failover_connects_to_fallback() {
             "ferrum".to_string(),
             0, // disable primary-retry timer for this test
             Some(conn_state_clone),
+            None,
         )
         .await;
     });
@@ -636,6 +639,7 @@ async fn test_primary_retry_reconnects_to_primary() {
             "ferrum".to_string(),
             3, // primary_retry_secs — disconnect from fallback every 3s to retry primary
             Some(cs),
+            None,
         )
         .await;
     });
@@ -808,6 +812,7 @@ async fn test_cluster_endpoint_shape_cp_and_dp() {
             "ferrum".to_string(),
             0,
             Some(cs),
+            None,
         )
         .await;
     });

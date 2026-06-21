@@ -20,7 +20,10 @@
 //! APIs for SPIFFE-aware listeners and clients.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
+
+use zeroize::Zeroizing;
 
 pub mod attestation;
 pub mod ca;
@@ -94,16 +97,37 @@ pub fn allow_no_ca() -> bool {
 ///
 /// Hot-swapped by [`workload_api::fetch_loop`] / [`rotation`] via `ArcSwap`
 /// so concurrent readers never observe a partial swap.
-#[derive(Debug, Clone)]
+pub type SvidPrivateKeyDer = Zeroizing<Vec<u8>>;
+
+pub(crate) struct RedactedPrivateKeyDer;
+
+impl fmt::Debug for RedactedPrivateKeyDer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+#[derive(Clone)]
 pub struct SvidBundle {
     pub spiffe_id: SpiffeId,
     /// Leaf-first DER-encoded chain (length ≥ 1).
     pub cert_chain_der: Vec<Vec<u8>>,
     /// PKCS#8 / DER-encoded private key for `cert_chain_der[0]`.
-    pub private_key_pkcs8_der: Vec<u8>,
+    pub private_key_pkcs8_der: SvidPrivateKeyDer,
     /// Local trust anchors for this SVID's trust domain plus any federated
     /// bundles relevant to peers we expect to communicate with.
     pub trust_bundles: TrustBundleSet,
+}
+
+impl fmt::Debug for SvidBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SvidBundle")
+            .field("spiffe_id", &self.spiffe_id)
+            .field("cert_chain_der", &self.cert_chain_der)
+            .field("private_key_pkcs8_der", &RedactedPrivateKeyDer)
+            .field("trust_bundles", &self.trust_bundles)
+            .finish()
+    }
 }
 
 impl SvidBundle {

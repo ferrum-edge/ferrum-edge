@@ -64,8 +64,8 @@ pub struct Http3ListenerOptions {
     pub frontend_tls_reload: Option<Http3FrontendTlsReload>,
 }
 
-/// Frontend TLS live-reload inputs for the H3 listener. Populated only when
-/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
+/// Frontend TLS live-reload inputs for the H3 listener. This may be populated
+/// by operator file reload or by a DP CP-delivered Gateway TLS overlay.
 pub struct Http3FrontendTlsReload {
     /// Shared frontend TLS slot. The proxy HTTPS / H2 / H3 listeners read
     /// from the same slot so they observe the same rotated cert/key pair.
@@ -350,6 +350,12 @@ pub async fn start_http3_listener_with_signal(
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
     let frontend_listen_port = bound_addr.map(|addr| addr.port());
+    if let Some(reload) = frontend_tls_reload.as_ref()
+        && reload.tls_slot.load_full().as_ref().is_none()
+    {
+        endpoint.set_server_config(None);
+        info!("HTTP/3 listener started disabled until frontend TLS material is available");
+    }
     info!("HTTP/3 (QUIC) listener started on {}", local_addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
@@ -442,9 +448,10 @@ pub async fn start_http3_listener_with_signal(
                 };
                 let new_tls = slot.load_full().as_ref().clone();
                 let Some(new_tls) = new_tls else {
-                    warn!(
+                    endpoint.set_server_config(None);
+                    info!(
                         revision,
-                        "Frontend TLS reload notified but slot is empty; keeping current HTTP/3 server config"
+                        "HTTP/3 listener disabled because frontend TLS slot is empty"
                     );
                     continue;
                 };
@@ -887,6 +894,7 @@ async fn handle_h3_request(
 
     // Store raw headers for deferred materialization.
     ctx.set_raw_headers(req.headers().clone());
+    crate::proxy::stamp_original_request_metadata(&mut ctx);
 
     // Validate URL length (path + query string)
     if state.max_url_length_bytes > 0 {
@@ -1831,16 +1839,18 @@ async fn handle_h3_request(
     let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
-    // NOTE (pre-existing, moot for mesh): this standalone H3 frontend selects
-    // upstream targets but does NOT run the per-target effective-proxy override
-    // pipeline (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
-    // that the H1/H2 dispatch path uses, so NONE of the DR per-port
-    // effective-proxy overrides (h2UpgradePolicy / maxRetries plus the
-    // pre-existing idleTimeout / http2MaxRequests / connectTimeout /
-    // maxConnections / tcpKeepalive / per-port LB+outlier) are applied here.
-    // This is moot for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT;
-    // UDP/H3 are out of mesh scope) and these are DestinationRule-derived
-    // (mesh-only). A uniform H3-override pass is a tracked follow-up — see
+    // NOTE (moot for mesh): this standalone H3 frontend's SELECTION path does
+    // not run `cap_proxy_retry_for_target` (the per-request `maxRetries` cap),
+    // so that DR knob is not applied on the H3 frontend. The H3→HTTP
+    // cross-protocol **plain** bridge DOES now apply the per-target
+    // effective-proxy overrides via `resolve_effective_proxy_for_target`
+    // (h2UpgradePolicy / idleTimeout / http2MaxRequests / connectTimeout / TLS,
+    // plus the service-discovery top-level fallback) — see
+    // `src/http3/cross_protocol.rs` `dispatch_plain`. The native-H3 backend pool
+    // and the gRPC bridge flavor, plus the `maxRetries` cap and per-port
+    // maxConnections / tcpKeepalive / LB+outlier, remain follow-ups. All moot
+    // for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT; UDP/H3 are
+    // out of mesh scope) and these are DestinationRule-derived (mesh-only) — see
     // `docs/mesh.md` "Dispatch-path coverage".
     // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
@@ -1980,11 +1990,7 @@ async fn handle_h3_request(
                 .get("origin")
                 .map(String::as_str)
                 .unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !crate::proxy::websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "H3 WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
@@ -2508,6 +2514,12 @@ async fn handle_h3_request(
         let mut response_headers = h3_resp.headers;
 
         // Hop-by-hop headers already filtered during collection in the H3 pool.
+
+        // Capture original response invariants before `after_proxy` runs on this
+        // default native-H3 streaming path; `compression.after_proxy` honors the
+        // marker so a streamed body is never mislabeled if a transformer strips
+        // `Content-Range` or `Cache-Control` first.
+        stamp_h3_original_response_metadata(&mut ctx, response_status, &response_headers);
 
         // Enforce response body size limit via Content-Length fast path
         if state.max_response_body_size_bytes > 0
@@ -3807,6 +3819,14 @@ async fn handle_h3_request(
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let mut response_body = response_body;
 
+        // Capture original response invariants before `after_proxy` runs on this
+        // buffered native-H3 path. Unlike the streamed paths, the body here IS
+        // buffered, so `compression.transform_response_body` would actually
+        // compress it; a response transformer that strips `Content-Range` or
+        // `Cache-Control` before compression would otherwise let compression
+        // rewrite a representation it must preserve.
+        stamp_h3_original_response_metadata(&mut ctx, response_status, &response_headers);
+
         // after_proxy hooks
         let mut after_proxy_rejected = false;
         {
@@ -3900,7 +3920,12 @@ async fn handle_h3_request(
             let ct_ref = content_type.as_deref();
             for plugin in plugins.iter() {
                 if let Some(transformed) = plugin
-                    .transform_response_body(&response_body, ct_ref, &response_headers)
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &response_body,
+                        ct_ref,
+                        &response_headers,
+                    )
                     .await
                 {
                     response_headers
@@ -4377,21 +4402,12 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             proxy,
             &epoch.load_balancer,
             upstream_id,
-            target.port,
+            target,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -4596,6 +4612,18 @@ fn h3_backend_unavailable_stream_result(
     }
 }
 
+/// Record original backend response invariants before any `after_proxy` hook can
+/// rewrite response headers, mirroring the H1/H2 stamp in `proxy/mod.rs`.
+/// Compression preserves these markers even if a response transformer removes
+/// `Content-Range` or `Cache-Control` before compression's own header hook.
+pub(crate) fn stamp_h3_original_response_metadata(
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) {
+    crate::proxy::stamp_original_response_metadata(ctx, response_status, response_headers);
+}
+
 async fn run_h3_streaming_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -4703,11 +4731,18 @@ async fn proxy_to_backend_h3_refined_response(
     let mut response_headers = h3_resp.headers;
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
 
+    // Stamp original response invariants before the buffer/stream refine and
+    // before any `after_proxy` hook can strip `Content-Range` or `Cache-Control`.
+    // The streaming branch below runs `compression.after_proxy` later (via
+    // `stream_h3_open_response_to_client`), which honors these markers.
+    stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
+
     if crate::proxy::refine_stream_response_for_content_type(
         false,
         proxy,
         plugins,
         Some(ctx),
+        response_status,
         &response_headers,
     ) {
         let result = stream_h3_open_response_to_client(
@@ -5380,6 +5415,11 @@ async fn proxy_to_backend_h3_streaming(
     // `proxy::headers` for the canonical predicate. Response-direction
     // set differs from the request-direction set.
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+
+    // Capture original response invariants before `after_proxy` below can let a
+    // response transformer strip `Content-Range` or `Cache-Control`; compression
+    // honors these markers before committing response coding headers.
+    stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
     // Enforce response body size limit via Content-Length fast path
     if state.max_response_body_size_bytes > 0
@@ -7033,6 +7073,10 @@ mod build_h3_backend_headers_tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
+            frontend_tls_source_namespace: None,
+            frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
         };

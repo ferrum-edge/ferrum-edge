@@ -66,6 +66,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -1676,6 +1677,7 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
             "ferrum".to_string(),
             0,
             None,
+            None,
         )
         .await;
     });
@@ -2697,6 +2699,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
             .map(|(h, p)| UpstreamTarget {
                 host: h.to_string(),
                 port: *p,
+                service_port_policy_key: None,
                 weight: 100,
                 tags: HashMap::new(),
                 locality: None,
@@ -2720,6 +2723,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

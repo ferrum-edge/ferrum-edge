@@ -55,7 +55,7 @@ impl CertificateAuthority for StubCa {
         Ok(SignedSvid {
             spiffe_id: id,
             cert_chain_der: vec![format!("stub-cert-{n}").into_bytes()],
-            private_key_pkcs8_der: b"stub-key".to_vec(),
+            private_key_pkcs8_der: b"stub-key".to_vec().into(),
             not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
         })
     }
@@ -105,7 +105,7 @@ impl CertificateAuthority for FederatedStubCa {
         Ok(SignedSvid {
             spiffe_id: id,
             cert_chain_der: vec![format!("stub-cert-{n}").into_bytes()],
-            private_key_pkcs8_der: b"stub-key".to_vec(),
+            private_key_pkcs8_der: b"stub-key".to_vec().into(),
             not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
         })
     }
@@ -331,7 +331,7 @@ fn dummy_bundle() -> ferrum_edge::identity::SvidBundle {
     SvidBundle {
         spiffe_id: id,
         cert_chain_der: vec![b"placeholder-cert".to_vec()],
-        private_key_pkcs8_der: b"placeholder-key".to_vec(),
+        private_key_pkcs8_der: b"placeholder-key".to_vec().into(),
         trust_bundles: TrustBundleSet {
             local: TrustBundle {
                 trust_domain,

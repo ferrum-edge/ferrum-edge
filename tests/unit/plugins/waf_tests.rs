@@ -1,6 +1,8 @@
 use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::waf::Waf;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
+use ferrum_edge::plugins::{
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -1241,7 +1243,10 @@ fn header_value_target_names_must_be_non_empty_when_provided() {
 
 #[test]
 fn waf_is_security_critical() {
-    assert!(is_security_plugin("waf"));
+    assert_eq!(
+        plugin_failure_policy("waf"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
 }
 
 #[tokio::test]
@@ -1478,19 +1483,37 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
 
     // Pre-flight (content-type-agnostic) decision buffers.
     assert!(plugin.should_buffer_response_body(&ctx));
+    let headers = HashMap::new();
 
     // Allowlisted content-types stay buffered (they will be scanned).
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/html")));
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &headers
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
 
     // Non-allowlisted / binary / missing content-types narrow to false so the
     // proxy streams them instead of buffering a body the WAF will not scan.
-    assert!(
-        !plugin
-            .should_buffer_response_body_for_content_type(&ctx, Some("application/octet-stream"))
-    );
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("image/png")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/octet-stream"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
 }
 
 #[tokio::test]

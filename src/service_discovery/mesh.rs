@@ -46,6 +46,7 @@ impl MeshServiceDiscoverer {
             return if service.ports.is_empty() {
                 Some(SelectedPort {
                     port: requested,
+                    service_port: Some(requested),
                     name: None,
                     protocol: AppProtocol::Unknown,
                     target_port: None,
@@ -57,6 +58,7 @@ impl MeshServiceDiscoverer {
                     .find(|port| port.port == requested)
                     .map(|port| SelectedPort {
                         port: port.port,
+                        service_port: Some(port.port),
                         name: port.name.clone(),
                         protocol: port.protocol,
                         target_port: port.target_port.clone(),
@@ -66,6 +68,7 @@ impl MeshServiceDiscoverer {
 
         service.ports.first().map(|port| SelectedPort {
             port: port.port,
+            service_port: Some(port.port),
             name: port.name.clone(),
             protocol: port.protocol,
             target_port: port.target_port.clone(),
@@ -124,6 +127,7 @@ impl MeshServiceDiscoverer {
                 return match resolve_target_port(selected.target_port.as_ref(), &workload.ports) {
                     Some(backend) if backend != 0 => Some(SelectedPort {
                         port: backend,
+                        service_port: selected.service_port,
                         name: selected.name.clone(),
                         protocol: selected.protocol,
                         target_port: None,
@@ -144,6 +148,7 @@ impl MeshServiceDiscoverer {
                 if selected.protocol == AppProtocol::Unknown && selected.name.is_none() {
                     return Some(SelectedPort {
                         port: workload_port.port,
+                        service_port: selected.service_port,
                         name: workload_port.name.clone(),
                         protocol: workload_port.protocol,
                         target_port: None,
@@ -156,6 +161,7 @@ impl MeshServiceDiscoverer {
 
         workload.ports.first().map(|port| SelectedPort {
             port: port.port,
+            service_port: None,
             name: port.name.clone(),
             protocol: port.protocol,
             target_port: None,
@@ -236,9 +242,27 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 if address.is_empty() {
                     continue;
                 }
+                // Collapse runtime targets on `(address, port, spiffe_id)` ONLY —
+                // deliberately NOT on `cluster`/`network` provenance. Two remote
+                // entries can advertise the same address on different networks
+                // (overlapping CIDR), but the rest of the runtime keys a target by
+                // its literal `host:port`: the dial uses `UpstreamTarget.host`, and
+                // LoadBalancer/HealthChecker/circuit-breaker keys are `host:port`
+                // (or `upstream_id::host:port`). The `mesh.cluster`/`mesh.network`
+                // tags are introspection metadata only — nothing downstream reads
+                // them to disambiguate dial/health/CB. Emitting two same-`host:port`
+                // targets would therefore yield no independently-dial-able failover
+                // peer (no network-gateway address rewrite exists yet, issue #1719)
+                // while letting a passive/active ejection or opened circuit for one
+                // overlapping-CIDR endpoint silently eject the sibling via the
+                // shared key. Keep them collapsed until target identity carries
+                // provenance. The merge-layer `WorkloadEndpointKey` still retains
+                // `cluster`/`network` so the workload REGISTRY keeps both for
+                // provenance/metadata; only the emitted RUNTIME target collapses.
                 let key = (
                     address.as_str(),
                     selected_port.port,
+                    selected_port.service_port,
                     workload.spiffe_id.as_str(),
                 );
                 if !seen.insert(key) {
@@ -255,6 +279,7 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 targets.push(UpstreamTarget {
                     host: address.clone(),
                     port: selected_port.port,
+                    service_port_policy_key: selected_port.service_port,
                     weight: self.default_weight,
                     tags,
                     locality: workload.locality.clone(),
@@ -279,7 +304,12 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
 
 #[derive(Clone)]
 struct SelectedPort {
+    /// Resolved workload/app port used as the actual dial destination.
     port: u16,
+    /// Declared Service port that owns this target and keys DestinationRule
+    /// `portLevelSettings`. `None` when discovery fell back to workload ports
+    /// because the service declared none.
+    service_port: Option<u16>,
     name: Option<String>,
     protocol: AppProtocol,
     /// The Service port's `targetPort`, carried so workload-address targets dial
@@ -495,6 +525,175 @@ mod tests {
             targets[0].port, 8080,
             "dials the numeric targetPort even though the workload declares no ports"
         );
+        assert_eq!(
+            targets[0].service_port_policy_key,
+            Some(80),
+            "policy remains keyed by the declared Service port"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_named_target_port_with_service_port_policy_key() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80]);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].port, 8080, "dials the named targetPort");
+        assert_eq!(
+            targets[0].service_port_policy_key,
+            Some(80),
+            "DestinationRule policy is keyed by the owning declared Service port"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_port_equal_to_workload_port_still_carries_policy_identity() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![api_id], vec![8080])],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].port, 8080);
+        assert_eq!(targets[0].service_port_policy_key, Some(8080));
+    }
+
+    #[tokio::test]
+    async fn same_workload_endpoint_keeps_requested_service_port_identity() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80, 81]);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        svc.ports[1].target_port = Some(ServiceTargetPort::Number(8080));
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+
+        let targets_80 = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh.clone())),
+            "api".to_string(),
+            default_namespace(),
+            Some(80),
+            1,
+        )
+        .discover()
+        .await
+        .expect("discover port 80");
+        let targets_81 = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            Some(81),
+            1,
+        )
+        .discover()
+        .await
+        .expect("discover port 81");
+
+        assert_eq!(targets_80.len(), 1);
+        assert_eq!(targets_81.len(), 1);
+        assert_eq!(targets_80[0].port, 8080);
+        assert_eq!(targets_81[0].port, 8080);
+        assert_eq!(targets_80[0].service_port_policy_key, Some(80));
+        assert_eq!(targets_81[0].service_port_policy_key, Some(81));
+    }
+
+    #[tokio::test]
+    async fn same_named_target_port_can_resolve_differently_per_workload() {
+        let api_a = "spiffe://cluster.local/ns/ferrum/sa/api-a";
+        let api_b = "spiffe://cluster.local/ns/ferrum/sa/api-b";
+        let mut svc = service("api", vec![api_a, api_b], vec![80]);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![
+                workload(api_a, "api", vec!["10.0.0.1"], vec![8080]),
+                workload(api_b, "api", vec!["10.0.0.2"], vec![9090]),
+            ],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let mut targets = discoverer.discover().await.expect("discover succeeds");
+        targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            (targets[0].host.as_str(), targets[0].port),
+            ("10.0.0.1", 8080)
+        );
+        assert_eq!(
+            (targets[1].host.as_str(), targets[1].port),
+            ("10.0.0.2", 9090)
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.service_port_policy_key == Some(80))
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_target_port_mapping_replaces_discovered_dial_port() {
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc_v1 = service("api", vec![api_id], vec![80]);
+        svc_v1.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let mut svc_v2 = service("api", vec![api_id], vec![80]);
+        svc_v2.ports[0].target_port = Some(ServiceTargetPort::Number(9090));
+
+        let discover = |svc| {
+            MeshServiceDiscoverer::new(
+                epoch_store(Some(MeshConfig {
+                    services: vec![svc],
+                    workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080, 9090])],
+                    ..MeshConfig::default()
+                })),
+                "api".to_string(),
+                default_namespace(),
+                None,
+                1,
+            )
+        };
+
+        let targets_v1 = discover(svc_v1).discover().await.expect("discover v1");
+        let targets_v2 = discover(svc_v2).discover().await.expect("discover v2");
+
+        assert_eq!(targets_v1[0].port, 8080);
+        assert_eq!(targets_v2[0].port, 9090);
+        assert_eq!(targets_v2[0].service_port_policy_key, Some(80));
     }
 
     #[tokio::test]

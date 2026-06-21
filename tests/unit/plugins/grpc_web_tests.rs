@@ -90,6 +90,27 @@ async fn test_may_modify_response_content_type_tracks_grpc_web_request() {
 }
 
 #[tokio::test]
+async fn test_response_buffering_only_for_grpc_web_requests() {
+    let plugin = create_plugin_default();
+
+    let native = create_grpc_web_context("application/grpc");
+    assert!(!plugin.should_buffer_response_body(&native));
+
+    let http = create_grpc_web_context("application/json");
+    assert!(!plugin.should_buffer_response_body(&http));
+
+    let mut grpc_web = create_grpc_web_context("application/grpc-web");
+    let result = plugin.on_request_received(&mut grpc_web).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&grpc_web));
+
+    let mut grpc_web_text = create_grpc_web_context("application/grpc-web-text");
+    let result = plugin.on_request_received(&mut grpc_web_text).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&grpc_web_text));
+}
+
+#[tokio::test]
 async fn test_detects_grpc_web_binary_proto() {
     let plugin = create_plugin_default();
     let mut ctx = create_grpc_web_context("application/grpc-web+proto");

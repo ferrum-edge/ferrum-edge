@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use regex::{Regex, RegexSet};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
@@ -26,11 +27,28 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "type",
     "created",
     "stream",
+    // Numeric/scalar LLM request parameters an operator legitimately sends.
+    // Their values are tuning knobs, not user content, so a top-level scalar
+    // here that incidentally matches a PII regex (e.g. a 9-digit `seed` that
+    // looks like an SSN) must be preserved rather than rewritten — otherwise
+    // redaction silently changes the upstream request schema/semantics. These
+    // are carved out at the TOP LEVEL only; the same names nested under
+    // attacker-controlled structure are still scanned/redacted.
     "temperature",
     "top_p",
+    "top_k",
     "max_tokens",
     "max_output_tokens",
     "max_completion_tokens",
+    "seed",
+    "n",
+    "best_of",
+    "logprobs",
+    "top_logprobs",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "logit_bias",
     "tool_call_id",
 ];
 
@@ -58,6 +76,25 @@ enum ScanMode {
     Content,
     /// Scan the entire request body as text.
     All,
+}
+
+/// Result of attempting redaction on a request body.
+enum RedactionOutcome {
+    /// No PII to redact, body not parseable, or over `max_scan_bytes` — the
+    /// caller should forward the body unchanged without claiming redaction.
+    NoChange,
+    /// PII was detected and the rewritten body no longer contains any
+    /// detectable PII — safe to forward and report as redacted.
+    Redacted(Value),
+    /// PII was detected but could not be fully removed (e.g. it was carried in
+    /// an object key, or matched only a cross-token/contextual custom pattern
+    /// that has no single rewritable token). The carried `Value` is the
+    /// best-effort redaction (string values and numeric scalars already
+    /// removed). `before_proxy` fails the request closed on this outcome rather
+    /// than forwarding the residual value while falsely reporting redaction;
+    /// the body-transform path, which cannot reject, still emits this
+    /// best-effort body so it never forwards the *original* unredacted bytes.
+    Incomplete(Value),
 }
 
 /// A named regex pattern for PII detection.
@@ -300,13 +337,17 @@ impl AiPromptShield {
     /// Detect PII in the given text segments. Returns names of detected pattern types.
     /// Uses a single `RegexSet` DFA pass per text fragment, O(text_len)
     /// regardless of pattern count.
-    fn detect_pii(&self, texts: &[&str]) -> Vec<String> {
+    ///
+    /// Generic over `AsRef<str>` so callers can pass borrowed `&str` slices
+    /// (`ScanMode::Content`) or owned/`Cow` text (`ScanMode::All`, which must
+    /// collect stringified JSON numbers that have no backing `&str`).
+    fn detect_pii<S: AsRef<str>>(&self, texts: &[S]) -> Vec<String> {
         if self.patterns.is_empty() {
             return Vec::new();
         }
         let mut hit = vec![false; self.patterns.len()];
         for text in texts {
-            for idx in self.detection_set.matches(text).into_iter() {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
                 hit[idx] = true;
             }
         }
@@ -322,23 +363,153 @@ impl AiPromptShield {
             .collect()
     }
 
-    /// Detect PII in a raw string (for "all" scan mode).
-    /// Single `RegexSet` DFA pass — O(text_len).
-    fn detect_pii_in_str(&self, text: &str) -> Vec<String> {
+    /// Fallback PII scan for a `ScanMode::All` body that failed to parse as
+    /// JSON. The decoded walker (`collect_json_strings`) needs a parsed
+    /// `Value`; a malformed JSON body has none, so without this the request
+    /// short-circuited to `Continue` and raw PII in a broken body failed open.
+    ///
+    /// For `Reject`/`Warn` the documented all-mode contract is "scans the
+    /// entire body", so we scan the raw bytes as text — this is the same
+    /// coverage the original raw-body scan provided and cannot decode JSON
+    /// escapes, which is acceptable for an already-malformed body. For
+    /// `Redact` we return no detections: an unparseable body cannot be
+    /// re-serialized after redaction, so reporting PII we cannot remove would
+    /// be misleading; the request is forwarded unchanged as before.
+    fn detect_pii_raw_fallback(&self, body: &str) -> Vec<String> {
+        if self.action == ShieldAction::Redact {
+            return Vec::new();
+        }
+        self.detect_pii(std::slice::from_ref(&body))
+    }
+
+    /// `ScanMode::All` detection: the union of two passes over the parsed JSON.
+    ///
+    /// 1. Decoded walker (`collect_json_strings`): scans each JSON token after
+    ///    serde has resolved `\uXXXX` and other escapes, so escaped PII in
+    ///    string values, object keys, and numeric scalars is caught exactly as
+    ///    the backend LLM will see it. This is the coverage issue #1714 added.
+    /// 2. Raw-body pass: runs the `RegexSet` over `raw` (the serialized request
+    ///    body). The original all-mode scan was raw-only, and some patterns —
+    ///    notably operator-supplied `custom_patterns` — depend on JSON context
+    ///    that spans tokens (e.g. `"password"\s*:`) or match scalar shapes the
+    ///    decoded walker drops (booleans/null, e.g. `"allow_pii"\s*:\s*true`).
+    ///    Testing the key and value as separate tokens never reconstructs that
+    ///    context, so without this pass those patterns regress to no-match.
+    ///
+    /// Unioning the two only ever *adds* detections, so this strictly hardens
+    /// all-mode coverage: escaped-value PII (pass 1) and cross-token/contextual
+    /// patterns plus dropped scalars (pass 2) are both caught. Both passes feed
+    /// the reject/warn decision; the redact path additionally re-scans the
+    /// rewritten body so any detection a token rewrite cannot remove fails
+    /// closed rather than forwarding PII while claiming redaction succeeded.
+    fn detect_pii_all_mode(&self, json: &Value, raw: &str) -> Vec<String> {
         if self.patterns.is_empty() {
             return Vec::new();
         }
-        self.detection_set
-            .matches(text)
-            .into_iter()
-            .filter_map(|idx| self.patterns.get(idx).map(|p| p.name.clone()))
+        let mut hit = vec![false; self.patterns.len()];
+        // Pass 1: decoded tokens.
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_json_strings(json, &mut texts);
+        for text in &texts {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
+                hit[idx] = true;
+            }
+        }
+        // Pass 2: raw serialized body (cross-token / contextual patterns).
+        for idx in self.detection_set.matches(raw).into_iter() {
+            hit[idx] = true;
+        }
+        hit.iter()
+            .enumerate()
+            .filter_map(|(idx, &h)| {
+                if h {
+                    self.patterns.get(idx).map(|p| p.name.clone())
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
-    /// Parse the body as JSON, apply mode-appropriate redaction, and return
-    /// the mutated `Value`. Returns `None` when the body isn't valid JSON,
-    /// is over `max_scan_bytes`, or contains no PII to redact (so callers
-    /// don't waste serialization on a no-op).
+    /// Whether the ORIGINAL request contains a raw-body match that token
+    /// rewriting cannot remove — i.e. an individual match in the serialized body
+    /// whose matched byte span is not fully contained inside the serialized span
+    /// of a single rewritable value (a string VALUE or numeric scalar). Such a
+    /// match (e.g. a contextual `custom_pattern` like `"password"\s*:`, which
+    /// spans a key name, the surrounding quotes, and the colon) covers structural
+    /// bytes that lie outside any value, so `redact_json_strings` — which only
+    /// rewrites string values and numbers — can never remove it. The request is
+    /// therefore unredactable and must fail closed.
+    ///
+    /// Matching is done per individual occurrence (`Regex::find_iter`), NOT per
+    /// pattern index. A single custom regex can alternate a removable value
+    /// alternative with an unremovable structural-context alternative (for
+    /// example `(?:"password"\s+:)|(?:\w+@\w+\.\w+)`); if the value alternative
+    /// hits a token, an index-level "this pattern matched a token" flag would
+    /// wrongly mark the structural-context occurrence removable too. Testing
+    /// each matched occurrence by byte span avoids that suppression so the
+    /// contextual occurrence is still caught.
+    ///
+    /// Removability is decided by BYTE-SPAN containment in the raw body, not by
+    /// substring containment in decoded tokens. The substring test was unsound:
+    /// a structural match (key + colon) could be wrongly judged removable merely
+    /// because an unrelated string VALUE happened to contain the same decoded
+    /// text — e.g. with pattern `"password"\s+:` and body
+    /// `{"password" : "hunter2", "note": "\"password\" :"}`, the real
+    /// `"password" :` field match would be "absorbed" by the `note` value while
+    /// the key/colon it actually spans can never be rewritten. Tying each match
+    /// to a concrete value span fixes that: a match overlapping any structural
+    /// byte (a key, a `:`/`,`, container brackets, or inter-token whitespace)
+    /// falls outside every value span and is correctly treated as unredactable.
+    ///
+    /// This is computed from the ORIGINAL body, independent of the rewritten
+    /// body's serialization, precisely so a whitespace-sensitive contextual
+    /// match cannot be "cleared" by the minification that `serde_json::to_string`
+    /// applies to the rewritten body. Using minified output as proof of removal
+    /// is unsound: minification can erase the formatting a raw regex depended on
+    /// even though nothing was redacted.
+    ///
+    /// Object KEY spans are intentionally excluded from the rewritable-value set
+    /// (`redact_json_strings` cannot rename keys), so a raw match that overlaps
+    /// only a key is treated as non-removable here. PII carried purely in a key
+    /// name is still caught — by `redacted_body_has_residual_pii`, whose key text
+    /// survives minification unchanged — so it does not need to drive this
+    /// contextual verdict as well.
+    fn original_has_unredactable_contextual_match(&self, raw: &str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        // Cheap DFA pre-check: nothing fired on the raw body at all.
+        if !self.detection_set.is_match(raw) {
+            return false;
+        }
+        // Byte spans of the rewritable values (string VALUES + numeric scalars;
+        // NOT keys, NOT structural punctuation). Computed once over the raw body.
+        let value_spans = collect_json_value_spans(raw);
+        // A raw match is removable iff its byte span lies entirely within one
+        // value span. Any match that touches structural bytes (keys/punctuation/
+        // whitespace) or straddles a token boundary is contextual-only and cannot
+        // be rewritten in place, so the request must fail closed.
+        for pattern in &self.patterns {
+            for m in pattern.regex.find_iter(raw) {
+                let (start, end) = (m.start(), m.end());
+                let removable = value_spans
+                    .iter()
+                    .any(|span| span.start <= start && end <= span.end);
+                if !removable {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Parse the body as JSON, apply mode-appropriate redaction, and return a
+    /// [`RedactionOutcome`]. Returns `NoChange` when the body isn't valid JSON,
+    /// is over `max_scan_bytes`, or contains no PII to redact (so callers don't
+    /// waste serialization on a no-op); `Redacted` when PII was detected and
+    /// fully removed; `Incomplete` when PII was detected but some could not be
+    /// rewritten in place.
     ///
     /// Shared between `before_proxy` (which uses this to update
     /// `ctx.metadata["request_body"]` so downstream `before_proxy` plugins
@@ -346,17 +517,27 @@ impl AiPromptShield {
     /// returned `Value` to rewrite the wire body on the backend dispatch
     /// path). Keeping the two paths in lockstep guarantees both see the
     /// same redacted bytes regardless of which path actually runs.
-    fn apply_redaction_in_place(&self, body: &str) -> Option<Value> {
+    fn apply_redaction_in_place(&self, body: &str) -> RedactionOutcome {
         if body.len() > self.max_scan_bytes {
-            return None;
+            return RedactionOutcome::NoChange;
         }
-        let mut json: Value = serde_json::from_str(body).ok()?;
+        let Ok(mut json) = serde_json::from_str::<Value>(body) else {
+            return RedactionOutcome::NoChange;
+        };
 
         if self.scan_mode == ScanMode::All {
-            // Single DFA pass to short-circuit when no pattern matches.
-            if !self.detection_set.is_match(body) {
-                return None;
+            // Gate on the same union detection used for reject/warn so the
+            // redact path can't silently miss cross-token/contextual matches.
+            let detected = self.detect_pii_all_mode(&json, body);
+            if detected.is_empty() {
+                return RedactionOutcome::NoChange;
             }
+            // Decide UP FRONT, against the unmodified original, whether any hit
+            // is a raw-only contextual match that token rewriting cannot remove.
+            // Captured before mutation so the verdict can't depend on the
+            // minified serialization of the rewritten body (see
+            // `original_has_unredactable_contextual_match`).
+            let unredactable_contextual = self.original_has_unredactable_contextual_match(body);
             // Run structured redaction first on known prompt-content
             // fields (messages[].content) so recognized chat-completion
             // shapes are handled with the correct template. Then run the
@@ -377,16 +558,67 @@ impl AiPromptShield {
                 self.redact_body(&mut json);
             }
             redact_json_strings(&mut json, &self.patterns, true);
-            return Some(json);
+
+            // Fail closed when redaction provably could not remove the PII:
+            //   1. A raw-only contextual match in the original (no rewritable
+            //      token) — decided above against the unmodified body so
+            //      minification can't erase the signal.
+            //   2. The rewritten body still has residual PII in a decoded token
+            //      (e.g. PII carried in an object key, which is never rewritten).
+            // Either case means forwarding would leak the value while reporting
+            // it redacted. `[REDACTED:...]` placeholders match no PII pattern, so
+            // a fully-redacted token re-scans clean.
+            if unredactable_contextual || self.redacted_body_has_residual_pii(&json) {
+                return RedactionOutcome::Incomplete(json);
+            }
+            return RedactionOutcome::Redacted(json);
         }
 
         // Content mode: only redact within messages
         let texts = self.extract_scan_text(&json);
         if self.detect_pii(&texts).is_empty() {
-            return None;
+            return RedactionOutcome::NoChange;
         }
         self.redact_body(&mut json);
-        Some(json)
+        RedactionOutcome::Redacted(json)
+    }
+
+    /// After `ScanMode::All` redaction, decide whether any *unredactable* PII
+    /// still remains, so the caller can fail closed instead of forwarding it
+    /// while reporting the body as redacted.
+    ///
+    /// This must mirror `redact_json_strings`' structural carve-out: top-level
+    /// structural scalar values (`model`, `id`, request parameters, …) are
+    /// deliberately preserved even when they incidentally match a PII regex, so
+    /// they are NOT residual leaks and must not trigger a fail-closed. To run
+    /// the same union detection (decoded tokens + a raw-body pass for
+    /// cross-token/contextual custom patterns) without those preserved scalars
+    /// re-triggering, we scan a copy of the body whose top-level structural
+    /// scalars have been blanked to an empty string. Blanking only the scalar
+    /// values keeps the surrounding JSON structure intact, so a contextual
+    /// pattern such as `"password"\s*:` still matches while a preserved
+    /// `"max_tokens": 123456789` no longer does.
+    ///
+    /// What this still catches: PII in an object key (`{"a@b.com": …}`), a
+    /// string/number the walker failed to rewrite, and contextual custom
+    /// patterns that have no single rewritable token — all genuine
+    /// "detected but not removed" cases.
+    fn redacted_body_has_residual_pii(&self, json: &Value) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let mut check = json.clone();
+        if let Value::Object(map) = &mut check {
+            for (key, value) in map.iter_mut() {
+                if STRUCTURAL_KEYS.contains(&key.as_str())
+                    && (value.is_string() || value.is_number())
+                {
+                    *value = Value::String(String::new());
+                }
+            }
+        }
+        let serialized = check.to_string();
+        !self.detect_pii_all_mode(&check, &serialized).is_empty()
     }
 
     /// Apply redaction to message content fields in the JSON body.
@@ -519,21 +751,24 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // Detect PII and (in non-scan-all mode) capture streaming intent from
-        // the same parsed JSON. Scan-all mode operates on the raw body string,
-        // so a full JSON parse just to read `stream` would be pure overhead —
-        // gate it behind a cheap byte-level substring check first.
+        // Detect PII and capture streaming intent from the same parsed JSON.
+        // Scan-all mode walks decoded JSON string values instead of raw bytes
+        // so JSON escapes cannot hide PII or prompt-injection payloads from the
+        // detector while the backend sees the decoded text.
         //
         // The streaming flag is captured before mutating `ctx.metadata`
         // because `body` borrows from `ctx.metadata.get("request_body")`.
         let (detected, is_streaming_request) = if self.scan_mode == ScanMode::All {
-            let detected = self.detect_pii_in_str(body);
-            let is_streaming = body.contains("\"stream\"")
-                && serde_json::from_str::<Value>(body)
-                    .ok()
-                    .and_then(|json| json.get("stream").and_then(|s| s.as_bool()))
-                    == Some(true);
-            (detected, is_streaming)
+            match serde_json::from_str::<Value>(body) {
+                Ok(json) => {
+                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
+                    (self.detect_pii_all_mode(&json, body), is_streaming)
+                }
+                // Malformed JSON in all-mode: handled below for non-redact
+                // actions by falling back to a raw-body scan so PII in an
+                // unparseable body cannot fail open.
+                Err(_) => (self.detect_pii_raw_fallback(body), false),
+            }
         } else {
             match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
@@ -616,17 +851,60 @@ impl Plugin for AiPromptShield {
                     .get("request_body")
                     .cloned()
                     .unwrap_or_default();
-                let redacted_body = self
-                    .apply_redaction_in_place(&original_body)
-                    .and_then(|json| serde_json::to_string(&json).ok());
-
-                ctx.metadata
-                    .insert("ai_shield_redacted".to_string(), detected.join(","));
-                if let Some(serialized) = redacted_body {
-                    ctx.metadata.insert("request_body".to_string(), serialized);
+                match self.apply_redaction_in_place(&original_body) {
+                    RedactionOutcome::Redacted(json) => {
+                        // Only claim redaction once the rewritten body is
+                        // verified free of detectable PII (see
+                        // `apply_redaction_in_place`).
+                        ctx.metadata
+                            .insert("ai_shield_redacted".to_string(), detected.join(","));
+                        if let Ok(serialized) = serde_json::to_string(&json) {
+                            ctx.metadata.insert("request_body".to_string(), serialized);
+                        }
+                        PluginResult::Continue
+                    }
+                    RedactionOutcome::Incomplete(_) => {
+                        // PII was detected but could not be fully removed from
+                        // the body (e.g. carried in an object key, or matching
+                        // only a cross-token custom pattern). Fail closed
+                        // rather than forward the value while reporting it
+                        // redacted.
+                        warn!(
+                            "ai_prompt_shield: PII detected (types: {:?}) could not be fully redacted, rejecting request",
+                            detected
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "PII detected in request",
+                                "detected_types": detected,
+                                "message": "Request blocked: sensitive data could not be redacted. Remove sensitive data before sending to AI provider."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
+                    RedactionOutcome::NoChange => {
+                        // `detected` is non-empty (checked above) yet redaction
+                        // found nothing to change. This should not happen for a
+                        // parseable in-range body, but if it does, do not claim
+                        // redaction and do not forward unredacted PII.
+                        warn!(
+                            "ai_prompt_shield: PII detected (types: {:?}) but redaction produced no change, rejecting request",
+                            detected
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "PII detected in request",
+                                "detected_types": detected,
+                                "message": "Request blocked: sensitive data could not be redacted. Remove sensitive data before sending to AI provider."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
                 }
-
-                PluginResult::Continue
             }
         }
     }
@@ -653,8 +931,20 @@ impl Plugin for AiPromptShield {
         }
 
         let body_str = std::str::from_utf8(body).ok()?;
-        let json = self.apply_redaction_in_place(body_str)?;
-        serde_json::to_vec(&json).ok()
+        match self.apply_redaction_in_place(body_str) {
+            // Fully redacted, or best-effort on a body whose residual PII lives
+            // somewhere a token rewrite can't reach. `before_proxy` runs first
+            // and already rejects the `Incomplete` case, so in normal flow this
+            // path only sees fully-redacted bodies; emitting the best-effort
+            // body here is a defensive backstop that still strips every PII the
+            // walker *can* remove and never forwards the original bytes.
+            RedactionOutcome::Redacted(json) | RedactionOutcome::Incomplete(json) => {
+                serde_json::to_vec(&json).ok()
+            }
+            // No PII to redact (or body not parseable / over the size cap):
+            // leave the wire body unchanged.
+            RedactionOutcome::NoChange => None,
+        }
     }
 }
 
@@ -722,6 +1012,152 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     usize::try_from(value)
         .map(Some)
         .map_err(|_| format!("ai_prompt_shield: '{field}' is too large for this platform"))
+}
+
+/// Collect every decoded JSON token for `ScanMode::All` detection so the
+/// decoded walker matches the coverage of the original raw-body scan.
+///
+/// Serde has already resolved `\uXXXX` and other JSON string escapes here, so
+/// detection sees the same text the backend LLM will receive after parsing.
+///
+/// Collected, mirroring the raw-body scan this replaced:
+/// - String values (borrowed `&str`).
+/// - Object keys (borrowed `&str`) — e.g. `{"a@b.com":"allowed"}`, whose key
+///   the raw scan caught but a values-only walk would drop.
+/// - Numeric scalars, stringified to owned `String` — e.g. a numeric SSN
+///   `{"ssn":123456789}` or credit-card number, which a `&str`-only walk
+///   cannot see. Numbers are the load-bearing scalar case for PII.
+///
+/// Booleans and null are intentionally skipped: their canonical forms
+/// (`true`/`false`/`null`) carry no PII, so collecting them would only add
+/// noise. The walker yields `Cow<str>` (`Borrowed` for strings/keys,
+/// `Owned` for stringified numbers) so number text can be included without
+/// allocating for the common string case.
+fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    match value {
+        Value::String(s) => texts.push(Cow::Borrowed(s.as_str())),
+        Value::Number(n) => texts.push(Cow::Owned(n.to_string())),
+        Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, texts);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                texts.push(Cow::Borrowed(key.as_str()));
+                collect_json_strings(value, texts);
+            }
+        }
+        // Bool / Null carry no PII; deliberately dropped.
+        _ => {}
+    }
+}
+
+/// Scan a raw JSON body and return the byte spans of every *rewritable* value —
+/// string VALUES (quotes included) and number literals — while excluding object
+/// KEY spans and all structural punctuation/whitespace.
+///
+/// `redact_json_strings` rewrites string values and numeric scalars in place but
+/// cannot rewrite a key name (renaming keys risks collisions and reorders the
+/// document; key-PII is instead caught by the post-redaction residual re-scan).
+/// `original_has_unredactable_contextual_match` uses these spans to decide
+/// removability by BYTE-SPAN containment rather than decoded-substring presence:
+/// a raw regex match is rewritable only if it lies entirely inside one value
+/// span. A match that overlaps a key, a `:`/`,` separator, container brackets,
+/// or inter-token whitespace lands outside every span and is treated as
+/// unredactable — which a decoded-substring test could not distinguish, since an
+/// unrelated value may contain the same text as a structural match.
+///
+/// This is a forward single-pass scanner over the raw bytes (the body already
+/// parsed as valid JSON upstream, so it is well-formed). Strings honor `\\`
+/// escapes so an escaped quote does not end the span prematurely. In an object,
+/// the string immediately after `{` or `,` is a KEY (its span is skipped); the
+/// value after `:` — and every array element and the root token — is a VALUE.
+fn collect_json_value_spans(raw: &str) -> Vec<std::ops::Range<usize>> {
+    /// What the next encountered value token represents in the current context.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Expect {
+        /// Object key position (after `{` or `,` inside an object).
+        Key,
+        /// Value position (after `:`, an array element, or the root token).
+        Value,
+    }
+    let bytes = raw.as_bytes();
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    // Stack of `true` for object contexts, `false` for array contexts. Drives
+    // whether `,` returns us to a Key (object) or a Value (array) expectation.
+    let mut in_object: Vec<bool> = Vec::new();
+    // Root token is a value; inside an object the first token is a key.
+    let mut expect = Expect::Value;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                in_object.push(true);
+                expect = Expect::Key;
+                i += 1;
+            }
+            b'[' => {
+                in_object.push(false);
+                expect = Expect::Value;
+                i += 1;
+            }
+            b'}' | b']' => {
+                in_object.pop();
+                i += 1;
+            }
+            b':' => {
+                // Object key/value separator: the next token is a VALUE.
+                expect = Expect::Value;
+                i += 1;
+            }
+            b',' => {
+                // Next token: a key in an object, a value in an array.
+                expect = match in_object.last() {
+                    Some(true) => Expect::Key,
+                    _ => Expect::Value,
+                };
+                i += 1;
+            }
+            b'"' => {
+                // Scan to the closing quote, skipping `\\`-escaped bytes.
+                let start = i;
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' => j += 2, // escape consumes the next byte
+                        b'"' => {
+                            j += 1;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                // Only VALUE strings are rewritable; KEY strings are not.
+                if expect == Expect::Value {
+                    spans.push(start..j.min(bytes.len()));
+                }
+                i = j;
+            }
+            // Number literal (rewritable only in value position). serde accepts
+            // a leading `-`; scan the contiguous numeric run.
+            b'-' | b'0'..=b'9' if expect == Expect::Value => {
+                let start = i;
+                let mut j = i + 1;
+                while j < bytes.len()
+                    && matches!(bytes[j], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    j += 1;
+                }
+                spans.push(start..j);
+                i = j;
+            }
+            // Whitespace and literal scalars (true/false/null) carry no
+            // rewritable PII span; advance past them.
+            _ => i += 1,
+        }
+    }
+    spans
 }
 
 /// Collect scannable prompt text from a top-level LLM field that may be a
@@ -890,6 +1326,24 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
                 *s = result;
             }
         }
+        // Numeric scalar PII (e.g. a bare `{"ssn":123456789}` or a numeric
+        // credit-card number). `ScanMode::All` detection collects stringified
+        // numbers, so a number that matches a PII pattern must actually be
+        // removed here — otherwise it is forwarded unchanged while the request
+        // is reported as redacted. A number has no in-place string to rewrite,
+        // so when it matches we replace the whole scalar with the placeholder
+        // string. The type change (number -> string) is the safe direction for
+        // a privacy control: the alternative is leaking the value. Only the
+        // first matching pattern's placeholder is used; a number matches at
+        // most one PII shape in practice. The top-level structural carve-out
+        // below prevents legitimate top-level numerics (timestamps, token
+        // limits) from being rewritten.
+        Value::Number(n) => {
+            let rendered = n.to_string();
+            if let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(&rendered)) {
+                *value = Value::String(pattern.placeholder.clone());
+            }
+        }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
                 redact_json_strings(item, patterns, false);
@@ -897,17 +1351,28 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
         }
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
-                // Preserve only top-level structural scalar strings (the
-                // model name, IDs, roles, and request parameters an operator
-                // legitimately sends). Always recurse into nested
-                // objects/arrays, and never skip nested occurrences of these
-                // key names, so PII cannot hide under a structural key.
-                if top_level && STRUCTURAL_KEYS.contains(&k.as_str()) && val.is_string() {
+                // Preserve only top-level structural scalar values (the model
+                // name, IDs, roles, and request parameters an operator
+                // legitimately sends) — both strings and numbers, since a
+                // numeric `id`/`created`/token limit must not be rewritten.
+                // Always recurse into nested objects/arrays, and never skip
+                // nested occurrences of these key names, so PII cannot hide
+                // under a structural key.
+                if top_level
+                    && STRUCTURAL_KEYS.contains(&k.as_str())
+                    && (val.is_string() || val.is_number())
+                {
                     continue;
                 }
                 redact_json_strings(val, patterns, false);
             }
         }
+        // PII carried in an object KEY name (e.g. `{"a@b.com":"x"}`) cannot be
+        // rewritten here without rebuilding the map, and renaming keys risks
+        // collisions and reorders the document. Such PII is instead caught by
+        // the post-redaction re-scan in `apply_redaction_in_place`, which fails
+        // the request closed rather than forwarding key PII while reporting it
+        // redacted. Bool / Null carry no PII.
         _ => {}
     }
 }

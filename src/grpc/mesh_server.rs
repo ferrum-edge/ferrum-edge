@@ -14,8 +14,8 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use super::auth::verify_grpc_jwt_metadata;
-use super::cp_server::{CpGrpcServer, DEFAULT_CP_DP_JWT_ISSUER};
+use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use super::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -75,6 +75,8 @@ pub struct MeshGrpcServer {
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     registry: Arc<MeshNodeRegistry>,
     namespace: String,
+    scope: CpScope,
+    require_ns_claim: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. Threaded through every
     /// per-subscriber slice request so DP-facing slices honor the operator's
     /// rollout decision. Default `false` preserves existing CP behavior.
@@ -96,6 +98,8 @@ pub struct MeshGrpcServerBuilder {
     registry: Arc<MeshNodeRegistry>,
     expected_issuer: String,
     namespace: String,
+    scope: CpScope,
+    require_ns_claim: bool,
     sidecar_enforced: bool,
     sidecar_enforced_dry_run: bool,
     sidecar_identity_narrowing: bool,
@@ -111,6 +115,8 @@ impl MeshGrpcServerBuilder {
             registry: Arc::new(MeshNodeRegistry::new()),
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
             namespace: default_namespace(),
+            scope: CpScope::Single(default_namespace()),
+            require_ns_claim: false,
             sidecar_enforced: false,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -134,7 +140,18 @@ impl MeshGrpcServerBuilder {
     }
 
     pub fn namespace(mut self, namespace: String) -> Self {
+        self.scope = CpScope::Single(namespace.clone());
         self.namespace = namespace;
+        self
+    }
+
+    pub fn scope(mut self, scope: CpScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn require_ns_claim(mut self, require: bool) -> Self {
+        self.require_ns_claim = require;
         self
     }
 
@@ -169,6 +186,8 @@ impl MeshGrpcServerBuilder {
                 mesh_update_tx: tx,
                 registry: self.registry,
                 namespace: self.namespace,
+                scope: self.scope,
+                require_ns_claim: self.require_ns_claim,
                 sidecar_enforced: self.sidecar_enforced,
                 sidecar_enforced_dry_run: self.sidecar_enforced_dry_run,
                 sidecar_identity_narrowing: self.sidecar_identity_narrowing,
@@ -234,21 +253,54 @@ impl MeshGrpcServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn check_namespace(&self, mesh_namespace: &str) -> Result<(), Status> {
-        if mesh_namespace != self.namespace {
-            return Err(Status::failed_precondition(format!(
-                "Mesh namespace '{}' does not match CP namespace '{}'. \
-                 A single CP serves a single namespace; deploy a separate CP \
-                 instance per namespace.",
-                mesh_namespace, self.namespace
-            )));
-        }
-        Ok(())
+    fn check_namespace(
+        &self,
+        mesh_namespace: &str,
+        allowed: &AllowedNamespaces,
+    ) -> Result<(), Status> {
+        CpGrpcServer::authorise_namespace_for_scope(
+            &self.scope,
+            self.require_ns_claim,
+            allowed,
+            mesh_namespace,
+        )
+        .map_err(|status| {
+            if matches!(self.scope, CpScope::Single(_))
+                && status.code() == tonic::Code::FailedPrecondition
+            {
+                return Status::failed_precondition(format!(
+                    "Mesh namespace '{}' does not match CP namespace '{}'. \
+                     A single CP serves a single namespace; deploy a separate CP \
+                     instance per namespace.",
+                    mesh_namespace, self.namespace
+                ));
+            }
+            status
+        })
     }
 
     #[allow(clippy::result_large_err)]
-    fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
-        verify_grpc_jwt_metadata(metadata, &self.jwt_secret, &self.expected_issuer)
+    fn verify_jwt_metadata(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<AllowedNamespaces, Status> {
+        verify_grpc_jwt_metadata_with_claims(metadata, &self.jwt_secret, &self.expected_issuer)
+    }
+
+    fn filter_config_for_request(
+        &self,
+        config: &GatewayConfig,
+        request: &MeshSliceRequest,
+    ) -> GatewayConfig {
+        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, request, &self.scope)
+    }
+
+    fn filter_config_for_request_and_scope(
+        config: &GatewayConfig,
+        request: &MeshSliceRequest,
+        scope: &CpScope,
+    ) -> GatewayConfig {
+        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, request, scope)
     }
 
     #[allow(clippy::result_large_err)]
@@ -296,9 +348,11 @@ impl MeshGrpcServer {
         delta: crate::config::db_loader::IncrementalResult,
         slice_request: MeshSliceRequest,
         previous_slice: &MeshSlice,
+        scope: &CpScope,
     ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let mut candidate = stream_config.clone();
         apply_incremental_to_config_snapshot(&mut candidate, delta);
+        candidate = Self::filter_config_for_request_and_scope(&candidate, &slice_request, scope);
         candidate.normalize_fields();
         candidate.normalize_mesh_fields();
         // Advance the per-stream base BEFORE building the wire frame: the delta
@@ -350,16 +404,45 @@ impl MeshConfigSync for MeshGrpcServer {
         &self,
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
-        self.verify_jwt_metadata(request.metadata())?;
+        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+            Ok(allowed) => allowed,
+            Err(status) => {
+                let req = request.get_ref();
+                CpGrpcServer::audit_tenant_subscription(
+                    "MeshConfigSync.MeshSubscribe",
+                    &req.node_id,
+                    &req.namespace,
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
 
         let inner = request.into_inner();
         CpGrpcServer::check_version_compatibility(&inner.ferrum_version)?;
-        self.check_namespace(&inner.namespace)?;
+        if let Err(status) = self.check_namespace(&inner.namespace, &allowed) {
+            CpGrpcServer::audit_tenant_subscription(
+                "MeshConfigSync.MeshSubscribe",
+                &inner.node_id,
+                &inner.namespace,
+                "failure",
+                status.message(),
+            );
+            return Err(status);
+        }
         if inner.node_id.is_empty() {
             return Err(Status::invalid_argument(
                 "MeshSubscribe node_id is required",
             ));
         }
+        CpGrpcServer::audit_tenant_subscription(
+            "MeshConfigSync.MeshSubscribe",
+            &inner.node_id,
+            &inner.namespace,
+            "success",
+            "",
+        );
 
         info!(
             "Mesh node '{}' (v{}) subscribed for mesh config (namespace='{}')",
@@ -391,7 +474,7 @@ impl MeshConfigSync for MeshGrpcServer {
         // reflected in the loaded snapshot.
         let rx = self.mesh_update_tx.subscribe();
         let config = self.config.load_full();
-        let mut initial_config = config.as_ref().clone();
+        let mut initial_config = self.filter_config_for_request(config.as_ref(), &slice_request);
         initial_config.normalize_fields();
         initial_config.normalize_mesh_fields();
         let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
@@ -411,11 +494,16 @@ impl MeshConfigSync for MeshGrpcServer {
         let mut previous_slice = initial_slice;
         let config_for_recovery = self.config.clone();
         let stream_slice_request = slice_request.clone();
+        let stream_scope = self.scope.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
             let slice_request = stream_slice_request.clone();
             match result {
                 Ok(MeshConfigBroadcast::Full(config)) => {
-                    let mut config = config.as_ref().clone();
+                    let mut config = Self::filter_config_for_request_and_scope(
+                        config.as_ref(),
+                        &slice_request,
+                        &stream_scope,
+                    );
                     config.normalize_fields();
                     config.normalize_mesh_fields();
                     match Self::build_mesh_config_update_if_changed(
@@ -441,6 +529,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         *result,
                         slice_request,
                         &previous_slice,
+                        &stream_scope,
                     ) {
                         Ok((next_slice, maybe_update)) => {
                             if maybe_update.is_some() {
@@ -464,7 +553,11 @@ impl MeshConfigSync for MeshGrpcServer {
                         n
                     );
                     let current = config_for_recovery.load_full();
-                    let mut current_config = current.as_ref().clone();
+                    let mut current_config = Self::filter_config_for_request_and_scope(
+                        current.as_ref(),
+                        &slice_request,
+                        &stream_scope,
+                    );
                     current_config.normalize_fields();
                     current_config.normalize_mesh_fields();
                     match Self::build_mesh_config_update_if_changed(
@@ -573,6 +666,7 @@ mod tests {
             delta,
             slice_request,
             &previous_slice,
+            &CpScope::Single("ferrum".to_string()),
         )
         .expect("mesh delta should build");
 

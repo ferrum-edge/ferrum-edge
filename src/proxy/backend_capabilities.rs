@@ -99,6 +99,10 @@ pub struct BackendCapabilityProbeTarget {
     pub hbone_hint: bool,
     /// Sidecar HBONE listener port for this target. Defaults to Istio 15008.
     pub hbone_port: u16,
+    /// DestinationRule policy port for this target. The probe still dials
+    /// `.proxy.backend_port`, but per-port keepalive policy may be keyed by the
+    /// owning Service port when mesh targetPort remaps are in play.
+    pub dispatch_policy_port: u16,
     /// Destination identity the HBONE probe handshake must pin
     /// (`mesh.spiffe_id` tag), mirroring the request path so a probe cannot
     /// classify a peer Supported under weaker verification than dispatch uses.
@@ -110,10 +114,12 @@ impl BackendCapabilityProbeTarget {
         let mut probe_proxy = proxy.clone();
         let mut hbone_hint = false;
         let mut hbone_port = crate::modes::mesh::hbone::ISTIO_HBONE_PORT;
+        let mut dispatch_policy_port = proxy.backend_port;
         let mut hbone_expected_peer = None;
         if let Some(target) = target {
             probe_proxy.backend_host = target.host.clone();
             probe_proxy.backend_port = target.port;
+            dispatch_policy_port = target.dispatch_policy_port();
             hbone_hint = crate::proxy::hbone_pool::target_hbone_enabled(target);
             hbone_port = crate::proxy::hbone_pool::target_hbone_port(target);
             match crate::proxy::hbone_pool::target_expected_peer_spiffe(target) {
@@ -140,6 +146,7 @@ impl BackendCapabilityProbeTarget {
             proxy: probe_proxy,
             hbone_hint,
             hbone_port,
+            dispatch_policy_port,
             hbone_expected_peer,
         }
     }
@@ -515,6 +522,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             resolved_tls: BackendTlsConfig::default_verify(),
             dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
             dns_override: None,
             dns_cache_ttl_seconds: None,
             auth_mode: AuthMode::Single,
@@ -722,6 +730,7 @@ mod tests {
         let target = UpstreamTarget {
             host: "orders.default.svc.cluster.local".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags,
             locality: None,

@@ -48,10 +48,12 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 use url::Host;
 
-use super::utils::body_transform::is_json_content_type;
+use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+const AI_CACHE_KEY_METADATA: &str = "_ai_cache_key";
 
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
 
@@ -1295,6 +1297,21 @@ impl Plugin for AiSemanticCache {
         true
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(AI_CACHE_KEY_METADATA)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_event_stream_content_type)
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -1440,7 +1457,8 @@ impl Plugin for AiSemanticCache {
             cache_key = %cache_key,
             "ai_semantic_cache: cache MISS"
         );
-        ctx.metadata.insert("_ai_cache_key".to_string(), cache_key);
+        ctx.metadata
+            .insert(AI_CACHE_KEY_METADATA.to_string(), cache_key);
         ctx.metadata
             .insert("ai_cache_status".to_string(), "MISS".to_string());
 
@@ -1472,7 +1490,7 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
-        let cache_key = match ctx.metadata.get("_ai_cache_key") {
+        let cache_key = match ctx.metadata.get(AI_CACHE_KEY_METADATA) {
             Some(k) => k.clone(),
             None => return PluginResult::Continue,
         };
@@ -1482,7 +1500,7 @@ impl Plugin for AiSemanticCache {
             .get("content-type")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if content_type.contains("event-stream") {
+        if is_event_stream_content_type(content_type) {
             debug!("ai_semantic_cache: skipping SSE streaming response");
             return PluginResult::Continue;
         }

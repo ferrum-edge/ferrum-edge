@@ -144,7 +144,8 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `pool_http2_initial_stream_window_size` | 65,535–134,217,728 | HTTP/2 per-stream window (64 KiB – 128 MiB) |
 | `pool_http2_initial_connection_window_size` | 65,535–134,217,728 | HTTP/2 connection window (64 KiB – 128 MiB) |
 | `pool_http2_max_frame_size` | 16,384–1,048,576 | HTTP/2 frame size (16 KiB – 1 MiB) |
-| `pool_http2_max_concurrent_streams` | ≥ 1 | HTTP/2 max concurrent streams |
+| `pool_http2_max_concurrent_streams` | 1–2,147,483,647 | HTTP/2 max concurrent streams |
+| `pool_max_requests_per_connection` | 0–2,147,483,647 | Reserved Istio max requests per connection (0 = unlimited) |
 | `pool_http3_connections_per_backend` | 1–256 | QUIC connections per backend |
 | `backend_tls_client_cert_path` | 4096 chars | mTLS client certificate path |
 | `backend_tls_client_key_path` | 4096 chars | mTLS client key path |

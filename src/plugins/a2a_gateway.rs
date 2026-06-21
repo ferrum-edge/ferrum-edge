@@ -563,6 +563,8 @@ impl Plugin for A2aGateway {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         if content_type.is_some_and(is_event_stream_content_type) {
             return false;

@@ -3753,3 +3753,458 @@ async fn functional_mesh_ambient_ws_egress_rejects_untrusted_client_gateway() {
         );
     }
 }
+
+// ===================================================================
+// UDP §3.3 Stage 7 — functional destination tests
+// ===================================================================
+//
+// These drive a `udp`-marked HTTP/2 CONNECT directly at a spawned mesh gateway
+// B's inbound HBONE relay (`handle_hbone_udp_request`), exercising the
+// DESTINATION half of the datagram-over-mesh datapath end-to-end: a framed
+// datagram in -> local UDP echo backend -> framed datagram back. The source
+// side TPROXY capture is NOT needed (the client synthesizes the `udp` CONNECT),
+// so these run without root/netns. The full source-capture e2e (TPROXY ->
+// tunnel -> unframe -> app -> return-source-spoofing) still needs a live
+// netns/root env and is tracked separately as the remaining UDP gap.
+
+/// Test-only server-cert verifier that accepts any certificate. The functional
+/// gateway SVIDs carry only a SPIFFE URI SAN (no IP/DNS SAN), so a standard
+/// rustls name check against `127.0.0.1` would reject B's server cert; the real
+/// mesh peer verification is SPIFFE-aware. These tests exercise the UDP RELAY
+/// datapath, not the client's verification of the server — and gateway B still
+/// verifies OUR client SVID with its real SPIFFE verifier, so accepting B's
+/// cert here is just plumbing.
+#[derive(Debug)]
+struct AnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
+}
+
+/// A mesh slice declaring svc-b's workload with a single UDP service port, so
+/// gateway B (which owns `b_spiffe`) recognizes the workload as local and its
+/// inbound open-relay guard admits a `udp` CONNECT to `127.0.0.1:<udp_port>`.
+/// STRICT PeerAuthentication so B requires + verifies the client SVID.
+fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
+    let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: b_id.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "svc-b".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: udp_port,
+                protocol: AppProtocol::Udp,
+                name: Some("udp".to_string()),
+            }],
+            trust_domain,
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-b".to_string()),
+            pod_uid: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-b".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: udp_port,
+                protocol: AppProtocol::Udp,
+                name: Some("udp".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: b_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Bind a UDP echo backend on loopback; returns (port, task). Echoes each
+/// datagram back to its sender. Holds the socket for the task's lifetime.
+async fn start_udp_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind udp echo backend");
+    let port = socket.local_addr().expect("udp echo local addr").port();
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..n], src).await;
+        }
+    });
+    (port, handle)
+}
+
+/// Build an mTLS HTTP/2 client config presenting `svid`'s leaf cert + key, with
+/// the permissive server-cert verifier (see [`AnyServerCert`]). ALPN `h2`.
+fn udp_dest_client_config(svid: &GeneratedGatewaySvid) -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_pem = std::fs::read(&svid.cert_path).expect("read client svid cert");
+    let key_pem = std::fs::read(&svid.key_path).expect("read client svid key");
+    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .filter_map(|r| r.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .expect("parse client svid key")
+        .expect("client svid key present");
+    let mut cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServerCert))
+        .with_client_auth_cert(chain, key)
+        .expect("client config");
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
+/// Read exactly one length-delimited datagram (`[u16 BE len][payload]`) from an
+/// h2 response body, accumulating chunks until a full frame is buffered. The
+/// relay keeps the response stream OPEN (it is a tunnel), so this must stop at
+/// the first complete frame rather than draining to EOF.
+async fn read_one_framed_reply(
+    body: &mut h2::RecvStream,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    tokio::time::timeout(timeout, async {
+        loop {
+            if buf.len() >= 2 {
+                let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                if buf.len() >= 2 + len {
+                    return Ok(buf[2..2 + len].to_vec());
+                }
+            }
+            match body.data().await {
+                Some(Ok(chunk)) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => return Err(format!("response body error: {e}")),
+                None => return Err("response body ended before a full datagram".to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "timed out reading framed reply".to_string())?
+}
+
+/// Open mTLS H2 to B, send a `udp` CONNECT + one framed `ping`, return
+/// (status, optional framed reply).
+async fn drive_one_udp_connect(
+    hbone_port: u16,
+    authority: &str,
+    client_svid: &GeneratedGatewaySvid,
+) -> Result<(u16, Option<Vec<u8>>), String> {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+        .await
+        .map_err(|e| format!("connect B: {e}"))?;
+    let _ = tcp.set_nodelay(true);
+    let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
+    let server_name = rustls::pki_types::ServerName::IpAddress(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
+    );
+    // Bound the handshakes: if the HBONE port is bound but the TLS server wedges
+    // (or a regression binds a non-TLS listener), an unbounded handshake await
+    // would hang the ignored test forever before reaching the later timeouts.
+    let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| "client TLS handshake timed out".to_string())?
+        .map_err(|e| format!("client TLS handshake: {e}"))?;
+    let (mut sender, conn) =
+        tokio::time::timeout(Duration::from_secs(10), h2::client::handshake(tls))
+            .await
+            .map_err(|_| "h2 handshake timed out".to_string())?
+            .map_err(|e| format!("h2 handshake: {e}"))?;
+    let conn_task = tokio::spawn(conn);
+
+    let req = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(authority)
+        .header("x-ferrum-mesh-protocol", "udp")
+        .body(())
+        .map_err(|e| format!("build CONNECT: {e}"))?;
+    let (response_fut, mut send_body) = sender
+        .send_request(req, false)
+        .map_err(|e| format!("send CONNECT: {e}"))?;
+
+    let mut framed = bytes::BytesMut::new();
+    ferrum_edge::proxy::mesh_udp_frame::encode_datagram(&mut framed, b"ping")
+        .map_err(|e| format!("encode datagram: {e}"))?;
+    // Keep the request stream OPEN (end_stream=false) so the relay stays alive
+    // for the return datagram.
+    let _ = send_body.send_data(framed.freeze(), false);
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), response_fut)
+        .await
+        .map_err(|_| "CONNECT response timed out".to_string())?
+        .map_err(|e| format!("CONNECT response: {e}"))?;
+    let status = resp.status().as_u16();
+
+    let reply = if status == 200 {
+        let mut response_body = resp.into_body();
+        Some(
+            read_one_framed_reply(&mut response_body, Duration::from_secs(5))
+                .await
+                .map_err(|e| format!("read reply: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    conn_task.abort();
+    Ok((status, reply))
+}
+
+/// Outcome of a UDP dest drive AFTER the gateway came up. Distinguishes a
+/// completed CONNECT from a connection/handshake failure so a SETUP failure
+/// (gateway never built/bound — returned as the outer `Err`) can never be
+/// mistaken for an expected fail-closed rejection.
+enum UdpDestOutcome {
+    /// The CONNECT completed: (status, optional framed reply payload).
+    Connected(u16, Option<Vec<u8>>),
+    /// The connection/handshake/request failed before a CONNECT response — the
+    /// expected outcome for an untrusted (cert-rejected) peer.
+    ConnectFailed(String),
+}
+
+/// Spawn gateway B (Ambient inbound HBONE terminator) over a slice declaring a
+/// UDP svc-b workload, then drive a single `udp` CONNECT at its HBONE port.
+/// `client_trusted` selects whether the client SVID chains to B's mesh CA;
+/// `dial_declared_port` selects an in-allowlist vs off-allowlist authority.
+/// The outer `Err` is a SETUP failure (gateway never built/bound after retries)
+/// — callers must treat it as a test failure, NOT a fail-closed pass. `Ok`
+/// carries the [`UdpDestOutcome`] of the actual CONNECT attempt.
+async fn drive_udp_dest_connect(
+    client_trusted: bool,
+    dial_declared_port: bool,
+) -> Result<UdpDestOutcome, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_b = format!("functional-mesh-udp-dest-{trust_label}-b-{attempt}");
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let temp_client = TempDir::new().map_err(|e| format!("temp dir client: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+        // An untrusted client mints its OWN CA: its cert does not chain to B's
+        // mesh CA, so B's STRICT inbound rejects the handshake (fail closed).
+        let client_svid = if client_trusted {
+            svids.a
+        } else {
+            generate_gateway_svid(temp_client.path(), a_spiffe)
+        };
+
+        let (udp_port, echo) = start_udp_echo_backend().await;
+        let cp_b = start_static_mesh_cp(udp_dest_slice(&node_b, b_spiffe, udp_port)).await;
+        let ports_b = reserve_mesh_ports().await;
+        let hbone_port = ports_b.hbone;
+
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology: "ambient",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(hbone_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway B HBONE listener never bound\n{}",
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            echo.abort();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let dial_port = if dial_declared_port {
+            udp_port
+        } else {
+            // A port no workload declares — the open-relay guard must refuse it.
+            udp_port.checked_add(1).unwrap_or(1)
+        };
+        let authority = format!("127.0.0.1:{dial_port}");
+
+        let outcome = drive_one_udp_connect(hbone_port, &authority, &client_svid).await;
+
+        let logs = captured_output(&temp_b);
+        kill_child(&mut child_b);
+        cp_b.shutdown().await;
+        echo.abort();
+
+        return Ok(match outcome {
+            Ok((status, reply)) => UdpDestOutcome::Connected(status, reply),
+            Err(e) => UdpDestOutcome::ConnectFailed(format!("{e}\n--- gateway B ---\n{logs}")),
+        });
+    }
+
+    Err(format!(
+        "udp dest gateway never bound after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Stage 7 keystone (destination side): a `udp`-marked HBONE CONNECT into a mesh
+/// gateway is unframed into a local `UdpSocket`, the datagram echoes off a local
+/// backend, and the reply is framed back byte-for-byte — exercising
+/// `handle_hbone_udp_request` / `relay_hbone_udp` end-to-end over real SVID-mTLS
+/// with no source-side TPROXY.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_udp_dest_relays_datagram_round_trip() {
+    // `.expect` on the outer Result = the gateway must come up (setup failure is a
+    // test failure, never a silent pass).
+    match drive_udp_dest_connect(true, true)
+        .await
+        .expect("udp dest setup")
+    {
+        UdpDestOutcome::Connected(status, reply) => {
+            assert_eq!(status, 200, "the udp CONNECT must be accepted by B's relay");
+            assert_eq!(
+                reply.as_deref(),
+                Some(&b"ping"[..]),
+                "the echoed datagram must return framed byte-for-byte"
+            );
+        }
+        UdpDestOutcome::ConnectFailed(e) => {
+            panic!("a trusted udp CONNECT must connect and round-trip, not fail closed: {e}")
+        }
+    }
+}
+
+/// Stage 7 fail-closed (open-relay guard): a `udp` CONNECT whose authority is a
+/// port the slice does NOT declare is refused at the destination — the inbound
+/// open-relay guard admits only loopback / slice-declared workload addr+port, so
+/// an authenticated peer can never ride a `udp` CONNECT to an arbitrary port.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_udp_dest_off_allowlist_authority_is_refused() {
+    match drive_udp_dest_connect(true, false)
+        .await
+        .expect("udp dest setup")
+    {
+        UdpDestOutcome::Connected(status, reply) => {
+            assert_ne!(
+                status, 200,
+                "a udp CONNECT to an undeclared port must be refused, not relayed"
+            );
+            assert!(
+                reply.is_none(),
+                "a refused CONNECT must not return a relayed datagram"
+            );
+        }
+        UdpDestOutcome::ConnectFailed(e) => panic!(
+            "an off-allowlist CONNECT should reach B and be refused (non-200), \
+             not fail to connect: {e}"
+        ),
+    }
+}
+
+/// Stage 7 fail-closed (peer authentication): a client whose SVID does NOT chain
+/// to B's mesh CA must not reach the relay. B's STRICT inbound rejects the
+/// handshake, failing the request closed before any datagram is relayed. (Under
+/// STRICT the rejection is at the TLS layer; the handler-level
+/// `peer_spiffe_id.is_none()` 403 stays predicate-pinned — this asserts the
+/// equivalent fail-closed OUTCOME at the transport boundary.)
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
+    // `.expect` ensures a SETUP failure (gateway never bound) is a test failure,
+    // not a false "fail-closed" pass — the bug codex flagged. Only a genuine
+    // CONNECT-attempt failure counts as the expected fail-closed outcome.
+    match drive_udp_dest_connect(false, true)
+        .await
+        .expect("udp dest setup")
+    {
+        // Expected: the mTLS handshake fails closed before any CONNECT response.
+        UdpDestOutcome::ConnectFailed(_) => {}
+        // If a connection somehow established, it must NOT have relayed a datagram.
+        UdpDestOutcome::Connected(status, reply) => {
+            assert_ne!(
+                status, 200,
+                "an untrusted client's udp CONNECT must fail closed, not be relayed"
+            );
+            assert!(
+                reply.is_none(),
+                "no datagram may be relayed for an untrusted peer"
+            );
+        }
+    }
+}

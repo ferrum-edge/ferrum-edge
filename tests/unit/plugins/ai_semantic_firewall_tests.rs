@@ -135,15 +135,15 @@ async fn plugin_name_priority_protocols_and_registration() {
     );
     assert!(ferrum_edge::plugins::available_plugins().contains(&"ai_semantic_firewall"));
     assert!(!ferrum_edge::plugins::available_plugins().contains(&"semantic_ai_firewall"));
-    assert!(ferrum_edge::plugins::is_security_plugin(
-        "ai_semantic_firewall"
-    ));
-    assert!(!ferrum_edge::plugins::is_security_plugin(
-        "semantic_ai_firewall"
-    ));
-    assert!(ferrum_edge::plugins::is_removed_security_plugin(
-        "semantic_ai_firewall"
-    ));
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("ai_semantic_firewall"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::FailClosed)
+    );
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("semantic_ai_firewall"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::FailClosed)
+    );
+    assert!(ferrum_edge::plugins::removed_plugin_registration("semantic_ai_firewall").is_some());
 }
 
 #[test]
@@ -641,8 +641,18 @@ async fn accept_sse_does_not_bypass_json_response_inspection() {
         .insert("accept".to_string(), "text/event-stream".to_string());
 
     assert!(plugin.should_buffer_response_body(&ctx));
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -669,7 +679,12 @@ async fn native_grpc_request_does_not_force_response_body_buffering() {
         .insert("content-type".to_string(), "application/grpc".to_string());
 
     assert!(!plugin.should_buffer_response_body(&ctx));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/grpc")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -696,7 +711,12 @@ async fn stream_true_request_disables_response_body_buffering() {
             .map(String::as_str),
         Some("streaming")
     );
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -1351,7 +1371,12 @@ async fn streaming_response_buffer_forces_event_stream_buffering() {
     );
     // The event-stream response is now pinned to the buffered path.
     assert!(plugin.should_buffer_response_body(&ctx));
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -1371,7 +1396,12 @@ async fn streaming_response_skip_does_not_buffer_event_stream() {
     let mut headers = json_headers();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -1501,11 +1531,21 @@ async fn buffer_mode_does_not_buffer_unflagged_event_stream() {
     let ctx = create_test_context(); // no before_proxy → no streaming_buffered marker
 
     assert!(
-        !plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")),
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &HashMap::new()
+        ),
         "an unflagged event stream must keep streaming under buffer mode"
     );
     // JSON responses are still inspected as before.
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -1571,7 +1611,12 @@ async fn buffer_mode_overrides_shared_streaming_flag() {
         plugin.should_buffer_response_body(&ctx),
         "buffer marker must override a pre-set ai_request_streaming flag"
     );
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
@@ -2104,11 +2149,21 @@ async fn inspect_mode_buffers_non_sse_response_for_inspection() {
         "a marked inspect request buffers by default (refine downgrades SSE)"
     );
     assert!(
-        plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")),
+        plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &HashMap::new()
+        ),
         "a JSON response to a marked inspect request must be buffered for inspection"
     );
     assert!(
-        !plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")),
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &HashMap::new()
+        ),
         "an SSE response to a marked inspect request streams (windowed), not buffered"
     );
 }

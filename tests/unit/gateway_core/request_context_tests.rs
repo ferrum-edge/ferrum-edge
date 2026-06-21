@@ -146,6 +146,28 @@ fn materialize_headers_skips_reserved_identity_headers_even_when_repeated() {
 }
 
 #[test]
+fn materialize_headers_skips_reserved_path_param_headers_even_when_repeated() {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    let mut raw = HeaderMap::new();
+    raw.append("x-path-param-user_id", "spoofed".parse().unwrap());
+    raw.append("x-path-param-user_id", "also-spoofed".parse().unwrap());
+    raw.append("X-Path-Param-Other", "spoofed-other".parse().unwrap());
+    raw.append("x-path-param-", "empty-name".parse().unwrap());
+    raw.append("x-path-paramish", "ordinary".parse().unwrap());
+    ctx.set_raw_headers(raw);
+
+    ctx.materialize_headers();
+
+    assert!(!ctx.headers.contains_key("x-path-param-user_id"));
+    assert!(!ctx.headers.contains_key("x-path-param-other"));
+    assert!(!ctx.headers.contains_key("x-path-param-"));
+    assert_eq!(
+        ctx.headers.get("x-path-paramish").map(String::as_str),
+        Some("ordinary")
+    );
+}
+
+#[test]
 fn raw_header_get_returns_none_after_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();

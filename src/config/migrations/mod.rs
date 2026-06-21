@@ -276,6 +276,18 @@ impl MigrationRunner {
             newly_applied.push(record);
         }
 
+        // Idempotent compatibility pass for tables folded into the V001
+        // baseline after some databases already recorded V001. The loop above
+        // skips V001 once version 1 is tracked, so a newly folded-in table
+        // (e.g. `proxy_route_locks`, which the proxy persistence path writes to
+        // unconditionally) would otherwise be missing on existing databases.
+        // This runs after every `run_pending()` and only issues idempotent
+        // `CREATE TABLE IF NOT EXISTS` statements, so it is a no-op on fresh
+        // databases that just applied V001 in full.
+        sql_dialect::V001SqlBuilder::new(&self.db_type)
+            .ensure_compatibility_tables(&self.pool)
+            .await?;
+
         Ok(newly_applied)
     }
 

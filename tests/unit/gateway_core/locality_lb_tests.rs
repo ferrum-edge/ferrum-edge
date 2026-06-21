@@ -16,6 +16,7 @@ fn target_on_port(host: &str, port: u16, locality: Option<&str>) -> UpstreamTarg
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: locality.map(str::to_string),
@@ -38,6 +39,7 @@ fn tagged_target(
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::from([(tag.0.to_string(), tag.1.to_string())]),
         locality: locality.map(str::to_string),
@@ -74,6 +76,7 @@ fn make_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -750,6 +753,93 @@ fn strict_locality_present_source_unchanged_priority_tier() {
 }
 
 #[test]
+fn strict_locality_absent_source_falls_back_to_unhealthy_local_not_remote() {
+    // Strict mode is a fail-closed-to-local control: if configured local
+    // endpoints are currently unhealthy/ejected while remote endpoints remain
+    // healthy, selection may use a local fallback but must not widen to remote.
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let up = strict_upstream(
+        None,
+        vec![
+            local.clone(),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &local), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("strict-local-fallback-{i}"),
+            Some(&health),
+        )
+        .expect("local fallback selected");
+        assert_eq!(selection.target.host, "local-a.local");
+        assert!(
+            selection.is_fallback,
+            "selecting an unhealthy local instead of a healthy remote must be marked as fallback"
+        );
+    }
+}
+
+#[test]
+fn strict_locality_vec_path_falls_back_to_unhealthy_local_not_remote() {
+    // Same regression guard for the >128-target Vec fallback path.
+    let mut targets = Vec::with_capacity(130);
+    let mut locals = Vec::new();
+    for i in 0..2 {
+        let local = target(&format!("local-{i}.local"), Some("us-west/us-west-1/a"));
+        locals.push(local.clone());
+        targets.push(local);
+    }
+    for i in 0..128 {
+        targets.push(remote_target(
+            &format!("remote-{i}.local"),
+            Some("remote-cluster-east"),
+        ));
+    }
+    let up = strict_upstream(None, targets);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    for local in &locals {
+        active_unhealthy.insert(target_key("u1", local), 1);
+    }
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    let mut seen = HashSet::new();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("strict-local-vec-fallback-{i}"),
+            Some(&health),
+        )
+        .expect("local fallback selected");
+        assert!(selection.target.host.starts_with("local-"));
+        assert!(selection.is_fallback);
+        seen.insert(selection.target.host.clone());
+    }
+    assert!(
+        seen.iter().all(|host| host.starts_with("local-")),
+        "strict Vec fallback must not widen to remote endpoints — saw {seen:?}"
+    );
+}
+
+#[test]
 fn strict_locality_no_local_endpoints_falls_back_to_full_pool() {
     // Strict ON, absent source locality, and EVERY target is remote (tagged):
     // rather than black-holing, selection must widen to the full healthy pool so
@@ -770,6 +860,146 @@ fn strict_locality_no_local_endpoints_falls_back_to_full_pool() {
         2,
         "with no local endpoints, strict mode must widen to the full pool — saw {seen:?}"
     );
+}
+
+#[test]
+fn strict_locality_port_scope_falls_back_to_unhealthy_local_not_remote() {
+    // Port-scoped regression guard: a per-port lane whose local endpoint is
+    // unhealthy while a remote endpoint on the same port is healthy must fail
+    // closed to the unhealthy local (marked fallback), not widen to remote.
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(8080, UpstreamPortOverride::default());
+    let mut up = strict_upstream(
+        None,
+        vec![
+            local.clone(),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+        ],
+    );
+    up.port_overrides = port_overrides;
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &local), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            &format!("strict-port-fallback-{i}"),
+            8080,
+            Some(&health),
+        )
+        .expect("port-scoped local fallback selected");
+        assert_eq!(selection.target.host, "local-a.local");
+        assert!(
+            selection.is_fallback,
+            "port-scoped strict fail-closed to unhealthy local must be marked fallback"
+        );
+    }
+}
+
+#[test]
+fn strict_locality_remote_only_port_scope_does_not_black_hole() {
+    // Port-scoped regression guard for the inverse: a port lane that is
+    // genuinely remote-only (no local endpoint on that port) must NOT black-hole
+    // just because a local endpoint exists on a DIFFERENT port. Strict mode
+    // widens within that remote-only scope so traffic still flows.
+    let mut port_overrides = HashMap::new();
+    // Port 9090 lane contains only the remote endpoint.
+    port_overrides.insert(9090, UpstreamPortOverride::default());
+    let mut up = strict_upstream(
+        None,
+        vec![
+            // Local endpoint lives on a different port (8080), not in the lane.
+            target_on_port("local-a.local", 8080, Some("us-west/us-west-1/a")),
+            tagged_target(
+                "remote-a.local",
+                9090,
+                Some("remote-cluster-east"),
+                ("mesh.remote", "true"),
+            ),
+        ],
+    );
+    up.port_overrides = port_overrides;
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            &format!("strict-remote-only-port-{i}"),
+            9090,
+            no_health(),
+        )
+        .expect("remote-only port lane must not black-hole");
+        assert_eq!(selection.target.host, "remote-a.local");
+        assert!(
+            !selection.is_fallback,
+            "serving a healthy remote in a remote-only scope is normal, not a degraded fallback"
+        );
+    }
+}
+
+#[test]
+fn strict_locality_subset_scope_falls_back_to_unhealthy_local_not_remote() {
+    // Subset-scoped regression guard: a subset whose local member is unhealthy
+    // while a remote member of the same subset is healthy must fail closed to
+    // the unhealthy local member, not widen to the remote one.
+    let local = tagged_target(
+        "local-a.local",
+        8080,
+        Some("us-west/us-west-1/a"),
+        ("v", "1"),
+    );
+    let mut remote = tagged_target(
+        "remote-a.local",
+        8080,
+        Some("remote-cluster-east"),
+        ("v", "1"),
+    );
+    // Carry BOTH the subset label and the remote provenance tag.
+    remote
+        .tags
+        .insert("mesh.remote".to_string(), "true".to_string());
+    let mut up = strict_upstream(None, vec![local.clone(), remote]);
+    up.subsets = Some(vec![SubsetDefinition {
+        name: "v1".into(),
+        labels: HashMap::from([("v".to_string(), "1".to_string())]),
+        traffic_policy: None,
+    }]);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &local), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_subset_from(
+            &snapshot,
+            "u1",
+            &format!("strict-subset-fallback-{i}"),
+            "v1",
+            Some(&health),
+        )
+        .expect("subset-scoped local fallback selected");
+        assert_eq!(selection.target.host, "local-a.local");
+        assert!(
+            selection.is_fallback,
+            "subset-scoped strict fail-closed to unhealthy local must be marked fallback"
+        );
+    }
 }
 
 // ── localityLbSetting.distribute ──────────────────────────────────────────

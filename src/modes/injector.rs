@@ -896,6 +896,7 @@ fn build_sidecar_patch_for_namespace(
         path: "/metadata/annotations/ferrum.io~1injected".to_string(),
         value: Some(Value::String("true".to_string())),
     });
+    ensure_containers(pod, &mut patch);
     patch.push(JsonPatchOperation {
         op: "add",
         path: "/spec/containers/-".to_string(),
@@ -930,7 +931,7 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
 
     if value_is_false(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
         || value_is_false(annotations.and_then(|m| m.get("ferrum.io/inject")))
-        || value_is_false(labels.and_then(|m| m.get("ferrum.io/mesh")))
+        || mesh_label_opts_out(labels.and_then(|m| m.get("ferrum.io/mesh")))
     {
         return false;
     }
@@ -974,6 +975,12 @@ fn value_is_true(value: Option<&Value>) -> bool {
 fn value_is_false(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_str)
+        .is_some_and(|value| value == "false")
+}
+
+fn mesh_label_opts_out(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
         .is_some_and(|value| matches!(value, "false" | "disabled"))
 }
 
@@ -992,6 +999,16 @@ fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
         patch.push(JsonPatchOperation {
             op: "add",
             path: "/spec/initContainers".to_string(),
+            value: Some(json!([])),
+        });
+    }
+}
+
+fn ensure_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
+    if pod.pointer("/spec/containers").is_none() {
+        patch.push(JsonPatchOperation {
+            op: "add",
+            path: "/spec/containers".to_string(),
             value: Some(json!([])),
         });
     }
@@ -1048,6 +1065,46 @@ fn workload_spiffe_id(config: &InjectorConfig, pod: &Value, namespace: &str) -> 
     )
 }
 
+/// Whether the injected **Sidecar** should capture+relay UDP egress.
+///
+/// **Enabled (#1808).** The Sidecar mesh-mTLS datagram relay
+/// (`MeshMtlsConnectionPool::open_datagram_tunnel`) makes Sidecar the FIRST
+/// topology with a working end-to-end UDP path: the mesh runtime binds the UDP
+/// capture listener for Sidecar (`MeshRuntime::udp_capture_listener` is gated to
+/// Ambient OR Sidecar), the egress datapath relays each captured datagram over a
+/// `udp`-marked mesh-mTLS CONNECT (`:15006`), and the destination unframes it
+/// into a local `UdpSocket`. The injector only ever produces **Sidecar** pods
+/// (`FERRUM_MESH_TOPOLOGY=sidecar`), so this central switch ENABLES the three
+/// pod-side surfaces TOGETHER — the init container's UDP TPROXY rules, the
+/// sidecar's runtime-enable env (`FERRUM_MESH_CAPTURE_UDP_ENABLED`/`_PORT`/
+/// `_TPROXY_MARK`), and the transparent-bind capability (`NET_ADMIN`) — so an
+/// injected Sidecar with `udp_capture_enabled` both binds the listener and
+/// diverts UDP into it, matching the runtime listener gate. All three remain
+/// behind the operator's `udp_capture_enabled` flag (default-off). (The
+/// node-agent / ambient host-netns path installs no UDP TPROXY rules — see
+/// `capture::udp_tproxy_commands_for_family`'s `host_netns` short-circuit — and
+/// ambient's UDP producer is still deferred (F4.3 / #1803), so this gate does NOT
+/// touch that path.)
+const fn sidecar_udp_capture_supported() -> bool {
+    true
+}
+
+/// Whether an injected Sidecar should ACTUALLY receive the pod-side UDP capture
+/// surfaces (init TPROXY rules + runtime-enable env + `NET_ADMIN`). Beyond the
+/// operator's `udp_capture_enabled` flag and the central
+/// [`sidecar_udp_capture_supported`] switch, this REQUIRES `CaptureMode::Iptables`
+/// (codex r1): the UDP TPROXY producer is the iptables init container, which
+/// `build_sidecar_patch_for_namespace` only adds in `CaptureMode::Iptables`; the
+/// eBPF path is TCP-only with no UDP producer, and `Explicit` mode installs no
+/// init container at all. In those modes, enabling the flag would bind a
+/// transparent UDP listener with NOTHING feeding it (UDP never captured/relayed
+/// despite the opt-in), so gate the three surfaces on the iptables producer.
+fn sidecar_udp_capture_active(config: &InjectorConfig) -> bool {
+    config.udp_capture_enabled
+        && sidecar_udp_capture_supported()
+        && config.capture_mode == CaptureMode::Iptables
+}
+
 fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Value> {
     let mut env = vec![
         json!({"name": "FERRUM_MODE", "value": "mesh"}),
@@ -1056,17 +1113,14 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
         json!({"name": "FERRUM_MESH_CAPTURE_MODE", "value": format!("{:?}", config.capture_mode).to_ascii_lowercase()}),
         json!({"name": "FERRUM_MESH_WORKLOAD_SPIFFE_ID", "value": workload_spiffe_id(config, pod, namespace)}),
     ];
-    // When the injector enables UDP capture, the init container installs the
-    // Stage-2 TPROXY rules from `config.udp_*`, but the sidecar mesh runtime
-    // re-reads these vars in `udp_capture_listener()`/`serve_mesh_runtime` to
-    // bind the Stage-3 listener. They are NOT in `SIDECAR_ENV_KEYS` (which copy
-    // the injector's own runtime env), so set them here from the SAME config
-    // fields the init container uses — otherwise the sidecar defaults to
-    // disabled/default-port and captured UDP is diverted to an unbound port
-    // (codex r2 P2). The mark is propagated too so the listener's
-    // `udp_capture_settings_from_env()` agrees with the init container and the
-    // Stage-4 egress reinjection mark stays consistent.
-    if config.udp_capture_enabled {
+    // Sidecar UDP capture is ENABLED (#1808): the init container installs the UDP
+    // TPROXY rules (see `capture_config`) and the mesh runtime binds the UDP
+    // listener for Sidecar, so push the runtime-enable env (and the TPROXY mark,
+    // kept consistent with the init container's reinjection mark). Routed through
+    // the same `sidecar_udp_capture_supported()` switch the rule emission uses so
+    // the three pod-side surfaces stay consistent; all gated behind the operator's
+    // `udp_capture_enabled` flag (default-off).
+    if sidecar_udp_capture_active(config) {
         env.push(json!({"name": "FERRUM_MESH_CAPTURE_UDP_ENABLED", "value": "true"}));
         env.push(json!({
             "name": "FERRUM_MESH_CAPTURE_UDP_PORT",
@@ -1099,15 +1153,15 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
 
 fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> Value {
     // The sidecar normally drops ALL capabilities (it runs as PROXY_UID). UDP
-    // TPROXY capture is the exception: the capture listener binds an
-    // `IP_TRANSPARENT` UDP socket in THIS process, and on Linux that setsockopt
-    // requires a network capability — without it the bind fails `EPERM` and the
-    // capture listener never starts (codex r1 P2). Grant `CAP_NET_ADMIN` ONLY
-    // when UDP capture is enabled; the default (capture off) keeps the
-    // drop-ALL, zero-capability posture. (The init container already holds
-    // NET_ADMIN for the iptables/TPROXY setup — this is the runtime proxy
-    // needing it too for the transparent bind.)
-    let capabilities = if config.udp_capture_enabled {
+    // TPROXY capture is the exception (the capture listener binds an
+    // `IP_TRANSPARENT` UDP socket, which on Linux needs `NET_ADMIN`). Sidecar UDP
+    // capture is ENABLED (#1808): when `udp_capture_enabled` is on the runtime
+    // binds the transparent UDP listener and the init container installs the UDP
+    // rules, so authorize the transparent bind by adding `NET_ADMIN`. Gated on the
+    // same `sidecar_udp_capture_supported()` switch as the listener + rules so the
+    // capability appears together with them; otherwise keep the drop-ALL,
+    // zero-capability posture.
+    let capabilities = if sidecar_udp_capture_active(config) {
         json!({"drop": ["ALL"], "add": ["NET_ADMIN"]})
     } else {
         json!({"drop": ["ALL"]})
@@ -1201,8 +1255,14 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
     capture.ip6tables_mode = config.ip6tables_mode;
     // UDP TPROXY capture (F3 §3.3 Stage 2), flag-gated default-off. When off the
-    // emitted plan contains no mangle/TPROXY rules at all.
-    capture.udp_capture_enabled = config.udp_capture_enabled;
+    // emitted plan contains no mangle/TPROXY rules at all. Sidecar UDP egress is
+    // ENABLED (#1808) and the injector only produces Sidecar pods, so the rules
+    // are installed whenever the operator sets `udp_capture_enabled`: the mesh
+    // runtime binds the Sidecar UDP listener and the egress datapath relays the
+    // datagram over a mesh-mTLS CONNECT. Routed through the same
+    // `sidecar_udp_capture_supported()` switch as the runtime-enable env and the
+    // transparent-bind capability so the three pod-side surfaces stay consistent.
+    capture.udp_capture_enabled = sidecar_udp_capture_active(config);
     capture.udp_outbound_port = config.udp_outbound_port;
     capture.tproxy_mark = config.tproxy_mark;
 
@@ -1659,7 +1719,79 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_gets_net_admin_only_when_udp_capture_enabled() {
+    fn patch_creates_missing_containers_array_before_appending_sidecar() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+
+        let containers_index = patch
+            .iter()
+            .position(|op| op.path == "/spec/containers")
+            .expect("containers array guard");
+        let sidecar_index = patch
+            .iter()
+            .position(|op| op.path == "/spec/containers/-")
+            .expect("sidecar append");
+        assert!(
+            containers_index < sidecar_index,
+            "containers array must exist before appending the sidecar"
+        );
+    }
+
+    #[test]
+    fn istio_disabled_inject_annotation_does_not_opt_out() {
+        let pod = json!({
+            "metadata": {
+                "annotations": {"sidecar.istio.io/inject": "disabled"}
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(false, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+
+        assert!(
+            patch.iter().any(|op| op.path == "/spec/containers/-"),
+            "Istio compatibility only treats sidecar.istio.io/inject=\"false\" as opt-out"
+        );
+    }
+
+    #[test]
+    fn ferrum_mesh_disabled_label_opts_out() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "disabled"}},
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(false, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+
+        assert!(
+            patch.is_empty(),
+            "Ferrum-native disabled label remains opt-out"
+        );
+    }
+
+    #[test]
+    fn sidecar_capabilities_track_udp_capture_flag() {
+        // Sidecar UDP capture is ENABLED (#1808): with the flag OFF the sidecar
+        // keeps the drop-ALL, zero-capability posture; with the flag ON the
+        // transparent UDP bind needs NET_ADMIN, so the sidecar grants it. The two
+        // surfaces (this capability + the init-container rules + the runtime env)
+        // re-enable together via `sidecar_udp_capture_supported()`.
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
             "spec": {
@@ -1668,11 +1800,10 @@ mod tests {
             }
         });
 
-        // Default (UDP capture OFF): the sidecar keeps the zero-capability,
-        // drop-ALL posture — no `add` list.
-        let mut off = test_config(true, CaptureMode::Iptables);
-        off.udp_capture_enabled = false;
-        let patch = build_sidecar_patch_for_namespace(&pod, &off, None).expect("patch");
+        // Flag OFF: zero capability.
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.udp_capture_enabled = false;
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
         let sidecar = patch
             .iter()
             .find(|op| op.path == "/spec/containers/-")
@@ -1685,14 +1816,13 @@ mod tests {
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/add"),
             None,
-            "UDP capture off must not grant the sidecar any capability"
+            "UDP capture off ⇒ no added capability"
         );
 
-        // UDP capture ON: the sidecar's `IP_TRANSPARENT` UDP bind needs
-        // CAP_NET_ADMIN (codex r1 P2), so it is added on top of drop-ALL.
-        let mut on = test_config(true, CaptureMode::Iptables);
-        on.udp_capture_enabled = true;
-        let patch = build_sidecar_patch_for_namespace(&pod, &on, None).expect("patch");
+        // Flag ON: NET_ADMIN added for the transparent UDP bind.
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.udp_capture_enabled = true;
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
         let sidecar = patch
             .iter()
             .find(|op| op.path == "/spec/containers/-")
@@ -1705,8 +1835,125 @@ mod tests {
         assert_eq!(
             sidecar.pointer("/securityContext/capabilities/add"),
             Some(&json!(["NET_ADMIN"])),
-            "UDP capture on must grant the sidecar CAP_NET_ADMIN for the transparent bind"
+            "UDP capture on ⇒ NET_ADMIN for the transparent bind"
         );
+    }
+
+    #[test]
+    fn injected_sidecar_installs_udp_tproxy_rules_when_enabled() {
+        // With FERRUM_MESH_CAPTURE_UDP_ENABLED set, the injected init container
+        // emits the UDP mangle/TPROXY rules and the sidecar carries the
+        // runtime-enable env (#1808): Sidecar UDP relay is enabled (mesh-mTLS
+        // datagram tunnel), so captured UDP is diverted into the bound listener.
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.udp_capture_enabled = true;
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+
+        // Init container: UDP TPROXY/mangle rules ARE emitted.
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+        assert!(
+            commands.contains("-p udp"),
+            "enabled Sidecar UDP must emit `-p udp` rules: {commands}"
+        );
+        assert!(
+            commands.contains("TPROXY"),
+            "enabled Sidecar UDP must emit the TPROXY target: {commands}"
+        );
+        assert!(
+            commands.contains("mangle"),
+            "enabled Sidecar UDP must use the mangle table: {commands}"
+        );
+
+        // Sidecar container: runtime UDP-enable env IS set.
+        let sidecar = patch
+            .iter()
+            .find(|op| op.path == "/spec/containers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("sidecar container");
+        let env = sidecar
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("sidecar env");
+        let udp_enable = env.iter().find(|e| {
+            e.pointer("/name").and_then(Value::as_str) == Some("FERRUM_MESH_CAPTURE_UDP_ENABLED")
+        });
+        assert_eq!(
+            udp_enable.and_then(|e| e.pointer("/value")),
+            Some(&json!("true")),
+            "enabled Sidecar UDP must set FERRUM_MESH_CAPTURE_UDP_ENABLED=true"
+        );
+        // The capture port + TPROXY mark env ride alongside it.
+        assert!(
+            env.iter().any(|e| {
+                e.pointer("/name").and_then(Value::as_str) == Some("FERRUM_MESH_CAPTURE_UDP_PORT")
+            }),
+            "enabled Sidecar UDP must set FERRUM_MESH_CAPTURE_UDP_PORT"
+        );
+        assert!(
+            env.iter().any(|e| {
+                e.pointer("/name").and_then(Value::as_str) == Some("FERRUM_MESH_TPROXY_MARK")
+            }),
+            "enabled Sidecar UDP must set FERRUM_MESH_TPROXY_MARK"
+        );
+    }
+
+    #[test]
+    fn injected_sidecar_omits_udp_rules_when_capture_disabled() {
+        // With the flag OFF, no UDP rules and no runtime-enable env (default-off
+        // posture preserved).
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let mut config = test_config(true, CaptureMode::Iptables);
+        config.udp_capture_enabled = false;
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+        let init = patch
+            .iter()
+            .find(|op| op.path == "/spec/initContainers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("init container");
+        let commands = init
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan");
+        assert!(
+            !commands.contains("-p udp"),
+            "UDP capture off must emit no `-p udp` rules: {commands}"
+        );
+        let sidecar = patch
+            .iter()
+            .find(|op| op.path == "/spec/containers/-")
+            .and_then(|op| op.value.as_ref())
+            .expect("sidecar container");
+        if let Some(env) = sidecar.pointer("/env").and_then(Value::as_array) {
+            assert!(
+                !env.iter().any(|e| {
+                    e.pointer("/name").and_then(Value::as_str)
+                        == Some("FERRUM_MESH_CAPTURE_UDP_ENABLED")
+                }),
+                "UDP capture off must not set FERRUM_MESH_CAPTURE_UDP_ENABLED"
+            );
+        }
     }
 
     #[test]

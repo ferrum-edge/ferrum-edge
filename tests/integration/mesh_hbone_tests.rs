@@ -42,6 +42,7 @@ fn create_mesh_proxy(backend_port: u16) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -96,6 +97,10 @@ fn create_mesh_proxy_state_with_config(
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
+        frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
     };

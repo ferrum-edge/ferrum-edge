@@ -181,12 +181,14 @@ fn se_mesh_internal_skipped_by_egress() {
     let prepared =
         prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
 
-    // No egress proxy for the internal entry.
+    // No egress proxy for the internal entry. (The host `api.internal` would
+    // encode into an egress id as `api_dot_internal` under the injective id
+    // scheme; assert that token is absent.)
     assert!(
         prepared
             .proxies
             .iter()
-            .all(|p| !p.id.contains("api-dot-internal")),
+            .all(|p| !p.id.contains("api_dot_internal")),
         "MESH_INTERNAL entry must not materialize as an egress proxy"
     );
 }

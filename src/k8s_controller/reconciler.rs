@@ -12,15 +12,17 @@ use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     translate_k8s_objects_with_filter,
 };
-use crate::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
-use crate::grpc::proto::ConfigUpdate;
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
-use crate::k8s_controller::status::{GatewayApiStatusWriter, plan_gateway_api_status_updates};
+use crate::k8s_controller::status::{
+    GatewayApiStatusContext, GatewayApiStatusWriter, gateway_api_data_plane_service_ready,
+    plan_gateway_api_status_updates_with_context,
+};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,6 +37,9 @@ pub struct ReconcilerConfig {
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub pod_discovery_enabled: bool,
+    pub gateway_api_data_plane_service_namespace: Option<String>,
+    pub gateway_api_data_plane_service_name: Option<String>,
+    pub gateway_api_status_address: Option<String>,
     /// Effective Sidecar `ingress[]` materialization gate
     /// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`),
     /// passed to the Istio status writer so it reports `ingress_modeled` only
@@ -43,7 +48,8 @@ pub struct ReconcilerConfig {
 }
 
 pub struct ReconcileBroadcasters {
-    pub update_tx: broadcast::Sender<ConfigUpdate>,
+    pub broadcasts: Arc<NamespaceBroadcasts>,
+    pub cp_scope: CpScope,
     pub dp_registry: Arc<DpNodeRegistry>,
     pub mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     pub mesh_registry: Arc<MeshNodeRegistry>,
@@ -127,7 +133,8 @@ async fn run_reconcile_loop(
         Arc::clone(&store_set),
         ReconcileContext {
             config_arc: Arc::clone(&config_arc),
-            update_tx: broadcasters.update_tx.clone(),
+            broadcasts: Arc::clone(&broadcasters.broadcasts),
+            cp_scope: broadcasters.cp_scope.clone(),
             dp_registry: Arc::clone(&broadcasters.dp_registry),
             mesh_update_tx: broadcasters.mesh_update_tx.clone(),
             mesh_registry: Arc::clone(&broadcasters.mesh_registry),
@@ -137,6 +144,13 @@ async fn run_reconcile_loop(
             watch_namespaces: reconciler_config.watch_namespaces.clone(),
             trust_domain: trust_domain.clone(),
             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+            gateway_api_data_plane_service_namespace: reconciler_config
+                .gateway_api_data_plane_service_namespace
+                .clone(),
+            gateway_api_data_plane_service_name: reconciler_config
+                .gateway_api_data_plane_service_name
+                .clone(),
+            gateway_api_status_address: reconciler_config.gateway_api_status_address.clone(),
             mesh_sidecar_ingress_enforced: reconciler_config.mesh_sidecar_ingress_enforced,
             gateway_status_writer: gateway_status_writer.clone(),
             istio_status_writer: istio_status_writer.clone(),
@@ -161,7 +175,8 @@ async fn run_reconcile_loop(
                     Arc::clone(&store_set),
                     ReconcileContext {
                         config_arc: Arc::clone(&config_arc),
-                        update_tx: broadcasters.update_tx.clone(),
+                        broadcasts: Arc::clone(&broadcasters.broadcasts),
+                        cp_scope: broadcasters.cp_scope.clone(),
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
@@ -171,6 +186,15 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        gateway_api_data_plane_service_namespace: reconciler_config
+                            .gateway_api_data_plane_service_namespace
+                            .clone(),
+                        gateway_api_data_plane_service_name: reconciler_config
+                            .gateway_api_data_plane_service_name
+                            .clone(),
+                        gateway_api_status_address: reconciler_config
+                            .gateway_api_status_address
+                            .clone(),
                         mesh_sidecar_ingress_enforced: reconciler_config
                             .mesh_sidecar_ingress_enforced,
                         gateway_status_writer: gateway_status_writer.clone(),
@@ -190,7 +214,8 @@ async fn run_reconcile_loop(
                     Arc::clone(&store_set),
                     ReconcileContext {
                         config_arc: Arc::clone(&config_arc),
-                        update_tx: broadcasters.update_tx.clone(),
+                        broadcasts: Arc::clone(&broadcasters.broadcasts),
+                        cp_scope: broadcasters.cp_scope.clone(),
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
@@ -200,6 +225,15 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        gateway_api_data_plane_service_namespace: reconciler_config
+                            .gateway_api_data_plane_service_namespace
+                            .clone(),
+                        gateway_api_data_plane_service_name: reconciler_config
+                            .gateway_api_data_plane_service_name
+                            .clone(),
+                        gateway_api_status_address: reconciler_config
+                            .gateway_api_status_address
+                            .clone(),
                         mesh_sidecar_ingress_enforced: reconciler_config
                             .mesh_sidecar_ingress_enforced,
                         gateway_status_writer: gateway_status_writer.clone(),
@@ -367,7 +401,8 @@ async fn wait_for_initial_store_readiness_with_timeout(
 /// values once per reconcile is cheap relative to the reconciliation work.
 struct ReconcileContext {
     config_arc: Arc<ArcSwap<GatewayConfig>>,
-    update_tx: broadcast::Sender<ConfigUpdate>,
+    broadcasts: Arc<NamespaceBroadcasts>,
+    cp_scope: CpScope,
     dp_registry: Arc<DpNodeRegistry>,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
@@ -377,6 +412,9 @@ struct ReconcileContext {
     watch_namespaces: Vec<String>,
     trust_domain: TrustDomain,
     pod_discovery_enabled: bool,
+    gateway_api_data_plane_service_namespace: Option<String>,
+    gateway_api_data_plane_service_name: Option<String>,
+    gateway_api_status_address: Option<String>,
     mesh_sidecar_ingress_enforced: bool,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     /// T2-B: Istio CRD status sub-resource patcher. `None` when the
@@ -385,6 +423,57 @@ struct ReconcileContext {
     /// a no-op when None — every other code path stays unchanged.
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
+}
+
+fn namespaces_for_broadcast(
+    config: &GatewayConfig,
+    fallback_namespace: &str,
+    cp_scope: &CpScope,
+    broadcasts: &NamespaceBroadcasts,
+) -> Vec<String> {
+    let mut namespaces = BTreeSet::new();
+    namespaces.extend(config.known_namespaces.iter().cloned());
+    namespaces.extend(config.proxies.iter().map(|p| p.namespace.clone()));
+    namespaces.extend(config.consumers.iter().map(|c| c.namespace.clone()));
+    namespaces.extend(config.plugin_configs.iter().map(|pc| pc.namespace.clone()));
+    namespaces.extend(config.upstreams.iter().map(|u| u.namespace.clone()));
+    if let Some(mesh) = config.mesh.as_ref() {
+        namespaces.extend(mesh.workloads.iter().map(|w| w.namespace.clone()));
+        namespaces.extend(mesh.services.iter().map(|s| s.namespace.clone()));
+        namespaces.extend(mesh.mesh_policies.iter().map(|p| p.namespace.clone()));
+        namespaces.extend(
+            mesh.peer_authentications
+                .iter()
+                .map(|p| p.namespace.clone()),
+        );
+        namespaces.extend(mesh.service_entries.iter().map(|e| e.namespace.clone()));
+        namespaces.extend(
+            mesh.request_authentications
+                .iter()
+                .map(|r| r.namespace.clone()),
+        );
+        namespaces.extend(mesh.telemetry_resources.iter().map(|t| t.namespace.clone()));
+        namespaces.extend(mesh.destination_rules.iter().map(|d| d.namespace.clone()));
+        namespaces.extend(mesh.proxy_configs.iter().map(|p| p.namespace.clone()));
+        namespaces.extend(mesh.sidecars.iter().map(|s| s.namespace.clone()));
+        namespaces.extend(mesh.waypoint_bindings.iter().map(|w| w.namespace.clone()));
+    }
+    match cp_scope {
+        CpScope::Single(namespace) => {
+            namespaces.insert(namespace.clone());
+        }
+        CpScope::Set(scope_namespaces) => {
+            namespaces.extend(scope_namespaces.iter().cloned());
+        }
+        CpScope::All => {
+            namespaces.extend(broadcasts.namespaces());
+        }
+    }
+    namespaces.retain(|namespace| !namespace.trim().is_empty());
+    if namespaces.is_empty() {
+        namespaces.insert(fallback_namespace.to_string());
+    }
+    namespaces.into_iter().collect()
 }
 
 async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
@@ -416,6 +505,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     else {
         return;
     };
+    let gateway_api_status_context = gateway_api_status_context(&objects, &ctx);
 
     for warning in &translation.warnings {
         warn!(warning, "K8s translation warning");
@@ -446,6 +536,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
             &objects,
             &options,
             Some(&translation.route_conflicts),
+            gateway_api_status_context,
         )
         .await;
         let elapsed = start.elapsed();
@@ -457,7 +548,20 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     };
 
     // Notify DPs and mesh subscribers of the config change.
-    CpGrpcServer::broadcast_update_with_registry(&ctx.update_tx, &new_config, &ctx.dp_registry);
+    for namespace in namespaces_for_broadcast(
+        &new_config,
+        &ctx.namespace,
+        &ctx.cp_scope,
+        ctx.broadcasts.as_ref(),
+    ) {
+        CpGrpcServer::broadcast_namespace_update(
+            ctx.broadcasts.as_ref(),
+            &namespace,
+            &new_config,
+            &ctx.dp_registry,
+            &ctx.cp_scope,
+        );
+    }
     MeshGrpcServer::broadcast_full_with_registry(
         &ctx.mesh_update_tx,
         new_config.clone(),
@@ -471,6 +575,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         &objects,
         &options,
         Some(&translation.route_conflicts),
+        gateway_api_status_context,
     )
     .await;
 
@@ -504,6 +609,7 @@ async fn run_status_patchers(
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
     route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
+    gateway_api_status_context: GatewayApiStatusContext,
 ) {
     if let Some(writer) = gateway_writer {
         patch_gateway_api_statuses(
@@ -511,6 +617,7 @@ async fn run_status_patchers(
             objects.to_vec(),
             options.clone(),
             route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
+            gateway_api_status_context,
         )
         .await;
     }
@@ -524,8 +631,14 @@ async fn patch_gateway_api_statuses(
     objects: Vec<K8sObject>,
     options: K8sTranslationOptions,
     route_conflicts: Vec<crate::config_sources::k8s::GatewayApiRouteConflict>,
+    status_context: GatewayApiStatusContext,
 ) {
-    let mut updates = plan_gateway_api_status_updates(&objects, options, &route_conflicts);
+    let mut updates = plan_gateway_api_status_updates_with_context(
+        &objects,
+        options,
+        &route_conflicts,
+        status_context,
+    );
     if updates.is_empty() {
         return;
     }
@@ -544,6 +657,25 @@ async fn patch_gateway_api_statuses(
             updates = updates_len,
             "Failed to patch Gateway API status"
         );
+    }
+}
+
+fn gateway_api_status_context(
+    objects: &[K8sObject],
+    ctx: &ReconcileContext,
+) -> GatewayApiStatusContext {
+    let data_plane_ready = match (
+        ctx.gateway_api_data_plane_service_namespace.as_deref(),
+        ctx.gateway_api_data_plane_service_name.as_deref(),
+    ) {
+        (Some(namespace), Some(name)) => {
+            gateway_api_data_plane_service_ready(objects, namespace, name)
+        }
+        _ => true,
+    };
+    GatewayApiStatusContext {
+        data_plane_ready,
+        status_address: ctx.gateway_api_status_address.clone(),
     }
 }
 
@@ -609,6 +741,8 @@ const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-mirror-",
     "istio-vs-mrd-",
     "istio-vs-rt-",
+    "__istio_vs_req_xform_",
+    "__istio_vs_resp_xform_",
 ];
 
 fn managed_k8s_namespaces(
@@ -657,6 +791,7 @@ fn merge_k8s_translation(
     merged
         .plugin_configs
         .extend(k8s_config.plugin_configs.clone());
+    merge_k8s_frontend_tls(&mut merged, k8s_config);
 
     let mut namespaces: BTreeSet<String> = merged.known_namespaces.iter().cloned().collect();
     namespaces.extend(k8s_config.known_namespaces.iter().cloned());
@@ -668,6 +803,28 @@ fn merge_k8s_translation(
 
     merged.normalize_fields();
     merged
+}
+
+fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
+    let k8s_supplies_tls = !k8s_config.frontend_tls_namespace_sources.is_empty()
+        || k8s_config.frontend_tls_cert_path.is_some()
+        || k8s_config.frontend_tls_key_path.is_some();
+    if k8s_supplies_tls {
+        merged.frontend_tls_cert_path = k8s_config.frontend_tls_cert_path.clone();
+        merged.frontend_tls_key_path = k8s_config.frontend_tls_key_path.clone();
+        merged.frontend_tls_source_namespace = k8s_config.frontend_tls_source_namespace.clone();
+        merged.frontend_tls_namespace_sources = k8s_config.frontend_tls_namespace_sources.clone();
+        return;
+    }
+
+    if merged.frontend_tls_source_namespace.is_some()
+        || !merged.frontend_tls_namespace_sources.is_empty()
+    {
+        merged.frontend_tls_cert_path = None;
+        merged.frontend_tls_key_path = None;
+        merged.frontend_tls_source_namespace = None;
+        merged.frontend_tls_namespace_sources.clear();
+    }
 }
 
 fn has_any_prefix(id: &str, prefixes: &[&str]) -> bool {
@@ -682,6 +839,10 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
         "plugin_configs": &config.plugin_configs,
         "upstreams": &config.upstreams,
         "known_namespaces": &config.known_namespaces,
+        "frontend_tls_cert_path": &config.frontend_tls_cert_path,
+        "frontend_tls_key_path": &config.frontend_tls_key_path,
+        "frontend_tls_source_namespace": &config.frontend_tls_source_namespace,
+        "frontend_tls_namespace_sources": &config.frontend_tls_namespace_sources,
         "mesh": &config.mesh,
     });
     strip_volatile_timestamps(&mut value);
@@ -817,17 +978,19 @@ fn canonical_json_sort_key(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+    use crate::config::types::{
+        FrontendTlsNamespaceSource, PluginConfig, PluginScope, Proxy, Upstream,
+    };
     use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
     use crate::modes::mesh::config::{
-        MeshConfig, MeshService, Workload, WorkloadRef, WorkloadSelector,
+        MeshConfig, MeshPolicy, MeshService, PolicyScope, Workload, WorkloadRef, WorkloadSelector,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use kube::api::ApiResource;
     use kube::runtime::reflector;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn plugin_config(id: &str, config: Value) -> PluginConfig {
         PluginConfig {
@@ -870,6 +1033,65 @@ mod tests {
             }]
         }))
         .expect("test upstream should deserialize")
+    }
+
+    fn root_policy_only_config() -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                istio_root_namespace: "istio-system".to_string(),
+                mesh_policies: vec![MeshPolicy {
+                    name: "root-authz".to_string(),
+                    namespace: "istio-system".to_string(),
+                    scope: PolicyScope::MeshWide,
+                    rules: Vec::new(),
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn broadcast_namespaces_include_explicit_cp_scope_namespaces() {
+        let mut scope = HashSet::new();
+        scope.insert("tenant-a".to_string());
+        scope.insert("tenant-b".to_string());
+        let broadcasts = NamespaceBroadcasts::new(4);
+
+        let namespaces = namespaces_for_broadcast(
+            &root_policy_only_config(),
+            "fallback",
+            &CpScope::Set(scope),
+            &broadcasts,
+        );
+
+        assert!(namespaces.iter().any(|namespace| namespace == "tenant-a"));
+        assert!(namespaces.iter().any(|namespace| namespace == "tenant-b"));
+        assert!(
+            namespaces
+                .iter()
+                .any(|namespace| namespace == "istio-system")
+        );
+    }
+
+    #[test]
+    fn broadcast_namespaces_include_all_scope_subscribed_namespaces() {
+        let broadcasts = NamespaceBroadcasts::new(4);
+        let _ = broadcasts.sender_for("tenant-a");
+
+        let namespaces = namespaces_for_broadcast(
+            &root_policy_only_config(),
+            "fallback",
+            &CpScope::All,
+            &broadcasts,
+        );
+
+        assert!(namespaces.iter().any(|namespace| namespace == "tenant-a"));
+        assert!(
+            namespaces
+                .iter()
+                .any(|namespace| namespace == "istio-system")
+        );
     }
 
     fn mesh_workload(service_account: &str) -> Workload {
@@ -1158,6 +1380,121 @@ mod tests {
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));
+    }
+
+    #[test]
+    fn merge_k8s_translation_preserves_operator_frontend_tls_when_k8s_has_none() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("/etc/ferrum/operator.crt".to_string()),
+            frontend_tls_key_path: Some("/etc/ferrum/operator.key".to_string()),
+            frontend_tls_source_namespace: None,
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig::default();
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(
+            merged.frontend_tls_cert_path.as_deref(),
+            Some("/etc/ferrum/operator.crt")
+        );
+        assert_eq!(
+            merged.frontend_tls_key_path.as_deref(),
+            Some("/etc/ferrum/operator.key")
+        );
+        assert_eq!(merged.frontend_tls_source_namespace, None);
+    }
+
+    #[test]
+    fn merge_k8s_translation_clears_stale_gateway_frontend_tls_when_k8s_has_none() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt?sha256=old".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key?sha256=old".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig::default();
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(merged.frontend_tls_cert_path, None);
+        assert_eq!(merged.frontend_tls_key_path, None);
+        assert_eq!(merged.frontend_tls_source_namespace, None);
+    }
+
+    #[test]
+    fn merge_k8s_translation_replaces_operator_frontend_tls_when_k8s_supplies_gateway_tls() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("/etc/ferrum/operator.crt".to_string()),
+            frontend_tls_key_path: Some("/etc/ferrum/operator.key".to_string()),
+            frontend_tls_source_namespace: None,
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://default/cert#tls.crt?sha256=new".to_string()),
+            frontend_tls_key_path: Some("k8s://default/cert#tls.key?sha256=new".to_string()),
+            frontend_tls_source_namespace: Some("default".to_string()),
+            ..GatewayConfig::default()
+        };
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(
+            merged.frontend_tls_cert_path.as_deref(),
+            Some("k8s://default/cert#tls.crt?sha256=new")
+        );
+        assert_eq!(
+            merged.frontend_tls_key_path.as_deref(),
+            Some("k8s://default/cert#tls.key?sha256=new")
+        );
+        assert_eq!(
+            merged.frontend_tls_source_namespace.as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn merge_k8s_translation_preserves_namespace_scoped_gateway_frontend_tls() {
+        let active = GatewayConfig {
+            frontend_tls_cert_path: Some("/etc/ferrum/operator.crt".to_string()),
+            frontend_tls_key_path: Some("/etc/ferrum/operator.key".to_string()),
+            frontend_tls_source_namespace: None,
+            ..GatewayConfig::default()
+        };
+        let k8s = GatewayConfig {
+            frontend_tls_cert_path: Some("k8s://ns-a/cert#tls.crt?sha256=a".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-a/cert#tls.key?sha256=a".to_string()),
+            frontend_tls_source_namespace: Some("ns-a".to_string()),
+            frontend_tls_namespace_sources: vec![
+                FrontendTlsNamespaceSource {
+                    namespace: "ns-a".to_string(),
+                    cert_path: "k8s://ns-a/cert#tls.crt?sha256=a".to_string(),
+                    key_path: "k8s://ns-a/cert#tls.key?sha256=a".to_string(),
+                },
+                FrontendTlsNamespaceSource {
+                    namespace: "ns-b".to_string(),
+                    cert_path: "k8s://ns-b/cert#tls.crt?sha256=b".to_string(),
+                    key_path: "k8s://ns-b/cert#tls.key?sha256=b".to_string(),
+                },
+            ],
+            ..GatewayConfig::default()
+        };
+
+        let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
+
+        assert_eq!(merged.frontend_tls_namespace_sources.len(), 2);
+        assert!(
+            merged
+                .frontend_tls_namespace_sources
+                .iter()
+                .any(|source| source.namespace == "ns-a")
+        );
+        assert!(
+            merged
+                .frontend_tls_namespace_sources
+                .iter()
+                .any(|source| source.namespace == "ns-b")
+        );
     }
 
     #[test]

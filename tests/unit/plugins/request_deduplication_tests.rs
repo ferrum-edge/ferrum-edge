@@ -1,3 +1,10 @@
+use bytes::Bytes;
+use ferrum_edge::_test_support::{
+    request_deduplication_completed_size_snapshot_for_test,
+    request_deduplication_expire_completed_entries_for_test,
+    request_deduplication_redis_cached_response_payload_is_valid,
+    request_deduplication_redis_payload_for_test,
+};
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
@@ -7,8 +14,100 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
+const DEDUP_KEY_METADATA: &str = "_dedup_key";
+const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
+
 fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), key.to_string());
+    headers.insert("host".to_string(), host.to_string());
+    headers.insert("content-length".to_string(), body_len.to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
+fn body_ctx(method: &str, path: &str, body: &'static [u8]) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::from_static(body));
+    ctx
+}
+
+fn gzip_body(body: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).expect("gzip write failed");
+    encoder.finish().expect("gzip finish failed")
+}
+
+async fn complete_response(plugin: &RequestDeduplication, ctx: &mut RequestContext) {
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .on_final_response_body(ctx, 201, &response_headers, b"{\"ok\":true}")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+async fn complete_response_with_body(
+    plugin: &RequestDeduplication,
+    ctx: &mut RequestContext,
+    body: &[u8],
+) {
+    let response_headers = HashMap::new();
+    let result = plugin
+        .on_final_response_body(ctx, 200, &response_headers, body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+fn assert_completed_size_exact(plugin: &RequestDeduplication) -> usize {
+    let (tracked, actual) = request_deduplication_completed_size_snapshot_for_test(plugin);
+    assert_eq!(
+        tracked, actual,
+        "tracked completed-response bytes must match retained completed entries"
+    );
+    tracked
+}
+
+fn assert_fingerprint_conflict(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(body.contains("different request"), "body was {body}");
+        }
+        other => panic!("Expected fingerprint mismatch conflict, got {other:?}"),
+    }
+}
+
+async fn assert_reused_key_for_different_request_conflicts(
+    first_ctx: &mut RequestContext,
+    first_headers: &mut HashMap<String, String>,
+    second_ctx: &mut RequestContext,
+    second_headers: &mut HashMap<String, String>,
+) {
+    let plugin = make_plugin(json!({
+        "applicable_methods": ["POST", "PUT", "PATCH"]
+    }));
+
+    let result = plugin.before_proxy(first_ctx, first_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response(&plugin, first_ctx).await;
+
+    let result = plugin.before_proxy(second_ctx, second_headers).await;
+    assert_fingerprint_conflict(result);
 }
 
 #[test]
@@ -22,7 +121,9 @@ fn test_new_default_config() {
     assert!(!plugin.is_auth_plugin());
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
-    assert!(!plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.needs_request_body_bytes());
 }
 
 #[test]
@@ -60,6 +161,10 @@ fn test_new_rejects_invalid_numeric_and_bool_types() {
         json!({"inflight_ttl_seconds": "300"}),
         json!({"max_entries": "100"}),
         json!({"max_entries": 0}),
+        json!({"max_entry_size_bytes": "1024"}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": "1048576"}),
+        json!({"max_total_size_bytes": 0}),
         json!({"scope_by_consumer": "true"}),
         json!({"enforce_required": "false"}),
     ] {
@@ -418,6 +523,179 @@ fn test_requires_response_body_buffering() {
     assert!(plugin.requires_response_body_buffering());
 }
 
+#[tokio::test]
+async fn test_response_buffering_only_for_fresh_dedup_keys() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut get_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut get_headers = HashMap::new();
+    get_headers.insert("idempotency-key".to_string(), "get-key".to_string());
+    let result = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&get_ctx));
+
+    let mut keyless_post_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut keyless_post_headers = HashMap::new();
+    let result = plugin
+        .before_proxy(&mut keyless_post_ctx, &mut keyless_post_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&keyless_post_ctx));
+
+    let mut keyed_post_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut keyed_post_headers = HashMap::new();
+    keyed_post_headers.insert("idempotency-key".to_string(), "post-key".to_string());
+    let result = plugin
+        .before_proxy(&mut keyed_post_ctx, &mut keyed_post_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&keyed_post_ctx));
+}
+
+#[tokio::test]
+async fn test_response_buffering_releases_event_stream_content_type() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "stream-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+}
+
+/// A keyed request whose response is streamed as `text/event-stream` is handed
+/// to the client incrementally, so `on_final_response_body` (which transitions
+/// the `InFlight` marker to a cached `Completed` entry) never runs. The marker
+/// is intentionally kept in-flight for the lifetime of the stream — there is no
+/// plugin hook for streamed-body completion, and releasing it at response-headers
+/// time would let a concurrent duplicate mutating request reach the backend while
+/// the original stream is still running. While the stream is active a duplicate
+/// key must therefore still 409.
+#[tokio::test]
+async fn test_streamed_event_stream_keeps_inflight_marker_for_stream_lifetime() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    // The fresh key is marked in-flight and stays that way for the stream.
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(ctx.metadata.contains_key("_dedup_key"));
+
+    // The SSE response is streamed (not buffered), confirmed by the content-type
+    // refinement declining to buffer it.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+
+    // A duplicate request arriving while the stream is still active must be
+    // rejected with 409 — the in-flight lock is exactly the protection this
+    // plugin promises for the still-running request.
+    let mut dup_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut dup_headers = HashMap::new();
+    dup_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut dup_ctx, &mut dup_headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "duplicate during an active streamed SSE response must 409, got {result:?}"
+    );
+}
+
+// Note: after a streamed SSE response ends, the `InFlight` marker self-heals
+// once it exceeds `inflight_ttl` (documented to cover the longest protected
+// request, including a long-lived stream) via the staleness branch in
+// `local_lookup_or_mark_inflight`. That path is exercised by the staleness logic
+// generally; a dedicated test here would require either a real >=1s sleep
+// (`inflight_ttl_seconds` is rejected at 0) or injectable time, which this suite
+// deliberately avoids to keep CI fast (see `test_inflight_marker_carries_timestamp`).
+
+/// A buffered (non-SSE) keyed response keeps the marker in-flight through the
+/// header phase and transitions it to a cached `Completed` entry via
+/// `on_final_response_body`, which only runs on the buffered path.
+#[tokio::test]
+async fn test_buffered_response_transitions_inflight_to_completed() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "json-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(ctx.metadata.contains_key("_dedup_key"));
+
+    // A JSON response is buffered (the content-type refinement still votes to
+    // buffer), so `on_final_response_body` runs and caches it.
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    let response_headers = HashMap::new();
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"{}")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
 #[test]
 fn test_tracked_keys_count() {
     let config = json!({});
@@ -470,6 +748,210 @@ async fn test_completion_clears_inflight_then_replays() {
             "Expected RejectBinary replay after completion, got {:?}",
             result
         ),
+    }
+}
+
+#[tokio::test]
+async fn test_response_below_entry_limit_is_retained() {
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert(
+        "idempotency-key".to_string(),
+        "below-entry-limit".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"small retained response").await;
+    assert!(assert_completed_size_exact(&plugin) > 0);
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert(
+        "idempotency-key".to_string(),
+        "below-entry-limit".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(
+        result,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn test_oversized_response_is_not_retained_and_clears_inflight() {
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "oversized-entry".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"too large").await;
+
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "oversized-entry".to_string());
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "oversized completion must clear in-flight state so the next request can execute"
+    );
+}
+
+#[tokio::test]
+async fn test_total_retained_bytes_cap_skips_new_completion() {
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 768
+    }));
+    let body = vec![b'a'; 500];
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "total-cap-a".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, &body).await;
+    let first_size = assert_completed_size_exact(&plugin);
+    assert!(
+        first_size <= 768,
+        "first entry should fit under the configured total cap, got {first_size}"
+    );
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "total-cap-b".to_string());
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx2, &body).await;
+
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(assert_completed_size_exact(&plugin), first_size);
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert("idempotency-key".to_string(), "total-cap-b".to_string());
+    let result = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "total-cap skip must clear the skipped key's in-flight marker"
+    );
+
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 200, HashMap::new(), &body).is_some(),
+        "a local total-cap skip must still be small enough for Redis publication"
+    );
+}
+
+#[tokio::test]
+async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
+    let plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 768
+    }));
+    let body = vec![b'a'; 500];
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-a".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, &body).await;
+    let first_size = assert_completed_size_exact(&plugin);
+    assert!(
+        first_size <= 768,
+        "first entry should fit under the configured total cap, got {first_size}"
+    );
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-b".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx2, &body).await;
+
+    assert_eq!(assert_completed_size_exact(&plugin), first_size);
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-b".to_string(),
+    );
+    let result = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 409),
+        other => {
+            panic!("Expected Redis publish failure to preserve local in-flight lock, got {other:?}")
+        }
     }
 }
 
@@ -528,6 +1010,43 @@ async fn test_completed_entries_evict_over_capacity_on_insert() {
     }
 
     assert_eq!(plugin.tracked_keys_count(), Some(2));
+    assert!(assert_completed_size_exact(&plugin) > 0);
+}
+
+#[tokio::test]
+async fn test_expired_completed_entries_release_retained_bytes() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "expires-size".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"expires").await;
+    assert!(assert_completed_size_exact(&plugin) > 0);
+
+    request_deduplication_expire_completed_entries_for_test(&plugin);
+
+    let mut cleanup_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut cleanup_headers = HashMap::new();
+    cleanup_headers.insert("idempotency-key".to_string(), "cleanup-trigger".to_string());
+    let result = plugin
+        .before_proxy(&mut cleanup_ctx, &mut cleanup_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
 }
 
 #[tokio::test]
@@ -795,4 +1314,753 @@ async fn test_replay_strips_set_cookie_case_insensitively() {
         }
         other => panic!("Expected RejectBinary replay, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
+    let plugin = make_plugin(json!({}));
+
+    let mut keyed_post = body_ctx("POST", "/api", b"{\"a\":1}");
+    keyed_post.headers = keyed_headers("body-key", "api.example", 7);
+    assert!(plugin.should_buffer_request_body(&keyed_post));
+
+    let keyless_without_declared_body = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&keyless_without_declared_body),
+        "keyless optional requests must not lose streaming semantics"
+    );
+
+    let mut keyless_declared_body = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    keyless_declared_body
+        .headers
+        .insert("content-length".to_string(), "7".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&keyless_declared_body),
+        "keyless optional requests must not be rejected by body buffering limits before this plugin ignores them"
+    );
+
+    let required_keyless = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let required_plugin = make_plugin(json!({
+        "enforce_required": true
+    }));
+    assert!(required_plugin.should_buffer_request_body(&required_keyless));
+
+    let mut keyed_get = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    keyed_get.headers = keyed_headers("body-key", "api.example", 0);
+    assert!(!plugin.should_buffer_request_body(&keyed_get));
+}
+
+#[tokio::test]
+async fn test_keyed_idempotency_header_can_fingerprint_prebuffered_body() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx = body_ctx("POST", "/api", b"{\"a\":1}");
+    ctx.headers
+        .insert("content-length".to_string(), "7".to_string());
+    ctx.headers
+        .insert("idempotency-key".to_string(), "transformed-key".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "declared-body applicable requests must prebuffer before earlier plugins can add the key"
+    );
+
+    let mut headers = keyed_headers("transformed-key", "api.example", 7);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key(DEDUP_FINGERPRINT_METADATA));
+}
+
+#[tokio::test]
+async fn test_keyed_idempotency_header_buffers_implicit_http2_body() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "idempotency-key".to_string(),
+        "implicit-body-key".to_string(),
+    );
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "keyed HTTP/2 and HTTP/3 POST bodies may arrive without length or transfer headers"
+    );
+}
+
+#[tokio::test]
+async fn test_identical_request_bodies_replay_cached_response() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx1 = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut headers1 = keyed_headers("same-body", "api.example", 11);
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response(&plugin, &mut ctx1).await;
+
+    let mut ctx2 = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut headers2 = keyed_headers("same-body", "api.example", 11);
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(&body[..], b"{\"ok\":true}");
+        }
+        other => panic!("Expected replay for identical body, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_reused_key_different_method_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("method-key", "api.example", 11);
+    let mut second_ctx = body_ctx("PUT", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("method-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_authority_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("authority-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("authority-key", "other.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_authority_case_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("authority-case-key", "API.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("authority-case-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_raw_path_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders/1", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("path-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders/2", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("path-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_raw_query_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.set_raw_query_string("a=1&a=2".to_string());
+    let mut first_headers = keyed_headers("query-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.set_raw_query_string("a=2&a=1".to_string());
+    let mut second_headers = keyed_headers("query-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_route_affecting_header_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("route-header-key", "api.example", 11);
+    first_headers.insert("x-canary".to_string(), "blue".to_string());
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("route-header-key", "api.example", 11);
+    second_headers.insert("x-canary".to_string(), "green".to_string());
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_reused_key_different_client_trace_headers_replays() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("synthetic-key", "api.example", 11);
+    first_headers.insert(
+        "traceparent".to_string(),
+        "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
+    );
+    first_headers.insert("x-request-id".to_string(), "request-a".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("synthetic-key", "api.example", 11);
+    second_headers.insert(
+        "traceparent".to_string(),
+        "00-33333333333333333333333333333333-4444444444444444-01".to_string(),
+    );
+    second_headers.insert("x-request-id".to_string(), "request-b".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_scoped_credential_rotation_replays_cached_response() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut first_headers = keyed_headers("credential-rotation-key", "api.example", 11);
+    first_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    first_headers.insert("cookie".to_string(), "session=old".to_string());
+    first_headers.insert("x-api-key".to_string(), "old-api-key".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut second_headers = keyed_headers("credential-rotation-key", "api.example", 11);
+    second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+    second_headers.insert("cookie".to_string(), "session=new".to_string());
+    second_headers.insert("x-api-key".to_string(), "new-api-key".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_unscoped_credentials_remain_in_fingerprint() {
+    let plugin = make_plugin(json!({
+        "scope_by_consumer": false
+    }));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut first_headers = keyed_headers("unscoped-credential-key", "api.example", 11);
+    first_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.authenticated_identity = Some("consumer-1".to_string());
+    let mut second_headers = keyed_headers("unscoped-credential-key", "api.example", 11);
+    second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_anonymous_credentials_remain_in_fingerprint() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("anonymous-credential-key", "api.example", 11);
+    first_headers.insert("authorization".to_string(), "Bearer old-token".to_string());
+    first_headers.insert("cookie".to_string(), "session=old".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("anonymous-credential-key", "api.example", 11);
+    second_headers.insert("authorization".to_string(), "Bearer new-token".to_string());
+    second_headers.insert("cookie".to_string(), "session=new".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_reused_key_different_connection_listed_header_returns_409() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("connection-key", "api.example", 11);
+    first_headers.insert("connection".to_string(), "x-debug-route".to_string());
+    first_headers.insert("x-debug-route".to_string(), "blue".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("connection-key", "api.example", 11);
+    second_headers.insert("connection".to_string(), "x-debug-route".to_string());
+    second_headers.insert("x-debug-route".to_string(), "green".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_reused_key_different_content_length_replays() {
+    let plugin = make_plugin(json!({}));
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("content-length-key", "api.example", 11);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut second_headers = keyed_headers("content-length-key", "api.example", 11);
+    second_headers.insert("content-length".to_string(), "999".to_string());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_reused_key_equivalent_gzip_body_replays() {
+    let plugin = make_plugin(json!({}));
+    let logical_body = br#"{"order":1}"#;
+    let compressed_body = gzip_body(logical_body);
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    first_ctx.request_body_bytes = Some(Bytes::from(compressed_body.clone()));
+    let mut first_headers = keyed_headers("gzip-body-key", "api.example", compressed_body.len());
+    first_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", logical_body);
+    let mut second_headers = keyed_headers("gzip-body-key", "api.example", logical_body.len());
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::RejectBinary { .. }));
+}
+
+#[tokio::test]
+async fn test_large_gzip_body_uses_wire_fingerprint_fallback() {
+    let plugin = make_plugin(json!({}));
+    let logical_body = vec![b'a'; 1024 * 1024 + 1];
+    let compressed_body = gzip_body(&logical_body);
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    first_ctx.request_body_bytes = Some(Bytes::from(compressed_body.clone()));
+    let mut first_headers =
+        keyed_headers("large-gzip-body-key", "api.example", compressed_body.len());
+    first_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    second_ctx.request_body_bytes = Some(Bytes::from(logical_body));
+    let mut second_headers = keyed_headers("large-gzip-body-key", "api.example", 1024 * 1024 + 1);
+
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_unsupported_content_encoding_stays_in_fingerprint() {
+    let plugin = make_plugin(json!({}));
+    let body = b"same wire bytes";
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", body);
+    let mut first_headers = keyed_headers("unsupported-encoding-key", "api.example", body.len());
+    first_headers.insert("content-encoding".to_string(), "deflate".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", body);
+    let mut second_headers = keyed_headers("unsupported-encoding-key", "api.example", body.len());
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_malformed_supported_content_encoding_stays_in_fingerprint() {
+    let plugin = make_plugin(json!({}));
+    let body = b"not actually gzip";
+
+    let mut first_ctx = body_ctx("POST", "/api/orders", body);
+    let mut first_headers = keyed_headers("malformed-encoding-key", "api.example", body.len());
+    first_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", body);
+    let mut second_headers = keyed_headers("malformed-encoding-key", "api.example", body.len());
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert_fingerprint_conflict(result);
+}
+
+#[tokio::test]
+async fn test_reused_key_different_body_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    let mut first_headers = keyed_headers("body-key", "api.example", 11);
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":2}");
+    let mut second_headers = keyed_headers("body-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_declared_body_unavailable_rejects_fingerprinting() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/orders".to_string(),
+    );
+    let mut headers = keyed_headers("missing-body", "api.example", 12);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("Request body unavailable"));
+        }
+        other => panic!("Expected body-unavailable reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_legacy_redis_cached_response_without_fingerprint_is_rejected() {
+    let legacy = br#"{"status_code":201,"headers":{},"body":[]}"#;
+
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(legacy));
+}
+
+#[test]
+fn test_legacy_redis_cached_response_byte_array_body_is_accepted() {
+    let legacy = br#"{"fingerprint":"sha256-test","status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
+
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(legacy));
+}
+
+#[test]
+fn test_redis_payload_admission_respects_entry_size_limit() {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 2048
+    }));
+    let payload = request_deduplication_redis_payload_for_test(
+        &plugin,
+        201,
+        headers.clone(),
+        b"{\"ok\":true}",
+    )
+    .expect("small Redis payload should be admitted");
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1
+    }));
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 201, headers, b"{\"ok\":true}")
+            .is_none(),
+        "oversized responses must not be serialized for Redis storage"
+    );
+}
+
+#[test]
+fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+
+    let max_entry_size_bytes = 256 * 1024;
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": max_entry_size_bytes
+    }));
+    let body = vec![0xab; 160 * 1024];
+    let payload = request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body)
+        .expect("compact Redis payload should be admitted under the entry limit");
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&payload).expect("payload should be JSON");
+
+    assert!(
+        payload_json
+            .get("body")
+            .is_some_and(serde_json::Value::is_string),
+        "Redis response bodies must serialize as compact base64 strings"
+    );
+    assert!(
+        payload.len() <= max_entry_size_bytes,
+        "compact Redis payload should remain under the configured entry cap"
+    );
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
+}
+
+#[test]
+fn test_redis_payload_admission_rejects_serialized_payload_over_entry_limit() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1024 * 1024
+    }));
+    let body = vec![0xab; 800 * 1024];
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body).is_none(),
+        "Redis payloads must be rejected when serialized storage exceeds the entry cap"
+    );
+}
+
+#[tokio::test]
+async fn test_delimiter_containing_identities_and_keys_do_not_collide() {
+    let plugin = make_plugin(json!({
+        "scope_by_consumer": true
+    }));
+
+    let mut ctx1 = body_ctx("POST", "/api/orders", b"{}");
+    ctx1.authenticated_identity = Some("alice:tenant".to_string());
+    let mut headers1 = keyed_headers("key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut ctx2 = body_ctx("POST", "/api/orders", b"{}");
+    ctx2.authenticated_identity = Some("alice".to_string());
+    let mut headers2 = keyed_headers("tenant:key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    assert_ne!(key1, key2);
+    assert!(!key1.contains("alice"));
+    assert!(!key1.contains("key"));
+    assert!(!key2.contains("tenant"));
+}
+
+#[tokio::test]
+async fn test_peer_spiffe_id_scopes_logical_key() {
+    let plugin = make_plugin(json!({}));
+
+    let mut ctx1 = body_ctx("POST", "/api/orders", b"{}");
+    ctx1.peer_spiffe_id = Some(
+        ferrum_edge::identity::SpiffeId::new("spiffe://mesh.local/ns/blue/sa/default")
+            .expect("valid SPIFFE ID"),
+    );
+    let mut headers1 = keyed_headers("mesh-key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut ctx2 = body_ctx("POST", "/api/orders", b"{}");
+    ctx2.peer_spiffe_id = Some(
+        ferrum_edge::identity::SpiffeId::new("spiffe://mesh.local/ns/green/sa/default")
+            .expect("valid SPIFFE ID"),
+    );
+    let mut headers2 = keyed_headers("mesh-key", "api.example", 2);
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    assert_ne!(key1, key2);
+    assert!(!key1.contains("blue"));
+    assert!(!key2.contains("green"));
+}
+
+#[tokio::test]
+async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = body_ctx("POST", "/api/orders", b"super-secret-body");
+    ctx.authenticated_identity = Some("identity-secret".to_string());
+    let mut headers = keyed_headers("secret-idempotency-key", "api.example", 17);
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer request-secret-token".to_string(),
+    );
+    headers.insert("cookie".to_string(), "session=request-secret".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let logical_key = ctx.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let fingerprint = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA).unwrap();
+    assert!(logical_key.starts_with("v2:"));
+    assert!(fingerprint.starts_with("sha256-"));
+    for secret in [
+        "super-secret-body",
+        "secret-idempotency-key",
+        "identity-secret",
+        "request-secret-token",
+        "request-secret",
+    ] {
+        assert!(!logical_key.contains(secret));
+        assert!(!fingerprint.contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn test_local_and_redis_modes_compute_identical_request_identity() {
+    let local_plugin = make_plugin(json!({}));
+    let redis_plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1
+    }));
+
+    let mut local_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    local_ctx.set_raw_query_string("expand=items".to_string());
+    let mut local_headers = keyed_headers("shared-key", "api.example", 11);
+    let local_result = local_plugin
+        .before_proxy(&mut local_ctx, &mut local_headers)
+        .await;
+    assert!(matches!(local_result, PluginResult::Continue));
+
+    let mut redis_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    redis_ctx.set_raw_query_string("expand=items".to_string());
+    let mut redis_headers = keyed_headers("shared-key", "api.example", 11);
+    let redis_result = redis_plugin
+        .before_proxy(&mut redis_ctx, &mut redis_headers)
+        .await;
+    assert!(matches!(redis_result, PluginResult::Continue));
+
+    assert_eq!(
+        local_ctx.metadata.get(DEDUP_KEY_METADATA),
+        redis_ctx.metadata.get(DEDUP_KEY_METADATA)
+    );
+    assert_eq!(
+        local_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA),
+        redis_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA)
+    );
 }

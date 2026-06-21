@@ -742,6 +742,15 @@ impl MetricsRegistry {
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
+        let mesh_key = prometheus_helpers::mesh_request_key(summary);
+        self.record_with_mesh_key(summary, mesh_key.as_ref());
+    }
+
+    pub fn record_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+    ) {
         // Mirror/shadow summaries represent internal backend probes rather
         // than client-facing proxy results. They must not affect normal
         // request counters/histograms exposed on unauthenticated /metrics.
@@ -781,7 +790,8 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
-        if let Some(mesh_key) = prometheus_helpers::mesh_request_key(summary) {
+        if let Some(mesh_key) = mesh_key {
+            let mesh_key = mesh_key.clone();
             self.mesh_request_counter
                 .entry(mesh_key.clone())
                 .or_insert_with(|| TimestampedCounter::new(self.epoch))
@@ -1665,6 +1675,14 @@ impl Plugin for PrometheusMetrics {
 
     async fn log(&self, summary: &TransactionSummary) {
         self.registry.record(summary);
+    }
+
+    async fn log_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+    ) {
+        self.registry.record_with_mesh_key(summary, mesh_key);
     }
 }
 
