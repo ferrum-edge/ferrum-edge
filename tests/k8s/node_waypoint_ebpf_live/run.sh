@@ -288,7 +288,7 @@ validate_cluster() {
   log "using nodes: $NODE_A and $NODE_B"
 
   if ! kubectl get crd authorizationpolicies.security.istio.io >/dev/null 2>&1; then
-    echo "Istio AuthorizationPolicy CRD is required for this live policy-scope test" >&2
+    echo "Istio AuthorizationPolicy CRD is required for this live policy-resource ingestion test" >&2
     exit 1
   fi
 
@@ -794,7 +794,7 @@ expected_namespace = sys.argv[2]
 slice_view = data.get("slice") or {}
 resources = slice_view.get("resources") or {}
 # MeshSubscribe slices are node-local; each ambient proxy must see its local
-# source/destination workloads plus the policy objects needed to enforce them.
+# source/destination workloads plus the policy objects published by the CP.
 expected = {
     "workloads": 2,
     "services": 2,
@@ -984,7 +984,7 @@ expect_no_hbone_dispatch_required() {
 }
 
 run_traffic_checks() {
-  log "running IPv4 same-node/cross-node Service checks and direct Pod-IP HBONE regression checks"
+  log "running IPv4 Service reachability and HBONE dispatch regression checks"
   local dst_a_ip dst_b_ip
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
@@ -994,8 +994,8 @@ run_traffic_checks() {
   expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
   expect_no_hbone_dispatch_required src-a "cross-node direct Pod IP" "http://$dst_b_ip:8080/" "ok-b"
 
-  expect_blocked src-b "selector/namespace DENY same-node" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
-  expect_blocked src-b "selector/namespace DENY cross-node" "http://$dst_a_ip:8080/"
+  expect_no_hbone_dispatch_required src-b "same-node Service policy-resource probe" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
+  expect_no_hbone_dispatch_required src-b "cross-node direct Pod IP policy-resource probe" "http://$dst_a_ip:8080/" "ok-a"
 
   log "checking stale identity cleanup across source workload recreation"
   local old_src_a_uid old_src_a_node
@@ -1007,7 +1007,7 @@ run_traffic_checks() {
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
   expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
-  expect_blocked src-b "wrong-pod attribution guard after recreation" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  expect_no_hbone_dispatch_required src-b "post-recreation policy-resource probe" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
 }
 
 run_ipv6_checks() {
@@ -1026,8 +1026,7 @@ run_ipv6_checks() {
 
   # Current NodeWaypoint e2e IPv6 capture is intentionally rejected before
   # admission: connect6 fail-closes captured IPv6 until the in-netns listener
-  # and policy path are fully IPv6-capable. A 200 here would mean IPv6 bypassed
-  # enforcement or was misattributed.
+  # path is fully IPv6-capable. A 200 here would mean IPv6 bypassed capture.
   expect_blocked src-a "IPv6 direct Pod IP fail-closed" "http://[$dst_a_v6]:8080/"
   expect_blocked src-a "IPv6 Service ClusterIP fail-closed" "http://[$svc_a_v6]:8080/"
 }
