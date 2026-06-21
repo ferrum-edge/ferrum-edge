@@ -124,10 +124,20 @@ async fn full_load_late_query_failure_rejects_candidate() {
     let (store, _temp_dir) = sqlite_store().await;
     seed_runtime_row_set(&store, 0).await;
 
+    let mut conn = store
+        .pool()
+        .acquire()
+        .await
+        .expect("SQLite connection acquisition must succeed");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .expect("disabling SQLite foreign key checks must succeed");
     sqlx::query("DROP TABLE upstreams")
-        .execute(&store.pool())
+        .execute(&mut *conn)
         .await
         .expect("dropping upstreams table must succeed");
+    drop(conn);
 
     let error = match store.load_full_config("ferrum").await {
         Ok(_) => panic!("late table failure must reject the full-load candidate"),
