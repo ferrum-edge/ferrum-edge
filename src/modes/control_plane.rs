@@ -12,6 +12,7 @@
 
 use arc_swap::ArcSwap;
 use futures_util::TryStreamExt;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -316,13 +317,18 @@ fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
 async fn load_incremental_config_multi(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
-    after_sequence: u64,
-) -> Result<IncrementalResult, anyhow::Error> {
+    after_sequences: &HashMap<String, u64>,
+) -> Result<(IncrementalResult, HashMap<String, u64>), anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        return db.load_incremental_config(ns, after_sequence).await;
+        let after_sequence = after_sequences.get(ns).copied().unwrap_or(0);
+        let result = db.load_incremental_config(ns, after_sequence).await?;
+        let mut next_sequences = after_sequences.clone();
+        next_sequences.insert(ns.to_string(), result.sequence_cursor);
+        return Ok((result, next_sequences));
     }
 
+    let mut next_sequences = after_sequences.clone();
     let mut combined = IncrementalResult {
         added_or_modified_proxies: Vec::new(),
         removed_proxy_ids: Vec::new(),
@@ -332,11 +338,17 @@ async fn load_incremental_config_multi(
         removed_plugin_config_ids: Vec::new(),
         added_or_modified_upstreams: Vec::new(),
         removed_upstream_ids: Vec::new(),
-        sequence_cursor: after_sequence,
+        sequence_cursor: namespaces
+            .iter()
+            .filter_map(|ns| after_sequences.get(ns).copied())
+            .max()
+            .unwrap_or(0),
         poll_timestamp: chrono::Utc::now(),
     };
     for ns in namespaces {
+        let after_sequence = after_sequences.get(ns).copied().unwrap_or(0);
         let mut delta = db.load_incremental_config(ns, after_sequence).await?;
+        next_sequences.insert(ns.clone(), delta.sequence_cursor);
         combined
             .added_or_modified_proxies
             .append(&mut delta.added_or_modified_proxies);
@@ -364,7 +376,7 @@ async fn load_incremental_config_multi(
         combined.sequence_cursor = combined.sequence_cursor.max(delta.sequence_cursor);
         combined.poll_timestamp = combined.poll_timestamp.min(delta.poll_timestamp);
     }
-    Ok(combined)
+    Ok((combined, next_sequences))
 }
 
 /// Load and merge per-namespace `GatewayConfig`s into a single combined config.
@@ -405,13 +417,16 @@ async fn load_full_config_multi(
 async fn load_full_config_multi_with_sequence(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
-) -> Result<(GatewayConfig, u64), anyhow::Error> {
-    let mut sequence = 0;
+) -> Result<(GatewayConfig, HashMap<String, u64>), anyhow::Error> {
+    let mut sequences = HashMap::new();
+    if namespaces.is_empty() {
+        sequences.insert("ferrum".to_string(), db.latest_change_sequence("ferrum").await?);
+    }
     for ns in namespaces {
-        sequence = sequence.max(db.latest_change_sequence(ns).await?);
+        sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
     }
     let config = load_full_config_multi(db, namespaces).await?;
-    Ok((config, sequence))
+    Ok((config, sequences))
 }
 
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
@@ -697,7 +712,8 @@ pub async fn run(
         );
     }
 
-    let config = load_full_config_multi(db.as_ref(), &polled_namespaces).await?;
+    let (config, initial_change_sequences) =
+        load_full_config_multi_with_sequence(db.as_ref(), &polled_namespaces).await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers, {} plugins, {} upstreams across {} namespace(s)",
         config.proxies.len(),
@@ -1230,7 +1246,7 @@ pub async fn run(
 
         let initial_config = config_poll.load_full();
         let mut last_gateway_trust_bundles = initial_config.trust_bundles.clone();
-        let mut last_change_sequence: Option<u64> = None;
+        let mut last_change_sequences = initial_change_sequences;
 
         loop {
             tokio::select! {
@@ -1299,10 +1315,10 @@ pub async fn run(
                         )
                         .await;
                         match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
-                            Ok((new_config, sequence)) => {
+                            Ok((new_config, sequences)) => {
                                 // Treat pool swap as a new source snapshot.
                                 last_gateway_trust_bundles = new_config.trust_bundles.clone();
-                                last_change_sequence = Some(sequence);
+                                last_change_sequences = sequences;
                                 let new_config_arc = Arc::new(new_config.clone());
                                 config_poll.store(new_config_arc.clone());
                                 last_polled_namespaces = nslist.clone();
@@ -1338,7 +1354,7 @@ pub async fn run(
                                 continue;
                             }
                         }
-                    } else if let Some(after_sequence) = last_change_sequence {
+                    } else {
                         // Resolve the polled namespace list. For `Single`
                         // / `Set` this is the explicit list (no DB call).
                         // For `All`, authoritative namespace discovery runs
@@ -1365,21 +1381,20 @@ pub async fn run(
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
                             &nslist,
-                            after_sequence,
+                            &last_change_sequences,
                         )
                         .await
                         {
-                            Ok(result) => {
+                            Ok((result, next_change_sequences)) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
-                                    let next_sequence = result.sequence_cursor;
                                     let source_trust_bundles = match db_poll
                                         .load_gateway_trust_bundles(&poll_namespace)
                                         .await
                                     {
                                         Ok(GatewayTrustBundlePoll::Unchanged) => {
-                                            last_change_sequence = Some(next_sequence);
+                                            last_change_sequences = next_change_sequences;
                                             continue;
                                         }
                                         Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
@@ -1423,11 +1438,10 @@ pub async fn run(
                                         last_gateway_trust_bundles =
                                             source_trust_bundles;
                                     }
-                                    last_change_sequence = Some(next_sequence);
+                                    last_change_sequences = next_change_sequences;
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
-                                let next_sequence = result.sequence_cursor;
 
                                 // Apply delta to a cloned config, then validate
                                 // before broadcasting or advancing the sequence cursor.
@@ -1576,7 +1590,7 @@ pub async fn run(
                                     partitions.len(),
                                     version
                                 );
-                                last_change_sequence = Some(next_sequence);
+                                last_change_sequences = next_change_sequences;
                             }
                             Err(e) => {
                                 warn!(
@@ -1585,10 +1599,10 @@ pub async fn run(
                                 );
                                 // Fallback to full config load + full snapshot broadcast
                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
-                                    Ok((new_config, sequence)) => {
+                                    Ok((new_config, sequences)) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         last_polled_namespaces = nslist.clone();
-                                        last_change_sequence = Some(sequence);
+                                        last_change_sequences = sequences;
                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
@@ -1610,10 +1624,10 @@ pub async fn run(
                                         match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
                                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
-                                                    Ok((new_config, sequence)) => {
+                                                    Ok((new_config, sequences)) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         last_polled_namespaces = nslist.clone();
-                                                        last_change_sequence = Some(sequence);
+                                                        last_change_sequences = sequences;
                                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
