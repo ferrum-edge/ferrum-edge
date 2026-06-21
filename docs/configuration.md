@@ -91,7 +91,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 |---|---|---|---|
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string. For MongoDB: `mongodb://` or `mongodb+srv://` |
-| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
+| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to a full runtime reload on error. SQL full reloads use transaction-scoped keyset pagination, and MongoDB replica-set full reloads use snapshot transactions; failed candidates keep the last known-good runtime config active. |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use primary. MongoDB read preferences are ignored by Ferrum's config store |
