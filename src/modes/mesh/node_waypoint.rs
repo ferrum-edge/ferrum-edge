@@ -1,9 +1,13 @@
 //! Node-waypoint identity resolution.
 //!
-//! In node-waypoint topology one proxy listener accepts traffic for many pods.
-//! The node-agent/eBPF side records the socket cookie, original destination,
-//! and source pod identity. The proxy resolves that cookie at accept time and
-//! rejects unknown cookies before the request enters the plugin chain.
+//! In node-waypoint topology the proxy accepts captured pod traffic either on a
+//! shared listener or on one in-netns listener per pod. The node-agent/eBPF side
+//! records the socket cookie, original destination, and source pod identity.
+//! Shared listeners resolve that cookie at accept time and reject unknown
+//! cookies before the request enters the plugin chain. Pod-specific in-netns
+//! listeners also carry the expected pod UID; when the accept-side cookie bridge
+//! cannot recover a cookie record, they admit only if the current slice still
+//! maps that exact pod UID to a workload identity.
 //!
 //! ## Hot-path contract
 //!
@@ -19,10 +23,9 @@
 //!    against its `identities_by_hash` gate, re-validating that the control
 //!    plane still vouches for the resolved workload (fail closed if it was
 //!    removed) and, from the SAME load, deriving the per-pod policy scope by
-//!    pod UID (`scopes_by_pod_uid`, with a SPIFFE-keyed fallback for uid-less
-//!    VM workloads). No allocation; the same loaded generation serves the
-//!    cached and lazy-enrollment branches AND the returned scope, so a reader
-//!    can never pair a new gate with an old/missing scope.
+//!    pod UID (`scopes_by_pod_uid`). No allocation; the same loaded generation
+//!    serves the cached and lazy-enrollment branches AND the returned scope, so a
+//!    reader can never pair a new gate with an old/missing scope.
 //! 5. One `Arc::clone` (~5 ns) to hand the identity to the connection task.
 //!
 //! Both hot-path DashMaps are sized via `crate::util::sharding::pool_shard_amount`
@@ -34,11 +37,11 @@
 //! gate: the accept path receives `(identity, scope)` from one `resolve_*`
 //! call (one slice load). The HTTP/HBONE request path re-derives scope per
 //! request via [`NodeWaypointIdentityResolver::policy_scope_for_pod`] — one
-//! `ArcSwap::load` then a `scopes_by_pod_uid` lookup (SPIFFE fallback for
-//! uid-less workloads) — so a workload whose SPIFFE hash is unchanged but whose
-//! scope changed is served the scope from the very generation that re-vouched
-//! for it. Keying scope by pod UID (not SPIFFE) means pods that share a service
-//! account but carry different labels are scoped independently.
+//! `ArcSwap::load` then a `scopes_by_pod_uid` lookup — so a workload whose
+//! SPIFFE hash is unchanged but whose scope changed is served the scope from the
+//! very generation that re-vouched for it. Keying scope by pod UID (not SPIFFE)
+//! means pods that share a service account but carry different labels are scoped
+//! independently.
 //! The slice is published as one atomic `ArcSwap` store on slice apply; nothing
 //! is rebuilt in the accept loop.
 //!
@@ -236,6 +239,10 @@ impl NodeWaypointIdentity {
 #[derive(Default)]
 struct NodeWaypointSlice {
     identities_by_hash: std::collections::HashMap<u64, NodeWaypointIdentityGateEntry>,
+    /// Pod UID -> SPIFFE identity for captured pods in this slice generation.
+    /// Used only by pod-specific in-netns listeners whose source pod is already
+    /// fixed by the listener that accepted the connection.
+    spiffe_by_pod_uid: std::collections::HashMap<[u8; 16], SpiffeId>,
     /// Per-pod policy scope keyed by the exact `[u8; 16]` pod UID the eBPF
     /// capture stamps (parsed from each per-pod workload's `metadata.uid`).
     /// Pods that share a SPIFFE but differ in labels get distinct entries, so
@@ -283,6 +290,10 @@ impl NodeWaypointSlice {
             NodeWaypointIdentityGateEntry::Single(spiffe_id) => Some(spiffe_id),
             NodeWaypointIdentityGateEntry::Collision => None,
         }
+    }
+
+    fn spiffe_for_pod_uid(&self, pod_uid: &[u8; 16]) -> Option<&SpiffeId> {
+        self.spiffe_by_pod_uid.get(pod_uid)
     }
 
     /// Resolve a captured pod's policy scope from this one generation, keyed by
@@ -834,6 +845,7 @@ impl NodeWaypointIdentityResolver {
         // UID is skipped (the SPIFFE gate still vouches the identity; scope then
         // falls through to `None` → fail closed when scoped policies exist).
         let mut scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>> = HashMap::new();
+        let mut spiffe_by_pod_uid: HashMap<[u8; 16], SpiffeId> = HashMap::new();
         for workload in &workloads {
             let Some(raw_uid) = workload.pod_uid.as_deref() else {
                 continue;
@@ -842,6 +854,7 @@ impl NodeWaypointIdentityResolver {
                 Ok(uid) => {
                     scopes_by_pod_uid
                         .insert(uid, Arc::new(PolicyScopeCache::from_workload(workload)));
+                    spiffe_by_pod_uid.insert(uid, workload.spiffe_id.clone());
                 }
                 Err(error) => {
                     warn!(
@@ -865,6 +878,7 @@ impl NodeWaypointIdentityResolver {
         NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
                 identities_by_hash,
+                spiffe_by_pod_uid,
                 scopes_by_pod_uid,
             },
         }
@@ -1063,6 +1077,37 @@ impl NodeWaypointIdentityResolver {
             });
         }
         Ok(resolved)
+    }
+
+    /// Resolve identity from a pod-specific in-netns listener's expected pod
+    /// UID. This is a bounded fallback for kernels/topologies where the
+    /// accept-side sock-ops bridge cannot recover the socket cookie: the
+    /// listener is already bound inside one pod netns, and the current slice
+    /// must still contain that exact pod UID before traffic is admitted.
+    pub fn resolve_expected_pod_identity(
+        &self,
+        expected_pod_uid: [u8; 16],
+    ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
+    {
+        if expected_pod_uid == [0; 16] {
+            return Err(NodeWaypointIdentityError::UnknownPod(expected_pod_uid));
+        }
+
+        let slice = self.slice.load();
+        let Some(spiffe_id) = slice.spiffe_for_pod_uid(&expected_pod_uid).cloned() else {
+            return Err(NodeWaypointIdentityError::UnknownPod(expected_pod_uid));
+        };
+        let expected_hash = workload_spiffe_hash(&spiffe_id);
+
+        if let Some(identity) = self.identities_by_pod_uid.get(&expected_pod_uid) {
+            let identity = identity.clone();
+            if identity.spiffe_id == spiffe_id && identity.workload_spiffe_hash == expected_hash {
+                return Ok((identity, slice.scope_for(&expected_pod_uid)));
+            }
+        }
+
+        let identity = self.upsert_identity(NodeWaypointIdentity::new(expected_pod_uid, spiffe_id));
+        Ok((identity, slice.scope_for(&expected_pod_uid)))
     }
 
     /// Resolve an eBPF-stamped `(pod_uid, workload_spiffe_hash)` record to its
@@ -1626,6 +1671,53 @@ mod tests {
                 actual: actual_pod,
             }
         );
+    }
+
+    #[test]
+    fn resolve_expected_pod_identity_lazily_enrolls_from_slice_uid() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::new(),
+            "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        )]);
+
+        assert_eq!(resolver.identity_count(), 0);
+        let (identity, scope) = resolver
+            .resolve_expected_pod_identity(pod_uid)
+            .expect("listener pod UID resolves from current slice");
+
+        assert_eq!(identity.pod_uid, pod_uid);
+        assert_eq!(identity.spiffe_id.as_str(), "spiffe://td/ns/default/sa/api");
+        assert!(
+            scope.is_some(),
+            "listener pod UID fallback must return the per-pod policy scope"
+        );
+        assert_eq!(resolver.identity_count(), 1);
+    }
+
+    #[test]
+    fn resolve_expected_pod_identity_fails_closed_for_uid_absent_from_slice() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let missing_pod = parse_pod_uid("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap();
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::new(),
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        )]);
+
+        let error = match resolver.resolve_expected_pod_identity(missing_pod) {
+            Ok(_) => panic!("absent listener pod UID must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, NodeWaypointIdentityError::UnknownPod(missing_pod));
+        assert_eq!(resolver.identity_count(), 0);
     }
 
     #[test]
@@ -2643,6 +2735,7 @@ mod tests {
         resolver.install_policy_scope_snapshot(NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
                 identities_by_hash,
+                spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
             },
         });
@@ -2703,6 +2796,7 @@ mod tests {
         resolver.install_policy_scope_snapshot(NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
                 identities_by_hash: gate_a,
+                spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
             },
         });
@@ -2717,6 +2811,7 @@ mod tests {
         resolver.install_policy_scope_snapshot(NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
                 identities_by_hash: gate_b,
+                spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
             },
         });

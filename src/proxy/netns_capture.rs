@@ -11,14 +11,18 @@
 //! receive captured traffic from any pod: there is nothing listening on the
 //! pod's own loopback.
 //!
-//! The GAP-2M `sock_ops` cookie bridge has the same requirement from the other
-//! direction: it re-keys the orig-dst record by `(netns cookie, 4-tuple)` at
-//! active-established and recovers it at passive-established using the
-//! accept-side callback's netns cookie. Live kernels may report the proxy
-//! accepting task's netns for that passive callback even though the listener was
-//! bound in the workload netns. The eBPF bridge therefore has a best-effort
-//! any-netns fallback, and this listener passes its expected pod UID into the
-//! accept path so a fallback match is still validated before admission.
+//! The listener itself is scoped to exactly one pod netns, so the accept path
+//! passes the listener's expected pod UID as the primary source-identity gate:
+//! the current mesh slice must still contain that pod UID before traffic is
+//! admitted. The GAP-2M `sock_ops` cookie bridge remains the source of
+//! original-destination metadata when available; it re-keys the orig-dst record
+//! by `(netns cookie, 4-tuple)` at active-established and recovers it at
+//! passive-established using the accept-side callback's netns cookie. Live
+//! kernels may report the proxy accepting task's netns for that passive callback
+//! even though the listener was bound in the workload netns. The eBPF bridge
+//! therefore has a best-effort any-netns fallback, and the accept path still
+//! validates any resolved cookie record against the listener pod UID before
+//! using its original destination.
 //!
 //! # What this does
 //!
@@ -29,8 +33,8 @@
 //! socket. The listening socket's fd is process-global once created, so the
 //! accept loop runs on the shared tokio runtime in the host netns; only the
 //! `bind()` happens in the pod netns. The accepted connection then resolves its
-//! source pod identity through the same cookie path as before, with the listener
-//! pod UID used as a final guard against any fallback tuple collision.
+//! source pod identity from the listener pod UID and uses cookie metadata, when
+//! present, only after validating it against that UID.
 //!
 //! The node-agent (which watches pods and holds their cgroup paths) publishes
 //! the enrolled-pod set to a pinned registry directory; this manager polls it

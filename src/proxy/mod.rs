@@ -260,6 +260,14 @@ fn record_node_waypoint_identity_drop(
     overload.record_node_waypoint_drop(reason);
 }
 
+fn node_waypoint_listener_uid_fallback_allowed(error: &NodeWaypointIdentityError) -> bool {
+    matches!(
+        error,
+        NodeWaypointIdentityError::SocketCookieUnavailable(_)
+            | NodeWaypointIdentityError::UnknownCookie(_)
+    )
+}
+
 /// Validate that every `mesh_route_dispatch` rule's
 /// `destination.upstream_id` points at a real upstream in the config.
 ///
@@ -10182,6 +10190,62 @@ struct TlsConnectionMetadata {
     orig_dst: Option<SocketAddr>,
 }
 
+struct NodeWaypointAcceptIdentity {
+    identity: Arc<NodeWaypointIdentity>,
+    orig_dst: Option<SocketAddr>,
+    cookie_error: Option<NodeWaypointIdentityError>,
+}
+
+struct NodeWaypointAcceptIdentityDrop {
+    error: NodeWaypointIdentityError,
+    cookie_error: Option<NodeWaypointIdentityError>,
+}
+
+fn resolve_node_waypoint_accept_identity(
+    resolver: &NodeWaypointIdentityResolver,
+    stream: &tokio::net::TcpStream,
+    expected_pod_uid: Option<[u8; 16]>,
+) -> Result<NodeWaypointAcceptIdentity, NodeWaypointAcceptIdentityDrop> {
+    let Some(expected_pod_uid) = expected_pod_uid else {
+        return resolver
+            .resolve_stream(stream)
+            .map(|resolved| NodeWaypointAcceptIdentity {
+                identity: resolved.identity,
+                orig_dst: Some(resolved.orig_dst),
+                cookie_error: None,
+            })
+            .map_err(|error| NodeWaypointAcceptIdentityDrop {
+                error,
+                cookie_error: None,
+            });
+    };
+
+    match resolver.resolve_stream_for_expected_pod(stream, expected_pod_uid) {
+        Ok(resolved) => Ok(NodeWaypointAcceptIdentity {
+            identity: resolved.identity,
+            orig_dst: Some(resolved.orig_dst),
+            cookie_error: None,
+        }),
+        Err(error) if node_waypoint_listener_uid_fallback_allowed(&error) => {
+            match resolver.resolve_expected_pod_identity(expected_pod_uid) {
+                Ok((identity, _scope)) => Ok(NodeWaypointAcceptIdentity {
+                    identity,
+                    orig_dst: None,
+                    cookie_error: Some(error),
+                }),
+                Err(fallback_error) => Err(NodeWaypointAcceptIdentityDrop {
+                    error: fallback_error,
+                    cookie_error: Some(error),
+                }),
+            }
+        }
+        Err(error) => Err(NodeWaypointAcceptIdentityDrop {
+            error,
+            cookie_error: None,
+        }),
+    }
+}
+
 async fn start_proxy_listener_with_tls_source_and_signal(
     addr: SocketAddr,
     state: ProxyState,
@@ -10435,32 +10499,48 @@ async fn run_accept_loop(
                                 && let Some(resolver) =
                                     state.node_waypoint_identity_resolver.as_ref()
                             {
-                                let resolved = if let Some(expected_pod_uid) =
-                                    node_waypoint_expected_pod_uid
-                                {
-                                    resolver.resolve_stream_for_expected_pod(
-                                        &stream,
-                                        expected_pod_uid,
-                                    )
-                                } else {
-                                    resolver.resolve_stream(&stream)
-                                };
-                                match resolved {
-                                    // HTTP/HBONE re-queries the per-pod scope per
-                                    // request, so the accept-time scope is unused
-                                    // here; keep only the identity on the
+                                match resolve_node_waypoint_accept_identity(
+                                    resolver,
+                                    &stream,
+                                    node_waypoint_expected_pod_uid,
+                                ) {
+                                    // HTTP/HBONE re-queries the per-pod scope
+                                    // per request, so the accept-time scope is
+                                    // unused here; keep only the identity and
+                                    // optional original destination on the
                                     // connection metadata.
                                     Ok(resolved) => {
-                                        node_waypoint_orig_dst = Some(resolved.orig_dst);
+                                        node_waypoint_orig_dst = resolved.orig_dst;
+                                        if let Some(cookie_error) = resolved.cookie_error.as_ref() {
+                                            debug!(
+                                                remote_addr = %remote_addr,
+                                                error = %cookie_error,
+                                                "Admitting node-waypoint in-netns connection by listener pod UID after cookie lookup miss"
+                                            );
+                                        }
                                         Some(resolved.identity)
                                     }
-                                    Err(error) => {
-                                        record_node_waypoint_identity_drop(&state.overload, &error);
-                                        debug!(
-                                            remote_addr = %remote_addr,
-                                            error = %error,
-                                            "Dropping node-waypoint connection without a resolved pod identity"
+                                    Err(drop_reason) => {
+                                        record_node_waypoint_identity_drop(
+                                            &state.overload,
+                                            &drop_reason.error,
                                         );
+                                        if let Some(cookie_error) =
+                                            drop_reason.cookie_error.as_ref()
+                                        {
+                                            debug!(
+                                                remote_addr = %remote_addr,
+                                                cookie_error = %cookie_error,
+                                                error = %drop_reason.error,
+                                                "Dropping node-waypoint connection without a resolved pod identity"
+                                            );
+                                        } else {
+                                            debug!(
+                                                remote_addr = %remote_addr,
+                                                error = %drop_reason.error,
+                                                "Dropping node-waypoint connection without a resolved pod identity"
+                                            );
+                                        }
                                         drop(stream);
                                         continue;
                                     }
@@ -22064,6 +22144,42 @@ mod tests {
             !should_resolve_node_waypoint_identity(None),
             "non-mesh listeners must not be coupled to the NodeWaypoint identity resolver"
         );
+    }
+
+    #[test]
+    fn node_waypoint_listener_uid_fallback_is_cookie_lookup_only() {
+        let pod_uid = [1u8; 16];
+        let other_uid = [2u8; 16];
+
+        assert!(node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::SocketCookieUnavailable("not supported".to_string())
+        ));
+        assert!(node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::UnknownCookie(7)
+        ));
+
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::MissingPodUid(7)
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::MissingWorkloadHash { cookie: 7, pod_uid }
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::UnknownPod(pod_uid)
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::WorkloadHashMismatch {
+                pod_uid,
+                expected: 1,
+                actual: 2,
+            }
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::PodUidMismatch {
+                expected: pod_uid,
+                actual: other_uid,
+            }
+        ));
     }
 
     #[test]
