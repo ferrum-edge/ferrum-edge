@@ -120,7 +120,8 @@ upstreams come from one multi-collection view. A full-load query, decode, or
 validation failure rejects the complete candidate and the gateway keeps serving
 the last known-good runtime configuration. Standalone MongoDB deployments cannot
 provide multi-collection snapshots; Ferrum uses sequential primary reads there
-and rejects candidates that fail relationship or field validation.
+and rejects candidates only for errors and validation checks enforced by the
+runtime load path, so concurrent writes can require a later poll to converge.
 
 `FERRUM_DB_READ_REPLICA_URL` is SQL-only. MongoDB replica sets are still useful
 for primary failover, transactions, and majority write concern; they are not a
@@ -350,9 +351,9 @@ New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `Plu
 
 MongoDB uses the same incremental polling strategy as SQL backends:
 
-1. **Startup:** A full load reads all runtime collections. Replica sets use a snapshot transaction; standalone deployments use sequential primary reads plus validation.
+1. **Startup:** A full load reads all runtime collections. Replica sets use a snapshot transaction; standalone deployments use sequential primary reads and only reject inconsistencies caught by the runtime load validation path.
 2. **Subsequent polls:** `updated_at >= last_poll_timestamp - safety_margin` queries fetch changed documents (indexed)
 3. **Deletion detection:** Lightweight `_id` projection queries detect removed documents
-4. **Fallback:** If incremental poll fails, falls back to the same full-load path and rejects the candidate on any query, decode, relationship, or validation error
+4. **Fallback:** If incremental poll fails, falls back to the same full-load path and rejects the candidate on any query, decode, or runtime load validation error
 
 The `updated_at` indexes on all four collections ensure polling queries use index scans, not full collection scans.

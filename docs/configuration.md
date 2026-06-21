@@ -126,6 +126,10 @@ utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
 compatibility policy of folding schema changes into the V001 baseline rather
 than shipping incremental migrations.
 
+MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
+server or session default is weaker, Ferrum rejects the candidate full load and
+keeps the last known-good runtime config instead of publishing a mixed snapshot.
+
 ### Database TLS
 
 | Variable | Required | Default | Description |

@@ -18,10 +18,10 @@
 //! **Full loads and incremental polling**: Replica-set full loads use a
 //! snapshot transaction so the runtime config is read from one multi-collection
 //! view. Standalone deployments cannot provide multi-collection snapshots, so
-//! they use sequential primary reads and rely on validation to reject
-//! inconsistent candidates. Incremental polling uses `updated_at` timestamp
-//! queries (same strategy as the SQL backend). MongoDB change streams are a
-//! future enhancement that requires a replica set.
+//! they use sequential primary reads and only reject inconsistencies caught by
+//! the runtime load validation path. Incremental polling uses `updated_at`
+//! timestamp queries (same strategy as the SQL backend). MongoDB change streams
+//! are a future enhancement that requires a replica set.
 //!
 //! **Index creation**: The `run_migrations()` method creates indexes instead of
 //! running SQL migrations. `createIndex` is idempotent **only when the full
@@ -52,7 +52,7 @@ mod inner {
     };
     use mongodb::options::{
         ClientOptions, FindOptions, IndexOptions, ReadConcern, ReadPreference, SelectionCriteria,
-        Tls, TlsOptions,
+        Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -1616,20 +1616,33 @@ mod inner {
                     session
                         .start_transaction()
                         .read_concern(ReadConcern::snapshot())
+                        .write_concern(WriteConcern::majority())
                         .await?;
 
                     let loaded = async {
                         let proxies = self
-                            .load_full_proxies_opt_session(namespace, Some(&mut session))
+                            .load_full_proxies_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
                             .await?;
                         let consumers = self
-                            .load_full_consumers_opt_session(namespace, Some(&mut session))
+                            .load_full_consumers_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
                             .await?;
                         let plugin_configs = self
-                            .load_full_plugin_configs_opt_session(namespace, Some(&mut session))
+                            .load_full_plugin_configs_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
                             .await?;
                         let upstreams = self
-                            .load_full_upstreams_opt_session(namespace, Some(&mut session))
+                            .load_full_upstreams_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
                             .await?;
                         Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
                     }
@@ -4219,13 +4232,13 @@ mod inner {
         async fn load_full_proxies_opt_session(
             &self,
             namespace: &str,
-            session: Option<&mut ClientSession>,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
         ) -> Result<Vec<Proxy>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
-            let proxies_collection = self.proxies();
             let mut proxies = Vec::new();
 
-            if let Some(s) = session {
+            if let Some((connection, s)) = session {
+                let proxies_collection: Collection<Document> = connection.db.collection("proxies");
                 let mut cursor = proxies_collection.find(filter).session(&mut *s).await?;
                 while cursor.advance(&mut *s).await? {
                     let doc = cursor.deserialize_current()?;
@@ -4234,6 +4247,7 @@ mod inner {
                     proxies.push(proxy);
                 }
             } else {
+                let proxies_collection = self.proxies();
                 let mut cursor = proxies_collection.find(filter).await?;
                 while cursor.advance().await? {
                     let doc = cursor.deserialize_current()?;
@@ -4249,19 +4263,21 @@ mod inner {
         async fn load_full_consumers_opt_session(
             &self,
             namespace: &str,
-            session: Option<&mut ClientSession>,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
         ) -> Result<Vec<Consumer>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
-            let consumers_collection = self.consumers();
             let mut consumers = Vec::new();
 
-            if let Some(s) = session {
+            if let Some((connection, s)) = session {
+                let consumers_collection: Collection<Document> =
+                    connection.db.collection("consumers");
                 let mut cursor = consumers_collection.find(filter).session(&mut *s).await?;
                 while cursor.advance(&mut *s).await? {
                     let doc = cursor.deserialize_current()?;
                     consumers.push(doc_to_consumer(doc)?);
                 }
             } else {
+                let consumers_collection = self.consumers();
                 let mut cursor = consumers_collection.find(filter).await?;
                 while cursor.advance().await? {
                     let doc = cursor.deserialize_current()?;
@@ -4275,13 +4291,14 @@ mod inner {
         async fn load_full_plugin_configs_opt_session(
             &self,
             namespace: &str,
-            session: Option<&mut ClientSession>,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
         ) -> Result<Vec<PluginConfig>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
-            let plugin_configs_collection = self.plugin_configs();
             let mut plugin_configs = Vec::new();
 
-            if let Some(s) = session {
+            if let Some((connection, s)) = session {
+                let plugin_configs_collection: Collection<Document> =
+                    connection.db.collection("plugin_configs");
                 let mut cursor = plugin_configs_collection
                     .find(filter)
                     .session(&mut *s)
@@ -4293,6 +4310,7 @@ mod inner {
                     plugin_configs.push(plugin_config);
                 }
             } else {
+                let plugin_configs_collection = self.plugin_configs();
                 let mut cursor = plugin_configs_collection.find(filter).await?;
                 while cursor.advance().await? {
                     let doc = cursor.deserialize_current()?;
@@ -4308,13 +4326,14 @@ mod inner {
         async fn load_full_upstreams_opt_session(
             &self,
             namespace: &str,
-            session: Option<&mut ClientSession>,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
         ) -> Result<Vec<Upstream>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
-            let upstreams_collection = self.upstreams();
             let mut upstreams = Vec::new();
 
-            if let Some(s) = session {
+            if let Some((connection, s)) = session {
+                let upstreams_collection: Collection<Document> =
+                    connection.db.collection("upstreams");
                 let mut cursor = upstreams_collection.find(filter).session(&mut *s).await?;
                 while cursor.advance(&mut *s).await? {
                     let doc = cursor.deserialize_current()?;
@@ -4323,6 +4342,7 @@ mod inner {
                     upstreams.push(upstream);
                 }
             } else {
+                let upstreams_collection = self.upstreams();
                 let mut cursor = upstreams_collection.find(filter).await?;
                 while cursor.advance().await? {
                     let doc = cursor.deserialize_current()?;

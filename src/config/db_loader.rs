@@ -1252,16 +1252,54 @@ impl DatabaseStore {
                     .execute(&mut **tx)
                     .await?;
             }
-            "sqlite" | "mysql" => {
+            "mysql" => {
+                let isolation = Self::mysql_transaction_isolation(tx).await?;
+                if !Self::is_mysql_repeatable_read(&isolation) {
+                    return Err(anyhow::anyhow!(
+                        "MySQL full-load transactions require REPEATABLE READ isolation; current transaction isolation is '{}'. Configure the MySQL server or Ferrum session default to REPEATABLE READ so full runtime loads fail closed instead of publishing mixed snapshots.",
+                        isolation
+                    ));
+                }
+            }
+            "sqlite" => {
                 // SQLite read transactions observe one database snapshot from
-                // the first read. MySQL/InnoDB's default repeatable-read
-                // transaction is the strongest portable mode available through
-                // sqlx::Any without issuing connection-specific START
-                // TRANSACTION variants outside the Transaction API.
+                // the first read.
             }
             _ => {}
         }
         Ok(())
+    }
+
+    async fn mysql_transaction_isolation(
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<String, anyhow::Error> {
+        match sqlx::query_scalar::<_, String>("SELECT @@transaction_isolation")
+            .fetch_one(&mut **tx)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(primary_error) => {
+                sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "failed to read MySQL transaction isolation: {}; fallback @@tx_isolation failed: {}",
+                            primary_error,
+                            fallback_error
+                        )
+                    })
+            }
+        }
+    }
+
+    fn is_mysql_repeatable_read(isolation: &str) -> bool {
+        isolation
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-' && *ch != '_')
+            .flat_map(char::to_uppercase)
+            .collect::<String>()
+            == "REPEATABLEREAD"
     }
 
     async fn load_proxies_tx(
