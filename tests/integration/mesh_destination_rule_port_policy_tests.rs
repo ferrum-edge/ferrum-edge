@@ -4,6 +4,10 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream, UpstreamTarget,
 };
+use ferrum_edge::config_sources::k8s::{
+    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+};
+use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb,
     MeshTrafficPolicy,
@@ -112,6 +116,32 @@ fn proxy() -> Proxy {
     .expect("proxy fixture")
 }
 
+fn k8s_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
+    K8sObject {
+        api_version: "networking.istio.io/v1".to_string(),
+        kind: kind.to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            uid: String::new(),
+            namespace: "default".to_string(),
+            generation: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec,
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn k8s_options() -> K8sTranslationOptions {
+    K8sTranslationOptions::new(
+        "default".to_string(),
+        TrustDomain::new("cluster.local").expect("trust domain"),
+    )
+}
+
 #[test]
 fn destination_rule_port_level_load_balancer_projects_to_upstream_override() {
     let mut port_level_settings = HashMap::new();
@@ -145,6 +175,72 @@ fn destination_rule_port_level_load_balancer_projects_to_upstream_override() {
         .get(&8080)
         .expect("port override projected");
     assert_eq!(port_override.algorithm, Some(LoadBalancerAlgorithm::Random));
+}
+
+#[test]
+fn destination_rule_max_requests_only_rule_does_not_clear_prior_locality_policy() {
+    let mut translated = translate_k8s_objects(
+        &[
+            k8s_object(
+                "DestinationRule",
+                "a-locality",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "loadBalancer": {
+                            "localityLbSetting": {
+                                "enabled": true,
+                                "distribute": [
+                                    {
+                                        "from": "us-west/us-west-1/a",
+                                        "to": {"us-west/us-west-1/a": 100}
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }),
+            ),
+            k8s_object(
+                "DestinationRule",
+                "z-max-requests-only",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "http": {"maxRequestsPerConnection": 2}
+                        }
+                    }
+                }),
+            ),
+        ],
+        k8s_options(),
+    )
+    .expect("DestinationRules translate");
+
+    let mesh = translated.config.mesh.as_ref().expect("mesh config");
+    let later = mesh
+        .destination_rules
+        .iter()
+        .find(|dr| dr.name == "z-max-requests-only")
+        .expect("later DR translated");
+    assert!(
+        later.traffic_policy.is_none(),
+        "a deferred-only later DR must not carry an empty effective traffic policy"
+    );
+
+    translated.config.upstreams.push(upstream());
+    translated.config.proxies.push(proxy());
+    translated.config.normalize_fields();
+
+    let prepared =
+        prepare_gateway_config_for_mesh(translated.config, &runtime()).expect("mesh config");
+    let locality = prepared.upstreams[0]
+        .locality_lb_setting
+        .as_ref()
+        .expect("earlier locality policy must survive deferred-only later DR");
+    assert!(locality.enabled);
+    assert_eq!(locality.distribute.len(), 1);
 }
 
 #[test]

@@ -982,7 +982,8 @@ fn destination_rule(
         .spec
         .get("trafficPolicy")
         .map(|tp| translate_traffic_policy(acc, object, tp, TrafficPolicyScope::TopLevelOrPort))
-        .transpose()?;
+        .transpose()?
+        .filter(traffic_policy_has_applied_fields);
 
     let port_level_settings = object
         .spec
@@ -1025,6 +1026,7 @@ fn translate_port_level_settings(
     })?;
 
     let mut out = HashMap::with_capacity(entries.len());
+    let mut seen_ports = HashSet::with_capacity(entries.len());
     for entry in entries {
         let port_value = entry
             .get("port")
@@ -1051,17 +1053,23 @@ fn translate_port_level_settings(
         }
         let port = port_u64 as u16;
 
-        let policy =
-            translate_traffic_policy(acc, object, entry, TrafficPolicyScope::TopLevelOrPort)?;
-
-        if out.insert(port, policy).is_some() {
+        if !seen_ports.insert(port) {
             return Err(invalid_resource(
                 object,
                 format!("trafficPolicy.portLevelSettings has duplicate port {port}"),
             ));
         }
+        let policy =
+            translate_traffic_policy(acc, object, entry, TrafficPolicyScope::TopLevelOrPort)?;
+        if traffic_policy_has_applied_fields(&policy) {
+            out.insert(port, policy);
+        }
     }
     Ok(out)
+}
+
+fn traffic_policy_has_applied_fields(policy: &MeshTrafficPolicy) -> bool {
+    policy != &MeshTrafficPolicy::default()
 }
 
 /// Where a `trafficPolicy` block sits in a DestinationRule. This scopes the
@@ -2001,7 +2009,8 @@ fn translate_subset(
     let traffic_policy = value
         .get("trafficPolicy")
         .map(|tp| translate_traffic_policy(acc, object, tp, TrafficPolicyScope::Subset))
-        .transpose()?;
+        .transpose()?
+        .filter(traffic_policy_has_applied_fields);
 
     // A subset's `connectionPool.tcp.connectTimeout`, `tls`, and the full
     // `outlierDetection` (both the *thresholds* and the `maxEjectionPercent`
@@ -15171,11 +15180,8 @@ extensionProviders:
         let mesh = result.config.mesh.expect("mesh config");
         let dr = &mesh.destination_rules[0];
         assert!(
-            dr.traffic_policy
-                .as_ref()
-                .and_then(|tp| tp.connection_pool_http.as_ref())
-                .is_none(),
-            "maxRequestsPerConnection-only block must not synthesize an effective overlay"
+            dr.traffic_policy.is_none(),
+            "maxRequestsPerConnection-only trafficPolicy must not synthesize an effective policy"
         );
         assert!(
             result
@@ -15184,6 +15190,84 @@ extensionProviders:
                 .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
             "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
             result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_drops_port_level_max_requests_only_policy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {"maxRequestsPerConnection": 2}
+                                }
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("maxRequestsPerConnection-only port policy must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        assert!(
+            dr.traffic_policy.is_none(),
+            "top-level trafficPolicy containing only portLevelSettings must not become a default policy"
+        );
+        assert!(
+            dr.port_level_settings.is_empty(),
+            "maxRequestsPerConnection-only portLevelSettings entry must not synthesize an effective port policy"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_duplicate_port_level_settings_even_when_first_is_deferred_only() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {"maxRequestsPerConnection": 2}
+                                }
+                            },
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {"idleTimeout": "30s"}
+                                }
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("duplicate port must still fail");
+
+        assert!(
+            err.to_string().contains("duplicate port 8080"),
+            "unexpected duplicate-port error: {err}"
         );
     }
 
