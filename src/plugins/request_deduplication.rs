@@ -16,6 +16,7 @@
 //! Only applies to non-safe HTTP methods (POST, PUT, PATCH by default).
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -23,10 +24,12 @@ use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Read;
+use std::mem;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -56,6 +59,8 @@ const DEDUP_REDIS_LOCK_TOKEN_METADATA: &str = "_dedup_redis_lock_token";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
 const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
+const DEFAULT_MAX_ENTRY_SIZE_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CANONICAL_DECODED_BODY_BYTES: usize = 1024 * 1024;
 const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "connection",
@@ -127,6 +132,23 @@ struct CachedResponse {
     inserted_at: Instant,
 }
 
+impl CachedResponse {
+    fn retained_size(&self) -> usize {
+        cached_response_retained_size(self.body.len(), &self.headers)
+    }
+}
+
+fn cached_response_retained_size(body_len: usize, headers: &HashMap<String, String>) -> usize {
+    mem::size_of::<CachedResponse>()
+        .saturating_add(body_len)
+        .saturating_add(
+            headers
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        )
+}
+
 /// In-flight marker to handle concurrent duplicate requests.
 ///
 /// `InFlight` carries the timestamp it was inserted so stale markers (from
@@ -172,12 +194,39 @@ enum RedisInFlightAction {
     Unavailable,
 }
 
+enum RedisStoreAction {
+    Stored,
+    SkippedSize,
+    Failed,
+}
+
+enum RedisPayloadAdmission {
+    Admitted(Vec<u8>),
+    RejectedBySize,
+}
+
 enum LocalCompletionAction {
     Published {
+        cached: CachedResponse,
         completed_count: usize,
         inflight_count: usize,
     },
+    Skipped {
+        inflight_count: usize,
+        reason: CompletionSkipReason,
+        redis_candidate: Option<CachedResponse>,
+    },
     Stale,
+}
+
+enum CompletionSkipReason {
+    EntryTooLarge {
+        entry_size: usize,
+    },
+    TotalCapacity {
+        entry_size: usize,
+        current_total: usize,
+    },
 }
 
 pub struct RequestDeduplication {
@@ -194,6 +243,10 @@ pub struct RequestDeduplication {
     inflight_ttl: Duration,
     /// Maximum number of cached entries (local mode).
     max_entries: usize,
+    /// Maximum retained size of one completed response entry.
+    max_entry_size_bytes: usize,
+    /// Maximum retained size across completed response entries.
+    max_total_size_bytes: usize,
     /// HTTP methods to apply deduplication to.
     applicable_methods: Vec<String>,
     /// Whether to scope keys by authenticated consumer identity.
@@ -203,10 +256,12 @@ pub struct RequestDeduplication {
     /// Local in-memory cache.
     local_cache: Arc<DashMap<String, DeduplicationEntry>>,
     completed_count: AtomicUsize,
+    completed_size_bytes: AtomicUsize,
     inflight_count: AtomicUsize,
     completed_sequence: AtomicU64,
     next_completed_evict_sequence: AtomicU64,
     completed_order: Arc<DashMap<u64, CompletedOrderEntry>>,
+    accounting_lock: Mutex<()>,
     eviction_lock: Mutex<()>,
     /// Optional Redis client for centralized deduplication.
     redis_client: Option<Arc<RedisRateLimitClient>>,
@@ -235,6 +290,10 @@ impl RequestDeduplication {
         let inflight_ttl = Duration::from_secs(inflight_ttl_seconds);
 
         let max_entries = optional_positive_usize(config, "max_entries")?.unwrap_or(10_000);
+        let max_entry_size_bytes = optional_positive_usize(config, "max_entry_size_bytes")?
+            .unwrap_or(DEFAULT_MAX_ENTRY_SIZE_BYTES);
+        let max_total_size_bytes = optional_positive_usize(config, "max_total_size_bytes")?
+            .unwrap_or(DEFAULT_MAX_TOTAL_SIZE_BYTES);
 
         let applicable_methods = parse_applicable_methods(config)?;
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
@@ -261,19 +320,80 @@ impl RequestDeduplication {
             ttl,
             inflight_ttl,
             max_entries,
+            max_entry_size_bytes,
+            max_total_size_bytes,
             applicable_methods,
             scope_by_consumer,
             enforce_required,
             local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             completed_count: AtomicUsize::new(0),
+            completed_size_bytes: AtomicUsize::new(0),
             inflight_count: AtomicUsize::new(0),
             completed_sequence: AtomicU64::new(0),
             next_completed_evict_sequence: AtomicU64::new(0),
             completed_order: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            accounting_lock: Mutex::new(()),
             eviction_lock: Mutex::new(()),
             redis_client,
             last_cleanup: AtomicU64::new(CLEANUP_NEVER),
         })
+    }
+
+    fn accounting_guard(&self) -> MutexGuard<'_, ()> {
+        self.accounting_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn add_completed_size_locked(&self, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let current = self.completed_size_bytes.load(Ordering::Relaxed);
+        self.completed_size_bytes
+            .store(current.saturating_add(size), Ordering::Relaxed);
+    }
+
+    fn sub_completed_size_locked(&self, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let current = self.completed_size_bytes.load(Ordering::Relaxed);
+        self.completed_size_bytes
+            .store(current.saturating_sub(size), Ordering::Relaxed);
+    }
+
+    fn actual_completed_size_locked(&self) -> usize {
+        self.local_cache
+            .iter()
+            .map(|entry| match entry.value() {
+                DeduplicationEntry::Completed { cached, .. } => cached.retained_size(),
+                DeduplicationEntry::InFlight { .. } => 0,
+            })
+            .sum()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn completed_size_snapshot_for_tests(&self) -> (usize, usize) {
+        let _guard = self.accounting_guard();
+        (
+            self.completed_size_bytes.load(Ordering::Relaxed),
+            self.actual_completed_size_locked(),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn expire_completed_entries_for_tests(&self) {
+        let _guard = self.accounting_guard();
+        let expired_at = Instant::now()
+            .checked_sub(self.ttl.saturating_add(Duration::from_secs(1)))
+            .unwrap_or_else(Instant::now);
+        for mut entry in self.local_cache.iter_mut() {
+            if let DeduplicationEntry::Completed { cached, .. } = entry.value_mut() {
+                cached.inserted_at = expired_at;
+            }
+        }
+        self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     /// Build the logical deduplication key from unambiguous framed fields.
@@ -363,6 +483,65 @@ impl RequestDeduplication {
                 self.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
+            Entry::Occupied(mut entry) => {
+                match entry.get() {
+                    DeduplicationEntry::Completed {
+                        cached,
+                        fingerprint: cached_fingerprint,
+                        ..
+                    } => {
+                        if now.duration_since(cached.inserted_at) < self.ttl {
+                            if cached_fingerprint == fingerprint {
+                                return LocalDeduplicationAction::Replay(cached.clone());
+                            }
+                            return LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            );
+                        }
+                    }
+                    DeduplicationEntry::InFlight {
+                        started_at,
+                        fingerprint: cached_fingerprint,
+                    } => {
+                        if now.duration_since(*started_at) >= self.inflight_ttl {
+                            entry.insert(DeduplicationEntry::InFlight {
+                                started_at: now,
+                                fingerprint: fingerprint.to_string(),
+                            });
+                            return LocalDeduplicationAction::Fresh;
+                        }
+                        if cached_fingerprint == fingerprint {
+                            return LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::InFlight,
+                            );
+                        }
+                        return LocalDeduplicationAction::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        );
+                    }
+                }
+                drop(entry);
+                self.replace_expired_completed_with_inflight(key, fingerprint, now)
+            }
+        }
+    }
+
+    fn replace_expired_completed_with_inflight(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: Instant,
+    ) -> LocalDeduplicationAction {
+        let _guard = self.accounting_guard();
+        match self.local_cache.entry(key.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(DeduplicationEntry::InFlight {
+                    started_at: now,
+                    fingerprint: fingerprint.to_string(),
+                });
+                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                LocalDeduplicationAction::Fresh
+            }
             Entry::Occupied(mut entry) => match entry.get() {
                 DeduplicationEntry::Completed {
                     cached,
@@ -378,7 +557,9 @@ impl RequestDeduplication {
                             )
                         }
                     } else {
+                        let retained_size = cached.retained_size();
                         self.mark_completed_sequence_pruned(*sequence);
+                        self.sub_completed_size_locked(retained_size);
                         decrement_atomic(&self.completed_count);
                         self.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight {
@@ -514,12 +695,49 @@ impl RequestDeduplication {
     }
 
     /// Store a cached response in Redis with TTL.
-    async fn redis_set(&self, key: &str, fingerprint: &str, response: &CachedResponse) -> bool {
+    async fn redis_set(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        response: &CachedResponse,
+    ) -> RedisStoreAction {
         let Some(redis) = self.redis_client.as_ref() else {
-            return false;
+            return RedisStoreAction::Failed;
         };
         if !redis.is_available() {
-            return false;
+            return RedisStoreAction::Failed;
+        }
+
+        let data = match self.redis_payload_for_response(fingerprint, response) {
+            RedisPayloadAdmission::Admitted(data) => data,
+            RedisPayloadAdmission::RejectedBySize => return RedisStoreAction::SkippedSize,
+        };
+
+        let redis_key = redis.make_key(&[key]);
+        let ttl_seconds = self.ttl.as_secs().max(1);
+        if let Err(()) = redis
+            .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+            .await
+        {
+            debug!("request_deduplication: Redis SET failed");
+            return RedisStoreAction::Failed;
+        }
+        RedisStoreAction::Stored
+    }
+
+    fn redis_payload_for_response(
+        &self,
+        fingerprint: &str,
+        response: &CachedResponse,
+    ) -> RedisPayloadAdmission {
+        let entry_size = response.retained_size();
+        if entry_size > self.max_entry_size_bytes {
+            debug!(
+                entry_size,
+                max_entry_size_bytes = self.max_entry_size_bytes,
+                "request_deduplication: completed response exceeds Redis entry size limit, skipping store"
+            );
+            return RedisPayloadAdmission::RejectedBySize;
         }
 
         let serializable = SerializableCachedResponse {
@@ -530,28 +748,63 @@ impl RequestDeduplication {
         };
 
         let data = match serde_json::to_vec(&serializable) {
-            Ok(d) => d,
-            Err(_) => return false,
+            Ok(data) => data,
+            Err(_) => return RedisPayloadAdmission::RejectedBySize,
         };
-
-        let redis_key = redis.make_key(&[key]);
-        let ttl_seconds = self.ttl.as_secs().max(1);
-        if let Err(()) = redis
-            .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
-            .await
-        {
-            debug!("request_deduplication: Redis SET failed");
-            return false;
+        if data.len() > self.max_entry_size_bytes {
+            debug!(
+                payload_size = data.len(),
+                max_entry_size_bytes = self.max_entry_size_bytes,
+                "request_deduplication: serialized Redis response exceeds entry size limit, skipping store"
+            );
+            return RedisPayloadAdmission::RejectedBySize;
         }
-        true
+        RedisPayloadAdmission::Admitted(data)
+    }
+
+    fn remove_matching_local_inflight(&self, key: &str, fingerprint: &str) -> Option<usize> {
+        self.local_cache
+            .remove_if(key, |_, entry| {
+                matches!(
+                    entry,
+                    DeduplicationEntry::InFlight {
+                        fingerprint: current,
+                        ..
+                    } if current == fingerprint
+                )
+            })
+            .map(|_| decrement_atomic(&self.inflight_count))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_payload_for_tests(
+        &self,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        let response = CachedResponse {
+            status_code,
+            headers,
+            body: Bytes::copy_from_slice(body),
+            inserted_at: Instant::now(),
+        };
+        match self.redis_payload_for_response("test-fingerprint", &response) {
+            RedisPayloadAdmission::Admitted(payload) => Some(payload),
+            RedisPayloadAdmission::RejectedBySize => None,
+        }
     }
 
     fn local_publish_completed(
         &self,
         key: &str,
         fingerprint: &str,
-        cached: CachedResponse,
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: &[u8],
     ) -> LocalCompletionAction {
+        let entry_size = cached_response_retained_size(body.len(), &headers);
+        let _guard = self.accounting_guard();
         let mut entry = match self.local_cache.entry(key.to_string()) {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(_) => return LocalCompletionAction::Stale,
@@ -565,17 +818,64 @@ impl RequestDeduplication {
             _ => return LocalCompletionAction::Stale,
         }
 
+        if entry_size > self.max_entry_size_bytes {
+            entry.remove();
+            let inflight_count = decrement_atomic(&self.inflight_count);
+            return LocalCompletionAction::Skipped {
+                inflight_count,
+                reason: CompletionSkipReason::EntryTooLarge { entry_size },
+                redis_candidate: None,
+            };
+        }
+
+        let current_total = self.completed_size_bytes.load(Ordering::Relaxed);
+        if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
+            let redis_candidate = if self.redis_client.is_some() {
+                Some(CachedResponse {
+                    status_code,
+                    headers,
+                    body: Bytes::copy_from_slice(body),
+                    inserted_at: Instant::now(),
+                })
+            } else {
+                entry.remove();
+                None
+            };
+            let inflight_count = if redis_candidate.is_some() {
+                self.inflight_count.load(Ordering::Relaxed)
+            } else {
+                decrement_atomic(&self.inflight_count)
+            };
+            return LocalCompletionAction::Skipped {
+                inflight_count,
+                reason: CompletionSkipReason::TotalCapacity {
+                    entry_size,
+                    current_total,
+                },
+                redis_candidate,
+            };
+        }
+
         let sequence = self.next_completed_sequence();
         self.completed_order
             .insert(sequence, CompletedOrderEntry::Pending);
+        let cached = CachedResponse {
+            status_code,
+            headers,
+            body: Bytes::copy_from_slice(body),
+            inserted_at: Instant::now(),
+        };
+        let redis_copy = cached.clone();
         entry.insert(DeduplicationEntry::Completed {
             cached,
             sequence,
             fingerprint: fingerprint.to_string(),
         });
+        self.add_completed_size_locked(entry_size);
         self.completed_order
             .insert(sequence, CompletedOrderEntry::Published(key.to_string()));
         LocalCompletionAction::Published {
+            cached: redis_copy,
             completed_count: self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
             inflight_count: decrement_atomic(&self.inflight_count),
         }
@@ -618,6 +918,7 @@ impl RequestDeduplication {
             return; // Another thread is doing cleanup this interval
         }
 
+        let _guard = self.accounting_guard();
         let now = Instant::now();
         // Single all-shard pass: drop expired Completed entries and stale
         // InFlight markers. Decrement counters for entries actually removed
@@ -629,7 +930,9 @@ impl RequestDeduplication {
             } => {
                 let keep = now.duration_since(cached.inserted_at) < self.ttl;
                 if !keep {
+                    let retained_size = cached.retained_size();
                     self.mark_completed_sequence_pruned(*sequence);
+                    self.sub_completed_size_locked(retained_size);
                     decrement_atomic(&self.completed_count);
                 }
                 keep
@@ -648,14 +951,19 @@ impl RequestDeduplication {
             }
         });
 
-        self.evict_completed_over_capacity(
+        self.evict_completed_over_capacity_locked(
             self.completed_count.load(Ordering::Relaxed),
             self.inflight_count.load(Ordering::Relaxed),
         );
-        self.advance_completed_evict_cursor();
+        self.advance_completed_evict_cursor_locked();
     }
 
     fn evict_completed_over_capacity(&self, completed_hint: usize, inflight_hint: usize) {
+        let _guard = self.accounting_guard();
+        self.evict_completed_over_capacity_locked(completed_hint, inflight_hint);
+    }
+
+    fn evict_completed_over_capacity_locked(&self, completed_hint: usize, inflight_hint: usize) {
         if completed_hint == 0 || completed_hint.saturating_add(inflight_hint) <= self.max_entries {
             return;
         }
@@ -664,13 +972,13 @@ impl RequestDeduplication {
         let Ok(_guard) = self.eviction_lock.try_lock() else {
             return;
         };
-        self.evict_completed_over_capacity_locked(
+        self.evict_completed_over_capacity_guarded(
             self.completed_count.load(Ordering::Relaxed),
             self.inflight_count.load(Ordering::Relaxed),
         );
     }
 
-    fn evict_completed_over_capacity_locked(&self, completed_hint: usize, inflight_hint: usize) {
+    fn evict_completed_over_capacity_guarded(&self, completed_hint: usize, inflight_hint: usize) {
         // Enforce max entries by removing oldest Completed entries first. Active
         // (non-stale) InFlight markers are NEVER evicted by LRU because evicting
         // them would release the in-flight lock while the original request is
@@ -692,7 +1000,7 @@ impl RequestDeduplication {
         let limit = self.completed_sequence.load(Ordering::Relaxed);
         while to_remove > 0 && sequence < limit {
             let current_sequence = sequence;
-            match self.remove_completed_sequence(sequence) {
+            match self.remove_completed_sequence_locked(sequence) {
                 CompletedSequenceRemoval::Removed => {
                     to_remove -= 1;
                     sequence += 1;
@@ -715,7 +1023,7 @@ impl RequestDeduplication {
             .store(sequence, Ordering::Relaxed);
     }
 
-    fn remove_completed_sequence(&self, sequence: u64) -> CompletedSequenceRemoval {
+    fn remove_completed_sequence_locked(&self, sequence: u64) -> CompletedSequenceRemoval {
         let Some(order_entry) = self.completed_order.get(&sequence) else {
             return CompletedSequenceRemoval::NotPublished;
         };
@@ -746,19 +1054,18 @@ impl RequestDeduplication {
             return CompletedSequenceRemoval::Stale;
         }
 
-        if self
-            .local_cache
-            .remove_if(&key, |_, entry| {
-                matches!(
-                    entry,
-                    DeduplicationEntry::Completed {
-                        sequence: current,
-                        ..
-                    } if *current == sequence
-                )
-            })
-            .is_some()
-        {
+        if let Some((_, removed)) = self.local_cache.remove_if(&key, |_, entry| {
+            matches!(
+                entry,
+                DeduplicationEntry::Completed {
+                    sequence: current,
+                    ..
+                } if *current == sequence
+            )
+        }) {
+            if let DeduplicationEntry::Completed { cached, .. } = removed {
+                self.sub_completed_size_locked(cached.retained_size());
+            }
             decrement_atomic(&self.completed_count);
             self.remove_stale_completed_order(sequence, &key);
             CompletedSequenceRemoval::Removed
@@ -795,14 +1102,14 @@ impl RequestDeduplication {
         });
     }
 
-    fn advance_completed_evict_cursor(&self) {
+    fn advance_completed_evict_cursor_locked(&self) {
         let Ok(_guard) = self.eviction_lock.try_lock() else {
             return;
         };
-        self.advance_completed_evict_cursor_locked();
+        self.advance_completed_evict_cursor_guarded();
     }
 
-    fn advance_completed_evict_cursor_locked(&self) {
+    fn advance_completed_evict_cursor_guarded(&self) {
         let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
         let limit = self.completed_sequence.load(Ordering::Relaxed);
         while sequence < limit {
@@ -852,6 +1159,10 @@ struct SerializableCachedResponse {
     fingerprint: String,
     status_code: u16,
     headers: HashMap<String, String>,
+    #[serde(
+        serialize_with = "serialize_cached_response_body",
+        deserialize_with = "deserialize_cached_response_body"
+    )]
     body: Vec<u8>,
 }
 
@@ -859,6 +1170,57 @@ struct SerializableCachedResponse {
 struct SerializableInFlightLock {
     fingerprint: String,
     token: String,
+}
+
+fn serialize_cached_response_body<S>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(body))
+}
+
+fn deserialize_cached_response_body<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CachedResponseBodyVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CachedResponseBodyVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a base64 response body string or legacy byte array")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut body = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                body.push(byte);
+            }
+            Ok(body)
+        }
+    }
+
+    deserializer.deserialize_any(CachedResponseBodyVisitor)
 }
 
 fn hash_framed(hasher: &mut Sha256, label: &str, value: &[u8]) {
@@ -1398,36 +1760,86 @@ impl Plugin for RequestDeduplication {
         // sanitization on store. See [`super::utils::cache_headers`].
         let safe_headers = sanitize_cached_headers(response_headers);
 
-        let cached = CachedResponse {
-            status_code: response_status,
-            headers: safe_headers,
-            body: Bytes::from(body.to_vec()),
-            inserted_at: Instant::now(),
-        };
-
-        let (completed, inflight) =
-            match self.local_publish_completed(&key, &fingerprint, cached.clone()) {
-                LocalCompletionAction::Published {
-                    completed_count,
-                    inflight_count,
-                } => (completed_count, inflight_count),
-                LocalCompletionAction::Stale => {
-                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-                        self.redis_release_inflight(&key, &fingerprint, token).await;
+        let (cached, completed, inflight) = match self.local_publish_completed(
+            &key,
+            &fingerprint,
+            response_status,
+            safe_headers,
+            body,
+        ) {
+            LocalCompletionAction::Published {
+                cached,
+                completed_count,
+                inflight_count,
+            } => (cached, completed_count, inflight_count),
+            LocalCompletionAction::Skipped {
+                inflight_count,
+                reason,
+                redis_candidate,
+            } => {
+                match reason {
+                    CompletionSkipReason::EntryTooLarge { entry_size } => {
+                        debug!(
+                            entry_size,
+                            max_entry_size_bytes = self.max_entry_size_bytes,
+                            inflight_count,
+                            "request_deduplication: completed response exceeds entry size limit, skipping store"
+                        );
+                    }
+                    CompletionSkipReason::TotalCapacity {
+                        entry_size,
+                        current_total,
+                    } => {
+                        debug!(
+                            entry_size,
+                            current_total,
+                            max_total_size_bytes = self.max_total_size_bytes,
+                            inflight_count,
+                            "request_deduplication: completed response would exceed total size limit, skipping store"
+                        );
+                    }
+                }
+                if let Some(cached) = redis_candidate {
+                    match self.redis_set(&key, &fingerprint, &cached).await {
+                        RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                            self.remove_matching_local_inflight(&key, &fingerprint);
+                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                                self.redis_release_inflight(&key, &fingerprint, token).await;
+                            }
+                        }
+                        // Nothing was retained locally. If Redis publication
+                        // fails too, keep both in-flight locks until
+                        // `inflight_ttl` so retries cannot immediately re-run a
+                        // completed side-effecting request with no replay value.
+                        RedisStoreAction::Failed => {}
                     }
                     return PluginResult::Continue;
                 }
-            };
+                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                }
+                return PluginResult::Continue;
+            }
+            LocalCompletionAction::Stale => {
+                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                }
+                return PluginResult::Continue;
+            }
+        };
         self.evict_completed_over_capacity(completed, inflight);
 
         // Also store in Redis if available. Release the distributed in-flight
         // lock only after the completed response is visible in Redis, so a peer
         // cannot miss both the lock and the replayable response.
         if self.redis_client.is_some() {
-            let redis_store_ok = self.redis_set(&key, &fingerprint, &cached).await;
-            if redis_store_ok && let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA)
-            {
-                self.redis_release_inflight(&key, &fingerprint, token).await;
+            match self.redis_set(&key, &fingerprint, &cached).await {
+                RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                        self.redis_release_inflight(&key, &fingerprint, token).await;
+                    }
+                }
+                RedisStoreAction::Failed => {}
             }
         }
 

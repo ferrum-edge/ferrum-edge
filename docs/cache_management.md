@@ -188,11 +188,11 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Idempotency keys with cached responses for POST/PUT/PATCH deduplication.
 
-**Default limit:** 10,000 entries.
+**Default limit:** 10,000 entries, 1 MiB per completed response entry, and 100 MiB retained completed response-entry bytes.
 
-**Config field:** `max_entries` (in plugin config JSON, default 10,000).
+**Config fields:** `max_entries`, `max_entry_size_bytes`, and `max_total_size_bytes` (in plugin config JSON).
 
-**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed. When using `sync_mode: "redis"`, entries are stored in Redis with TTL-based key expiration.
+**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). Completed-response retention is bounded by `max_entry_size_bytes` and exact local `max_total_size_bytes` accounting; oversized or over-cap responses return normally and are not retained. In local mode, skipped responses clear their local in-flight marker immediately. When the local cache exceeds `max_entries`, expired entries are evicted first, then oldest completed entries are removed. Active in-flight markers are not evicted while live. When using `sync_mode: "redis"`, completed responses are stored in Redis with TTL-based key expiration only after retained-response and serialized-payload per-entry size admission; oversized responses are not written. Responses skipped only by the local total cap still attempt Redis publication, and local plus distributed in-flight locks are released only when that publication succeeds or is skipped by per-entry admission.
 
 ### SOAP WS-Security Nonce Cache
 
@@ -280,6 +280,8 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `response_caching` | `max_total_size_bytes` | `104857600` | Exact maximum retained response-entry bytes |
 | `ai_semantic_cache` | `max_entries` | `10000` | Maximum cached LLM responses |
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
+| `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
+| `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
 | `soap_ws_security` | `nonce_replay_protection.max_cache_size` | `10000` | Maximum tracked nonces |
 | `soap_ws_security` | `nonce_replay_protection.cache_ttl_seconds` | `300` | Nonce expiry TTL |
 | `ldap_auth` | `max_cache_entries` | `1000` | Maximum cached LDAP bind results |

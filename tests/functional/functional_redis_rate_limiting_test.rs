@@ -9,6 +9,7 @@
 //!
 //! These tests require a Redis-compatible server running at `127.0.0.1:6379`.
 //! If Redis is not available, tests are skipped gracefully (not failed).
+//! Set `FERRUM_REDIS_REQUIRED=1` for CI gates that must fail instead of skip.
 //!
 //! Start Redis locally:
 //!   docker run --rm -p 6379:6379 redis:7-alpine
@@ -1371,6 +1372,9 @@ plugin_configs:
 #[ignore]
 async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the request deduplication cross-instance CI gate");
+        }
         return;
     }
 

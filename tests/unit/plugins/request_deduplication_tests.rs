@@ -1,5 +1,10 @@
 use bytes::Bytes;
-use ferrum_edge::_test_support::request_deduplication_redis_cached_response_payload_is_valid;
+use ferrum_edge::_test_support::{
+    request_deduplication_completed_size_snapshot_for_test,
+    request_deduplication_expire_completed_entries_for_test,
+    request_deduplication_redis_cached_response_payload_is_valid,
+    request_deduplication_redis_payload_for_test,
+};
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
@@ -52,6 +57,27 @@ async fn complete_response(plugin: &RequestDeduplication, ctx: &mut RequestConte
         .on_final_response_body(ctx, 201, &response_headers, b"{\"ok\":true}")
         .await;
     assert!(matches!(result, PluginResult::Continue));
+}
+
+async fn complete_response_with_body(
+    plugin: &RequestDeduplication,
+    ctx: &mut RequestContext,
+    body: &[u8],
+) {
+    let response_headers = HashMap::new();
+    let result = plugin
+        .on_final_response_body(ctx, 200, &response_headers, body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+fn assert_completed_size_exact(plugin: &RequestDeduplication) -> usize {
+    let (tracked, actual) = request_deduplication_completed_size_snapshot_for_test(plugin);
+    assert_eq!(
+        tracked, actual,
+        "tracked completed-response bytes must match retained completed entries"
+    );
+    tracked
 }
 
 fn assert_fingerprint_conflict(result: PluginResult) {
@@ -135,6 +161,10 @@ fn test_new_rejects_invalid_numeric_and_bool_types() {
         json!({"inflight_ttl_seconds": "300"}),
         json!({"max_entries": "100"}),
         json!({"max_entries": 0}),
+        json!({"max_entry_size_bytes": "1024"}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": "1048576"}),
+        json!({"max_total_size_bytes": 0}),
         json!({"scope_by_consumer": "true"}),
         json!({"enforce_required": "false"}),
     ] {
@@ -722,6 +752,210 @@ async fn test_completion_clears_inflight_then_replays() {
 }
 
 #[tokio::test]
+async fn test_response_below_entry_limit_is_retained() {
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert(
+        "idempotency-key".to_string(),
+        "below-entry-limit".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"small retained response").await;
+    assert!(assert_completed_size_exact(&plugin) > 0);
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert(
+        "idempotency-key".to_string(),
+        "below-entry-limit".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(
+        result,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn test_oversized_response_is_not_retained_and_clears_inflight() {
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "oversized-entry".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"too large").await;
+
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "oversized-entry".to_string());
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "oversized completion must clear in-flight state so the next request can execute"
+    );
+}
+
+#[tokio::test]
+async fn test_total_retained_bytes_cap_skips_new_completion() {
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 768
+    }));
+    let body = vec![b'a'; 500];
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "total-cap-a".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, &body).await;
+    let first_size = assert_completed_size_exact(&plugin);
+    assert!(
+        first_size <= 768,
+        "first entry should fit under the configured total cap, got {first_size}"
+    );
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "total-cap-b".to_string());
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx2, &body).await;
+
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(assert_completed_size_exact(&plugin), first_size);
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert("idempotency-key".to_string(), "total-cap-b".to_string());
+    let result = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "total-cap skip must clear the skipped key's in-flight marker"
+    );
+
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 200, HashMap::new(), &body).is_some(),
+        "a local total-cap skip must still be small enough for Redis publication"
+    );
+}
+
+#[tokio::test]
+async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
+    let plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 768
+    }));
+    let body = vec![b'a'; 500];
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-a".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, &body).await;
+    let first_size = assert_completed_size_exact(&plugin);
+    assert!(
+        first_size <= 768,
+        "first entry should fit under the configured total cap, got {first_size}"
+    );
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-b".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx2, &body).await;
+
+    assert_eq!(assert_completed_size_exact(&plugin), first_size);
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "redis-total-cap-b".to_string(),
+    );
+    let result = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 409),
+        other => {
+            panic!("Expected Redis publish failure to preserve local in-flight lock, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_inflight_marker_carries_timestamp() {
     // Smoke test: confirm InFlight marker can be inserted multiple times for
     // distinct keys without panic and tracked_keys_count reflects the inserts.
@@ -776,6 +1010,43 @@ async fn test_completed_entries_evict_over_capacity_on_insert() {
     }
 
     assert_eq!(plugin.tracked_keys_count(), Some(2));
+    assert!(assert_completed_size_exact(&plugin) > 0);
+}
+
+#[tokio::test]
+async fn test_expired_completed_entries_release_retained_bytes() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "max_entry_size_bytes": 2048,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "expires-size".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"expires").await;
+    assert!(assert_completed_size_exact(&plugin) > 0);
+
+    request_deduplication_expire_completed_entries_for_test(&plugin);
+
+    let mut cleanup_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut cleanup_headers = HashMap::new();
+    cleanup_headers.insert("idempotency-key".to_string(), "cleanup-trigger".to_string());
+    let result = plugin
+        .before_proxy(&mut cleanup_ctx, &mut cleanup_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
 }
 
 #[tokio::test]
@@ -1588,6 +1859,89 @@ fn test_legacy_redis_cached_response_without_fingerprint_is_rejected() {
     let legacy = br#"{"status_code":201,"headers":{},"body":[]}"#;
 
     assert!(!request_deduplication_redis_cached_response_payload_is_valid(legacy));
+}
+
+#[test]
+fn test_legacy_redis_cached_response_byte_array_body_is_accepted() {
+    let legacy = br#"{"fingerprint":"sha256-test","status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
+
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(legacy));
+}
+
+#[test]
+fn test_redis_payload_admission_respects_entry_size_limit() {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 2048
+    }));
+    let payload = request_deduplication_redis_payload_for_test(
+        &plugin,
+        201,
+        headers.clone(),
+        b"{\"ok\":true}",
+    )
+    .expect("small Redis payload should be admitted");
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1
+    }));
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 201, headers, b"{\"ok\":true}")
+            .is_none(),
+        "oversized responses must not be serialized for Redis storage"
+    );
+}
+
+#[test]
+fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+
+    let max_entry_size_bytes = 256 * 1024;
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": max_entry_size_bytes
+    }));
+    let body = vec![0xab; 160 * 1024];
+    let payload = request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body)
+        .expect("compact Redis payload should be admitted under the entry limit");
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&payload).expect("payload should be JSON");
+
+    assert!(
+        payload_json
+            .get("body")
+            .is_some_and(serde_json::Value::is_string),
+        "Redis response bodies must serialize as compact base64 strings"
+    );
+    assert!(
+        payload.len() <= max_entry_size_bytes,
+        "compact Redis payload should remain under the configured entry cap"
+    );
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
+}
+
+#[test]
+fn test_redis_payload_admission_rejects_serialized_payload_over_entry_limit() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+
+    let plugin = make_plugin(json!({
+        "max_entry_size_bytes": 1024 * 1024
+    }));
+    let body = vec![0xab; 800 * 1024];
+    assert!(
+        request_deduplication_redis_payload_for_test(&plugin, 201, headers, &body).is_none(),
+        "Redis payloads must be rejected when serialized storage exceeds the entry cap"
+    );
 }
 
 #[tokio::test]
