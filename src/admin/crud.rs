@@ -151,6 +151,13 @@ pub(crate) trait AdminResource:
     }
 
     async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>>;
+    async fn db_get_scoped(
+        db: &dyn DatabaseBackend,
+        id: &str,
+        _namespace: &str,
+    ) -> DbResult<Option<Self>> {
+        Self::db_get(db, id).await
+    }
     async fn db_get_for_write(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
         Self::db_get(db, id).await
     }
@@ -246,7 +253,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        match R::db_get(db.as_ref(), id).await {
+        match R::db_get_scoped(db.as_ref(), id, namespace).await {
             Ok(Some(resource)) => {
                 if resource.namespace() != namespace {
                     return Ok(not_found_response::<R>());
@@ -1689,6 +1696,17 @@ impl AdminResource for Proxy {
     }
 
     async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        db.get_proxy(id).await
+    }
+
+    async fn db_get_scoped(
+        db: &dyn DatabaseBackend,
+        id: &str,
+        namespace: &str,
+    ) -> DbResult<Option<Self>> {
+        if !db.check_proxy_exists(id, namespace).await? {
+            return Ok(None);
+        }
         db.get_proxy(id).await
     }
 

@@ -894,6 +894,21 @@ impl DatabaseStore {
         })
     }
 
+    fn proxy_plugin_reference_lookup_error(
+        operation: &str,
+        namespace: &str,
+        column: Option<&str>,
+        source: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        let column_context = column
+            .map(|column| format!(" column=plugin_configs.{column}"))
+            .unwrap_or_default();
+        anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+            "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+            operation, namespace, column_context, source
+        )))
+    }
+
     fn push_proxy_plugin_association_row(
         associations: &mut ProxyPluginAssociations,
         row: &AnyRow,
@@ -1009,7 +1024,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(std::slice::from_ref(proxy));
         let plugin_refs = self
-            .load_plugin_config_refs(&plugin_config_ids, &proxy.namespace)
+            .load_plugin_config_refs(&plugin_config_ids, &proxy.namespace, operation)
             .await?;
         let errors = Self::validate_loaded_proxy_plugin_associations_with_refs(
             &proxy.id,
@@ -1040,7 +1055,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(proxies);
         let plugin_refs = self
-            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, pool)
+            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, operation, pool)
             .await?;
         let mut errors = Vec::new();
         for proxy in proxies {
@@ -3031,7 +3046,11 @@ impl DatabaseStore {
         }
 
         let plugin_refs = self
-            .load_plugin_config_refs(&requested_ids, namespace)
+            .load_plugin_config_refs(
+                &requested_ids,
+                namespace,
+                "validate_proxy_plugin_associations",
+            )
             .await?;
 
         for assoc in associations {
@@ -3321,9 +3340,10 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
+        operation: &str,
     ) -> Result<PluginConfigRefs, anyhow::Error> {
         let pool = self.pool();
-        self.load_plugin_config_refs_from_pool(ids, namespace, &pool)
+        self.load_plugin_config_refs_from_pool(ids, namespace, operation, &pool)
             .await
     }
 
@@ -3331,6 +3351,7 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
+        operation: &str,
         pool: &AnyPool,
     ) -> Result<PluginConfigRefs, anyhow::Error> {
         if ids.is_empty() {
@@ -3353,16 +3374,36 @@ impl DatabaseStore {
                 query = query.bind(id);
             }
 
-            let rows = query.fetch_all(pool).await?;
+            let rows = query.fetch_all(pool).await.map_err(|e| {
+                Self::proxy_plugin_reference_lookup_error(operation, namespace, None, e)
+            })?;
             for row in rows {
-                let id: String = row.try_get("id")?;
-                let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                let id: String = row.try_get("id").map_err(|e| {
+                    Self::proxy_plugin_reference_lookup_error(operation, namespace, Some("id"), e)
+                })?;
+                let scope_raw: String = row.try_get("scope").map_err(|e| {
+                    Self::proxy_plugin_reference_lookup_error(
+                        operation,
+                        namespace,
+                        Some("scope"),
+                        e,
+                    )
+                })?;
+                let scope = match scope_raw.as_str() {
                     "proxy" => PluginScope::Proxy,
                     "proxy_group" => PluginScope::ProxyGroup,
                     _ => PluginScope::Global,
                 };
                 let proxy_id = row
-                    .try_get::<Option<String>, _>("proxy_id")?
+                    .try_get::<Option<String>, _>("proxy_id")
+                    .map_err(|e| {
+                        Self::proxy_plugin_reference_lookup_error(
+                            operation,
+                            namespace,
+                            Some("proxy_id"),
+                            e,
+                        )
+                    })?
                     .filter(|id| !id.trim().is_empty());
                 plugin_refs.insert(
                     id.clone(),
