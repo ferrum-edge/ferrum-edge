@@ -2692,6 +2692,13 @@ pub struct ProxyState {
     pub add_forwarded_header: bool,
     /// Environment config for backend TLS settings (WebSocket, etc.)
     pub env_config: Arc<crate::config::EnvConfig>,
+    /// Gateway-owned listener ports used for stream proxy conflict validation.
+    ///
+    /// Most modes derive this from [`EnvConfig::reserved_gateway_ports`]. File
+    /// mode can adopt pre-bound listeners whose live ports differ from
+    /// `EnvConfig`; storing the effective startup set here keeps later reload
+    /// validation aligned with the sockets the process actually owns.
+    pub reserved_gateway_ports: Arc<HashSet<u16>>,
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -3861,13 +3868,40 @@ impl ProxyState {
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
-        Self::new_with_bpf_metrics(
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
             config,
             dns_cache,
             env_config,
             tls_policy,
             health_check_shutdown_rx,
             None,
+            reserved_gateway_ports,
+        )
+    }
+
+    /// Constructor variant that accepts the effective gateway-owned listener
+    /// ports for stream proxy conflict validation.
+    ///
+    /// File mode uses this when adopting pre-bound listeners so initial
+    /// validation, SIGHUP reloads, and programmatic `update_config` calls all
+    /// use the same actual socket set instead of recalculating from `EnvConfig`.
+    pub fn new_with_reserved_gateway_ports(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        reserved_gateway_ports: HashSet<u16>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            None,
+            reserved_gateway_ports,
         )
     }
 
@@ -3881,12 +3915,33 @@ impl ProxyState {
     /// metrics state at startup. Keeping the parameter optional avoids
     /// forcing every other entry point to plumb a placeholder.
     pub fn new_with_bpf_metrics(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            bpf_metrics_state,
+            reserved_gateway_ports,
+        )
+    }
+
+    fn new_with_bpf_metrics_and_reserved_gateway_ports(
         mut config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+        reserved_gateway_ports: HashSet<u16>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
             for msg in &errors {
@@ -4326,6 +4381,7 @@ impl ProxyState {
             )),
             early_data_methods: Arc::new(env_config_arc.tls_early_data_methods.clone()),
             env_config: env_config_arc,
+            reserved_gateway_ports: Arc::new(reserved_gateway_ports),
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_header_count,
@@ -5611,8 +5667,9 @@ impl ProxyState {
         // Stream proxy port conflicts — reject in non-DP modes, warn in DP
         // mode. The DP doesn't control its config and one bad stream proxy
         // port shouldn't block all other config updates pushed by the CP.
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errs) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        if let Err(errs) =
+            config.validate_stream_proxy_port_conflicts(self.reserved_gateway_ports.as_ref())
+        {
             if matches!(
                 self.env_config.mode,
                 crate::config::env_config::OperatingMode::DataPlane
@@ -27276,10 +27333,30 @@ mod tests {
         initial_config: GatewayConfig,
         env_config: crate::config::env_config::EnvConfig,
     ) -> ProxyState {
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        make_test_proxy_state_with_reserved_ports(
+            initial_config,
+            env_config,
+            reserved_gateway_ports,
+        )
+    }
+
+    fn make_test_proxy_state_with_reserved_ports(
+        initial_config: GatewayConfig,
+        env_config: crate::config::env_config::EnvConfig,
+        reserved_gateway_ports: HashSet<u16>,
+    ) -> ProxyState {
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
-        ProxyState::new(initial_config, dns_cache, env_config, None, None)
-            .expect("ProxyState construction should succeed in tests")
-            .0
+        ProxyState::new_with_reserved_gateway_ports(
+            initial_config,
+            dns_cache,
+            env_config,
+            None,
+            None,
+            reserved_gateway_ports,
+        )
+        .expect("ProxyState construction should succeed in tests")
+        .0
     }
 
     fn header_value<'a>(
@@ -27332,6 +27409,20 @@ mod tests {
             "backend_tls_verify_server_cert": true,
         }))
         .expect("validation test proxy should deserialize")
+    }
+
+    fn make_validation_stream_proxy(id: &str, listen_port: u16) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": "test-stream-proxy",
+            "listen_port": listen_port,
+            "backend_scheme": "tcp",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "backend_tls_verify_server_cert": true,
+        }))
+        .expect("validation test stream proxy should deserialize")
     }
 
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
@@ -27700,6 +27791,76 @@ mod tests {
         assert!(
             state.validate_full_config(&good_config).is_ok(),
             "minimal valid config must pass validate_full_config"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_uses_effective_reserved_ports_for_reload() {
+        let env_config = crate::config::env_config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 41_001,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            ..crate::config::env_config::EnvConfig::default()
+        };
+        let state = make_test_proxy_state_with_reserved_ports(
+            make_validation_config(vec![]),
+            env_config,
+            HashSet::from([41_000]),
+        );
+
+        let actual_reserved =
+            make_validation_config(vec![make_validation_stream_proxy("stream-actual", 41_000)]);
+        let err = state
+            .validate_full_config(&actual_reserved)
+            .expect_err("effective reserved port must be rejected");
+        assert!(
+            err.iter().any(|msg| msg.contains("gateway reserved port")),
+            "error must identify gateway reserved-port conflict; got {err:?}"
+        );
+
+        let stale_env_port =
+            make_validation_config(vec![make_validation_stream_proxy("stream-env", 41_001)]);
+        assert!(
+            state.validate_full_config(&stale_env_port).is_ok(),
+            "reload validation must not reject an EnvConfig port that is not in the effective reserved set",
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_effective_reserved_port_without_swapping() {
+        let env_config = crate::config::env_config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 41_001,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            ..crate::config::env_config::EnvConfig::default()
+        };
+        let state = make_test_proxy_state_with_reserved_ports(
+            make_validation_config(vec![]),
+            env_config,
+            HashSet::from([41_000]),
+        );
+        let pre_swap_loaded_at = state.config.load_full().loaded_at;
+        let rejected =
+            make_validation_config(vec![make_validation_stream_proxy("stream-actual", 41_000)]);
+
+        let outcome = state.update_config(rejected);
+
+        assert!(
+            matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+            "reserved stream port must reject reload; got {outcome:?}"
+        );
+        let post_attempt_config = state.config.load_full();
+        assert!(
+            post_attempt_config.proxies.is_empty(),
+            "rejected reserved-port reload must preserve previous config"
+        );
+        assert_eq!(
+            post_attempt_config.loaded_at, pre_swap_loaded_at,
+            "loaded_at must not advance when reserved-port validation rejects reload"
         );
     }
 

@@ -440,6 +440,7 @@ fn effective_reserved_ports(
     if let Some(ref addr) = env_config.cp_grpc_listen_addr
         && let Some(port_str) = addr.rsplit(':').next()
         && let Ok(port) = port_str.parse::<u16>()
+        && port != 0
     {
         ports.insert(port);
     }
@@ -702,12 +703,13 @@ pub async fn serve(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
 
-    let (proxy_state, health_check_handles) = ProxyState::new(
+    let (proxy_state, health_check_handles) = ProxyState::new_with_reserved_gateway_ports(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
+        reserved_ports.clone(),
     )?;
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
@@ -1641,6 +1643,28 @@ mod tests {
         assert!(
             !reserved.contains(&0),
             "port 0 means disabled and must not be reserved; got {reserved:?}",
+        );
+    }
+
+    #[test]
+    fn effective_reserved_ports_excludes_disabled_cp_grpc_port() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 0,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            cp_grpc_listen_addr: Some("127.0.0.1:0".to_string()),
+            ..EnvConfig::default()
+        };
+        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default());
+        assert!(
+            !reserved.contains(&0),
+            "CP gRPC port 0 means disabled and must not be reserved; got {reserved:?}",
+        );
+        assert!(
+            reserved.is_empty(),
+            "all configured listeners are disabled, so no reserved ports should remain; got {reserved:?}",
         );
     }
 }
