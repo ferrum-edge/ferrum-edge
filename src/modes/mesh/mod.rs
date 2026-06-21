@@ -11797,7 +11797,7 @@ mod tests {
 
         assert!(
             !config.proxies.iter().any(|p| p.id == proxy_id),
-            "NodeWaypoint direct-pod HTTP routing must stay fail-closed until pod-IP HBONE targets are reachable"
+            "NodeWaypoint direct-pod HTTP routing must stay fail-closed instead of synthesizing unreachable pod-IP HBONE targets"
         );
         assert!(
             !config.upstreams.iter().any(|u| u.id == upstream_id),

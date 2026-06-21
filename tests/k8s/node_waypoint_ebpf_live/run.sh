@@ -288,7 +288,7 @@ validate_cluster() {
   log "using nodes: $NODE_A and $NODE_B"
 
   if ! kubectl get crd authorizationpolicies.security.istio.io >/dev/null 2>&1; then
-    echo "Istio AuthorizationPolicy CRD is required for this live policy-resource ingestion test" >&2
+    echo "Istio AuthorizationPolicy CRD is required for this live policy enforcement test" >&2
     exit 1
   fi
 
@@ -543,17 +543,18 @@ collect_bpf_evidence() {
 
 apply_workloads() {
   log "applying live traffic workloads"
-  local service_ip_family_block
-  if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
-    service_ip_family_block=$'  ipFamilyPolicy: RequireDualStack\n  ipFamilies:\n    - IPv4\n    - IPv6'
-  else
-    service_ip_family_block=$'  ipFamilyPolicy: PreferDualStack'
-  fi
-  awk -v ns="$WORKLOAD_NS" -v family_block="$service_ip_family_block" '
+  awk -v ns="$WORKLOAD_NS" -v require_dual="$REQUIRE_DUAL_STACK" '
     {
       gsub(/__NAMESPACE__/, ns)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
-        print family_block
+        if (require_dual == "true") {
+          print "  ipFamilyPolicy: RequireDualStack"
+          print "  ipFamilies:"
+          print "    - IPv4"
+          print "    - IPv6"
+        } else {
+          print "  ipFamilyPolicy: PreferDualStack"
+        }
       } else {
         print
       }
@@ -937,44 +938,15 @@ expect_blocked() {
   local from="$1"
   local label="$2"
   local url="$3"
-  local output code
+  local output code err
+  err="$(mktemp)"
   set +e
-  output="$(curl_from "$from" "$url" 2>/tmp/ferrum-live-curl.err)"
+  output="$(curl_from "$from" "$url" 2>"$err")"
   local status=$?
   set -e
   code="${output##*$'\n'}"
   if [[ "$status" -eq 0 && "$code" == "200" ]]; then
     echo "expected block for $label from $from to $url, got HTTP 200" >&2
-    exit 1
-  fi
-}
-
-expect_no_hbone_dispatch_required() {
-  local from="$1"
-  local label="$2"
-  local url="$3"
-  local expected_body="$4"
-  local output="" code="" body="" status=1 err
-  err="$(mktemp)"
-  set +e
-  output="$(curl_from "$from" "$url" 2>"$err")"
-  status=$?
-  set -e
-  code="${output##*$'\n'}"
-  body="${output%$'\n'*}"
-  body="${body//$'\r'/}"
-  while [[ "$body" == *$'\n' ]]; do
-    body="${body%$'\n'}"
-  done
-  if [[ "$status" -eq 0 && "$code" == "502" && "$body" == *"HBONE dispatch required"* ]]; then
-    echo "expected $label from $from to $url to avoid unreachable pod-IP HBONE dispatch, got HTTP 502 body '$body'" >&2
-    cat "$err" >&2 || true
-    rm -f "$err"
-    collect_traffic_failure_diagnostics
-    exit 1
-  fi
-  if [[ "$status" -eq 0 && "$code" == "200" && "$body" != "$expected_body" ]]; then
-    echo "expected $label from $from to $url to return body '$expected_body' when allowed, got '$body'" >&2
     cat "$err" >&2 || true
     rm -f "$err"
     collect_traffic_failure_diagnostics
@@ -984,18 +956,19 @@ expect_no_hbone_dispatch_required() {
 }
 
 run_traffic_checks() {
-  log "running IPv4 Service reachability and HBONE dispatch regression checks"
+  log "running IPv4 Service authorization and bypass checks"
   local dst_a_ip dst_b_ip
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
 
   expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
-  expect_no_hbone_dispatch_required src-a "same-node direct Pod IP" "http://$dst_a_ip:8080/" "ok-a"
   expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
-  expect_no_hbone_dispatch_required src-a "cross-node direct Pod IP" "http://$dst_b_ip:8080/" "ok-b"
 
-  expect_no_hbone_dispatch_required src-b "same-node Service policy-resource probe" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
-  expect_no_hbone_dispatch_required src-b "cross-node direct Pod IP policy-resource probe" "http://$dst_a_ip:8080/" "ok-a"
+  expect_blocked src-b "same-node Service AuthorizationPolicy DENY" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
+  expect_blocked src-b "cross-node Service AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+
+  expect_blocked src-b "same-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_b_ip:8080/"
+  expect_blocked src-b "cross-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_a_ip:8080/"
 
   log "checking stale identity cleanup across source workload recreation"
   local old_src_a_uid old_src_a_node
@@ -1007,7 +980,7 @@ run_traffic_checks() {
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
   expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
-  expect_no_hbone_dispatch_required src-b "post-recreation policy-resource probe" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
+  expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
 }
 
 run_ipv6_checks() {
@@ -1017,7 +990,9 @@ run_ipv6_checks() {
   svc_a_v6="$(svc_ipv6 dst-a)"
   if [[ -z "$dst_a_v6" || -z "$svc_a_v6" ]]; then
     if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
-      echo "dual-stack pass required, but dst-a pod/service has no IPv6 address" >&2
+      echo "dual-stack pass required, but dst-a pod/service has no IPv6 address (pod='$dst_a_v6' service='$svc_a_v6')" >&2
+      kubectl -n "$WORKLOAD_NS" get pod -l app=dst-a -o yaml >&2 || true
+      kubectl -n "$WORKLOAD_NS" get svc dst-a -o yaml >&2 || true
       exit 1
     fi
     log "cluster is not dual-stack; skipping IPv6 pass"

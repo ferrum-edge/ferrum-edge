@@ -98,12 +98,15 @@ jobs:
           apiVersion: kind.x-k8s.io/v1alpha4
           networking:
             ipFamily: dual
+            podSubnet: "10.244.0.0/16,fd00:10:244::/56"
+            serviceSubnet: "10.96.0.0/16,fd00:10:96::/112"
           nodes:
             - role: control-plane
             - role: worker
             - role: worker
           YAML
           kind create cluster --name "$KIND_CLUSTER" --config kind-ebpf-live.yaml --wait 180s
+          kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" podCIDRs="}{.spec.podCIDRs}{"\n"}{end}'
           for node in $(kind get nodes --name "$KIND_CLUSTER"); do
             docker exec "$node" sh -eu -c '
               mkdir -p /sys/fs/bpf
@@ -160,6 +163,9 @@ jobs:
           kubectl get pods -A -o wide > "$results/pods.txt" 2>&1
           kubectl get events -A --sort-by=.lastTimestamp > "$results/events.txt" 2>&1
           kubectl -n ferrum get all -o wide > "$results/ferrum-all.txt" 2>&1
+          kubectl -n ferrum-ebpf-live get all -o wide > "$results/workloads-all.txt" 2>&1
+          kubectl -n ferrum-ebpf-live describe pods > "$results/workloads-pods-describe.txt" 2>&1
+          kubectl -n ferrum-ebpf-live describe svc > "$results/workloads-services-describe.txt" 2>&1
           helm -n ferrum get values ferrum-live --all > "$results/helm-values.yaml" 2>&1
           helm -n ferrum get manifest ferrum-live > "$results/helm-manifest.yaml" 2>&1
           kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/control-plane-deployment-describe.txt" 2>&1

@@ -155,9 +155,11 @@ The harness renders the Helm chart to assert enabled eBPF topologies select the
 checks the shared node-agent ↔ ambient pod registry plus per-pod in-netns ready
 markers, and verifies every ambient proxy accepted a mesh slice with the live
 workloads and policies before traffic starts. It then runs same-node and
-cross-node source/destination pod traffic over Service ClusterIP and direct Pod
-IP. The dual-stack pass verifies IPv6 is rejected before traffic is admitted
-until the end-to-end IPv6 NodeWaypoint path is completed. The workflow uploads
+cross-node source/destination pod traffic, requiring `src-a` Service ClusterIP
+requests to succeed and `src-b` Service ClusterIP plus direct Pod-IP attempts to
+be rejected by live `AuthorizationPolicy`. The dual-stack pass verifies IPv6 is
+rejected before traffic is admitted until the end-to-end IPv6 NodeWaypoint path
+is completed. The workflow uploads
 Kubernetes diagnostics, mesh drift snapshots, pod-registry dumps, and `bpftool`
 evidence with 14-day retention.
 

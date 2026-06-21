@@ -16,16 +16,16 @@ The script renders the chart first and fails if an enabled eBPF node-agent or
 NodeWaypoint proxy would use a non-`-ebpf` image. It then installs the chart,
 checks `/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`,
 collects BPF program/link/map evidence with `bpftool`, creates same-node and
-cross-node source/destination pods, exercises Service ClusterIP reachability,
-verifies policy resources are present in the live mesh slice, and checks direct
-Pod-IP probes do not regress to unreachable pod-IP HBONE dispatch. On dual-stack
-clusters it requires IPv6 to be rejected before a request is admitted until the
-end-to-end IPv6 NodeWaypoint path is implemented.
+cross-node source/destination pods, verifies `src-a` Service ClusterIP traffic
+is admitted, verifies `src-b` Service ClusterIP and direct Pod-IP attempts are
+rejected by the live `AuthorizationPolicy`, and checks stale source identities
+stay denied after pod recreation. On dual-stack clusters it requires IPv6 to be
+rejected before a request is admitted until the end-to-end IPv6 NodeWaypoint path
+is implemented.
 The ambient proxy is started with `FERRUM_MESH_ALLOW_NO_CA=true` because this
-disposable test targets eBPF capture, pod attribution, policy-resource
-ingestion, and HBONE dispatch regression coverage, not mesh mTLS identity
-issuance. Production installs must provide gateway SVID material or a CA backend
-instead.
+disposable test targets eBPF capture, pod attribution, policy enforcement, and
+fail-closed bypass coverage, not mesh mTLS identity issuance.
+Production installs must provide gateway SVID material or a CA backend instead.
 
 Run manually:
 
