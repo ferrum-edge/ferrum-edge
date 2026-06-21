@@ -63,8 +63,11 @@ need them, or because they are blocked upstream / architecturally:
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
 - **IPv6 ambient / node-waypoint capture** — blocked on the aya BPF verifier for
   the v6 socket-cookie read; dual-stack **sidecar** serves IPv6 fully.
-- **UDP/DTLS per-pod authz scoping** — architectural (no UDP capture hooks);
-  mesh-wide + fail-closed is the safe invariant.
+- **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
+  capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
+  services are rejected at slice apply. Mesh-wide UDP/DTLS policy stays
+  supported, and Sidecar remains the supported topology for workload-scoped
+  UDP/DTLS authorization.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — wire-projected but inert
   at runtime, blocked on hyper (no close-after-N knob); use `http2MaxRequests`.
   (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
