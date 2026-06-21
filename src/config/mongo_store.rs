@@ -2471,13 +2471,13 @@ mod inner {
                                                 "upstream",
                                                 upstream_id,
                                                 "delete",
-                                        )
-                                        .await
-                                        .map_err(
-                                            |e| mongodb::error::Error::custom(e.to_string()),
-                                        )?;
+                                            )
+                                            .await
+                                            .map_err(
+                                                |e| mongodb::error::Error::custom(e.to_string()),
+                                            )?;
+                                        }
                                     }
-                                }
                                     if let Some(upstream_id) = deleted_orphaned_upstream_id.as_ref()
                                     {
                                         this.record_config_change_in_session(
