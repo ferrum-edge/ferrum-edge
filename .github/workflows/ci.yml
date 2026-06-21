@@ -337,6 +337,7 @@ jobs:
               integration::mesh_destination_rule_locality_lb_tests
               integration::mesh_destination_rule_port_policy_tests
               integration::mesh_destination_rule_max_connections_tests
+              integration::mesh_destination_rule_connection_pool_audit_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
           - shard: mesh-platform
