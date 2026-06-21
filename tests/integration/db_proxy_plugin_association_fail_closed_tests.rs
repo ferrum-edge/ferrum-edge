@@ -64,6 +64,22 @@ async fn drop_proxy_plugins_table(store: &DatabaseStore) {
         .expect("drop proxy_plugins must succeed");
 }
 
+async fn drop_plugin_configs_table(store: &DatabaseStore) {
+    let pool = store.pool();
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("connection acquisition must succeed");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .expect("foreign key disabling must succeed");
+    sqlx::query("DROP TABLE plugin_configs")
+        .execute(&mut *conn)
+        .await
+        .expect("drop plugin_configs must succeed");
+}
+
 fn error_text<T>(result: Result<T, anyhow::Error>) -> String {
     match result {
         Ok(_) => panic!("operation unexpectedly succeeded"),
@@ -266,6 +282,27 @@ async fn admin_proxy_reads_fail_closed_on_association_query_failure() {
 
     let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
     assert_association_error_context(&list_message, "list_proxies_paginated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_proxy_reads_wrap_plugin_config_lookup_failures_as_association_errors() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+    drop_plugin_configs_table(&store).await;
+
+    let get_message = error_text(store.get_proxy("proxy-1").await);
+    assert_association_error_context(&get_message, "get_proxy");
+    assert!(
+        get_message.contains("failed to load plugin_config references"),
+        "plugin_config lookup failure should be wrapped as association context, got: {get_message}"
+    );
+
+    let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
+    assert_association_error_context(&list_message, "list_proxies_paginated");
+    assert!(
+        list_message.contains("failed to load plugin_config references"),
+        "paginated plugin_config lookup failure should be wrapped as association context, got: {list_message}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

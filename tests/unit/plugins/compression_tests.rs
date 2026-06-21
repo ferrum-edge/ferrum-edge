@@ -602,6 +602,14 @@ fn test_response_buffering_skips_strong_etag() {
         200,
         &headers
     ));
+
+    headers.insert("etag".to_string(), "W/\"old\", W/\"new\"".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
 }
 
 #[test]
@@ -945,6 +953,26 @@ async fn test_whitespace_after_weak_etag_prefix_is_preserved_like_malformed_etag
     assert!(!resp_headers.contains_key("content-encoding"));
     assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
     assert_eq!(resp_headers.get("etag").unwrap(), "W/ \"abc123\"");
+}
+
+#[tokio::test]
+async fn test_folded_duplicate_weak_etag_is_preserved_like_malformed_etag() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "W/\"old\", W/\"new\"".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("etag").unwrap(), "W/\"old\", W/\"new\"");
 }
 
 #[tokio::test]
