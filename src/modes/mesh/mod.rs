@@ -1128,14 +1128,14 @@ fn strip_node_waypoint_udp_dtls_mesh_service_ports(mesh: Option<&mut MeshConfig>
 
     let mut udp_services = Vec::new();
     for service in &mut mesh.services {
-        let udp_ports: HashSet<u16> = service_udp_stream_ports(service)
+        let udp_port_numbers: HashSet<u16> = service_udp_stream_ports(service)
             .iter()
             .map(|port| port.port)
             .collect();
-        if udp_ports.is_empty() {
+        if udp_port_numbers.is_empty() {
             continue;
         }
-        let mut rendered_ports = udp_ports
+        let mut rendered_ports = udp_port_numbers
             .iter()
             .map(|port| port.to_string())
             .collect::<Vec<_>>();
@@ -1146,13 +1146,51 @@ fn strip_node_waypoint_udp_dtls_mesh_service_ports(mesh: Option<&mut MeshConfig>
             service.name,
             rendered_ports.join(",")
         ));
-        service.ports.retain(|port| !udp_ports.contains(&port.port));
+        let protocol_overrides = service.protocol_overrides.clone();
+        service.ports.retain(|port| {
+            let protocol = protocol_overrides
+                .get(&port.port)
+                .copied()
+                .unwrap_or(port.protocol);
+            !is_udp_mesh_protocol(protocol)
+        });
+        let remaining_port_numbers: HashSet<u16> =
+            service.ports.iter().map(|port| port.port).collect();
         service
             .protocol_overrides
-            .retain(|port, _| !udp_ports.contains(port));
+            .retain(|port, _| remaining_port_numbers.contains(port));
     }
 
     udp_services
+}
+
+fn node_waypoint_dns_slice_for_prepared_config(
+    runtime: &MeshRuntimeConfig,
+    base_slice: &MeshSlice,
+    config: &GatewayConfig,
+) -> Option<MeshSlice> {
+    if runtime.topology != MeshTopology::NodeWaypoint
+        || effective_node_waypoint_scoped_authz_policy_labels(config).is_empty()
+    {
+        return None;
+    }
+    let mesh = config.mesh.as_deref()?;
+    // DNS is rebuilt from a MeshSlice, while UDP fail-closed suppression mutates
+    // the prepared GatewayConfig. Mirror the accepted service view here so a
+    // UDP-only service stripped from routing is not still advertised by DNS.
+    let services = mesh
+        .services
+        .iter()
+        .filter(|service| !service.ports.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if services == base_slice.services {
+        return None;
+    }
+
+    let mut dns_slice = base_slice.clone();
+    dns_slice.services = services;
+    Some(dns_slice)
 }
 
 fn mesh_policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
@@ -10021,6 +10059,9 @@ async fn apply_mesh_slice_generation(
             // that window can enter the new plugin chain without a peer
             // principal; mesh authz still fails closed for identity-required
             // policy until the slot swaps.
+            let dns_slice = dns_proxy.as_ref().and_then(|_| {
+                node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
+            });
             let outcome = proxy_state.update_config(config);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
@@ -10057,7 +10098,7 @@ async fn apply_mesh_slice_generation(
                 .await;
             }
             if accepted && let Some(dns_proxy) = dns_proxy {
-                dns_proxy.update_from_slice(base_slice);
+                dns_proxy.update_from_slice(dns_slice.as_ref().unwrap_or(base_slice));
             }
             if accepted {
                 refresh_mesh_outbound_enforcement(proxy_state, runtime, base_slice);
@@ -12464,6 +12505,105 @@ mod tests {
                 .id
                 .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)),
             "synthesized UDP upstreams must not survive fail-closed suppression"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_udp_scoped_policy_removes_udp_only_service_from_dns_slice() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            mesh_policies: vec![scoped_node_waypoint_deny_policy()],
+            ..MeshSlice::default()
+        };
+
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let prepared =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice prepares");
+        let dns_slice = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared)
+            .expect("UDP-only service must be suppressed from DNS-visible slice");
+
+        assert!(
+            dns_slice.services.is_empty(),
+            "UDP-only service should not remain DNS-visible after NodeWaypoint fail-closed suppression"
+        );
+        let original_dns = dns_proxy::DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(
+            original_dns
+                .resolve("dns.default.svc.cluster.local")
+                .is_some(),
+            "sanity check: original slice would publish the service"
+        );
+        let suppressed_dns = dns_proxy::DnsResolutionTable::from_mesh_slice(&dns_slice);
+        assert!(
+            suppressed_dns
+                .resolve("dns.default.svc.cluster.local")
+                .is_none(),
+            "sanitized DNS slice must not publish a UDP-only NodeWaypoint service under scoped authz"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_udp_scoped_policy_preserves_tcp_port_sharing_udp_number() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports = vec![
+            ServicePort {
+                port: 53,
+                protocol: AppProtocol::Tcp,
+                name: Some("dns-tcp".to_string()),
+                target_port: None,
+            },
+            ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns-udp".to_string()),
+                target_port: None,
+            },
+        ];
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            mesh_policies: vec![scoped_node_waypoint_deny_policy()],
+            ..MeshSlice::default()
+        };
+
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let prepared = prepare_normalized_gateway_config_for_mesh(
+            gateway_config_with_mesh_services(&slice),
+            &runtime,
+            &slice,
+        )
+        .expect("NodeWaypoint scoped policy update must apply while UDP fails closed");
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        let dns = mesh
+            .services
+            .iter()
+            .find(|service| service.name == "dns")
+            .expect("service retained for TCP");
+
+        assert!(
+            service_udp_stream_ports(dns).is_empty(),
+            "UDP entry sharing port 53 must be stripped"
+        );
+        let tcp_ports = service_tcp_stream_ports(dns);
+        assert_eq!(tcp_ports.len(), 1);
+        assert_eq!(tcp_ports[0].port, 53);
+        assert_eq!(tcp_ports[0].name.as_deref(), Some("dns-tcp"));
+
+        let dns_slice = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared)
+            .expect("mixed service should use sanitized service list for DNS");
+        let dns_table = dns_proxy::DnsResolutionTable::from_mesh_slice(&dns_slice);
+        assert!(
+            dns_table.resolve("dns.default.svc.cluster.local").is_some(),
+            "service with a supported TCP port must remain DNS-visible"
         );
     }
 
