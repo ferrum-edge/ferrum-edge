@@ -512,6 +512,7 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     let trust_bundles = create_test_trust_bundles();
@@ -584,6 +585,7 @@ async fn test_dp_applies_gateway_trust_bundles_from_rejected_delta() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     let trust_bundles = create_test_trust_bundles();
@@ -2059,6 +2061,7 @@ async fn test_dp_applies_delta_update_adding_proxy() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -2135,6 +2138,7 @@ async fn test_dp_applies_delta_update_removing_proxy() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -2208,6 +2212,7 @@ async fn test_dp_applies_delta_then_full_snapshot() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -2312,6 +2317,7 @@ async fn test_dp_ignores_malformed_delta() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
@@ -2349,6 +2355,7 @@ async fn test_incremental_result_serde_roundtrip() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec!["upstream-x".to_string()],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
 
@@ -2419,6 +2426,7 @@ async fn test_dp_applies_delta_modifying_proxy() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -2505,6 +2513,7 @@ async fn test_dp_applies_delta_with_mixed_operations() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -2781,6 +2790,7 @@ async fn test_dp_applies_delta_adding_upstream() {
             &[("backend1.local", 8080), ("backend2.local", 8081)],
         )],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -2850,6 +2860,7 @@ async fn test_dp_applies_delta_removing_upstream() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec!["u1".to_string()],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
@@ -2916,6 +2927,7 @@ async fn test_dp_applies_delta_modifying_upstream_targets() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![modified_upstream],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
@@ -2976,6 +2988,7 @@ async fn test_dp_applies_delta_adding_consumer() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -3045,6 +3058,7 @@ async fn test_dp_applies_delta_removing_consumer() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
@@ -3118,6 +3132,7 @@ async fn test_cp_broadcasts_delta_to_multiple_dps() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
@@ -3202,6 +3217,7 @@ async fn test_dp_applies_delta_with_all_entity_types() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![modified_upstream],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");

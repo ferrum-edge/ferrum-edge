@@ -1,4 +1,38 @@
 {{- if .Values.ambient.enabled }}
+{{- $ambientImageRepository := toString .Values.image.repository -}}
+{{- $ambientImageTag := toString .Values.image.tag -}}
+{{- $ambientEnv := default dict .Values.ambient.env -}}
+{{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
+{{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
+{{- $nodeWaypointRegistryMountPath = toString (index $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR") -}}
+{{- end -}}
+{{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
+{{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
+{{- $ambientAdminPort := "9000" -}}
+{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
+{{- $ambientAdminPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTP_PORT") -}}
+{{- end -}}
+{{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
+{{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
+{{- end -}}
+{{- if $nodeWaypointRegistryEnabled -}}
+{{- if not .Values.nodeAgent.enabled -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.enabled=true" -}}
+{{- end -}}
+{{- if ne $nodeAgentProxyMode "node_waypoint" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.proxyMode=node_waypoint" -}}
+{{- end -}}
+{{- if ne $nodeAgentCaptureMode "ebpf" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.captureMode=ebpf" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint")) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
+{{- end -}}
+{{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -20,16 +54,32 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
+      {{- if $nodeWaypointRegistryEnabled }}
+      hostPID: true
+      {{- end }}
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: ferrum-edge
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ $ambientImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           securityContext:
+            {{- if $nodeWaypointRegistryEnabled }}
+            runAsUser: 0
+            runAsGroup: 0
+            {{- end }}
             capabilities:
               add:
+                {{- if $nodeWaypointRegistryEnabled }}
+                - BPF
+                {{- end }}
                 - NET_ADMIN
                 - NET_RAW
+                {{- if $nodeWaypointRegistryEnabled }}
+                - PERFMON
+                - SYS_ADMIN
+                - SYS_PTRACE
+                {{- end }}
           ports:
             - name: outbound
               containerPort: {{ .Values.ambient.outboundPort }}
@@ -40,8 +90,38 @@ spec:
           env:
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
-            {{- range $name, $value := .Values.ambient.env }}
+            {{- if and $nodeWaypointRegistryEnabled (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
+            - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
+              value: {{ .Values.nodeAgent.podRegistryDir | quote }}
+            {{- end }}
+            {{- range $name, $value := $ambientEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
+          {{- if $nodeWaypointRegistryEnabled }}
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+              readOnly: true
+            - name: cgroup
+              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
+              readOnly: true
+            - name: node-waypoint-pod-registry
+              mountPath: {{ $nodeWaypointRegistryMountPath }}
+          {{- end }}
+      {{- if $nodeWaypointRegistryEnabled }}
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: {{ .Values.nodeAgent.bpfFsPath }}
+            type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.nodeAgent.cgroupRoot }}
+            type: Directory
+        - name: node-waypoint-pod-registry
+          hostPath:
+            path: {{ .Values.nodeAgent.podRegistryDir }}
+            type: DirectoryOrCreate
+      {{- end }}
 {{- end }}

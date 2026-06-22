@@ -2248,6 +2248,9 @@ paths:
                         - control_plane_configured
                         - federation_endpoint_configured
                         - discovered
+                        - outbound_trust_active
+                        - inbound_trust_active
+                        - trust_source
                       properties:
                         cluster_name:
                           type: string
@@ -2274,6 +2277,30 @@ paths:
                           description: |
                             Whether this cluster is present in the scoped
                             `discovered` view (matched by name + trust domain).
+                        outbound_trust_active:
+                          type: boolean
+                          description: Whether this DP has an active outbound trust bundle for the remote trust domain.
+                        inbound_trust_active:
+                          type: boolean
+                          description: Whether this DP has an active inbound SPIFFE verifier that can authenticate peers from the remote trust domain.
+                        trust_source:
+                          type: string
+                          enum: [polled, control_plane, local, blocked_pending_poll, none]
+                          description: |
+                            Source of the currently effective remote trust
+                            state. `blocked_pending_poll` means fail-closed
+                            bootstrap is blocking a CP-supplied fallback until
+                            the first successful federation poll.
+                        trust_bundle_fetched_at_unix_seconds:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: Unix timestamp (seconds) of the last successful polled bundle fetch, present when `trust_source` is `polled`.
+                        trust_bundle_age_seconds:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: Seconds since the last successful polled bundle fetch, present when `trust_source` is `polled`.
               examples:
                 discovery-active:
                   value:
@@ -2293,11 +2320,19 @@ paths:
                         control_plane_configured: true
                         federation_endpoint_configured: true
                         discovered: true
+                        outbound_trust_active: true
+                        inbound_trust_active: true
+                        trust_source: polled
+                        trust_bundle_fetched_at_unix_seconds: 1747595530
+                        trust_bundle_age_seconds: 9
                       - cluster_name: remote-west
                         trust_domain: west.example.com
                         control_plane_configured: false
                         federation_endpoint_configured: true
                         discovered: false
+                        outbound_trust_active: false
+                        inbound_trust_active: false
+                        trust_source: blocked_pending_poll
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

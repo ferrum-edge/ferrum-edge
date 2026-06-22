@@ -252,7 +252,6 @@ impl MeshGrpcServer {
         MeshConfigSyncServer::new(self)
     }
 
-    #[allow(clippy::result_large_err)]
     fn check_namespace(
         &self,
         mesh_namespace: &str,
@@ -639,6 +638,73 @@ mod tests {
         }
     }
 
+    fn mesh_server_with_scope(scope: CpScope, require_ns_claim: bool) -> MeshGrpcServer {
+        let cfg = Arc::new(ArcSwap::new(Arc::new(GatewayConfig::default())));
+        let (server, _tx) = MeshGrpcServer::builder(cfg, "test-secret".to_string())
+            .scope(scope)
+            .require_ns_claim(require_ns_claim)
+            .build();
+        server
+    }
+
+    fn allowed_namespaces(namespaces: &[&str]) -> AllowedNamespaces {
+        AllowedNamespaces(Some(namespaces.iter().map(|ns| ns.to_string()).collect()))
+    }
+
+    #[test]
+    fn mesh_subscribe_all_scope_rejects_missing_claim() {
+        let server = mesh_server_with_scope(CpScope::All, false);
+        let err = server
+            .check_namespace("ferrum-ebpf-live", &AllowedNamespaces::empty())
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("Multi-namespace CP scope"));
+    }
+
+    #[test]
+    fn mesh_subscribe_all_scope_accepts_workload_namespace_with_claim() {
+        let server = mesh_server_with_scope(CpScope::All, false);
+        let allowed = allowed_namespaces(&["ferrum-ebpf-live"]);
+
+        assert!(server.check_namespace("ferrum-ebpf-live", &allowed).is_ok());
+    }
+
+    #[test]
+    fn mesh_subscribe_single_scope_rejects_other_namespace() {
+        let server = mesh_server_with_scope(CpScope::Single("ferrum".to_string()), false);
+        let err = server
+            .check_namespace("ferrum-ebpf-live", &AllowedNamespaces::empty())
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("ferrum-ebpf-live"));
+        assert!(err.message().contains("ferrum"));
+    }
+
+    #[test]
+    fn mesh_subscribe_require_claim_rejects_missing_claim() {
+        let server = mesh_server_with_scope(CpScope::Single("ferrum-ebpf-live".to_string()), true);
+        let err = server
+            .check_namespace("ferrum-ebpf-live", &AllowedNamespaces::empty())
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("FERRUM_CP_REQUIRE_NAMESPACE_CLAIM"));
+    }
+
+    #[test]
+    fn mesh_subscribe_claim_must_allow_requested_namespace() {
+        let server = mesh_server_with_scope(CpScope::All, false);
+        let allowed = allowed_namespaces(&["prod"]);
+        let err = server
+            .check_namespace("ferrum-ebpf-live", &allowed)
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("ferrum-ebpf-live"));
+    }
+
     #[test]
     fn mesh_delta_update_skips_unchanged_mesh_slice_content() {
         let mut stream_config = mesh_config_with_service(0);
@@ -652,6 +718,7 @@ mod tests {
             removed_plugin_config_ids: Vec::new(),
             added_or_modified_upstreams: Vec::new(),
             removed_upstream_ids: vec!["stale-upstream".to_string()],
+            sequence_cursor: 0,
             poll_timestamp,
         };
         let slice_request = MeshSliceRequest::from_native(

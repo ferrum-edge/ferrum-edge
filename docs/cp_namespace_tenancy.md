@@ -81,8 +81,8 @@ to 32) to keep the per-namespace channel small.
 
 ## JWT tenancy claim
 
-DP configuration JWTs carry an `ns` claim that pins which namespaces the
-bearer is authorised to subscribe to. The claim accepts:
+DP, native mesh, and xDS configuration JWTs carry an `ns` claim that pins
+which namespaces the bearer is authorised to subscribe to. The claim accepts:
 
 - a single string: `"ns": "prod"`
 - an array of strings: `"ns": ["prod","staging"]`
@@ -113,11 +113,14 @@ as "missing" because that would let ambiguous tokens fall back to legacy
 single-namespace compatibility.
 
 Self-minted DP tokens (the `connect_and_subscribe` path in
-`src/grpc/dp_client.rs`) embed a single-string `ns` claim from the DP's own
-`FERRUM_NAMESPACE`. Operator-minted tokens that should grant access to
-multiple namespaces should embed the claim as an array. xDS ADS has no
-explicit namespace request field, so multi-tenant xDS accepts only a
-single-namespace `ns` claim; a multi-namespace xDS token is ambiguous and
+`src/grpc/dp_client.rs`) and native mesh-client tokens
+(`src/modes/mesh/config_consumer/native_client.rs`) embed a single-string
+`ns` claim from the process' own `FERRUM_NAMESPACE`, so data planes and mesh
+nodes continue to work out of the box even when the CP runs with
+`FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`. Operator-minted tokens that should
+grant access to multiple namespaces should embed the claim as an array. xDS
+ADS has no explicit namespace request field, so multi-tenant xDS accepts only
+a single-namespace `ns` claim; a multi-namespace xDS token is ambiguous and
 is rejected.
 
 ## Migration steps

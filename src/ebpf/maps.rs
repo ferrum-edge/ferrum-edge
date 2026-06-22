@@ -24,7 +24,7 @@ use ferrum_ebpf_common::{
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use super::PodInfo;
+use super::{BPF_MAP_CAPTURE_CONFIG, BPF_MAP_WORKLOAD_IDENTITY, PodInfo};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct BpfMaps {
@@ -92,7 +92,7 @@ impl BpfMaps {
             ),
             None => {
                 tracing::warn!(
-                    "FERRUM_CAPTURE_CONFIG map not found; continuing with eBPF program default capture ports"
+                    "FERRUM_CAPTURE_CONFIG map not found; startup readiness will reject enabled eBPF capture before reporting ready"
                 );
                 None
             }
@@ -128,7 +128,7 @@ impl BpfMaps {
             ),
             None => {
                 tracing::warn!(
-                    "FERRUM_WORKLOAD_IDENTITY map not found; node-waypoint source-identity stamping disabled (eBPF ELF predates GAP-1b)"
+                    "FERRUM_WORKLOAD_IDENTITY map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
                 );
                 None
             }
@@ -146,6 +146,23 @@ impl BpfMaps {
             include_ports,
             workload_identity,
         })
+    }
+
+    pub fn validate_required(&self, require_workload_identity: bool) -> Result<(), String> {
+        let mut missing = Vec::new();
+        if self.capture_config.is_none() {
+            missing.push(BPF_MAP_CAPTURE_CONFIG);
+        }
+        if require_workload_identity && self.workload_identity.is_none() {
+            missing.push(BPF_MAP_WORKLOAD_IDENTITY);
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "BPF ELF is missing required map(s) for the selected capture topology: {}",
+            missing.join(", ")
+        ))
     }
 
     pub fn insert_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {

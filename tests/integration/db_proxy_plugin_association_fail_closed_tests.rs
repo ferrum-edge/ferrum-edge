@@ -4,9 +4,8 @@
 //! must fail closed when the junction-table query or row decoding fails, and
 //! admin reads must not serialize incomplete association graphs.
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use std::collections::HashSet;
 use tempfile::TempDir;
 
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
@@ -55,6 +54,17 @@ async fn seed_proxy_with_plugin(store: &DatabaseStore) {
         .execute(&pool)
         .await
         .expect("association insert must succeed");
+
+    sqlx::query(
+        "INSERT INTO config_changes (namespace, resource_type, resource_id, operation, created_at) \
+         VALUES ('ferrum', 'plugin_config', 'plugin-1', 'upsert', ?), \
+                ('ferrum', 'proxy', 'proxy-1', 'upsert', ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("change-log seed must succeed");
 }
 
 async fn drop_proxy_plugins_table(store: &DatabaseStore) {
@@ -115,16 +125,8 @@ async fn successful_association_loading_remains_unchanged() {
     assert_eq!(proxy.plugins.len(), 1);
     assert_eq!(proxy.plugins[0].plugin_config_id, "plugin-1");
 
-    let empty = HashSet::new();
     let incremental = store
-        .load_incremental_config(
-            "ferrum",
-            Utc::now() - Duration::days(1),
-            &empty,
-            &empty,
-            &empty,
-            &empty,
-        )
+        .load_incremental_config("ferrum", 0)
         .await
         .expect("incremental load must succeed");
     let incremental_proxy = incremental
@@ -175,31 +177,11 @@ async fn incremental_association_query_failure_rejects_delta() {
         .load_full_config("ferrum")
         .await
         .expect("baseline full load must succeed");
-    let known_proxy_ids: HashSet<String> = baseline.proxies.iter().map(|p| p.id.clone()).collect();
-    let known_consumer_ids: HashSet<String> =
-        baseline.consumers.iter().map(|c| c.id.clone()).collect();
-    let known_plugin_config_ids: HashSet<String> = baseline
-        .plugin_configs
-        .iter()
-        .map(|pc| pc.id.clone())
-        .collect();
-    let known_upstream_ids: HashSet<String> =
-        baseline.upstreams.iter().map(|u| u.id.clone()).collect();
+    assert_eq!(baseline.proxies.len(), 1);
 
     drop_proxy_plugins_table(&store).await;
 
-    let message = error_text(
-        store
-            .load_incremental_config(
-                "ferrum",
-                Utc::now() - Duration::days(1),
-                &known_proxy_ids,
-                &known_consumer_ids,
-                &known_plugin_config_ids,
-                &known_upstream_ids,
-            )
-            .await,
-    );
+    let message = error_text(store.load_incremental_config("ferrum", 0).await);
     assert_association_error_context(&message, "load_incremental_config");
 }
 

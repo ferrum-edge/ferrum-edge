@@ -1787,6 +1787,11 @@ async fn handle_mesh_remote_clusters_get(
         .as_ref()
         .as_ref()
         .and_then(|slice| slice.multi_cluster.as_ref());
+    let trust_bundles = applied_slice
+        .as_ref()
+        .as_ref()
+        .and_then(|slice| slice.trust_bundles.as_ref());
+    let federation = mesh_runtime.federation_store().snapshot();
 
     // Discovery is enabled only when the poll interval is positive. Read from
     // the DP's own env config so the flag is populated even before the first
@@ -1797,12 +1802,29 @@ async fn handle_mesh_remote_clusters_get(
         .proxy_state
         .as_ref()
         .is_some_and(|ps| ps.env_config.mesh_remote_discovery_poll_interval_seconds > 0);
+    let federation_poll_enabled = state
+        .proxy_state
+        .as_ref()
+        .is_some_and(|ps| ps.env_config.mesh_federation_poll_interval_seconds > 0);
+    let federation_fail_open = state
+        .proxy_state
+        .as_ref()
+        .is_some_and(|ps| ps.env_config.mesh_federation_fail_open);
+    let inbound_spiffe_verifier_configured = state.proxy_state.as_ref().is_some_and(|ps| {
+        ps.mesh_inbound_spiffe_verifier_active
+            .load(Ordering::Acquire)
+    });
 
     let resp =
         mesh_remote_clusters::build_response(mesh_remote_clusters::MeshRemoteClustersInputs {
             snapshot: snapshot.as_ref(),
             multi_cluster,
+            federation: &federation,
+            trust_bundles,
             discovery_enabled,
+            federation_poll_enabled,
+            federation_fail_open,
+            inbound_spiffe_verifier_configured,
             // `timestamp()` is non-negative for any realistic wall clock; clamp the
             // theoretical pre-epoch case to 0 rather than casting a negative i64.
             now_unix_seconds: chrono::Utc::now().timestamp().max(0) as u64,

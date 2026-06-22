@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::capture::{
-    CaptureConfig, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
+    CaptureConfig, CaptureMode, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
@@ -38,7 +38,10 @@ use crate::ebpf::pod_watcher::{self, EnrollmentDecision};
 use crate::ebpf::veth;
 use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
-    IncludePortsPolicy, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState, PodInfo,
+    IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
+    NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+    NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE, NodeAgentMetrics,
+    NodeAgentProxyMode, PodAttachmentState, PodInfo,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
@@ -52,6 +55,11 @@ const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
+static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(DashMap::new);
+
+const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
+const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
+const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -173,6 +181,14 @@ impl NodeAgentConfig {
         // EPERM via this flag) rather than bypass `mesh_authz`. Excluded v6
         // (CIDR/port excludes) is decided before the deny and still flows.
         capture_contract.ipv6_outbound_deny = node_waypoint_in_netns;
+        if node_waypoint_in_netns
+            && !capture_config
+                .include_cidrs
+                .iter()
+                .any(|cidr| cidr_is_ipv6(cidr))
+        {
+            capture_config.include_cidrs.push("::/0".to_string());
+        }
         let node_waypoint_pod_registry_dir = if node_waypoint_in_netns {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
@@ -193,6 +209,15 @@ impl NodeAgentConfig {
             node_waypoint_pod_registry_dir,
         })
     }
+}
+
+fn cidr_is_ipv6(cidr: &str) -> bool {
+    let Some((addr, _prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    addr.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_ipv6())
+        .unwrap_or(false)
 }
 
 pub async fn run(
@@ -240,7 +265,7 @@ pub async fn run(
         )
         .await
     } else {
-        let backend = create_backend(&metrics);
+        let backend = create_backend(&config, &metrics)?;
         run_with_backend(
             backend,
             &config,
@@ -410,31 +435,30 @@ fn decide_admin_bind_address(
     Ok(std::net::SocketAddr::new(configured_ip, port))
 }
 
-fn create_backend(metrics: &Arc<NodeAgentMetrics>) -> Box<dyn EbpfBackend> {
+fn create_backend(
+    config: &NodeAgentConfig,
+    metrics: &Arc<NodeAgentMetrics>,
+) -> Result<Box<dyn EbpfBackend>, anyhow::Error> {
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     {
-        let _ = metrics;
-        Box::new(crate::ebpf::AyaEbpfBackend::new())
+        let _ = (config, metrics);
+        Ok(Box::new(crate::ebpf::AyaEbpfBackend::new()))
     }
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     {
         // The kernel probe said this node CAN run eBPF capture, but THIS
         // binary was built without the `ebpf` feature (or for a non-Linux
-        // target), so the mock backend attaches nothing. Capture does not
-        // happen. Surface this loudly and set the degraded gauge so the
-        // condition is observable instead of silently no-op'ing as if the
-        // node were healthy. This is the explicit fallback the build-out
-        // policy allows, not a recommended production posture.
+        // target), so the mock backend would attach nothing. Refuse startup
+        // and set observable degraded state instead of silently no-op'ing as
+        // if the node were healthy.
+        let _ = config;
         metrics.set_topology_degraded("ebpf_feature_disabled");
-        warn!(
-            "Node-agent is using the MOCK eBPF backend: NO traffic capture occurs. \
-             The kernel supports eBPF, but this binary was built without `--features ebpf` \
-             (or for a non-Linux target). Pods will NOT be redirected through the mesh proxy. \
-             Set ferrum_mesh_node_topology_degraded{{reason=\"ebpf_feature_disabled\"}}=1. \
-             Rebuild with --features ebpf (Linux) and use the node-agent image that ships \
-             the ferrum-ebpf ELF to enable capture."
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        anyhow::bail!(
+            "node-agent eBPF capture requires a Linux binary built with --features ebpf. \
+             This binary would select the mock backend, which attaches nothing and captures \
+             no traffic. Use the -ebpf image variant or rebuild with FEATURES=cloud-secrets,ebpf."
         );
-        Box::new(crate::ebpf::MockEbpfBackend::default())
     }
 }
 
@@ -545,7 +569,7 @@ async fn run_with_backend(
                             // Also drop owned failure snapshots for pods that
                             // vanished across the relist; otherwise the retry
                             // loop replays them indefinitely (see helper docs).
-                            prune_failed_enrollments_from_relist(&pod_states, &seen);
+                            prune_failed_enrollments_from_relist(&pod_states, &metrics, &seen);
                         }
                         startup_ready.store(true, Ordering::Release);
                         info!("Node agent initial pod sync complete; /health now reports ready");
@@ -584,13 +608,20 @@ async fn run_with_backend(
             }
             _ = retry_interval.tick() => {
                 // Re-drive any pod whose transient enrollment failure has aged
-                // past the backoff window. Cheap no-op when none are pending.
+                // past the backoff window, and retry stale pod-IP map removals
+                // that would otherwise keep capture partially attached. Cheap
+                // no-ops when none are pending.
                 retry_backed_off_pod_enrollments(
                     backend.as_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                     false,
+                );
+                retry_pending_pod_ip_removals(
+                    backend.as_mut(),
+                    &pod_states,
+                    metrics.as_ref(),
                 );
             }
         }
@@ -636,8 +667,43 @@ fn watcher_init_stale_uids(
 ///
 /// Records are scoped by the `pod_states` key prefix so a sibling node-agent
 /// runtime (or, under `cargo test`, another test's pods) is never pruned.
+fn has_failed_pod_enrollments(pod_states: &DashMap<String, PodAttachmentState>) -> bool {
+    if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
+        return false;
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    FAILED_POD_ENROLLMENT_ATTEMPTS
+        .iter()
+        .any(|entry| entry.key().starts_with(&key_prefix))
+}
+
+fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>) -> bool {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return false;
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    PENDING_CAPTURE_FAILURES
+        .iter()
+        .any(|entry| entry.key().starts_with(&key_prefix))
+}
+
+fn clear_partial_capture_state_if_recovered(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+) {
+    if !has_failed_pod_enrollments(pod_states)
+        && !has_pending_capture_failures(pod_states)
+        && metrics.snapshot().capture_state == NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+    {
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
+    }
+}
+
 fn prune_failed_enrollments_from_relist(
     pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
     seen: &HashSet<String>,
 ) {
     if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
@@ -657,6 +723,7 @@ fn prune_failed_enrollments_from_relist(
     for state_key in stale_keys {
         forget_failed_pod_enrollment(&state_key);
     }
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
 fn mark_relist_seen_from_cni_add(
@@ -1395,6 +1462,90 @@ fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str
     format!("{}{pod_uid}", pod_state_key_prefix(pod_states))
 }
 
+fn pending_capture_failure_key(state_key: &str, operation: &str, detail: &str) -> String {
+    format!("{state_key}:{operation}:{detail}")
+}
+
+#[derive(Debug, Clone)]
+struct PendingCaptureFailure {
+    key: String,
+    state_key: String,
+    operation: String,
+    detail: String,
+}
+
+fn parse_pending_capture_failure_key(key: &str) -> Option<PendingCaptureFailure> {
+    let mut parts = key.rsplitn(3, ':');
+    let detail = parts.next()?;
+    let operation = parts.next()?;
+    let state_key = parts.next()?;
+    if state_key.is_empty() || operation.is_empty() || detail.is_empty() {
+        return None;
+    }
+    Some(PendingCaptureFailure {
+        key: key.to_string(),
+        state_key: state_key.to_string(),
+        operation: operation.to_string(),
+        detail: detail.to_string(),
+    })
+}
+
+#[cfg(test)]
+fn pending_capture_failure_prefix(state_key: &str) -> String {
+    format!("{state_key}:")
+}
+
+fn remember_pending_capture_failure(state_key: &str, operation: &str, detail: &str) {
+    PENDING_CAPTURE_FAILURES.insert(
+        pending_capture_failure_key(state_key, operation, detail),
+        (),
+    );
+}
+
+fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str) {
+    PENDING_CAPTURE_FAILURES.remove(&pending_capture_failure_key(state_key, operation, detail));
+}
+
+fn forget_pending_pod_ip_remove_failures_for_ip(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::Ipv4Addr,
+) -> usize {
+    let key_prefix = pod_state_key_prefix(pod_states);
+    let detail = ip.to_string();
+    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            (failure.state_key.starts_with(&key_prefix)
+                && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
+                && failure.detail == detail)
+                .then_some(failure.key)
+        })
+        .collect();
+    let removed = keys.len();
+    for key in keys {
+        PENDING_CAPTURE_FAILURES.remove(&key);
+    }
+    removed
+}
+
+#[cfg(test)]
+fn forget_pending_capture_failures_for_pod(state_key: &str) {
+    let prefix = pending_capture_failure_prefix(state_key);
+    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .key()
+                .starts_with(&prefix)
+                .then(|| entry.key().clone())
+        })
+        .collect();
+    for key in keys {
+        PENDING_CAPTURE_FAILURES.remove(&key);
+    }
+}
+
 fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_unstable_by_key(|(left_key, _)| *left_key);
@@ -1542,6 +1693,68 @@ fn retry_backed_off_pod_enrollments(
     }
 }
 
+fn pending_pod_ip_removal_failures(
+    pod_states: &DashMap<String, PodAttachmentState>,
+) -> Vec<(String, std::net::Ipv4Addr)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            if !failure.state_key.starts_with(&key_prefix)
+                || failure.operation != CAPTURE_FAILURE_POD_IP_REMOVE
+            {
+                return None;
+            }
+            let ip = failure.detail.parse().ok()?;
+            Some((failure.key, ip))
+        })
+        .collect()
+}
+
+fn retry_pending_pod_ip_removals(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+) {
+    let pending = pending_pod_ip_removal_failures(pod_states);
+    if pending.is_empty() {
+        return;
+    }
+
+    for (failure_key, ip) in pending {
+        if let Some(owner_pod_uid) = pod_owning_ip(pod_states, ip) {
+            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            debug!(
+                owner_pod_uid,
+                %ip,
+                "Cleared pending pod IP removal failure because another tracked pod owns the IP"
+            );
+            continue;
+        }
+
+        match backend.remove_pod_ip(ip) {
+            Ok(()) => {
+                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                debug!(%ip, "Recovered pending pod IP map removal failure");
+            }
+            Err(e) => {
+                warn!(
+                    %ip,
+                    error = %e,
+                    "Retrying pending pod IP map removal failed; keeping capture state degraded"
+                );
+            }
+        }
+    }
+
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
 /// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
 /// Kubernetes-assigned value; treating it as a path component without checks
 /// would let an empty, slash-, backslash-, or `..`-bearing value write or
@@ -1677,13 +1890,16 @@ fn handle_pod_added(
         .map(|p| p.to_string_lossy().to_string());
     // Production: the kube-rs caller sets `veth_iface_override = None`; the
     // resolver first uses an explicit pod PID when available, then falls back
-    // to the resolved pod cgroup to find a live process in that pod.
+    // to the resolved pod cgroup to find a live process in that pod. Some
+    // container runtimes expose neither pod sysfs nor setns from the node-agent
+    // container, so use the host route table as a final pod-IP-scoped fallback.
     // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
     // is satisfied without a real pod PID / Linux kernel.
     let veth_iface = event
         .veth_iface_override
         .map(|s| s.to_string())
-        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()));
+        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()))
+        .or_else(|| pod_ip.and_then(veth::discover_veth_for_pod_ip));
 
     if let Some(mut state) = pod_states.get_mut(pod_uid) {
         let attachment_target_changed = state.cgroup_path != cgroup_path
@@ -1694,8 +1910,9 @@ fn handle_pod_added(
             drop(state);
             handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         } else {
-            let stale_pod_ip =
-                reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+            let pod_ip_reconcile = reconcile_existing_pod_ip(
+                backend, config, metrics, &state_key, pod_uid, pod_ip, &mut state,
+            );
             reconcile_existing_pod_include_ports(
                 backend,
                 metrics,
@@ -1713,7 +1930,10 @@ fn handle_pod_added(
             );
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
             drop(state);
-            if let Some(ip) = stale_pod_ip {
+            if pod_ip_reconcile.recovered_pending_failure {
+                clear_partial_capture_state_if_recovered(pod_states, metrics);
+            }
+            if let Some(ip) = pod_ip_reconcile.stale_pod_ip {
                 remove_pod_ip_if_unowned(
                     backend,
                     pod_states,
@@ -1803,7 +2023,7 @@ fn handle_pod_added(
         for prog in programs {
             if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, prog) {
                 warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.record_attach_error();
                 attach_ok = false;
                 break;
             }
@@ -1816,7 +2036,7 @@ fn handle_pod_added(
                     namespace,
                     "Could not resolve pod veth interface, skipping attachment"
                 );
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
@@ -1828,7 +2048,7 @@ fn handle_pod_added(
 
             if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
-                metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
@@ -1844,7 +2064,7 @@ fn handle_pod_added(
                 };
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
-                    metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+                    metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
@@ -1874,13 +2094,17 @@ fn handle_pod_added(
             pod_uid,
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        metrics.record_attach_error();
         remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         return;
     }
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
+        if let Some(ip) = pod_ip {
+            forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
+        }
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
         // succeeded (programs attached, pod-IP + identity written), so a failed
@@ -1897,17 +2121,26 @@ fn handle_pod_added(
     }
 }
 
+#[derive(Debug, Default)]
+struct PodIpReconcileResult {
+    stale_pod_ip: Option<std::net::Ipv4Addr>,
+    recovered_pending_failure: bool,
+}
+
 fn reconcile_existing_pod_ip(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
+    state_key: &str,
     pod_uid: &str,
     pod_ip: Option<std::net::Ipv4Addr>,
     state: &mut PodAttachmentState,
-) -> Option<std::net::Ipv4Addr> {
-    let new_ip = pod_ip?;
+) -> PodIpReconcileResult {
+    let Some(new_ip) = pod_ip else {
+        return PodIpReconcileResult::default();
+    };
     if state.pod_ip == Some(new_ip) {
-        return None;
+        return PodIpReconcileResult::default();
     }
 
     let info = PodInfo {
@@ -1916,9 +2149,19 @@ fn reconcile_existing_pod_ip(
     };
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-        return None;
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_POD_IP_UPDATE,
+            CAPTURE_FAILURE_DETAIL_POD_IP,
+        );
+        return PodIpReconcileResult::default();
     }
+    forget_pending_capture_failure(
+        state_key,
+        CAPTURE_FAILURE_POD_IP_UPDATE,
+        CAPTURE_FAILURE_DETAIL_POD_IP,
+    );
     let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
     // Keep the in-netns capture registry's pod IP in sync (line 2 of the entry)
@@ -1931,7 +2174,10 @@ fn reconcile_existing_pod_ip(
     ) {
         publish_pod_registry(dir, pod_uid, cgroup, Some(new_ip));
     }
-    old_ip
+    PodIpReconcileResult {
+        stale_pod_ip: old_ip,
+        recovered_pending_failure: true,
+    }
 }
 
 fn remove_pod_ip_if_unowned(
@@ -1950,12 +2196,25 @@ fn remove_pod_ip_if_unowned(
             removal_reason,
             "Skipping pod IP map removal; IP is owned by another tracked pod"
         );
+        let state_key = pod_state_key(pod_states, pod_uid);
+        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     }
+    let state_key = pod_state_key(pod_states, pod_uid);
     if let Err(e) = backend.remove_pod_ip(ip) {
         warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IP from map");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+        return;
     }
+    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
 fn other_pod_owning_ip(
@@ -1967,6 +2226,15 @@ fn other_pod_owning_ip(
         (entry.key().as_str() != pod_uid && entry.value().pod_ip == Some(ip))
             .then(|| entry.key().clone())
     })
+}
+
+fn pod_owning_ip(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::Ipv4Addr,
+) -> Option<String> {
+    pod_states
+        .iter()
+        .find_map(|entry| (entry.value().pod_ip == Some(ip)).then(|| entry.key().clone()))
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -2279,6 +2547,11 @@ pub fn handle_pod_removed(
 ) {
     let state_key = pod_state_key(pod_states, pod_uid);
     forget_pod_enrollment_attempt(&state_key);
+    forget_pending_capture_failure(
+        &state_key,
+        CAPTURE_FAILURE_POD_IP_UPDATE,
+        CAPTURE_FAILURE_DETAIL_POD_IP,
+    );
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -2293,6 +2566,7 @@ pub fn handle_pod_removed(
 
     let removed = pod_states.remove(pod_uid);
     let Some((_, state)) = removed else {
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     };
 
@@ -2333,6 +2607,7 @@ pub fn handle_pod_removed(
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
     }
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
 async fn handle_fallback(
@@ -2420,6 +2695,7 @@ where
     // caller that probes more capability bits than the helper checks).
     let reason = probe.degradation_reason().unwrap_or("unknown");
     metrics.set_topology_degraded(reason);
+    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
 
     match config.fallback_mode {
         FallbackMode::Iptables => {
@@ -2506,6 +2782,7 @@ where
                 }
                 return Err(setup_err);
             }
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK);
             startup_ready.store(true, Ordering::Release);
 
             info!("Iptables fallback rules applied, awaiting shutdown signal");
@@ -2715,29 +2992,56 @@ fn initialize_backend(
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) -> Result<(), anyhow::Error> {
-    backend.load_programs().map_err(anyhow::Error::msg)?;
-    backend
-        .update_capture_config(&config.capture_contract.bpf_capture_config())
-        .map_err(anyhow::Error::msg)?;
+    if config.capture_config.mode != CaptureMode::Ebpf {
+        metrics.set_topology_degraded("capture_mode_not_ebpf");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        anyhow::bail!(
+            "node_agent mode requires FERRUM_MESH_CAPTURE_MODE=ebpf for the managed capture backend; \
+             got {:?}. Use the explicit injector path or set FERRUM_NODE_AGENT_FALLBACK_MODE=iptables \
+             only for explicit node-global fallback on unsupported kernels.",
+            config.capture_config.mode
+        );
+    }
 
-    if let Some(uid) = config.capture_config.proxy_uid {
-        backend.update_bypass_uid(uid).map_err(anyhow::Error::msg)?;
+    if let Err(e) = backend.load_programs() {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(e));
+    }
+    if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(e));
+    }
+
+    if let Some(uid) = config.capture_config.proxy_uid
+        && let Err(e) = backend.update_bypass_uid(uid)
+    {
+        metrics.set_topology_degraded("capture_unavailable");
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        return Err(anyhow::Error::msg(e));
     }
 
     for cidr in &config.capture_config.include_cidrs {
-        backend
-            .update_cidr_include(cidr)
-            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = backend.update_cidr_include(cidr) {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     for cidr in &config.capture_config.exclude_cidrs {
-        backend
-            .update_cidr_exclude(cidr)
-            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = backend.update_cidr_exclude(cidr) {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     for port in &config.capture_config.exclude_ports {
-        backend
-            .update_port_exclude(*port)
-            .map_err(anyhow::Error::msg)?;
+        if let Err(e) = backend.update_port_exclude(*port) {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     // Per-pod `includeOutboundPorts` narrowing is applied later in
     // `handle_pod_added` via `apply_include_outbound_ports` because the
@@ -2746,29 +3050,48 @@ fn initialize_backend(
     // node-global shape (CIDR includes/excludes, port excludes, proxy
     // UID bypass).
 
-    if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
+    let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
+    if require_sock_ops {
         // SOCK_OPS at the cgroup root carries BOTH TCP-layer telemetry AND the
         // GAP-2M accept-side cookie bridge that node-waypoint per-pod identity
         // resolution depends on. A failure here is therefore not merely lost
         // counters: with no accept-side cookie stamping, every node-waypoint
         // connection resolves `UnknownCookie` and scoped authz fails closed.
         // Surface it as topology degradation (gauge + error) — not a quiet
-        // telemetry warning — so operators see identity resolution is down even
-        // though cgroup/tc capture continues.
+        // telemetry warning — and refuse readiness so operators see identity
+        // resolution is down before traffic is admitted.
         if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
             error!(
                 cgroup_root = %config.cgroup_root,
                 error = %e,
                 "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
-                 cookie bridge is not running, so per-pod source-identity resolution is \
-                 disabled and scoped node-waypoint authz will fail closed (TCP-layer \
-                 telemetry is also lost). cgroup/tc capture continues. Set \
+                 cookie bridge is not running, so per-pod source-identity resolution would \
+                 be disabled and scoped node-waypoint authz would fail closed (TCP-layer \
+                 telemetry is also lost). Refusing startup so /health cannot report Ready \
+                 for a partially attached node-waypoint topology. Set \
                  ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
+            );
+            anyhow::bail!(
+                "node-waypoint eBPF capture requires the SOCK_OPS identity bridge to attach; \
+                 source workload identity resolution would be unavailable: {e}"
             );
         }
     }
 
+    if let Err(e) = backend.validate_startup_ready(require_sock_ops) {
+        if require_sock_ops && e.contains("SOCK_OPS") {
+            metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
+        } else {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        }
+        anyhow::bail!("node-agent eBPF startup validation failed: {e}");
+    }
+
+    metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
     info!("BPF programs loaded and maps initialized");
     Ok(())
 }
@@ -2895,6 +3218,14 @@ mod tests {
                 "the deny flag must reach the BPF capture config the connect6 hook reads"
             );
             assert!(
+                config
+                    .capture_config
+                    .include_cidrs
+                    .iter()
+                    .any(|cidr| cidr == "::/0"),
+                "NodeWaypoint must include IPv6 destinations so connect6 reaches the fail-closed deny"
+            );
+            assert!(
                 config.node_waypoint_pod_registry_dir.is_some(),
                 "in-netns registry is published in NodeWaypoint mode"
             );
@@ -2911,7 +3242,37 @@ mod tests {
                 !config.capture_contract.ipv6_outbound_deny,
                 "non-NodeWaypoint modes do not fail-close IPv6 egress"
             );
+            assert!(
+                !config
+                    .capture_config
+                    .include_cidrs
+                    .iter()
+                    .any(|cidr| cidr == "::/0"),
+                "non-NodeWaypoint modes preserve the normal IPv4-only default include"
+            );
         });
+    }
+
+    #[test]
+    fn from_env_config_preserves_explicit_ipv6_include_for_node_waypoint() {
+        let waypoint = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                ("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "10.0.0.0/8,fd00::/8"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&waypoint)
+                    .expect("node-agent config should parse");
+                assert_eq!(
+                    config.capture_config.include_cidrs,
+                    vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()]
+                );
+            },
+        );
     }
 
     #[test]
@@ -2947,7 +3308,8 @@ mod tests {
         };
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
+        let metrics = NodeAgentMetrics::default();
+        initialize_backend(&mut backend, &config, &metrics).unwrap();
 
         assert!(backend.programs_loaded);
         assert_eq!(backend.bypass_uids, vec![1337]);
@@ -2959,13 +3321,19 @@ mod tests {
             Some(config.capture_contract.bpf_capture_config())
         );
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
     }
 
     #[test]
     fn initialize_backend_attaches_sock_ops_for_node_waypoint() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
         let mut config = NodeAgentConfig {
             node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
+            capture_config,
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
@@ -2977,19 +3345,26 @@ mod tests {
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
+        let metrics = NodeAgentMetrics::default();
+        initialize_backend(&mut backend, &config, &metrics).unwrap();
 
         assert_eq!(
             backend.sock_ops_attached_cgroup_root.as_deref(),
             Some("/sys/fs/cgroup")
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
     }
 
     #[test]
     fn initialize_backend_node_waypoint_sock_ops_failure_marks_degraded() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
         let mut config = NodeAgentConfig {
             node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
+            capture_config,
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
@@ -3005,23 +3380,28 @@ mod tests {
         };
         let metrics = NodeAgentMetrics::default();
 
-        // Init still succeeds — cgroup/tc capture is unaffected — but the
-        // SOCK_OPS failure (which carries the GAP-2M identity bridge) must
-        // surface as topology degradation, not a silent telemetry warning.
-        initialize_backend(&mut backend, &config, &metrics).unwrap();
+        let err = initialize_backend(&mut backend, &config, &metrics)
+            .expect_err("missing identity bridge must fail startup");
 
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        assert!(err.to_string().contains("SOCK_OPS identity bridge"));
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("node_waypoint_sock_ops_unavailable")
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE
         );
     }
 
     #[test]
     fn initialize_backend_capture_config_failure_is_fatal() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
+            capture_config,
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
             fallback_mode: FallbackMode::Iptables,
@@ -3035,12 +3415,17 @@ mod tests {
             ..MockEbpfBackend::default()
         };
 
-        let err = initialize_backend(&mut backend, &config, &NodeAgentMetrics::default())
+        let metrics = NodeAgentMetrics::default();
+        let err = initialize_backend(&mut backend, &config, &metrics)
             .expect_err("capture-config failure should abort initialization");
 
         assert!(err.to_string().contains("capture config update failed"));
         assert!(backend.programs_loaded);
         assert!(backend.capture_config.is_none());
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -3290,6 +3675,11 @@ mod tests {
             Some("kernel_too_old"),
             "kernel-version failure should set the degraded gauge"
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
+            "explicit iptables fallback should be observable as node-global fallback"
+        );
     }
 
     #[tokio::test]
@@ -3344,6 +3734,10 @@ mod tests {
         assert!(result.is_err());
         assert!(!startup_ready.load(Ordering::Acquire));
         assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
+        );
+        assert_eq!(
             *phases.lock().expect("phases mutex"),
             // The unconditional pre-setup UDP teardown (codex r4) always runs
             // first to reap stale UDP state from a prior UDP-enabled run, before
@@ -3363,6 +3757,10 @@ mod tests {
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("kernel_too_old"),
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
         );
     }
 
@@ -4352,6 +4750,10 @@ mod tests {
             "transiently-failed pod must not be inserted into pod_states"
         );
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
         assert!(
             FAILED_POD_ENROLLMENT_ATTEMPTS
@@ -4373,6 +4775,11 @@ mod tests {
             "pod must enroll once the transient failure clears and the retry runs"
         );
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY,
+            "successful retry should clear a recovered partial-attach state"
+        );
         assert!(
             !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&state_key),
             "successful re-drive must clear the failed-enrollment record"
@@ -4462,11 +4869,15 @@ mod tests {
         let stays_key = pod_state_key(&pod_states, "stays-uid");
         assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key));
         assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
 
         // Relist saw `stays-uid` but not `gone-uid`.
         let mut seen = HashSet::new();
         seen.insert("stays-uid".to_string());
-        prune_failed_enrollments_from_relist(&pod_states, &seen);
+        prune_failed_enrollments_from_relist(&pod_states, &metrics, &seen);
 
         assert!(
             !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key),
@@ -4475,6 +4886,23 @@ mod tests {
         assert!(
             FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key),
             "failed record for a pod still present in the relist must be retained for retry"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+            "remaining failed enrollment should keep the node marked partially attached"
+        );
+
+        seen.clear();
+        prune_failed_enrollments_from_relist(&pod_states, &metrics, &seen);
+        assert!(
+            !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key),
+            "second relist with no failed pods seen should prune the last failed record"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY,
+            "pruning the last failed enrollment should clear the recovered partial state"
         );
 
         // Clean up the global between tests sharing this static.
@@ -5405,6 +5833,248 @@ mod tests {
     }
 
     #[test]
+    fn existing_pod_ip_update_failure_keeps_partial_state_until_recovered() {
+        let mut backend = MockEbpfBackend {
+            fail_update_pod_ip: true,
+            ..MockEbpfBackend::default()
+        };
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.8"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        let failure_key = pending_capture_failure_key(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_UPDATE,
+            CAPTURE_FAILURE_DETAIL_POD_IP,
+        );
+        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+        clear_partial_capture_state_if_recovered(&pod_states, &metrics);
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+            "untracked pod-IP update failures must not be cleared by enrollment recovery checks"
+        );
+
+        backend.fail_update_pod_ip = false;
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(
+            pod_states.get("pod-uid-1").unwrap().pod_ip,
+            Some(std::net::Ipv4Addr::new(10, 0, 0, 8))
+        );
+        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
+        forget_pending_capture_failures_for_pod(&state_key);
+    }
+
+    #[test]
+    fn pod_ip_remove_failure_keeps_partial_state_pending() {
+        let mut backend = MockEbpfBackend {
+            fail_remove_pod_ip: true,
+            ..MockEbpfBackend::default()
+        };
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
+
+        let failure_key =
+            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
+        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+        clear_partial_capture_state_if_recovered(&pod_states, &metrics);
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+            "pod-IP removal failures can leave stale map entries and must keep degraded readiness"
+        );
+
+        backend.fail_remove_pod_ip = false;
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+
+        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(
+            !backend.pod_ips.contains_key(&ip),
+            "retry must remove the stale pod-IP map entry"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
+    }
+
+    #[test]
+    fn pod_ip_remove_failure_clears_when_ip_is_reowned() {
+        let mut backend = MockEbpfBackend {
+            fail_remove_pod_ip: true,
+            ..MockEbpfBackend::default()
+        };
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "old".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let old_state_key = pod_state_key(&pod_states, "pod-uid-1");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
+
+        let failure_key =
+            pending_capture_failure_key(&old_state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
+        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+
+        pod_states.insert(
+            "pod-uid-2".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-2".to_string(),
+                pod_name: "new".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+
+        assert!(
+            !PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+            "re-owned pod IP should clear stale removal failure instead of keeping readiness degraded"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
+    }
+
+    #[test]
     fn handle_pod_added_keeps_old_ip_when_another_pod_owns_it() {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -5569,6 +6239,10 @@ mod tests {
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("cgroup_v1"),
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
         );
     }
 
@@ -6740,16 +7414,37 @@ mod tests {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     #[test]
     fn create_backend_sets_degraded_gauge_without_ebpf_feature() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
         let metrics = Arc::new(NodeAgentMetrics::default());
         assert_eq!(metrics.snapshot().topology_degraded_reason, None);
 
-        let _backend = create_backend(&metrics);
+        let err = match create_backend(&config, &metrics) {
+            Ok(_) => panic!("mock backend must not start for enabled eBPF capture"),
+            Err(err) => err,
+        };
 
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("ebpf_feature_disabled"),
             "mock-backend fallback must mark the node topology degraded"
         );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
+        );
+        assert!(err.to_string().contains("--features ebpf"));
     }
 
     /// GAP-1b: the workload identity the node-agent writes to

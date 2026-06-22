@@ -6,8 +6,8 @@
 //! 3. Load full config from DB (falls back to on-disk JSON backup if DB is unreachable)
 //! 4. Build all caches (router, plugin, consumer, load balancer, circuit breaker)
 //! 5. Start proxy + admin listeners
-//! 6. Enter the polling loop: incremental `WHERE updated_at > ?` queries every N seconds,
-//!    with automatic fallback to full reload + DB failover on error
+//! 6. Enter the polling loop: read durable config changes after the accepted
+//!    sequence cursor, with automatic fallback to full reload + DB failover on error
 //!
 //! The admin API is read/write in this mode. A `db_available` AtomicBool gates
 //! write endpoints — when the DB is unreachable, the admin API becomes temporarily
@@ -15,7 +15,7 @@
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -32,6 +31,7 @@ use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::file::{
     ListenerJoinHandle, await_fallible_listener_handles, join_background_handles,
@@ -417,15 +417,15 @@ impl DatabaseDeltaValidationCategory {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RejectedDeltaIdentity {
-    since_millis: i64,
+    after_sequence: u64,
     resource_category: DatabaseDeltaResourceCategory,
     change_set_hash: u64,
 }
 
 impl RejectedDeltaIdentity {
-    fn from_incremental(since: DateTime<Utc>, result: &db_backend::IncrementalResult) -> Self {
+    fn from_incremental(after_sequence: u64, result: &db_backend::IncrementalResult) -> Self {
         Self {
-            since_millis: since.timestamp_millis(),
+            after_sequence,
             resource_category: rejected_delta_resource_category(result),
             change_set_hash: rejected_delta_change_set_hash(result),
         }
@@ -433,7 +433,7 @@ impl RejectedDeltaIdentity {
 
     fn with_validation(self, errors: &[String]) -> RejectedDeltaFingerprint {
         RejectedDeltaFingerprint {
-            since_millis: self.since_millis,
+            after_sequence: self.after_sequence,
             resource_category: self.resource_category,
             validation_category: DatabaseDeltaValidationCategory::classify(errors),
             change_set_hash: self.change_set_hash,
@@ -443,7 +443,7 @@ impl RejectedDeltaIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RejectedDeltaFingerprint {
-    since_millis: i64,
+    after_sequence: u64,
     resource_category: DatabaseDeltaResourceCategory,
     validation_category: DatabaseDeltaValidationCategory,
     change_set_hash: u64,
@@ -1014,47 +1014,51 @@ pub async fn run(
         .await?;
     }
 
-    // Load initial config from database, falling back to backup file if configured
+    // Load initial config from database, falling back to backup file if configured.
+    // Successful DB loads seed the durable change cursor so the first poll can
+    // use config_changes immediately; backup loads intentionally start without
+    // a cursor and force an authoritative DB reload after recovery.
     let backup_path = env_config.db_config_backup_path.clone();
-    let config = match db.load_full_config(&env_config.namespace).await {
-        Ok(cfg) => {
-            info!(
-                "Database mode: loaded {} proxies, {} consumers",
-                cfg.proxies.len(),
-                cfg.consumers.len()
-            );
-            cfg
-        }
-        Err(e) => {
-            // Database unreachable — try backup file for pod restart resilience
-            if let Some(ref path) = backup_path {
-                warn!(
-                    "Database load failed ({}), attempting backup file: {}",
-                    e, path
+    let (config, initial_change_sequence) =
+        match load_full_config_with_sequence(&db, &env_config.namespace).await {
+            Ok((cfg, sequence)) => {
+                info!(
+                    "Database mode: loaded {} proxies, {} consumers",
+                    cfg.proxies.len(),
+                    cfg.consumers.len()
                 );
-                match load_config_backup(path) {
-                    Some(cfg) => {
-                        warn!(
-                            "Starting with backup config ({} proxies, {} consumers). \
-                             Database polling will retry and update when DB recovers.",
-                            cfg.proxies.len(),
-                            cfg.consumers.len()
-                        );
-                        cfg
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "Database load failed and no usable backup at {}: {}",
-                            path,
-                            e
-                        ));
-                    }
-                }
-            } else {
-                return Err(e);
+                (cfg, Some(sequence))
             }
-        }
-    };
+            Err(e) => {
+                // Database unreachable — try backup file for pod restart resilience
+                if let Some(ref path) = backup_path {
+                    warn!(
+                        "Database load failed ({}), attempting backup file: {}",
+                        e, path
+                    );
+                    match load_config_backup(path) {
+                        Some(cfg) => {
+                            warn!(
+                                "Starting with backup config ({} proxies, {} consumers). \
+                                 Database polling will retry and update when DB recovers.",
+                                cfg.proxies.len(),
+                                cfg.consumers.len()
+                            );
+                            (cfg, None)
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Database load failed and no usable backup at {}: {}",
+                                path,
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
     // Validate stream proxy ports don't conflict with gateway reserved ports
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -1763,10 +1767,9 @@ pub async fn run(
     // Database polling loop (with shutdown) — uses incremental polling
     // to avoid full table scans on every cycle.
     //
-    // First poll after startup seeds the known ID sets from the initial config.
-    // Subsequent polls use `load_incremental_config()` which fetches only
-    // rows with `updated_at > last_poll_at` and detects deletions via
-    // lightweight `SELECT id` queries.
+    // Normal startup seeds the durable config-change sequence cursor before
+    // this task starts. Backup/offline bootstrap leaves the cursor empty so the
+    // first recovered poll performs an authoritative full reload.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let proxy_state_poll = proxy_state.clone();
@@ -1810,26 +1813,7 @@ pub async fn run(
             database_delta_poll_metrics_for_poll,
         );
 
-        // Seed incremental state from the initial config load
-        let initial_config = proxy_state_poll.current_config();
-        let (
-            mut known_proxy_ids,
-            mut known_consumer_ids,
-            mut known_plugin_config_ids,
-            mut known_upstream_ids,
-        ) = db_backend::extract_known_ids(&initial_config);
-        // If startup used the on-disk backup fallback, force the first
-        // successful poll path to do a full DB reload instead of seeding
-        // incremental polling from `initial_config.loaded_at`.
-        //
-        // Why: backup JSON may omit `loaded_at` (serde defaults to "now"),
-        // which can be newer than many existing DB rows. Starting incremental
-        // from that timestamp can skip unchanged DB state indefinitely.
-        let mut last_poll_at: Option<DateTime<Utc>> = if bootstrap_from_backup {
-            None
-        } else {
-            Some(initial_config.loaded_at)
-        };
+        let mut last_change_sequence: Option<u64> = initial_change_sequence;
 
         loop {
             tokio::select! {
@@ -1871,8 +1855,8 @@ pub async fn run(
                     }
 
                     if force_full_reload {
-                        match db_poll.load_full_config(&poll_namespace).await {
-                            Ok(new_config) => {
+                        match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
+                            Ok((new_config, sequence)) => {
                                 mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
@@ -1883,14 +1867,8 @@ pub async fn run(
                                 if commit_full_reload_poll_state(
                                     "after DB DNS reconnect",
                                     outcome,
-                                    &proxy_state_poll,
-                                    full_reload_poll_state(
-                                        &mut known_proxy_ids,
-                                        &mut known_consumer_ids,
-                                        &mut known_plugin_config_ids,
-                                        &mut known_upstream_ids,
-                                        &mut last_poll_at,
-                                    ),
+                                    &mut last_change_sequence,
+                                    sequence,
                                 ) {
                                     force_full_reload = false;
                                     rejected_delta_tracker.record_accepted();
@@ -1906,72 +1884,34 @@ pub async fn run(
                                 continue;
                             }
                         }
-                    } else if let Some(since) = last_poll_at {
-                        // Incremental poll — only fetch changes since last poll
-                        match db_poll.load_incremental_config(
-                            &poll_namespace,
-                            since,
-                            &known_proxy_ids,
-                            &known_consumer_ids,
-                            &known_plugin_config_ids,
-                            &known_upstream_ids,
-                        ).await {
+                    } else if let Some(after_sequence) = last_change_sequence {
+                        match db_poll
+                            .load_incremental_config(&poll_namespace, after_sequence)
+                            .await
+                        {
                             Ok(result) => {
-                                // Catch the lazy-pool-connects-directly case:
-                                // if offline bootstrap left `migrations_pending`
-                                // set, the query above succeeded without
-                                // `reconnect()` ever firing. Run deferred
-                                // migrations now before flipping
-                                // `db_available` — otherwise admin writes
-                                // could hit an outdated schema.
-                                // No-op when nothing is pending.
                                 mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
                                     "incremental poll",
                                 )
                                 .await;
-                                let poll_ts = result.poll_timestamp;
-                                // Collect ID changes before moving result into apply_incremental
-                                let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
-                                let removed_proxy_ids = result.removed_proxy_ids.clone();
-                                let added_consumer_ids: Vec<String> = result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect();
-                                let removed_consumer_ids = result.removed_consumer_ids.clone();
-                                let added_plugin_config_ids: Vec<String> = result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect();
-                                let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
-                                let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
-                                let removed_upstream_ids = result.removed_upstream_ids.clone();
+                                let next_sequence = result.sequence_cursor;
                                 let rejected_delta_identity =
-                                    RejectedDeltaIdentity::from_incremental(since, &result);
+                                    RejectedDeltaIdentity::from_incremental(after_sequence, &result);
 
                                 match proxy_state_poll.apply_incremental(result).await {
                                     proxy::ConfigApplyOutcome::Applied => {
-                                        // Update known IDs only after successful apply to keep them
-                                        // in sync with actual proxy state.
-                                        update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
-                                        update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
-                                        update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
-                                        update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
+                                        last_change_sequence = Some(next_sequence);
                                         debug!("Incremental config reload complete");
-                                        last_poll_at = Some(poll_ts);
                                         rejected_delta_tracker.record_accepted();
                                     }
                                     proxy::ConfigApplyOutcome::Unchanged => {
-                                        // Nothing to apply this cycle. Advance the cursor
-                                        // so the next poll only fetches truly newer rows.
-                                        last_poll_at = Some(poll_ts);
+                                        last_change_sequence = Some(next_sequence);
                                         debug!("Incremental config poll valid but unchanged");
                                         rejected_delta_tracker.record_accepted();
                                     }
                                     proxy::ConfigApplyOutcome::Rejected { errors } => {
-                                        // Validation rejected the patched config (e.g. security
-                                        // plugin / unique listen-path). Leave `last_poll_at`
-                                        // unchanged so the next poll re-fetches the same rows
-                                        // and tries again. Without this, a rejected resource
-                                        // older than the 1-second `since_safe` margin would
-                                        // silently disappear from the gateway's view of the
-                                        // DB, leaving permanent divergence between DB state
-                                        // and in-memory config until a full reload.
                                         let decision = rejected_delta_tracker.record_rejection(
                                             rejected_delta_identity.with_validation(&errors),
                                         );
@@ -1982,8 +1922,13 @@ pub async fn run(
                                             rejected_delta_tracker
                                                 .metrics
                                                 .record_forced_full_reload();
-                                            match db_poll.load_full_config(&poll_namespace).await {
-                                                Ok(new_config) => {
+                                            match load_full_config_with_sequence(
+                                                &db_poll,
+                                                &poll_namespace,
+                                            )
+                                            .await
+                                            {
+                                                Ok((new_config, sequence)) => {
                                                     mark_db_available_after_successful_poll_load(
                                                         &db_poll,
                                                         &db_available_poll,
@@ -1995,14 +1940,8 @@ pub async fn run(
                                                     if commit_full_reload_poll_state(
                                                         "rejected delta escalation",
                                                         outcome,
-                                                        &proxy_state_poll,
-                                                        full_reload_poll_state(
-                                                            &mut known_proxy_ids,
-                                                            &mut known_consumer_ids,
-                                                            &mut known_plugin_config_ids,
-                                                            &mut known_upstream_ids,
-                                                            &mut last_poll_at,
-                                                        ),
+                                                        &mut last_change_sequence,
+                                                        sequence,
                                                     ) {
                                                         rejected_delta_tracker.record_accepted();
                                                         recovered_by_full_reload = true;
@@ -2023,13 +1962,13 @@ pub async fn run(
                                                         .await
                                                     {
                                                         Ok(_url) => {
-                                                            match db_poll
-                                                                .load_full_config(
-                                                                    &poll_namespace,
-                                                                )
-                                                                .await
+                                                            match load_full_config_with_sequence(
+                                                                &db_poll,
+                                                                &poll_namespace,
+                                                            )
+                                                            .await
                                                             {
-                                                                Ok(new_config) => {
+                                                                Ok((new_config, sequence)) => {
                                                                     mark_db_available_after_successful_poll_load(
                                                                         &db_poll,
                                                                         &db_available_poll,
@@ -2041,14 +1980,8 @@ pub async fn run(
                                                                     if commit_full_reload_poll_state(
                                                                         "rejected delta escalation failover",
                                                                         outcome,
-                                                                        &proxy_state_poll,
-                                                                        full_reload_poll_state(
-                                                                            &mut known_proxy_ids,
-                                                                            &mut known_consumer_ids,
-                                                                            &mut known_plugin_config_ids,
-                                                                            &mut known_upstream_ids,
-                                                                            &mut last_poll_at,
-                                                                        ),
+                                                                        &mut last_change_sequence,
+                                                                        sequence,
                                                                     ) {
                                                                         rejected_delta_tracker
                                                                             .record_accepted();
@@ -2095,9 +2028,9 @@ pub async fn run(
                                     "Authoritative primary incremental poll failed, falling back to full reload: {}",
                                     e
                                 );
-                                // Fallback to full config load
-                                match db_poll.load_full_config(&poll_namespace).await {
-                                    Ok(new_config) => {
+                                match load_full_config_with_sequence(&db_poll, &poll_namespace).await
+                                {
+                                    Ok((new_config, sequence)) => {
                                         mark_db_available_after_successful_poll_load(
                                             &db_poll,
                                             &db_available_poll,
@@ -2108,44 +2041,38 @@ pub async fn run(
                                         if commit_full_reload_poll_state(
                                             "full fallback",
                                             outcome,
-                                            &proxy_state_poll,
-                                            full_reload_poll_state(
-                                                &mut known_proxy_ids,
-                                                &mut known_consumer_ids,
-                                                &mut known_plugin_config_ids,
-                                                &mut known_upstream_ids,
-                                                &mut last_poll_at,
-                                            ),
+                                            &mut last_change_sequence,
+                                            sequence,
                                         ) {
                                             rejected_delta_tracker.record_accepted();
                                         }
                                     }
                                     Err(e2) => {
-                                        // Both incremental and full reload failed —
-                                        // try failover URLs before giving up.
-                                        match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
+                                        match db_poll
+                                            .try_failover_reconnect(&db_url_for_reconnect)
+                                            .await
+                                        {
                                             Ok(_url) => {
-                                                // Reconnected to a failover DB — try full reload
-                                                match db_poll.load_full_config(&poll_namespace).await {
-                                                    Ok(new_config) => {
+                                                match load_full_config_with_sequence(
+                                                    &db_poll,
+                                                    &poll_namespace,
+                                                )
+                                                .await
+                                                {
+                                                    Ok((new_config, sequence)) => {
                                                         mark_db_available_after_successful_poll_load(
                                                             &db_poll,
                                                             &db_available_poll,
                                                             "failover full reload",
                                                         )
                                                         .await;
-                                                        let outcome = proxy_state_poll.update_config(new_config);
+                                                        let outcome =
+                                                            proxy_state_poll.update_config(new_config);
                                                         if commit_full_reload_poll_state(
                                                             "failover",
                                                             outcome,
-                                                            &proxy_state_poll,
-                                                            full_reload_poll_state(
-                                                                &mut known_proxy_ids,
-                                                                &mut known_consumer_ids,
-                                                                &mut known_plugin_config_ids,
-                                                                &mut known_upstream_ids,
-                                                                &mut last_poll_at,
-                                                            ),
+                                                            &mut last_change_sequence,
+                                                            sequence,
                                                         ) {
                                                             rejected_delta_tracker.record_accepted();
                                                         }
@@ -2172,14 +2099,8 @@ pub async fn run(
                             }
                         }
                     } else {
-                        // First poll — full load to seed state. This path can
-                        // fire when the startup `load_full_config` failed (we
-                        // bootstrapped from backup) but the lazy pool is now
-                        // reaching a live DB. Run deferred migrations if any
-                        // before flipping `db_available` — see comment in the
-                        // incremental-success branch above.
-                        match db_poll.load_full_config(&poll_namespace).await {
-                            Ok(new_config) => {
+                        match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
+                            Ok((new_config, sequence)) => {
                                 mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
@@ -2190,14 +2111,8 @@ pub async fn run(
                                 if commit_full_reload_poll_state(
                                     "initial full poll",
                                     outcome,
-                                    &proxy_state_poll,
-                                    full_reload_poll_state(
-                                        &mut known_proxy_ids,
-                                        &mut known_consumer_ids,
-                                        &mut known_plugin_config_ids,
-                                        &mut known_upstream_ids,
-                                        &mut last_poll_at,
-                                    ),
+                                    &mut last_change_sequence,
+                                    sequence,
                                 ) {
                                     rejected_delta_tracker.record_accepted();
                                 }
@@ -2283,81 +2198,40 @@ pub async fn run(
     Ok(())
 }
 
-struct FullReloadPollState<'a> {
-    known_proxy_ids: &'a mut HashSet<String>,
-    known_consumer_ids: &'a mut HashSet<String>,
-    known_plugin_config_ids: &'a mut HashSet<String>,
-    known_upstream_ids: &'a mut HashSet<String>,
-    last_poll_at: &'a mut Option<DateTime<Utc>>,
-}
-
-impl FullReloadPollState<'_> {
-    fn commit_from_proxy_state(self, proxy_state: &ProxyState) {
-        let published_config = proxy_state.current_config();
-        let (
-            next_known_proxy_ids,
-            next_known_consumer_ids,
-            next_known_plugin_config_ids,
-            next_known_upstream_ids,
-        ) = db_backend::extract_known_ids(&published_config);
-        *self.known_proxy_ids = next_known_proxy_ids;
-        *self.known_consumer_ids = next_known_consumer_ids;
-        *self.known_plugin_config_ids = next_known_plugin_config_ids;
-        *self.known_upstream_ids = next_known_upstream_ids;
-        *self.last_poll_at = Some(published_config.loaded_at);
-    }
-}
-
-fn full_reload_poll_state<'a>(
-    known_proxy_ids: &'a mut HashSet<String>,
-    known_consumer_ids: &'a mut HashSet<String>,
-    known_plugin_config_ids: &'a mut HashSet<String>,
-    known_upstream_ids: &'a mut HashSet<String>,
-    last_poll_at: &'a mut Option<DateTime<Utc>>,
-) -> FullReloadPollState<'a> {
-    FullReloadPollState {
-        known_proxy_ids,
-        known_consumer_ids,
-        known_plugin_config_ids,
-        known_upstream_ids,
-        last_poll_at,
-    }
+async fn load_full_config_with_sequence(
+    db: &Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<(GatewayConfig, u64), anyhow::Error> {
+    db.maybe_apply_deferred_migrations().await?;
+    let sequence = db.latest_change_sequence(namespace).await?;
+    let config = db.load_full_config(namespace).await?;
+    Ok((config, sequence))
 }
 
 fn commit_full_reload_poll_state(
     context: &str,
     outcome: proxy::ConfigApplyOutcome,
-    proxy_state: &ProxyState,
-    poll_state: FullReloadPollState<'_>,
+    last_change_sequence: &mut Option<u64>,
+    sequence: u64,
 ) -> bool {
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
-            poll_state.commit_from_proxy_state(proxy_state);
+            *last_change_sequence = Some(sequence);
             info!("Configuration applied from database ({})", context);
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
-            poll_state.commit_from_proxy_state(proxy_state);
+            *last_change_sequence = Some(sequence);
             debug!("Database configuration valid but unchanged ({})", context);
             true
         }
         proxy::ConfigApplyOutcome::Rejected { .. } => {
             warn!(
-                "Database configuration candidate rejected ({}); keeping previous runtime config, poll cursor, and known ID sets",
+                "Database configuration candidate rejected ({}); keeping previous runtime config and poll cursor",
                 context
             );
             false
         }
-    }
-}
-
-/// Update a known ID set by adding new IDs and removing deleted ones.
-fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &[String]) {
-    for id in removed {
-        known.remove(id);
-    }
-    for id in added {
-        known.insert(id.clone());
     }
 }
 
@@ -2382,115 +2256,77 @@ async fn mark_db_available_after_successful_poll_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
 
-    fn empty_proxy_state_for_poll_tests() -> Result<ProxyState, anyhow::Error> {
-        let dns_cache = DnsCache::new(DnsConfig::default());
-        let env_config = EnvConfig::default();
-        let (state, _health_check_handles) =
-            ProxyState::new(Default::default(), dns_cache, env_config, None, None)?;
-        Ok(state)
+    #[test]
+    fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
+        let source = include_str!("database.rs");
+        assert!(
+            source.contains("let (config, initial_change_sequence) ="),
+            "database startup must retain the initial full-load change sequence"
+        );
+        assert!(
+            source.contains("let mut last_change_sequence: Option<u64> = initial_change_sequence;"),
+            "poll loop must start from the initial full-load cursor"
+        );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_reload_unchanged_commits_cursor_and_known_ids() -> Result<(), anyhow::Error> {
-        let state = empty_proxy_state_for_poll_tests()?;
-        let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
-        let mut last_poll_at = Some(previous_poll_at);
-        let mut known_proxy_ids: HashSet<String> = HashSet::from(["stale-proxy".to_string()]);
-        let mut known_consumer_ids: HashSet<String> = HashSet::from(["stale-consumer".to_string()]);
-        let mut known_plugin_config_ids: HashSet<String> =
-            HashSet::from(["stale-plugin".to_string()]);
-        let mut known_upstream_ids: HashSet<String> = HashSet::from(["stale-upstream".to_string()]);
+    #[test]
+    fn full_reload_applies_deferred_migrations_before_sequence_cursor_read() {
+        let source = include_str!("database.rs");
+        let helper_start = source
+            .find("async fn load_full_config_with_sequence")
+            .expect("load_full_config_with_sequence helper must exist");
+        let helper_end = source[helper_start..]
+            .find("fn commit_full_reload_poll_state")
+            .expect("commit_full_reload_poll_state helper must follow full load helper");
+        let helper_source = &source[helper_start..helper_start + helper_end];
+
+        let migration_hook = helper_source
+            .find("maybe_apply_deferred_migrations")
+            .expect("full reload helper must apply deferred migrations");
+        let sequence_read = helper_source
+            .find("latest_change_sequence")
+            .expect("full reload helper must read latest change sequence");
+
+        assert!(
+            migration_hook < sequence_read,
+            "deferred migrations must run before reading config_changes"
+        );
+    }
+
+    #[test]
+    fn full_reload_unchanged_commits_sequence_cursor() {
+        let mut last_change_sequence = Some(7);
+        let sequence = 42;
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
             proxy::ConfigApplyOutcome::Unchanged,
-            &state,
-            full_reload_poll_state(
-                &mut known_proxy_ids,
-                &mut known_consumer_ids,
-                &mut known_plugin_config_ids,
-                &mut known_upstream_ids,
-                &mut last_poll_at,
-            ),
+            &mut last_change_sequence,
+            sequence,
         );
 
         assert!(accepted);
-        assert!(known_proxy_ids.is_empty());
-        assert!(known_consumer_ids.is_empty());
-        assert!(known_plugin_config_ids.is_empty());
-        assert!(known_upstream_ids.is_empty());
-        assert_eq!(last_poll_at, Some(state.current_config().loaded_at));
-        assert_ne!(last_poll_at, Some(previous_poll_at));
-        Ok(())
+        assert_eq!(last_change_sequence, Some(sequence));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_reload_rejected_preserves_cursor_and_known_ids() -> Result<(), anyhow::Error> {
-        let state = empty_proxy_state_for_poll_tests()?;
-        let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
-        let mut last_poll_at = Some(previous_poll_at);
-        let mut known_proxy_ids: HashSet<String> = HashSet::from(["proxy-a".to_string()]);
-        let mut known_consumer_ids: HashSet<String> = HashSet::from(["consumer-a".to_string()]);
-        let mut known_plugin_config_ids: HashSet<String> = HashSet::from(["plugin-a".to_string()]);
-        let mut known_upstream_ids: HashSet<String> = HashSet::from(["upstream-a".to_string()]);
+    #[test]
+    fn full_reload_rejected_preserves_sequence_cursor() {
+        let previous_sequence = Some(7);
+        let mut last_change_sequence = previous_sequence;
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
             proxy::ConfigApplyOutcome::Rejected {
                 errors: vec!["invalid candidate".to_string()],
             },
-            &state,
-            full_reload_poll_state(
-                &mut known_proxy_ids,
-                &mut known_consumer_ids,
-                &mut known_plugin_config_ids,
-                &mut known_upstream_ids,
-                &mut last_poll_at,
-            ),
+            &mut last_change_sequence,
+            42,
         );
 
         assert!(!accepted);
-        assert_eq!(known_proxy_ids, HashSet::from(["proxy-a".to_string()]));
-        assert_eq!(
-            known_consumer_ids,
-            HashSet::from(["consumer-a".to_string()])
-        );
-        assert_eq!(
-            known_plugin_config_ids,
-            HashSet::from(["plugin-a".to_string()])
-        );
-        assert_eq!(
-            known_upstream_ids,
-            HashSet::from(["upstream-a".to_string()])
-        );
-        assert_eq!(last_poll_at, Some(previous_poll_at));
-        Ok(())
-    }
-
-    #[test]
-    fn update_known_ids_adds_and_removes() {
-        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
-        assert!(known.contains("a"));
-        assert!(!known.contains("b"));
-        assert!(known.contains("c"));
-        assert!(known.contains("d"));
-        assert_eq!(known.len(), 3);
-    }
-
-    #[test]
-    fn update_known_ids_remove_nonexistent_is_noop() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
-        assert_eq!(known.len(), 1);
-    }
-
-    #[test]
-    fn update_known_ids_duplicate_add_is_idempotent() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec!["a".to_string(), "a".to_string()], &[]);
-        assert_eq!(known.len(), 1);
+        assert_eq!(last_change_sequence, previous_sequence);
     }
 
     fn incremental_with_removed_proxy(
@@ -2506,6 +2342,7 @@ mod tests {
             removed_plugin_config_ids: vec![],
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
+            sequence_cursor: 1,
             poll_timestamp,
         }
     }
@@ -2536,27 +2373,28 @@ mod tests {
             removed_plugin_config_ids: vec![],
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
+            sequence_cursor: 1,
             poll_timestamp,
         }
     }
 
     #[test]
     fn rejected_delta_identity_ignores_poll_timestamp_for_same_effective_delta() {
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let first = incremental_with_removed_proxy("proxy-a", Utc::now());
         let second =
             incremental_with_removed_proxy("proxy-a", Utc::now() + chrono::Duration::seconds(5));
 
         assert_eq!(
-            RejectedDeltaIdentity::from_incremental(since, &first),
-            RejectedDeltaIdentity::from_incremental(since, &second),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &first),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second),
             "same cursor and change set should classify as the same rejected delta even when poll timestamps differ"
         );
     }
 
     #[test]
     fn rejected_delta_identity_includes_content_for_same_ids() {
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let poll_timestamp = Utc::now();
         let first = incremental_with_plugin_config(
             serde_json::json!({"limit": 10, "window_seconds": 60}),
@@ -2568,8 +2406,8 @@ mod tests {
         );
 
         assert_ne!(
-            RejectedDeltaIdentity::from_incremental(since, &first),
-            RejectedDeltaIdentity::from_incremental(since, &second),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &first),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second),
             "same resource IDs with different content must reset rejected-delta backoff state"
         );
     }
@@ -2627,9 +2465,9 @@ mod tests {
             3,
             metrics.clone(),
         );
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let result = incremental_with_removed_proxy("proxy-a", Utc::now());
-        let identity = RejectedDeltaIdentity::from_incremental(since, &result);
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &result);
         let errors = vec!["duplicate listen path '/api'".to_string()];
 
         let first = tracker.record_rejection(identity.clone().with_validation(&errors));
@@ -2678,16 +2516,17 @@ mod tests {
             3,
             metrics.clone(),
         );
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let first_delta = incremental_with_removed_proxy("proxy-a", Utc::now());
         let second_delta = incremental_with_removed_proxy("proxy-b", Utc::now());
         let errors = vec!["duplicate listen path '/api'".to_string()];
 
-        let first_identity = RejectedDeltaIdentity::from_incremental(since, &first_delta);
+        let first_identity = RejectedDeltaIdentity::from_incremental(after_sequence, &first_delta);
         tracker.record_rejection(first_identity.clone().with_validation(&errors));
         tracker.record_rejection(first_identity.with_validation(&errors));
 
-        let second_identity = RejectedDeltaIdentity::from_incremental(since, &second_delta);
+        let second_identity =
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second_delta);
         let different = tracker.record_rejection(second_identity.with_validation(&errors));
         assert_eq!(different.consecutive, 1);
         assert_eq!(different.backoff, Duration::from_secs(1));
@@ -2702,7 +2541,8 @@ mod tests {
         assert!(recovered.degraded.is_none());
 
         let next = tracker.record_rejection(
-            RejectedDeltaIdentity::from_incremental(since, &second_delta).with_validation(&errors),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second_delta)
+                .with_validation(&errors),
         );
         assert_eq!(next.consecutive, 1);
         assert_eq!(next.backoff, Duration::from_secs(1));
@@ -2717,9 +2557,9 @@ mod tests {
             3,
             metrics.clone(),
         );
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let delta = incremental_with_removed_proxy("secret-proxy-id", Utc::now());
-        let identity = RejectedDeltaIdentity::from_incremental(since, &delta);
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
 
         tracker.record_rejection(
             identity
@@ -2763,9 +2603,9 @@ mod tests {
             1,
             metrics.clone(),
         );
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let delta = incremental_with_removed_proxy("proxy-a", Utc::now());
-        let identity = RejectedDeltaIdentity::from_incremental(since, &delta);
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
         let decision = tracker
             .record_rejection(identity.with_validation(&["missing plugin reference".to_string()]));
         assert!(decision.should_escalate);
@@ -2842,9 +2682,9 @@ mod tests {
             r#"ferrum_database_delta_rejections_total{resource_category="proxy",namespace="ops-cache"} 0"#
         ));
 
-        let since = Utc::now() - chrono::Duration::seconds(30);
+        let after_sequence = 9;
         let delta = incremental_with_removed_proxy("proxy-a", Utc::now());
-        let identity = RejectedDeltaIdentity::from_incremental(since, &delta);
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
         tracker.record_rejection(identity.with_validation(&["missing upstream".to_string()]));
 
         let updated = registry.render();

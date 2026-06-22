@@ -67,7 +67,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -96,7 +96,7 @@ use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
 use crate::modes::mesh::node_waypoint::{
-    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
+    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
@@ -253,8 +253,19 @@ fn record_node_waypoint_identity_drop(
         NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
             crate::overload::NodeWaypointDropReason::HashMismatch
         }
+        NodeWaypointIdentityError::PodUidMismatch { .. } => {
+            crate::overload::NodeWaypointDropReason::HashMismatch
+        }
     };
     overload.record_node_waypoint_drop(reason);
+}
+
+fn node_waypoint_listener_uid_fallback_allowed(error: &NodeWaypointIdentityError) -> bool {
+    matches!(
+        error,
+        NodeWaypointIdentityError::SocketCookieUnavailable(_)
+            | NodeWaypointIdentityError::UnknownCookie(_)
+    )
 }
 
 /// Validate that every `mesh_route_dispatch` rule's
@@ -2761,9 +2772,11 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
-    /// Node-waypoint source identity resolver. When present, accepted sockets
-    /// must carry a node-agent/eBPF cookie record or the connection is dropped
-    /// fail-closed before TLS/HBONE processing.
+    /// Node-waypoint source identity resolver. Outbound capture sockets accepted
+    /// from per-pod in-netns listeners must carry a node-agent/eBPF cookie record
+    /// or the connection is dropped fail-closed before request processing.
+    /// Inbound HBONE sockets from peer proxies do not carry those pod-loopback
+    /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
     /// This is live, not staged: `supports_hbone_backend` gates HBONE dispatch
@@ -2785,6 +2798,12 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Whether the current mesh inbound TLS posture is actually terminating
+    /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
+    /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
+    /// gateway SVID slot and stays false for plaintext or passthrough
+    /// topologies.
+    pub mesh_inbound_spiffe_verifier_active: Arc<AtomicBool>,
     /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement for stream-
     /// family egress (TCP / UDP / TCP+TLS / UDP+DTLS). `Some` only when
     /// (a) the gateway runs in mesh mode, (b) the resolved policy is
@@ -2892,7 +2911,9 @@ struct RequestConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// Pre-NAT original destination of an iptables-REDIRECTed connection,
     /// read once at accept on mesh outbound capture listeners
-    /// (`SO_ORIGINAL_DST`). `None` everywhere else — see
+    /// (`SO_ORIGINAL_DST`). NodeWaypoint eBPF capture can also supply this from
+    /// the resolver cookie record because cgroup/connect rewrites do not create
+    /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
 }
@@ -4035,6 +4056,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
@@ -4420,6 +4442,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
             backend_svid_generation,
@@ -9893,6 +9916,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         None,
         0,
         SourceIpOverride::none(),
+        None,
     )
     .await;
     Ok(())
@@ -10224,6 +10248,62 @@ struct TlsConnectionMetadata {
     orig_dst: Option<SocketAddr>,
 }
 
+struct NodeWaypointAcceptIdentity {
+    identity: Arc<NodeWaypointIdentity>,
+    orig_dst: Option<SocketAddr>,
+    cookie_error: Option<NodeWaypointIdentityError>,
+}
+
+struct NodeWaypointAcceptIdentityDrop {
+    error: NodeWaypointIdentityError,
+    cookie_error: Option<NodeWaypointIdentityError>,
+}
+
+fn resolve_node_waypoint_accept_identity(
+    resolver: &NodeWaypointIdentityResolver,
+    stream: &tokio::net::TcpStream,
+    expected_pod_uid: Option<[u8; 16]>,
+) -> Result<NodeWaypointAcceptIdentity, NodeWaypointAcceptIdentityDrop> {
+    let Some(expected_pod_uid) = expected_pod_uid else {
+        return resolver
+            .resolve_stream(stream)
+            .map(|resolved| NodeWaypointAcceptIdentity {
+                identity: resolved.identity,
+                orig_dst: Some(resolved.orig_dst),
+                cookie_error: None,
+            })
+            .map_err(|error| NodeWaypointAcceptIdentityDrop {
+                error,
+                cookie_error: None,
+            });
+    };
+
+    match resolver.resolve_stream_for_expected_pod(stream, expected_pod_uid) {
+        Ok(resolved) => Ok(NodeWaypointAcceptIdentity {
+            identity: resolved.identity,
+            orig_dst: Some(resolved.orig_dst),
+            cookie_error: None,
+        }),
+        Err(error) if node_waypoint_listener_uid_fallback_allowed(&error) => {
+            match resolver.resolve_expected_pod_identity(expected_pod_uid) {
+                Ok((identity, _scope)) => Ok(NodeWaypointAcceptIdentity {
+                    identity,
+                    orig_dst: None,
+                    cookie_error: Some(error),
+                }),
+                Err(fallback_error) => Err(NodeWaypointAcceptIdentityDrop {
+                    error: fallback_error,
+                    cookie_error: Some(error),
+                }),
+            }
+        }
+        Err(error) => Err(NodeWaypointAcceptIdentityDrop {
+            error,
+            cookie_error: None,
+        }),
+    }
+}
+
 async fn start_proxy_listener_with_tls_source_and_signal(
     addr: SocketAddr,
     state: ProxyState,
@@ -10300,6 +10380,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     mesh_direction,
                     i,
                     SourceIpOverride::none(),
+                    None,
                 )
                 .await;
             }));
@@ -10323,6 +10404,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             mesh_direction,
             0,
             SourceIpOverride::none(),
+            None,
         )
         .await;
 
@@ -10346,6 +10428,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             mesh_direction,
             0,
             SourceIpOverride::none(),
+            None,
         )
         .await;
     }
@@ -10371,6 +10454,34 @@ impl SourceIpOverride {
     }
 }
 
+fn select_mesh_original_dst(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    socket_original_dst: Option<SocketAddr>,
+    node_waypoint_original_dst: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    match mesh_direction {
+        Some(crate::modes::mesh::MeshTrafficDirection::Outbound) => {
+            node_waypoint_original_dst.or(socket_original_dst)
+        }
+        Some(crate::modes::mesh::MeshTrafficDirection::Inbound) => socket_original_dst,
+        None => None,
+    }
+}
+
+fn should_resolve_node_waypoint_identity(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+}
+
+fn should_use_direct_pod_ip_http_route(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    has_node_waypoint_identity: bool,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+        && has_node_waypoint_identity
+}
+
 /// Accept loop that runs on a single listener socket. Multiple instances can
 /// run concurrently on the same address when SO_REUSEPORT is enabled.
 #[allow(clippy::too_many_arguments)]
@@ -10388,6 +10499,7 @@ async fn run_accept_loop(
     // pod IP so client-IP authz conditions, logs, and IP-keyed plugins see the
     // pod instead of loopback.
     source_ip_override: SourceIpOverride,
+    node_waypoint_expected_pod_uid: Option<[u8; 16]>,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     // Count consecutive accept() failures to back off a busy-loop. Under fd
@@ -10439,21 +10551,69 @@ async fn run_accept_loop(
                         };
 
                         let state = Arc::clone(&state);
+                        let mut node_waypoint_orig_dst = None;
                         let node_waypoint_identity =
-                            if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
-                                match resolver.resolve_stream(&stream) {
-                                    // HTTP/HBONE re-queries the per-pod scope per
-                                    // request, so the accept-time scope is unused
-                                    // here; keep only the identity on the
+                            if should_resolve_node_waypoint_identity(mesh_direction)
+                                && let Some(resolver) =
+                                    state.node_waypoint_identity_resolver.as_ref()
+                            {
+                                match resolve_node_waypoint_accept_identity(
+                                    resolver,
+                                    &stream,
+                                    node_waypoint_expected_pod_uid,
+                                ) {
+                                    // HTTP/HBONE re-queries the per-pod scope
+                                    // per request, so the accept-time scope is
+                                    // unused here; keep only the identity and
+                                    // optional original destination on the
                                     // connection metadata.
-                                    Ok((identity, _scope)) => Some(identity),
-                                    Err(error) => {
-                                        record_node_waypoint_identity_drop(&state.overload, &error);
-                                        debug!(
-                                            remote_addr = %remote_addr,
-                                            error = %error,
-                                            "Dropping node-waypoint connection without a resolved pod identity"
+                                    Ok(resolved) => {
+                                        node_waypoint_orig_dst = resolved.orig_dst;
+                                        if let Some(cookie_error) = resolved.cookie_error.as_ref() {
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            info!(
+                                                remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
+                                                error = %cookie_error,
+                                                "Admitting node-waypoint in-netns connection by listener pod UID after cookie lookup miss"
+                                            );
+                                        }
+                                        Some(resolved.identity)
+                                    }
+                                    Err(drop_reason) => {
+                                        record_node_waypoint_identity_drop(
+                                            &state.overload,
+                                            &drop_reason.error,
                                         );
+                                        if let Some(cookie_error) =
+                                            drop_reason.cookie_error.as_ref()
+                                        {
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            warn!(
+                                                remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
+                                                cookie_error = %cookie_error,
+                                                error = %drop_reason.error,
+                                                "Dropping node-waypoint connection without a resolved pod identity"
+                                            );
+                                        } else {
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            warn!(
+                                                remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
+                                                error = %drop_reason.error,
+                                                "Dropping node-waypoint connection without a resolved pod identity"
+                                            );
+                                        }
                                         drop(stream);
                                         continue;
                                     }
@@ -10481,19 +10641,21 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
-                        // Read the captured connection's pre-NAT original
-                        // destination ONCE per accept, only on mesh capture
-                        // listeners (one getsockopt; every request on the
-                        // connection shares it). Outbound: `:15001` REDIRECT
-                        // capture, port = the dialed SERVICE port. Inbound:
-                        // the injector also REDIRECTs a sidecar-less client's
-                        // direct dial of the app port to `:15006`, port = the
-                        // CONTAINER port (peer-sidecar dials are direct and
-                        // yield `None` per the `socket_opts::original_dst`
-                        // contract). `None` everywhere else and for
-                        // non-redirected traffic.
+                        // Read the captured connection's original destination
+                        // ONCE per accept, only on mesh capture listeners. For
+                        // iptables REDIRECT capture, `SO_ORIGINAL_DST` carries
+                        // the pre-NAT address. For NodeWaypoint cgroup/connect
+                        // capture there is no conntrack original-dst state, so
+                        // the eBPF resolver's original destination wins for
+                        // outbound. Every request on the connection shares this
+                        // value. `None` everywhere else and for non-redirected
+                        // traffic.
                         let orig_dst = if mesh_direction.is_some() {
-                            crate::socket_opts::original_dst(&stream)
+                            select_mesh_original_dst(
+                                mesh_direction,
+                                crate::socket_opts::original_dst(&stream),
+                                node_waypoint_orig_dst,
+                            )
                         } else {
                             None
                         };
@@ -10531,15 +10693,25 @@ async fn run_accept_loop(
                                 // service port)`), then fall back to the
                                 // direct-pod-IP / headless by-workload index
                                 // (strict `(workload IP, target port)`, F3 §3.4)
-                                // — a client that resolved a headless service
-                                // itself dials a POD IP, bypassing the VIP table.
+                                // only when no HTTP direct-pod-IP route owns the
+                                // same target. HTTP direct-pod-IP egress needs the
+                                // HTTP request path for Host-independent routing
+                                // and AuthorizationPolicy evaluation.
+                                let http_direct_pod_ip_owner = epoch
+                                    .route_table
+                                    .mesh_http_egress_by_workload_decision(dst)
+                                    .is_some();
                                 let decision = epoch
                                     .route_table
                                     .mesh_tcp_egress_decision(dst)
                                     .or_else(|| {
-                                        epoch
-                                            .route_table
-                                            .mesh_tcp_egress_by_workload_decision(dst)
+                                        if http_direct_pod_ip_owner {
+                                            None
+                                        } else {
+                                            epoch
+                                                .route_table
+                                                .mesh_tcp_egress_by_workload_decision(dst)
+                                        }
                                     })
                                     .cloned();
                                 match decision {
@@ -11878,13 +12050,59 @@ async fn handle_proxy_request_inner(
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
     let epoch = state.request_epoch.load();
 
+    // Direct Pod-IP HTTP mesh egress is selected by captured original
+    // destination before Host routing. The client-controlled Host header cannot
+    // safely identify the destination service for a direct pod-IP dial.
+    let direct_pod_ip_http_route = if should_use_direct_pod_ip_http_route(
+        ctx.mesh_direction,
+        ctx.node_waypoint_pod_uid.is_some(),
+    ) {
+        ctx.orig_dst.and_then(|orig_dst| {
+            epoch
+                .route_table
+                .mesh_http_egress_by_workload_decision(orig_dst)
+                .cloned()
+        })
+    } else {
+        None
+    };
+
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state.router_cache.find_proxy_in_snapshot(
-        &epoch.route_table,
-        epoch.route_generation,
-        request_host.as_deref(),
-        &path,
-    );
+    let route_match = match direct_pod_ip_http_route {
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {
+            proxy,
+            service_port,
+        }) => {
+            ctx.mesh_outbound_destination_authz_port = Some(service_port);
+            Some(crate::router_cache::RouteMatch {
+                proxy,
+                path_params: Vec::new(),
+                matched_prefix_len: 0,
+            })
+        }
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::CloseNotRoutable) => {
+            debug!(
+                orig_dst = ?ctx.orig_dst,
+                client_ip = %ctx.client_ip,
+                "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
+            );
+            state.request_count.fetch_add(1, Ordering::Relaxed);
+            let reject = normalize_reject_response(
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
+                &EMPTY_HEADERS,
+                request_uses_grpc_content_type,
+            );
+            record_status(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+        None => state.router_cache.find_proxy_in_snapshot(
+            &epoch.route_table,
+            epoch.route_generation,
+            request_host.as_deref(),
+            &path,
+        ),
+    };
 
     // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
     // direction-scoped: the inbound and outbound capture listeners share one
@@ -11921,7 +12139,8 @@ async fn handle_proxy_request_inner(
     let route_match = match route_match {
         Some(rm)
             if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
-                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id) =>
+                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id)
+                && !crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&rm.proxy.id) =>
         {
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
@@ -21936,6 +22155,121 @@ mod tests {
     }
 
     #[test]
+    fn node_waypoint_outbound_prefers_ebpf_original_destination() {
+        let socket_capture_endpoint: SocketAddr = "127.0.0.1:15001".parse().unwrap();
+        let ebpf_original_dst: SocketAddr = "10.244.1.4:8080".parse().unwrap();
+
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                Some(socket_capture_endpoint),
+                Some(ebpf_original_dst),
+            ),
+            Some(ebpf_original_dst),
+            "cgroup/connect capture has no conntrack original-dst, so direct Pod-IP HTTP must route by the eBPF original destination"
+        );
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                Some(socket_capture_endpoint),
+                None,
+            ),
+            Some(socket_capture_endpoint),
+            "non-node-waypoint outbound REDIRECT capture still uses SO_ORIGINAL_DST"
+        );
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Inbound),
+                Some(socket_capture_endpoint),
+                Some(ebpf_original_dst),
+            ),
+            Some(socket_capture_endpoint),
+            "inbound capture is still the iptables original-dst path"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_identity_resolution_is_outbound_capture_only() {
+        assert!(
+            should_resolve_node_waypoint_identity(Some(
+                crate::modes::mesh::MeshTrafficDirection::Outbound
+            )),
+            "pod-loopback outbound capture must resolve the eBPF cookie before request handling"
+        );
+        assert!(
+            !should_resolve_node_waypoint_identity(Some(
+                crate::modes::mesh::MeshTrafficDirection::Inbound
+            )),
+            "peer HBONE connections on the inbound listener do not carry pod-loopback cookies"
+        );
+        assert!(
+            !should_resolve_node_waypoint_identity(None),
+            "non-mesh listeners must not be coupled to the NodeWaypoint identity resolver"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_listener_uid_fallback_is_cookie_lookup_only() {
+        let pod_uid = [1u8; 16];
+        let other_uid = [2u8; 16];
+
+        assert!(node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::SocketCookieUnavailable("not supported".to_string())
+        ));
+        assert!(node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::UnknownCookie(7)
+        ));
+
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::MissingPodUid(7)
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::MissingWorkloadHash { cookie: 7, pod_uid }
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::UnknownPod(pod_uid)
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::WorkloadHashMismatch {
+                pod_uid,
+                expected: 1,
+                actual: 2,
+            }
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::PodUidMismatch {
+                expected: pod_uid,
+                actual: other_uid,
+            }
+        ));
+    }
+
+    #[test]
+    fn direct_pod_ip_http_route_is_node_waypoint_only() {
+        assert!(
+            should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                true
+            ),
+            "NodeWaypoint outbound capture with a resolved source pod identity may route by original pod IP"
+        );
+        assert!(
+            !should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                false
+            ),
+            "Sidecar and other outbound listeners keep Host routing because they do not have NodeWaypoint pod identity"
+        );
+        assert!(
+            !should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Inbound),
+                true
+            ),
+            "inbound HBONE relay traffic must not use the outbound direct-pod-IP lookup"
+        );
+    }
+
+    #[test]
     fn grpc_streaming_defers_passive_unhealthy_2xx_until_body_terminal() {
         let proxy = streaming_dispatch_test_proxy();
 
@@ -28004,6 +28338,7 @@ mod tests {
                 removed_plugin_config_ids: vec!["pc1".to_string()],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
+                sequence_cursor: 0,
                 poll_timestamp: now,
             })
             .await;

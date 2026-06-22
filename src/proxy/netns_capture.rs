@@ -11,12 +11,18 @@
 //! receive captured traffic from any pod: there is nothing listening on the
 //! pod's own loopback.
 //!
-//! The GAP-2M `sock_ops` cookie bridge has the same requirement from the other
-//! direction: it re-keys the orig-dst record by `(netns cookie, 4-tuple)` at
-//! active-established and recovers it at passive-established using the
-//! accept-side socket's netns cookie. That only matches when the accepting
-//! socket shares the connecting socket's netns — i.e. when the proxy accepts
-//! *in the pod netns*.
+//! The listener itself is scoped to exactly one pod netns, so the accept path
+//! passes the listener's expected pod UID as the primary source-identity gate:
+//! the current mesh slice must still contain that pod UID before traffic is
+//! admitted. The GAP-2M `sock_ops` cookie bridge remains the source of
+//! original-destination metadata when available; it re-keys the orig-dst record
+//! by `(netns cookie, 4-tuple)` at active-established and recovers it at
+//! passive-established using the accept-side callback's netns cookie. Live
+//! kernels may report the proxy accepting task's netns for that passive callback
+//! even though the listener was bound in the workload netns. The eBPF bridge
+//! therefore has a best-effort any-netns fallback, and the accept path still
+//! validates any resolved cookie record against the listener pod UID before
+//! using its original destination.
 //!
 //! # What this does
 //!
@@ -27,8 +33,8 @@
 //! socket. The listening socket's fd is process-global once created, so the
 //! accept loop runs on the shared tokio runtime in the host netns; only the
 //! `bind()` happens in the pod netns. The accepted connection then resolves its
-//! source pod identity through the same cookie path as before — which now
-//! succeeds because the bridge's same-netns assumption holds.
+//! source pod identity from the listener pod UID and uses cookie metadata, when
+//! present, only after validating it against that UID.
 //!
 //! The node-agent (which watches pods and holds their cgroup paths) publishes
 //! the enrolled-pod set to a pinned registry directory; this manager polls it
@@ -54,6 +60,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+
+use crate::modes::mesh::node_waypoint::parse_pod_uid;
 
 use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 
@@ -133,10 +141,11 @@ impl PodCaptureSource for DirectoryCaptureSource {
 /// reconcile diff is unit-testable with a mock; production uses
 /// [`ProxyNetnsBackend`].
 pub trait NetnsBackend: Send + Sync + 'static {
-    /// Stable per-netns key for the pod (the netns inode). `None` when no live
-    /// PID can be found in the cgroup (pod terminating, race) or the platform
-    /// can't resolve it — the pod is skipped this round and retried next poll.
-    fn netns_key(&self, target: &PodCaptureTarget) -> Option<u64>;
+    /// Stable per-netns key for the pod (the netns inode). An error means no
+    /// live PID can be found in the cgroup (pod terminating, race), the proxy
+    /// cannot inspect the host cgroup/proc view it needs, or the platform can't
+    /// resolve it. The pod is skipped this round and retried next poll.
+    fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String>;
 
     /// Open a `capture_addr` listener inside the pod's netns and spawn its
     /// accept loop. Returns a stop handle (setting it `true` shuts the loop
@@ -240,6 +249,13 @@ pub struct NetnsCaptureManager<B: NetnsBackend> {
     /// capture port before a listener exists to accept it. `None` disables
     /// marker publishing (unit tests).
     ready_dir: Option<PathBuf>,
+    /// Last registry UID set logged, so startup/churn diagnostics show whether
+    /// the ambient proxy can see the node-agent's hostPath registry without
+    /// emitting the same line every poll.
+    last_registry_uids: HashSet<String>,
+    /// Last unresolved-netns reason per pod UID, so persistent cgroup/proc
+    /// visibility failures remain clear without warning every poll.
+    unresolved_reasons: HashMap<String, String>,
 }
 
 impl<B: NetnsBackend> NetnsCaptureManager<B> {
@@ -256,6 +272,8 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             poll_interval,
             active: HashMap::new(),
             ready_dir: None,
+            last_registry_uids: HashSet::new(),
+            unresolved_reasons: HashMap::new(),
         }
     }
 
@@ -311,22 +329,56 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
         let mut resolved_uid_netns: HashMap<String, u64> = HashMap::new();
         let mut unresolved_uids: HashSet<String> = HashSet::new();
         let registry_uids: HashSet<String> = targets.iter().map(|t| t.pod_uid.clone()).collect();
+        if registry_uids != self.last_registry_uids {
+            info!(
+                target_count = registry_uids.len(),
+                pod_uids = ?registry_uids,
+                "Node-waypoint capture registry changed"
+            );
+            self.last_registry_uids = registry_uids.clone();
+        }
         for target in &targets {
-            if let Some(netns) = self.backend.netns_key(target) {
-                desired
-                    .entry(netns)
-                    .or_default()
-                    .insert(target.pod_uid.clone());
-                resolved_uid_netns.insert(target.pod_uid.clone(), netns);
-            } else {
-                unresolved_uids.insert(target.pod_uid.clone());
-                debug!(
-                    pod_uid = %target.pod_uid,
-                    cgroup = %target.cgroup_path,
-                    "Node-waypoint capture: pod netns not resolvable yet; will retry"
-                );
+            match self.backend.netns_key(target) {
+                Ok(netns) => {
+                    if self.unresolved_reasons.remove(&target.pod_uid).is_some() {
+                        info!(
+                            pod_uid = %target.pod_uid,
+                            cgroup = %target.cgroup_path,
+                            netns_inode = netns,
+                            "Node-waypoint capture: pod netns resolved after retry"
+                        );
+                    }
+                    desired
+                        .entry(netns)
+                        .or_default()
+                        .insert(target.pod_uid.clone());
+                    resolved_uid_netns.insert(target.pod_uid.clone(), netns);
+                }
+                Err(error) => {
+                    unresolved_uids.insert(target.pod_uid.clone());
+                    let previous = self
+                        .unresolved_reasons
+                        .insert(target.pod_uid.clone(), error.clone());
+                    if previous.as_deref() == Some(error.as_str()) {
+                        debug!(
+                            pod_uid = %target.pod_uid,
+                            cgroup = %target.cgroup_path,
+                            %error,
+                            "Node-waypoint capture: pod netns still not resolvable; will retry"
+                        );
+                    } else {
+                        warn!(
+                            pod_uid = %target.pod_uid,
+                            cgroup = %target.cgroup_path,
+                            %error,
+                            "Node-waypoint capture: pod netns not resolvable; will retry"
+                        );
+                    }
+                }
             }
         }
+        self.unresolved_reasons
+            .retain(|uid, _| unresolved_uids.contains(uid));
 
         // Close a listener when none of its pods still justify it. A pod on the
         // listener for netns N justifies keeping N open when it is still in the
@@ -489,8 +541,8 @@ impl ProxyNetnsBackend {
 }
 
 impl NetnsBackend for ProxyNetnsBackend {
-    fn netns_key(&self, target: &PodCaptureTarget) -> Option<u64> {
-        imp::netns_inode_for_cgroup(&target.cgroup_path)
+    fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String> {
+        imp::netns_inode_for_cgroup(&target.cgroup_path).map_err(|error| error.to_string())
     }
 
     fn open_listener(
@@ -498,6 +550,17 @@ impl NetnsBackend for ProxyNetnsBackend {
         target: &PodCaptureTarget,
         capture_addr: SocketAddr,
     ) -> Option<OpenedNetnsListener> {
+        let expected_pod_uid = match parse_pod_uid(&target.pod_uid) {
+            Ok(pod_uid) => pod_uid,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    %error,
+                    "Node-waypoint in-netns listener rejected invalid pod UID"
+                );
+                return None;
+            }
+        };
         let std_listener =
             match imp::bind_capture_listener_in_pod_netns(&target.cgroup_path, capture_addr) {
                 Ok(listener) => listener,
@@ -565,6 +628,7 @@ impl NetnsBackend for ProxyNetnsBackend {
                 mesh_direction,
                 0,
                 SourceIpOverride::Dynamic(source_ip_rx),
+                Some(expected_pod_uid),
             )
             .await;
         });
@@ -576,6 +640,7 @@ impl NetnsBackend for ProxyNetnsBackend {
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs::File;
+    use std::io;
     use std::net::SocketAddr;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -584,10 +649,16 @@ mod imp {
     /// Resolve the pod's netns identity (the `net` namespace inode) from a live
     /// PID in its cgroup. The inode is stable for the life of the netns and is a
     /// good dedup key across the pod sandbox + container cgroups.
-    pub(super) fn netns_inode_for_cgroup(cgroup_path: &str) -> Option<u64> {
+    pub(super) fn netns_inode_for_cgroup(cgroup_path: &str) -> io::Result<u64> {
         let pid = first_pid_in_cgroup(cgroup_path)?;
-        let meta = std::fs::metadata(format!("/proc/{pid}/ns/net")).ok()?;
-        Some(meta.ino())
+        let path = format!("/proc/{pid}/ns/net");
+        let meta = std::fs::metadata(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to stat pod netns {path}: {error}"),
+            )
+        })?;
+        Ok(meta.ino())
     }
 
     /// Bind `addr` (the capture loopback endpoint) inside the pod's network
@@ -601,12 +672,7 @@ mod imp {
         cgroup_path: &str,
         addr: SocketAddr,
     ) -> std::io::Result<std::net::TcpListener> {
-        let pid = first_pid_in_cgroup(cgroup_path).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no live PID in pod cgroup (pod terminating or not yet started)",
-            )
-        })?;
+        let pid = first_pid_in_cgroup(cgroup_path)?;
         std::thread::spawn(move || -> std::io::Result<std::net::TcpListener> {
             let _guard = NetnsGuard::enter(pid)?;
             let socket = socket2::Socket::new(
@@ -634,28 +700,68 @@ mod imp {
     /// Breadth-first walk of the pod cgroup subtree, returning the first PID
     /// from any `cgroup.procs`. Mirrors the discovery used by
     /// `crate::ebpf::veth`. Bounded to avoid runaway traversal.
-    fn first_pid_in_cgroup(cgroup_path: &str) -> Option<u32> {
+    fn first_pid_in_cgroup(cgroup_path: &str) -> io::Result<u32> {
+        let root = PathBuf::from(cgroup_path);
+        let metadata = std::fs::metadata(&root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to stat pod cgroup {}: {error}", root.display()),
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pod cgroup path is not a directory: {}", root.display()),
+            ));
+        }
         let mut dirs = vec![PathBuf::from(cgroup_path)];
         let mut scanned = 0usize;
+        let mut first_read_error: Option<String> = None;
         while let Some(dir) = dirs.pop() {
             scanned += 1;
             if scanned > 1024 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pod cgroup walk exceeded 1024 directories under {cgroup_path}"),
+                ));
             }
-            if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs"))
-                && let Some(pid) = procs.split_whitespace().find_map(|raw| raw.parse().ok())
-            {
-                return Some(pid);
-            }
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                        dirs.push(entry.path());
+            let procs_path = dir.join("cgroup.procs");
+            match std::fs::read_to_string(&procs_path) {
+                Ok(procs) => {
+                    if let Some(pid) = procs.split_whitespace().find_map(|raw| raw.parse().ok()) {
+                        return Ok(pid);
                     }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    first_read_error.get_or_insert_with(|| {
+                        format!("failed to read {}: {error}", procs_path.display())
+                    });
+                }
+            }
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                            dirs.push(entry.path());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    first_read_error.get_or_insert_with(|| {
+                        format!("failed to read cgroup directory {}: {error}", dir.display())
+                    });
                 }
             }
         }
-        None
+        let detail = first_read_error
+            .map(|error| format!("; first read error: {error}"))
+            .unwrap_or_default();
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no live PID found in pod cgroup subtree {cgroup_path}{detail}"),
+        ))
     }
 
     /// RAII netns switch: enters the target PID's net namespace on construction
@@ -694,8 +800,11 @@ mod imp {
 mod imp {
     use std::net::SocketAddr;
 
-    pub(super) fn netns_inode_for_cgroup(_cgroup_path: &str) -> Option<u64> {
-        None
+    pub(super) fn netns_inode_for_cgroup(_cgroup_path: &str) -> std::io::Result<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "in-netns capture listeners are Linux-only",
+        ))
     }
 
     pub(super) fn bind_capture_listener_in_pod_netns(
@@ -735,13 +844,14 @@ mod tests {
     }
 
     impl NetnsBackend for MockBackend {
-        fn netns_key(&self, target: &PodCaptureTarget) -> Option<u64> {
+        fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String> {
             self.netns_by_cgroup
                 .lock()
                 .unwrap()
                 .get(&target.cgroup_path)
                 .copied()
                 .flatten()
+                .ok_or_else(|| "mock netns unresolved".to_string())
         }
 
         fn open_listener(
@@ -749,7 +859,7 @@ mod tests {
             target: &PodCaptureTarget,
             _addr: SocketAddr,
         ) -> Option<OpenedNetnsListener> {
-            let netns = self.netns_key(target)?;
+            let netns = self.netns_key(target).ok()?;
             self.opened.lock().unwrap().push(netns);
             // The manager records closes by dropping the listener from `active`;
             // tests assert on `mgr.active` membership, so the mock just hands
@@ -1032,8 +1142,8 @@ mod tests {
             opens: AtomicUsize,
         }
         impl NetnsBackend for FailReopenBackend {
-            fn netns_key(&self, _target: &PodCaptureTarget) -> Option<u64> {
-                Some(100)
+            fn netns_key(&self, _target: &PodCaptureTarget) -> Result<u64, String> {
+                Ok(100)
             }
             fn open_listener(
                 &self,

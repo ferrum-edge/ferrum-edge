@@ -471,7 +471,7 @@ Set the poller env knobs (defaults are usually fine):
 ```bash
 FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=300   # 5 min; 0 disables the poller
 FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS=30
-# FERRUM_MESH_FEDERATION_FAIL_OPEN=false           # reserved; today the verifier is always fail-closed
+# FERRUM_MESH_FEDERATION_FAIL_OPEN=false           # false blocks CP fallback until a bundle is polled; true allows bootstrap fallback
 ```
 
 If your federation requires alias trust domains during a migration (for

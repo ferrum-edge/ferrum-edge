@@ -343,7 +343,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
     resolver.record_orig_dst4(
         cookie,
         OrigDst4 {
-            addr: 0x0a00_0001,
+            addr: u32::from_ne_bytes([10, 0, 0, 1]),
             port: 8080,
             pod_uid: pod_a,
             workload_spiffe_hash: hash_a,
@@ -376,18 +376,22 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
     resolver.install_policy_scopes_from_workloads(&[workload]);
 
     // The exact chain the TCP accept loop now runs: `resolve_stream` returns
-    // BOTH the identity and the per-pod scope from one consistent slice load.
-    let (identity, scope) = resolver
+    // the identity, per-pod scope, and original destination from one consistent
+    // slice load.
+    let resolved = resolver
         .resolve_stream(&accepted)
         .expect("accepted socket resolves to enrolled pod identity");
-    assert_eq!(identity.pod_uid, pod_a);
-    assert_eq!(identity.spiffe_id.as_str(), SPIFFE_A);
+    assert_eq!(resolved.identity.pod_uid, pod_a);
+    assert_eq!(resolved.identity.spiffe_id.as_str(), SPIFFE_A);
+    assert_eq!(resolved.orig_dst, "10.0.0.1:8080".parse().unwrap());
 
     // The scope returned by resolve and the scope re-queried per request must
     // agree (same generation), and both must be present for this vouched pod.
-    let scope = scope.expect("resolve must return the resolved pod's scope");
+    let scope = resolved
+        .policy_scope
+        .expect("resolve must return the resolved pod's scope");
     let requeried = resolver
-        .policy_scope_for_pod(&identity.pod_uid)
+        .policy_scope_for_pod(&resolved.identity.pod_uid)
         .expect("resolved pod has an installed policy scope");
     assert_eq!(scope.namespace, requeried.namespace);
 

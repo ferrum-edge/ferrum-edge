@@ -49,9 +49,13 @@ currently enrolled (machine-gated) set, which is the authoritative answer to
 - **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, `EastWestGateway`
   SNI passthrough, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA),
   trust-bundle federation.
-- **Experimental.** `NodeWaypoint` sidecarless capture (IPv4-only GAP-2M bridge,
-  live-datapath-unverified), eBPF ambient capture (Dev-only; default image ships
-  a no-op mock), cross-cluster endpoint discovery, stream-family egress.
+- **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 intended path gated
+  by a privileged live job; IPv6 captured egress fails closed before admission;
+  Helm must mount the shared node-agent ↔ ambient pod registry plus host
+  cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
+  `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
+  auto-select `-ebpf` images and non-eBPF builds cannot report Ready),
+  cross-cluster endpoint discovery, stream-family egress.
 
 ## Acceptable residual / out-of-scope (the long tail)
 
@@ -61,8 +65,10 @@ need them, or because they are blocked upstream / architecturally:
 - **Stock Envoy / third-party Istio xDS interop** — Ferrum xDS is Ferrum-to-Ferrum
   (security/policy fields ride Ferrum ECDS carriers). Not a drop-in xDS data plane.
 - **`EnvoyFilter` / `WasmPlugin`** — use Ferrum custom plugins (`custom_plugins/`).
-- **IPv6 ambient / node-waypoint capture** — blocked on the aya BPF verifier for
-  the v6 socket-cookie read; dual-stack **sidecar** serves IPv6 fully.
+- **IPv6 ambient / node-waypoint capture** — the accept-side socket-cookie bridge
+  handles IPv6, but the end-to-end NodeWaypoint capture path is not admitted yet:
+  the in-netns listener is IPv4-loopback only and captured IPv6 egress is denied
+  in `connect6`. Dual-stack **sidecar** serves IPv6 fully.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
   services or proxies force the NodeWaypoint UDP/DTLS path closed during config

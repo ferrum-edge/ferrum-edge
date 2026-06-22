@@ -307,6 +307,7 @@ fn empty_delta_at(poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp,
     }
 }
@@ -321,6 +322,7 @@ fn delta_with_proxy(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> Incr
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp,
     }
 }
@@ -422,6 +424,7 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
         removed_plugin_config_ids: vec!["pc2".to_string()],
         added_or_modified_upstreams: vec![u1],
         removed_upstream_ids: vec!["u2".to_string()],
+        sequence_cursor: 0,
         poll_timestamp,
     };
 
@@ -481,6 +484,7 @@ async fn apply_incremental_rejected_returns_rejected_variant() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
 
@@ -528,6 +532,7 @@ async fn polling_cursor_only_advances_on_applied_or_unchanged() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: rejected_ts,
     };
 
@@ -786,6 +791,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![rotated_upstream],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     let outcome = state.apply_incremental(delta).await;

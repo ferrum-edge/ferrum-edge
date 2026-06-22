@@ -356,6 +356,20 @@ pub(crate) fn mesh_hbone_target_tags(
     tags
 }
 
+/// Build the `mesh.*` UpstreamTarget tags for NodeWaypoint captured-Service
+/// HTTP dispatch. The in-pod-netns capture listener has already attributed the
+/// source pod and runs `mesh_authz`; there is no reachable backing-pod HBONE or
+/// sidecar-mTLS listener to tag here, so this intentionally carries destination
+/// identity and service metadata without a mesh transport tag.
+pub(crate) fn mesh_node_waypoint_plaintext_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    mesh_target_tags_core(service, workload, protocol, port_name)
+}
+
 /// Build the `mesh.*` UpstreamTarget tags that mark a target for Sidecar
 /// SVID-mTLS dispatch (plain HTTP/2 over mutual TLS to the peer sidecar's
 /// inbound listener). Same shared identity tags as the HBONE builder, but with

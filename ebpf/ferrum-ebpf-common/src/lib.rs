@@ -58,16 +58,16 @@ pub struct OrigDst6 {
 /// accept-side cookie. Both callbacks must compute an identical key, so:
 ///
 /// - `netns_cookie` (`bpf_get_netns_cookie`) disambiguates pods, and is the
-///   load-bearing part of the key. Every captured connection is rewritten to
-///   `127.0.0.1:15001`, so `client_addr`/`server_addr` collapse to loopback and
-///   only the ephemeral `client_port` varies — and ephemeral ports are
-///   per-netns, so two pods can present the *same* 4-tuple into this one global
-///   map. The netns cookie is identical for both ends of a same-netns loopback
-///   connection but distinct across pods, so it makes the key globally unique
-///   and stops one pod's record from overwriting another's (which would
-///   misattribute identity to the accepted socket). A connection whose accept
-///   side lives in a different netns than its connect side never matches —
-///   fail-closed, never misattributed.
+///   load-bearing part of the preferred key. Every captured connection is
+///   rewritten to `127.0.0.1:15001`, so `client_addr`/`server_addr` collapse to
+///   loopback and only the ephemeral `client_port` varies — and ephemeral ports
+///   are per-netns, so two pods can present the *same* 4-tuple into this one
+///   global map. The exact netns key stops one pod's record from overwriting
+///   another's. The sock-ops program may also publish a best-effort
+///   `netns_cookie = 0` fallback for kernels where the passive callback reports
+///   the accepting task's netns rather than the accepted socket's workload
+///   netns; the proxy must validate the accepted record against the pod-specific
+///   in-netns listener before admitting the connection.
 /// - `client_addr` / `server_addr` are kept in **network byte order** (the
 ///   kernel stores `local_ip4` / `remote_ip4` that way on both sides).
 /// - `client_port` / `server_port` are normalized to **host byte order** (see
@@ -104,6 +104,22 @@ impl ConnTuple4 {
             netns_cookie,
         }
     }
+
+    /// Same connection tuple with the netns discriminator removed. Used only as
+    /// a secondary bridge key on live kernels whose sock-ops passive callback
+    /// reports the accepting task's netns instead of the accepted socket's
+    /// workload netns; userspace still validates the resolved pod UID against
+    /// the listener's expected pod before admitting traffic.
+    pub const fn any_netns(self) -> Self {
+        Self {
+            client_addr: self.client_addr,
+            server_addr: self.server_addr,
+            client_port: self.client_port,
+            server_port: self.server_port,
+            _pad: 0,
+            netns_cookie: 0,
+        }
+    }
 }
 
 /// IPv6 connection 4-tuple key for the accept-side cookie bridge (GAP-2M).
@@ -137,6 +153,19 @@ impl ConnTuple6 {
             server_port,
             _pad: 0,
             netns_cookie,
+        }
+    }
+
+    /// Same connection tuple with the netns discriminator removed. See
+    /// [`ConnTuple4::any_netns`] for the live-kernel compatibility rationale.
+    pub const fn any_netns(self) -> Self {
+        Self {
+            client_addr: self.client_addr,
+            server_addr: self.server_addr,
+            client_port: self.client_port,
+            server_port: self.server_port,
+            _pad: 0,
+            netns_cookie: 0,
         }
     }
 }
@@ -670,6 +699,25 @@ mod tests {
                 "port {port} must not use the sock_ops high-half encoding"
             );
         }
+    }
+
+    #[test]
+    fn conn_tuple_any_netns_preserves_connection_tuple() {
+        let tuple4 = ConnTuple4::new(42, 0x0100_007f, 49152, 0x0100_007f, 15001);
+        let any4 = tuple4.any_netns();
+        assert_eq!(any4.client_addr, tuple4.client_addr);
+        assert_eq!(any4.server_addr, tuple4.server_addr);
+        assert_eq!(any4.client_port, tuple4.client_port);
+        assert_eq!(any4.server_port, tuple4.server_port);
+        assert_eq!(any4.netns_cookie, 0);
+
+        let tuple6 = ConnTuple6::new(99, [0, 0, 0, 1], 49153, [0, 0, 0, 1], 15001);
+        let any6 = tuple6.any_netns();
+        assert_eq!(any6.client_addr, tuple6.client_addr);
+        assert_eq!(any6.server_addr, tuple6.server_addr);
+        assert_eq!(any6.client_port, tuple6.client_port);
+        assert_eq!(any6.server_port, tuple6.server_port);
+        assert_eq!(any6.netns_cookie, 0);
     }
 
     #[test]
