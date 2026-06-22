@@ -25,13 +25,17 @@
 //!
 //! Node-waypoint mode is different because one proxy instance handles many
 //! pods. When `per_pod_policy_scoping` is enabled, construction-time filtering
-//! is skipped and the request path evaluates the `PolicyScopeCache` attached to
-//! `RequestContext::node_waypoint_policy_scope`. A missing scope means the
-//! pod's workload is no longer in the live slice (the resolver derives a pod's
-//! scope from the same single generation that vouches its identity, so it is
-//! not an enrollment race): both the HTTP/HBONE and stream paths then **fail
-//! closed** (403) when any namespace/selector-scoped policy is configured, and
-//! fall through to mesh-wide-only when the mesh carries only mesh-wide policies.
+//! is skipped. The request path still uses the source pod's
+//! `RequestContext::node_waypoint_policy_scope` as the liveness/scope-missing
+//! fail-closed gate, but HTTP Service egress filters policy applicability by
+//! the selected destination Service's backing workload scopes, matching Istio's
+//! destination-scoped AuthorizationPolicy semantics. A missing source scope
+//! means the pod's workload is no longer in the live slice (the resolver derives
+//! a pod's scope from the same single generation that vouches its identity, so
+//! it is not an enrollment race): both the HTTP/HBONE and stream paths then
+//! **fail closed** (403) when any namespace/selector-scoped policy is
+//! configured, and fall through to mesh-wide-only when the mesh carries only
+//! mesh-wide policies.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -60,6 +64,8 @@ use crate::plugins::{
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    destination_policy_scopes_by_upstream:
+        HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     has_header_rules: bool,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
@@ -189,6 +195,58 @@ impl ConditionAttributeKeys {
 /// `prefix...]` form.
 fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     key.strip_prefix(prefix)?.strip_suffix(']')
+}
+
+fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+fn destination_policy_scopes_by_upstream(
+    slice: &MeshSlice,
+) -> HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>> {
+    let mut scopes_by_upstream = HashMap::new();
+    for service in &slice.services {
+        let scopes: Vec<_> = if service.workloads.is_empty() {
+            slice
+                .workloads
+                .iter()
+                .filter(|workload| {
+                    workload.namespace == service.namespace && workload.service_name == service.name
+                })
+                .map(crate::modes::mesh::runtime::PolicyScopeCache::from_workload)
+                .collect()
+        } else {
+            service
+                .workloads
+                .iter()
+                .filter_map(|workload_ref| {
+                    slice.workloads.iter().find(|workload| {
+                        workload.spiffe_id == workload_ref.spiffe_id
+                            && workload.namespace == service.namespace
+                            && workload.service_name == service.name
+                    })
+                })
+                .map(crate::modes::mesh::runtime::PolicyScopeCache::from_workload)
+                .collect()
+        };
+        if scopes.is_empty() {
+            continue;
+        }
+        for service_port in &service.ports {
+            scopes_by_upstream.insert(
+                mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port),
+                scopes.clone(),
+            );
+        }
+    }
+    scopes_by_upstream
+}
+
+fn policy_applies_to_any_scope<'a>(
+    policy: &MeshPolicy,
+    scopes: impl IntoIterator<Item = &'a crate::modes::mesh::runtime::PolicyScopeCache>,
+) -> bool {
+    scopes.into_iter().any(|scope| scope.policy_applies(policy))
 }
 
 /// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
@@ -472,8 +530,12 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
+        let destination_policy_scopes_by_upstream = per_pod_policy_scoping
+            .then(|| destination_policy_scopes_by_upstream(&slice))
+            .unwrap_or_default();
         Ok(Self {
             slice,
+            destination_policy_scopes_by_upstream,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
@@ -1016,10 +1078,11 @@ impl Plugin for MeshAuthz {
         //
         // When `per_pod_policy_scoping` is enabled, the construction-time
         // filter was skipped (`self.slice.mesh_policies` carries the full
-        // unfiltered set) and we filter per-request using the source pod's
-        // PolicyScopeCache. If the scope is absent, retain mesh-wide policies
-        // only so scoped policies do not leak across pods. Other topologies
-        // keep the pre-filtered slice.
+        // unfiltered set). The source pod scope remains the fail-closed
+        // liveness gate. For materialized NodeWaypoint HTTP Service egress, the
+        // policy applicability filter must use the destination Service's backing
+        // workload scopes (AuthorizationPolicy scopes select destination
+        // workloads). Other per-pod paths keep source-pod filtering.
         //
         // Filtering is expressed as an iterator predicate so the hot path
         // never clones the full `MeshSlice` (which carries workloads,
@@ -1054,12 +1117,23 @@ impl Plugin for MeshAuthz {
                     headers: HashMap::new(),
                 };
             }
+            let destination_scopes = ctx
+                .matched_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.upstream_id.as_deref())
+                .and_then(|upstream_id| {
+                    self.destination_policy_scopes_by_upstream
+                        .get(upstream_id)
+                        .map(Vec::as_slice)
+                });
             let scope = ctx.node_waypoint_policy_scope.as_deref();
-            let policies = self
-                .slice
-                .mesh_policies
-                .iter()
-                .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+            let policies = self.slice.mesh_policies.iter().filter(|policy| {
+                if let Some(destination_scopes) = destination_scopes {
+                    policy_applies_to_any_scope(policy, destination_scopes.iter())
+                } else {
+                    Self::policy_applies_to_pod(policy, scope)
+                }
+            });
             evaluate_mesh_authorization_policies(policies, &request)
         } else {
             evaluate_mesh_authorization(&self.slice, &request)
