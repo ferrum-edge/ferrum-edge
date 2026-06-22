@@ -2580,10 +2580,8 @@ mod inner {
                                 .get_str("namespace")
                                 .map(str::to_string)
                                 .unwrap_or_else(|_| crate::config::types::default_namespace());
-                            let upstream_id_to_check: Option<String> = proxy_doc
-                                .get_str("upstream_id")
-                                .ok()
-                                .map(str::to_string);
+                            let upstream_id_to_check: Option<String> =
+                                proxy_doc.get_str("upstream_id").ok().map(str::to_string);
                             let proxy_scoped_plugin_ids_for_changes = this
                                 .load_collection_ids_filtered_in_session(
                                     &mut *s,
@@ -2599,14 +2597,13 @@ mod inner {
                                 .session(&mut *s)
                                 .await?
                                 .map(|doc| {
-                                    let sid = doc.get_str("_id").map(str::to_string).map_err(
-                                        |e| {
+                                    let sid =
+                                        doc.get_str("_id").map(str::to_string).map_err(|e| {
                                             mongodb::error::Error::custom(format!(
                                                 "api_spec for proxy {} is missing _id: {}",
                                                 id, e
                                             ))
-                                        },
-                                    )?;
+                                        })?;
                                     let namespace = doc
                                         .get_str("namespace")
                                         .map(str::to_string)
@@ -2637,9 +2634,7 @@ mod inner {
                                         },
                                     )
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
                                 } else {
                                     HashSet::new()
                                 };
@@ -2689,18 +2684,14 @@ mod inner {
                                             uid,
                                         )
                                         .await
-                                        .map_err(
-                                            |e| mongodb::error::Error::custom(e.to_string()),
-                                        )?
+                                        .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
                                     } else {
                                         None
                                     };
                                     if !still_referenced && dispatch_ref.is_none() {
                                         let upstream_delete = this
                                             .upstreams()
-                                            .delete_one(
-                                                mongodb::bson::doc! { "_id": uid.as_str() },
-                                            )
+                                            .delete_one(mongodb::bson::doc! { "_id": uid.as_str() })
                                             .session(&mut *s)
                                             .await?;
                                         if upstream_delete.deleted_count > 0 {
@@ -2733,9 +2724,7 @@ mod inner {
                                         "delete",
                                     )
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?;
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 }
                                 if let Some((_, namespace)) = spec_owner.as_ref() {
                                     for upstream_id in spec_upstream_ids_for_changes.iter() {
@@ -2747,13 +2736,12 @@ mod inner {
                                             "delete",
                                         )
                                         .await
-                                        .map_err(
-                                            |e| mongodb::error::Error::custom(e.to_string()),
-                                        )?;
+                                        .map_err(|e| {
+                                            mongodb::error::Error::custom(e.to_string())
+                                        })?;
                                     }
                                 }
-                                if let Some(upstream_id) = deleted_orphaned_upstream_id.as_ref()
-                                {
+                                if let Some(upstream_id) = deleted_orphaned_upstream_id.as_ref() {
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         proxy_namespace_for_changes.as_str(),
@@ -2762,13 +2750,9 @@ mod inner {
                                         "delete",
                                     )
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?;
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 }
-                                for (plugin_id, namespace) in
-                                    &orphaned_proxy_group_plugin_deletes
-                                {
+                                for (plugin_id, namespace) in &orphaned_proxy_group_plugin_deletes {
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         namespace,
@@ -2777,9 +2761,7 @@ mod inner {
                                         "delete",
                                     )
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?;
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 }
                             }
                             let spec_namespace_for_changes =
