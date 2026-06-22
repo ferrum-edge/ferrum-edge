@@ -181,6 +181,14 @@ impl NodeAgentConfig {
         // EPERM via this flag) rather than bypass `mesh_authz`. Excluded v6
         // (CIDR/port excludes) is decided before the deny and still flows.
         capture_contract.ipv6_outbound_deny = node_waypoint_in_netns;
+        if node_waypoint_in_netns
+            && !capture_config
+                .include_cidrs
+                .iter()
+                .any(|cidr| cidr_is_ipv6(cidr))
+        {
+            capture_config.include_cidrs.push("::/0".to_string());
+        }
         let node_waypoint_pod_registry_dir = if node_waypoint_in_netns {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
@@ -201,6 +209,15 @@ impl NodeAgentConfig {
             node_waypoint_pod_registry_dir,
         })
     }
+}
+
+fn cidr_is_ipv6(cidr: &str) -> bool {
+    let Some((addr, _prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    addr.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_ipv6())
+        .unwrap_or(false)
 }
 
 pub async fn run(
@@ -3201,6 +3218,14 @@ mod tests {
                 "the deny flag must reach the BPF capture config the connect6 hook reads"
             );
             assert!(
+                config
+                    .capture_config
+                    .include_cidrs
+                    .iter()
+                    .any(|cidr| cidr == "::/0"),
+                "NodeWaypoint must include IPv6 destinations so connect6 reaches the fail-closed deny"
+            );
+            assert!(
                 config.node_waypoint_pod_registry_dir.is_some(),
                 "in-netns registry is published in NodeWaypoint mode"
             );
@@ -3217,7 +3242,37 @@ mod tests {
                 !config.capture_contract.ipv6_outbound_deny,
                 "non-NodeWaypoint modes do not fail-close IPv6 egress"
             );
+            assert!(
+                !config
+                    .capture_config
+                    .include_cidrs
+                    .iter()
+                    .any(|cidr| cidr == "::/0"),
+                "non-NodeWaypoint modes preserve the normal IPv4-only default include"
+            );
         });
+    }
+
+    #[test]
+    fn from_env_config_preserves_explicit_ipv6_include_for_node_waypoint() {
+        let waypoint = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                ("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "10.0.0.0/8,fd00::/8"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&waypoint)
+                    .expect("node-agent config should parse");
+                assert_eq!(
+                    config.capture_config.include_cidrs,
+                    vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()]
+                );
+            },
+        );
     }
 
     #[test]

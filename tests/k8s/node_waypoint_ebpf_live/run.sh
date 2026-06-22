@@ -676,6 +676,90 @@ sys.exit(1)
 PY
 }
 
+summarize_orig_dst4_records_for_uid() {
+  local node="$1"
+  local uid="$2"
+  local expected_port="$3"
+  local evidence_file="$RESULTS_DIR/bpftool-$node.txt"
+  if [[ ! -f "$evidence_file" ]]; then
+    return 0
+  fi
+  python3 - "$evidence_file" "$uid" "$expected_port" <<'PY'
+import ipaddress
+import re
+import sys
+import uuid
+
+path, uid_text, expected_port_text = sys.argv[1:4]
+uid = uuid.UUID(uid_text).bytes
+expected_port = int(expected_port_text)
+records = []
+in_orig_dst4 = False
+pending_value = False
+hex_bytes = []
+
+def flush_value():
+    global hex_bytes
+    if len(hex_bytes) >= 32:
+        value = bytes(hex_bytes[:32])
+        if value[8:24] == uid:
+            records.append(
+                (
+                    str(ipaddress.IPv4Address(value[0:4])),
+                    int.from_bytes(value[4:8], "little"),
+                    int.from_bytes(value[24:32], "little"),
+                )
+            )
+    hex_bytes = []
+
+with open(path, encoding="utf-8", errors="replace") as fh:
+    for raw in fh:
+        line = raw.strip()
+        if line.startswith("## bpftool map dump pinned "):
+            if pending_value:
+                flush_value()
+                pending_value = False
+            in_orig_dst4 = line.endswith("/orig_dst4")
+            continue
+        if not in_orig_dst4:
+            continue
+        if line == "value:":
+            if pending_value:
+                flush_value()
+            pending_value = True
+            continue
+        if line == "key:" or line.startswith("Found ") or line.startswith("## "):
+            if pending_value:
+                flush_value()
+                pending_value = False
+            if line.startswith("## "):
+                in_orig_dst4 = False
+            continue
+        if pending_value:
+            hex_bytes.extend(int(token, 16) for token in re.findall(r"\b[0-9a-fA-F]{2}\b", line))
+    if pending_value:
+        flush_value()
+
+if not records:
+    print(f"orig_dst4 records for uid {uid_text}: none")
+    sys.exit(0)
+
+ports = sorted({port for _, port, _ in records})
+destinations = ", ".join(f"{addr}:{port}" for addr, port, _ in records[:12])
+suffix = "" if len(records) <= 12 else f", ... +{len(records) - 12} more"
+print(
+    f"orig_dst4 records for uid {uid_text}: count={len(records)} "
+    f"ports={ports} destinations=[{destinations}{suffix}]"
+)
+if expected_port not in ports:
+    print(
+        f"orig_dst4 records for uid {uid_text} did not include expected port "
+        f"{expected_port}; this means capture stamped records, but not the intended "
+        "Service destination port"
+    )
+PY
+}
+
 node_host_file_exists() {
   local node="$1"
   local path="$2"
@@ -758,7 +842,7 @@ dump_node_waypoint_runtime_state() {
                 fi
                 if command -v nsenter >/dev/null 2>&1; then
                   echo "  sockets:"
-                  nsenter -t "$pid" -n sh -c '
+                  nsenter -t "$pid" -n sh -c "
                     if command -v ss >/dev/null 2>&1; then
                       ss -ltnp 2>/dev/null || true
                       ss -tnp 2>/dev/null || true
@@ -766,9 +850,9 @@ dump_node_waypoint_runtime_state() {
                       netstat -tnlp 2>/dev/null || true
                       netstat -tn 2>/dev/null || true
                     else
-                      echo "ss/netstat unavailable"
+                      echo \"ss/netstat unavailable\"
                     fi
-                  ' 2>/dev/null | sed "s/^/    /" || true
+                  " 2>/dev/null | sed "s/^/    /" || true
                 fi
               done
             done
@@ -809,7 +893,7 @@ dump_node_waypoint_runtime_state() {
                   fi
                   if command -v nsenter >/dev/null 2>&1; then
                     echo "  sockets:"
-                    nsenter -t "$pid" -n sh -c '
+                    nsenter -t "$pid" -n sh -c "
                       if command -v ss >/dev/null 2>&1; then
                         ss -ltnp 2>/dev/null || true
                         ss -tnp 2>/dev/null || true
@@ -817,9 +901,9 @@ dump_node_waypoint_runtime_state() {
                         netstat -tnlp 2>/dev/null || true
                         netstat -tn 2>/dev/null || true
                       else
-                        echo "ss/netstat unavailable"
+                        echo \"ss/netstat unavailable\"
                       fi
-                    ' 2>/dev/null | sed "s/^/    /" || true
+                    " 2>/dev/null | sed "s/^/    /" || true
                   fi
                 done
               done
@@ -987,20 +1071,60 @@ pod_ipv6() {
 }
 
 svc_ipv6() {
-  kubectl -n "$WORKLOAD_NS" get svc "$1" -o jsonpath='{range .spec.clusterIPs[*]}{.}{"\n"}{end}' | grep ':' | head -n1 || true
+  kubectl -n "$WORKLOAD_NS" get svc "$1" -o go-template='{{range .spec.clusterIPs}}{{.}}{{"\n"}}{{end}}' | grep ':' | head -n1 || true
+}
+
+curl_family_from() {
+  local family="$1"
+  local deploy="$2"
+  local url="$3"
+  if [[ -n "$family" ]]; then
+    kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
+      sh -c 'curl "$1" -g -sS -m 8 -w "\n%{http_code}" "$2"' -- "$family" "$url"
+  else
+    kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
+      sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
+  fi
 }
 
 curl_from() {
   local deploy="$1"
   local url="$2"
-  kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
-    sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
+  curl_family_from "" "$deploy" "$url"
+}
+
+curl4_from() {
+  local deploy="$1"
+  local url="$2"
+  curl_family_from "-4" "$deploy" "$url"
+}
+
+curl6_from() {
+  local deploy="$1"
+  local url="$2"
+  curl_family_from "-6" "$deploy" "$url"
+}
+
+curl_for_family_from() {
+  local family="$1"
+  local deploy="$2"
+  local url="$3"
+  case "$family" in
+    4) curl4_from "$deploy" "$url" ;;
+    6) curl6_from "$deploy" "$url" ;;
+    "") curl_from "$deploy" "$url" ;;
+    *)
+      echo "unsupported curl address family '$family'" >&2
+      exit 1
+      ;;
+  esac
 }
 
 wait_for_node_waypoint_admission() {
   local from="$1"
   local label="$2"
   local url="$3"
+  local family="${4:-4}"
   local uid node pod identities_dir identities_file curl_out curl_err curl_status_file curl_status record
   record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r uid node pod <<<"$record"
@@ -1020,7 +1144,7 @@ wait_for_node_waypoint_admission() {
 
   for _ in $(seq 1 30); do
     set +e
-    curl_from "$from" "$url" >"$curl_out" 2>"$curl_err"
+    curl_for_family_from "$family" "$from" "$url" >"$curl_out" 2>"$curl_err"
     curl_status=$?
     set -e
     echo "$curl_status" >"$curl_status_file"
@@ -1048,6 +1172,7 @@ wait_for_node_waypoint_admission() {
     cat "$identities_file" >&2 || true
   fi
   collect_traffic_failure_diagnostics
+  summarize_orig_dst4_records_for_uid "$node" "$uid" 8080 >&2 || true
   exit 1
 }
 
@@ -1056,11 +1181,12 @@ expect_allowed() {
   local label="$2"
   local url="$3"
   local expected_body="$4"
+  local family="${5:-}"
   local output="" code="" body="" status=1 err
   err="$(mktemp)"
   for attempt in $(seq 1 8); do
     set +e
-    output="$(curl_from "$from" "$url" 2>"$err")"
+    output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
     status=$?
     set -e
     code="${output##*$'\n'}"
@@ -1092,10 +1218,11 @@ expect_blocked() {
   local from="$1"
   local label="$2"
   local url="$3"
+  local family="${4:-}"
   local output code err
   err="$(mktemp)"
   set +e
-  output="$(curl_from "$from" "$url" 2>"$err")"
+  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
   local status=$?
   set -e
   code="${output##*$'\n'}"
@@ -1115,17 +1242,17 @@ run_traffic_checks() {
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
 
-  wait_for_node_waypoint_admission src-a "src-a same-node Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
-  wait_for_node_waypoint_admission src-b "src-b same-node Service path" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
+  wait_for_node_waypoint_admission src-a "src-a same-node Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  wait_for_node_waypoint_admission src-b "src-b same-node Service path" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" 4
 
-  expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
-  expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b"
+  expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4
+  expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b" 4
 
-  expect_blocked src-b "same-node Service AuthorizationPolicy DENY" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/"
-  expect_blocked src-b "cross-node Service AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  expect_blocked src-b "same-node Service AuthorizationPolicy DENY" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  expect_blocked src-b "cross-node Service AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
 
-  expect_blocked src-b "same-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_b_ip:8080/"
-  expect_blocked src-b "cross-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_a_ip:8080/"
+  expect_blocked src-b "same-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_b_ip:8080/" 4
+  expect_blocked src-b "cross-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_a_ip:8080/" 4
 
   log "checking stale identity cleanup across source workload recreation"
   local old_src_a_uid old_src_a_node
@@ -1136,10 +1263,10 @@ run_traffic_checks() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
-  wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
-  wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
-  expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a"
-  expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4
+  expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
 }
 
 run_ipv6_checks() {
@@ -1161,8 +1288,8 @@ run_ipv6_checks() {
   # Current NodeWaypoint e2e IPv6 capture is intentionally rejected before
   # admission: connect6 fail-closes captured IPv6 until the in-netns listener
   # path is fully IPv6-capable. A 200 here would mean IPv6 bypassed capture.
-  expect_blocked src-a "IPv6 direct Pod IP fail-closed" "http://[$dst_a_v6]:8080/"
-  expect_blocked src-a "IPv6 Service ClusterIP fail-closed" "http://[$svc_a_v6]:8080/"
+  expect_blocked src-a "IPv6 direct Pod IP fail-closed" "http://[$dst_a_v6]:8080/" 6
+  expect_blocked src-a "IPv6 Service ClusterIP fail-closed" "http://[$svc_a_v6]:8080/" 6
 }
 
 cleanup() {
