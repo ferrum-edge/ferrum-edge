@@ -91,7 +91,10 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 |---|---|---|---|
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string. For MongoDB: `mongodb://` or `mongodb+srv://` |
-| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
+| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to a full runtime reload on error. SQL full reloads use transaction-scoped keyset pagination, and MongoDB replica-set full reloads use snapshot transactions; failed candidates keep the last known-good runtime config active. |
+| `FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS` | No | `1` | Database-mode initial retry backoff after a DB incremental delta is rejected by validation. The poller retries after this delay and does not advance the accepted cursor. CP mode uses `FERRUM_DB_POLL_INTERVAL`. |
+| `FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS` | No | `30` | Database-mode maximum retry backoff for the same rejected DB incremental delta. Values below the initial backoff are clamped up to the initial value. |
+| `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` | No | `3` | Database-mode number of identical rejected DB incremental deltas before attempting an authoritative primary-backed full reload while preserving the last known-good config if that snapshot fails or is rejected. |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use primary. MongoDB read preferences are ignored by Ferrum's config store |
@@ -102,7 +105,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 
 | Setting family | PostgreSQL | MySQL | SQLite | MongoDB |
 |---|---|---|---|---|
-| Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
+| Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, rejected-delta backoff fields, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
 | `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
 | `FERRUM_DB_READ_REPLICA_URL` | Yes, admin reads only | Yes, admin reads only | No | No; Ferrum forces primary reads |
 | `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | `disable` only as a no-op; cert paths rejected | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
@@ -125,6 +128,10 @@ matching `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE
 utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
 compatibility policy of folding schema changes into the V001 baseline rather
 than shipping incremental migrations.
+
+MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
+server or session default is weaker, Ferrum rejects the candidate full load and
+keeps the last known-good runtime config instead of publishing a mixed snapshot.
 
 ### Database TLS
 

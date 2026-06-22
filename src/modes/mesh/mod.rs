@@ -20,7 +20,7 @@ pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,10 +47,11 @@ use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_c
 use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshInboundTcpRoute,
-    MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting, MeshOutlierDetection,
+    MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting, MeshOutlierDetection, MeshPolicy,
     MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServiceTargetPort, resolve_target_port, service_entry_exported_to_namespace,
+    MeshTrafficPolicyTls, MtlsMode, PolicyAction, PolicyScope, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServiceTargetPort, resolve_target_port,
+    service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -905,8 +906,6 @@ fn prepare_normalized_gateway_config_for_mesh(
         ));
     }
 
-    reject_node_waypoint_udp_dtls_scoped_policies(runtime, mesh_slice)?;
-
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
@@ -918,6 +917,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
+    fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
@@ -1006,73 +1006,163 @@ fn prepare_normalized_gateway_config_for_mesh(
     Ok(config)
 }
 
-fn reject_node_waypoint_udp_dtls_scoped_policies(
+fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
+    config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
-    mesh_slice: &MeshSlice,
-) -> Result<(), anyhow::Error> {
+) {
     if runtime.topology != MeshTopology::NodeWaypoint {
-        return Ok(());
+        return;
     }
 
-    let udp_services: Vec<String> = mesh_slice
-        .services
-        .iter()
-        .filter_map(|service| {
-            let ports = service_udp_stream_ports(service);
-            if ports.is_empty() {
-                return None;
-            }
-            Some(format!(
-                "{}/{}:{}",
-                service.namespace,
-                service.name,
-                ports
-                    .iter()
-                    .map(|port| port.port.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ))
-        })
-        .collect();
-    if udp_services.is_empty() {
-        return Ok(());
-    }
-
-    let scoped_policies: Vec<String> = mesh_slice
-        .mesh_policies
-        .iter()
-        .filter(|policy| {
-            !matches!(policy.scope, PolicyScope::MeshWide) && mesh_policy_has_enforcing_rule(policy)
-        })
-        .map(scoped_policy_label)
-        .collect();
+    let scoped_policies = effective_node_waypoint_scoped_authz_policy_labels(config);
     if scoped_policies.is_empty() {
-        return Ok(());
+        return;
     }
 
-    Err(anyhow::anyhow!(
-        "NodeWaypoint UDP/DTLS per-pod authorization scoping is unsupported: UDP services [{}] \
-         are present while enforcing namespace/selector-scoped AuthorizationPolicies [{}] are \
-         configured. The node-agent identity path is TCP socket-cookie based, and a shared \
-         UDP/DTLS listener has no trustworthy per-source-pod socket cookie, cgroup, or pod UID \
-         for each datagram/session. Use Sidecar for UDP/DTLS workload-scoped authorization, keep \
-         NodeWaypoint UDP/DTLS policy MeshWide, or remove UDP/DTLS services from NodeWaypoint.",
-        capped_join(&udp_services, 8),
-        capped_join(&scoped_policies, 8),
-    ))
+    let udp_proxy_ids: HashSet<String> = config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_udp())
+        .map(|proxy| proxy.id.clone())
+        .collect();
+    let udp_proxies: Vec<String> = config
+        .proxies
+        .iter()
+        .filter(|proxy| udp_proxy_ids.contains(&proxy.id))
+        .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
+        .collect();
+    let udp_services = strip_node_waypoint_udp_dtls_mesh_service_ports(config.mesh.as_deref_mut());
+
+    let udp_upstreams: Vec<String> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream
+                .id
+                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        })
+        .map(|upstream| upstream.id.clone())
+        .collect();
+
+    if udp_proxy_ids.is_empty() && udp_services.is_empty() && udp_upstreams.is_empty() {
+        return;
+    }
+
+    if !udp_proxy_ids.is_empty() {
+        config
+            .proxies
+            .retain(|proxy| !udp_proxy_ids.contains(&proxy.id));
+        config.plugin_configs.retain(|plugin| {
+            plugin
+                .proxy_id
+                .as_deref()
+                .is_none_or(|proxy_id| !udp_proxy_ids.contains(proxy_id))
+        });
+    }
+    if !udp_upstreams.is_empty() {
+        config.upstreams.retain(|upstream| {
+            !upstream
+                .id
+                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        });
+    }
+
+    warn!(
+        topology = "node_waypoint",
+        udp_services = %capped_join(&udp_services, 8),
+        udp_proxies = %capped_join(&udp_proxies, 8),
+        udp_upstreams = %capped_join(&udp_upstreams, 8),
+        scoped_policies = %capped_join(&scoped_policies, 8),
+        "Disabling NodeWaypoint UDP/DTLS paths because enforcing namespace/selector-scoped \
+         AuthorizationPolicies require per-source-pod identity, but the NodeWaypoint UDP/DTLS \
+         path has no trustworthy per-datagram/session pod identity. The slice is still applied \
+         so scoped policy updates take effect for supported TCP/HTTP traffic; UDP/DTLS fails \
+         closed in this topology. Use Sidecar for workload-scoped UDP/DTLS authorization or \
+         keep NodeWaypoint UDP/DTLS policy MeshWide."
+    );
 }
 
-fn mesh_policy_has_enforcing_rule(policy: &crate::modes::mesh::config::MeshPolicy) -> bool {
-    policy.rules.iter().any(|rule| {
-        matches!(
-            rule.action,
-            crate::modes::mesh::config::PolicyAction::Allow
-                | crate::modes::mesh::config::PolicyAction::Deny
-        )
-    })
+fn effective_node_waypoint_scoped_authz_policy_labels(config: &GatewayConfig) -> Vec<String> {
+    let mut labels = Vec::new();
+    for plugin in config.plugin_configs.iter().filter(|plugin| {
+        plugin.enabled
+            && plugin.scope == PluginScope::Global
+            && plugin.plugin_name == "mesh_authz"
+            && plugin
+                .config
+                .get("per_pod_policy_scoping")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    }) {
+        labels.extend(
+            mesh_authz_config_policies(&plugin.config)
+                .into_iter()
+                .filter(|policy| {
+                    !matches!(policy.scope, PolicyScope::MeshWide)
+                        && mesh_policy_has_enforcing_rule(policy)
+                })
+                .map(|policy| scoped_policy_label(&policy)),
+        );
+    }
+    labels.sort();
+    labels.dedup();
+    labels
 }
 
-fn scoped_policy_label(policy: &crate::modes::mesh::config::MeshPolicy) -> String {
+fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
+    if let Some(value) = config.get("mesh_slice") {
+        return serde_json::from_value::<MeshSlice>(value.clone())
+            .map(|slice| slice.mesh_policies)
+            .unwrap_or_default();
+    }
+    if let Some(value) = config.get("mesh_policies") {
+        return serde_json::from_value::<Vec<MeshPolicy>>(value.clone()).unwrap_or_default();
+    }
+    Vec::new()
+}
+
+fn strip_node_waypoint_udp_dtls_mesh_service_ports(mesh: Option<&mut MeshConfig>) -> Vec<String> {
+    let Some(mesh) = mesh else {
+        return Vec::new();
+    };
+
+    let mut udp_services = Vec::new();
+    for service in &mut mesh.services {
+        let udp_ports: HashSet<u16> = service_udp_stream_ports(service)
+            .iter()
+            .map(|port| port.port)
+            .collect();
+        if udp_ports.is_empty() {
+            continue;
+        }
+        let mut rendered_ports = udp_ports
+            .iter()
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>();
+        rendered_ports.sort();
+        udp_services.push(format!(
+            "{}/{}:{}",
+            service.namespace,
+            service.name,
+            rendered_ports.join(",")
+        ));
+        service.ports.retain(|port| !udp_ports.contains(&port.port));
+        service
+            .protocol_overrides
+            .retain(|port, _| !udp_ports.contains(port));
+    }
+
+    udp_services
+}
+
+fn mesh_policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
+    policy
+        .rules
+        .iter()
+        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+}
+
+fn scoped_policy_label(policy: &MeshPolicy) -> String {
     let scope = match &policy.scope {
         PolicyScope::MeshWide => "mesh-wide",
         PolicyScope::Namespace { .. } => "namespace",
@@ -2296,8 +2386,11 @@ pub(crate) fn mesh_outbound_tcp_upstream_id(namespace: &str, name: &str, port: u
 /// the same port number across the three lanes (via `protocol_overrides` skew)
 /// can never conflate LB counters / passive health / DR fan-out. Same non-route
 /// prefix rationale (never enters the route table or `config.proxies`).
+pub(crate) const MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX: &str = "__mesh-out-udp-upstream-";
+
 pub(crate) fn mesh_outbound_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("__mesh-out-udp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-")
 }
 
 /// Upstream id for a raw-TCP egress upstream addressed by a DIRECT pod IP
@@ -4875,8 +4968,8 @@ fn apply_traffic_policy_to_port_override(
 /// destination-level `connectionPool` for that port; Ferrum instead does a
 /// per-field merge (top-level fan-out, then this additive per-port overlay).
 /// This is pre-existing and CONSISTENT across every `connectionPool` knob
-/// (`maxRequestsPerConnection` / `idleTimeout` / `http2MaxRequests` /
-/// `maxConnections` / `tcpKeepalive`), so unifying it to complete-replacement
+/// (`idleTimeout` / `http2MaxRequests` / `maxConnections` / `tcpKeepalive`),
+/// so unifying it to complete-replacement
 /// is a separate uniform follow-up (it would change existing
 /// idleTimeout/http2MaxRequests behavior + their tests). It is documented in
 /// `docs/mesh.md`.
@@ -4892,9 +4985,9 @@ fn apply_connection_pool_http_to_port_override(
     slot: &mut UpstreamPortOverride,
     http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
 ) {
-    if let Some(max) = http.max_requests_per_connection {
-        slot.http_max_requests_per_connection = Some(max);
-    }
+    // `maxRequestsPerConnection` is intentionally NOT projected. The parser
+    // validates and status-reports it as deferred because Ferrum does not have
+    // close-after-N-requests behavior for backend pools.
     if let Some(idle_ms) = http.idle_timeout_ms {
         slot.http_idle_timeout_ms = Some(idle_ms);
     }
@@ -12286,8 +12379,49 @@ mod tests {
         );
     }
 
+    fn gateway_config_with_mesh_services(slice: &MeshSlice) -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: slice.services.clone(),
+                mesh_policies: slice.mesh_policies.clone(),
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        }
+    }
+
+    fn global_mesh_authz_plugin(id: &str, config: serde_json::Value) -> PluginConfig {
+        PluginConfig {
+            id: id.to_string(),
+            plugin_name: "mesh_authz".to_string(),
+            namespace: "default".to_string(),
+            config,
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn scoped_node_waypoint_deny_policy() -> MeshPolicy {
+        MeshPolicy {
+            name: "team-a-deny".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "team-a".to_string(),
+            },
+            rules: vec![MeshRule {
+                action: PolicyAction::Deny,
+                ..MeshRule::default()
+            }],
+        }
+    }
+
     #[test]
-    fn node_waypoint_rejects_udp_service_with_scoped_enforcing_policy() {
+    fn node_waypoint_udp_scoped_policy_update_disables_udp_service_fail_closed() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
         svc.ports[0].protocol = AppProtocol::Udp;
@@ -12296,36 +12430,40 @@ mod tests {
             namespace: "default".to_string(),
             workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
             services: vec![svc],
-            mesh_policies: vec![MeshPolicy {
-                name: "team-a-deny".to_string(),
-                namespace: "default".to_string(),
-                scope: PolicyScope::Namespace {
-                    namespace: "team-a".to_string(),
-                },
-                rules: vec![MeshRule {
-                    action: PolicyAction::Deny,
-                    ..MeshRule::default()
-                }],
-            }],
+            mesh_policies: vec![scoped_node_waypoint_deny_policy()],
             ..MeshSlice::default()
         };
 
         let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
-        let err =
-            prepare_normalized_gateway_config_for_mesh(GatewayConfig::default(), &runtime, &slice)
-                .expect_err("NodeWaypoint UDP with scoped enforcing policy must be rejected");
-        let message = err.to_string();
+        let prepared = prepare_normalized_gateway_config_for_mesh(
+            gateway_config_with_mesh_services(&slice),
+            &runtime,
+            &slice,
+        )
+        .expect("NodeWaypoint scoped policy update must apply while UDP fails closed");
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        let dns = mesh
+            .services
+            .iter()
+            .find(|service| service.name == "dns")
+            .expect("service kept for non-UDP metadata");
         assert!(
-            message.contains("NodeWaypoint UDP/DTLS per-pod authorization scoping is unsupported"),
-            "unexpected error: {message}"
+            service_udp_stream_ports(dns).is_empty(),
+            "unsupported UDP service port must be stripped from NodeWaypoint mesh metadata"
         );
+        let mesh_authz = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .expect("managed mesh_authz still injected");
+        let mesh_slice: MeshSlice =
+            serde_json::from_value(mesh_authz.config["mesh_slice"].clone()).unwrap();
+        assert_eq!(mesh_slice.mesh_policies.len(), 1);
         assert!(
-            message.contains("default/dns:53"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("default/team-a-deny (namespace)"),
-            "unexpected error: {message}"
+            !prepared.upstreams.iter().any(|upstream| upstream
+                .id
+                .starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)),
+            "synthesized UDP upstreams must not survive fail-closed suppression"
         );
     }
 
@@ -12352,8 +12490,19 @@ mod tests {
         };
 
         let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
-        prepare_normalized_gateway_config_for_mesh(GatewayConfig::default(), &runtime, &slice)
-            .expect("MeshWide UDP policy stays supported on NodeWaypoint");
+        let prepared = prepare_normalized_gateway_config_for_mesh(
+            gateway_config_with_mesh_services(&slice),
+            &runtime,
+            &slice,
+        )
+        .expect("MeshWide UDP policy stays supported on NodeWaypoint");
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        let dns = mesh
+            .services
+            .iter()
+            .find(|service| service.name == "dns")
+            .expect("service retained");
+        assert_eq!(service_udp_stream_ports(dns).len(), 1);
     }
 
     #[test]
@@ -12384,8 +12533,127 @@ mod tests {
         };
 
         let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
-        prepare_normalized_gateway_config_for_mesh(GatewayConfig::default(), &runtime, &slice)
-            .expect("audit-only scoped policy must not reject NodeWaypoint UDP");
+        let prepared = prepare_normalized_gateway_config_for_mesh(
+            gateway_config_with_mesh_services(&slice),
+            &runtime,
+            &slice,
+        )
+        .expect("audit-only scoped policy must not reject NodeWaypoint UDP");
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        let dns = mesh
+            .services
+            .iter()
+            .find(|service| service.name == "dns")
+            .expect("service retained");
+        assert_eq!(service_udp_stream_ports(dns).len(), 1);
+    }
+
+    #[test]
+    fn node_waypoint_udp_scoped_policy_disables_operator_udp_proxy() {
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            mesh_policies: vec![scoped_node_waypoint_deny_policy()],
+            ..MeshSlice::default()
+        };
+        let mut udp_proxy =
+            mesh_outbound_udp_relay_proxy("default", "operator-dns", 53, "operator-upstream");
+        udp_proxy.id = "operator-udp".to_string();
+        udp_proxy.name = Some("operator udp".to_string());
+        let proxy_plugin = PluginConfig {
+            id: "operator-udp-plugin".to_string(),
+            plugin_name: "udp_logging".to_string(),
+            namespace: "default".to_string(),
+            config: serde_json::json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("operator-udp".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let config = GatewayConfig {
+            proxies: vec![udp_proxy],
+            plugin_configs: vec![proxy_plugin],
+            ..GatewayConfig::default()
+        };
+
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let prepared = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+            .expect("scoped NodeWaypoint policy update must apply");
+
+        assert!(
+            !prepared
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id == "operator-udp"),
+            "operator-defined UDP/DTLS proxy must be disabled under scoped NodeWaypoint authz"
+        );
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.proxy_id.as_deref() != Some("operator-udp")),
+            "proxy-scoped plugin config must not dangle after disabling UDP proxy"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_udp_scoped_operator_authz_override_disables_udp_service() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let operator_authz = global_mesh_authz_plugin(
+            "operator-mesh-authz",
+            serde_json::json!({
+                "per_pod_policy_scoping": true,
+                "mesh_policies": [scoped_node_waypoint_deny_policy()],
+            }),
+        );
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: slice.services.clone(),
+                ..MeshConfig::default()
+            })),
+            plugin_configs: vec![operator_authz],
+            ..GatewayConfig::default()
+        };
+
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let prepared = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+            .expect("operator mesh_authz override must apply while UDP fails closed");
+
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "operator-mesh-authz"),
+            "operator authz override must be preserved"
+        );
+        assert!(
+            !prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID),
+            "managed mesh_authz should not be injected over operator override"
+        );
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        let dns = mesh
+            .services
+            .iter()
+            .find(|service| service.name == "dns")
+            .expect("service kept for non-UDP metadata");
+        assert!(
+            service_udp_stream_ports(dns).is_empty(),
+            "operator authz override with per-pod scoping must disable UDP service path"
+        );
     }
 
     #[test]
@@ -12414,8 +12682,19 @@ mod tests {
 
         let runtime = test_mesh_runtime_config();
         assert_eq!(runtime.topology, MeshTopology::Sidecar);
-        prepare_normalized_gateway_config_for_mesh(GatewayConfig::default(), &runtime, &slice)
-            .expect("Sidecar UDP keeps workload-scoped authorization support");
+        let prepared = prepare_normalized_gateway_config_for_mesh(
+            gateway_config_with_mesh_services(&slice),
+            &runtime,
+            &slice,
+        )
+        .expect("Sidecar UDP keeps workload-scoped authorization support");
+        let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
+        let dns = mesh
+            .services
+            .iter()
+            .find(|service| service.name == "dns")
+            .expect("service retained");
+        assert_eq!(service_udp_stream_ports(dns).len(), 1);
     }
 
     #[test]

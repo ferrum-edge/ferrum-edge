@@ -65,11 +65,13 @@ need them, or because they are blocked upstream / architecturally:
   the v6 socket-cookie read; dual-stack **sidecar** serves IPv6 fully.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
-  services are rejected at slice apply. Mesh-wide UDP/DTLS policy stays
-  supported, and Sidecar remains the supported topology for workload-scoped
-  UDP/DTLS authorization.
-- **DR `connectionPool.http.maxRequestsPerConnection`** — wire-projected but inert
-  at runtime, blocked on hyper (no close-after-N knob); use `http2MaxRequests`.
+  services or proxies force the NodeWaypoint UDP/DTLS path closed during config
+  preparation while the policy update still applies to supported TCP/HTTP
+  traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
+  supported topology for workload-scoped UDP/DTLS authorization.
+- **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
+  but **Deferred** in status; backend close-after-N-requests is unsupported, so
+  it is not projected as effective policy. Use `http2MaxRequests`.
   (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
   on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.

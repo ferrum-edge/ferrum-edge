@@ -9,9 +9,11 @@
 //! 2. **Deletion detection**: Lightweight `SELECT id` queries on all 4 tables, diffed
 //!    against the poller's known ID sets to find removed rows.
 //!
-//! On startup, a full `SELECT *` seeds the initial config and known ID sets.
-//! If an incremental poll fails for any reason, the loop falls back to a full
-//! reload and re-seeds. Known ID sets are only updated after successful apply.
+//! On startup, a transaction-scoped full load seeds the initial config and known
+//! ID sets. Full loads use deterministic keyset pagination (`id > last_id`) so
+//! mutable tables cannot shift under `OFFSET`. If an incremental poll fails for
+//! any reason, the loop falls back to a full reload and re-seeds. Known ID sets
+//! are only updated after successful apply.
 //!
 //! **Key implementation details**:
 //! - Postgres `?` → `$N` placeholder rewrite via `q()` method (sqlx `Any` uses `?`)
@@ -939,10 +941,11 @@ impl DatabaseStore {
         Ok(())
     }
 
-    async fn load_proxy_plugin_associations_for_namespace(
+    async fn load_proxy_plugin_associations_for_namespace_tx(
         &self,
         namespace: &str,
         operation: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<ProxyPluginAssociations, anyhow::Error> {
         let sql = self.q("SELECT pp.proxy_id, pp.plugin_config_id \
              FROM proxy_plugins pp \
@@ -950,7 +953,7 @@ impl DatabaseStore {
              WHERE p.namespace = ?");
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
-            .fetch_all(&self.pool())
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| {
                 Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
@@ -1169,10 +1172,14 @@ impl DatabaseStore {
         // Capture timestamp before queries so the incremental polling safety
         // margin covers the full load duration.
         let loaded_at = Utc::now();
-        let proxies = self.load_proxies(namespace).await?;
-        let consumers = self.load_consumers(namespace).await?;
-        let plugin_configs = self.load_plugin_configs(namespace).await?;
-        let upstreams = self.load_upstreams(namespace).await?;
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        let proxies = self.load_proxies_tx(namespace, &mut tx).await?;
+        let consumers = self.load_consumers_tx(namespace, &mut tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, &mut tx).await?;
+        let upstreams = self.load_upstreams_tx(namespace, &mut tx).await?;
+        tx.commit().await?;
 
         let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -1235,7 +1242,71 @@ impl DatabaseStore {
         Ok(config)
     }
 
-    async fn load_proxies(&self, namespace: &str) -> Result<Vec<Proxy>, anyhow::Error> {
+    async fn configure_full_load_snapshot(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        match self.db_type.as_str() {
+            "postgres" => {
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            "mysql" => {
+                let isolation = Self::mysql_transaction_isolation(tx).await?;
+                if !Self::is_mysql_repeatable_read(&isolation) {
+                    return Err(anyhow::anyhow!(
+                        "MySQL full-load transactions require REPEATABLE READ isolation; current transaction isolation is '{}'. Configure the MySQL server or Ferrum session default to REPEATABLE READ so full runtime loads fail closed instead of publishing mixed snapshots.",
+                        isolation
+                    ));
+                }
+            }
+            "sqlite" => {
+                // SQLite read transactions observe one database snapshot from
+                // the first read.
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn mysql_transaction_isolation(
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<String, anyhow::Error> {
+        match sqlx::query_scalar::<_, String>("SELECT @@transaction_isolation")
+            .fetch_one(&mut **tx)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(primary_error) => {
+                sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "failed to read MySQL transaction isolation: {}; fallback @@tx_isolation failed: {}",
+                            primary_error,
+                            fallback_error
+                        )
+                    })
+            }
+        }
+    }
+
+    fn is_mysql_repeatable_read(isolation: &str) -> bool {
+        isolation
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-' && *ch != '_')
+            .flat_map(char::to_uppercase)
+            .collect::<String>()
+            == "REPEATABLEREAD"
+    }
+
+    async fn load_proxies_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
         // Batch-load proxy_plugins for proxies in this namespace (eliminates N+1).
@@ -1243,32 +1314,39 @@ impl DatabaseStore {
         // query or decode error rejects the whole candidate instead of
         // publishing proxies with silently empty plugin lists.
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_namespace(namespace, "load_full_config")
+            .load_proxy_plugin_associations_for_namespace_tx(namespace, "load_full_config", tx)
             .await?;
 
         // Load proxies in chunks to avoid unbounded SELECT * at scale.
         let mut proxies = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-            )
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.pool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM proxies WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
                 let id: String = row.try_get("id")?;
                 let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-                proxies.push(row_to_proxy(&row, id, plugins)?);
+                let proxy = row_to_proxy(&row, id.clone(), plugins)?;
+                proxies.push(proxy);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
         Self::ensure_no_unmatched_proxy_plugin_associations("load_full_config", &plugins_by_proxy)?;
 
@@ -1276,59 +1354,78 @@ impl DatabaseStore {
         Ok(proxies)
     }
 
-    async fn load_consumers(&self, namespace: &str) -> Result<Vec<Consumer>, anyhow::Error> {
+    async fn load_consumers_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let mut consumers = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-            )
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.pool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM consumers WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
+                let id: String = row.try_get("id")?;
                 consumers.push(row_to_consumer(&row)?);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_consumers", start);
         Ok(consumers)
     }
 
-    async fn load_plugin_configs(
+    async fn load_plugin_configs_tx(
         &self,
         namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
         let mut configs = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(&self.q(
-                "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?",
-            ))
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.pool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM plugin_configs WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
+                let id: String = row.try_get("id")?;
                 configs.push(row_to_plugin_config(&row)?);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_plugin_configs", start);
@@ -2140,28 +2237,39 @@ impl DatabaseStore {
 
     // ---- Upstream CRUD ----
 
-    async fn load_upstreams(&self, namespace: &str) -> Result<Vec<Upstream>, anyhow::Error> {
+    async fn load_upstreams_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let mut upstreams = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-            )
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.pool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM upstreams WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
+                let id: String = row.try_get("id")?;
                 upstreams.push(row_to_upstream(&row)?);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_upstreams", start);

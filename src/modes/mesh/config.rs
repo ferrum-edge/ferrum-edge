@@ -1765,15 +1765,17 @@ pub struct MeshTrafficPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
-    /// When present, the K8s translator has parsed at least one of the
-    /// supported HTTP connection-pool knobs (`maxRequestsPerConnection`,
-    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`,
-    /// `http1MaxPendingRequests`); the mesh apply layer projects these onto
-    /// the matching upstream's `port_overrides[port]` slot (top-level fan-out
-    /// applies to every target port; per-port `portLevelSettings` overrides
-    /// per-port). Old DPs reading new slices see this as a no-op via the
-    /// serde default. There are no longer any deferred `connectionPool.http`
-    /// knobs at top-level/`portLevelSettings` scope.
+    /// When present, the K8s translator has parsed at least one supported HTTP
+    /// connection-pool knob (`idleTimeout`, `http2MaxRequests`,
+    /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`); the mesh
+    /// apply layer projects these onto the matching upstream's
+    /// `port_overrides[port]` slot (top-level fan-out applies to every target
+    /// port; per-port `portLevelSettings` overrides per-port). Old DPs reading
+    /// new slices see this as a no-op via the serde default.
+    ///
+    /// `maxRequestsPerConnection` may still deserialize for carrier/backward
+    /// compatibility, but new K8s translation warns, reports it as deferred, and
+    /// does not populate this overlay field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_pool_http: Option<MeshConnectionPoolHttp>,
 }
@@ -1786,12 +1788,10 @@ pub struct MeshTrafficPolicy {
 /// resolved slots and dispatch wiring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshConnectionPoolHttp {
-    /// Mapped from `maxRequestsPerConnection`. Wire-projected end-to-end
-    /// (admitted, persisted on slice, and reaches dispatch via
-    /// `Proxy.pool_max_requests_per_connection`) but hyper does not yet
-    /// expose a close-after-N-requests builder knob, so the runtime
-    /// effect is pending. Tracked as a follow-on; documented same as the
-    /// proxy-level field.
+    /// Deprecated carrier for `maxRequestsPerConnection`. New K8s translation
+    /// validates and warns on the field, reports it as deferred, and does not
+    /// populate this slot because Ferrum has no backend close-after-N-requests
+    /// behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_requests_per_connection: Option<u32>,
     /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
