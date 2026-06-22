@@ -11,7 +11,7 @@ matrix is emitted by the conformance suite to `target/conformance/coverage.md`
 
 | Tier | Meaning | Enforcement |
 |---|---|---|
-| **GA** (≙ `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive.** Listed in the conformance `GA_CONTRACT` and tagged `Maturity::Ga`; a regression to anything but `Supported` fails CI (`tests/conformance/`). Full GA additionally requires the live-datapath e2e gate (`mesh-e2e-sidecar`, in build-out). |
+| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a regression to anything but `Supported` fails CI (`tests/conformance/`). Full GA additionally requires the live-datapath e2e gate (`mesh-e2e-sidecar`, in build-out). |
 | **Beta** | Feature-complete and tested, with a documented sharp edge or an owed verification step. | Observational — may be `Deferred` without failing CI. |
 | **Experimental** | Usable with a safety-relevant caveat (plaintext, partial enforcement) or live-datapath-unverified. Opt-in; not recommended without compensating controls. | Observational. |
 | **Dev-only** | Gated behind a build feature or dev opt-in; not in the default published image. | Observational. |
@@ -23,10 +23,11 @@ feature could be silently downgraded. Now a GA feature that regresses breaks its
 own test. See `tests/conformance/ga_scope.rs` for the gate.
 
 The GA contract is **seeded and grows incrementally** — a feature is enrolled
-only once we are prepared to fail CI on its regression. So the contract does not
-yet enroll every row the maturity tables label *Stable*; `coverage.md` lists the
-currently enrolled (machine-gated) set, which is the authoritative answer to
-"what regression fails CI today."
+only once we are prepared to fail CI on its regression. The source of truth is
+`tests/conformance/ga_contract.yaml`. So the contract does not yet enroll every
+row the maturity tables label *Stable*; `coverage.md` lists the currently
+enrolled semantic rows and required live assertion IDs, which are the
+authoritative answer to "what regression fails CI today."
 
 ## Current headline state
 
@@ -89,6 +90,7 @@ need them, or because they are blocked upstream / architecturally:
 ## How a feature graduates
 
 1. Semantics pinned by a `tests/conformance/` test → eligible for `Beta`.
-2. Promoted to `Maturity::Ga` + added to `GA_CONTRACT` once we will fail CI on
-   its regression (translation/semantic contract).
+2. Promoted to `Maturity::Ga` + added to `tests/conformance/ga_contract.yaml`
+   once we will fail CI on its semantic regression and have named the required
+   live datapath assertions.
 3. Covered by a live-datapath e2e job (`mesh-e2e-*`) → full GA / "Stable".
