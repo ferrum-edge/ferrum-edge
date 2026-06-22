@@ -1175,22 +1175,46 @@ fn node_waypoint_dns_slice_for_prepared_config(
         return None;
     }
     let mesh = config.mesh.as_deref()?;
+    let dns_suppressed_services = base_slice
+        .services
+        .iter()
+        .filter(|service| !service_udp_stream_ports(service).is_empty())
+        .map(|service| (service.namespace.as_str(), service.name.as_str()))
+        .collect::<HashSet<_>>();
     // DNS is rebuilt from a MeshSlice, while UDP fail-closed suppression mutates
-    // the prepared GatewayConfig. Mirror the accepted service view here so a
-    // UDP-only service stripped from routing is not still advertised by DNS.
+    // the prepared GatewayConfig. Hide every service that declared a UDP port:
+    // mesh DNS is service-name scoped, not port scoped, so a mixed TCP+UDP
+    // service would otherwise keep resolving for UDP clients after UDP routing
+    // was stripped.
     let services = mesh
         .services
         .iter()
-        .filter(|service| !service.ports.is_empty())
+        .filter(|service| {
+            !dns_suppressed_services.contains(&(service.namespace.as_str(), service.name.as_str()))
+        })
         .cloned()
         .collect::<Vec<_>>();
-    if services == base_slice.services {
+    let service_entries = mesh
+        .service_entries
+        .iter()
+        .filter(|entry| !service_entry_has_udp_port(entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    if services == base_slice.services && service_entries == base_slice.service_entries {
         return None;
     }
 
     let mut dns_slice = base_slice.clone();
     dns_slice.services = services;
+    dns_slice.service_entries = service_entries;
     Some(dns_slice)
+}
+
+fn service_entry_has_udp_port(entry: &ServiceEntry) -> bool {
+    entry
+        .ports
+        .iter()
+        .any(|port| is_udp_mesh_protocol(port.protocol))
 }
 
 fn mesh_policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
@@ -12605,8 +12629,59 @@ mod tests {
             .expect("mixed service should use sanitized service list for DNS");
         let dns_table = dns_proxy::DnsResolutionTable::from_mesh_slice(&dns_slice);
         assert!(
-            dns_table.resolve("dns.default.svc.cluster.local").is_some(),
-            "service with a supported TCP port must remain DNS-visible"
+            dns_table.resolve("dns.default.svc.cluster.local").is_none(),
+            "service that declared UDP must not remain DNS-visible even when TCP routing survives"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_udp_scoped_policy_removes_udp_service_entry_from_dns_slice() {
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            service_entries: vec![ServiceEntry {
+                name: "external-dns".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["dns.external.test".to_string()],
+                endpoints: vec![MeshEndpoint {
+                    address: "10.0.0.20".to_string(),
+                    ports: HashMap::new(),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 53,
+                    protocol: AppProtocol::Udp,
+                    name: Some("dns-udp".to_string()),
+                    target_port: None,
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            }],
+            mesh_policies: vec![scoped_node_waypoint_deny_policy()],
+            ..MeshSlice::default()
+        };
+
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        let prepared =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice prepares");
+        let dns_slice = node_waypoint_dns_slice_for_prepared_config(&runtime, &slice, &prepared)
+            .expect("UDP ServiceEntry must be suppressed from DNS-visible slice");
+
+        assert!(
+            dns_slice.service_entries.is_empty(),
+            "UDP ServiceEntry should not remain DNS-visible after NodeWaypoint fail-closed suppression"
+        );
+        let original_dns = dns_proxy::DnsResolutionTable::from_mesh_slice(&slice);
+        assert!(
+            original_dns.resolve("dns.external.test").is_some(),
+            "sanity check: original slice would publish the ServiceEntry host"
+        );
+        let suppressed_dns = dns_proxy::DnsResolutionTable::from_mesh_slice(&dns_slice);
+        assert!(
+            suppressed_dns.resolve("dns.external.test").is_none(),
+            "sanitized DNS slice must not publish UDP ServiceEntry hosts under scoped authz"
         );
     }
 
