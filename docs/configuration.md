@@ -113,6 +113,64 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
 
+#### Runtime Config Lifecycle Invariants
+
+File, database, and DP modes apply runtime configuration through explicit
+`Applied`, `Unchanged`, or `Rejected` outcomes. `Applied` swaps the new config
+and rebuilds the derived caches. `Unchanged` confirms the source is still valid
+without churning caches. `Rejected` keeps the last known-good runtime config and
+does not commit database poll bookkeeping. CP mode validates database poll
+candidates before storing and broadcasting them, but it does not use those
+`ProxyState` apply outcomes on every broadcast path.
+
+Database-mode polling commits the accepted `config_changes.sequence` cursor only
+after an `Applied` or `Unchanged` candidate. Full reload candidates follow the
+same rule: a rejected full snapshot cannot poison the later incremental cursor.
+SQL runtime polling always uses the primary pool; `FERRUM_DB_READ_REPLICA_URL`
+is only for eligible admin reads. MongoDB config reads force primary read
+preference, and standalone MongoDB polling intentionally uses full reloads
+instead of accepting non-transactional incremental cursors.
+
+Full-load guarantees are backend-specific but fail closed. PostgreSQL uses a
+repeatable-read, read-only transaction; MySQL requires repeatable-read
+transaction isolation; SQLite reads through one transaction snapshot; MongoDB
+replica sets use snapshot transactions. If a query, decode, relationship, or
+runtime validation step fails, the whole candidate is rejected and the previous
+config keeps serving.
+
+Normal incremental polling is durable-change-log based. SQL and MongoDB
+replica-set pollers read ordered `config_changes` rows/documents after the
+accepted cursor, collapse each resource to the final operation in the batch, and
+point-load only those changed IDs. Delete records carry removals, so normal
+incremental polling does not scan every runtime collection or table ID.
+Retained-history gaps and saturated change batches force the same authoritative
+full-reload path.
+
+Repeated rejected database deltas use bounded backoff and low-cardinality
+metrics. After `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` identical
+rejections, database mode attempts an authoritative full reload and keeps the
+last known-good config if that reload fails or is also rejected. The public
+health and metrics surfaces report degraded database polling without exposing
+resource IDs or validation strings as unbounded labels.
+
+Listener readiness and supervision are part of the same fail-closed lifecycle.
+File and database modes report startup ready only after configured HTTP, HTTPS,
+HTTP/3, and stream listeners have bound or been adopted. Supervised HTTP-family
+and admin listener task failures trigger sibling shutdown instead of leaving a
+partially serving process. Stream listener bind/startup failures are fatal in
+file/database modes; after startup, stream listener exits are handled by stream
+listener reconciliation and retry rather than by shutting down sibling listeners
+or the process.
+In-process file-mode callers that pass pre-bound listeners reserve those actual
+ports for stream-listener conflict validation; env-config ports are used only
+when no listener is pre-bound.
+
+TLS source ownership is explicit. Database TLS live reload reconnects the active
+SQL primary pool or MongoDB client, plus SQL admin-read replicas when present.
+MongoDB driver paths that require filesystem PEMs receive owner-scoped temporary
+files with restrictive permissions; those files remain only while the connection
+bundle that may need them is alive.
+
 #### MySQL minimum version
 
 MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit

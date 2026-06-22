@@ -205,9 +205,41 @@ async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn incremental_poll_does_not_scan_rows_without_change_records() {
+async fn incremental_poll_does_not_scan_runtime_rows_without_change_records() {
     let (store, _temp_dir) = sqlite_store().await;
     let ts = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO proxies \
+         (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, created_at, updated_at) \
+         VALUES ('raw-proxy', 'ferrum', 'raw proxy', '[]', '/raw-proxy', 'http', '127.0.0.1', 8080, ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("raw proxy insert must succeed");
+
+    sqlx::query(
+        "INSERT INTO consumers (id, namespace, username, credentials, created_at, updated_at) \
+         VALUES ('raw-consumer', 'ferrum', 'raw-consumer', '{}', ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("raw consumer insert must succeed");
+
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, enabled, created_at, updated_at) \
+         VALUES ('raw-plugin', 'ferrum', 'stdout_logging', '{}', 1, ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("raw plugin insert must succeed");
 
     sqlx::query(
         "INSERT INTO upstreams \
@@ -226,9 +258,47 @@ async fn incremental_poll_does_not_scan_rows_without_change_records() {
         .expect("incremental poll must succeed");
     assert!(
         result.is_empty(),
-        "raw resource rows without config_changes records must not be discovered by incremental polling"
+        "raw runtime rows without config_changes records must not be discovered by incremental polling"
     );
     assert_eq!(result.sequence_cursor, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_delete_records_drive_removals_without_resource_row_scans() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO config_changes \
+         (sequence, namespace, resource_type, resource_id, operation, created_at) \
+         VALUES \
+             (1, 'ferrum', 'proxy', 'deleted-proxy', 'delete', ?), \
+             (2, 'ferrum', 'consumer', 'deleted-consumer', 'delete', ?), \
+             (3, 'ferrum', 'plugin_config', 'deleted-plugin', 'delete', ?), \
+             (4, 'ferrum', 'upstream', 'deleted-upstream', 'delete', ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("manual config_changes delete inserts must succeed");
+
+    let result = store
+        .load_incremental_config("ferrum", 0)
+        .await
+        .expect("delete-only incremental poll must succeed");
+
+    assert_eq!(result.sequence_cursor, 4);
+    assert_eq!(result.removed_proxy_ids, vec!["deleted-proxy"]);
+    assert_eq!(result.removed_consumer_ids, vec!["deleted-consumer"]);
+    assert_eq!(result.removed_plugin_config_ids, vec!["deleted-plugin"]);
+    assert_eq!(result.removed_upstream_ids, vec!["deleted-upstream"]);
+    assert!(result.added_or_modified_proxies.is_empty());
+    assert!(result.added_or_modified_consumers.is_empty());
+    assert!(result.added_or_modified_plugin_configs.is_empty());
+    assert!(result.added_or_modified_upstreams.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
