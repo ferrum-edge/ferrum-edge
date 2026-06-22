@@ -6,6 +6,8 @@ set -euo pipefail
 FERRUM_SPIRE_NAMESPACE="${FERRUM_SPIRE_NAMESPACE:-spire-system}"
 FERRUM_SPIRE_SERVER_IMAGE="${FERRUM_SPIRE_SERVER_IMAGE:-ghcr.io/spiffe/spire-server:1.12.4}"
 FERRUM_SPIRE_AGENT_IMAGE="${FERRUM_SPIRE_AGENT_IMAGE:-ghcr.io/spiffe/spire-agent:1.12.4}"
+FERRUM_SPIRE_SERVER_HEALTH_PORT="${FERRUM_SPIRE_SERVER_HEALTH_PORT:-8080}"
+FERRUM_SPIRE_AGENT_HEALTH_PORT="${FERRUM_SPIRE_AGENT_HEALTH_PORT:-8082}"
 
 ferrum_spire_require_tools() {
   command -v kubectl >/dev/null 2>&1 || {
@@ -120,6 +122,13 @@ data:
         }
       }
     }
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "$FERRUM_SPIRE_SERVER_HEALTH_PORT"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -134,6 +143,8 @@ data:
       server_port = "8081"
       socket_path = "/run/spire/sockets/agent.sock"
       trust_domain = "$trust_domain"
+      # Test-only minimal install: trust the server during first bootstrap.
+      insecure_bootstrap = true
     }
     plugins {
       NodeAttestor "k8s_psat" {
@@ -151,6 +162,13 @@ data:
           node_name_env = "MY_NODE_NAME"
         }
       }
+    }
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "$FERRUM_SPIRE_AGENT_HEALTH_PORT"
+      live_path = "/live"
+      ready_path = "/ready"
     }
 ---
 apiVersion: v1
@@ -187,6 +205,22 @@ spec:
           args: ["-config", "/run/spire/config/server.conf"]
           ports:
             - containerPort: 8081
+            - containerPort: $FERRUM_SPIRE_SERVER_HEALTH_PORT
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
           volumeMounts:
             - name: config
               mountPath: /run/spire/config
@@ -220,11 +254,28 @@ spec:
         - name: spire-agent
           image: "$FERRUM_SPIRE_AGENT_IMAGE"
           args: ["-config", "/run/spire/config/agent.conf"]
+          ports:
+            - containerPort: $FERRUM_SPIRE_AGENT_HEALTH_PORT
+              name: health
           env:
             - name: MY_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
           volumeMounts:
             - name: config
               mountPath: /run/spire/config
