@@ -3140,26 +3140,29 @@ mod inner {
                 let mut session = connection.client.start_session().await?;
                 let deleted = session
                     .start_transaction()
-                    .and_run((self, id.to_string(), namespace.clone()), |s, (this, id, namespace)| {
-                        Box::pin(async move {
-                            let result = this
-                                .consumers()
-                                .delete_one(doc! { "_id": id.as_str() })
-                                .session(&mut *s)
-                                .await?;
-                            if result.deleted_count > 0 {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "consumer",
-                                    id.as_str(),
-                                    "delete",
-                                )
-                                .await?;
-                            }
-                            Ok(result.deleted_count > 0)
-                        })
-                    })
+                    .and_run(
+                        (self, id.to_string(), namespace.clone()),
+                        |s, (this, id, namespace)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .consumers()
+                                    .delete_one(doc! { "_id": id.as_str() })
+                                    .session(&mut *s)
+                                    .await?;
+                                if result.deleted_count > 0 {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        "consumer",
+                                        id.as_str(),
+                                        "delete",
+                                    )
+                                    .await?;
+                                }
+                                Ok(result.deleted_count > 0)
+                            })
+                        },
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("delete_consumer transaction failed: {}", e))?;
                 if deleted {
@@ -3713,26 +3716,29 @@ mod inner {
                 let mut session = connection.client.start_session().await?;
                 let deleted = session
                     .start_transaction()
-                    .and_run((self, id.to_string(), namespace.clone()), |s, (this, id, namespace)| {
-                        Box::pin(async move {
-                            let result = this
-                                .upstreams()
-                                .delete_one(doc! { "_id": id.as_str() })
-                                .session(&mut *s)
-                                .await?;
-                            if result.deleted_count > 0 {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "upstream",
-                                    id.as_str(),
-                                    "delete",
-                                )
-                                .await?;
-                            }
-                            Ok(result.deleted_count > 0)
-                        })
-                    })
+                    .and_run(
+                        (self, id.to_string(), namespace.clone()),
+                        |s, (this, id, namespace)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .upstreams()
+                                    .delete_one(doc! { "_id": id.as_str() })
+                                    .session(&mut *s)
+                                    .await?;
+                                if result.deleted_count > 0 {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        "upstream",
+                                        id.as_str(),
+                                        "delete",
+                                    )
+                                    .await?;
+                                }
+                                Ok(result.deleted_count > 0)
+                            })
+                        },
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("delete_upstream transaction failed: {}", e))?;
                 if deleted {
@@ -3800,10 +3806,9 @@ mod inner {
                                         .session(&mut *s)
                                         .await?;
                                     if result.deleted_count > 0 {
-                                        let namespace = upstream_namespace
-                                            .unwrap_or_else(
-                                                crate::config::types::default_namespace,
-                                            );
+                                        let namespace = upstream_namespace.unwrap_or_else(
+                                            crate::config::types::default_namespace,
+                                        );
                                         this.record_config_change_in_session(
                                             &mut *s,
                                             namespace.as_str(),
@@ -5278,9 +5283,7 @@ mod inner {
                                 let orphaned = this
                                     .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?;
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 for change in upsert_changes.iter() {
                                     let (namespace, resource_type, resource_id) = change;
                                     this.record_config_change_in_session(
@@ -5662,9 +5665,7 @@ mod inner {
                                 let orphaned = this
                                     .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?;
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
 
                                 for change in upsert_changes.iter() {
                                     let (namespace, resource_type, resource_id) = change;
@@ -6336,9 +6337,7 @@ mod inner {
                                 let orphaned = this
                                     .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
-                                    .map_err(|e| {
-                                        mongodb::error::Error::custom(e.to_string())
-                                    })?;
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 this.upstreams()
                                     .delete_many(doc! {
                                         "api_spec_id": id.as_str(),
