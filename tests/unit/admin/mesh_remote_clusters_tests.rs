@@ -914,6 +914,39 @@ fn configured_trust_reports_polled_bundle_freshness() {
         None,
         Some("https://remote.test/.well-known/spiffe"),
     )]);
+    let trust_bundles = trust_bundles_with_federated(vec![]);
+    let federation = federation_snapshot_for("remote-east", "remote.local", 900);
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        federation: &federation,
+        trust_bundles: Some(&trust_bundles),
+        discovery_enabled: false,
+        federation_poll_enabled: true,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: true,
+        now_unix_seconds: 1_000,
+    });
+
+    let configured = &resp.configured[0];
+    assert!(configured.outbound_trust_active);
+    assert!(configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "polled");
+    assert_eq!(configured.trust_bundle_fetched_at_unix_seconds, Some(900));
+    assert_eq!(configured.trust_bundle_age_seconds, Some(100));
+}
+
+#[test]
+fn configured_trust_does_not_report_unpublished_polled_bundle_active() {
+    let snapshot = RemoteEndpointSnapshot::default();
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        None,
+        None,
+        Some("https://remote.test/.well-known/spiffe"),
+    )]);
     let federation = federation_snapshot_for("remote-east", "remote.local", 900);
 
     let resp = build_response(MeshRemoteClustersInputs {
@@ -929,11 +962,11 @@ fn configured_trust_reports_polled_bundle_freshness() {
     });
 
     let configured = &resp.configured[0];
-    assert!(configured.outbound_trust_active);
-    assert!(configured.inbound_trust_active);
-    assert_eq!(configured.trust_source, "polled");
-    assert_eq!(configured.trust_bundle_fetched_at_unix_seconds, Some(900));
-    assert_eq!(configured.trust_bundle_age_seconds, Some(100));
+    assert!(!configured.outbound_trust_active);
+    assert!(!configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "none");
+    assert_eq!(configured.trust_bundle_fetched_at_unix_seconds, None);
+    assert_eq!(configured.trust_bundle_age_seconds, None);
 }
 
 #[test]

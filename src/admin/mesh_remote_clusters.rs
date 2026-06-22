@@ -197,12 +197,36 @@ fn endpoint_configured(remote: &RemoteCluster) -> bool {
         .is_some_and(|url| !url.trim().is_empty())
 }
 
+fn trust_bundle_set_contains_remote_domain(
+    bundles: &TrustBundleSet,
+    remote: &RemoteCluster,
+) -> bool {
+    bundles.local.trust_domain == remote.trust_domain
+        || bundles
+            .federated
+            .iter()
+            .any(|bundle| bundle.trust_domain == remote.trust_domain)
+}
+
 fn remote_trust_status(
     remote: &RemoteCluster,
     inputs: &MeshRemoteClustersInputs<'_>,
     federation_endpoint_configured: bool,
+    effective_trust_bundles: Option<&TrustBundleSet>,
 ) -> RemoteTrustStatus {
+    let effective_bundle_present = effective_trust_bundles
+        .is_some_and(|bundles| trust_bundle_set_contains_remote_domain(bundles, remote));
+
     if let Some(bundle) = inputs.federation.bundles.get(&remote.trust_domain) {
+        if !effective_bundle_present {
+            return RemoteTrustStatus {
+                outbound_trust_active: false,
+                inbound_trust_active: false,
+                trust_source: TRUST_SOURCE_NONE,
+                fetched_at_unix_seconds: None,
+                age_seconds: None,
+            };
+        }
         let fetched_at = bundle.fetched_at_unix_seconds;
         return RemoteTrustStatus {
             outbound_trust_active: true,
@@ -213,13 +237,9 @@ fn remote_trust_status(
         };
     }
 
-    let cp_bundle_present = inputs.trust_bundles.is_some_and(|bundles| {
-        bundles.local.trust_domain == remote.trust_domain
-            || bundles
-                .federated
-                .iter()
-                .any(|bundle| bundle.trust_domain == remote.trust_domain)
-    });
+    let cp_bundle_present = inputs
+        .trust_bundles
+        .is_some_and(|bundles| trust_bundle_set_contains_remote_domain(bundles, remote));
 
     if !cp_bundle_present {
         return RemoteTrustStatus {
@@ -244,7 +264,7 @@ fn remote_trust_status(
     } else {
         TRUST_SOURCE_CONTROL_PLANE
     };
-    let active = source != TRUST_SOURCE_BLOCKED_PENDING_POLL;
+    let active = source != TRUST_SOURCE_BLOCKED_PENDING_POLL && effective_bundle_present;
 
     RemoteTrustStatus {
         outbound_trust_active: active,
@@ -334,6 +354,14 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
     // Configured view: one entry per declared remote cluster. `discovered`
     // flag cross-references the scoped discovered set so operators see at a
     // glance which configured clusters are actually returning endpoints.
+    let effective_trust_bundles =
+        crate::modes::mesh::federation::merge_federation_into_trust_bundles(
+            inputs.trust_bundles.cloned(),
+            inputs.federation,
+            inputs.multi_cluster,
+            inputs.federation_fail_open,
+            inputs.federation_poll_enabled,
+        );
     let configured: Vec<ConfiguredRemoteCluster> = inputs
         .multi_cluster
         .map(|mc| {
@@ -342,8 +370,12 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
                 .iter()
                 .map(|remote| {
                     let federation_endpoint_configured = endpoint_configured(remote);
-                    let trust_status =
-                        remote_trust_status(remote, &inputs, federation_endpoint_configured);
+                    let trust_status = remote_trust_status(
+                        remote,
+                        &inputs,
+                        federation_endpoint_configured,
+                        effective_trust_bundles.as_ref(),
+                    );
                     ConfiguredRemoteCluster {
                         cluster_name: remote.name.clone(),
                         trust_domain: remote.trust_domain.as_str().to_string(),
