@@ -574,7 +574,13 @@ impl DatabaseStore {
             .execute(&mut **tx)
             .await?;
 
-        if self.db_type != "sqlite" {
+        if self.db_type == "sqlite" {
+            sqlx::query("UPDATE config_change_locks SET updated_at = ? WHERE lock_name = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+                .execute(&mut **tx)
+                .await?;
+        } else {
             let lock_sql =
                 self.q("SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE");
             sqlx::query(&lock_sql)
@@ -3780,14 +3786,23 @@ impl DatabaseStore {
         table: &'static str,
         namespace: &str,
         extra_predicate: Option<(&'static str, &str)>,
+        lock_rows: bool,
     ) -> Result<Vec<String>, anyhow::Error> {
+        let lock_clause = if lock_rows && self.db_type != "sqlite" {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
         let sql = if let Some((column, _)) = extra_predicate {
             self.q(&format!(
-                "SELECT id FROM {} WHERE namespace = ? AND {} = ?",
-                table, column
+                "SELECT id FROM {} WHERE namespace = ? AND {} = ?{}",
+                table, column, lock_clause
             ))
         } else {
-            self.q(&format!("SELECT id FROM {} WHERE namespace = ?", table))
+            self.q(&format!(
+                "SELECT id FROM {} WHERE namespace = ?{}",
+                table, lock_clause
+            ))
         };
         let mut query = sqlx::query(&sql).bind(namespace);
         if let Some((_, value)) = extra_predicate {
@@ -3797,6 +3812,20 @@ impl DatabaseStore {
         rows.iter()
             .map(|row| row.try_get("id").map_err(anyhow::Error::from))
             .collect()
+    }
+
+    async fn use_delete_capture_snapshot_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        // PostgreSQL defaults to READ COMMITTED, where a namespace-wide DELETE
+        // can see rows committed after the pre-scan used for change logging.
+        if self.db_type == "postgres" {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn record_config_change_tx(
@@ -4452,17 +4481,18 @@ impl DatabaseStore {
     pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         let proxy_ids = self
-            .select_resource_ids_tx(&mut tx, "proxies", namespace, None)
+            .select_resource_ids_tx(&mut tx, "proxies", namespace, None, true)
             .await?;
         let plugin_config_ids = self
-            .select_resource_ids_tx(&mut tx, "plugin_configs", namespace, None)
+            .select_resource_ids_tx(&mut tx, "plugin_configs", namespace, None, true)
             .await?;
         let consumer_ids = self
-            .select_resource_ids_tx(&mut tx, "consumers", namespace, None)
+            .select_resource_ids_tx(&mut tx, "consumers", namespace, None, true)
             .await?;
         let upstream_ids = self
-            .select_resource_ids_tx(&mut tx, "upstreams", namespace, None)
+            .select_resource_ids_tx(&mut tx, "upstreams", namespace, None, true)
             .await?;
 
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id IN (SELECT id FROM proxies WHERE namespace = ?)"))
@@ -5240,6 +5270,7 @@ impl DatabaseStore {
                 "plugin_configs",
                 &spec.namespace,
                 Some(("api_spec_id", &spec.id)),
+                false,
             )
             .await?;
         let deleted_upstream_ids = self
@@ -5248,6 +5279,7 @@ impl DatabaseStore {
                 "upstreams",
                 &spec.namespace,
                 Some(("api_spec_id", &spec.id)),
+                false,
             )
             .await?;
 
@@ -6049,6 +6081,7 @@ impl DatabaseStore {
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.
         let row: Option<AnyRow> =
@@ -6065,6 +6098,17 @@ impl DatabaseStore {
 
         let proxy_id: String = row.try_get("proxy_id")?;
 
+        let proxy_lock_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ? FOR UPDATE")
+        };
+        sqlx::query(&proxy_lock_sql)
+            .bind(&proxy_id)
+            .bind(namespace)
+            .fetch_optional(&mut *tx)
+            .await?;
+
         self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, id, &proxy_id)
             .await?;
         let mut deleted_plugin_config_ids = self
@@ -6073,15 +6117,19 @@ impl DatabaseStore {
                 "plugin_configs",
                 namespace,
                 Some(("api_spec_id", id)),
+                true,
             )
             .await?;
-        let proxy_plugin_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT id FROM plugin_configs WHERE proxy_id = ? AND namespace = ?"),
-        )
-        .bind(&proxy_id)
-        .bind(namespace)
-        .fetch_all(&mut *tx)
-        .await?;
+        let proxy_plugin_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM plugin_configs WHERE proxy_id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM plugin_configs WHERE proxy_id = ? AND namespace = ? FOR UPDATE")
+        };
+        let proxy_plugin_rows: Vec<AnyRow> = sqlx::query(&proxy_plugin_sql)
+            .bind(&proxy_id)
+            .bind(namespace)
+            .fetch_all(&mut *tx)
+            .await?;
         for row in proxy_plugin_rows {
             let plugin_id: String = row.try_get("id")?;
             if !deleted_plugin_config_ids.contains(&plugin_id) {
@@ -6089,7 +6137,13 @@ impl DatabaseStore {
             }
         }
         let deleted_upstream_ids = self
-            .select_resource_ids_tx(&mut tx, "upstreams", namespace, Some(("api_spec_id", id)))
+            .select_resource_ids_tx(
+                &mut tx,
+                "upstreams",
+                namespace,
+                Some(("api_spec_id", id)),
+                true,
+            )
             .await?;
 
         // Delete spec-owned plugin_configs by api_spec_id (belt-and-suspenders;
