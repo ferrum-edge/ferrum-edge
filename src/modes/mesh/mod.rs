@@ -7155,6 +7155,9 @@ async fn serve_mesh_runtime(
             hostnames.push((target.host.clone(), None, None));
         }
     }
+    let initial_dns_slice = initial_applied_mesh_slice.as_ref().and_then(|slice| {
+        node_waypoint_dns_slice_for_prepared_config(&runtime, slice.as_ref(), &config)
+    });
 
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
@@ -7461,7 +7464,7 @@ async fn serve_mesh_runtime(
         ));
         // Build initial resolution table from the applied slice
         if let Some(ref slice) = initial_applied_mesh_slice {
-            dns_proxy.update_from_slice(slice);
+            dns_proxy.update_from_slice(initial_dns_slice.as_ref().unwrap_or(slice.as_ref()));
         }
         let dns_sockets = dns_proxy.bind().await.with_context(|| {
             format!(
