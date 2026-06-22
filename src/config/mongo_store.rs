@@ -5289,7 +5289,7 @@ mod inner {
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         namespace.as_str(),
-                                        *resource_type,
+                                        resource_type,
                                         resource_id.as_str(),
                                         "upsert",
                                     )
@@ -5672,7 +5672,7 @@ mod inner {
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         namespace.as_str(),
-                                        *resource_type,
+                                        resource_type,
                                         resource_id.as_str(),
                                         "upsert",
                                     )
