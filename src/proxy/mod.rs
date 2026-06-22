@@ -96,7 +96,7 @@ use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
 use crate::modes::mesh::node_waypoint::{
-    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
+    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
@@ -10512,8 +10512,13 @@ async fn run_accept_loop(
                                     Ok(resolved) => {
                                         node_waypoint_orig_dst = resolved.orig_dst;
                                         if let Some(cookie_error) = resolved.cookie_error.as_ref() {
-                                            debug!(
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            info!(
                                                 remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
                                                 error = %cookie_error,
                                                 "Admitting node-waypoint in-netns connection by listener pod UID after cookie lookup miss"
                                             );
@@ -10528,15 +10533,25 @@ async fn run_accept_loop(
                                         if let Some(cookie_error) =
                                             drop_reason.cookie_error.as_ref()
                                         {
-                                            debug!(
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            warn!(
                                                 remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
                                                 cookie_error = %cookie_error,
                                                 error = %drop_reason.error,
                                                 "Dropping node-waypoint connection without a resolved pod identity"
                                             );
                                         } else {
-                                            debug!(
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            warn!(
                                                 remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
                                                 error = %drop_reason.error,
                                                 "Dropping node-waypoint connection without a resolved pod identity"
                                             );

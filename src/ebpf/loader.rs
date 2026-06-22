@@ -538,10 +538,12 @@ fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), Stri
 #[cfg(test)]
 mod live_kernel_tests {
     use super::AyaEbpfBackend;
-    use crate::ebpf::EbpfBackend;
     use crate::ebpf::kernel_probe::probe_kernel;
-    use ferrum_ebpf_common::WorkloadIdentity;
+    use crate::ebpf::{BPF_ORIG_DST4_PIN_PATH, EbpfBackend};
+    use aya::maps::{HashMap as BpfHashMap, Map, MapData};
+    use ferrum_ebpf_common::{OrigDst4, OrigDstKey, WorkloadIdentity};
     use std::fs;
+    use std::net::Ipv4Addr;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
@@ -578,6 +580,16 @@ mod live_kernel_tests {
             // cgroup v2 dirs are removed with rmdir once empty.
             let _ = fs::remove_dir(&self.path);
         }
+    }
+
+    fn read_orig_dst4_records() -> Result<Vec<(OrigDstKey, OrigDst4)>, String> {
+        let data = MapData::from_pin(BPF_ORIG_DST4_PIN_PATH)
+            .map_err(|e| format!("open pinned orig_dst4 map: {e}"))?;
+        let map = BpfHashMap::<MapData, OrigDstKey, OrigDst4>::try_from(Map::LruHashMap(data))
+            .map_err(|e| format!("orig_dst4 pin type mismatch: {e}"))?;
+        map.iter()
+            .map(|entry| entry.map_err(|e| format!("iterate orig_dst4 map: {e}")))
+            .collect()
     }
 
     #[test]
@@ -741,19 +753,34 @@ mod live_kernel_tests {
         // Connect to an unroutable TEST-NET-1 address (RFC 5737). Uncaptured
         // this would time out; captured, connect4 rewrites it to
         // 127.0.0.1:capture_port and it lands on `server`.
-        let connect_handle = std::thread::spawn(move || {
-            std::net::TcpStream::connect_timeout(
-                &"192.0.2.1:1234".parse().unwrap(),
-                Duration::from_secs(3),
-            )
-            .is_ok()
-        });
+        let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let connect_handle =
+            std::thread::spawn(move || {
+                match std::net::TcpStream::connect_timeout(
+                    &"192.0.2.1:1234".parse().unwrap(),
+                    Duration::from_secs(3),
+                ) {
+                    Ok(stream) => {
+                        let _ = connected_tx.send(true);
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                        drop(stream);
+                        true
+                    }
+                    Err(_) => {
+                        let _ = connected_tx.send(false);
+                        false
+                    }
+                }
+            });
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut accepted = false;
+        let mut accepted_stream = None;
         while Instant::now() < deadline {
             match server.accept() {
-                Ok(_) => {
+                Ok((stream, _)) => {
+                    accepted_stream = Some(stream);
                     accepted = true;
                     break;
                 }
@@ -763,11 +790,29 @@ mod live_kernel_tests {
                 Err(e) => panic!("capture-port server accept failed: {e}"),
             }
         }
-        let connected = connect_handle.join().unwrap_or(false);
+        let connected = connected_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(false);
+        let orig_dst4_records = if connected && accepted {
+            read_orig_dst4_records().expect("read orig-dst4 records while captured socket is open")
+        } else {
+            Vec::new()
+        };
+        let expected_orig_ip = Ipv4Addr::new(192, 0, 2, 1);
+        let matching_orig_dst4 = orig_dst4_records.iter().find(|(_, record)| {
+            Ipv4Addr::from(record.addr.to_ne_bytes()) == expected_orig_ip
+                && record.port == 1234
+                && record.pod_uid == [9u8; 16]
+                && record.workload_spiffe_hash == 0x0123_4567_89ab_cdef
+        });
 
         // Capture diagnostics while still in the scratch cgroup (before moving
         // back) so a genuine failure shows the capture port + cgroup membership.
         let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+
+        let _ = release_tx.send(());
+        drop(accepted_stream);
+        let thread_connected = connect_handle.join().unwrap_or(false);
 
         // Move back to the cgroup root so the scratch cgroup can be removed, and
         // clean up BPF state — before asserting, so a failed assert still tidies.
@@ -775,9 +820,17 @@ mod live_kernel_tests {
         backend.cleanup_all().expect("cleanup BPF state");
 
         assert!(
-            connected && accepted,
+            connected && thread_connected && accepted,
             "a captured connect() to an unroutable dst must be redirected by connect4 to the local \
              capture port and accepted (connected={connected}, accepted={accepted}, \
+             capture_port={capture_port}, self_cgroup={self_cgroup:?})"
+        );
+        assert!(
+            matching_orig_dst4.is_some(),
+            "connect4 must stamp the original IPv4 destination and source identity into \
+             FERRUM_ORIG_DST4 while the captured socket is alive \
+             (expected_ip={expected_orig_ip}, expected_port=1234, expected_pod_uid=09090909..., \
+             expected_hash=0x0123456789abcdef, records={orig_dst4_records:?}, \
              capture_port={capture_port}, self_cgroup={self_cgroup:?})"
         );
     }

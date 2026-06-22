@@ -434,6 +434,7 @@ collect_traffic_failure_diagnostics() {
   collect_bpf_evidence || true
   for node in "$NODE_A" "$NODE_B"; do
     dump_node_waypoint_registry "$node"
+    dump_node_waypoint_runtime_state "$node"
   done
 }
 
@@ -755,6 +756,20 @@ dump_node_waypoint_runtime_state() {
                 else
                   echo "  missing $net_dir"
                 fi
+                if command -v nsenter >/dev/null 2>&1; then
+                  echo "  sockets:"
+                  nsenter -t "$pid" -n sh -c '
+                    if command -v ss >/dev/null 2>&1; then
+                      ss -ltnp 2>/dev/null || true
+                      ss -tnp 2>/dev/null || true
+                    elif command -v netstat >/dev/null 2>&1; then
+                      netstat -tnlp 2>/dev/null || true
+                      netstat -tn 2>/dev/null || true
+                    else
+                      echo "ss/netstat unavailable"
+                    fi
+                  ' 2>/dev/null | sed "s/^/    /" || true
+                fi
               done
             done
         done
@@ -791,6 +806,20 @@ dump_node_waypoint_runtime_state() {
                     done
                   else
                     echo "  missing $net_dir"
+                  fi
+                  if command -v nsenter >/dev/null 2>&1; then
+                    echo "  sockets:"
+                    nsenter -t "$pid" -n sh -c '
+                      if command -v ss >/dev/null 2>&1; then
+                        ss -ltnp 2>/dev/null || true
+                        ss -tnp 2>/dev/null || true
+                      elif command -v netstat >/dev/null 2>&1; then
+                        netstat -tnlp 2>/dev/null || true
+                        netstat -tn 2>/dev/null || true
+                      else
+                        echo "ss/netstat unavailable"
+                      fi
+                    ' 2>/dev/null | sed "s/^/    /" || true
                   fi
                 done
               done
@@ -864,10 +893,11 @@ with open(sys.argv[1], encoding="utf-8") as fh:
 expected_namespace = sys.argv[2]
 slice_view = data.get("slice") or {}
 resources = slice_view.get("resources") or {}
-# MeshSubscribe slices are node-local; each ambient proxy must see its local
-# source/destination workloads plus the policy objects published by the CP.
+# This scenario needs both source-only identity workloads and both destination
+# workloads in every ambient proxy slice; a lower count can pass readiness but
+# fail the NodeWaypoint listener-UID identity fallback later.
 expected = {
-    "workloads": 2,
+    "workloads": 4,
     "services": 2,
     "mesh_policies": 1,
     "peer_authentications": 1,
@@ -971,7 +1001,7 @@ wait_for_node_waypoint_admission() {
   local from="$1"
   local label="$2"
   local url="$3"
-  local uid node pod identities_dir identities_file err record
+  local uid node pod identities_dir identities_file curl_out curl_err curl_status_file curl_status record
   record="$(workload_pod_record_for_app "$from")"
   IFS=$'\t' read -r uid node pod <<<"$record"
   if [[ -z "${uid:-}" || -z "${node:-}" || -z "${pod:-}" ]]; then
@@ -984,13 +1014,16 @@ wait_for_node_waypoint_admission() {
   identities_dir="$RESULTS_DIR/ambient-node-waypoint-admission"
   mkdir -p "$identities_dir"
   identities_file="$identities_dir/$from-$uid.json"
+  curl_out="$identities_dir/$from-$uid.curl.out"
+  curl_err="$identities_dir/$from-$uid.curl.err"
+  curl_status_file="$identities_dir/$from-$uid.curl.status"
 
   for _ in $(seq 1 30); do
-    err="$(mktemp)"
     set +e
-    curl_from "$from" "$url" >/dev/null 2>"$err"
+    curl_from "$from" "$url" >"$curl_out" 2>"$curl_err"
+    curl_status=$?
     set -e
-    rm -f "$err"
+    echo "$curl_status" >"$curl_status_file"
 
     if fetch_node_waypoint_identities_for_node "$node" "$identities_file" &&
       node_waypoint_identities_include_uid "$identities_file" "$uid"; then
@@ -1000,6 +1033,17 @@ wait_for_node_waypoint_admission() {
   done
 
   echo "NodeWaypoint did not admit $label traffic from $pod ($uid) on $node to $url" >&2
+  if [[ -f "$curl_status_file" ]]; then
+    echo "last curl status: $(cat "$curl_status_file")" >&2 || true
+  fi
+  if [[ -s "$curl_out" ]]; then
+    echo "--- last curl stdout" >&2
+    cat "$curl_out" >&2 || true
+  fi
+  if [[ -s "$curl_err" ]]; then
+    echo "--- last curl stderr" >&2
+    cat "$curl_err" >&2 || true
+  fi
   if [[ -f "$identities_file" ]]; then
     cat "$identities_file" >&2 || true
   fi
