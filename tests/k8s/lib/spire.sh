@@ -39,6 +39,9 @@ kind: ClusterRole
 metadata:
   name: ferrum-spire-server-tokenreviewer
 rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get"]
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
@@ -64,6 +67,9 @@ rules:
   - apiGroups: [""]
     resources: ["nodes", "pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -133,6 +139,7 @@ data:
       NodeAttestor "k8s_psat" {
         plugin_data {
           cluster = "$trust_domain"
+          token_path = "/var/run/secrets/tokens/spire-agent"
         }
       }
       KeyManager "memory" {
@@ -140,7 +147,8 @@ data:
       }
       WorkloadAttestor "k8s" {
         plugin_data {
-          kubelet_read_only_port = 10255
+          skip_kubelet_verification = true
+          node_name_env = "MY_NODE_NAME"
         }
       }
     }
@@ -212,11 +220,20 @@ spec:
         - name: spire-agent
           image: "$FERRUM_SPIRE_AGENT_IMAGE"
           args: ["-config", "/run/spire/config/agent.conf"]
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: config
               mountPath: /run/spire/config
+              readOnly: true
             - name: sockets
               mountPath: /run/spire/sockets
+            - name: spire-agent-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -225,6 +242,13 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        - name: spire-agent-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  expirationSeconds: 3600
+                  audience: spire-server
 YAML
 }
 
