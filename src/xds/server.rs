@@ -2417,6 +2417,7 @@ mod tests {
             removed_plugin_config_ids: Vec::new(),
             added_or_modified_upstreams: Vec::new(),
             removed_upstream_ids: Vec::new(),
+            sequence_cursor: 0,
             poll_timestamp: Utc
                 .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
                 .unwrap(),

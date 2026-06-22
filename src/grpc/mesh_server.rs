@@ -718,6 +718,7 @@ mod tests {
             removed_plugin_config_ids: Vec::new(),
             added_or_modified_upstreams: Vec::new(),
             removed_upstream_ids: vec!["stale-upstream".to_string()],
+            sequence_cursor: 0,
             poll_timestamp,
         };
         let slice_request = MeshSliceRequest::from_native(

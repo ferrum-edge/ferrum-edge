@@ -1337,7 +1337,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     );
                                 }
                             }
-                            ConfigApplyOutcome::Rejected { .. } => {
+                            ConfigApplyOutcome::Rejected { errors } => {
                                 if apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
@@ -1367,8 +1367,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         removed_consumers = ?removed_consumer_ids,
                                         added_plugin_configs = ?added_plugin_config_ids,
                                         removed_plugin_configs = ?removed_plugin_config_ids,
-                                        "DP rejected CP-pushed delta — divergence possible until next full snapshot. \
-                                         See preceding 'Incremental config rejected' log lines for the underlying reason."
+                                        validation_errors = ?errors,
+                                        "DP rejected CP-pushed delta — divergence possible until next full snapshot"
                                     );
                                 }
                             }
@@ -1921,6 +1921,7 @@ mod tests {
                 upstream_in_namespace("u-staging", "staging"),
             ],
             removed_upstream_ids: vec![],
+            sequence_cursor: 0,
             poll_timestamp: Utc::now(),
         };
 
@@ -1950,6 +1951,7 @@ mod tests {
             removed_plugin_config_ids: vec![],
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
+            sequence_cursor: 0,
             poll_timestamp: Utc::now(),
         };
         assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 0);

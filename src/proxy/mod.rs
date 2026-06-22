@@ -67,7 +67,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -2703,6 +2703,13 @@ pub struct ProxyState {
     pub add_forwarded_header: bool,
     /// Environment config for backend TLS settings (WebSocket, etc.)
     pub env_config: Arc<crate::config::EnvConfig>,
+    /// Gateway-owned listener ports used for stream proxy conflict validation.
+    ///
+    /// Most modes derive this from [`EnvConfig::reserved_gateway_ports`]. File
+    /// mode can adopt pre-bound listeners whose live ports differ from
+    /// `EnvConfig`; storing the effective startup set here keeps later reload
+    /// validation aligned with the sockets the process actually owns.
+    pub reserved_gateway_ports: Arc<HashSet<u16>>,
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -2791,6 +2798,12 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Whether the current mesh inbound TLS posture is actually terminating
+    /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
+    /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
+    /// gateway SVID slot and stays false for plaintext or passthrough
+    /// topologies.
+    pub mesh_inbound_spiffe_verifier_active: Arc<AtomicBool>,
     /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement for stream-
     /// family egress (TCP / UDP / TCP+TLS / UDP+DTLS). `Some` only when
     /// (a) the gateway runs in mesh mode, (b) the resolved policy is
@@ -3876,13 +3889,40 @@ impl ProxyState {
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
-        Self::new_with_bpf_metrics(
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
             config,
             dns_cache,
             env_config,
             tls_policy,
             health_check_shutdown_rx,
             None,
+            reserved_gateway_ports,
+        )
+    }
+
+    /// Constructor variant that accepts the effective gateway-owned listener
+    /// ports for stream proxy conflict validation.
+    ///
+    /// File mode uses this when adopting pre-bound listeners so initial
+    /// validation, SIGHUP reloads, and programmatic `update_config` calls all
+    /// use the same actual socket set instead of recalculating from `EnvConfig`.
+    pub fn new_with_reserved_gateway_ports(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        reserved_gateway_ports: HashSet<u16>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            None,
+            reserved_gateway_ports,
         )
     }
 
@@ -3896,12 +3936,33 @@ impl ProxyState {
     /// metrics state at startup. Keeping the parameter optional avoids
     /// forcing every other entry point to plumb a placeholder.
     pub fn new_with_bpf_metrics(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            bpf_metrics_state,
+            reserved_gateway_ports,
+        )
+    }
+
+    fn new_with_bpf_metrics_and_reserved_gateway_ports(
         mut config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+        reserved_gateway_ports: HashSet<u16>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
             for msg in &errors {
@@ -3995,6 +4056,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
@@ -4341,6 +4403,7 @@ impl ProxyState {
             )),
             early_data_methods: Arc::new(env_config_arc.tls_early_data_methods.clone()),
             env_config: env_config_arc,
+            reserved_gateway_ports: Arc::new(reserved_gateway_ports),
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_header_count,
@@ -4379,6 +4442,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
             backend_svid_generation,
@@ -5626,8 +5690,9 @@ impl ProxyState {
         // Stream proxy port conflicts — reject in non-DP modes, warn in DP
         // mode. The DP doesn't control its config and one bad stream proxy
         // port shouldn't block all other config updates pushed by the CP.
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errs) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        if let Err(errs) =
+            config.validate_stream_proxy_port_conflicts(self.reserved_gateway_ports.as_ref())
+        {
             if matches!(
                 self.env_config.mode,
                 crate::config::env_config::OperatingMode::DataPlane
@@ -6611,9 +6676,6 @@ impl ProxyState {
             &self.env_config.namespace,
         );
         if let Err(errors) = self.validate_full_config(&new_config) {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
             return ConfigApplyOutcome::rejected(errors);
         }
 
@@ -6647,10 +6709,6 @@ impl ProxyState {
             Ok(None) => return ConfigApplyOutcome::Unchanged,
             Err(e) => {
                 let message = format!("security plugin validation failed: {e}");
-                error!(
-                    "Incremental config rejected — security plugin validation failed: {}",
-                    e
-                );
                 return ConfigApplyOutcome::rejected_one(message);
             }
         };
@@ -16602,17 +16660,10 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
     });
 
-    // Per-port `maxRequestsPerConnection` is wire-projected end-to-end onto
-    // `Proxy.pool_max_requests_per_connection`. Hyper does not yet expose a
-    // close-after-N-requests builder knob, so the runtime effect remains
-    // pending (same status as the proxy-level field's existing docstring) —
-    // wiring the per-port projection here means the field will light up the
-    // moment a request-count wrapper is introduced. The proxy field is
-    // `Option<u64>`; widen the `u32` override to match the schema.
-    let max_reqs_override = override_config
-        .http_max_requests_per_connection
-        .map(u64::from)
-        .filter(|new| Some(*new) != proxy.pool_max_requests_per_connection);
+    // `maxRequestsPerConnection` is intentionally not projected from
+    // DestinationRule-derived port overrides. It has no backend close-after-N
+    // runtime behavior, so translation/status report it as deferred instead of
+    // letting a legacy carried value appear effective here.
 
     // Per-port backend TLS (DestinationRule `portLevelSettings[].tls`), resolved
     // at apply time. Overrides the proxy's upstream-/subset-level `resolved_tls`
@@ -16644,7 +16695,6 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
-        && max_reqs_override.is_none()
         && tls_override.is_none()
         && h2_upgrade_override.is_none()
         && http1_pending_override.is_none()
@@ -16661,9 +16711,6 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(secs) = idle_seconds_override {
         owned.pool_idle_timeout_seconds = Some(secs);
-    }
-    if let Some(n) = max_reqs_override {
-        owned.pool_max_requests_per_connection = Some(n);
     }
     if let Some(tls) = tls_override {
         owned.resolved_tls = tls.clone();
@@ -27609,10 +27656,30 @@ mod tests {
         initial_config: GatewayConfig,
         env_config: crate::config::env_config::EnvConfig,
     ) -> ProxyState {
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        make_test_proxy_state_with_reserved_ports(
+            initial_config,
+            env_config,
+            reserved_gateway_ports,
+        )
+    }
+
+    fn make_test_proxy_state_with_reserved_ports(
+        initial_config: GatewayConfig,
+        env_config: crate::config::env_config::EnvConfig,
+        reserved_gateway_ports: HashSet<u16>,
+    ) -> ProxyState {
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
-        ProxyState::new(initial_config, dns_cache, env_config, None, None)
-            .expect("ProxyState construction should succeed in tests")
-            .0
+        ProxyState::new_with_reserved_gateway_ports(
+            initial_config,
+            dns_cache,
+            env_config,
+            None,
+            None,
+            reserved_gateway_ports,
+        )
+        .expect("ProxyState construction should succeed in tests")
+        .0
     }
 
     fn header_value<'a>(
@@ -27665,6 +27732,22 @@ mod tests {
             "backend_tls_verify_server_cert": true,
         }))
         .expect("validation test proxy should deserialize")
+    }
+
+    fn make_validation_stream_proxy(id: &str, listen_port: u16) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": "test-stream-proxy",
+            "listen_port": listen_port,
+            "backend_scheme": "tcp",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "backend_tls_verify_server_cert": true,
+        }))
+        .expect("validation test stream proxy should deserialize");
+        proxy.normalize_fields();
+        proxy
     }
 
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
@@ -28037,6 +28120,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_full_config_uses_effective_reserved_ports_for_reload() {
+        let env_config = crate::config::env_config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 41_001,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            ..crate::config::env_config::EnvConfig::default()
+        };
+        let state = make_test_proxy_state_with_reserved_ports(
+            make_validation_config(vec![]),
+            env_config,
+            HashSet::from([41_000]),
+        );
+
+        let actual_reserved =
+            make_validation_config(vec![make_validation_stream_proxy("stream-actual", 41_000)]);
+        let err = state
+            .validate_full_config(&actual_reserved)
+            .expect_err("effective reserved port must be rejected");
+        assert!(
+            err.iter().any(|msg| msg.contains("gateway reserved port")),
+            "error must identify gateway reserved-port conflict; got {err:?}"
+        );
+
+        let stale_env_port =
+            make_validation_config(vec![make_validation_stream_proxy("stream-env", 41_001)]);
+        assert!(
+            state.validate_full_config(&stale_env_port).is_ok(),
+            "reload validation must not reject an EnvConfig port that is not in the effective reserved set",
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_effective_reserved_port_without_swapping() {
+        let env_config = crate::config::env_config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 41_001,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            ..crate::config::env_config::EnvConfig::default()
+        };
+        let state = make_test_proxy_state_with_reserved_ports(
+            make_validation_config(vec![]),
+            env_config,
+            HashSet::from([41_000]),
+        );
+        let pre_swap_loaded_at = state.config.load_full().loaded_at;
+        let rejected =
+            make_validation_config(vec![make_validation_stream_proxy("stream-actual", 41_000)]);
+
+        let outcome = state.update_config(rejected);
+
+        assert!(
+            matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+            "reserved stream port must reject reload; got {outcome:?}"
+        );
+        let post_attempt_config = state.config.load_full();
+        assert!(
+            post_attempt_config.proxies.is_empty(),
+            "rejected reserved-port reload must preserve previous config"
+        );
+        assert_eq!(
+            post_attempt_config.loaded_at, pre_swap_loaded_at,
+            "loaded_at must not advance when reserved-port validation rejects reload"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_full_config_rejects_dangling_mesh_route_dispatch_upstream_id() {
         // External-review P2: mesh_route_dispatch.destination.upstream_id
         // typos used to be warn-only and silently routed matched traffic
@@ -28185,6 +28338,7 @@ mod tests {
                 removed_plugin_config_ids: vec!["pc1".to_string()],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
+                sequence_cursor: 0,
                 poll_timestamp: now,
             })
             .await;
@@ -28671,8 +28825,9 @@ mod tests {
     // ── T1-C: HTTP connection-pool projection onto effective proxy ───────
 
     /// Helper: clone the standard test proxy and add a per-port override
-    /// carrying the three new HTTP fields plus the existing connect timeout
-    /// so each test can dial in only the field it cares about.
+    /// carrying the supported HTTP fields plus a legacy
+    /// maxRequestsPerConnection carrier and the existing connect timeout so
+    /// each test can dial in only the field it cares about.
     fn proxy_with_http_overrides_for_test(
         connect_ms: u64,
         h2_streams: Option<u32>,
@@ -28722,15 +28877,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_effective_proxy_projects_max_requests_per_connection_as_u64() {
-        // Per-port wire field is `u32`; `Proxy.pool_max_requests_per_connection`
-        // is `Option<u64>` for schema compatibility. The widening conversion
-        // must round-trip without sign drift or truncation.
+    fn resolve_effective_proxy_ignores_legacy_max_requests_per_connection() {
+        // The field has no close-after-N runtime behavior. A legacy carried
+        // override must not make the effective proxy look programmed.
         let proxy = proxy_with_http_overrides_for_test(5000, None, None, Some(40));
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
-        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
-        assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "a legacy-only maxRequestsPerConnection override must be ignored"
+        );
+        assert_eq!(effective.pool_max_requests_per_connection, None);
     }
 
     #[test]
@@ -28760,7 +28917,6 @@ mod tests {
             proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
         proxy.pool_http2_max_concurrent_streams = Some(250);
         proxy.pool_idle_timeout_seconds = Some(120);
-        proxy.pool_max_requests_per_connection = Some(40);
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(
@@ -28779,7 +28935,6 @@ mod tests {
             proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
         proxy.backend_connect_timeout_ms = 5000; // override = 5000 too, no diff
         proxy.pool_idle_timeout_seconds = Some(120); // matches override
-        proxy.pool_max_requests_per_connection = Some(40); // matches override
         // h2 streams currently None → override Some(250) differs.
         // Override `connect_timeout_ms` to a different value so it's a diff
         // too: but we already set proxy=5000 and override=5000 above → matches.
@@ -28798,7 +28953,7 @@ mod tests {
         assert_eq!(owned.pool_http2_max_concurrent_streams, Some(250));
         // Unchanged fields preserved from proxy:
         assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
-        assert_eq!(owned.pool_max_requests_per_connection, Some(40));
+        assert_eq!(owned.pool_max_requests_per_connection, None);
     }
 
     // ── F5.1: h2UpgradePolicy projection + dispatch decision ─────────────

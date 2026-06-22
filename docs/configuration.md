@@ -91,7 +91,10 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 |---|---|---|---|
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string. For MongoDB: `mongodb://` or `mongodb+srv://` |
-| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
+| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling reads durable `config_changes` records after the last accepted sequence cursor, then point-loads changed IDs only. If polling fails or the cursor is older than retained change history, Ferrum falls back to a full runtime reload. SQL full reloads use transaction-scoped keyset pagination, MongoDB replica-set full reloads use snapshot transactions, and standalone MongoDB pollers use full reloads because change records are not crash-atomic without transactions; failed candidates keep the last known-good runtime config active. |
+| `FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS` | No | `1` | Database-mode initial retry backoff after a DB incremental delta is rejected by validation. The poller retries after this delay and does not advance the accepted cursor. CP mode uses `FERRUM_DB_POLL_INTERVAL`. |
+| `FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS` | No | `30` | Database-mode maximum retry backoff for the same rejected DB incremental delta. Values below the initial backoff are clamped up to the initial value. |
+| `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` | No | `3` | Database-mode number of identical rejected DB incremental deltas before attempting an authoritative primary-backed full reload while preserving the last known-good config if that snapshot fails or is rejected. |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use primary. MongoDB read preferences are ignored by Ferrum's config store |
@@ -102,13 +105,71 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 
 | Setting family | PostgreSQL | MySQL | SQLite | MongoDB |
 |---|---|---|---|---|
-| Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
+| Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, rejected-delta backoff fields, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
 | `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
 | `FERRUM_DB_READ_REPLICA_URL` | Yes, admin reads only | Yes, admin reads only | No | No; Ferrum forces primary reads |
 | `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | `disable` only as a no-op; cert paths rejected | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
 | `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | Yes | Yes | Yes | Ignored; MongoDB uses cursor-based loading |
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
+
+#### Runtime Config Lifecycle Invariants
+
+File, database, and DP modes apply runtime configuration through explicit
+`Applied`, `Unchanged`, or `Rejected` outcomes. `Applied` swaps the new config
+and rebuilds the derived caches. `Unchanged` confirms the source is still valid
+without churning caches. `Rejected` keeps the last known-good runtime config and
+does not commit database poll bookkeeping. CP mode validates database poll
+candidates before storing and broadcasting them, but it does not use those
+`ProxyState` apply outcomes on every broadcast path.
+
+Database-mode polling commits the accepted `config_changes.sequence` cursor only
+after an `Applied` or `Unchanged` candidate. Full reload candidates follow the
+same rule: a rejected full snapshot cannot poison the later incremental cursor.
+SQL runtime polling always uses the primary pool; `FERRUM_DB_READ_REPLICA_URL`
+is only for eligible admin reads. MongoDB config reads force primary read
+preference, and standalone MongoDB polling intentionally uses full reloads
+instead of accepting non-transactional incremental cursors.
+
+Full-load guarantees are backend-specific but fail closed. PostgreSQL uses a
+repeatable-read, read-only transaction; MySQL requires repeatable-read
+transaction isolation; SQLite reads through one transaction snapshot; MongoDB
+replica sets use snapshot transactions. If a query, decode, relationship, or
+runtime validation step fails, the whole candidate is rejected and the previous
+config keeps serving.
+
+Normal incremental polling is durable-change-log based. SQL and MongoDB
+replica-set pollers read ordered `config_changes` rows/documents after the
+accepted cursor, collapse each resource to the final operation in the batch, and
+point-load only those changed IDs. Delete records carry removals, so normal
+incremental polling does not scan every runtime collection or table ID.
+Retained-history gaps and saturated change batches force the same authoritative
+full-reload path.
+
+Repeated rejected database deltas use bounded backoff and low-cardinality
+metrics. After `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` identical
+rejections, database mode attempts an authoritative full reload and keeps the
+last known-good config if that reload fails or is also rejected. The public
+health and metrics surfaces report degraded database polling without exposing
+resource IDs or validation strings as unbounded labels.
+
+Listener readiness and supervision are part of the same fail-closed lifecycle.
+File and database modes report startup ready only after configured HTTP, HTTPS,
+HTTP/3, and stream listeners have bound or been adopted. Supervised HTTP-family
+and admin listener task failures trigger sibling shutdown instead of leaving a
+partially serving process. Stream listener bind/startup failures are fatal in
+file/database modes; after startup, stream listener exits are handled by stream
+listener reconciliation and retry rather than by shutting down sibling listeners
+or the process.
+In-process file-mode callers that pass pre-bound listeners reserve those actual
+ports for stream-listener conflict validation; env-config ports are used only
+when no listener is pre-bound.
+
+TLS source ownership is explicit. Database TLS live reload reconnects the active
+SQL primary pool or MongoDB client, plus SQL admin-read replicas when present.
+MongoDB driver paths that require filesystem PEMs receive owner-scoped temporary
+files with restrictive permissions; those files remain only while the connection
+bundle that may need them is alive.
 
 #### MySQL minimum version
 
@@ -125,6 +186,10 @@ matching `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE
 utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
 compatibility policy of folding schema changes into the V001 baseline rather
 than shipping incremental migrations.
+
+MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
+server or session default is weaker, Ferrum rejects the candidate full load and
+keeps the last known-good runtime config instead of publishing a mixed snapshot.
 
 ### Database TLS
 
@@ -252,7 +317,7 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | No | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens so they cannot live forever. Set `false` only for Istio issuers that legitimately omit `exp`. Independent of expiry *validation*: a present-but-expired `exp` is always rejected regardless of this flag |
 | `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` | No | `300` | Polling interval (seconds) for SPIFFE trust-bundle federation. The poller fetches each `RemoteCluster.federation_endpoint` and overlays the result on `TrustBundleSet.federated` for cross-cluster mTLS. Set to `0` to disable the poller entirely; cross-cluster bundles then come only from the CP-supplied slice. Per-target backoff uses the same 1s→30s ±25% jitter as the CP-reconnect loop on transient failures. Mesh validation caps `mesh.multi_cluster.remote_clusters` at 256 entries, bounding federation task fan-out |
 | `FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS` | No | `30` | Per-request HTTP timeout (seconds) for a single federation bundle fetch. Slow or hung endpoints fall through to backoff once this fires |
-| `FERRUM_MESH_FEDERATION_FAIL_OPEN` | No | `false` | **Reserved for future verifier integration.** Today this flag is recorded in poll-failure log lines for operator visibility but does NOT change verifier behavior — cross-cluster mTLS always verifies against the last-good bundle (fail-closed) regardless of this value. Pollers always preserve the last-good bundle on poll failure |
+| `FERRUM_MESH_FEDERATION_FAIL_OPEN` | No | `false` | Federation bootstrap policy for remote clusters that declare `federation_endpoint`. `false` blocks CP-supplied fallback bundles until the federation poller installs a last-good bundle for that trust domain. `true` allows the CP fallback before the first successful poll. Both modes preserve last-good polled bundles across transient poll failures and use the effective trust set for outbound mTLS and inbound SPIFFE verification |
 | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` | No | `0` | Cross-cluster endpoint discovery polling interval (seconds). `0` disables it (multi-cluster stays east-west SNI passthrough + federated trust only). When `> 0`, each `RemoteCluster.control_plane_url` is dialed over native MeshSubscribe to fetch remote service endpoints, which are aggregated into local upstream targets tagged with remote locality so locality-aware priority LB fails over local→remote. Fail-closed on trust: only remote clusters with a federated trust bundle for their trust domain are dialed. Per-target backoff matches the federation poller (1s→30s ±25%). Mesh validation caps `mesh.multi_cluster.remote_clusters` at 256 entries, bounding endpoint-discovery task fan-out. **Precondition:** the local workload source locality (`topology.kubernetes.io/region`+`zone` on the SPIFFE-matched workload, or label-based fallback) must be set for the local-first priority-tier behavior to engage; without it the LB returns local and remote endpoints together. Ferrum emits a startup `WARN` when this precondition is not met. Set `FERRUM_MESH_LOCALITY_LB_STRICT=true` to fail closed to local endpoints instead of returning the mixed pool when source locality is absent. See `docs/mesh.md` "Cross-Cluster Endpoint Discovery" |
 | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS` | No | `30` | Per-poll timeout (seconds) for the remote-cluster MeshSubscribe fetch |
 | `FERRUM_MESH_LOCALITY_LB_STRICT` | No | `false` | Strict local-first locality load balancing for mesh upstreams. Default `false` (fail-open): when an upstream's source locality is absent/unresolved the locality-aware LB returns mixed local + remote endpoints. When `true` (fail-closed-to-local): an absent source locality restricts selection to LOCAL-locality endpoints (targets not tagged with the synthetic `remote-<cluster>` locality) and will not widen to remote unless there are no local endpoints, in which case it falls back to the full healthy pool with a one-time `WARN` rather than black-holing. Inert when a source locality IS resolved (priority-tier preference unchanged in both modes). Stamped onto upstreams at slice apply; not settable via the admin API. See `docs/mesh.md` "Locality-Aware Load Balancing" |

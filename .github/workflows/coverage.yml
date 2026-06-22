@@ -169,6 +169,7 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
+              integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_offline_bootstrap_tests
     steps:

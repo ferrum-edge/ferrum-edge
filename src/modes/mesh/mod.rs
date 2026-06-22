@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -1261,24 +1261,91 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
     a_value == content_value(b)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
     federation: Option<&federation::FederationSnapshot>,
     remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    gateway_config_from_mesh_slice_with_federation(
+        slice,
+        runtime,
+        federation,
+        remote_endpoints,
+        FederationActivation::disabled(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FederationActivation {
+    fail_open: bool,
+    poll_enabled: bool,
+}
+
+impl FederationActivation {
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            fail_open: false,
+            poll_enabled: false,
+        }
+    }
+
+    fn from_env_config(env_config: &EnvConfig) -> Self {
+        Self {
+            fail_open: env_config.mesh_federation_fail_open,
+            poll_enabled: env_config.mesh_federation_poll_interval_seconds > 0,
+        }
+    }
+}
+
+fn effective_trust_bundles_for_slice(
+    slice: &MeshSlice,
+    federation: Option<&federation::FederationSnapshot>,
+    activation: FederationActivation,
+) -> Option<config::TrustBundleSet> {
+    match federation {
+        Some(snapshot) => federation::merge_federation_into_trust_bundles(
+            slice.trust_bundles.clone(),
+            snapshot,
+            slice.multi_cluster.as_ref(),
+            activation.fail_open,
+            activation.poll_enabled,
+        ),
+        None => slice.trust_bundles.clone(),
+    }
+}
+
+fn validation_trust_bundles_for_slice(
+    slice: &MeshSlice,
+    federation: Option<&federation::FederationSnapshot>,
+) -> Option<config::TrustBundleSet> {
+    match federation {
+        Some(snapshot) => {
+            federation::merge_federation_for_validation(slice.trust_bundles.clone(), snapshot)
+        }
+        None => slice.trust_bundles.clone(),
+    }
+}
+
+fn gateway_config_from_mesh_slice_with_federation(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+    federation: Option<&federation::FederationSnapshot>,
+    remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
+    _activation: FederationActivation,
+) -> Result<GatewayConfig, anyhow::Error> {
     let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
         .map(|ts| ts.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
-    // Overlay live-polled federation bundles on top of the CP-provided
-    // [`TrustBundleSet.federated`] so cross-cluster mTLS verifies against the
-    // freshest bundle the gateway has fetched. Empty snapshots are a no-op.
-    let trust_bundles = match federation {
-        Some(snapshot) if !snapshot.bundles.is_empty() => {
-            federation::merge_federation_into_trust_bundles(slice.trust_bundles.clone(), snapshot)
-        }
-        _ => slice.trust_bundles.clone(),
-    };
+    // Keep CP-provided federation bootstrap bundles visible to structural mesh
+    // validation even in fail-closed mode. Traffic-facing verifier slots are
+    // published separately from `effective_trust_bundles_for_slice` only after
+    // this candidate config is accepted, so inactive bootstrap roots do not
+    // become live trust.
+    let trust_bundles = validation_trust_bundles_for_slice(slice, federation);
     // Aggregate cross-cluster endpoints (Tier 3b): merge remote-cluster
     // workloads / services discovered from `RemoteCluster.control_plane_url`
     // into the local registry. Remote workloads carry a distinct (remote)
@@ -1330,6 +1397,7 @@ fn gateway_config_from_mesh_slice(
 async fn wait_for_initial_mesh_config(
     mesh_state: &MeshRuntimeState,
     runtime: &MeshRuntimeConfig,
+    activation: FederationActivation,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(GatewayConfig, Arc<MeshSlice>), anyhow::Error> {
     let mut updates = mesh_state.subscribe();
@@ -1338,11 +1406,12 @@ async fn wait_for_initial_mesh_config(
         if let Some(slice) = snapshot.as_ref().as_ref() {
             let federation_snapshot = mesh_state.federation_store().snapshot();
             let remote_snapshot = mesh_state.remote_endpoint_store().snapshot();
-            match gateway_config_from_mesh_slice(
+            match gateway_config_from_mesh_slice_with_federation(
                 slice,
                 runtime,
                 Some(&federation_snapshot),
                 Some(&remote_snapshot),
+                activation,
             ) {
                 Ok(config) => return Ok((config, Arc::new(slice.clone()))),
                 Err(e) => {
@@ -5121,8 +5190,8 @@ fn apply_traffic_policy_to_port_override(
 /// destination-level `connectionPool` for that port; Ferrum instead does a
 /// per-field merge (top-level fan-out, then this additive per-port overlay).
 /// This is pre-existing and CONSISTENT across every `connectionPool` knob
-/// (`maxRequestsPerConnection` / `idleTimeout` / `http2MaxRequests` /
-/// `maxConnections` / `tcpKeepalive`), so unifying it to complete-replacement
+/// (`idleTimeout` / `http2MaxRequests` / `maxConnections` / `tcpKeepalive`),
+/// so unifying it to complete-replacement
 /// is a separate uniform follow-up (it would change existing
 /// idleTimeout/http2MaxRequests behavior + their tests). It is documented in
 /// `docs/mesh.md`.
@@ -5138,9 +5207,9 @@ fn apply_connection_pool_http_to_port_override(
     slot: &mut UpstreamPortOverride,
     http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
 ) {
-    if let Some(max) = http.max_requests_per_connection {
-        slot.http_max_requests_per_connection = Some(max);
-    }
+    // `maxRequestsPerConnection` is intentionally NOT projected. The parser
+    // validates and status-reports it as deferred because Ferrum does not have
+    // close-after-N-requests behavior for backend pools.
     if let Some(idle_ms) = http.idle_timeout_ms {
         slot.http_idle_timeout_ms = Some(idle_ms);
     }
@@ -7063,6 +7132,7 @@ pub async fn run(
     );
 
     let mesh_state = MeshRuntimeState::new();
+    let federation_activation = FederationActivation::from_env_config(&env_config);
 
     let mut background_handles = Vec::new();
     if runtime.config_protocol == MeshConfigProtocol::File {
@@ -7088,9 +7158,17 @@ pub async fn run(
         // rejected initial slice by waiting for the CP to push a fix; the
         // file source has no pusher, so a slice the runtime would reject must
         // refuse startup instead of hanging in the initial-config wait.
-        gateway_config_from_mesh_slice(&initial_slice, &runtime, None, None).with_context(
-            || format!("localized mesh config '{file_path}' failed runtime preparation"),
-        )?;
+        let empty_federation_snapshot = federation::FederationSnapshot::default();
+        gateway_config_from_mesh_slice_with_federation(
+            &initial_slice,
+            &runtime,
+            Some(&empty_federation_snapshot),
+            None,
+            federation_activation,
+        )
+        .with_context(|| {
+            format!("localized mesh config '{file_path}' failed runtime preparation")
+        })?;
         let initial_version = initial_slice.version.clone();
         mesh_state.install_slice(initial_slice);
         let handle = tokio::spawn(
@@ -7181,10 +7259,14 @@ pub async fn run(
             );
         }
     }
-    let (bootstrap_config, initial_applied_mesh_slice) =
-        wait_for_initial_mesh_config(&mesh_state, &runtime, shutdown_tx.subscribe())
-            .await
-            .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
+    let (bootstrap_config, initial_applied_mesh_slice) = wait_for_initial_mesh_config(
+        &mesh_state,
+        &runtime,
+        federation_activation,
+        shutdown_tx.subscribe(),
+    )
+    .await
+    .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
     info!(
         mesh_global_plugins = bootstrap_config.plugin_configs.len(),
         mesh_slice_version = %initial_applied_mesh_slice.version,
@@ -7630,19 +7712,31 @@ async fn serve_mesh_runtime(
     // material is configured — the listener then keeps operator-CA chain
     // verification. The slot is read live by the verifier and re-published on
     // slice apply so federated trust changes propagate lock-free.
-    let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot(
+    let federation_activation = FederationActivation::from_env_config(&env_config);
+    let initial_federation_snapshot = mesh_state.federation_store().snapshot();
+    let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot_with_federation(
         &env_config,
         initial_applied_mesh_slice.as_deref(),
+        Some(&initial_federation_snapshot),
+        federation_activation,
         mesh_ca_svid_slot.as_ref(),
     );
     if let Some(slice) = initial_applied_mesh_slice.as_deref() {
+        publish_gateway_active_trust_bundles(
+            &proxy_state,
+            slice,
+            Some(&initial_federation_snapshot),
+            federation_activation,
+        );
         publish_staged_spiffe_bundle(
             &proxy_state,
-            stage_gateway_runtime_spiffe_bundle(
+            stage_gateway_runtime_spiffe_bundle_with_federation(
                 &proxy_state,
                 mesh_inbound_spiffe_slot.as_ref(),
                 mesh_runtime_trust_overlay_slot.as_ref(),
                 slice,
+                Some(&initial_federation_snapshot),
+                federation_activation,
             ),
         );
     }
@@ -7670,6 +7764,7 @@ async fn serve_mesh_runtime(
             .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
         mesh_inbound_spiffe_slot.as_ref(),
     )?;
+    let has_inbound_tls_termination_listener = runtime.has_inbound_tls_termination_listener();
     // Runtime fail-closed enforcement (issue #1523): #1522's config-time gate
     // only checks that identity material is *named*. Here the inbound listener's
     // actual resolved posture is known, so a production mesh refuses to come up
@@ -7694,6 +7789,15 @@ async fn serve_mesh_runtime(
     proxy_state
         .mesh_inbound_tls
         .store(Arc::new(frontend_tls.clone()));
+    proxy_state.mesh_inbound_spiffe_verifier_active.store(
+        mesh_inbound_spiffe_verifier_active(
+            has_inbound_tls_termination_listener,
+            inbound_mtls_mode,
+            frontend_tls.is_some(),
+            mesh_inbound_spiffe_slot.is_some(),
+        ),
+        Ordering::Release,
+    );
     if let Some(ref tls_config) = frontend_tls {
         proxy_state
             .stream_listener_manager
@@ -7829,6 +7933,7 @@ async fn serve_mesh_runtime(
         mesh_background_handles.push(start_remote_cluster_discovery_reconcile_task(
             mesh_state.clone(),
             remote_discovery_manager,
+            federation_activation,
             shutdown_tx.subscribe(),
         ));
         info!("Cross-cluster endpoint discovery reconciler running");
@@ -8788,9 +8893,27 @@ struct MeshInboundTlsReloadState {
 /// `enforce_mesh_inbound_fail_closed`), and on live reload the previous trust
 /// bundle is retained. See `build_mesh_inbound_spiffe_slot`'s F2 comment for
 /// the precise per-caller disposition.
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
+    runtime_svid_slot: Option<&tls::SharedBundleSlot>,
+) -> Option<tls::SharedBundleSlot> {
+    build_mesh_inbound_spiffe_slot_with_federation(
+        env_config,
+        slice,
+        None,
+        FederationActivation::disabled(),
+        runtime_svid_slot,
+    )
+}
+
+fn build_mesh_inbound_spiffe_slot_with_federation(
+    env_config: &EnvConfig,
+    slice: Option<&MeshSlice>,
+    federation: Option<&federation::FederationSnapshot>,
+    activation: FederationActivation,
     runtime_svid_slot: Option<&tls::SharedBundleSlot>,
 ) -> Option<tls::SharedBundleSlot> {
     if let Some(slot) = runtime_svid_slot {
@@ -8845,34 +8968,24 @@ fn build_mesh_inbound_spiffe_slot(
         }
     };
 
-    merge_slice_federation_into_svid_bundle(&mut bundle, slice);
+    let effective_trust_bundles =
+        slice.and_then(|slice| effective_trust_bundles_for_slice(slice, federation, activation));
+    merge_effective_trust_bundles_into_svid_bundle(&mut bundle, effective_trust_bundles.as_ref());
 
     Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))))
 }
 
-/// Overlay the slice's federated (and any extra local) trust bundles onto the
-/// gateway SVID bundle so the inbound SPIFFE verifier accepts peers from
-/// federated trust domains. The SVID's own local bundle (its trust domain's
-/// roots) is preserved; federated entries from the slice replace any raw
-/// federated entries already present on the SVID bundle.
-///
-/// F3 (documented design choice): the CP-pushed slice is the SOLE authority for
-/// inbound trust domains. Unlike the backend/outbound path
-/// (`gateway_config_from_mesh_slice`), this does NOT overlay the federation
-/// poller store snapshot. A federation-poller-added trust domain therefore
-/// validates for outbound mTLS but is rejected for inbound until the CP pushes
-/// it in a slice. This is intentional: inbound peer trust is governed by mesh
-/// PeerAuthentication/slice config, while the poller's live cross-cluster
-/// bundles are an outbound-only freshness overlay.
-fn merge_slice_federation_into_svid_bundle(
+/// Overlay the effective federated (and any extra local) trust bundles onto the
+/// gateway SVID bundle so the inbound SPIFFE verifier accepts peers from the
+/// same active trust domains used for outbound mTLS. The SVID's own local
+/// bundle is preserved; effective federated entries replace any raw federated
+/// entries already present on the SVID bundle.
+fn merge_effective_trust_bundles_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
-    slice: Option<&MeshSlice>,
+    trust_bundles: Option<&config::TrustBundleSet>,
 ) {
     retain_svid_local_trust_only(bundle);
-    let Some(slice) = slice else {
-        return;
-    };
-    let Some(serialized) = slice.trust_bundles.as_ref() else {
+    let Some(serialized) = trust_bundles else {
         return;
     };
     let runtime = match serialized.to_runtime() {
@@ -8923,11 +9036,12 @@ fn merge_trust_overlay_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     runtime: &crate::identity::TrustBundleSet,
 ) {
-    // CP-pushed slice trust is authoritative for inbound federation. Drop raw
-    // federated bundles from the SVID source before adding accepted slice
+    // The accepted effective trust set is authoritative for inbound federation.
+    // Drop raw federated bundles from the SVID source before adding accepted
     // bundles. The local bundle stays anchored to the gateway SVID's own trust
-    // domain, but same-domain slice authorities are additive so a CP can stage
-    // CA-root rotation without replacing the freshly loaded SVID roots.
+    // domain, but same-domain authorities are additive so a control plane or
+    // polled bundle can stage CA-root rotation without replacing the freshly
+    // loaded SVID roots.
     retain_svid_local_trust_only(bundle);
     for (trust_domain, federated) in &runtime.federated {
         bundle
@@ -8957,6 +9071,8 @@ fn merge_trust_overlay_into_svid_bundle(
 /// federated trust domains active for inbound handshakes. A rebuild failure
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
+#[cfg(test)]
+#[allow(dead_code)]
 fn stage_mesh_inbound_spiffe_bundle(
     proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
@@ -8964,24 +9080,55 @@ fn stage_mesh_inbound_spiffe_bundle(
     env_config: &EnvConfig,
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
+    stage_mesh_inbound_spiffe_bundle_with_federation(
+        proxy_state,
+        slot,
+        runtime_trust_overlay_slot,
+        env_config,
+        slice,
+        None,
+        FederationActivation::disabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_mesh_inbound_spiffe_bundle_with_federation(
+    proxy_state: &ProxyState,
+    slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
+    env_config: &EnvConfig,
+    slice: &MeshSlice,
+    federation: Option<&federation::FederationSnapshot>,
+    activation: FederationActivation,
+) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
     if runtime_trust_overlay_slot.is_some() {
-        return stage_gateway_runtime_spiffe_bundle(
+        return stage_gateway_runtime_spiffe_bundle_with_federation(
             proxy_state,
             Some(slot),
             runtime_trust_overlay_slot,
             slice,
+            federation,
+            activation,
         );
     }
     if !gateway_svid_material_configured(env_config) {
-        return stage_gateway_runtime_spiffe_bundle(
+        return stage_gateway_runtime_spiffe_bundle_with_federation(
             proxy_state,
             Some(slot),
             runtime_trust_overlay_slot,
             slice,
+            federation,
+            activation,
         );
     }
-    match build_mesh_inbound_spiffe_slot(env_config, Some(slice), None) {
+    match build_mesh_inbound_spiffe_slot_with_federation(
+        env_config,
+        Some(slice),
+        federation,
+        activation,
+        None,
+    ) {
         Some(rebuilt) => Some(StagedSpiffeBundle::DirectSlot {
             slot: slot.clone(),
             bundle: rebuilt.load_full(),
@@ -8997,15 +9144,36 @@ fn stage_mesh_inbound_spiffe_bundle(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn stage_gateway_runtime_spiffe_bundle(
     proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
     runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
+    stage_gateway_runtime_spiffe_bundle_with_federation(
+        proxy_state,
+        slot,
+        runtime_trust_overlay_slot,
+        slice,
+        None,
+        FederationActivation::disabled(),
+    )
+}
+
+fn stage_gateway_runtime_spiffe_bundle_with_federation(
+    proxy_state: &ProxyState,
+    slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
+    slice: &MeshSlice,
+    federation: Option<&federation::FederationSnapshot>,
+    activation: FederationActivation,
+) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
     let runtime_trust_overlay_slot = runtime_trust_overlay_slot?;
-    let trust_overlay = match slice.trust_bundles.as_ref() {
+    let effective_trust_bundles = effective_trust_bundles_for_slice(slice, federation, activation);
+    let trust_overlay = match effective_trust_bundles.as_ref() {
         Some(serialized) => match serialized.to_runtime() {
             Ok(runtime) => Some(runtime),
             Err(error) => {
@@ -9658,6 +9826,18 @@ fn listener_tls_config_for_mtls_mode(
     listener_tls_config(listener, frontend_tls)
 }
 
+fn mesh_inbound_spiffe_verifier_active(
+    has_termination_listener: bool,
+    mtls_mode: config::MtlsMode,
+    tls_configured: bool,
+    spiffe_bundle_slot_configured: bool,
+) -> bool {
+    has_termination_listener
+        && mtls_mode != config::MtlsMode::Disable
+        && tls_configured
+        && spiffe_bundle_slot_configured
+}
+
 enum MeshInboundTlsReloadPlan {
     /// No listener TLS-config change is needed (mode + client CA bundle are
     /// unchanged), but the SPIFFE federated trust-bundle may still need
@@ -9702,10 +9882,45 @@ enum StagedSpiffeBundle {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(dead_code)]
 fn plan_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
+    mtls_mode: config::MtlsMode,
+    server_identity: Option<&tls::MeshServerIdentity>,
+    last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
+    spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
+    production: bool,
+    // Precomputed once by the apply task (topology is process-fixed) so the reload
+    // path does not re-derive `runtime.listener_plan()` on every slice apply.
+    has_termination_listener: bool,
+) -> Option<MeshInboundTlsReloadPlan> {
+    plan_mesh_inbound_tls_reload_with_federation(
+        proxy_state,
+        runtime,
+        slice,
+        None,
+        FederationActivation::disabled(),
+        mtls_mode,
+        server_identity,
+        last_snapshot,
+        spiffe_bundle_slot,
+        runtime_trust_overlay_slot,
+        production,
+        has_termination_listener,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_mesh_inbound_tls_reload_with_federation(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    slice: &MeshSlice,
+    federation: Option<&federation::FederationSnapshot>,
+    activation: FederationActivation,
     mtls_mode: config::MtlsMode,
     server_identity: Option<&tls::MeshServerIdentity>,
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
@@ -9738,12 +9953,14 @@ fn plan_mesh_inbound_tls_reload(
     // when the operator client CA bundle and mTLS mode are otherwise unchanged.
     // Only the accepted slice trust overlay is recomputed; the SVID cert/key
     // and local roots stay anchored to the current file or CA runtime source.
-    let staged_spiffe = stage_mesh_inbound_spiffe_bundle(
+    let staged_spiffe = stage_mesh_inbound_spiffe_bundle_with_federation(
         proxy_state,
         spiffe_bundle_slot,
         runtime_trust_overlay_slot,
         &proxy_state.env_config,
         slice,
+        federation,
+        activation,
     );
     if last_snapshot == Some(&next_snapshot) {
         return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
@@ -9836,6 +10053,8 @@ async fn apply_mesh_inbound_tls_reload(
     mtls_mode: config::MtlsMode,
     plan: MeshInboundTlsReloadPlan,
     last_snapshot: &mut Option<MeshInboundTlsReloadSnapshot>,
+    has_termination_listener: bool,
+    spiffe_bundle_slot_configured: bool,
 ) {
     match plan {
         MeshInboundTlsReloadPlan::Unchanged { staged_spiffe } => {
@@ -9843,6 +10062,16 @@ async fn apply_mesh_inbound_tls_reload(
             // change may still need publishing. Now that the proxy config was
             // accepted, store the staged SPIFFE bundle into the live slot.
             publish_staged_spiffe_bundle(proxy_state, staged_spiffe);
+            let tls_configured = proxy_state.mesh_inbound_tls.load().as_ref().is_some();
+            proxy_state.mesh_inbound_spiffe_verifier_active.store(
+                mesh_inbound_spiffe_verifier_active(
+                    has_termination_listener,
+                    mtls_mode,
+                    tls_configured,
+                    spiffe_bundle_slot_configured,
+                ),
+                Ordering::Release,
+            );
         }
         MeshInboundTlsReloadPlan::Swap {
             snapshot,
@@ -9858,6 +10087,15 @@ async fn apply_mesh_inbound_tls_reload(
             proxy_state
                 .mesh_inbound_tls
                 .store(Arc::new(tls_config.clone()));
+            proxy_state.mesh_inbound_spiffe_verifier_active.store(
+                mesh_inbound_spiffe_verifier_active(
+                    has_termination_listener,
+                    mtls_mode,
+                    tls_config.is_some(),
+                    spiffe_bundle_slot_configured,
+                ),
+                Ordering::Release,
+            );
             // Extend the live carve-out to mesh-shared TCP+TLS stream
             // listeners: swap the shared `rustls::ServerConfig` slot that
             // every TCP+TLS accept loop snapshots per accept. Existing
@@ -9988,6 +10226,7 @@ fn start_federation_poller_reconcile_task(
 fn start_remote_cluster_discovery_reconcile_task(
     mesh_state: MeshRuntimeState,
     mut manager: multicluster::RemoteDiscoveryManager,
+    federation_activation: FederationActivation,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -10002,9 +10241,17 @@ fn start_remote_cluster_discovery_reconcile_task(
             let snapshot = mesh_state.applied_snapshot();
             let slice = snapshot.as_ref().as_ref();
             let federation_snapshot = mesh_state.federation_store().snapshot();
+            let effective_trust_bundles = slice.and_then(|slice| {
+                effective_trust_bundles_for_slice(
+                    slice,
+                    Some(&federation_snapshot),
+                    federation_activation,
+                )
+            });
+            let empty_federation_snapshot = federation::FederationSnapshot::default();
             let trust_domains = multicluster::trust_domains_from_bundles(
-                slice.and_then(|slice| slice.trust_bundles.as_ref()),
-                &federation_snapshot,
+                effective_trust_bundles.as_ref(),
+                &empty_federation_snapshot,
             );
             manager.reconcile(
                 slice.and_then(|slice| slice.multi_cluster.as_ref()),
@@ -10060,6 +10307,29 @@ fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedS
     }
 }
 
+fn publish_gateway_active_trust_bundles(
+    proxy_state: &ProxyState,
+    slice: &MeshSlice,
+    federation: Option<&federation::FederationSnapshot>,
+    activation: FederationActivation,
+) {
+    let Some(serialized) = effective_trust_bundles_for_slice(slice, federation, activation) else {
+        proxy_state.clear_gateway_trust_bundles();
+        return;
+    };
+    match serialized.to_runtime() {
+        Ok(runtime) => proxy_state.update_gateway_trust_bundles(runtime),
+        Err(error) => {
+            warn!(
+                %error,
+                mesh_slice_version = %slice.version,
+                "Unable to publish accepted mesh federation trust to gateway SVID slot; \
+                 keeping previous outbound trust bundles"
+            );
+        }
+    }
+}
+
 /// Build a proxy [`GatewayConfig`] from `base_slice` overlaid with the current
 /// federation + remote-endpoint snapshots and apply it to the live proxy
 /// runtime, running the same TLS / node-waypoint / DNS / outbound-enforcement
@@ -10097,12 +10367,15 @@ async fn apply_mesh_slice_generation(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
 ) -> bool {
+    let federation_activation = FederationActivation::from_env_config(&proxy_state.env_config);
     let live_reload = if live_reload_enabled {
         live_reload_inbound_mtls_mode(base_slice, runtime).and_then(|mtls_mode| {
-            plan_mesh_inbound_tls_reload(
+            plan_mesh_inbound_tls_reload_with_federation(
                 proxy_state,
                 runtime,
                 base_slice,
+                Some(federation_snapshot),
+                federation_activation,
                 mtls_mode,
                 inbound_tls_reload.server_identity.as_deref(),
                 inbound_tls_reload.last_snapshot.as_ref(),
@@ -10123,11 +10396,25 @@ async fn apply_mesh_slice_generation(
         );
         return false;
     }
-    match gateway_config_from_mesh_slice(
+    let staged_inbound_spiffe = if live_reload_enabled {
+        None
+    } else {
+        stage_mesh_inbound_spiffe_bundle_with_federation(
+            proxy_state,
+            inbound_tls_reload.spiffe_bundle_slot.as_ref(),
+            inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
+            &proxy_state.env_config,
+            base_slice,
+            Some(federation_snapshot),
+            federation_activation,
+        )
+    };
+    match gateway_config_from_mesh_slice_with_federation(
         base_slice,
         runtime,
         Some(federation_snapshot),
         Some(remote_snapshot),
+        federation_activation,
     ) {
         Ok(mut config) => {
             let previous_config = proxy_state.config.load_full();
@@ -10201,15 +10488,28 @@ async fn apply_mesh_slice_generation(
                 resolver.install_policy_scope_snapshot(snapshot);
             }
             record_mesh_slice_apply_result(mesh_state, last_applied_slice, base_slice, accepted);
-            if accepted && let Some((mtls_mode, plan)) = live_reload {
-                apply_mesh_inbound_tls_reload(
+            if accepted {
+                publish_gateway_active_trust_bundles(
                     proxy_state,
                     base_slice,
-                    mtls_mode,
-                    plan,
-                    &mut inbound_tls_reload.last_snapshot,
-                )
-                .await;
+                    Some(federation_snapshot),
+                    federation_activation,
+                );
+                match live_reload {
+                    Some((mtls_mode, plan)) => {
+                        apply_mesh_inbound_tls_reload(
+                            proxy_state,
+                            base_slice,
+                            mtls_mode,
+                            plan,
+                            &mut inbound_tls_reload.last_snapshot,
+                            has_termination_listener,
+                            inbound_tls_reload.spiffe_bundle_slot.is_some(),
+                        )
+                        .await;
+                    }
+                    None => publish_staged_spiffe_bundle(proxy_state, staged_inbound_spiffe),
+                }
             }
             if accepted && let Some(dns_proxy) = dns_proxy {
                 dns_proxy.update_from_slice(base_slice);
@@ -19756,7 +20056,13 @@ mod tests {
         let state = mesh_state.clone();
 
         let wait = tokio::spawn(async move {
-            wait_for_initial_mesh_config(&state, &runtime, shutdown_rx).await
+            wait_for_initial_mesh_config(
+                &state,
+                &runtime,
+                FederationActivation::disabled(),
+                shutdown_rx,
+            )
+            .await
         });
 
         mesh_state.install_slice(MeshSlice {
@@ -20452,6 +20758,248 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gateway_config_validation_keeps_fail_closed_federation_bootstrap_bundle() {
+        use base64::Engine;
+
+        let local_td = TrustDomain::new("local.test").unwrap();
+        let remote_td = TrustDomain::new("remote.test").unwrap();
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "validation-bootstrap".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: local_td,
+                    x509_authorities: vec![engine.encode(b"local-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: remote_td.clone(),
+                    x509_authorities: vec![engine.encode(b"cp-bootstrap")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                }],
+            }),
+            multi_cluster: Some(MultiClusterConfig {
+                remote_clusters: vec![RemoteCluster {
+                    name: "remote".to_string(),
+                    trust_domain: remote_td,
+                    network: None,
+                    control_plane_url: None,
+                    federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                }],
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshSlice::default()
+        };
+        let activation = FederationActivation {
+            fail_open: false,
+            poll_enabled: true,
+        };
+
+        gateway_config_from_mesh_slice_with_federation(
+            &slice,
+            &test_mesh_runtime_config(),
+            Some(&federation::FederationSnapshot::default()),
+            None,
+            activation,
+        )
+        .expect(
+            "validation must accept CP bootstrap bundle even when fail-closed keeps it inactive",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_gateway_active_trust_bundles_updates_outbound_svid_slot() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let local_td = TrustDomain::new("local.test").unwrap();
+        let remote_td = TrustDomain::new("remote.test").unwrap();
+        let id = SpiffeId::from_parts(&local_td, "ns/foo/sa/bar").unwrap();
+        state.install_gateway_runtime_svid_bundle(SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: local_td.clone(),
+                x509_authorities: vec![vec![1]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        });
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "outbound-trust".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: local_td,
+                    x509_authorities: vec![engine.encode(b"slice-local")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: remote_td.clone(),
+                    x509_authorities: vec![engine.encode(b"cp-bootstrap")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                }],
+            }),
+            multi_cluster: Some(MultiClusterConfig {
+                remote_clusters: vec![RemoteCluster {
+                    name: "remote".to_string(),
+                    trust_domain: remote_td.clone(),
+                    network: None,
+                    control_plane_url: None,
+                    federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                }],
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshSlice::default()
+        };
+        let activation = FederationActivation {
+            fail_open: false,
+            poll_enabled: true,
+        };
+
+        publish_gateway_active_trust_bundles(
+            &state,
+            &slice,
+            Some(&federation::FederationSnapshot::default()),
+            activation,
+        );
+        let active = state.gateway_svid_bundle.load_full();
+        let bundle = active.as_ref().as_ref().expect("gateway SVID bundle");
+        assert!(
+            !bundle.trust_bundles.federated.contains_key(&remote_td),
+            "fail-closed bootstrap root must not become outbound active trust before a poll succeeds"
+        );
+
+        let mut polled = federation::FederationSnapshot::default();
+        polled.bundles.insert(
+            remote_td.clone(),
+            federation::FederatedBundle {
+                bundle: config::TrustBundle {
+                    trust_domain: remote_td.clone(),
+                    x509_authorities: vec![engine.encode(b"polled-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                fetched_at_unix_seconds: 1,
+                endpoint: "https://remote/.well-known/spiffe".to_string(),
+                cluster_name: "remote".to_string(),
+            },
+        );
+        publish_gateway_active_trust_bundles(&state, &slice, Some(&polled), activation);
+
+        let active = state.gateway_svid_bundle.load_full();
+        let bundle = active.as_ref().as_ref().expect("gateway SVID bundle");
+        let remote = bundle
+            .trust_bundles
+            .federated
+            .get(&remote_td)
+            .expect("polled remote trust is active");
+        assert_eq!(remote.x509_authorities, vec![b"polled-root".to_vec()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_republishes_inbound_spiffe_without_peer_auth_live_reload() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let runtime = test_mesh_runtime_config();
+        let mesh_state = MeshRuntimeState::new();
+        let proxy_state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let local_td = TrustDomain::new("local.runtime").unwrap();
+        let remote_td = TrustDomain::new("partner.runtime").unwrap();
+        let id = SpiffeId::from_parts(&local_td, "ns/foo/sa/bar").unwrap();
+        proxy_state.install_gateway_runtime_svid_bundle(SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: local_td.clone(),
+                x509_authorities: vec![vec![1]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: None,
+                last_snapshot: None,
+                spiffe_bundle_slot: Some(inbound_slot.clone()),
+                runtime_trust_overlay_slot: Some(overlay_slot),
+                production: false,
+            },
+            shutdown_rx,
+            None,
+        );
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        mesh_state.install_slice(MeshSlice {
+            version: "accepted-trust".to_string(),
+            labels: [("trust".to_string(), "published".to_string())].into(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: local_td,
+                    x509_authorities: vec![engine.encode(b"slice-local")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: remote_td.clone(),
+                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                }],
+            }),
+            ..MeshSlice::default()
+        });
+        wait_for_mesh_authz_label(&proxy_state, "trust", "published").await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active
+                    .as_ref()
+                    .as_ref()
+                    .is_some_and(|bundle| bundle.trust_bundles.federated.contains_key(&remote_td))
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted slice should republish inbound SPIFFE trust without PeerAuth reload");
+
+        let active = inbound_slot.load_full();
+        let bundle = active.as_ref().as_ref().expect("inbound SVID bundle");
+        let remote = bundle
+            .trust_bundles
+            .federated
+            .get(&remote_td)
+            .expect("federated trust published");
+        assert_eq!(remote.x509_authorities, vec![b"partner-root".to_vec()]);
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_spiffe_overlay_preserves_fresh_ca_roots_on_rotation() {
         use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
@@ -20998,6 +21546,40 @@ mod tests {
             decide_mesh_inbound_fail_closed(true, false),
             MeshInboundFailClosed::AllowWithWarning
         );
+    }
+
+    #[test]
+    fn mesh_inbound_spiffe_verifier_active_requires_actual_terminating_verifier() {
+        assert!(mesh_inbound_spiffe_verifier_active(
+            true,
+            config::MtlsMode::Strict,
+            true,
+            true
+        ));
+        assert!(!mesh_inbound_spiffe_verifier_active(
+            false,
+            config::MtlsMode::Strict,
+            true,
+            true
+        ));
+        assert!(!mesh_inbound_spiffe_verifier_active(
+            true,
+            config::MtlsMode::Disable,
+            true,
+            true
+        ));
+        assert!(!mesh_inbound_spiffe_verifier_active(
+            true,
+            config::MtlsMode::Strict,
+            false,
+            true
+        ));
+        assert!(!mesh_inbound_spiffe_verifier_active(
+            true,
+            config::MtlsMode::Strict,
+            true,
+            false
+        ));
     }
 
     #[test]

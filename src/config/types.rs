@@ -390,14 +390,14 @@ pub struct UpstreamPortOverride {
     /// (HTTP-family dispatch is a follow-on PR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
-    /// Per-port HTTP `maxRequestsPerConnection` mapped from DestinationRule
-    /// `connectionPool.http.maxRequestsPerConnection`. Projected onto the
-    /// per-target effective proxy's existing `pool_max_requests_per_connection`
-    /// schema field. Hyper does not yet expose a "close-after-N-requests"
-    /// builder knob, so the field is wire-projected end-to-end but its
-    /// runtime effect remains pending — same status as the proxy-level field.
-    /// Tracked as a follow-on once hyper grows the knob or a request-count
-    /// wrapper is introduced.
+    /// Legacy carrier for DestinationRule
+    /// `connectionPool.http.maxRequestsPerConnection`.
+    ///
+    /// New translation does not populate this field, and
+    /// `resolve_effective_proxy_for_target` intentionally ignores any legacy
+    /// carried value because Ferrum has no backend close-after-N-requests
+    /// runtime behavior. K8s status reports the DR field as deferred instead of
+    /// presenting this as effective policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_max_requests_per_connection: Option<u32>,
     /// Per-port HTTP idle-timeout mapped from DestinationRule
@@ -573,7 +573,7 @@ impl ResolvedPortOverride {
     /// Field-by-field seed of the `connectionPool.http` fields from a
     /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
     ///
-    /// For each of the six `connectionPool.http` fields, the per-port value wins
+    /// For each supported `connectionPool.http` field, the per-port value wins
     /// when set; otherwise the fallback's value is inherited. This mirrors the
     /// NON-SD apply-time layering EXACTLY: there, the top-level
     /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
@@ -585,8 +585,8 @@ impl ResolvedPortOverride {
     /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
     /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
     ///
-    /// Only the six `connectionPool.http` fields are merged; the fallback only
-    /// ever carries those (it is built solely from the DR top-level
+    /// Only `connectionPool.http` fields are merged; the fallback only ever
+    /// carries those (it is built solely from the DR top-level
     /// `connectionPool.http` block), so non-`connectionPool.http` fields
     /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
     /// this per-port entry already has them.
@@ -1923,15 +1923,13 @@ pub struct Proxy {
     /// (always H2) or HBONE/mesh-mTLS transport selection.
     #[serde(skip)]
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
-    /// Istio DestinationRule `connectionPool.http.maxRequestsPerConnection`
-    /// (wire-projected). Populated at admit time directly, and at dispatch
-    /// time by `resolve_effective_proxy_for_target` from
-    /// `Upstream.port_overrides[port].http_max_requests_per_connection`.
-    /// Reqwest/hyper do not yet expose a stable close-after-N-requests
-    /// builder knob for the shared client pool, so the field is admitted,
-    /// persisted, and routed end-to-end but has no live runtime effect —
-    /// once hyper grows the knob (or a request-count wrapper is added) the
-    /// field will activate without further schema or projection work.
+    /// Deprecated proxy-level `maxRequestsPerConnection` carrier.
+    /// Reqwest/hyper do not expose a stable close-after-N-requests builder knob
+    /// for the shared backend client pool, so this direct proxy field is
+    /// admitted for backward compatibility but has no live runtime effect.
+    /// DestinationRule translation no longer projects into this field; K8s
+    /// status reports DR `connectionPool.http.maxRequestsPerConnection` as
+    /// deferred instead.
     /// `None` (default) = no configured cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
