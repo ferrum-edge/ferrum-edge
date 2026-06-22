@@ -1130,8 +1130,31 @@ pub fn merge_federation_into_trust_bundles(
         }
     }
 
+    overlay_polled_federation_bundles(&mut set, snapshot);
+    Some(set)
+}
+
+/// Merge federation bundles for mesh slice structural validation.
+///
+/// Unlike [`merge_federation_into_trust_bundles`], this keeps CP-supplied
+/// bootstrap bundles for dynamic federation endpoints even in fail-closed mode.
+/// They are required so `validate_multi_cluster` can prove the documented
+/// one-way declaration is structurally complete before the poller has fetched a
+/// last-good bundle. The active verifier path still calls
+/// `merge_federation_into_trust_bundles`, so these bootstrap bundles are not
+/// trusted for traffic until fail-open allows them or a poll succeeds.
+pub fn merge_federation_for_validation(
+    trust_bundles: Option<TrustBundleSet>,
+    snapshot: &FederationSnapshot,
+) -> Option<TrustBundleSet> {
+    let mut set = trust_bundles?;
+    overlay_polled_federation_bundles(&mut set, snapshot);
+    Some(set)
+}
+
+fn overlay_polled_federation_bundles(set: &mut TrustBundleSet, snapshot: &FederationSnapshot) {
     if snapshot.bundles.is_empty() {
-        return Some(set);
+        return;
     }
     // Dedupe by trust domain: drop any existing federated entries whose trust
     // domain the poller has fetched, then append the fresh polled bundles.
@@ -1140,7 +1163,6 @@ pub fn merge_federation_into_trust_bundles(
     for (_td, federated) in snapshot.bundles.iter() {
         set.federated.push(federated.bundle.clone());
     }
-    Some(set)
 }
 
 #[cfg(test)]
@@ -1461,6 +1483,57 @@ mod tests {
             merged.federated.is_empty(),
             "fail-closed mode must not activate a CP fallback for a dynamic federation endpoint before a poll succeeds"
         );
+    }
+
+    #[test]
+    fn validation_merge_keeps_cp_fallback_before_first_poll() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let remote_td = td("remote.example.com");
+        let cp_bundle = TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: td("local"),
+                x509_authorities: vec![sample_cert_base64()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: vec![TrustBundle {
+                trust_domain: remote_td.clone(),
+                x509_authorities: vec!["cp_value".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }],
+        };
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "remote".to_string(),
+                trust_domain: remote_td.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        let active = merge_federation_into_trust_bundles(
+            Some(cp_bundle.clone()),
+            &FederationSnapshot::default(),
+            Some(&mc),
+            false,
+            true,
+        )
+        .expect("active merge result");
+        assert!(
+            active.federated.is_empty(),
+            "fail-closed active trust must still block the CP fallback"
+        );
+
+        let validation =
+            merge_federation_for_validation(Some(cp_bundle), &FederationSnapshot::default())
+                .expect("validation merge result");
+        assert_eq!(validation.federated.len(), 1);
+        assert_eq!(validation.federated[0].trust_domain, remote_td);
+        assert_eq!(validation.federated[0].x509_authorities[0], "cp_value");
     }
 
     #[test]

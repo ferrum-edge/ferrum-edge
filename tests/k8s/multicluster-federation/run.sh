@@ -92,7 +92,7 @@ install_cluster() {
     --set-string eastWest.env.FERRUM_MESH_FEDERATION_FAIL_OPEN="$fail_open" \
     --set-string eastWest.env.FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=5 \
     --set-string eastWest.env.FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS=5 \
-    --set-string eastWest.env.FERRUM_MESH_TRUST_DOMAIN="$trust_domain" \
+    --set-string eastWest.env.FERRUM_MESH_WORKLOAD_SPIFFE_ID="spiffe://$trust_domain/ns/$NS/sa/ferrum-mesh" \
     --set-string eastWest.env.FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true \
     --set-string eastWest.env.FERRUM_MESH_ALLOW_NO_CA=true \
     --wait \

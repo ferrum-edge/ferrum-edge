@@ -1784,10 +1784,10 @@ async fn handle_mesh_remote_clusters_get(
         .proxy_state
         .as_ref()
         .is_some_and(|ps| ps.env_config.mesh_federation_fail_open);
-    let inbound_spiffe_verifier_configured = state
-        .proxy_state
-        .as_ref()
-        .is_some_and(|ps| ps.gateway_svid_bundle.load().is_some());
+    let inbound_spiffe_verifier_configured = state.proxy_state.as_ref().is_some_and(|ps| {
+        ps.mesh_inbound_spiffe_verifier_active
+            .load(Ordering::Acquire)
+    });
 
     let resp =
         mesh_remote_clusters::build_response(mesh_remote_clusters::MeshRemoteClustersInputs {

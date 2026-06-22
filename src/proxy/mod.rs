@@ -67,7 +67,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -2778,6 +2778,12 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Whether the current mesh inbound TLS posture is actually terminating
+    /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
+    /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
+    /// gateway SVID slot and stays false for plaintext or passthrough
+    /// topologies.
+    pub mesh_inbound_spiffe_verifier_active: Arc<AtomicBool>,
     /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement for stream-
     /// family egress (TCP / UDP / TCP+TLS / UDP+DTLS). `Some` only when
     /// (a) the gateway runs in mesh mode, (b) the resolved policy is
@@ -3980,6 +3986,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
@@ -4364,6 +4371,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
             backend_svid_generation,
