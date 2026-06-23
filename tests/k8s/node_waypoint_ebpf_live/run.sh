@@ -1501,8 +1501,28 @@ run_traffic_checks() {
   wait_for_ambient_mesh_slice
   wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
   wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
-  expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4
-  expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  if ! expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-a \
+      dst-a \
+      "recreated-source-not-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return 1
+  fi
+  if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-deny-regressed" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)"
+    return 1
+  fi
   record_live_assertion \
     node_waypoint.identity.stale_cleanup \
     pass \
