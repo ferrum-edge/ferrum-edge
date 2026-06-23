@@ -3077,6 +3077,9 @@ fn route_backends(
                 ),
                 port: backend_port,
                 weight,
+                service_namespace: Some(backend_namespace.clone()),
+                service_name: Some(backend_name.to_string()),
+                service_port: Some(backend_port),
             }],
         });
     }

@@ -552,6 +552,9 @@ pub(super) fn endpoint_route_backends_for_service(
                         host: address.clone(),
                         port: target_port,
                         weight,
+                        service_namespace: Some(namespace.to_string()),
+                        service_name: Some(service_name.to_string()),
+                        service_port: Some(service_port),
                     });
                 }
             }

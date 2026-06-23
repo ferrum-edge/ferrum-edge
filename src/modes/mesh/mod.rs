@@ -39,8 +39,9 @@ use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
     PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy, Upstream,
-    UpstreamPortOverride, UpstreamTarget,
+    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy,
+    UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -6584,10 +6585,30 @@ fn inject_mesh_global_plugins(
                     "id": upstream.id.clone(),
                     "namespace": upstream.namespace.clone(),
                     "targets": upstream.targets.iter().map(|target| {
-                        serde_json::json!({
+                        let service_port = target.service_port_policy_key.or_else(|| {
+                            target
+                                .tags
+                                .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
+                                .and_then(|value| value.parse::<u16>().ok())
+                                .filter(|port| *port != 0)
+                        });
+                        let mut target_config = serde_json::json!({
                             "host": target.host.clone(),
                             "port": target.port,
-                        })
+                        });
+                        if let Some(service_port) = service_port {
+                            target_config["service_port"] = serde_json::json!(service_port);
+                        }
+                        if let Some(namespace) =
+                            target.tags.get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
+                        {
+                            target_config["service_namespace"] =
+                                serde_json::json!(namespace.clone());
+                        }
+                        if let Some(name) = target.tags.get(UPSTREAM_TARGET_SERVICE_NAME_TAG) {
+                            target_config["service_name"] = serde_json::json!(name.clone());
+                        }
+                        target_config
                     }).collect::<Vec<_>>(),
                 })
             })

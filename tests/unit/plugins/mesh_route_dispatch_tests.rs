@@ -162,6 +162,37 @@ async fn mesh_route_dispatch_allows_node_waypoint_authorized_backend_override() 
 }
 
 #[tokio::test]
+async fn mesh_route_dispatch_allows_node_waypoint_authorized_backend_alias_override() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "stable.default.svc.cluster.local", "backend_port": 80}
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = ctx();
+    ctx.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_backend".to_string(),
+        "stable|80".to_string(),
+    );
+    ctx.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_backend_aliases".to_string(),
+        "stable|80,stable.default|80,stable.default.svc|80,stable.default.svc.cluster.local|80"
+            .to_string(),
+    );
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+    assert_eq!(ctx.route_override_backend_port, Some(80));
+}
+
+#[tokio::test]
 async fn mesh_route_dispatch_rejects_node_waypoint_authorized_backend_to_upstream_override() {
     let plugin = MeshRouteDispatch::new(&json!({
         "rules": [{

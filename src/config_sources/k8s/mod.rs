@@ -36,7 +36,8 @@ use serde_json::Value;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     MAX_TARGET_WEIGHT, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    RetryConfig, Upstream, UpstreamTarget, default_namespace,
+    RetryConfig, UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
@@ -2335,6 +2336,9 @@ pub(crate) struct RouteBackend {
     pub host: String,
     pub port: u16,
     pub weight: u32,
+    pub service_namespace: Option<String>,
+    pub service_name: Option<String>,
+    pub service_port: Option<u16>,
 }
 
 pub(crate) fn upstream_for_route(
@@ -2353,14 +2357,32 @@ pub(crate) fn upstream_for_route(
         namespace,
         targets: backends
             .into_iter()
-            .map(|backend| UpstreamTarget {
-                host: backend.host,
-                port: backend.port,
-                service_port_policy_key: None,
-                weight: backend.weight,
-                tags: HashMap::new(),
-                locality: None,
-                path: None,
+            .map(|backend| {
+                let mut tags = HashMap::new();
+                if let (Some(namespace), Some(name), Some(port)) = (
+                    backend.service_namespace.as_ref(),
+                    backend.service_name.as_ref(),
+                    backend.service_port,
+                ) {
+                    tags.insert(
+                        UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                        namespace.clone(),
+                    );
+                    tags.insert(UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(), name.clone());
+                    tags.insert(
+                        UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                        port.to_string(),
+                    );
+                }
+                UpstreamTarget {
+                    host: backend.host,
+                    port: backend.port,
+                    service_port_policy_key: backend.service_port,
+                    weight: backend.weight,
+                    tags,
+                    locality: None,
+                    path: None,
+                }
             })
             .collect(),
         algorithm: if has_weighted_target {

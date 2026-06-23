@@ -3158,6 +3158,194 @@ async fn mesh_authz_node_waypoint_virtual_service_split_upstream_uses_route_targ
     );
 }
 
+fn node_waypoint_endpoint_route_slice() -> MeshSlice {
+    let dst_spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/dst").expect("spiffe");
+    let dst_allow_trusted = MeshPolicy {
+        name: "dst-allow-trusted".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "dst".to_string())]),
+                namespace: None,
+            },
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/trusted".to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    MeshSlice {
+        mesh_policies: vec![dst_allow_trusted],
+        services: vec![MeshService {
+            name: "dst".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: None,
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: dst_spiffe.clone(),
+            }],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        }],
+        workloads: vec![Workload {
+            spiffe_id: dst_spiffe,
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "dst".to_string())]),
+                namespace: None,
+            },
+            service_name: "dst".to_string(),
+            addresses: vec!["10.0.0.20".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            remote_provenance: false,
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+fn node_waypoint_route_proxy(upstream_id: &str) -> Arc<Proxy> {
+    Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "vs-split",
+            "namespace": "default",
+            "hosts": ["api.example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": upstream_id
+        }))
+        .expect("proxy"),
+    )
+}
+
+fn node_waypoint_scoped_context(source_sa: &str, upstream_id: &str) -> RequestContext {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let principal = format!("spiffe://cluster.local/ns/default/sa/{source_sa}");
+    let mut ctx = request_context(Some(&principal));
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new(&principal).expect("spiffe"),
+        "default",
+        HashMap::from([("app".to_string(), "src".to_string())]),
+    )));
+    ctx.matched_proxy = Some(node_waypoint_route_proxy(upstream_id));
+    ctx
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_route_upstream_uses_endpoint_service_metadata() {
+    let upstream_id = "gwapi-route-upstream-default-api-0";
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+        "node_waypoint_route_upstreams": [{
+            "id": upstream_id,
+            "namespace": "default",
+            "targets": [{
+                "host": "10.0.0.20",
+                "port": 8080,
+                "service_namespace": "default",
+                "service_name": "dst",
+                "service_port": 80
+            }]
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = node_waypoint_scoped_context("trusted", upstream_id);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "trusted source should be allowed through endpoint-expanded route target, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.node_waypoint_authorized_upstream_id")
+            .map(String::as_str),
+        Some(upstream_id)
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_route_upstream_with_mixed_unscoped_target_fails_closed() {
+    let upstream_id = "gwapi-route-upstream-default-api-0";
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+        "node_waypoint_route_upstreams": [{
+            "id": upstream_id,
+            "namespace": "default",
+            "targets": [
+                {
+                    "host": "dst",
+                    "port": 80
+                },
+                {
+                    "host": "external.example.com",
+                    "port": 443
+                }
+            ]
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = node_waypoint_scoped_context("trusted", upstream_id);
+
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("mixed scoped/unscoped route upstream must fail closed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_endpoint_route_without_service_metadata_fails_closed() {
+    let upstream_id = "gwapi-route-upstream-default-api-0";
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+        "node_waypoint_route_upstreams": [{
+            "id": upstream_id,
+            "namespace": "default",
+            "targets": [{
+                "host": "10.0.0.20",
+                "port": 8080
+            }]
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = node_waypoint_scoped_context("trusted", upstream_id);
+
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!(
+            "endpoint-expanded route target without service metadata must fail closed, got {other:?}"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn mesh_authz_node_waypoint_destination_scopes_follow_target_port_eligibility() {
     use ferrum_edge::identity::SpiffeId;

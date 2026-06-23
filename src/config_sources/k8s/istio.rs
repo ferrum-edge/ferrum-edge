@@ -3087,10 +3087,26 @@ fn route_backends(
             ));
         };
         let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
+        let service_identity = service_host_components(
+            host,
+            &object.metadata.namespace,
+            &acc.options.cluster_domain,
+        )
+        .and_then(|(svc, ns)| {
+            acc.service_port_exists(ns, svc, port)
+                .then(|| (ns.to_string(), svc.to_string(), port))
+        });
         backends.push(RouteBackend {
             host: host.to_string(),
             port,
             weight,
+            service_namespace: service_identity
+                .as_ref()
+                .map(|(namespace, _, _)| namespace.clone()),
+            service_name: service_identity
+                .as_ref()
+                .map(|(_, service, _)| service.clone()),
+            service_port: service_identity.map(|(_, _, port)| port),
         });
     }
     if skipped_zero > 0 {

@@ -74,6 +74,10 @@ pub struct MeshAuthz {
         NamespacedDestinationBackendKey,
         Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
     >,
+    destination_backend_aliases_by_backend:
+        HashMap<DestinationBackendKey, Vec<DestinationBackendKey>>,
+    destination_backend_aliases_by_namespaced_backend:
+        HashMap<NamespacedDestinationBackendKey, Vec<DestinationBackendKey>>,
     destination_service_backend_hosts: HashSet<String>,
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: HashSet<String>,
@@ -166,6 +170,8 @@ pub(crate) const NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA: &str =
     "mesh_authz.node_waypoint_authorized_upstream_id";
 pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA: &str =
     "mesh_authz.node_waypoint_authorized_backend";
+pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA: &str =
+    "mesh_authz.node_waypoint_authorized_backend_aliases";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DestinationBackendKey {
@@ -245,12 +251,26 @@ impl ServicePortKey {
             port,
         }
     }
+
+    fn from_parts(namespace: &str, name: &str, port: u16) -> Option<Self> {
+        if port == 0 || namespace.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            namespace: namespace.trim().to_ascii_lowercase(),
+            name: name.trim().to_ascii_lowercase(),
+            port,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 enum NodeWaypointAuthorizedDestination {
     Upstream(String),
-    Backend(DestinationBackendKey),
+    Backend {
+        key: DestinationBackendKey,
+        aliases: Vec<DestinationBackendKey>,
+    },
 }
 
 struct DestinationScopeMatch<'a> {
@@ -266,6 +286,9 @@ struct DestinationPolicyScopeIndex {
         NamespacedDestinationBackendKey,
         Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
     >,
+    backend_aliases_by_backend: HashMap<DestinationBackendKey, Vec<DestinationBackendKey>>,
+    backend_aliases_by_namespaced_backend:
+        HashMap<NamespacedDestinationBackendKey, Vec<DestinationBackendKey>>,
     service_backend_hosts: HashSet<String>,
     namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     route_upstreams_requiring_scope: HashSet<String>,
@@ -283,6 +306,12 @@ struct NodeWaypointRouteUpstreamConfig {
 struct NodeWaypointRouteTargetConfig {
     host: String,
     port: u16,
+    #[serde(default)]
+    service_namespace: Option<String>,
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    service_port: Option<u16>,
 }
 
 impl ConditionAttributeKeys {
@@ -419,6 +448,55 @@ fn service_port_key_for_backend(
     namespaced_service_ports.get(&key).cloned()
 }
 
+fn service_port_key_for_route_target(
+    target: &NodeWaypointRouteTargetConfig,
+    default_namespace: &str,
+    qualified_service_ports: &HashMap<DestinationBackendKey, ServicePortKey>,
+    namespaced_service_ports: &HashMap<NamespacedDestinationBackendKey, ServicePortKey>,
+) -> Option<ServicePortKey> {
+    if let (Some(service_name), Some(service_port)) =
+        (target.service_name.as_deref(), target.service_port)
+    {
+        let namespace = target
+            .service_namespace
+            .as_deref()
+            .unwrap_or(default_namespace);
+        return ServicePortKey::from_parts(namespace, service_name, service_port);
+    }
+    let service_port = target.service_port.unwrap_or(target.port);
+    service_port_key_for_backend(
+        &target.host,
+        service_port,
+        default_namespace,
+        qualified_service_ports,
+        namespaced_service_ports,
+    )
+}
+
+fn destination_backend_aliases_for_service_port(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: u16,
+    qualified_aliases: &[String],
+    include_short_name: bool,
+) -> Vec<DestinationBackendKey> {
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+    for alias in qualified_aliases {
+        if let Some(key) = DestinationBackendKey::new(alias, service_port)
+            && seen.insert(key.clone())
+        {
+            aliases.push(key);
+        }
+    }
+    if include_short_name
+        && let Some(key) = DestinationBackendKey::new(&service.name, service_port)
+        && seen.insert(key.clone())
+    {
+        aliases.push(key);
+    }
+    aliases
+}
+
 fn destination_policy_scope_index(
     slice: &MeshSlice,
     cluster_domain: &str,
@@ -428,6 +506,14 @@ fn destination_policy_scope_index(
     let mut service_port_scopes = HashMap::new();
     let mut qualified_service_ports = HashMap::new();
     let mut namespaced_service_ports = HashMap::new();
+    let mut workload_backend_hosts = HashSet::new();
+    for workload in &slice.workloads {
+        for address in &workload.addresses {
+            if let Some(address) = normalize_destination_backend_host(address) {
+                workload_backend_hosts.insert(address);
+            }
+        }
+    }
     for service in &slice.services {
         let aliases = service_qualified_host_aliases(service, cluster_domain);
         for alias in &aliases {
@@ -442,6 +528,18 @@ fn destination_policy_scope_index(
         }
         for service_port in &service.ports {
             let service_key = ServicePortKey::new(service, service_port.port);
+            let qualified_backend_aliases = destination_backend_aliases_for_service_port(
+                service,
+                service_port.port,
+                &aliases,
+                false,
+            );
+            let namespaced_backend_aliases = destination_backend_aliases_for_service_port(
+                service,
+                service_port.port,
+                &aliases,
+                true,
+            );
             for alias in &aliases {
                 if let Some(key) = DestinationBackendKey::new(alias, service_port.port) {
                     qualified_service_ports.insert(key, service_key.clone());
@@ -477,42 +575,69 @@ fn destination_policy_scope_index(
                     index.by_backend.insert(key, scopes.clone());
                 }
             }
+            for alias_key in &qualified_backend_aliases {
+                index
+                    .backend_aliases_by_backend
+                    .insert(alias_key.clone(), qualified_backend_aliases.clone());
+            }
             if let Some(key) = NamespacedDestinationBackendKey::new(
                 &service.namespace,
                 &service.name,
                 service_port.port,
             ) {
-                index.by_namespaced_backend.insert(key, scopes.clone());
+                index
+                    .by_namespaced_backend
+                    .insert(key.clone(), scopes.clone());
+                index
+                    .backend_aliases_by_namespaced_backend
+                    .insert(key, namespaced_backend_aliases);
             }
         }
     }
     for upstream in route_upstreams {
         let mut route_scopes = Vec::new();
-        let mut service_target_seen = false;
+        let mut requires_destination_scope = false;
+        let mut unscoped_target_seen = false;
+        let mut external_target_seen = false;
         let mut seen_service_ports = HashSet::new();
         for target in &upstream.targets {
-            let Some(service_key) = service_port_key_for_backend(
-                &target.host,
-                target.port,
+            let Some(service_key) = service_port_key_for_route_target(
+                target,
                 &upstream.namespace,
                 &qualified_service_ports,
                 &namespaced_service_ports,
             ) else {
+                let host = normalize_destination_backend_host(&target.host);
+                if host.is_some_and(|host| workload_backend_hosts.contains(&host))
+                    || target.service_name.is_some()
+                    || target.service_port.is_some()
+                {
+                    requires_destination_scope = true;
+                    unscoped_target_seen = true;
+                } else {
+                    external_target_seen = true;
+                }
                 continue;
             };
-            service_target_seen = true;
-            if seen_service_ports.insert(service_key.clone())
-                && let Some(scopes) = service_port_scopes.get(&service_key)
-            {
-                route_scopes.extend(scopes.clone());
+            requires_destination_scope = true;
+            if seen_service_ports.insert(service_key.clone()) {
+                if let Some(scopes) = service_port_scopes.get(&service_key) {
+                    route_scopes.extend(scopes.clone());
+                } else {
+                    unscoped_target_seen = true;
+                }
             }
         }
-        if service_target_seen {
+        if requires_destination_scope {
             index
                 .route_upstreams_requiring_scope
                 .insert(upstream.id.clone());
         }
-        if !route_scopes.is_empty() {
+        if requires_destination_scope
+            && !unscoped_target_seen
+            && !external_target_seen
+            && !route_scopes.is_empty()
+        {
             index.by_upstream.insert(upstream.id.clone(), route_scopes);
         }
     }
@@ -849,6 +974,10 @@ impl MeshAuthz {
             destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
             destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
                 .by_namespaced_backend,
+            destination_backend_aliases_by_backend: destination_policy_scope_index
+                .backend_aliases_by_backend,
+            destination_backend_aliases_by_namespaced_backend: destination_policy_scope_index
+                .backend_aliases_by_namespaced_backend,
             destination_service_backend_hosts: destination_policy_scope_index.service_backend_hosts,
             destination_namespaced_service_backend_hosts: destination_policy_scope_index
                 .namespaced_service_backend_hosts,
@@ -1060,8 +1189,16 @@ impl MeshAuthz {
         }
         let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
         if let Some(scopes) = self.destination_policy_scopes_by_backend.get(&backend_key) {
+            let aliases = self
+                .destination_backend_aliases_by_backend
+                .get(&backend_key)
+                .cloned()
+                .unwrap_or_else(|| vec![backend_key.clone()]);
             return Some(DestinationScopeMatch {
-                authorized_destination: NodeWaypointAuthorizedDestination::Backend(backend_key),
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                    key: backend_key,
+                    aliases,
+                },
                 scopes,
             });
         }
@@ -1073,9 +1210,14 @@ impl MeshAuthz {
         self.destination_policy_scopes_by_namespaced_backend
             .get(&namespaced_backend_key)
             .map(|scopes| DestinationScopeMatch {
-                authorized_destination: NodeWaypointAuthorizedDestination::Backend(
-                    namespaced_backend_key.backend_key(),
-                ),
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                    key: namespaced_backend_key.backend_key(),
+                    aliases: self
+                        .destination_backend_aliases_by_namespaced_backend
+                        .get(&namespaced_backend_key)
+                        .cloned()
+                        .unwrap_or_else(|| vec![namespaced_backend_key.backend_key()]),
+                },
                 scopes,
             })
     }
@@ -1566,11 +1708,21 @@ impl Plugin for MeshAuthz {
                         upstream_id,
                     );
                 }
-                NodeWaypointAuthorizedDestination::Backend(backend) => {
+                NodeWaypointAuthorizedDestination::Backend { key, aliases } => {
                     ctx.metadata.insert(
                         NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA.to_string(),
-                        backend.metadata_value(),
+                        key.metadata_value(),
                     );
+                    if !aliases.is_empty() {
+                        ctx.metadata.insert(
+                            NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA.to_string(),
+                            aliases
+                                .iter()
+                                .map(DestinationBackendKey::metadata_value)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                    }
                 }
             }
         }

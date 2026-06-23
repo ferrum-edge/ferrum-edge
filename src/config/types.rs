@@ -708,6 +708,10 @@ impl ResolvedSubsetTrafficPolicy {
 }
 
 /// A single backend target within an upstream group.
+pub const UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG: &str = "_ferrum_service_namespace";
+pub const UPSTREAM_TARGET_SERVICE_NAME_TAG: &str = "_ferrum_service_name";
+pub const UPSTREAM_TARGET_SERVICE_PORT_TAG: &str = "_ferrum_service_port";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamTarget {
     pub host: String,

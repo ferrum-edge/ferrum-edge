@@ -67,7 +67,8 @@ use crate::config::types::{
     validate_backend_tls_sni,
 };
 use crate::plugins::mesh::authz::{
-    NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA, NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA,
+    NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
+    NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA,
 };
 use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
@@ -1016,6 +1017,9 @@ fn reject_node_waypoint_authz_destination_override(
         .metadata
         .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA);
     let authorized_backend = ctx.metadata.get(NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA);
+    let authorized_backend_aliases = ctx
+        .metadata
+        .get(NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA);
     if authorized_upstream_id.is_none() && authorized_backend.is_none() {
         return None;
     }
@@ -1032,12 +1036,16 @@ fn reject_node_waypoint_authz_destination_override(
     }
     if let Some(authorized_backend) = authorized_backend
         && destination.upstream_id.is_none()
-        && destination
-            .backend_host
-            .as_deref()
-            .and_then(|host| node_waypoint_backend_metadata_value(host, destination.backend_port?))
-            .as_deref()
-            == Some(authorized_backend.as_str())
+        && let Some(destination_backend) = destination.backend_host.as_deref().and_then(|host| {
+            destination
+                .backend_port
+                .and_then(|port| node_waypoint_backend_metadata_value(host, port))
+        })
+        && (destination_backend == *authorized_backend
+            || node_waypoint_backend_metadata_contains(
+                authorized_backend_aliases.map(String::as_str),
+                &destination_backend,
+            ))
     {
         return None;
     }
@@ -1056,6 +1064,13 @@ fn node_waypoint_backend_metadata_value(host: &str, port: u16) -> Option<String>
     }
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then(|| format!("{host}|{port}"))
+}
+
+fn node_waypoint_backend_metadata_contains(values: Option<&str>, backend: &str) -> bool {
+    values
+        .into_iter()
+        .flat_map(|values| values.split(','))
+        .any(|value| value.trim() == backend)
 }
 
 /// Per-rule fault action carried by a single [`RouteRule`]. Projects Istio
