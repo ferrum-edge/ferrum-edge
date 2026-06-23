@@ -77,10 +77,12 @@ need them, or because they are blocked upstream / architecturally:
   (`FERRUM_MESH_WORKLOAD_SPIFFE_ID` or `FERRUM_GATEWAY_SPIFFE_ID`) before
   publishing secured metadata. Captured Service targets consume that metadata
   when present by dialing the destination NodeWaypoint over SPIFFE-mTLS HBONE
-  while preserving the selected workload as the inner CONNECT authority; no-CA
-  and no-identity waypoint pods retain the current plaintext compatibility
-  fallback. Broader promotion still waits on mandatory fail-closed enforcement,
-  production SPIRE, and inbound direct-pod enforcement.
+  while preserving the selected workload as the inner CONNECT authority.
+  Identity-backed source NodeWaypoint runtimes skip metadata-absent service
+  targets so they cannot become plaintext backends; explicit no-CA/no-identity
+  development runs retain the temporary plaintext fallback. Broader promotion
+  still waits on production SPIRE, destination-side validation, and inbound
+  direct-pod enforcement.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
   services or proxies force the NodeWaypoint UDP/DTLS path closed during config

@@ -375,9 +375,10 @@ pub(crate) fn mesh_node_waypoint_plaintext_target_tags(
 /// metadata, the target is marked for HBONE dispatch to that NodeWaypoint and
 /// pins the NodeWaypoint SVID. The target host/port still name the selected
 /// workload app endpoint and therefore become the CONNECT authority. When the
-/// metadata is absent, retain the current plaintext NodeWaypoint target shape
-/// until the control plane population + enforcement PRs make the field
-/// mandatory.
+/// metadata is absent, this helper returns the temporary plaintext target shape;
+/// identity-backed NodeWaypoint materialization gates those targets out before
+/// dispatch so missing metadata fails closed instead of becoming a plaintext
+/// backend.
 pub(crate) fn mesh_node_waypoint_target_tags(
     service: &MeshService,
     workload: &Workload,

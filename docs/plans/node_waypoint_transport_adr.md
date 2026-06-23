@@ -70,10 +70,13 @@ falling back to the named `hbone` container port/default,
 expected `spiffe_id`, and the owning Node object supplies `node_uid` when
 available. Pods with `FERRUM_MESH_ALLOW_NO_CA=true` or without an explicit
 waypoint SVID identity remain recognized as NodeWaypoint proxy pods for
-exclusion purposes, but do not publish `node_waypoint` metadata; this preserves
-the current plaintext compatibility fallback until secured transport material
-exists. If the slice does not name a destination NodeWaypoint for an enrolled
-in-mesh target, the route fails closed.
+exclusion purposes, but do not publish `node_waypoint` metadata.
+Identity-backed source NodeWaypoint runtimes (file SVID material or mesh CA
+backend; production mode requires one of those identity sources) skip
+metadata-absent service targets so the route fails closed instead of retaining a
+plaintext backend. Explicit no-CA/no-identity development runs keep the
+temporary plaintext compatibility fallback until the SPIRE production live
+fixture replaces it.
 
 Implementation status: the data plane now consumes `Workload.node_waypoint`
 when it is present on a selected captured-Service workload. It materializes a
@@ -82,9 +85,10 @@ endpoint, whose pinned peer identity is the NodeWaypoint SPIFFE ID, and whose
 inner CONNECT authority remains the selected workload app address and port.
 Kubernetes pod discovery now populates `node_waypoint` for service-backed
 workloads when their node has a trusted ready NodeWaypoint proxy Pod;
-metadata-absent targets retain the current compatibility fallback until the H2
-enforcement PR removes that fallback for enrolled in-mesh destinations and
-makes missing metadata fail closed.
+identity-backed source NodeWaypoint runtimes now make missing destination
+metadata fail closed by skipping those targets during materialization. The
+temporary plaintext compatibility fallback remains only for explicit
+no-CA/no-identity development runs.
 
 ## Destination NodeWaypoint Identity
 

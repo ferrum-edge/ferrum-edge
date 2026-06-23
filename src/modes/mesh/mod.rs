@@ -389,6 +389,18 @@ pub struct MeshRuntimeConfig {
 }
 
 impl MeshRuntimeConfig {
+    fn node_waypoint_secured_transport_required(&self) -> bool {
+        if self.topology != MeshTopology::NodeWaypoint {
+            return false;
+        }
+        if self.ca_backend != CaBackend::None {
+            return true;
+        }
+        self.workload_svid_cert_path.is_some()
+            && self.workload_svid_key_path.is_some()
+            && self.workload_svid_trust_bundle_path.is_some()
+    }
+
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
         let cp_urls = env_config.resolved_dp_cp_grpc_urls();
@@ -3675,18 +3687,22 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
 /// Mesh transports are PER-TOPOLOGY (see `.claude/rules/mesh.md` "Datapath
 /// Layering"): Ambient speaks HBONE on `:15008`; Sidecar speaks plain
 /// SVID-mTLS HTTP on `:15006`. NodeWaypoint captured-Service HTTP dispatch has
-/// no reachable backing-pod mesh transport, so it deliberately carries no
-/// transport tag after the source pod has been attributed and authorized.
+/// no pod-local backing-pod mesh transport. In an identity-backed posture it
+/// requires `Workload.node_waypoint` metadata and emits a secured HBONE target
+/// to the destination NodeWaypoint; in explicit no-CA/dev posture it preserves
+/// the temporary plaintext compatibility target while H2 production live gates
+/// are still being built.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MeshEgressTransport {
     /// HBONE: HTTP/2 CONNECT over mTLS to the destination's `:15008`
     /// (`mesh.hbone`-tagged targets → `HboneConnectionPool`).
     Hbone,
     /// NodeWaypoint captured HTTP Service traffic: run the normal route/plugin
-    /// chain from the pod-netns capture listener, then dispatch ordinary HTTP
-    /// to the selected backing pod app port. This is not used for direct Pod-IP
-    /// routes or raw stream materialization.
-    NodeWaypointPlaintext,
+    /// chain from the pod-netns capture listener, then dispatch according to
+    /// the selected workload's NodeWaypoint metadata and the runtime identity
+    /// posture. This is not used for direct Pod-IP routes or raw stream
+    /// materialization.
+    NodeWaypointCapturedService,
     /// Plain SVID-mTLS HTTP/2 to the destination sidecar's inbound `:15006`
     /// (`mesh.mtls`-tagged targets → `MeshMtlsConnectionPool`).
     SidecarMtls,
@@ -3740,7 +3756,7 @@ fn materialize_mesh_outbound_proxies(
 ) {
     let transport = match runtime.topology {
         MeshTopology::Ambient => MeshEgressTransport::Hbone,
-        MeshTopology::NodeWaypoint => MeshEgressTransport::NodeWaypointPlaintext,
+        MeshTopology::NodeWaypoint => MeshEgressTransport::NodeWaypointCapturedService,
         MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
         // Gateway and ServiceWaypoint topologies have their own materializers
         // and no plaintext outbound capture listener.
@@ -3938,7 +3954,8 @@ fn materialize_mesh_outbound_proxies(
             outbound_http_bywl_proxies = http_bywl_materialized,
             transport = match transport {
                 MeshEgressTransport::Hbone => "hbone",
-                MeshEgressTransport::NodeWaypointPlaintext => "node_waypoint_plaintext",
+                MeshEgressTransport::NodeWaypointCapturedService =>
+                    "node_waypoint_captured_service",
                 MeshEgressTransport::SidecarMtls => "mtls",
             },
             "Materialized mesh outbound egress routes to in-mesh services"
@@ -4097,7 +4114,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 spec.protocol,
                 spec.service_port.name.as_deref(),
             ),
-            MeshEgressTransport::NodeWaypointPlaintext => {
+            MeshEgressTransport::NodeWaypointCapturedService => {
                 crate::service_discovery::mesh::mesh_node_waypoint_target_tags(
                     spec.service,
                     spec.workload,
@@ -4125,7 +4142,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                     );
                 }
             }
-            MeshEgressTransport::NodeWaypointPlaintext => {}
+            MeshEgressTransport::NodeWaypointCapturedService => {}
             MeshEgressTransport::SidecarMtls => {
                 if runtime.egress_mtls_port
                     != crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT
@@ -4459,8 +4476,8 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
 /// still produce distinct targets, with remote-cluster endpoints filtered out),
 /// tags each target for the topology's dispatch posture via the shared
 /// `service_discovery::mesh` tag builders (HBONE for Ambient, SVID-mTLS for
-/// Sidecar, and transport-tagless captured-Service dispatch for NodeWaypoint),
-/// and
+/// Sidecar, and NodeWaypoint metadata-backed HBONE or dev-only plaintext
+/// captured-Service dispatch for NodeWaypoint), and
 /// sets `UpstreamTarget.port` to the app (container) port the service port
 /// forwards to (the HBONE CONNECT authority port / DR `port_overrides` key),
 /// not the service port. The transport's own DIAL port (15008 / 15006, or the
@@ -4484,7 +4501,20 @@ fn build_outbound_mesh_targets(
     multi_port_service: bool,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
+    let require_node_waypoint_metadata = transport
+        == MeshEgressTransport::NodeWaypointCapturedService
+        && runtime.node_waypoint_secured_transport_required();
     for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
+        if require_node_waypoint_metadata && workload.node_waypoint.is_none() {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                workload_spiffe = %workload.spiffe_id,
+                "Skipping NodeWaypoint service target without destination node_waypoint metadata; \
+                 secured NodeWaypoint transport is required in this identity posture"
+            );
+            continue;
+        }
         // App (container) port the request is for. A DECLARED `targetPort` is
         // authoritative: resolve it, or SKIP this target (fail closed) rather
         // than fall back to the service port — an unresolved named targetPort
@@ -4510,7 +4540,7 @@ fn build_outbound_mesh_targets(
                 protocol,
                 service_port.name.as_deref(),
             ),
-            MeshEgressTransport::NodeWaypointPlaintext => {
+            MeshEgressTransport::NodeWaypointCapturedService => {
                 crate::service_discovery::mesh::mesh_node_waypoint_target_tags(
                     service,
                     workload,
@@ -4539,7 +4569,7 @@ fn build_outbound_mesh_targets(
                     );
                 }
             }
-            MeshEgressTransport::NodeWaypointPlaintext => {}
+            MeshEgressTransport::NodeWaypointCapturedService => {}
             MeshEgressTransport::SidecarMtls => {
                 if runtime.egress_mtls_port
                     != crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT
@@ -12289,6 +12319,15 @@ mod tests {
         }
     }
 
+    fn identity_backed_node_waypoint_runtime() -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            workload_svid_cert_path: Some("/var/run/ferrum/svid.pem".to_string()),
+            workload_svid_key_path: Some("/var/run/ferrum/svid.key".to_string()),
+            workload_svid_trust_bundle_path: Some("/var/run/ferrum/bundle.pem".to_string()),
+            ..node_waypoint_runtime()
+        }
+    }
+
     #[test]
     fn mesh_outbound_materializes_hbone_route_for_ambient_service() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
@@ -12345,7 +12384,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_materializes_node_waypoint_captured_service_route_without_transport_tag() {
+    fn mesh_outbound_node_waypoint_dev_fallback_materializes_plaintext_captured_service_route() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let slice = MeshSlice {
             namespace: "default".to_string(),
@@ -12395,6 +12434,38 @@ mod tests {
                 .tags
                 .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG),
             "NodeWaypoint captured-Service dispatch must not claim sidecar mTLS transport"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_node_waypoint_identity_backed_missing_metadata_fails_closed() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(
+            &mut config,
+            &identity_backed_node_waypoint_runtime(),
+            &slice,
+        );
+
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-outbound-default-reviews-8080"),
+            "identity-backed NodeWaypoint must not materialize a Service route whose selected workload lacks node_waypoint metadata"
+        );
+        assert!(
+            !config
+                .upstreams
+                .iter()
+                .any(|u| u.id == "__mesh-out-upstream-default-reviews-8080"),
+            "missing destination NodeWaypoint metadata must fail closed instead of retaining a plaintext upstream"
         );
     }
 
