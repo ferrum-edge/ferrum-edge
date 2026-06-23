@@ -2,14 +2,13 @@
 //!
 //! # Why this exists
 //!
-//! In node-waypoint topology the eBPF `connect4` hook rewrites a captured pod's
-//! outbound `connect()` to `127.0.0.1:15001` (the outbound capture port). That
-//! destination is **pod loopback** — it never leaves the pod's network
-//! namespace — so the connection can only be accepted by a socket that lives
-//! *inside that pod's netns*. A single listener bound on `127.0.0.1:15001` in
-//! the host/proxy netns (the default outbound listener) can therefore never
-//! receive captured traffic from any pod: there is nothing listening on the
-//! pod's own loopback.
+//! In node-waypoint topology the eBPF `connect4`/`connect6` hooks rewrite a
+//! captured pod's outbound `connect()` to `127.0.0.1:15001` or `[::1]:15001`
+//! (the outbound capture port). Those destinations are **pod loopback** — they
+//! never leave the pod's network namespace — so the connection can only be
+//! accepted by sockets that live *inside that pod's netns*. Host/proxy-netns
+//! loopback listeners can therefore never receive captured traffic from any pod:
+//! there is nothing listening on the pod's own loopback.
 //!
 //! The listener itself is scoped to exactly one pod netns, so the accept path
 //! passes the listener's expected pod UID as the primary source-identity gate:
@@ -26,21 +25,21 @@
 //!
 //! # What this does
 //!
-//! For each pod the node-agent has enrolled for capture, the mesh proxy opens a
-//! `127.0.0.1:15001` listener **inside that pod's network namespace** (entering
-//! via `setns(CLONE_NEWNET)` on a dedicated OS thread — the same pattern as
-//! [`crate::ebpf::veth`]) and runs the normal proxy accept loop on the returned
-//! socket. The listening socket's fd is process-global once created, so the
-//! accept loop runs on the shared tokio runtime in the host netns; only the
-//! `bind()` happens in the pod netns. The accepted connection then resolves its
-//! source pod identity from the listener pod UID and uses cookie metadata, when
-//! present, only after validating it against that UID.
+//! For each pod the node-agent has enrolled for capture, the mesh proxy opens
+//! `127.0.0.1:15001` and `[::1]:15001` listeners **inside that pod's network
+//! namespace** (entering via `setns(CLONE_NEWNET)` on a dedicated OS thread —
+//! the same pattern as [`crate::ebpf::veth`]) and runs the normal proxy accept
+//! loop on the returned sockets. Each listening socket's fd is process-global
+//! once created, so the accept loop runs on the shared tokio runtime in the host
+//! netns; only the `bind()` happens in the pod netns. The accepted connection
+//! then resolves its source pod identity from the listener pod UID and uses
+//! cookie metadata, when present, only after validating it against that UID.
 //!
 //! The node-agent (which watches pods and holds their cgroup paths) publishes
 //! the enrolled-pod set to a pinned registry directory; this manager polls it
-//! and reconciles **one listener per pod netns** (deduplicated by netns inode,
-//! since a pod's sandbox + containers share one netns). Pods that come and go
-//! drive listener open/close.
+//! and reconciles **one listener per address family per pod netns** (deduplicated
+//! by netns inode, since a pod's sandbox + containers share one netns). Pods that
+//! come and go drive listener open/close.
 //!
 //! # Verification
 //!
@@ -53,7 +52,7 @@
 //! `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,10 +167,55 @@ impl OpenedNetnsListener {
     }
 }
 
-/// One open in-netns listener, keyed in the manager by netns inode.
-struct ActiveListener {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CaptureFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl CaptureFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptureEndpoint {
+    family: CaptureFamily,
+    addr: SocketAddr,
+}
+
+fn capture_endpoints_from_port(port: u16) -> [CaptureEndpoint; 2] {
+    [
+        CaptureEndpoint {
+            family: CaptureFamily::Ipv4,
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        },
+        CaptureEndpoint {
+            family: CaptureFamily::Ipv6,
+            addr: SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        },
+    ]
+}
+
+struct ActiveFamilyListener {
     stop: watch::Sender<bool>,
     source_ip_tx: Option<watch::Sender<Option<IpAddr>>>,
+}
+
+impl ActiveFamilyListener {
+    fn close(&self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+/// Open in-netns listeners for one network namespace, keyed in the manager by
+/// netns inode.
+struct ActiveListener {
+    listeners: HashMap<CaptureFamily, ActiveFamilyListener>,
     /// Pods sharing this netns (normally exactly one; a pod's sandbox and
     /// containers share its netns). Kept for observability and so a netns stays
     /// open while any of its pods is still enrolled.
@@ -184,7 +228,13 @@ struct ActiveListener {
 
 impl ActiveListener {
     fn close(&self) {
-        let _ = self.stop.send(true);
+        for listener in self.listeners.values() {
+            listener.close();
+        }
+    }
+
+    fn has_family(&self, family: CaptureFamily) -> bool {
+        self.listeners.contains_key(&family)
     }
 }
 
@@ -205,49 +255,132 @@ fn ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
     Some(dir.join(pod_uid))
 }
 
-/// Publish a listener-readiness marker for `pod_uid`. Best-effort: a failure to
-/// create the directory or write the file is logged and swallowed (the pod just
-/// stays un-redirected a little longer on the node-agent side, which is the
-/// safe direction).
-fn write_ready_marker(dir: &Path, pod_uid: &str) {
+fn ready_family_dir(legacy_ready_dir: &Path, family: CaptureFamily) -> PathBuf {
+    let family_dir = match family {
+        CaptureFamily::Ipv4 => ".ready4",
+        CaptureFamily::Ipv6 => ".ready6",
+    };
+    legacy_ready_dir
+        .parent()
+        .map(|parent| parent.join(family_dir))
+        .unwrap_or_else(|| legacy_ready_dir.join(family_dir))
+}
+
+fn ready_marker_dirs_for_family(dir: &Path, family: CaptureFamily) -> Vec<PathBuf> {
+    match family {
+        CaptureFamily::Ipv4 => vec![dir.to_path_buf(), ready_family_dir(dir, family)],
+        CaptureFamily::Ipv6 => vec![ready_family_dir(dir, family)],
+    }
+}
+
+fn write_marker_file(dir: &Path, pod_uid: &str, family: CaptureFamily) {
     let Some(path) = ready_marker_path(dir, pod_uid) else {
         return;
     };
     if let Err(error) = std::fs::create_dir_all(dir) {
-        warn!(pod_uid, dir = %dir.display(), %error, "Failed to create in-netns readiness marker dir");
+        warn!(pod_uid, dir = %dir.display(), family = family.as_str(), %error, "Failed to create in-netns readiness marker dir");
         return;
     }
     if let Err(error) = std::fs::write(&path, b"") {
-        warn!(pod_uid, path = %path.display(), %error, "Failed to write in-netns readiness marker");
+        warn!(pod_uid, path = %path.display(), family = family.as_str(), %error, "Failed to write in-netns readiness marker");
     }
 }
 
-/// Remove a listener-readiness marker for `pod_uid`. A missing file is success.
-fn remove_ready_marker(dir: &Path, pod_uid: &str) {
+/// Publish a listener-readiness marker for `pod_uid` and `family`. Best-effort:
+/// a failure to create the directory or write the file is logged and swallowed;
+/// the affected family remains visibly unready and captured connects continue to
+/// fail closed until a listener exists.
+fn write_ready_marker(dir: &Path, pod_uid: &str, family: CaptureFamily) {
+    for marker_dir in ready_marker_dirs_for_family(dir, family) {
+        write_marker_file(&marker_dir, pod_uid, family);
+    }
+}
+
+fn remove_marker_file(dir: &Path, pod_uid: &str, family: CaptureFamily) {
     let Some(path) = ready_marker_path(dir, pod_uid) else {
         return;
     };
     if let Err(error) = std::fs::remove_file(&path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        warn!(pod_uid, path = %path.display(), %error, "Failed to remove in-netns readiness marker");
+        warn!(pod_uid, path = %path.display(), family = family.as_str(), %error, "Failed to remove in-netns readiness marker");
+    }
+}
+
+/// Remove listener-readiness markers for `pod_uid`. Missing files are success.
+fn remove_ready_marker(dir: &Path, pod_uid: &str, family: CaptureFamily) {
+    for marker_dir in ready_marker_dirs_for_family(dir, family) {
+        remove_marker_file(&marker_dir, pod_uid, family);
+    }
+}
+
+fn remove_all_ready_markers(dir: &Path, pod_uid: &str) {
+    for family in [CaptureFamily::Ipv4, CaptureFamily::Ipv6] {
+        remove_ready_marker(dir, pod_uid, family);
+    }
+}
+
+fn open_missing_family_listeners<B: NetnsBackend>(
+    backend: &B,
+    listener: &mut ActiveListener,
+    target: &PodCaptureTarget,
+    endpoints: [CaptureEndpoint; 2],
+    ready_dir: Option<&Path>,
+    netns: u64,
+) {
+    for endpoint in endpoints {
+        if listener.has_family(endpoint.family) {
+            continue;
+        }
+        match backend.open_listener(target, endpoint.addr) {
+            Some(opened) => {
+                info!(
+                    netns_inode = netns,
+                    pod_uid = %target.pod_uid,
+                    source_ip = ?listener.source_ip,
+                    capture_addr = %endpoint.addr,
+                    family = endpoint.family.as_str(),
+                    "Opened node-waypoint in-netns capture listener"
+                );
+                if let Some(dir) = ready_dir {
+                    for uid in &listener.pod_uids {
+                        write_ready_marker(dir, uid, endpoint.family);
+                    }
+                }
+                listener.listeners.insert(
+                    endpoint.family,
+                    ActiveFamilyListener {
+                        stop: opened.stop,
+                        source_ip_tx: opened.source_ip,
+                    },
+                );
+            }
+            None => {
+                warn!(
+                    netns_inode = netns,
+                    pod_uid = %target.pod_uid,
+                    capture_addr = %endpoint.addr,
+                    family = endpoint.family.as_str(),
+                    "Failed to open node-waypoint in-netns capture listener for address family; will retry"
+                );
+            }
+        }
     }
 }
 
 /// Reconciles in-netns capture listeners against the enrolled-pod set.
 pub struct NetnsCaptureManager<B: NetnsBackend> {
-    capture_addr: SocketAddr,
+    capture_endpoints: [CaptureEndpoint; 2],
     source: Arc<dyn PodCaptureSource>,
     backend: B,
     poll_interval: Duration,
     /// netns inode → its open listener.
     active: HashMap<u64, ActiveListener>,
-    /// When set, a per-pod readiness marker (`<dir>/<pod_uid>`) is written when
-    /// that pod's listener opens and removed when it closes. The node-agent
-    /// gates enabling the pod's eBPF outbound redirect on this marker so a
-    /// freshly enrolled pod's egress is never rewritten to a pod-loopback
-    /// capture port before a listener exists to accept it. `None` disables
-    /// marker publishing (unit tests).
+    /// When set, per-pod readiness markers are written when that pod's listeners
+    /// open and removed when they close. Redirect hooks attach at enrollment and
+    /// fail closed until a listener exists; these markers expose family readiness
+    /// to the live gate and keep stale-listener cleanup observable. `None`
+    /// disables marker publishing (unit tests).
     ready_dir: Option<PathBuf>,
     /// Last registry UID set logged, so startup/churn diagnostics show whether
     /// the ambient proxy can see the node-agent's hostPath registry without
@@ -266,7 +399,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
         poll_interval: Duration,
     ) -> Self {
         Self {
-            capture_addr,
+            capture_endpoints: capture_endpoints_from_port(capture_addr.port()),
             source,
             backend,
             poll_interval,
@@ -277,12 +410,9 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
         }
     }
 
-    /// Set the directory into which a per-pod listener-readiness marker
-    /// (`<dir>/<pod_uid>`) is written when the pod's in-netns listener is open
-    /// and removed when it closes. The node-agent watches these markers and
-    /// only enables a pod's eBPF outbound redirect once its marker exists, so a
-    /// freshly enrolled pod's captured egress is never sent to a pod-loopback
-    /// port with no listener yet (connection refused). `None` (the default)
+    /// Set the legacy readiness marker directory (`<registry>/.ready`). The
+    /// manager writes the historical IPv4 marker there, plus sibling `.ready4`
+    /// and `.ready6` directories for family-level evidence. `None` (the default)
     /// disables marker publishing — used by unit tests.
     pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.ready_dir = dir;
@@ -293,7 +423,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
     /// listener.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         info!(
-            capture_addr = %self.capture_addr,
+            capture_addrs = ?self.capture_endpoints.iter().map(|endpoint| endpoint.addr).collect::<Vec<_>>(),
             poll_secs = self.poll_interval.as_secs_f64(),
             "Node-waypoint in-netns capture manager started"
         );
@@ -409,7 +539,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                 listener.close();
                 if let Some(dir) = &self.ready_dir {
                     for uid in &listener.pod_uids {
-                        remove_ready_marker(dir, uid);
+                        remove_all_ready_markers(dir, uid);
                     }
                 }
                 info!(
@@ -434,67 +564,80 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
 
             if let Some(listener) = self.active.get_mut(&netns) {
                 let existing_ip = listener.source_ip;
-                if existing_ip == desired_ip {
-                    listener.pod_uids = pod_uids;
-                    continue;
-                }
+                let previous_pod_uids = listener.pod_uids.clone();
                 // Source pod IP changed. Keep the existing listener and push the
                 // new override into its accept loop. Rebinding this pod-loopback
                 // socket would either require SO_REUSEPORT (unsafe inside a
                 // workload netns) or create a no-listener window for redirected
                 // egress.
-                listener.pod_uids = pod_uids;
-                listener.source_ip = desired_ip;
-                if let Some(source_ip_tx) = &listener.source_ip_tx {
-                    let _ = source_ip_tx.send(desired_ip);
+                listener.pod_uids = pod_uids.clone();
+                if existing_ip != desired_ip {
+                    listener.source_ip = desired_ip;
+                    for family_listener in listener.listeners.values() {
+                        if let Some(source_ip_tx) = &family_listener.source_ip_tx {
+                            let _ = source_ip_tx.send(desired_ip);
+                        }
+                    }
+                    debug!(
+                        netns_inode = netns,
+                        old_ip = ?existing_ip,
+                        new_ip = ?desired_ip,
+                        "Node-waypoint capture: source pod IP changed; updated in-netns listener override"
+                    );
                 }
-                debug!(
-                    netns_inode = netns,
-                    old_ip = ?existing_ip,
-                    new_ip = ?desired_ip,
-                    "Node-waypoint capture: source pod IP changed; updated in-netns listener override"
-                );
+                if let Some(dir) = &self.ready_dir {
+                    for uid in previous_pod_uids.difference(&listener.pod_uids) {
+                        remove_all_ready_markers(dir, uid);
+                    }
+                    for uid in listener.pod_uids.difference(&previous_pod_uids) {
+                        for family in listener.listeners.keys().copied() {
+                            write_ready_marker(dir, uid, family);
+                        }
+                    }
+                }
+                let endpoints = self.capture_endpoints;
+                let ready_dir = self.ready_dir.clone();
+                if let Some(target) = desired_target {
+                    open_missing_family_listeners(
+                        &self.backend,
+                        listener,
+                        target,
+                        endpoints,
+                        ready_dir.as_deref(),
+                        netns,
+                    );
+                }
                 continue;
             }
 
-            // New netns: open a listener. Any target in this netns can open it —
-            // they share the namespace.
+            // New netns: open listeners. Any target in this netns can open them —
+            // they share the namespace. IPv4 and IPv6 are independent so a pod can
+            // keep the working family serving while the other fails closed and
+            // retries on the next poll.
             let Some(target) = desired_target else {
                 continue;
             };
-            match self.backend.open_listener(target, self.capture_addr) {
-                Some(opened) => {
-                    info!(
-                        netns_inode = netns,
-                        pod_uid = %target.pod_uid,
-                        source_ip = ?desired_ip,
-                        "Opened node-waypoint in-netns capture listener"
-                    );
-                    // Mark every pod in this netns ready: a listener now exists
-                    // to accept its captured egress, so the node-agent may enable
-                    // its eBPF outbound redirect.
-                    if let Some(dir) = &self.ready_dir {
-                        for uid in &pod_uids {
-                            write_ready_marker(dir, uid);
-                        }
-                    }
-                    self.active.insert(
-                        netns,
-                        ActiveListener {
-                            stop: opened.stop,
-                            source_ip_tx: opened.source_ip,
-                            pod_uids,
-                            source_ip: desired_ip,
-                        },
-                    );
-                }
-                None => {
-                    warn!(
-                        netns_inode = netns,
-                        pod_uid = %target.pod_uid,
-                        "Failed to open node-waypoint in-netns capture listener; will retry"
-                    );
-                }
+            let mut listener = ActiveListener {
+                listeners: HashMap::new(),
+                pod_uids,
+                source_ip: desired_ip,
+            };
+            open_missing_family_listeners(
+                &self.backend,
+                &mut listener,
+                target,
+                self.capture_endpoints,
+                self.ready_dir.as_deref(),
+                netns,
+            );
+            if listener.listeners.is_empty() {
+                warn!(
+                    netns_inode = netns,
+                    pod_uid = %target.pod_uid,
+                    "Failed to open any node-waypoint in-netns capture listener; will retry"
+                );
+            } else {
+                self.active.insert(netns, listener);
             }
         }
 
@@ -507,7 +650,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             listener.close();
             if let Some(dir) = &ready_dir {
                 for uid in &listener.pod_uids {
-                    remove_ready_marker(dir, uid);
+                    remove_all_ready_markers(dir, uid);
                 }
             }
         }
@@ -675,11 +818,15 @@ mod imp {
         let pid = first_pid_in_cgroup(cgroup_path)?;
         std::thread::spawn(move || -> std::io::Result<std::net::TcpListener> {
             let _guard = NetnsGuard::enter(pid)?;
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
+            let domain = match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            if addr.is_ipv6() {
+                socket.set_only_v6(true)?;
+            }
             socket.set_reuse_address(true)?;
             // Do not enable SO_REUSEPORT here. The socket is bound inside the
             // workload pod's network namespace, so pod processes with the same
@@ -829,7 +976,7 @@ mod tests {
     struct MockBackend {
         // cgroup_path → netns inode (None = unresolvable this round)
         netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
-        opened: Mutex<Vec<u64>>,
+        opened: Mutex<Vec<(u64, SocketAddr)>>,
     }
 
     impl MockBackend {
@@ -857,10 +1004,10 @@ mod tests {
         fn open_listener(
             &self,
             target: &PodCaptureTarget,
-            _addr: SocketAddr,
+            addr: SocketAddr,
         ) -> Option<OpenedNetnsListener> {
             let netns = self.netns_key(target).ok()?;
-            self.opened.lock().unwrap().push(netns);
+            self.opened.lock().unwrap().push((netns, addr));
             // The manager records closes by dropping the listener from `active`;
             // tests assert on `mgr.active` membership, so the mock just hands
             // back a live stop handle.
@@ -936,8 +1083,25 @@ mod tests {
         let active = mgr.reconcile_once();
         assert_eq!(active, 2, "two distinct netns → two listeners, not three");
         let opened = mgr.backend.opened.lock().unwrap().clone();
-        assert_eq!(opened.len(), 2);
-        assert!(opened.contains(&100) && opened.contains(&200));
+        assert_eq!(
+            opened.len(),
+            4,
+            "each distinct netns gets IPv4 and IPv6 listeners"
+        );
+        assert!(
+            opened
+                .iter()
+                .any(|(netns, addr)| *netns == 100 && addr.is_ipv4())
+                && opened
+                    .iter()
+                    .any(|(netns, addr)| *netns == 100 && addr.is_ipv6())
+                && opened
+                    .iter()
+                    .any(|(netns, addr)| *netns == 200 && addr.is_ipv4())
+                && opened
+                    .iter()
+                    .any(|(netns, addr)| *netns == 200 && addr.is_ipv6())
+        );
     }
 
     #[tokio::test]
@@ -965,7 +1129,7 @@ mod tests {
         assert_eq!(mgr.reconcile_once(), 2);
         // Second pass with the SAME set opens nothing new.
         assert_eq!(mgr.reconcile_once(), 2);
-        assert_eq!(mgr.backend.opened.lock().unwrap().len(), 2, "no re-open");
+        assert_eq!(mgr.backend.opened.lock().unwrap().len(), 4, "no re-open");
 
         // pod-c goes away → its netns listener closes.
         targets.lock().unwrap().retain(|t| t.pod_uid != "pod-c");
@@ -1021,14 +1185,14 @@ mod tests {
 
         // Initial open carries no source IP.
         assert_eq!(mgr.reconcile_once(), 1);
-        assert_eq!(mgr.backend.opened.lock().unwrap().len(), 1);
+        assert_eq!(mgr.backend.opened.lock().unwrap().len(), 2);
         assert_eq!(mgr.active.get(&100).unwrap().source_ip, None);
 
         // Unchanged IP (still None) → membership refresh only, no reopen.
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
-            1,
+            2,
             "no reopen when the source IP is unchanged"
         );
 
@@ -1038,7 +1202,7 @@ mod tests {
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
-            1,
+            2,
             "pod IP assignment must not reopen the listener"
         );
         assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip1));
@@ -1049,7 +1213,7 @@ mod tests {
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
-            1,
+            2,
             "pod IP changes must not reopen the listener"
         );
         assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip2));
@@ -1096,10 +1260,13 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_writes_and_removes_readiness_markers() {
-        // With a ready dir configured, opening a pod's listener writes its
-        // readiness marker (the node-agent's gate to enable redirect); closing
-        // it removes the marker.
-        let ready = tempfile::tempdir().unwrap();
+        // With a ready dir configured, opening a pod's listener writes the
+        // legacy IPv4 marker plus address-family markers; closing it removes
+        // them.
+        let registry = tempfile::tempdir().unwrap();
+        let ready_dir = registry.path().join(".ready");
+        let ready4_dir = registry.path().join(".ready4");
+        let ready6_dir = registry.path().join(".ready6");
         let targets = Arc::new(Mutex::new(vec![target("pod-a", "/cg/a")]));
         struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);
         impl PodCaptureSource for DynSource {
@@ -1114,20 +1281,36 @@ mod tests {
             backend,
             Duration::from_secs(1),
         )
-        .with_ready_dir(Some(ready.path().to_path_buf()));
+        .with_ready_dir(Some(ready_dir.clone()));
 
         assert_eq!(mgr.reconcile_once(), 1);
         assert!(
-            ready.path().join("pod-a").exists(),
-            "a readiness marker must be written when the listener opens"
+            ready_dir.join("pod-a").exists(),
+            "the legacy IPv4 readiness marker must be written when the IPv4 listener opens"
+        );
+        assert!(
+            ready4_dir.join("pod-a").exists(),
+            "the IPv4 family readiness marker must be written when the IPv4 listener opens"
+        );
+        assert!(
+            ready6_dir.join("pod-a").exists(),
+            "the IPv6 family readiness marker must be written when the IPv6 listener opens"
         );
 
         // Pod leaves the registry → listener closes → marker removed.
         targets.lock().unwrap().clear();
         assert_eq!(mgr.reconcile_once(), 0);
         assert!(
-            !ready.path().join("pod-a").exists(),
-            "the readiness marker must be removed when the listener closes"
+            !ready_dir.join("pod-a").exists(),
+            "the legacy readiness marker must be removed when the listener closes"
+        );
+        assert!(
+            !ready4_dir.join("pod-a").exists(),
+            "the IPv4 readiness marker must be removed when the listener closes"
+        );
+        assert!(
+            !ready6_dir.join("pod-a").exists(),
+            "the IPv6 readiness marker must be removed when the listener closes"
         );
     }
 
@@ -1135,9 +1318,10 @@ mod tests {
     async fn pod_ip_change_keeps_listener_and_marker_without_reopen() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Backend that opens the first listener and would fail any later open.
-        // A pod IP update must not call it again: closing the active listener
-        // would leave already-promoted redirects pointing at an empty port.
+        // Backend that opens the initial dual-family listeners and would fail
+        // any later open. A pod IP update must not call it again: closing the
+        // active listener would leave already-promoted redirects pointing at an
+        // empty port.
         struct FailReopenBackend {
             opens: AtomicUsize,
         }
@@ -1150,7 +1334,7 @@ mod tests {
                 _target: &PodCaptureTarget,
                 _addr: SocketAddr,
             ) -> Option<OpenedNetnsListener> {
-                if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
+                if self.opens.fetch_add(1, Ordering::SeqCst) < 2 {
                     let (tx, _rx) = watch::channel(false);
                     Some(OpenedNetnsListener::new(tx, None))
                 } else {
@@ -1159,7 +1343,9 @@ mod tests {
             }
         }
 
-        let ready = tempfile::tempdir().unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let ready_dir = registry.path().join(".ready");
+        let ready6_dir = registry.path().join(".ready6");
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
@@ -1179,11 +1365,15 @@ mod tests {
             },
             Duration::from_secs(1),
         )
-        .with_ready_dir(Some(ready.path().to_path_buf()));
+        .with_ready_dir(Some(ready_dir.clone()));
 
         // First open succeeds → marker present.
         assert_eq!(mgr.reconcile_once(), 1);
-        assert!(ready.path().join("pod-a").exists());
+        assert!(ready_dir.join("pod-a").exists());
+        assert!(
+            ready6_dir.join("pod-a").exists(),
+            "the IPv6 readiness marker is present after the v6 listener opens"
+        );
 
         // Pod IP changes → update metadata only. The existing listener and ready
         // marker must stay in place even though any reopen would fail.
@@ -1194,12 +1384,12 @@ mod tests {
             "a pod IP update keeps the existing listener active"
         );
         assert!(
-            ready.path().join("pod-a").exists(),
+            ready_dir.join("pod-a").exists(),
             "the readiness marker stays while the listener still serves the pod"
         );
         assert_eq!(
             mgr.backend.opens.load(Ordering::SeqCst),
-            1,
+            2,
             "pod IP changes must not attempt a replacement bind"
         );
     }
@@ -1228,13 +1418,14 @@ mod tests {
 /// `ebpf::loader::live_kernel_tests`.
 ///
 /// No eBPF here: this layer proves the OS mechanism the whole design rests on —
-/// a `127.0.0.1:15001` listener bound *inside* a pod's netns is reachable from a
-/// client in that netns and **unreachable from the host netns** (the per-pod
-/// loopback isolation that makes a single host-netns listener insufficient).
+/// `127.0.0.1:15001` and `[::1]:15001` listeners bound *inside* a pod's netns
+/// are reachable from a client in that netns and **unreachable from the host
+/// netns** (the per-pod loopback isolation that makes a single host-netns
+/// listener insufficient).
 #[cfg(all(test, target_os = "linux"))]
 mod live_netns_tests {
     use std::io::Write;
-    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
     use std::process::{Child, Command};
     use std::time::{Duration, Instant};
@@ -1271,10 +1462,10 @@ mod live_netns_tests {
         }
     }
 
-    /// Connect to `127.0.0.1:port` from inside `pid`'s network namespace, on a
-    /// throwaway thread (setns mutates only the calling thread, and the thread
-    /// exits immediately so no restore is needed). Returns whether it connected.
-    fn connect_inside_netns(pid: u32, port: u16) -> bool {
+    /// Connect to `addr` from inside `pid`'s network namespace, on a throwaway
+    /// thread (setns mutates only the calling thread, and the thread exits
+    /// immediately so no restore is needed). Returns whether it connected.
+    fn connect_inside_netns(pid: u32, addr: SocketAddr) -> bool {
         std::thread::spawn(move || -> bool {
             let Ok(target) = std::fs::File::open(format!("/proc/{pid}/ns/net")) else {
                 return false;
@@ -1283,10 +1474,7 @@ mod live_netns_tests {
             if unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
                 return false;
             }
-            match TcpStream::connect_timeout(
-                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                Duration::from_secs(2),
-            ) {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(mut stream) => {
                     let _ = stream.write_all(b"ping");
                     true
@@ -1298,9 +1486,30 @@ mod live_netns_tests {
         .unwrap_or(false)
     }
 
+    fn assert_accepts_loopback(listener: &TcpListener, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = false;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("in-netns listener accept failed for {label}: {e}"),
+            }
+        }
+        assert!(
+            accepted,
+            "the in-netns listener must accept the pod's loopback connection for {label}"
+        );
+    }
+
     #[test]
     #[ignore = "requires root + CAP_SYS_ADMIN to create/enter network namespaces"]
-    fn in_netns_listener_reachable_inside_pod_and_isolated_from_host() {
+    fn in_netns_dual_family_listeners_reachable_inside_pod_and_isolated_from_host() {
         if !is_root() {
             eprintln!("SKIP: not root; cannot create network namespaces");
             return;
@@ -1324,47 +1533,50 @@ mod live_netns_tests {
             &cgroup_path,
             SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)),
         )
-        .expect("bind capture listener inside the pod netns");
+        .expect("bind IPv4 capture listener inside the pod netns");
         listener
             .set_nonblocking(true)
-            .expect("listener set_nonblocking");
+            .expect("IPv4 listener set_nonblocking");
+        let listener6 = super::imp::bind_capture_listener_in_pod_netns(
+            &cgroup_path,
+            SocketAddr::from((Ipv6Addr::LOCALHOST, CAPTURE_PORT)),
+        )
+        .expect("bind IPv6 capture listener inside the pod netns");
+        listener6
+            .set_nonblocking(true)
+            .expect("IPv6 listener set_nonblocking");
 
         // (1) A client INSIDE the pod netns must reach the in-netns listener.
         assert!(
-            connect_inside_netns(pid, CAPTURE_PORT),
-            "a client inside the pod netns must reach the in-netns capture listener"
+            connect_inside_netns(pid, SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT))),
+            "a client inside the pod netns must reach the IPv4 in-netns capture listener"
         );
-
-        // Poll accept with a deadline so a missed connection can never hang CI.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut accepted = false;
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok(_) => {
-                    accepted = true;
-                    break;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("in-netns listener accept failed: {e}"),
-            }
-        }
         assert!(
-            accepted,
-            "the in-netns listener must accept the pod's loopback connection"
+            connect_inside_netns(pid, SocketAddr::from((Ipv6Addr::LOCALHOST, CAPTURE_PORT))),
+            "a client inside the pod netns must reach the IPv6 in-netns capture listener"
         );
+        assert_accepts_loopback(&listener, "ipv4");
+        assert_accepts_loopback(&listener6, "ipv6");
 
         // (2) The HOST netns must NOT reach 127.0.0.1:15001 — the listener lives
-        // only in the pod netns. This loopback isolation is exactly why a single
-        // host-netns listener can never serve captured pods.
+        // or [::1]:15001 — the listeners live only in the pod netns. This loopback
+        // isolation is exactly why a single host-netns listener can never serve
+        // captured pods.
         let host_reach = TcpStream::connect_timeout(
             &SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)),
             Duration::from_millis(500),
         );
         assert!(
             host_reach.is_err(),
-            "host netns must not reach a pod-netns-only loopback listener (got {host_reach:?})"
+            "host netns must not reach a pod-netns-only IPv4 loopback listener (got {host_reach:?})"
+        );
+        let host_reach6 = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv6Addr::LOCALHOST, CAPTURE_PORT)),
+            Duration::from_millis(500),
+        );
+        assert!(
+            host_reach6.is_err(),
+            "host netns must not reach a pod-netns-only IPv6 loopback listener (got {host_reach6:?})"
         );
     }
 }

@@ -69,13 +69,11 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
-    // IPv4-only datapath fail-closed: when configured (NodeWaypoint in-netns
-    // capture, whose in-netns listener and sock-ops bridge are v4-only), DENY a
-    // captured IPv6 connection — return 0 so the kernel fails the `connect()`
-    // with EPERM — instead of redirecting it to a v6 capture listener that does
-    // not exist. Without this, captured IPv6 egress would bypass `mesh_authz`
-    // entirely. Excluded traffic (bypass UID / port / CIDR excludes,
-    // non-included ports) already returned `Ok(1)` above and still flows.
+    // Optional fail-closed valve: when configured, DENY a captured IPv6
+    // connection — return 0 so the kernel fails the `connect()` with EPERM —
+    // instead of redirecting it. NodeWaypoint keeps this flag clear now that the
+    // proxy opens an IPv6 pod-loopback listener; if that listener is not ready,
+    // the redirect to [::1]:<port> fails closed by connection refusal.
     if ipv6_outbound_deny() {
         return Ok(0);
     }
@@ -126,9 +124,9 @@ fn outbound_capture_port() -> u32 {
     }
 }
 
-/// Whether captured IPv6 egress should fail closed (the node-agent sets this in
-/// NodeWaypoint in-netns mode, whose datapath is IPv4-only). Absent config →
-/// `false` (redirect as normal), so non-NodeWaypoint capture is unaffected.
+/// Whether captured IPv6 egress should fail closed before redirect. Absent
+/// config → `false` (redirect as normal), so non-NodeWaypoint capture is
+/// unaffected.
 #[inline(always)]
 fn ipv6_outbound_deny() -> bool {
     let key = FERRUM_CAPTURE_CONFIG_KEY;

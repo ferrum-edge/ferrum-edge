@@ -124,9 +124,8 @@ impl ConnTuple4 {
 
 /// IPv6 connection 4-tuple key for the accept-side cookie bridge (GAP-2M).
 /// Mirrors [`ConnTuple4`] (including the `netns_cookie` pod discriminator); the
-/// `sock_ops` bridge is currently IPv4-only, so this type is the documented v6
-/// wire format for the eventual IPv6 follow-up. `_pad` keeps `netns_cookie`
-/// 8-byte aligned with no implicit padding.
+/// `sock_ops` bridge handles this key for captured IPv6 loopback connections.
+/// `_pad` keeps `netns_cookie` 8-byte aligned with no implicit padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnTuple6 {
@@ -235,11 +234,11 @@ pub struct BpfCaptureConfig {
     pub outbound_capture_port: u32,
     pub hbone_redirect_port: u32,
     /// Non-zero → captured IPv6 outbound connections are DENIED (the `connect6`
-    /// hook returns `EPERM`) instead of redirected. Set in NodeWaypoint in-netns
-    /// capture mode, whose in-netns listener and GAP-2M sock-ops bridge are
-    /// IPv4-only: without it, captured IPv6 egress would bypass `mesh_authz`
-    /// entirely instead of failing closed. Excluded v6 (bypass UID / port / CIDR
-    /// excludes) is decided before the deny and still flows.
+    /// hook returns `EPERM`) instead of redirected. This is an explicit safety
+    /// valve for deployments that cannot provide an IPv6 pod-loopback listener;
+    /// the normal NodeWaypoint path leaves it clear and redirects to `[::1]`.
+    /// Excluded v6 (bypass UID / port / CIDR excludes) is decided before the deny
+    /// and still flows.
     pub ipv6_outbound_deny: u32,
 }
 
@@ -735,8 +734,8 @@ mod tests {
         assert_eq!(config.outbound_capture_port, OUTBOUND_CAPTURE_PORT as u32);
         assert_eq!(config.hbone_redirect_port, INBOUND_HBONE_PORT as u32);
         assert_eq!(FERRUM_CAPTURE_CONFIG_KEY, 0);
-        // IPv6 egress is redirected (not denied) by default; the deny is opt-in
-        // for the IPv4-only NodeWaypoint in-netns datapath.
+        // IPv6 egress is redirected (not denied) by default; the deny remains an
+        // explicit safety valve for deployments without an IPv6 capture listener.
         assert_eq!(config.ipv6_outbound_deny, 0);
     }
 

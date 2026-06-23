@@ -165,9 +165,10 @@ pub struct CaptureContract {
     pub unix_socket_path: String,
     pub bpf_maps: CaptureBpfMaps,
     /// Fail closed on captured IPv6 outbound (the `connect6` hook returns
-    /// `EPERM`) instead of redirecting it. Set in NodeWaypoint in-netns capture
-    /// mode, whose datapath is IPv4-only, so IPv6 egress cannot bypass
-    /// `mesh_authz`. See [`BpfCaptureConfig::ipv6_outbound_deny`].
+    /// `EPERM`) instead of redirecting it. This remains available as a safety
+    /// valve, but NodeWaypoint now keeps it disabled because the in-netns capture
+    /// manager opens an IPv6 pod-loopback listener and missing listeners fail
+    /// closed by connection refusal.
     pub ipv6_outbound_deny: bool,
 }
 

@@ -7690,23 +7690,22 @@ async fn serve_mesh_runtime(
         proxy_state
     };
     // Node-waypoint in-netns outbound capture listeners (opt-in). The default
-    // outbound listener binds 127.0.0.1:15001 in the HOST netns, which a pod's
-    // loopback-rewritten capture (`connect4` → 127.0.0.1:15001) can never reach;
-    // with this enabled the proxy additionally opens a 127.0.0.1:15001 listener
-    // INSIDE each enrolled pod's network namespace, so captured connections are
-    // accepted there and the GAP-2M sock_ops same-netns cookie bridge resolves
-    // their source identity. Pods are discovered from the registry the node-agent
-    // publishes. Linux-only; the full pod-loopback datapath is verified only on a
-    // live multi-pod node (see `src/proxy/netns_capture.rs`).
+    // outbound listener binds in the HOST netns, which a pod's loopback-rewritten
+    // capture (`connect4` → 127.0.0.1:15001, `connect6` → [::1]:15001) can never
+    // reach; with this enabled the proxy additionally opens dual-family loopback
+    // listeners INSIDE each enrolled pod's network namespace, so captured
+    // connections are accepted there and the GAP-2M sock_ops same-netns cookie
+    // bridge resolves their source identity. Pods are discovered from the registry
+    // the node-agent publishes. Linux-only; the full pod-loopback datapath is
+    // verified only on a live multi-pod node (see `src/proxy/netns_capture.rs`).
     if runtime.topology == MeshTopology::NodeWaypoint {
-        // `connect4` rewrites captured pod egress to `127.0.0.1:<port>` in the
-        // POD's loopback, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR
-        // (the rewrite IP is hardcoded loopback). So the in-netns listener must
-        // bind loopback and inherit ONLY the configured port — binding the
-        // configured IP verbatim (e.g. a node IP or `[::1]`) would listen on an
-        // address the pod never dials and refuse every IPv4 capture. The IP part
-        // of the configured address governs the HOST outbound listener, not this
-        // pod-netns one. Port `0` disables the outbound listener entirely
+        // The connect hooks rewrite captured pod egress to loopback inside the
+        // POD netns, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR.
+        // So the in-netns manager binds 127.0.0.1:<port> and [::1]:<port> and
+        // inherits ONLY the configured port — binding the configured IP verbatim
+        // (e.g. a node IP) would listen on an address the pod never dials. The IP
+        // part of the configured address governs the HOST outbound listener, not
+        // these pod-netns listeners. Port `0` disables the outbound listener entirely
         // (nothing is captured), so skip starting the manager.
         let capture_port = runtime.outbound_listen_addr.port();
         if capture_port == 0 {
@@ -7724,7 +7723,11 @@ async fn serve_mesh_runtime(
             {
                 info!(
                     configured = %runtime.outbound_listen_addr,
-                    bound = %capture_addr,
+                    bound_ipv4 = %capture_addr,
+                    bound_ipv6 = %std::net::SocketAddr::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                        capture_port,
+                    ),
                     "Node-waypoint in-netns capture binds pod loopback with the configured \
                      outbound port; the configured IP applies only to the host listener"
                 );
@@ -7754,11 +7757,12 @@ async fn serve_mesh_runtime(
                 Some(MeshTrafficDirection::Outbound),
                 shutdown_tx.subscribe(),
             );
-            // Listener-readiness markers go in a `.ready` subdir of the registry
-            // dir; the node-agent gates enabling a pod's eBPF outbound redirect
-            // on its marker so a freshly enrolled pod's egress is not captured
-            // before a listener exists. `DirectoryCaptureSource` skips dotfiles,
-            // so the subdir is invisible to the pod-discovery scan.
+            // Listener-readiness markers go in dot-subdirs of the registry dir:
+            // `.ready` remains the IPv4-compatible marker, while `.ready4` and
+            // `.ready6` expose family-level readiness. Redirect hooks are already
+            // attached by the node-agent and fail closed until a listener exists.
+            // `DirectoryCaptureSource` skips dotfiles, so these subdirs are
+            // invisible to the pod-discovery scan.
             let ready_dir = std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
                 .join(".ready");
             let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
@@ -7771,8 +7775,12 @@ async fn serve_mesh_runtime(
             let manager_shutdown = shutdown_tx.subscribe();
             info!(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
-                capture_addr = %capture_addr,
-                "Node-waypoint in-netns outbound capture listeners enabled"
+                capture_ipv4 = %capture_addr,
+                capture_ipv6 = %std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    capture_port,
+                ),
+                "Node-waypoint dual-family in-netns outbound capture listeners enabled"
             );
             mesh_background_handles.push(tokio::spawn(async move {
                 manager.run(manager_shutdown).await;

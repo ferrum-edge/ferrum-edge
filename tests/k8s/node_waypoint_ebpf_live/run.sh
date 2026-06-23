@@ -48,8 +48,10 @@ REQUIRED_LIVE_ASSERTIONS=(
 )
 if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
-    node_waypoint.ipv6.pod_ip_fail_closed
-    node_waypoint.ipv6.service_fail_closed
+    node_waypoint.ebpf.registry_ready_ipv6
+    node_waypoint.ipv6.service_allow
+    node_waypoint.ipv6.service_deny
+    node_waypoint.ipv6.pod_ip_bypass_guard
   )
 fi
 
@@ -1067,17 +1069,69 @@ wait_for_node_waypoint_ready_markers() {
   exit 1
 }
 
+wait_for_node_waypoint_ipv6_ready_markers() {
+  log "checking node-waypoint IPv6 in-netns ready markers"
+  local missing_file="$RESULTS_DIR/node-waypoint-ready6-missing.txt"
+  mkdir -p "$RESULTS_DIR"
+  for _ in $(seq 1 60); do
+    local count=0
+    local all_ready=true
+    : >"$missing_file"
+    while IFS=$'\t' read -r uid node pod_name; do
+      [[ -n "$uid" ]] || continue
+      count=$((count + 1))
+      if ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready6/$uid"; then
+        all_ready=false
+        echo "$pod_name on $node missing IPv6 ready marker $NODE_WAYPOINT_REGISTRY_DIR/.ready6/$uid" >>"$missing_file"
+      fi
+    done < <(workload_pod_records)
+    if [[ "$count" -ge 4 && "$all_ready" == "true" ]]; then
+      record_live_assertion_once \
+        node_waypoint.ebpf.registry_ready_ipv6 \
+        pass \
+        "" \
+        "" \
+        "pod-registry-ipv6-in-netns-ready-markers-present" \
+        "" \
+        "" \
+        "node-waypoint-ready6-missing.txt"
+      return
+    fi
+    sleep 2
+  done
+
+  echo "NodeWaypoint IPv6 ready markers did not appear for every workload pod" >&2
+  cat "$missing_file" >&2 || true
+  collect_node_agent_metrics
+  for node in "$NODE_A" "$NODE_B"; do
+    dump_node_waypoint_registry "$node"
+    dump_node_waypoint_runtime_state "$node"
+  done
+  record_live_assertion \
+    node_waypoint.ebpf.registry_ready_ipv6 \
+    fail \
+    "" \
+    "" \
+    "missing-ipv6-in-netns-ready-markers" \
+    "" \
+    "" \
+    "node-waypoint-ready6-missing.txt"
+  exit 1
+}
+
 wait_for_node_waypoint_marker_removed() {
   local node="$1"
   local uid="$2"
   for _ in $(seq 1 60); do
     if ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/$uid" &&
-      ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready/$uid"; then
+      ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready/$uid" &&
+      ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready4/$uid" &&
+      ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready6/$uid"; then
       return
     fi
     sleep 1
   done
-  echo "stale NodeWaypoint registry or ready marker remained for deleted pod $uid on $node" >&2
+  echo "stale NodeWaypoint registry or readiness marker remained for deleted pod $uid on $node" >&2
   dump_node_waypoint_registry "$node"
   exit 1
 }
@@ -1535,7 +1589,7 @@ run_traffic_checks() {
 
 run_ipv6_checks() {
   log "running dual-stack IPv6 admission checks"
-  local dst_a_v6 svc_a_v6
+  local dst_a_v6 svc_a_v6 svc_a_url
   dst_a_v6="$(pod_ipv6 dst-a)"
   svc_a_v6="$(svc_ipv6 dst-a)"
   if [[ -z "$dst_a_v6" || -z "$svc_a_v6" ]]; then
@@ -1546,6 +1600,38 @@ run_ipv6_checks() {
       exit 1
     fi
     log "cluster is not dual-stack; skipping IPv6 pass"
+    record_live_assertion \
+      node_waypoint.ebpf.registry_ready_ipv6 \
+      skip \
+      "" \
+      "" \
+      "cluster-not-dual-stack" \
+      "" \
+      ""
+    record_live_assertion \
+      node_waypoint.ipv6.service_allow \
+      skip \
+      src-a \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.ipv6.service_deny \
+      skip \
+      src-b \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.ipv6.pod_ip_bypass_guard \
+      skip \
+      src-b \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)"
     record_live_assertion \
       node_waypoint.ipv6.pod_ip_fail_closed \
       skip \
@@ -1565,25 +1651,54 @@ run_ipv6_checks() {
     return
   fi
 
-  # Current NodeWaypoint e2e IPv6 capture is intentionally rejected before
-  # admission: connect6 fail-closes captured IPv6 until the in-netns listener
-  # path is fully IPv6-capable. A 200 here would mean IPv6 bypassed capture.
-  recorded_expect_blocked \
+  wait_for_node_waypoint_ipv6_ready_markers
+  svc_a_url="http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/"
+  wait_for_node_waypoint_admission src-a "src-a IPv6 Service path" "$svc_a_url" 6
+
+  # Historical fail-closed assertion IDs remain in the artifact for comparability,
+  # but they are no longer required once IPv6 admission is implemented.
+  record_live_assertion \
     node_waypoint.ipv6.pod_ip_fail_closed \
+    skip \
     src-a \
     dst-a \
-    "IPv6 direct Pod IP fail-closed" \
+    "superseded-by-ipv6-admission" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)"
+  record_live_assertion \
+    node_waypoint.ipv6.service_fail_closed \
+    skip \
+    src-a \
+    dst-a \
+    "superseded-by-ipv6-admission" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)"
+
+  recorded_expect_allowed \
+    node_waypoint.ipv6.service_allow \
+    src-a \
+    dst-a \
+    "IPv6 Service ClusterIP" \
+    "$svc_a_url" \
+    "ok-a" \
+    6 \
+    "allowed-ipv6-http-200"
+  recorded_expect_blocked \
+    node_waypoint.ipv6.service_deny \
+    src-b \
+    dst-a \
+    "IPv6 Service AuthorizationPolicy DENY" \
+    "$svc_a_url" \
+    6 \
+    "denied-by-authorization-policy"
+  recorded_expect_blocked \
+    node_waypoint.ipv6.pod_ip_bypass_guard \
+    src-b \
+    dst-a \
+    "IPv6 direct Pod IP AuthorizationPolicy bypass guard" \
     "http://[$dst_a_v6]:8080/" \
     6 \
-    "ipv6-capture-denied-before-admission"
-  recorded_expect_blocked \
-    node_waypoint.ipv6.service_fail_closed \
-    src-a \
-    dst-a \
-    "IPv6 Service ClusterIP fail-closed" \
-    "http://[$svc_a_v6]:8080/" \
-    6 \
-    "ipv6-capture-denied-before-admission"
+    "direct-ipv6-pod-ip-fail-closed"
 }
 
 cleanup() {

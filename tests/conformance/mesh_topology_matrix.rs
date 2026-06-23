@@ -118,7 +118,7 @@ fn topology_node_waypoint() {
         feature = "NodeWaypoint topology",
         status = Status::Supported,
         maturity = Maturity::Experimental,
-        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4 datapath is live-gated by the node-waypoint-ebpf-live workflow; IPv6 capture fails closed until the end-to-end path is completed.",
+        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4 and IPv6 capture are live-gated by the node-waypoint-ebpf-live workflow; secured node-to-node transport and inbound enforcement remain H2 residuals.",
     );
     assert_topology_apply_succeeds(MeshTopology::NodeWaypoint);
 }

@@ -19,9 +19,9 @@ collects BPF program/link/map evidence with `bpftool`, creates same-node and
 cross-node source/destination pods, verifies `src-a` Service ClusterIP traffic
 is admitted, verifies `src-b` Service ClusterIP and direct Pod-IP attempts are
 rejected by the live `AuthorizationPolicy`, and checks stale source identities
-stay denied after pod recreation. On dual-stack clusters it requires IPv6 to be
-rejected before a request is admitted until the end-to-end IPv6 NodeWaypoint path
-is implemented.
+stay denied after pod recreation. On dual-stack clusters it also requires the
+IPv6 pod-netns ready markers, IPv6 Service allow/deny behavior, and an IPv6
+direct Pod-IP bypass guard.
 
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current

@@ -125,10 +125,9 @@ does not satisfy this ADR; the enforcement action must prevent the packet from
 reaching the app outside destination policy.
 
 The current live gate already asserts denied-source direct Pod-IP attempts do
-not reach the destination over IPv4 and that IPv6 direct Pod-IP is fail-closed
-before admission. H2 is not complete until same-node, cross-node, IPv4, IPv6,
-stale-IP reuse, unmanaged-source, and forged-assertion cases are covered with
-the production identity profile.
+not reach the destination over IPv4 or IPv6. H2 is not complete until same-node,
+cross-node, stale-IP reuse, unmanaged-source, forged-assertion, and production
+identity-profile cases are covered.
 
 ## Failure Behavior
 
@@ -179,8 +178,14 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv4.pod_ip_bypass_guard_same_node`
 - `node_waypoint.ipv4.pod_ip_bypass_guard_cross_node`
 - `node_waypoint.identity.stale_cleanup`
-- `node_waypoint.ipv6.pod_ip_fail_closed`
-- `node_waypoint.ipv6.service_fail_closed`
+- `node_waypoint.ipv6.pod_ip_fail_closed` (historical pre-admission evidence;
+  retained as a non-required artifact once IPv6 admission is enabled)
+- `node_waypoint.ipv6.service_fail_closed` (historical pre-admission evidence;
+  retained as a non-required artifact once IPv6 admission is enabled)
+- `node_waypoint.ebpf.registry_ready_ipv6`
+- `node_waypoint.ipv6.service_allow`
+- `node_waypoint.ipv6.service_deny`
+- `node_waypoint.ipv6.pod_ip_bypass_guard`
 
 Future H2 PRs should extend this list instead of renaming these IDs so artifacts
 remain comparable across commits.

@@ -10,7 +10,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 
 | Surface | Name / default | Purpose |
 |---|---|---|
-| Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod in-netns capture listeners, the GAP-2M socket-cookie bridge, and the pod registry (see below). The remote `node-waypoint-ebpf-live` workflow gates the IPv4 datapath; IPv6 fails closed until end-to-end capture is completed. |
+| Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod dual-family in-netns capture listeners, the GAP-2M socket-cookie bridge, and the pod registry (see below). The remote `node-waypoint-ebpf-live` workflow gates the IPv4 datapath and the dual-stack IPv6 capture assertions; secured node-to-node transport and inbound enforcement remain Experimental H2 residuals. |
 | Admin listener | `FERRUM_NODE_AGENT_ADMIN_ENABLED=false` | Opts in to the read-only admin listener for node-agent metrics/health. When enabled, `FERRUM_ADMIN_HTTP_PORT` controls the port and the listener defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. |
 | Outbound capture port | `15001` | The port written into the BPF capture config map and used by cgroup connect hooks when rewriting outbound sockets. |
 | HBONE redirect port | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT=15008` | The HBONE listener/redirect port carried in the same BPF config map for sidecarless topologies. Must match the mesh proxy HBONE listener (`15008` today). Node-agent startup automatically adds this port to outbound capture exclusions. |
@@ -158,7 +158,7 @@ pipeline:
    mirrors each cookie→identity record into the `NodeWaypointIdentityResolver`
    (`record_orig_dst4`/`record_orig_dst6`).
 
-> **Caveat — IPv4 live-gated; IPv6 fails closed.** The
+> **Caveat — capture live-gated; transport still Experimental.** The
 > connect-side vs accept-side cookie mismatch — the bridge mirrors records keyed
 > by the **connect-side** socket cookie, but the proxy accept path resolves by
 > the **accepted** socket's cookie — is now bridged by the kernel `sock_ops`
@@ -169,13 +169,10 @@ pipeline:
 > resolver lazily enrolls `pod_uid`→identity by hash-joining the slice's
 > `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped record. If two
 > SPIFFE IDs collide on that truncated hash, the proxy marks the hash unusable
-> and fails closed instead of picking either identity. The remaining blocker is
-> not the accept-side cookie bridge; it is the end-to-end IPv6 capture path. The
-> NodeWaypoint in-netns listener is IPv4-loopback only today, and the node-agent
-> sets `ipv6_outbound_deny` so captured IPv6 egress fails closed in `connect6`
-> before admission. The full IPv4 connect→capture→accept datapath is now gated by
-> the Docker/kind `node-waypoint-ebpf-live` GitHub Actions workflow, which runs
-> on a two-worker Linux cluster and collects BPF link/map evidence. On any
+> and fails closed instead of picking either identity. The IPv4 and IPv6
+> connect→capture→accept datapaths are gated by the Docker/kind
+> `node-waypoint-ebpf-live` GitHub Actions workflow, which runs on a two-worker
+> Linux cluster and collects BPF link/map evidence. On any
 > tuple/byte-order/enrollment miss no accept-side record is written and the
 > accept path resolves no identity (fail-closed, never misattributed).
 
@@ -232,24 +229,25 @@ chart adds those settings only when
 
 The node-agent **writes** a pod's registry file on enrollment and **removes**
 it on teardown. The mesh proxy's `NetnsCaptureManager` polls this directory and
-reconciles one in-netns listener per pod (opening on add, closing on removal).
+reconciles IPv4 and IPv6 in-netns listeners per pod netns (opening on add,
+closing on removal).
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod
-enrollment returns. The node-agent still attaches the IPv4 outbound-redirect
-program (`connect4`) during enrollment, before the pod is marked enrolled, so
-newly started workloads cannot open direct IPv4 egress connections that bypass
-`mesh_authz`. Until the proxy opens the pod-loopback listener, captured IPv4
-connections may be refused, but they fail closed instead of bypassing policy.
-The inbound `getpeername4`/`getpeername6` programs are also attached during
-enrollment. `connect6` is attached immediately as a **fail-closed IPv6 denier**:
-the in-netns listener is IPv4-only, so the node-agent sets the
-`ipv6_outbound_deny` capture-config flag and `connect6` returns `EPERM` for
-captured IPv6 instead of redirecting it (or letting it bypass `mesh_authz`).
-Excluded v6 (CIDR/port excludes) still flows. The proxy may write
-`<registry_dir>/.ready/<pod_uid>` once it has opened that pod's in-netns
-listener for observability and stale-listener cleanup; the `.ready` subdir is a
-dotfile and is skipped by the pod-discovery scan.
+enrollment returns. The node-agent still attaches the outbound-redirect programs
+(`connect4` and `connect6`) during enrollment, before the pod is marked
+enrolled, so newly started workloads cannot open direct egress connections that
+bypass `mesh_authz`. Until the proxy opens the pod-loopback listener for an
+address family, captured connections for that family may be refused, but they
+fail closed instead of bypassing policy. The inbound `getpeername4`/
+`getpeername6` programs are also attached during enrollment. NodeWaypoint adds
+`::/0` to the capture include set so IPv6 destinations reach `connect6`; the
+legacy `ipv6_outbound_deny` flag remains clear in the normal dual-family path.
+Excluded v6 (CIDR/port excludes) still flows. The proxy writes
+`<registry_dir>/.ready/<pod_uid>` for the historical IPv4 readiness marker,
+`<registry_dir>/.ready4/<pod_uid>` for IPv4, and
+`<registry_dir>/.ready6/<pod_uid>` for IPv6; these dotdirs are skipped by the
+pod-discovery scan.
 
 This is Linux-only and, like the rest of the in-netns datapath, is gated by the
 remote `node-waypoint-ebpf-live` workflow because it needs a live multi-pod

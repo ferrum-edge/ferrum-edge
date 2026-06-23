@@ -176,11 +176,12 @@ impl NodeAgentConfig {
         let node_waypoint_in_netns = env_config.node_agent_proxy_mode
             == NodeAgentProxyMode::NodeWaypoint
             && capture_config.outbound_capture_enabled;
-        // The in-netns listener and GAP-2M sock-ops bridge are IPv4-only, so
-        // captured IPv6 egress must FAIL CLOSED (the `connect6` hook returns
-        // EPERM via this flag) rather than bypass `mesh_authz`. Excluded v6
-        // (CIDR/port excludes) is decided before the deny and still flows.
-        capture_contract.ipv6_outbound_deny = node_waypoint_in_netns;
+        // NodeWaypoint in-netns capture now binds both pod-loopback families.
+        // Keep the global IPv6 include so dual-stack destinations are captured
+        // instead of bypassing `mesh_authz`; if a pod's IPv6 listener is not
+        // ready yet, connect6 redirects to `[::1]:<port>` and fails closed by
+        // connection refusal until the proxy publishes `.ready6`.
+        capture_contract.ipv6_outbound_deny = false;
         if node_waypoint_in_netns
             && !capture_config
                 .include_cidrs
@@ -1836,25 +1837,26 @@ fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
     }
 }
 
-/// Remove the mesh proxy's readiness marker `dir/.ready/<pod_uid>` on pod
-/// teardown. The proxy also removes it when its in-netns listener closes, but
-/// doing it here too closes the window where a same-UID re-enroll could observe
-/// a stale marker for the torn-down listener. Best-effort; shares the registry
-/// path-safety guard.
+/// Remove the mesh proxy's readiness markers on pod teardown. The proxy also
+/// removes them when its in-netns listeners close, but doing it here too closes
+/// the window where a same-UID re-enroll could observe stale readiness for the
+/// torn-down listeners. Best-effort; shares the registry path-safety guard.
 fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         return;
     }
-    let path = dir.join(".ready").join(pod_uid);
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(
-            pod_uid,
-            path = %path.display(),
-            error = %e,
-            "Failed to remove node-waypoint readiness marker"
-        );
+    for marker_dir in [".ready", ".ready4", ".ready6"] {
+        let path = dir.join(marker_dir).join(pod_uid);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                pod_uid,
+                path = %path.display(),
+                error = %e,
+                "Failed to remove node-waypoint readiness marker"
+            );
+        }
     }
 }
 
@@ -2001,13 +2003,11 @@ fn handle_pod_added(
         // capture is disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0), the
         // connect hooks are intentionally omitted and egress flows normally.
         // Otherwise attach both connect hooks up front, including NodeWaypoint
-        // in-netns mode: delaying connect4 until the mesh proxy listener is
-        // ready would leave a startup window where IPv4 egress bypasses
-        // mesh_authz entirely. Attaching connect4 immediately is fail-closed
-        // until the proxy opens the pod-loopback listener (connects may be
-        // refused, but they cannot bypass policy). In NodeWaypoint mode
-        // connect6 is configured as a fail-closed IPv6 denier via
-        // `ipv6_outbound_deny`; in other modes it redirects normally.
+        // in-netns mode: delaying them until the mesh proxy listener is ready
+        // would leave a startup window where egress bypasses mesh_authz entirely.
+        // Attaching immediately is fail-closed until the proxy opens the
+        // pod-loopback listener (connects may be refused, but they cannot bypass
+        // policy).
         let outbound_enabled = config.capture_config.outbound_capture_enabled;
         let programs: &[&str] = if !outbound_enabled {
             &["ferrum_getpeername4", "ferrum_getpeername6"]
@@ -3193,11 +3193,11 @@ mod tests {
     }
 
     #[test]
-    fn from_env_config_fail_closes_ipv6_only_in_node_waypoint_mode() {
-        // NodeWaypoint in-netns capture is IPv4-only, so the node-agent must mark
-        // the capture config to fail-close captured IPv6 egress (connect6 →
-        // EPERM) rather than let it bypass mesh_authz. Other proxy modes leave v6
-        // egress alone.
+    fn from_env_config_captures_ipv6_only_in_node_waypoint_mode() {
+        // NodeWaypoint in-netns capture binds both pod-loopback families, so the
+        // node-agent must include IPv6 destinations but must not set the old
+        // global deny flag. Other proxy modes leave the normal IPv4-only default
+        // include shape alone.
         let waypoint = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
             ..EnvConfig::default()
@@ -3206,16 +3206,16 @@ mod tests {
             let config = NodeAgentConfig::from_env_config(&waypoint)
                 .expect("node-agent config should parse");
             assert!(
-                config.capture_contract.ipv6_outbound_deny,
-                "NodeWaypoint in-netns mode must fail-close captured IPv6 egress"
+                !config.capture_contract.ipv6_outbound_deny,
+                "NodeWaypoint in-netns mode must redirect captured IPv6 egress to the IPv6 pod-loopback listener"
             );
-            assert_ne!(
+            assert_eq!(
                 config
                     .capture_contract
                     .bpf_capture_config()
                     .ipv6_outbound_deny,
                 0,
-                "the deny flag must reach the BPF capture config the connect6 hook reads"
+                "the old deny flag must remain clear so connect6 redirects to [::1]"
             );
             assert!(
                 config
@@ -3223,7 +3223,7 @@ mod tests {
                     .include_cidrs
                     .iter()
                     .any(|cidr| cidr == "::/0"),
-                "NodeWaypoint must include IPv6 destinations so connect6 reaches the fail-closed deny"
+                "NodeWaypoint must include IPv6 destinations so connect6 captures them instead of bypassing"
             );
             assert!(
                 config.node_waypoint_pod_registry_dir.is_some(),
@@ -3483,15 +3483,22 @@ mod tests {
 
     #[test]
     fn cleanup_all_pods_removes_registry_and_ready_files() {
-        // Shutdown must drop each enrolled pod's registry entry + .ready marker so
-        // a mesh proxy that keeps running doesn't leak a dead in-netns listener.
+        // Shutdown must drop each enrolled pod's registry entry + readiness
+        // markers so a mesh proxy that keeps running doesn't leak dead
+        // in-netns listeners.
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let registry = tempfile::tempdir().unwrap();
         let ready_dir = registry.path().join(".ready");
+        let ready4_dir = registry.path().join(".ready4");
+        let ready6_dir = registry.path().join(".ready6");
         std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::create_dir_all(&ready4_dir).unwrap();
+        std::fs::create_dir_all(&ready6_dir).unwrap();
         std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
         std::fs::write(ready_dir.join("pod-x"), b"").unwrap();
+        std::fs::write(ready4_dir.join("pod-x"), b"").unwrap();
+        std::fs::write(ready6_dir.join("pod-x"), b"").unwrap();
         pod_states.insert(
             "pod-x".to_string(),
             PodAttachmentState {
@@ -3527,7 +3534,15 @@ mod tests {
         );
         assert!(
             !ready_dir.join("pod-x").exists(),
-            "ready marker removed on shutdown"
+            "legacy ready marker removed on shutdown"
+        );
+        assert!(
+            !ready4_dir.join("pod-x").exists(),
+            "IPv4 ready marker removed on shutdown"
+        );
+        assert!(
+            !ready6_dir.join("pod-x").exists(),
+            "IPv6 ready marker removed on shutdown"
         );
     }
 
@@ -4089,7 +4104,7 @@ mod tests {
         );
         assert!(
             attached.contains(&"ferrum_connect6"),
-            "connect6 attaches immediately as the fail-closed IPv6 denier, got {attached:?}"
+            "connect6 attaches immediately so IPv6 egress cannot bypass mesh_authz, got {attached:?}"
         );
         assert!(
             attached.contains(&"ferrum_getpeername4") && attached.contains(&"ferrum_getpeername6"),
@@ -4172,17 +4187,25 @@ mod tests {
 
     #[test]
     fn handle_pod_removed_clears_readiness_marker() {
-        // Pod teardown must drop the proxy's `.ready/<uid>` marker too, so a
-        // same-UID re-enroll can't see a stale `ready` for the torn-down listener.
+        // Pod teardown must drop the proxy's readiness markers too, so a
+        // same-UID re-enroll can't see stale readiness for torn-down listeners.
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let registry = tempfile::tempdir().unwrap();
         let ready_dir = registry.path().join(".ready");
+        let ready4_dir = registry.path().join(".ready4");
+        let ready6_dir = registry.path().join(".ready6");
         std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::create_dir_all(&ready4_dir).unwrap();
+        std::fs::create_dir_all(&ready6_dir).unwrap();
         let marker = ready_dir.join("pod-x");
+        let marker4 = ready4_dir.join("pod-x");
+        let marker6 = ready6_dir.join("pod-x");
         std::fs::write(&marker, b"").unwrap();
+        std::fs::write(&marker4, b"").unwrap();
+        std::fs::write(&marker6, b"").unwrap();
         std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -4202,7 +4225,18 @@ mod tests {
             !registry.path().join("pod-x").exists(),
             "registry entry removed on teardown"
         );
-        assert!(!marker.exists(), "readiness marker removed on pod teardown");
+        assert!(
+            !marker.exists(),
+            "legacy readiness marker removed on pod teardown"
+        );
+        assert!(
+            !marker4.exists(),
+            "IPv4 readiness marker removed on pod teardown"
+        );
+        assert!(
+            !marker6.exists(),
+            "IPv6 readiness marker removed on pod teardown"
+        );
     }
 
     #[cfg(unix)]
