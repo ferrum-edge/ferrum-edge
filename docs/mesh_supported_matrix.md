@@ -80,9 +80,11 @@ need them, or because they are blocked upstream / architecturally:
   while preserving the selected workload as the inner CONNECT authority.
   Identity-backed source NodeWaypoint runtimes skip metadata-absent service
   targets so they cannot become plaintext backends, and destination-side
-  `mesh_authz` trusts HBONE baggage only from exact NodeWaypoint SPIFFE IDs
-  derived from the accepted slice. Explicit no-CA/no-identity development runs
-  retain the temporary plaintext fallback and built-in assertor defaults.
+  `mesh_authz` trusts HBONE baggage only from exact NodeWaypoint SPIFFE IDs in
+  the CP-derived `node_waypoint_assertors` inventory, which is built from
+  scope-authorized workloads before namespace/service slice narrowing.
+  Explicit no-CA/no-identity development runs retain the temporary plaintext
+  fallback and built-in assertor defaults.
   Broader promotion still waits on production SPIRE live coverage and inbound
   direct-pod enforcement.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP

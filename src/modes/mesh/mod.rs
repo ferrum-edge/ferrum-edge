@@ -20,7 +20,7 @@ pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -6779,17 +6779,11 @@ fn node_waypoint_authz_cluster_domains(primary_cluster_domain: &str) -> Vec<Stri
 }
 
 fn node_waypoint_assertor_spiffe_ids(mesh_slice: &MeshSlice) -> Vec<String> {
-    let mut ids = BTreeSet::new();
-    for workload in &mesh_slice.workloads {
-        // The accepted slice models source workloads as well as destination
-        // endpoints. Collecting every workload's node waypoint authorizes the
-        // assertor for cross-node source identity rewrites without falling back
-        // to service-account defaults.
-        if let Some(node_waypoint) = workload.node_waypoint.as_ref() {
-            ids.insert(node_waypoint.spiffe_id.as_str().to_string());
-        }
-    }
-    ids.into_iter().collect()
+    mesh_slice
+        .node_waypoint_assertors
+        .iter()
+        .map(|spiffe_id| spiffe_id.as_str().to_string())
+        .collect()
 }
 
 fn mesh_managed_trusted_hbone_assertors(
@@ -6885,10 +6879,10 @@ fn inject_mesh_global_plugins(
         mesh_authz_config["node_waypoint_route_upstreams"] = serde_json::json!(route_upstreams);
     }
     // Only thread the mesh-managed assertor list when it is explicit or when
-    // an identity-backed NodeWaypoint can derive exact assertor SPIFFE IDs from
-    // the accepted slice. A derived empty list intentionally disables baggage
-    // rewriting so production NodeWaypoint does not fall back to the bare
-    // service-account defaults.
+    // an identity-backed NodeWaypoint received the CP-derived exact assertor
+    // inventory. A derived empty list intentionally disables baggage rewriting
+    // so production NodeWaypoint does not fall back to the bare service-account
+    // defaults or to namespace-scoped destination workload metadata.
     if let Some(assertors) = mesh_managed_trusted_assertors.as_ref() {
         mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(
             assertors
@@ -17911,6 +17905,7 @@ mod tests {
             labels_ambiguous: false,
             version: "test".to_string(),
             workloads: Vec::new(),
+            node_waypoint_assertors: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -18362,6 +18357,10 @@ mod tests {
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
             workloads: vec![reviews, ratings, duplicate],
+            node_waypoint_assertors: vec![
+                SpiffeId::new(waypoint_a).unwrap(),
+                SpiffeId::new(waypoint_b).unwrap(),
+            ],
             ..MeshSlice::default()
         };
         let mut config = GatewayConfig::default();
@@ -18377,7 +18376,7 @@ mod tests {
         assert_eq!(
             authz.config.get("trusted_hbone_assertors"),
             Some(&expected),
-            "identity-backed NodeWaypoint must trust exact assertor SPIFFE IDs from the accepted slice"
+            "identity-backed NodeWaypoint must trust exact assertor SPIFFE IDs from the CP-derived inventory"
         );
         let workload_metrics = config
             .plugin_configs
@@ -18392,23 +18391,11 @@ mod tests {
     }
 
     #[test]
-    fn inject_mesh_global_plugins_node_waypoint_assertors_include_source_workload_nodes() {
+    fn inject_mesh_global_plugins_node_waypoint_assertors_include_source_inventory() {
         let runtime = identity_backed_node_waypoint_runtime();
-        let source_workload_spiffe = "spiffe://cluster.local/ns/default/sa/client";
         let destination_workload_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let source_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-source";
         let destination_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-destination";
-        let mut client = workload_with_address("client", "client", "10.0.0.10");
-        client.spiffe_id = SpiffeId::new(source_workload_spiffe).unwrap();
-        client.node_waypoint = Some(NodeWaypointEndpoint {
-            address: "10.9.0.10".to_string(),
-            hbone_port: 15008,
-            spiffe_id: SpiffeId::new(source_waypoint).unwrap(),
-            node_name: Some("worker-source".to_string()),
-            node_uid: Some("node-uid-source".to_string()),
-            network: None,
-            cluster: None,
-        });
         let mut reviews = workload_with_address("reviews", "reviews", "10.0.0.20");
         reviews.spiffe_id = SpiffeId::new(destination_workload_spiffe).unwrap();
         reviews.node_waypoint = Some(NodeWaypointEndpoint {
@@ -18422,7 +18409,11 @@ mod tests {
         });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
-            workloads: vec![client, reviews],
+            workloads: vec![reviews],
+            node_waypoint_assertors: vec![
+                SpiffeId::new(destination_waypoint).unwrap(),
+                SpiffeId::new(source_waypoint).unwrap(),
+            ],
             services: vec![http_mesh_service(
                 "reviews",
                 8080,
@@ -18460,9 +18451,20 @@ mod tests {
     #[test]
     fn inject_mesh_global_plugins_node_waypoint_no_slice_assertors_locks_baggage() {
         let runtime = identity_backed_node_waypoint_runtime();
+        let mut reviews = workload_with_address("reviews", "reviews", "10.0.0.1");
+        reviews.node_waypoint = Some(NodeWaypointEndpoint {
+            address: "10.9.0.7".to_string(),
+            hbone_port: 15008,
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a")
+                .unwrap(),
+            node_name: Some("worker-a".to_string()),
+            node_uid: Some("node-uid-a".to_string()),
+            network: None,
+            cluster: None,
+        });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
-            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            workloads: vec![reviews],
             ..MeshSlice::default()
         };
         let mut config = GatewayConfig::default();

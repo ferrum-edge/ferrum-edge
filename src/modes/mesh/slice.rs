@@ -190,6 +190,13 @@ pub struct MeshSlice {
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
+    /// Exact NodeWaypoint SPIFFE IDs trusted to assert HBONE source workload
+    /// identity for this slice. Unlike `workloads`, this inventory is derived
+    /// from scope-authorized `Workload.node_waypoint` endpoints before
+    /// namespace or service-scope narrowing so a destination slice can still
+    /// trust the source node waypoint for legitimate cross-namespace traffic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_waypoint_assertors: Vec<SpiffeId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<MeshService>,
     /// Inbound-only view: the LOCAL workload's own service(s), captured
@@ -414,6 +421,19 @@ pub struct MeshEgressScopeResource {
     pub ports: Vec<u16>,
 }
 
+pub(crate) fn node_waypoint_assertors_from_workloads<'a>(
+    workloads: impl IntoIterator<Item = &'a Workload>,
+) -> Vec<SpiffeId> {
+    let mut ids = BTreeMap::new();
+    for workload in workloads {
+        if let Some(node_waypoint) = workload.node_waypoint.as_ref() {
+            ids.entry(node_waypoint.spiffe_id.as_str().to_string())
+                .or_insert_with(|| node_waypoint.spiffe_id.clone());
+        }
+    }
+    ids.into_values().collect()
+}
+
 impl MeshSlice {
     /// Compare mesh-slice content while ignoring the transport version stamp.
     ///
@@ -433,6 +453,7 @@ impl MeshSlice {
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
             && self.workloads == other.workloads
+            && self.node_waypoint_assertors == other.node_waypoint_assertors
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
@@ -681,6 +702,11 @@ impl MeshSlice {
             request.waypoint_name.as_deref(),
             &namespace,
         );
+        let node_waypoint_assertors = if mesh.node_waypoint_assertors.is_empty() {
+            node_waypoint_assertors_from_workloads(mesh.workloads.iter())
+        } else {
+            mesh.node_waypoint_assertors.clone()
+        };
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -1114,6 +1140,7 @@ impl MeshSlice {
             labels_ambiguous,
             version,
             workloads,
+            node_waypoint_assertors,
             services,
             local_inbound_services,
             local_inbound_workloads,
@@ -2744,6 +2771,18 @@ mod tests {
         }
     }
 
+    fn make_node_waypoint_endpoint(spiffe: &str, address: &str) -> NodeWaypointEndpoint {
+        NodeWaypointEndpoint {
+            address: address.to_string(),
+            hbone_port: 15008,
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            node_name: None,
+            node_uid: None,
+            network: None,
+            cluster: None,
+        }
+    }
+
     fn make_service(namespace: &str, name: &str) -> MeshService {
         make_service_with_ports(namespace, name, &[80])
     }
@@ -2998,6 +3037,7 @@ mod tests {
             labels_ambiguous: false,
             version: "v1".into(),
             workloads: vec![make_workload("ns", "web", HashMap::new())],
+            node_waypoint_assertors: Vec::new(),
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -3465,6 +3505,41 @@ mod tests {
         assert_eq!(endpoint.node_uid.as_deref(), Some("node-uid-a"));
         assert_eq!(endpoint.network.as_deref(), Some("network-a"));
         assert_eq!(endpoint.cluster.as_deref(), Some("cluster-a"));
+    }
+
+    #[test]
+    fn from_gateway_config_node_waypoint_assertors_are_not_namespace_scoped() {
+        let waypoint_alpha = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-alpha";
+        let waypoint_beta = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-beta";
+        let mut alpha = make_workload("alpha", "client", HashMap::new());
+        alpha.node_waypoint = Some(make_node_waypoint_endpoint(waypoint_alpha, "10.2.0.11"));
+        let mut beta = make_workload("beta", "reviews", HashMap::new());
+        beta.node_waypoint = Some(make_node_waypoint_endpoint(waypoint_beta, "10.2.0.12"));
+        let mut beta_duplicate = make_workload("beta", "ratings", HashMap::new());
+        beta_duplicate.node_waypoint = beta.node_waypoint.clone();
+        let config = config_with_mesh(MeshConfig {
+            workloads: vec![alpha, beta, beta_duplicate],
+            ..MeshConfig::default()
+        });
+
+        let slice = MeshSlice::from_gateway_config(&config, slice_request("beta"));
+
+        assert!(
+            slice
+                .workloads
+                .iter()
+                .all(|workload| workload.namespace == "beta"),
+            "visible workloads remain namespace-scoped"
+        );
+        assert_eq!(
+            slice
+                .node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_alpha, waypoint_beta],
+            "NodeWaypoint assertor inventory must include source-node assertors outside the destination namespace"
+        );
     }
 
     #[test]

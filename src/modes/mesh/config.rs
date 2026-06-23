@@ -2161,6 +2161,14 @@ pub struct MeshConfig {
     /// `envoy.config.core.v3.TypedExtensionConfig` payloads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<crate::modes::mesh::slice::MeshExtensionConfig>,
+    /// Runtime-only CP-derived NodeWaypoint assertor inventory. The CP fills
+    /// this before request-specific workload narrowing so destination slices can
+    /// still trust legitimate source node-waypoint identities. `serde(skip)`:
+    /// never operator-settable, never serialized on raw `GatewayConfig`; the
+    /// narrowed `MeshSlice.node_waypoint_assertors` field carries it over the
+    /// mesh subscription transports.
+    #[serde(skip)]
+    pub node_waypoint_assertors: Vec<SpiffeId>,
     /// Runtime-only back-projection of the slice's narrowed **local-inbound**
     /// service view (`MeshSlice.local_inbound_services`), set by mesh
     /// preparation. `Some` exactly when Sidecar narrowing resolved the local
@@ -2232,6 +2240,7 @@ impl Default for MeshConfig {
             multi_cluster: None,
             outbound_traffic_policy: None,
             extension_configs: Vec::new(),
+            node_waypoint_assertors: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             declared_ingress_http_ports: 0,

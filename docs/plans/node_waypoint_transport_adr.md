@@ -89,8 +89,12 @@ identity-backed source NodeWaypoint runtimes now make missing destination
 metadata fail closed by skipping those targets during materialization. For
 identity-backed NodeWaypoint, the mesh-managed destination `mesh_authz` and
 `workload_metrics` plugins derive their `trusted_hbone_assertors` list from the
-exact `Workload.node_waypoint.spiffe_id` values in the accepted slice; if none
-exist, the generated list is empty so asserted workload identity is not honored.
+exact SPIFFE IDs in the scope-authorized CP-derived `node_waypoint_assertors`
+inventory. That inventory is built from known
+`Workload.node_waypoint.spiffe_id` values before namespace/service slice
+narrowing, so destination slices can still trust legitimate source
+NodeWaypoints. If none exist, the generated list is empty so asserted workload
+identity is not honored.
 The temporary plaintext compatibility fallback and built-in bare service-account
 assertor defaults remain only for explicit no-CA/no-identity development runs.
 
