@@ -202,29 +202,14 @@ fn destination_policy_scopes_by_upstream(
 ) -> HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>> {
     let mut scopes_by_upstream = HashMap::new();
     for service in &slice.services {
-        let scopes: Vec<_> = if service.workloads.is_empty() {
-            slice
-                .workloads
-                .iter()
-                .filter(|workload| {
-                    workload.namespace == service.namespace && workload.service_name == service.name
-                })
-                .map(crate::modes::mesh::runtime::PolicyScopeCache::from_workload)
-                .collect()
-        } else {
-            service
-                .workloads
-                .iter()
-                .filter_map(|workload_ref| {
-                    slice.workloads.iter().find(|workload| {
-                        workload.spiffe_id == workload_ref.spiffe_id
-                            && workload.namespace == service.namespace
-                            && workload.service_name == service.name
-                    })
-                })
-                .map(crate::modes::mesh::runtime::PolicyScopeCache::from_workload)
-                .collect()
-        };
+        let scopes: Vec<_> = crate::modes::mesh::matched_local_service_workloads(
+            service,
+            &slice.workloads,
+            slice.multi_cluster.as_ref(),
+        )
+        .into_iter()
+        .map(crate::modes::mesh::runtime::PolicyScopeCache::from_workload)
+        .collect();
         if scopes.is_empty() {
             continue;
         }

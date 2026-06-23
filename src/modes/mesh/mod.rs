@@ -1762,7 +1762,7 @@ fn build_east_west_service_proxies_and_upstreams(
 /// remote-cluster endpoints before consuming a ref slot. Shared scaffold for
 /// the east-west and Ambient outbound target builders, which differ only in
 /// per-target port/tag policy.
-fn matched_local_service_workloads<'a>(
+pub(crate) fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,

@@ -2358,7 +2358,12 @@ async fn mesh_authz_node_waypoint_service_egress_uses_destination_policy_scope()
                 labels: HashMap::from([("app".to_string(), "dst".to_string())]),
                 namespace: None,
             },
-            service_name: "dst".to_string(),
+            // The outbound materializer admits explicit WorkloadRef matches
+            // whose legacy service metadata does not name the Service, as long
+            // as no exact metadata match exists. Authz must use the same
+            // destination workload selection or destination-scoped policies can
+            // disappear on this materialized route.
+            service_name: "legacy-dst".to_string(),
             addresses: vec!["10.0.0.20".to_string()],
             ports: Vec::new(),
             trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
