@@ -6565,6 +6565,7 @@ fn inject_mesh_global_plugins(
         .and_then(|cfg| cfg.get("trusted_hbone_assertors").cloned());
     let mut mesh_authz_config = serde_json::json!({
         "mesh_slice": mesh_slice,
+        "cluster_domain": runtime.cluster_domain,
         "trust_domain_aliases": trust_domain_aliases,
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
     });

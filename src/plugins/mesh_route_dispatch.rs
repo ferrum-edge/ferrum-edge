@@ -66,7 +66,9 @@ use crate::config::types::{
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
-use crate::plugins::mesh::authz::NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA;
+use crate::plugins::mesh::authz::{
+    NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA, NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA,
+};
 use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
@@ -1012,12 +1014,30 @@ fn reject_node_waypoint_authz_destination_override(
 ) -> Option<PluginResult> {
     let authorized_upstream_id = ctx
         .metadata
-        .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA)?;
-    if destination.is_empty()
-        || (destination.upstream_id.as_deref() == Some(authorized_upstream_id.as_str())
-            && destination.backend_host.is_none()
-            && destination.backend_port.is_none()
-            && destination.backend_tls.is_none())
+        .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA);
+    let authorized_backend = ctx.metadata.get(NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA);
+    if authorized_upstream_id.is_none() && authorized_backend.is_none() {
+        return None;
+    }
+    if destination.is_empty() {
+        return None;
+    }
+    if let Some(authorized_upstream_id) = authorized_upstream_id
+        && destination.upstream_id.as_deref() == Some(authorized_upstream_id.as_str())
+        && destination.backend_host.is_none()
+        && destination.backend_port.is_none()
+        && destination.backend_tls.is_none()
+    {
+        return None;
+    }
+    if let Some(authorized_backend) = authorized_backend
+        && destination.upstream_id.is_none()
+        && destination
+            .backend_host
+            .as_deref()
+            .and_then(|host| node_waypoint_backend_metadata_value(host, destination.backend_port?))
+            .as_deref()
+            == Some(authorized_backend.as_str())
     {
         return None;
     }
@@ -1028,6 +1048,14 @@ fn reject_node_waypoint_authz_destination_override(
                 .to_string(),
         headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
     })
+}
+
+fn node_waypoint_backend_metadata_value(host: &str, port: u16) -> Option<String> {
+    if port == 0 {
+        return None;
+    }
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then(|| format!("{host}|{port}"))
 }
 
 /// Per-rule fault action carried by a single [`RouteRule`]. Projects Istio

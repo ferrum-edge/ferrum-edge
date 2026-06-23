@@ -40,13 +40,14 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload, resolve_target_port,
     validate_mesh_condition_ip_block, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
@@ -66,6 +67,9 @@ pub struct MeshAuthz {
     slice: MeshSlice,
     destination_policy_scopes_by_upstream:
         HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    destination_policy_scopes_by_backend:
+        HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    destination_service_backend_hosts: HashSet<String>,
     has_header_rules: bool,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
@@ -152,6 +156,46 @@ const ATTR_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
 const ATTR_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
 pub(crate) const NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA: &str =
     "mesh_authz.node_waypoint_authorized_upstream_id";
+pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA: &str =
+    "mesh_authz.node_waypoint_authorized_backend";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DestinationBackendKey {
+    host: String,
+    port: u16,
+}
+
+impl DestinationBackendKey {
+    fn new(host: &str, port: u16) -> Option<Self> {
+        if port == 0 {
+            return None;
+        }
+        let host = normalize_destination_backend_host(host)?;
+        Some(Self { host, port })
+    }
+
+    fn metadata_value(&self) -> String {
+        format!("{}|{}", self.host, self.port)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum NodeWaypointAuthorizedDestination {
+    Upstream(String),
+    Backend(DestinationBackendKey),
+}
+
+struct DestinationScopeMatch<'a> {
+    authorized_destination: NodeWaypointAuthorizedDestination,
+    scopes: &'a [crate::modes::mesh::runtime::PolicyScopeCache],
+}
+
+#[derive(Default)]
+struct DestinationPolicyScopeIndex {
+    by_upstream: HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    by_backend: HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    service_backend_hosts: HashSet<String>,
+}
 
 impl ConditionAttributeKeys {
     fn from_policies(policies: &[MeshPolicy]) -> Self {
@@ -199,24 +243,92 @@ fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     key.strip_prefix(prefix)?.strip_suffix(']')
 }
 
-fn destination_policy_scopes_by_upstream(
-    slice: &MeshSlice,
-) -> HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>> {
-    let mut scopes_by_upstream = HashMap::new();
-    for service in &slice.services {
-        let scopes: Vec<_> = crate::modes::mesh::matched_local_service_workloads(
-            service,
-            &slice.workloads,
-            slice.multi_cluster.as_ref(),
-        )
+fn normalize_destination_backend_host(host: &str) -> Option<String> {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn service_host_aliases(
+    service: &crate::modes::mesh::config::MeshService,
+    cluster_domain: &str,
+    unique_short_name: bool,
+) -> Vec<String> {
+    let mut aliases = vec![
+        format!("{}.{}", service.name, service.namespace),
+        format!("{}.{}.svc", service.name, service.namespace),
+    ];
+    let cluster_domain = cluster_domain.trim().trim_matches('.');
+    if !cluster_domain.is_empty() {
+        aliases.push(format!(
+            "{}.{}.svc.{}",
+            service.name, service.namespace, cluster_domain
+        ));
+    }
+    if unique_short_name {
+        aliases.push(service.name.clone());
+    }
+    aliases
+}
+
+fn destination_policy_scopes_for_service_port(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) -> Vec<crate::modes::mesh::runtime::PolicyScopeCache> {
+    crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
         .into_iter()
-        .map(crate::modes::mesh::runtime::PolicyScopeCache::from_workload)
-        .collect();
-        if scopes.is_empty() {
-            continue;
+        .filter_map(|workload| {
+            let app_port = match service_port.target_port.as_ref() {
+                Some(_) => {
+                    match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
+                        Some(port) if port != 0 => port,
+                        _ => return None,
+                    }
+                }
+                None => service_port.port,
+            };
+            if app_port == 0 {
+                return None;
+            }
+            Some(crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload))
+        })
+        .collect()
+}
+
+fn destination_policy_scope_index(
+    slice: &MeshSlice,
+    cluster_domain: &str,
+) -> DestinationPolicyScopeIndex {
+    let mut index = DestinationPolicyScopeIndex::default();
+    let mut service_name_counts = HashMap::new();
+    for service in &slice.services {
+        *service_name_counts
+            .entry(service.name.as_str())
+            .or_insert(0usize) += 1;
+    }
+    for service in &slice.services {
+        let aliases = service_host_aliases(
+            service,
+            cluster_domain,
+            service_name_counts.get(service.name.as_str()) == Some(&1),
+        );
+        for alias in &aliases {
+            if let Some(host) = normalize_destination_backend_host(alias) {
+                index.service_backend_hosts.insert(host);
+            }
         }
         for service_port in &service.ports {
-            scopes_by_upstream.insert(
+            let scopes = destination_policy_scopes_for_service_port(
+                service,
+                service_port,
+                &slice.workloads,
+                slice.multi_cluster.as_ref(),
+            );
+            if scopes.is_empty() {
+                continue;
+            }
+            index.by_upstream.insert(
                 crate::modes::mesh::mesh_outbound_upstream_id(
                     &service.namespace,
                     &service.name,
@@ -224,9 +336,14 @@ fn destination_policy_scopes_by_upstream(
                 ),
                 scopes.clone(),
             );
+            for alias in &aliases {
+                if let Some(key) = DestinationBackendKey::new(alias, service_port.port) {
+                    index.by_backend.insert(key, scopes.clone());
+                }
+            }
         }
     }
-    scopes_by_upstream
+    index
 }
 
 fn evaluate_destination_policy_scopes(
@@ -540,14 +657,20 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
-        let destination_policy_scopes_by_upstream = if per_pod_policy_scoping {
-            destination_policy_scopes_by_upstream(&slice)
+        let destination_policy_scope_index = if per_pod_policy_scoping {
+            let cluster_domain = config
+                .get("cluster_domain")
+                .and_then(Value::as_str)
+                .unwrap_or("cluster.local");
+            destination_policy_scope_index(&slice, cluster_domain)
         } else {
-            HashMap::new()
+            DestinationPolicyScopeIndex::default()
         };
         Ok(Self {
             slice,
-            destination_policy_scopes_by_upstream,
+            destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
+            destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
+            destination_service_backend_hosts: destination_policy_scope_index.service_backend_hosts,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
@@ -734,6 +857,40 @@ impl MeshAuthz {
             Some(scope) => scope.policy_applies(policy),
             None => matches!(policy.scope, PolicyScope::MeshWide),
         }
+    }
+
+    fn destination_scope_match_for_proxy(
+        &self,
+        proxy: &Proxy,
+    ) -> Option<DestinationScopeMatch<'_>> {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref()
+            && let Some(scopes) = self.destination_policy_scopes_by_upstream.get(upstream_id)
+        {
+            return Some(DestinationScopeMatch {
+                authorized_destination: NodeWaypointAuthorizedDestination::Upstream(
+                    upstream_id.to_string(),
+                ),
+                scopes,
+            });
+        }
+        let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+        self.destination_policy_scopes_by_backend
+            .get(&backend_key)
+            .map(|scopes| DestinationScopeMatch {
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend(backend_key),
+                scopes,
+            })
+    }
+
+    fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref()
+            && (upstream_id.starts_with("__mesh-out-upstream-")
+                || upstream_id.starts_with("istio-vs-upstream-"))
+        {
+            return true;
+        }
+        DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)
+            .is_some_and(|key| self.destination_service_backend_hosts.contains(&key.host))
     }
 
     fn decision_to_result(
@@ -1100,7 +1257,7 @@ impl Plugin for MeshAuthz {
         // never clones the full `MeshSlice` (which carries workloads,
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
-        let mut node_waypoint_authorized_upstream_id = None;
+        let mut node_waypoint_authorized_destination = None;
         let decision = if self.per_pod_policy_scoping {
             scope_missing = ctx.node_waypoint_policy_scope.is_none();
             // Fail closed when scoped policies exist and this request's pod has
@@ -1130,24 +1287,40 @@ impl Plugin for MeshAuthz {
                     headers: HashMap::new(),
                 };
             }
-            let destination_upstream_id = ctx
+            let destination_scope_match = ctx
                 .matched_proxy
                 .as_ref()
-                .and_then(|proxy| proxy.upstream_id.as_deref())
-                .map(str::to_string);
-            if let Some(destination_scopes) =
-                destination_upstream_id.as_deref().and_then(|upstream_id| {
-                    self.destination_policy_scopes_by_upstream
-                        .get(upstream_id)
-                        .map(Vec::as_slice)
-                })
-            {
-                node_waypoint_authorized_upstream_id = destination_upstream_id;
+                .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+            if let Some(destination_scope_match) = destination_scope_match {
+                node_waypoint_authorized_destination =
+                    Some(destination_scope_match.authorized_destination);
                 evaluate_destination_policy_scopes(
                     &self.slice.mesh_policies,
-                    destination_scopes,
+                    destination_scope_match.scopes,
                     &request,
                 )
+            } else if self.has_scoped_policies
+                && ctx
+                    .matched_proxy
+                    .as_ref()
+                    .is_some_and(|proxy| self.proxy_requires_destination_scope(proxy))
+            {
+                ctx.metadata.insert(
+                    "mesh_authz.destination_scope_missing".to_string(),
+                    "true".to_string(),
+                );
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "destination_scope_missing".to_string(),
+                );
+                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                return PluginResult::Reject {
+                    status_code: 403,
+                    body:
+                        r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+                            .into(),
+                    headers: HashMap::new(),
+                };
             } else {
                 let scope = ctx.node_waypoint_policy_scope.as_deref();
                 let policies = self
@@ -1171,12 +1344,22 @@ impl Plugin for MeshAuthz {
         let result = self.decision_to_result(decision, &mut ctx.metadata);
         if self.has_scoped_policies
             && matches!(result, PluginResult::Continue)
-            && let Some(upstream_id) = node_waypoint_authorized_upstream_id
+            && let Some(destination) = node_waypoint_authorized_destination
         {
-            ctx.metadata.insert(
-                NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA.to_string(),
-                upstream_id,
-            );
+            match destination {
+                NodeWaypointAuthorizedDestination::Upstream(upstream_id) => {
+                    ctx.metadata.insert(
+                        NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA.to_string(),
+                        upstream_id,
+                    );
+                }
+                NodeWaypointAuthorizedDestination::Backend(backend) => {
+                    ctx.metadata.insert(
+                        NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA.to_string(),
+                        backend.metadata_value(),
+                    );
+                }
+            }
         }
         if matches!(
             result,
