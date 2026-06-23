@@ -202,7 +202,7 @@ maps:
 
 | Surface | Name / default | Format |
 |---|---|---|
-| Pod registry dir | `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default `/run/ferrum/node-waypoint-pods`) | One file per enrolled pod. File **name** = pod UID; file **contents** = the pod cgroup path. |
+| Pod registry dir | `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default `/run/ferrum/node-waypoint-pods`) | One file per enrolled pod. File **name** = pod UID; file **contents** = line 1 pod cgroup path, then optional `ipv4=<pod-ip>` / `ipv6=<pod-ip>` lines from Kubernetes `status.podIPs`. |
 
 Helm sets `nodeAgent.podRegistryDir` to that default and, when
 `nodeAgent.proxyMode=node_waypoint`, mounts it as the same writable hostPath in
@@ -230,7 +230,10 @@ chart adds those settings only when
 The node-agent **writes** a pod's registry file on enrollment and **removes**
 it on teardown. The mesh proxy's `NetnsCaptureManager` polls this directory and
 reconciles IPv4 and IPv6 in-netns listeners per pod netns (opening on add,
-closing on removal).
+closing on removal). The family-specific `ipv4=` and `ipv6=` lines are used as
+dynamic source-IP overrides for the matching listener family so IPv6 captured
+traffic is attributed to the pod's IPv6 address instead of reusing the IPv4
+override or the pod-loopback peer.
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

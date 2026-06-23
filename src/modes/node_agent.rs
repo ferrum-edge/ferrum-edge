@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, PodStatus};
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use kube::{Client, api::Api};
 use tracing::{debug, error, info, warn};
@@ -78,12 +78,62 @@ pub struct NodeAgentConfig {
     /// CP-side SPIFFE format that the node-waypoint resolver enrolls.
     pub trust_domain: String,
     /// Directory under which the node-agent publishes a per-pod registry file
-    /// (`<dir>/<pod_uid>` containing the pod cgroup path) for the mesh proxy's
-    /// in-netns capture listeners to consume. `Some` only when in-netns
-    /// listeners are enabled AND the proxy mode is `NodeWaypoint`; `None`
-    /// disables publishing entirely (the registry is meaningless outside that
-    /// topology). Sourced from `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
+    /// (`<dir>/<pod_uid>` containing the pod cgroup path plus optional
+    /// `ipv4=`/`ipv6=` source-IP lines) for the mesh proxy's in-netns capture
+    /// listeners to consume. `Some` only when in-netns listeners are enabled AND
+    /// the proxy mode is `NodeWaypoint`; `None` disables publishing entirely
+    /// (the registry is meaningless outside that topology). Sourced from
+    /// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
     pub node_waypoint_pod_registry_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PodSourceIps {
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    pub ipv6: Option<std::net::Ipv6Addr>,
+}
+
+impl PodSourceIps {
+    #[cfg(test)]
+    fn from_primary_str(ip: Option<&str>) -> Self {
+        let mut ips = Self::default();
+        if let Some(ip) = ip {
+            ips.insert_str(ip);
+        }
+        ips
+    }
+
+    fn from_status(status: Option<&PodStatus>) -> Self {
+        let mut ips = Self::default();
+        let Some(status) = status else {
+            return ips;
+        };
+        if let Some(primary) = status.pod_ip.as_deref() {
+            ips.insert_str(primary);
+        }
+        if let Some(pod_ips) = &status.pod_ips {
+            for pod_ip in pod_ips {
+                ips.insert_str(&pod_ip.ip);
+            }
+        }
+        ips
+    }
+
+    fn insert_str(&mut self, ip: &str) {
+        match ip.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                if self.ipv4.is_none() {
+                    self.ipv4 = Some(ip);
+                }
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                if self.ipv6.is_none() {
+                    self.ipv6 = Some(ip);
+                }
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// CNI plugin listener configuration. Resolved from the env config in
@@ -878,10 +928,9 @@ fn apply_cni_add_from_pod(
         .namespace
         .as_deref()
         .unwrap_or(request.pod_namespace.as_str());
-    let pod_ip = pod
-        .status
-        .as_ref()
-        .and_then(|status| status.pod_ip.as_deref());
+    let status = pod.status.as_ref();
+    let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
+    let pod_source_ips = PodSourceIps::from_status(status);
     let service_account = pod
         .spec
         .as_ref()
@@ -894,6 +943,7 @@ fn apply_cni_add_from_pod(
         labels: &labels,
         annotations: &annotations,
         pod_ip_str: pod_ip,
+        pod_source_ips,
         pod_pid: None,
         veth_iface_override: None,
     };
@@ -1322,10 +1372,9 @@ fn handle_kube_pod_applied(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let pod_ip = pod
-        .status
-        .as_ref()
-        .and_then(|status| status.pod_ip.as_deref());
+    let status = pod.status.as_ref();
+    let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
+    let pod_source_ips = PodSourceIps::from_status(status);
     let service_account = pod
         .spec
         .as_ref()
@@ -1338,6 +1387,7 @@ fn handle_kube_pod_applied(
         labels: &labels,
         annotations: &annotations,
         pod_ip_str: pod_ip,
+        pod_source_ips,
         pod_pid: None,
         veth_iface_override: None,
     };
@@ -1357,6 +1407,7 @@ pub struct PodEvent<'a> {
     pub labels: &'a HashMap<String, String>,
     pub annotations: &'a HashMap<String, String>,
     pub pod_ip_str: Option<&'a str>,
+    pub pod_source_ips: PodSourceIps,
     pub pod_pid: Option<u32>,
     /// Pre-resolved host-side veth interface name for this pod, bypassing
     /// the production resolver. Production always sets this to `None` and
@@ -1374,6 +1425,7 @@ struct PodEnrollmentAttemptSignature {
     namespace: String,
     service_account: Option<String>,
     pod_ip: Option<std::net::Ipv4Addr>,
+    pod_source_ips: PodSourceIps,
     cgroup_path: Option<String>,
     veth_iface: Option<String>,
     labels_fingerprint: u64,
@@ -1404,6 +1456,7 @@ struct RetryablePodEnrollment {
     labels: HashMap<String, String>,
     annotations: HashMap<String, String>,
     pod_ip: Option<String>,
+    pod_source_ips: PodSourceIps,
     pod_pid: Option<u32>,
 }
 
@@ -1417,6 +1470,7 @@ impl RetryablePodEnrollment {
             labels: event.labels.clone(),
             annotations: event.annotations.clone(),
             pod_ip: event.pod_ip_str.map(ToOwned::to_owned),
+            pod_source_ips: event.pod_source_ips,
             pod_pid: event.pod_pid,
         }
     }
@@ -1433,6 +1487,7 @@ impl RetryablePodEnrollment {
             labels: &self.labels,
             annotations: &self.annotations,
             pod_ip_str: self.pod_ip.as_deref(),
+            pod_source_ips: self.pod_source_ips,
             pod_pid: self.pod_pid,
             // Production always re-resolves the veth on retry (see struct docs).
             veth_iface_override: None,
@@ -1568,6 +1623,7 @@ fn pod_enrollment_attempt_signature(
         namespace: event.namespace.to_string(),
         service_account: event.service_account.map(ToOwned::to_owned),
         pod_ip,
+        pod_source_ips: event.pod_source_ips,
         cgroup_path: cgroup_path.clone(),
         veth_iface: veth_iface.clone(),
         labels_fingerprint: map_fingerprint(event.labels),
@@ -1774,7 +1830,7 @@ fn publish_pod_registry(
     dir: &std::path::Path,
     pod_uid: &str,
     cgroup_path: &str,
-    pod_ip: Option<std::net::Ipv4Addr>,
+    pod_source_ips: PodSourceIps,
 ) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         warn!(
@@ -1794,13 +1850,16 @@ fn publish_pod_registry(
         return;
     }
     let path = dir.join(pod_uid);
-    // Line 1: pod cgroup path. Line 2 (optional): source pod IP — the mesh
-    // proxy uses it to override the loopback peer of in-netns capture
+    // Line 1: pod cgroup path. Optional keyed lines: same-family source pod IPs
+    // the mesh proxy uses to override the loopback peer of in-netns capture
     // connections so authz/logs/IP-keyed plugins see the real pod IP.
-    let contents = match pod_ip {
-        Some(ip) => format!("{cgroup_path}\n{ip}\n"),
-        None => format!("{cgroup_path}\n"),
-    };
+    let mut contents = format!("{cgroup_path}\n");
+    if let Some(ip) = pod_source_ips.ipv4 {
+        contents.push_str(&format!("ipv4={ip}\n"));
+    }
+    if let Some(ip) = pod_source_ips.ipv6 {
+        contents.push_str(&format!("ipv6={ip}\n"));
+    }
     if let Err(e) = std::fs::write(&path, contents) {
         warn!(
             pod_uid,
@@ -1930,6 +1989,14 @@ fn handle_pod_added(
                 event.service_account,
                 &mut state,
             );
+            if !pod_ip_reconcile.pod_ip_update_failed
+                && let (Some(dir), Some(cgroup)) = (
+                    &config.node_waypoint_pod_registry_dir,
+                    state.cgroup_path.as_deref(),
+                )
+            {
+                publish_pod_registry(dir, pod_uid, cgroup, event.pod_source_ips);
+            }
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
             drop(state);
             if pod_ip_reconcile.recovered_pending_failure {
@@ -2116,7 +2183,7 @@ fn handle_pod_added(
             &config.node_waypoint_pod_registry_dir,
             cgroup_path.as_deref(),
         ) {
-            publish_pod_registry(dir, pod_uid, cgroup_path_value, pod_ip);
+            publish_pod_registry(dir, pod_uid, cgroup_path_value, event.pod_source_ips);
         }
     }
 }
@@ -2125,6 +2192,7 @@ fn handle_pod_added(
 struct PodIpReconcileResult {
     stale_pod_ip: Option<std::net::Ipv4Addr>,
     recovered_pending_failure: bool,
+    pod_ip_update_failed: bool,
 }
 
 fn reconcile_existing_pod_ip(
@@ -2155,7 +2223,10 @@ fn reconcile_existing_pod_ip(
             CAPTURE_FAILURE_POD_IP_UPDATE,
             CAPTURE_FAILURE_DETAIL_POD_IP,
         );
-        return PodIpReconcileResult::default();
+        return PodIpReconcileResult {
+            pod_ip_update_failed: true,
+            ..PodIpReconcileResult::default()
+        };
     }
     forget_pending_capture_failure(
         state_key,
@@ -2164,19 +2235,10 @@ fn reconcile_existing_pod_ip(
     );
     let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
-    // Keep the in-netns capture registry's pod IP in sync (line 2 of the entry)
-    // so the mesh proxy reopens its in-netns listener with the new
-    // `source_ip_override` instead of reporting a stale IP to authz/logs/IP-keyed
-    // plugins. Best-effort and gated on in-netns publishing being enabled.
-    if let (Some(dir), Some(cgroup)) = (
-        &config.node_waypoint_pod_registry_dir,
-        state.cgroup_path.as_deref(),
-    ) {
-        publish_pod_registry(dir, pod_uid, cgroup, Some(new_ip));
-    }
     PodIpReconcileResult {
         stale_pod_ip: old_ip,
         recovered_pending_failure: true,
+        pod_ip_update_failed: false,
     }
 }
 
@@ -3582,6 +3644,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4017,6 +4080,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4063,6 +4127,10 @@ mod tests {
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
             annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "8080")]);
+        let pod_source_ips = PodSourceIps {
+            ipv4: Some("10.0.0.5".parse().unwrap()),
+            ipv6: Some("fd00::5".parse().unwrap()),
+        };
         let event = PodEvent {
             pod_uid,
             pod_name: "test-pod",
@@ -4071,6 +4139,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips,
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4110,6 +4179,86 @@ mod tests {
             attached.contains(&"ferrum_getpeername4") && attached.contains(&"ferrum_getpeername6"),
             "inbound getpeername programs attach immediately, got {attached:?}"
         );
+        assert_eq!(
+            std::fs::read_to_string(registry.path().join(pod_uid)).unwrap(),
+            format!(
+                "{}\nipv4=10.0.0.5\nipv6=fd00::5\n",
+                cgroup_root
+                    .path()
+                    .join(format!("kubepods/pod{pod_uid}"))
+                    .display()
+            ),
+            "NodeWaypoint registry must publish family-specific pod source IPs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_waypoint_republishes_registry_when_source_ips_change() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-source-ips";
+        let cgroup_path = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        std::fs::create_dir_all(&cgroup_path).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let make_event = |source_ips: PodSourceIps| PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: source_ips,
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &make_event(PodSourceIps::from_primary_str(Some("10.0.0.5"))),
+        );
+        assert_eq!(
+            std::fs::read_to_string(registry.path().join(pod_uid)).unwrap(),
+            format!("{}\nipv4=10.0.0.5\n", cgroup_path.display())
+        );
+
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &make_event(PodSourceIps {
+                ipv4: Some("10.0.0.5".parse().unwrap()),
+                ipv6: Some("fd00::5".parse().unwrap()),
+            }),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(registry.path().join(pod_uid)).unwrap(),
+            format!("{}\nipv4=10.0.0.5\nipv6=fd00::5\n", cgroup_path.display()),
+            "same-UID status.podIPs updates must refresh IPv6 source overrides"
+        );
     }
 
     #[cfg(unix)]
@@ -4148,6 +4297,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some(veth),
         };
@@ -4283,6 +4433,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4354,6 +4505,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4427,6 +4579,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4507,6 +4660,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.6"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.6")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4581,6 +4735,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.7"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.7")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4631,6 +4786,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4668,6 +4824,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4705,6 +4862,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: Some(4242),
             veth_iface_override: Some("veth-mock"),
         };
@@ -4771,6 +4929,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             // None mirrors production and the retry snapshot; veth resolves via
             // the override guard above.
@@ -4891,6 +5050,7 @@ mod tests {
                 labels: &labels,
                 annotations: &HashMap::new(),
                 pod_ip_str: Some(ip),
+                pod_source_ips: PodSourceIps::from_primary_str(Some(ip)),
                 pod_pid: None,
                 veth_iface_override: None,
             };
@@ -4972,6 +5132,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: None,
         };
@@ -5015,6 +5176,7 @@ mod tests {
             labels: &HashMap::new(),
             annotations: &HashMap::new(),
             pod_ip_str: None,
+            pod_source_ips: PodSourceIps::default(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5064,6 +5226,7 @@ mod tests {
             labels: &HashMap::new(),
             annotations: &HashMap::new(),
             pod_ip_str: None,
+            pod_source_ips: PodSourceIps::default(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5101,6 +5264,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: None,
+            pod_source_ips: PodSourceIps::default(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5250,23 +5414,47 @@ mod tests {
             &registry,
             "pod-uid-1",
             "/sys/fs/cgroup/kubepods/poduid1",
-            Some(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+            PodSourceIps {
+                ipv4: Some(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+                ipv6: Some("fd00::123".parse().unwrap()),
+            },
         );
 
         let path = registry.join("pod-uid-1");
         assert!(path.exists(), "registry entry must be written");
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
-            contents, "/sys/fs/cgroup/kubepods/poduid1\n10.1.2.3\n",
-            "registry entry carries the cgroup path on line 1 and the source pod IP on line 2"
+            contents, "/sys/fs/cgroup/kubepods/poduid1\nipv4=10.1.2.3\nipv6=fd00::123\n",
+            "registry entry carries the cgroup path and family-specific source pod IPs"
         );
+    }
+
+    #[test]
+    fn pod_source_ips_from_status_uses_dual_stack_pod_ips() {
+        let status = PodStatus {
+            pod_ip: Some("fd00::5".to_string()),
+            pod_ips: Some(vec![
+                k8s_openapi::api::core::v1::PodIP {
+                    ip: "fd00::5".to_string(),
+                },
+                k8s_openapi::api::core::v1::PodIP {
+                    ip: "10.0.0.5".to_string(),
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let ips = PodSourceIps::from_status(Some(&status));
+
+        assert_eq!(ips.ipv4, Some(std::net::Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(ips.ipv6, Some("fd00::5".parse().unwrap()));
     }
 
     #[test]
     fn remove_pod_registry_removes_entry_and_tolerates_absent() {
         let dir = tempfile::tempdir().unwrap();
         let registry = dir.path().join("node-waypoint-pods");
-        publish_pod_registry(&registry, "pod-uid-1", "/cg/path", None);
+        publish_pod_registry(&registry, "pod-uid-1", "/cg/path", PodSourceIps::default());
         let path = registry.join("pod-uid-1");
         assert!(path.exists());
 
@@ -5287,7 +5475,7 @@ mod tests {
         // None of these may write anything; an escaping UID must be refused
         // before any directory is created or file written.
         for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
-            publish_pod_registry(&registry, unsafe_uid, "/cg/path", None);
+            publish_pod_registry(&registry, unsafe_uid, "/cg/path", PodSourceIps::default());
         }
 
         // The guard fires before `create_dir_all`, so nothing was created and
@@ -5740,6 +5928,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: None,
+            pod_source_ips: PodSourceIps::default(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5794,6 +5983,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.9"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
             pod_pid: None,
             veth_iface_override: Some("veth-new"),
         };
@@ -5854,6 +6044,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5909,6 +6100,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6163,6 +6355,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             pod_pid: None,
             veth_iface_override: Some("veth-a"),
         };
@@ -6581,6 +6774,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6646,6 +6840,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6713,6 +6908,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6778,6 +6974,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6830,6 +7027,7 @@ mod tests {
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6881,6 +7079,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6927,6 +7126,7 @@ mod tests {
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6990,6 +7190,7 @@ mod tests {
             labels,
             annotations,
             pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         }

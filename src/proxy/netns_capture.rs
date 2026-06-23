@@ -72,11 +72,33 @@ use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 pub struct PodCaptureTarget {
     pub pod_uid: String,
     pub cgroup_path: String,
-    /// Source pod IP, if the node-agent published it. Used to override the
-    /// loopback peer of an accepted in-netns capture connection so client-IP
-    /// authz conditions, logs, and IP-keyed plugins see the real pod IP rather
-    /// than `127.0.0.1`.
-    pub pod_ip: Option<std::net::IpAddr>,
+    /// Source pod IPs, if the node-agent published them. Used to override the
+    /// loopback peer of accepted in-netns capture connections so client-IP
+    /// authz conditions, logs, and IP-keyed plugins see the real same-family pod
+    /// IP rather than `127.0.0.1` / `::1`.
+    pub source_ips: PodCaptureSourceIps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PodCaptureSourceIps {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+impl PodCaptureSourceIps {
+    fn source_for_family(self, family: CaptureFamily) -> Option<IpAddr> {
+        match family {
+            CaptureFamily::Ipv4 => self.ipv4.map(IpAddr::V4),
+            CaptureFamily::Ipv6 => self.ipv6.map(IpAddr::V6),
+        }
+    }
+
+    fn source_for_addr(self, addr: SocketAddr) -> Option<IpAddr> {
+        match addr {
+            SocketAddr::V4(_) => self.source_for_family(CaptureFamily::Ipv4),
+            SocketAddr::V6(_) => self.source_for_family(CaptureFamily::Ipv6),
+        }
+    }
 }
 
 /// Source of the current enrolled-pod set. Production reads a directory the
@@ -86,9 +108,11 @@ pub trait PodCaptureSource: Send + Sync {
 }
 
 /// Filesystem registry source: the node-agent writes one file per enrolled pod,
-/// named `<pod_uid>`, whose single line is the pod cgroup path. Removing the
-/// file (on pod teardown) drops the pod from the set. This mirrors the existing
-/// "pinned path is the entire node-agent ↔ mesh-proxy IPC surface" contract.
+/// named `<pod_uid>`, whose first line is the pod cgroup path and whose
+/// optional keyed lines carry same-family source IP overrides (`ipv4=<addr>`,
+/// `ipv6=<addr>`). Removing the file (on pod teardown) drops the pod from the
+/// set. This mirrors the existing "pinned path is the entire node-agent ↔
+/// mesh-proxy IPC surface" contract.
 pub struct DirectoryCaptureSource {
     dir: PathBuf,
 }
@@ -115,21 +139,26 @@ impl PodCaptureSource for DirectoryCaptureSource {
             let Ok(contents) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            // Line 1: pod cgroup path (required). Line 2: source pod IP
-            // (optional) — older entries with only the cgroup path parse with
-            // `pod_ip = None`.
+            // Line 1: pod cgroup path (required). Subsequent optional lines are
+            // family-specific source IPs (`ipv4=<addr>`, `ipv6=<addr>`).
             let mut lines = contents.lines();
             let cgroup_path = lines.next().unwrap_or("").trim().to_string();
             if cgroup_path.is_empty() {
                 continue;
             }
-            let pod_ip = lines
-                .next()
-                .and_then(|line| line.trim().parse::<std::net::IpAddr>().ok());
+            let mut source_ips = PodCaptureSourceIps::default();
+            for line in lines {
+                let line = line.trim();
+                if let Some(value) = line.strip_prefix("ipv4=") {
+                    source_ips.ipv4 = value.trim().parse::<Ipv4Addr>().ok();
+                } else if let Some(value) = line.strip_prefix("ipv6=") {
+                    source_ips.ipv6 = value.trim().parse::<Ipv6Addr>().ok();
+                }
+            }
             targets.push(PodCaptureTarget {
                 pod_uid,
                 cgroup_path,
-                pod_ip,
+                source_ips,
             });
         }
         targets
@@ -220,10 +249,10 @@ struct ActiveListener {
     /// containers share its netns). Kept for observability and so a netns stays
     /// open while any of its pods is still enrolled.
     pod_uids: HashSet<String>,
-    /// The source pod IP this listener's accept loop is currently overriding
-    /// with. Tracked so a later change to the pod's registered IP can update the
-    /// running accept loop without rebinding the pod-loopback socket.
-    source_ip: Option<IpAddr>,
+    /// The source pod IPs this listener's accept loops are currently overriding
+    /// with. Tracked so later status changes can update running accept loops
+    /// without rebinding pod-loopback sockets.
+    source_ips: PodCaptureSourceIps,
 }
 
 impl ActiveListener {
@@ -337,7 +366,7 @@ fn open_missing_family_listeners<B: NetnsBackend>(
                 info!(
                     netns_inode = netns,
                     pod_uid = %target.pod_uid,
-                    source_ip = ?listener.source_ip,
+                    source_ips = ?listener.source_ips,
                     capture_addr = %endpoint.addr,
                     family = endpoint.family.as_str(),
                     "Opened node-waypoint in-netns capture listener"
@@ -549,40 +578,42 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             }
         }
 
-        // Open listeners for newly-seen netns; for an existing netns, refresh pod
-        // membership and update the source-IP override when the pod IP changes.
-        // The accept loop reads the override from a watch channel, so a pod that
-        // was enrolled before `status.podIP` existed (override `None`), or whose
-        // IP later changed, does not need a socket rebind just to report the
-        // current pod IP to authz, logs, and IP-keyed plugins.
+        // Open listeners for newly-seen netns; for an existing netns, refresh
+        // pod membership and update the source-IP overrides when pod IPs change.
+        // The accept loops read the overrides from watch channels, so a pod that
+        // was enrolled before `status.podIPs` existed (override `None`), or
+        // whose IPs later changed, does not need socket rebinds just to report
+        // current pod IPs to authz, logs, and IP-keyed plugins.
         for (netns, pod_uids) in desired {
-            // The source IP this netns's listener should report: take it from the
-            // same target that would open it. Stable while one pod owns the netns
-            // (the normal case — a pod's sandbox and containers share it).
+            // The source IPs this netns's listeners should report: take them
+            // from the same target that would open them. Stable while one pod
+            // owns the netns (the normal case — a pod's sandbox and containers
+            // share it).
             let desired_target = targets.iter().find(|t| pod_uids.contains(&t.pod_uid));
-            let desired_ip = desired_target.and_then(|t| t.pod_ip);
+            let desired_source_ips = desired_target.map(|t| t.source_ips).unwrap_or_default();
 
             if let Some(listener) = self.active.get_mut(&netns) {
-                let existing_ip = listener.source_ip;
+                let existing_source_ips = listener.source_ips;
                 let previous_pod_uids = listener.pod_uids.clone();
-                // Source pod IP changed. Keep the existing listener and push the
-                // new override into its accept loop. Rebinding this pod-loopback
-                // socket would either require SO_REUSEPORT (unsafe inside a
-                // workload netns) or create a no-listener window for redirected
-                // egress.
+                // Source pod IPs changed. Keep existing listeners and push the
+                // new same-family overrides into their accept loops. Rebinding a
+                // pod-loopback socket would either require SO_REUSEPORT (unsafe
+                // inside a workload netns) or create a no-listener window for
+                // redirected egress.
                 listener.pod_uids = pod_uids.clone();
-                if existing_ip != desired_ip {
-                    listener.source_ip = desired_ip;
-                    for family_listener in listener.listeners.values() {
+                if existing_source_ips != desired_source_ips {
+                    listener.source_ips = desired_source_ips;
+                    for (family, family_listener) in &listener.listeners {
                         if let Some(source_ip_tx) = &family_listener.source_ip_tx {
-                            let _ = source_ip_tx.send(desired_ip);
+                            let _ =
+                                source_ip_tx.send(desired_source_ips.source_for_family(*family));
                         }
                     }
                     debug!(
                         netns_inode = netns,
-                        old_ip = ?existing_ip,
-                        new_ip = ?desired_ip,
-                        "Node-waypoint capture: source pod IP changed; updated in-netns listener override"
+                        old_ips = ?existing_source_ips,
+                        new_ips = ?desired_source_ips,
+                        "Node-waypoint capture: source pod IPs changed; updated in-netns listener overrides"
                     );
                 }
                 if let Some(dir) = &self.ready_dir {
@@ -620,7 +651,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             let mut listener = ActiveListener {
                 listeners: HashMap::new(),
                 pod_uids,
-                source_ip: desired_ip,
+                source_ips: desired_source_ips,
             };
             open_missing_family_listeners(
                 &self.backend,
@@ -731,7 +762,8 @@ impl NetnsBackend for ProxyNetnsBackend {
         // `ActiveListener::close`, e.g. on pod removal), so a churned listener
         // never leaves an idle task lingering until process shutdown.
         let (stop_tx, stop_rx) = watch::channel(false);
-        let (source_ip_tx, source_ip_rx) = watch::channel(target.pod_ip);
+        let (source_ip_tx, source_ip_rx) =
+            watch::channel(target.source_ips.source_for_addr(capture_addr));
         let forwarder_stop = stop_tx.clone();
         let mut closed = stop_tx.subscribe();
         let mut global = self.global_shutdown.clone();
@@ -976,7 +1008,7 @@ mod tests {
     struct MockBackend {
         // cgroup_path → netns inode (None = unresolvable this round)
         netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
-        opened: Mutex<Vec<(u64, SocketAddr)>>,
+        opened: Mutex<Vec<(u64, SocketAddr, Option<IpAddr>)>>,
     }
 
     impl MockBackend {
@@ -1007,7 +1039,11 @@ mod tests {
             addr: SocketAddr,
         ) -> Option<OpenedNetnsListener> {
             let netns = self.netns_key(target).ok()?;
-            self.opened.lock().unwrap().push((netns, addr));
+            self.opened.lock().unwrap().push((
+                netns,
+                addr,
+                target.source_ips.source_for_addr(addr),
+            ));
             // The manager records closes by dropping the listener from `active`;
             // tests assert on `mgr.active` membership, so the mock just hands
             // back a live stop handle.
@@ -1020,7 +1056,7 @@ mod tests {
         PodCaptureTarget {
             pod_uid: uid.to_string(),
             cgroup_path: cgroup.to_string(),
-            pod_ip: None,
+            source_ips: PodCaptureSourceIps::default(),
         }
     }
 
@@ -1034,7 +1070,11 @@ mod tests {
     #[test]
     fn directory_source_parses_pod_uid_and_cgroup() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pod-a"), "/sys/fs/cgroup/kubepods/pod-a\n").unwrap();
+        std::fs::write(
+            dir.path().join("pod-a"),
+            "/sys/fs/cgroup/kubepods/pod-a\nipv4=10.0.0.5\nipv6=fd00::5\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("pod-b"),
             "  /sys/fs/cgroup/kubepods/pod-b  ",
@@ -1050,8 +1090,14 @@ mod tests {
         assert_eq!(targets.len(), 2, "hidden + empty-cgroup files are skipped");
         assert_eq!(targets[0].pod_uid, "pod-a");
         assert_eq!(targets[0].cgroup_path, "/sys/fs/cgroup/kubepods/pod-a");
+        assert_eq!(
+            targets[0].source_ips.ipv4,
+            Some("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(targets[0].source_ips.ipv6, Some("fd00::5".parse().unwrap()));
         assert_eq!(targets[1].pod_uid, "pod-b");
         assert_eq!(targets[1].cgroup_path, "/sys/fs/cgroup/kubepods/pod-b");
+        assert_eq!(targets[1].source_ips, PodCaptureSourceIps::default());
     }
 
     #[test]
@@ -1091,16 +1137,16 @@ mod tests {
         assert!(
             opened
                 .iter()
-                .any(|(netns, addr)| *netns == 100 && addr.is_ipv4())
+                .any(|(netns, addr, _)| *netns == 100 && addr.is_ipv4())
                 && opened
                     .iter()
-                    .any(|(netns, addr)| *netns == 100 && addr.is_ipv6())
+                    .any(|(netns, addr, _)| *netns == 100 && addr.is_ipv6())
                 && opened
                     .iter()
-                    .any(|(netns, addr)| *netns == 200 && addr.is_ipv4())
+                    .any(|(netns, addr, _)| *netns == 200 && addr.is_ipv4())
                 && opened
                     .iter()
-                    .any(|(netns, addr)| *netns == 200 && addr.is_ipv6())
+                    .any(|(netns, addr, _)| *netns == 200 && addr.is_ipv6())
         );
     }
 
@@ -1158,14 +1204,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_updates_listener_source_ip_when_pod_ip_changes() {
-        // pod-a is enrolled before `status.podIP` exists (override `None`), then
-        // gets an IP, then the IP changes. Each transition must update the
-        // listener's source override without rebinding the pod-loopback socket.
+    async fn reconcile_opens_family_listeners_with_matching_source_ips() {
+        let source_ips = PodCaptureSourceIps {
+            ipv4: Some("10.1.2.3".parse().unwrap()),
+            ipv6: Some("fd00::3".parse().unwrap()),
+        };
+        let source = Arc::new(StaticSource(vec![PodCaptureTarget {
+            pod_uid: "pod-a".to_string(),
+            cgroup_path: "/cg/a".to_string(),
+            source_ips,
+        }]));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let mut mgr = NetnsCaptureManager::new(
+            "127.0.0.1:15001".parse().unwrap(),
+            source,
+            backend,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(mgr.reconcile_once(), 1);
+        let opened = mgr.backend.opened.lock().unwrap().clone();
+        assert!(
+            opened.iter().any(|(netns, addr, source_ip)| {
+                *netns == 100 && addr.is_ipv4() && *source_ip == source_ips.ipv4.map(IpAddr::V4)
+            }),
+            "IPv4 listener must use the IPv4 pod source IP: {opened:?}"
+        );
+        assert!(
+            opened.iter().any(|(netns, addr, source_ip)| {
+                *netns == 100 && addr.is_ipv6() && *source_ip == source_ips.ipv6.map(IpAddr::V6)
+            }),
+            "IPv6 listener must use the IPv6 pod source IP: {opened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_updates_listener_source_ips_when_pod_ips_change() {
+        // pod-a is enrolled before `status.podIPs` exists (override `None`),
+        // then gets family-specific IPs, then they change. Each transition must
+        // update listener source overrides without rebinding pod-loopback
+        // sockets.
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
-            pod_ip: None,
+            source_ips: PodCaptureSourceIps::default(),
         }]));
 
         struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);
@@ -1183,40 +1265,54 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        // Initial open carries no source IP.
+        // Initial open carries no source IPs.
         assert_eq!(mgr.reconcile_once(), 1);
-        assert_eq!(mgr.backend.opened.lock().unwrap().len(), 2);
-        assert_eq!(mgr.active.get(&100).unwrap().source_ip, None);
+        let opened = mgr.backend.opened.lock().unwrap().clone();
+        assert_eq!(opened.len(), 2);
+        assert!(
+            opened.iter().all(|(_, _, source_ip)| source_ip.is_none()),
+            "initial listener opens should not override loopback: {opened:?}"
+        );
+        assert_eq!(
+            mgr.active.get(&100).unwrap().source_ips,
+            PodCaptureSourceIps::default()
+        );
 
-        // Unchanged IP (still None) → membership refresh only, no reopen.
+        // Unchanged IPs (still None) → membership refresh only, no reopen.
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
             2,
-            "no reopen when the source IP is unchanged"
+            "no reopen when source IPs are unchanged"
         );
 
-        // status.podIP assigned → update the override without reopening.
-        let ip1: IpAddr = "10.1.2.3".parse().unwrap();
-        targets.lock().unwrap()[0].pod_ip = Some(ip1);
+        // status.podIPs assigned → update the overrides without reopening.
+        let ips1 = PodCaptureSourceIps {
+            ipv4: Some("10.1.2.3".parse().unwrap()),
+            ipv6: Some("fd00::3".parse().unwrap()),
+        };
+        targets.lock().unwrap()[0].source_ips = ips1;
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
             2,
-            "pod IP assignment must not reopen the listener"
+            "pod IP assignment must not reopen listeners"
         );
-        assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip1));
+        assert_eq!(mgr.active.get(&100).unwrap().source_ips, ips1);
 
-        // IP changes again → update again without reopening.
-        let ip2: IpAddr = "10.1.2.9".parse().unwrap();
-        targets.lock().unwrap()[0].pod_ip = Some(ip2);
+        // IPs change again → update again without reopening.
+        let ips2 = PodCaptureSourceIps {
+            ipv4: Some("10.1.2.9".parse().unwrap()),
+            ipv6: Some("fd00::9".parse().unwrap()),
+        };
+        targets.lock().unwrap()[0].source_ips = ips2;
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
             2,
-            "pod IP changes must not reopen the listener"
+            "pod IP changes must not reopen listeners"
         );
-        assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip2));
+        assert_eq!(mgr.active.get(&100).unwrap().source_ips, ips2);
     }
 
     #[tokio::test]
@@ -1349,7 +1445,7 @@ mod tests {
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
-            pod_ip: None,
+            source_ips: PodCaptureSourceIps::default(),
         }]));
         struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);
         impl PodCaptureSource for DynSource {
@@ -1375,9 +1471,12 @@ mod tests {
             "the IPv6 readiness marker is present after the v6 listener opens"
         );
 
-        // Pod IP changes → update metadata only. The existing listener and ready
-        // marker must stay in place even though any reopen would fail.
-        targets.lock().unwrap()[0].pod_ip = Some("10.0.0.7".parse().unwrap());
+        // Pod IPs change → update metadata only. The existing listeners and
+        // ready markers must stay in place even though any reopen would fail.
+        targets.lock().unwrap()[0].source_ips = PodCaptureSourceIps {
+            ipv4: Some("10.0.0.7".parse().unwrap()),
+            ipv6: Some("fd00::7".parse().unwrap()),
+        };
         assert_eq!(
             mgr.reconcile_once(),
             1,
