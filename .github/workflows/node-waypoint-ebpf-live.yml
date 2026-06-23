@@ -30,10 +30,13 @@ on:
       - "src/router_cache.rs"
       - "src/socket_opts.rs"
       - "charts/ferrum-mesh/**"
+      - "tests/k8s/lib/**"
       - "tests/k8s/node_waypoint_ebpf_live/**"
       - "docs/mesh.md"
+      - "docs/mesh_supported_matrix.md"
       - "docs/node_agent.md"
       - "docs/ci_cd.md"
+      - "docs/plans/node_waypoint_transport_adr.md"
 
 permissions:
   contents: read
@@ -198,6 +201,9 @@ jobs:
           fi
           if [ -d target/node-waypoint-ebpf-live ]; then
             cp -R target/node-waypoint-ebpf-live "$results/bpf-evidence"
+          fi
+          if [ -f target/node-waypoint-ebpf-live/live-assertions.json ]; then
+            cp target/node-waypoint-ebpf-live/live-assertions.json "$results/live-assertions.json"
           fi
 
       - name: Upload diagnostics

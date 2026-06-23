@@ -243,6 +243,10 @@ The HBONE listener accepts HTTP/2 CONNECT streams over mTLS on port 15008. Sourc
 ### Node Waypoint
 
 Node-scoped sidecarless waypoint for pods captured by the node agent. This topology uses the same HBONE listener as ambient mode, but source pod identity is resolved from the node-agent/eBPF socket-cookie record instead of assuming one proxy per workload.
+The production secured-transport target and fail-closed decisions are tracked in
+[`docs/plans/node_waypoint_transport_adr.md`](plans/node_waypoint_transport_adr.md);
+the current implementation remains Experimental until that ADR's SPIFFE-mTLS,
+destination-policy, IPv6, and direct-inbound gates pass.
 
 | Listener | Address | Direction | Kind |
 |---|---|---|---|

@@ -159,9 +159,13 @@ cross-node source/destination pod traffic, requiring `src-a` Service ClusterIP
 requests to succeed and `src-b` Service ClusterIP plus direct Pod-IP attempts to
 be rejected by live `AuthorizationPolicy`. The dual-stack pass verifies IPv6 is
 rejected before traffic is admitted until the end-to-end IPv6 NodeWaypoint path
-is completed. The workflow uploads
-Kubernetes diagnostics, mesh drift snapshots, pod-registry dumps, and `bpftool`
-evidence with 14-day retention.
+is completed. The harness also emits
+`target/node-waypoint-ebpf-live/live-assertions.json`, a machine-readable H2
+evidence file using the shared live-assertion schema. These assertion IDs are
+observational while NodeWaypoint remains Experimental; they are not part of the
+release-blocking sidecar GA contract. The workflow uploads Kubernetes
+diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
+`bpftool` evidence with 14-day retention.
 
 #### 6. Performance Regression Job
 

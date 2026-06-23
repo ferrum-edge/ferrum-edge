@@ -5,6 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CHART_DIR="$ROOT_DIR/charts/ferrum-mesh"
 MANIFESTS="$ROOT_DIR/tests/k8s/node_waypoint_ebpf_live/manifests.yaml"
 
+# shellcheck source=../lib/live_assertions.sh
+LIVE_ASSERTIONS_HELPER="$ROOT_DIR/tests/k8s/lib/live_assertions.sh"
+if [[ ! -f "$LIVE_ASSERTIONS_HELPER" && -f "$PWD/tests/k8s/lib/live_assertions.sh" ]]; then
+  LIVE_ASSERTIONS_HELPER="$PWD/tests/k8s/lib/live_assertions.sh"
+fi
+source "$LIVE_ASSERTIONS_HELPER"
+
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
@@ -21,6 +28,30 @@ NODE_AGENT_ADMIN_PORT="${FERRUM_LIVE_NODE_AGENT_ADMIN_PORT:-19090}"
 ADMIN_JWT_SECRET="${FERRUM_LIVE_ADMIN_JWT_SECRET:-ferrum-edge-node-waypoint-live-admin-secret}"
 ADMIN_JWT_ISSUER="${FERRUM_LIVE_ADMIN_JWT_ISSUER:-ferrum-edge}"
 RESULTS_DIR="$ROOT_DIR/target/node-waypoint-ebpf-live"
+LIVE_ASSERTIONS_FILE="${FERRUM_LIVE_ASSERTIONS_FILE:-$RESULTS_DIR/live-assertions.json}"
+LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-dual-stack-node-waypoint-ebpf}"
+LIVE_ASSERTIONS_INITIALIZED=false
+RECORDED_LIVE_ASSERTIONS=" "
+REQUIRED_LIVE_ASSERTIONS=(
+  node_waypoint.ebpf.chart_profile
+  node_waypoint.ebpf.capture_ready
+  node_waypoint.ebpf.bpf_attached
+  node_waypoint.ebpf.registry_ready
+  node_waypoint.mesh_slice.accepted
+  node_waypoint.ipv4.service_allow_same_node
+  node_waypoint.ipv4.service_allow_cross_node
+  node_waypoint.ipv4.service_deny_same_node
+  node_waypoint.ipv4.service_deny_cross_node
+  node_waypoint.ipv4.pod_ip_bypass_guard_same_node
+  node_waypoint.ipv4.pod_ip_bypass_guard_cross_node
+  node_waypoint.identity.stale_cleanup
+)
+if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
+  REQUIRED_LIVE_ASSERTIONS+=(
+    node_waypoint.ipv6.pod_ip_fail_closed
+    node_waypoint.ipv6.service_fail_closed
+  )
+fi
 
 if [[ "${FERRUM_EBPF_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
   echo "Refusing to run against the current kube-context without FERRUM_EBPF_LIVE_ACK_DISPOSABLE=true" >&2
@@ -44,6 +75,58 @@ fi
 
 log() {
   printf '\n[node-waypoint-ebpf-live] %s\n' "$*"
+}
+
+init_live_assertions() {
+  mkdir -p "$RESULTS_DIR"
+  export FERRUM_LIVE_REPO_ROOT="$ROOT_DIR"
+  ferrum_live_assertions_init \
+    "$LIVE_ASSERTIONS_FILE" \
+    node-waypoint-ebpf-live \
+    "$(ferrum_live_git_commit)" \
+    "$LIVE_PLATFORM_PROFILE"
+  LIVE_ASSERTIONS_INITIALIZED=true
+}
+
+record_live_assertion() {
+  local assertion_id="$1"
+  local status="$2"
+  local source_workload="${3:-}"
+  local destination_workload="${4:-}"
+  local observed_outcome="${5:-}"
+  local observed_source_spiffe="${6:-}"
+  local observed_destination_spiffe="${7:-}"
+  local diagnostics="${8:-}"
+
+  if [[ "$LIVE_ASSERTIONS_INITIALIZED" != "true" ]]; then
+    return
+  fi
+
+  ferrum_live_record_assertion \
+    "$LIVE_ASSERTIONS_FILE" \
+    "$assertion_id" \
+    "$status" \
+    "$source_workload" \
+    "$destination_workload" \
+    "$observed_outcome" \
+    "$observed_source_spiffe" \
+    "$observed_destination_spiffe" \
+    "" \
+    "$diagnostics"
+}
+
+record_live_assertion_once() {
+  local assertion_id="$1"
+  if [[ "$RECORDED_LIVE_ASSERTIONS" == *" $assertion_id "* ]]; then
+    return
+  fi
+  record_live_assertion "$@"
+  RECORDED_LIVE_ASSERTIONS="$RECORDED_LIVE_ASSERTIONS$assertion_id "
+}
+
+spiffe_for_sa() {
+  local service_account="$1"
+  printf 'spiffe://cluster.local/ns/%s/sa/%s' "$WORKLOAD_NS" "$service_account"
 }
 
 render_chart_assertions() {
@@ -267,6 +350,12 @@ render_chart_assertions() {
     cat /tmp/ferrum-node-waypoint-invalid-render.out >&2 || true
     exit 1
   fi
+  record_live_assertion \
+    node_waypoint.ebpf.chart_profile \
+    pass \
+    "" \
+    "" \
+    "helm-rendered-ebpf-images-registry-hostpid-capabilities"
 }
 
 ready_worker_nodes() {
@@ -467,6 +556,17 @@ assert_node_agent_ready_metric() {
   fi
   grep -q 'ferrum_node_agent_capture_state{state="ready"} 1' "$metrics_file"
   grep -q 'ferrum_mesh_node_topology_degraded{reason="none"} 0' "$metrics_file"
+  mkdir -p "$RESULTS_DIR/node-agent-metrics"
+  cp "$metrics_file" "$RESULTS_DIR/node-agent-metrics/ready-check.prom"
+  record_live_assertion \
+    node_waypoint.ebpf.capture_ready \
+    pass \
+    "" \
+    "" \
+    "node-agent-capture-state-ready" \
+    "" \
+    "" \
+    "node-agent-metrics/ready-check.prom"
 }
 
 collect_bpf_evidence() {
@@ -540,6 +640,15 @@ collect_bpf_evidence() {
       exit 1
     fi
   done
+  record_live_assertion \
+    node_waypoint.ebpf.bpf_attached \
+    pass \
+    "" \
+    "" \
+    "bpftool-program-link-map-evidence-present" \
+    "" \
+    "" \
+    "bpftool-$NODE_A.txt,bpftool-$NODE_B.txt"
 }
 
 apply_workloads() {
@@ -934,6 +1043,15 @@ wait_for_node_waypoint_ready_markers() {
       fi
     done < <(workload_pod_records)
     if [[ "$count" -ge 4 && "$all_ready" == "true" ]]; then
+      record_live_assertion_once \
+        node_waypoint.ebpf.registry_ready \
+        pass \
+        "" \
+        "" \
+        "pod-registry-and-in-netns-ready-markers-present" \
+        "" \
+        "" \
+        "node-waypoint-ready-missing.txt"
       return
     fi
     sleep 2
@@ -1049,6 +1167,15 @@ wait_for_ambient_mesh_slice() {
       fi
     done
     if [[ "$ready" -eq "${#ambient_pods[@]}" ]]; then
+      record_live_assertion_once \
+        node_waypoint.mesh_slice.accepted \
+        pass \
+        "" \
+        "" \
+        "ambient-proxies-accepted-live-mesh-slice" \
+        "" \
+        "" \
+        "mesh-drift"
       return
     fi
     sleep 2
@@ -1211,7 +1338,74 @@ expect_allowed() {
   cat "$err" >&2 || true
   rm -f "$err"
   collect_traffic_failure_diagnostics
-  exit 1
+  return 1
+}
+
+recorded_expect_allowed() {
+  local assertion_id="$1"
+  local from="$2"
+  local destination="$3"
+  local label="$4"
+  local url="$5"
+  local expected_body="$6"
+  local family="${7:-}"
+  local outcome="${8:-allowed-http-200}"
+  local source_spiffe destination_spiffe
+  source_spiffe="$(spiffe_for_sa "$from")"
+  destination_spiffe="$(spiffe_for_sa "$destination")"
+  if expect_allowed "$from" "$label" "$url" "$expected_body" "$family"; then
+    record_live_assertion \
+      "$assertion_id" \
+      pass \
+      "$from" \
+      "$destination" \
+      "$outcome" \
+      "$source_spiffe" \
+      "$destination_spiffe"
+  else
+    record_live_assertion \
+      "$assertion_id" \
+      fail \
+      "$from" \
+      "$destination" \
+      "expected-$outcome" \
+      "$source_spiffe" \
+      "$destination_spiffe"
+    return 1
+  fi
+}
+
+recorded_expect_blocked() {
+  local assertion_id="$1"
+  local from="$2"
+  local destination="$3"
+  local label="$4"
+  local url="$5"
+  local family="${6:-}"
+  local outcome="${7:-blocked-not-http-200}"
+  local source_spiffe destination_spiffe
+  source_spiffe="$(spiffe_for_sa "$from")"
+  destination_spiffe="$(spiffe_for_sa "$destination")"
+  if expect_blocked "$from" "$label" "$url" "$family"; then
+    record_live_assertion \
+      "$assertion_id" \
+      pass \
+      "$from" \
+      "$destination" \
+      "$outcome" \
+      "$source_spiffe" \
+      "$destination_spiffe"
+  else
+    record_live_assertion \
+      "$assertion_id" \
+      fail \
+      "$from" \
+      "$destination" \
+      "unexpected-http-200" \
+      "$source_spiffe" \
+      "$destination_spiffe"
+    return 1
+  fi
 }
 
 expect_blocked() {
@@ -1231,7 +1425,7 @@ expect_blocked() {
     cat "$err" >&2 || true
     rm -f "$err"
     collect_traffic_failure_diagnostics
-    exit 1
+    return 1
   fi
   rm -f "$err"
 }
@@ -1245,14 +1439,56 @@ run_traffic_checks() {
   wait_for_node_waypoint_admission src-a "src-a same-node Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
   wait_for_node_waypoint_admission src-b "src-b same-node Service path" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" 4
 
-  expect_allowed src-a "same-node Service ClusterIP" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4
-  expect_allowed src-a "cross-node Service ClusterIP" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-b" 4
+  recorded_expect_allowed \
+    node_waypoint.ipv4.service_allow_same_node \
+    src-a \
+    dst-a \
+    "same-node Service ClusterIP" \
+    "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+    "ok-a" \
+    4
+  recorded_expect_allowed \
+    node_waypoint.ipv4.service_allow_cross_node \
+    src-a \
+    dst-b \
+    "cross-node Service ClusterIP" \
+    "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" \
+    "ok-b" \
+    4
 
-  expect_blocked src-b "same-node Service AuthorizationPolicy DENY" "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" 4
-  expect_blocked src-b "cross-node Service AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  recorded_expect_blocked \
+    node_waypoint.ipv4.service_deny_same_node \
+    src-b \
+    dst-b \
+    "same-node Service AuthorizationPolicy DENY" \
+    "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" \
+    4 \
+    "denied-by-authorization-policy"
+  recorded_expect_blocked \
+    node_waypoint.ipv4.service_deny_cross_node \
+    src-b \
+    dst-a \
+    "cross-node Service AuthorizationPolicy DENY" \
+    "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+    4 \
+    "denied-by-authorization-policy"
 
-  expect_blocked src-b "same-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_b_ip:8080/" 4
-  expect_blocked src-b "cross-node direct Pod IP AuthorizationPolicy bypass guard" "http://$dst_a_ip:8080/" 4
+  recorded_expect_blocked \
+    node_waypoint.ipv4.pod_ip_bypass_guard_same_node \
+    src-b \
+    dst-b \
+    "same-node direct Pod IP AuthorizationPolicy bypass guard" \
+    "http://$dst_b_ip:8080/" \
+    4 \
+    "direct-pod-ip-fail-closed"
+  recorded_expect_blocked \
+    node_waypoint.ipv4.pod_ip_bypass_guard_cross_node \
+    src-b \
+    dst-a \
+    "cross-node direct Pod IP AuthorizationPolicy bypass guard" \
+    "http://$dst_a_ip:8080/" \
+    4 \
+    "direct-pod-ip-fail-closed"
 
   log "checking stale identity cleanup across source workload recreation"
   local old_src_a_uid old_src_a_node
@@ -1267,6 +1503,14 @@ run_traffic_checks() {
   wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
   expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4
   expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  record_live_assertion \
+    node_waypoint.identity.stale_cleanup \
+    pass \
+    src-a \
+    dst-a \
+    "deleted-source-registry-marker-removed-and-recreated-source-admitted" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)"
 }
 
 run_ipv6_checks() {
@@ -1282,14 +1526,44 @@ run_ipv6_checks() {
       exit 1
     fi
     log "cluster is not dual-stack; skipping IPv6 pass"
+    record_live_assertion \
+      node_waypoint.ipv6.pod_ip_fail_closed \
+      skip \
+      src-a \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.ipv6.service_fail_closed \
+      skip \
+      src-a \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
     return
   fi
 
   # Current NodeWaypoint e2e IPv6 capture is intentionally rejected before
   # admission: connect6 fail-closes captured IPv6 until the in-netns listener
   # path is fully IPv6-capable. A 200 here would mean IPv6 bypassed capture.
-  expect_blocked src-a "IPv6 direct Pod IP fail-closed" "http://[$dst_a_v6]:8080/" 6
-  expect_blocked src-a "IPv6 Service ClusterIP fail-closed" "http://[$svc_a_v6]:8080/" 6
+  recorded_expect_blocked \
+    node_waypoint.ipv6.pod_ip_fail_closed \
+    src-a \
+    dst-a \
+    "IPv6 direct Pod IP fail-closed" \
+    "http://[$dst_a_v6]:8080/" \
+    6 \
+    "ipv6-capture-denied-before-admission"
+  recorded_expect_blocked \
+    node_waypoint.ipv6.service_fail_closed \
+    src-a \
+    dst-a \
+    "IPv6 Service ClusterIP fail-closed" \
+    "http://[$svc_a_v6]:8080/" \
+    6 \
+    "ipv6-capture-denied-before-admission"
 }
 
 cleanup() {
@@ -1301,6 +1575,7 @@ cleanup() {
 
 trap cleanup EXIT
 
+init_live_assertions
 render_chart_assertions
 validate_cluster
 label_nodes
@@ -1312,5 +1587,6 @@ wait_for_node_waypoint_ready_markers
 wait_for_ambient_mesh_slice
 run_traffic_checks
 run_ipv6_checks
+ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 
 log "live NodeWaypoint eBPF datapath checks passed"

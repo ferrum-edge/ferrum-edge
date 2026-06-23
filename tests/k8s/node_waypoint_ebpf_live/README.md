@@ -22,6 +22,12 @@ rejected by the live `AuthorizationPolicy`, and checks stale source identities
 stay denied after pod recreation. On dual-stack clusters it requires IPv6 to be
 rejected before a request is admitted until the end-to-end IPv6 NodeWaypoint path
 is implemented.
+
+Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
+shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current
+assertions are H2 evidence only; they do not promote NodeWaypoint or make it a
+release-blocking GA contract row.
+
 The ambient proxy is started with `FERRUM_MESH_ALLOW_NO_CA=true` because this
 disposable test targets eBPF capture, pod attribution, policy enforcement, and
 fail-closed bypass coverage, not mesh mTLS identity issuance.
