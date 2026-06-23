@@ -2312,7 +2312,7 @@ pub(crate) fn mesh_ingress_listener_groups(
 /// [`mesh_route_direction`] / [`is_mesh_outbound_route_id`] — those predicates
 /// run on proxy ids, and a shared prefix would be a latent footgun if one were
 /// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
-fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+pub(crate) fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 

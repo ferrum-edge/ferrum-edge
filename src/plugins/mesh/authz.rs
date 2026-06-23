@@ -197,10 +197,6 @@ fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     key.strip_prefix(prefix)?.strip_suffix(']')
 }
 
-fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
-}
-
 fn destination_policy_scopes_by_upstream(
     slice: &MeshSlice,
 ) -> HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>> {
@@ -234,7 +230,11 @@ fn destination_policy_scopes_by_upstream(
         }
         for service_port in &service.ports {
             scopes_by_upstream.insert(
-                mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port),
+                crate::modes::mesh::mesh_outbound_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
                 scopes.clone(),
             );
         }
@@ -530,9 +530,11 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
-        let destination_policy_scopes_by_upstream = per_pod_policy_scoping
-            .then(|| destination_policy_scopes_by_upstream(&slice))
-            .unwrap_or_default();
+        let destination_policy_scopes_by_upstream = if per_pod_policy_scoping {
+            destination_policy_scopes_by_upstream(&slice)
+        } else {
+            HashMap::new()
+        };
         Ok(Self {
             slice,
             destination_policy_scopes_by_upstream,
