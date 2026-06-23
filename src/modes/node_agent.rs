@@ -1946,7 +1946,10 @@ fn handle_pod_added(
         return;
     }
 
-    let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
+    let pod_ip = event
+        .pod_ip_str
+        .and_then(pod_watcher::parse_pod_ip)
+        .or(event.pod_source_ips.ipv4);
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
     // Production: the kube-rs caller sets `veth_iface_override = None`; the
@@ -4095,6 +4098,57 @@ mod tests {
                 .contains_key(&std::net::Ipv4Addr::new(10, 0, 0, 5))
         );
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_added_uses_status_pod_ips_ipv4_when_primary_is_ipv6() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-v6-primary")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let event = PodEvent {
+            pod_uid: "pod-uid-v6-primary",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("fd00::5"),
+            pod_source_ips: PodSourceIps {
+                ipv4: Some("10.0.0.5".parse().unwrap()),
+                ipv6: Some("fd00::5".parse().unwrap()),
+            },
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let ipv4 = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        assert_eq!(
+            pod_states.get("pod-uid-v6-primary").unwrap().pod_ip,
+            Some(ipv4)
+        );
+        assert!(
+            backend.pod_ips.contains_key(&ipv4),
+            "IPv4 FERRUM_POD_IPS map entry should use status.podIPs when status.podIP is IPv6"
+        );
     }
 
     #[cfg(unix)]
