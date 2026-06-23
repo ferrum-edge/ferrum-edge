@@ -70,9 +70,12 @@ need them, or because they are blocked upstream / architecturally:
 - **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
   NodeWaypoint eBPF live gate now admits captured IPv6 Service traffic through a
   pod-netns `[::1]` listener with `.ready6` evidence. The mesh slice now has a
-  `Workload.node_waypoint` destination endpoint contract for the secured
-  transport path. Broader promotion still waits on H2 secured NodeWaypoint
-  transport consumption, production SPIRE, and inbound direct-pod enforcement.
+  `Workload.node_waypoint` destination endpoint contract, and captured Service
+  targets consume that metadata when present by dialing the destination
+  NodeWaypoint over SPIFFE-mTLS HBONE while preserving the selected workload as
+  the inner CONNECT authority. Broader promotion still waits on metadata
+  population for all eligible workloads, mandatory fail-closed enforcement,
+  production SPIRE, and inbound direct-pod enforcement.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
   services or proxies force the NodeWaypoint UDP/DTLS path closed during config

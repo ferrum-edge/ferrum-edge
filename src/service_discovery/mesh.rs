@@ -370,6 +370,45 @@ pub(crate) fn mesh_node_waypoint_plaintext_target_tags(
     mesh_target_tags_core(service, workload, protocol, port_name)
 }
 
+/// Build the `mesh.*` UpstreamTarget tags for NodeWaypoint captured-Service
+/// HTTP dispatch. When the selected workload carries destination NodeWaypoint
+/// metadata, the target is marked for HBONE dispatch to that NodeWaypoint and
+/// pins the NodeWaypoint SVID. The target host/port still name the selected
+/// workload app endpoint and therefore become the CONNECT authority. When the
+/// metadata is absent, retain the current plaintext NodeWaypoint target shape
+/// until the control plane population + enforcement PRs make the field
+/// mandatory.
+pub(crate) fn mesh_node_waypoint_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut tags = mesh_node_waypoint_plaintext_target_tags(service, workload, protocol, port_name);
+    let Some(node_waypoint) = &workload.node_waypoint else {
+        return tags;
+    };
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+        "true".to_string(),
+    );
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG.to_string(),
+        node_waypoint.address.clone(),
+    );
+    if node_waypoint.hbone_port != crate::modes::mesh::hbone::ISTIO_HBONE_PORT {
+        tags.insert(
+            crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+            node_waypoint.hbone_port.to_string(),
+        );
+    }
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG.to_string(),
+        node_waypoint.spiffe_id.as_str().to_string(),
+    );
+    tags
+}
+
 /// Build the `mesh.*` UpstreamTarget tags that mark a target for Sidecar
 /// SVID-mTLS dispatch (plain HTTP/2 over mutual TLS to the peer sidecar's
 /// inbound listener). Same shared identity tags as the HBONE builder, but with

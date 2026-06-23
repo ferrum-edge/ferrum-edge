@@ -4098,7 +4098,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 spec.service_port.name.as_deref(),
             ),
             MeshEgressTransport::NodeWaypointPlaintext => {
-                crate::service_discovery::mesh::mesh_node_waypoint_plaintext_target_tags(
+                crate::service_discovery::mesh::mesh_node_waypoint_target_tags(
                     spec.service,
                     spec.workload,
                     spec.protocol,
@@ -4511,7 +4511,7 @@ fn build_outbound_mesh_targets(
                 service_port.name.as_deref(),
             ),
             MeshEgressTransport::NodeWaypointPlaintext => {
-                crate::service_discovery::mesh::mesh_node_waypoint_plaintext_target_tags(
+                crate::service_discovery::mesh::mesh_node_waypoint_target_tags(
                     service,
                     workload,
                     protocol,
@@ -11169,9 +11169,9 @@ mod tests {
         AccessLogFilter, AppProtocol, EastWestGateway, JwtHeader, MeshAccessLoggingConfig,
         MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
         MeshService, MeshSubset, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig,
-        PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, Resolution, ServiceEntry,
-        ServiceEntryLocation, ServicePort, ServiceTargetPort, TracingProvider, Workload,
-        WorkloadPort, WorkloadRef, WorkloadSelector,
+        NodeWaypointEndpoint, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, Resolution,
+        ServiceEntry, ServiceEntryLocation, ServicePort, ServiceTargetPort, TracingProvider,
+        Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -12395,6 +12395,78 @@ mod tests {
                 .tags
                 .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG),
             "NodeWaypoint captured-Service dispatch must not claim sidecar mTLS transport"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_node_waypoint_metadata_materializes_hbone_target_to_waypoint() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a";
+        let mut workload = workload_with_address("reviews", "reviews", "10.0.0.1");
+        workload.node_waypoint = Some(NodeWaypointEndpoint {
+            address: "10.9.0.7".to_string(),
+            hbone_port: 16008,
+            spiffe_id: SpiffeId::new(waypoint_spiffe).unwrap(),
+            node_name: Some("worker-a".to_string()),
+            node_uid: Some("node-uid-a".to_string()),
+            network: Some("network-a".to_string()),
+            cluster: Some("cluster-a".to_string()),
+        });
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &node_waypoint_runtime(), &slice);
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-8080")
+            .expect("NodeWaypoint captured-Service outbound upstream materialized");
+        let target = &upstream.targets[0];
+        assert_eq!(
+            target.host, "10.0.0.1",
+            "inner CONNECT authority remains the selected workload app host"
+        );
+        assert_eq!(target.port, 8080);
+        assert_eq!(
+            target
+                .tags
+                .get(crate::proxy::hbone_pool::HBONE_TARGET_TAG)
+                .map(String::as_str),
+            Some("true"),
+            "metadata-backed NodeWaypoint targets ride secured HBONE"
+        );
+        assert_eq!(
+            target
+                .tags
+                .get(crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG)
+                .map(String::as_str),
+            Some("10.9.0.7"),
+            "outer dial host is the destination NodeWaypoint endpoint"
+        );
+        assert_eq!(
+            target
+                .tags
+                .get(crate::proxy::hbone_pool::HBONE_PORT_TAG)
+                .map(String::as_str),
+            Some("16008")
+        );
+        assert_eq!(
+            target
+                .tags
+                .get(crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG)
+                .map(String::as_str),
+            Some(waypoint_spiffe),
+            "mTLS pins the NodeWaypoint SVID, not the workload SVID"
+        );
+        assert_eq!(
+            target.tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(spiffe),
+            "destination workload identity metadata remains available to policy"
         );
     }
 

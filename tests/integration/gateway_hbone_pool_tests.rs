@@ -353,7 +353,15 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_source_baggage() {
     let proxy = proxy_for_test();
     let mut tunnel = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        pool.get_tunnel(&proxy, "127.0.0.1", 8080, 8080, server_addr.port(), None),
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+        ),
     )
     .await
     .expect("timely hbone tunnel open")
@@ -428,7 +436,15 @@ async fn hbone_fast_path_hit_refreshes_recency_and_keeps_busy_connection_alive()
     async fn drive_busy_round_trip(pool: &HboneConnectionPool, proxy: &Proxy, server_port: u16) {
         let mut tunnel = tokio::time::timeout(
             Duration::from_secs(10),
-            pool.get_tunnel(proxy, "127.0.0.1", 8080, 8080, server_port, None),
+            pool.get_tunnel_via(
+                proxy,
+                "127.0.0.1",
+                "127.0.0.1",
+                8080,
+                8080,
+                server_port,
+                None,
+            ),
         )
         .await
         .expect("timely hbone tunnel open")
@@ -522,7 +538,15 @@ async fn hbone_warmup_requires_connect_acceptance() {
     let proxy = proxy_for_test();
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        pool.warmup_connection(&proxy, "127.0.0.1", 8080, 8080, server_addr.port(), None),
+        pool.warmup_connection_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+        ),
     )
     .await
     .expect("timely hbone warmup")

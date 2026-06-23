@@ -355,6 +355,7 @@ struct H3ProbeOutcome {
 
 struct HboneProbeTarget<'a> {
     host: &'a str,
+    dial_host: &'a str,
     port: u16,
     policy_port: u16,
     hbone_port: u16,
@@ -4882,6 +4883,7 @@ impl ProxyState {
                 probe_timeout,
                 HboneProbeTarget {
                     host,
+                    dial_host: target.hbone_dial_host.as_str(),
                     port,
                     policy_port: target.dispatch_policy_port,
                     hbone_port: target.hbone_port,
@@ -5000,6 +5002,7 @@ impl ProxyState {
         record: &mut BackendCapabilityRecord,
     ) {
         let host = target.host;
+        let dial_host = target.dial_host;
         let port = target.port;
         let hbone_port = target.hbone_port;
         if self.gateway_svid_bundle.load().is_none() {
@@ -5019,8 +5022,9 @@ impl ProxyState {
         let warmup = async {
             if target.is_udp {
                 self.hbone_pool
-                    .warmup_datagram_connection(
+                    .warmup_datagram_connection_via(
                         probe_proxy,
+                        dial_host,
                         host,
                         port,
                         target.policy_port,
@@ -5030,8 +5034,9 @@ impl ProxyState {
                     .await
             } else {
                 self.hbone_pool
-                    .warmup_connection(
+                    .warmup_connection_via(
                         probe_proxy,
+                        dial_host,
                         host,
                         port,
                         target.policy_port,
@@ -8701,6 +8706,7 @@ async fn connect_mesh_websocket_backend(
         MeshWsEgress::AmbientHbone => {
             let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
             let hbone_port = hbone_pool::target_hbone_port(target);
+            let dial_host = hbone_pool::target_hbone_dial_host(target)?;
             // Bare HBONE byte tunnel to the destination workload's app addr:port
             // (the CONNECT `:authority` the relay byte-copies to) — NOT an
             // Extended CONNECT (see this fn's doc comment + `get_ws_byte_tunnel`).
@@ -8708,7 +8714,7 @@ async fn connect_mesh_websocket_backend(
                 .hbone_pool
                 .get_ws_byte_tunnel(
                     proxy,
-                    &target.host,
+                    dial_host,
                     hbone_port,
                     &target.host,
                     target.port,
@@ -19620,9 +19626,25 @@ async fn proxy_to_backend_hbone(
     }
 
     let hbone_port = hbone_pool::target_hbone_port(target);
-    // Pin the destination workload identity declared on the target. A present
-    // but corrupt `mesh.spiffe_id` tag fails CLOSED here — never silently
-    // downgrade a pinned dial to trust-domain-only verification.
+    let dial_host = match hbone_pool::target_hbone_dial_host(target) {
+        Ok(host) => host,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing HBONE dispatch: invalid dial host tag"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
+    // Pin the peer identity declared on the target. A present but corrupt
+    // `mesh.hbone_peer_spiffe_id` / `mesh.spiffe_id` tag fails CLOSED here —
+    // never silently downgrade a pinned dial to trust-domain-only verification.
     let expected_peer = match hbone_pool::target_expected_peer_spiffe(target) {
         Ok(peer) => peer,
         Err(err) => {
@@ -19641,8 +19663,9 @@ async fn proxy_to_backend_hbone(
     };
     let tunnel = match state
         .hbone_pool
-        .get_tunnel(
+        .get_tunnel_via(
             proxy,
+            dial_host,
             &target.host,
             target.port,
             target.dispatch_policy_port(),

@@ -58,6 +58,16 @@ endpoints, but the data plane consumes the explicit slice fields. If the slice
 does not name a destination NodeWaypoint for an enrolled in-mesh target, the
 route fails closed.
 
+Implementation status: the data plane now consumes `Workload.node_waypoint`
+when it is present on a selected captured-Service workload. It materializes a
+secured HBONE target whose outer dial host is the destination NodeWaypoint
+endpoint, whose pinned peer identity is the NodeWaypoint SPIFFE ID, and whose
+inner CONNECT authority remains the selected workload app address and port.
+Until the CP/Kubernetes population PR makes `node_waypoint` available for every
+eligible workload, metadata-absent targets retain the current compatibility
+fallback; the H2 enforcement PR must remove that fallback for enrolled in-mesh
+destinations and make missing metadata fail closed.
+
 ## Destination NodeWaypoint Identity
 
 Production should use a node-bound NodeWaypoint SVID so a peer can be pinned to
