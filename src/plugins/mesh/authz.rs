@@ -314,6 +314,12 @@ struct NodeWaypointRouteTargetConfig {
     service_port: Option<u16>,
 }
 
+#[derive(Clone)]
+struct ServicePortDestinationScopes {
+    scopes: Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    endpoint_backends: HashSet<DestinationBackendKey>,
+}
+
 impl ConditionAttributeKeys {
     fn from_policies(policies: &[MeshPolicy]) -> Self {
         let mut keys = ConditionAttributeKeys::default();
@@ -370,16 +376,43 @@ fn node_waypoint_generated_route_upstream_id(upstream_id: &str) -> bool {
         || upstream_id.starts_with("gwapi-route-upstream-")
 }
 
+fn normalized_cluster_domains(config: &Value) -> Vec<String> {
+    fn push_domain(domains: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+        let domain = value.trim().trim_matches('.').to_ascii_lowercase();
+        if !domain.is_empty() && seen.insert(domain.clone()) {
+            domains.push(domain);
+        }
+    }
+
+    let mut domains = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(domain) = config.get("cluster_domain").and_then(Value::as_str) {
+        push_domain(&mut domains, &mut seen, domain);
+    }
+    if let Some(extra_domains) = config.get("cluster_domains").and_then(Value::as_array) {
+        for domain in extra_domains.iter().filter_map(Value::as_str) {
+            push_domain(&mut domains, &mut seen, domain);
+        }
+    }
+    if domains.is_empty() {
+        domains.push("cluster.local".to_string());
+    }
+    domains
+}
+
 fn service_qualified_host_aliases(
     service: &crate::modes::mesh::config::MeshService,
-    cluster_domain: &str,
+    cluster_domains: &[String],
 ) -> Vec<String> {
     let mut aliases = vec![
         format!("{}.{}", service.name, service.namespace),
         format!("{}.{}.svc", service.name, service.namespace),
     ];
-    let cluster_domain = cluster_domain.trim().trim_matches('.');
-    if !cluster_domain.is_empty() {
+    for cluster_domain in cluster_domains {
+        let cluster_domain = cluster_domain.trim().trim_matches('.');
+        if cluster_domain.is_empty() {
+            continue;
+        }
         aliases.push(format!(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
@@ -393,28 +426,38 @@ fn destination_policy_scopes_for_service_port(
     service_port: &crate::modes::mesh::config::ServicePort,
     workloads: &[crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
-) -> Vec<crate::modes::mesh::runtime::PolicyScopeCache> {
-    crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
-        .into_iter()
-        .filter_map(|workload| {
-            if workload.addresses.is_empty() {
-                return None;
-            }
-            let app_port = match service_port.target_port.as_ref() {
-                Some(_) => {
-                    match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                        Some(port) if port != 0 => port,
-                        _ => return None,
-                    }
+) -> ServicePortDestinationScopes {
+    let mut scopes = Vec::new();
+    let mut endpoint_backends = HashSet::new();
+    for workload in
+        crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
+    {
+        if workload.addresses.is_empty() {
+            continue;
+        }
+        let app_port = match service_port.target_port.as_ref() {
+            Some(_) => {
+                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
+                    Some(port) if port != 0 => port,
+                    _ => continue,
                 }
-                None => service_port.port,
-            };
-            if app_port == 0 {
-                return None;
             }
-            Some(crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload))
-        })
-        .collect()
+            None => service_port.port,
+        };
+        if app_port == 0 {
+            continue;
+        }
+        scopes.push(crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload));
+        for address in &workload.addresses {
+            if let Some(key) = DestinationBackendKey::new(address, app_port) {
+                endpoint_backends.insert(key);
+            }
+        }
+    }
+    ServicePortDestinationScopes {
+        scopes,
+        endpoint_backends,
+    }
 }
 
 fn parse_node_waypoint_route_upstreams(
@@ -473,6 +516,36 @@ fn service_port_key_for_route_target(
     )
 }
 
+fn route_target_uses_service_alias(
+    target: &NodeWaypointRouteTargetConfig,
+    service_key: &ServicePortKey,
+    default_namespace: &str,
+    qualified_service_ports: &HashMap<DestinationBackendKey, ServicePortKey>,
+    namespaced_service_ports: &HashMap<NamespacedDestinationBackendKey, ServicePortKey>,
+) -> bool {
+    let service_port = target.service_port.unwrap_or(target.port);
+    service_port_key_for_backend(
+        &target.host,
+        service_port,
+        default_namespace,
+        qualified_service_ports,
+        namespaced_service_ports,
+    )
+    .is_some_and(|key| key == *service_key)
+}
+
+fn route_target_uses_modeled_endpoint(
+    target: &NodeWaypointRouteTargetConfig,
+    service_key: &ServicePortKey,
+    service_port_endpoints: &HashMap<ServicePortKey, HashSet<DestinationBackendKey>>,
+) -> bool {
+    DestinationBackendKey::new(&target.host, target.port).is_some_and(|backend| {
+        service_port_endpoints
+            .get(service_key)
+            .is_some_and(|endpoints| endpoints.contains(&backend))
+    })
+}
+
 fn destination_backend_aliases_for_service_port(
     service: &crate::modes::mesh::config::MeshService,
     service_port: u16,
@@ -499,11 +572,12 @@ fn destination_backend_aliases_for_service_port(
 
 fn destination_policy_scope_index(
     slice: &MeshSlice,
-    cluster_domain: &str,
+    cluster_domains: &[String],
     route_upstreams: &[NodeWaypointRouteUpstreamConfig],
 ) -> DestinationPolicyScopeIndex {
     let mut index = DestinationPolicyScopeIndex::default();
     let mut service_port_scopes = HashMap::new();
+    let mut service_port_endpoints = HashMap::new();
     let mut qualified_service_ports = HashMap::new();
     let mut namespaced_service_ports = HashMap::new();
     let mut workload_backend_hosts = HashSet::new();
@@ -515,7 +589,7 @@ fn destination_policy_scope_index(
         }
     }
     for service in &slice.services {
-        let aliases = service_qualified_host_aliases(service, cluster_domain);
+        let aliases = service_qualified_host_aliases(service, cluster_domains);
         for alias in &aliases {
             if let Some(host) = normalize_destination_backend_host(alias) {
                 index.service_backend_hosts.insert(host);
@@ -558,22 +632,31 @@ fn destination_policy_scope_index(
                 &slice.workloads,
                 slice.multi_cluster.as_ref(),
             );
-            if scopes.is_empty() {
+            if scopes.scopes.is_empty() {
                 continue;
             }
-            service_port_scopes.insert(service_key, scopes.clone());
+            service_port_scopes.insert(service_key.clone(), scopes.scopes.clone());
+            service_port_endpoints.insert(service_key.clone(), scopes.endpoint_backends.clone());
             index.by_upstream.insert(
                 crate::modes::mesh::mesh_outbound_upstream_id(
                     &service.namespace,
                     &service.name,
                     service_port.port,
                 ),
-                scopes.clone(),
+                scopes.scopes.clone(),
             );
             for alias in &aliases {
                 if let Some(key) = DestinationBackendKey::new(alias, service_port.port) {
-                    index.by_backend.insert(key, scopes.clone());
+                    index.by_backend.insert(key, scopes.scopes.clone());
                 }
+            }
+            for endpoint in &scopes.endpoint_backends {
+                index
+                    .by_backend
+                    .insert(endpoint.clone(), scopes.scopes.clone());
+                index
+                    .backend_aliases_by_backend
+                    .insert(endpoint.clone(), vec![endpoint.clone()]);
             }
             for alias_key in &qualified_backend_aliases {
                 index
@@ -587,7 +670,7 @@ fn destination_policy_scope_index(
             ) {
                 index
                     .by_namespaced_backend
-                    .insert(key.clone(), scopes.clone());
+                    .insert(key.clone(), scopes.scopes.clone());
                 index
                     .backend_aliases_by_namespaced_backend
                     .insert(key, namespaced_backend_aliases);
@@ -620,6 +703,20 @@ fn destination_policy_scope_index(
                 continue;
             };
             requires_destination_scope = true;
+            if !route_target_uses_service_alias(
+                target,
+                &service_key,
+                &upstream.namespace,
+                &qualified_service_ports,
+                &namespaced_service_ports,
+            ) && !route_target_uses_modeled_endpoint(
+                target,
+                &service_key,
+                &service_port_endpoints,
+            ) {
+                unscoped_target_seen = true;
+                continue;
+            }
             if seen_service_ports.insert(service_key.clone()) {
                 if let Some(scopes) = service_port_scopes.get(&service_key) {
                     route_scopes.extend(scopes.clone());
@@ -957,14 +1054,11 @@ impl MeshAuthz {
             });
         let mut has_route_upstream_metadata = false;
         let destination_policy_scope_index = if per_pod_policy_scoping {
-            let cluster_domain = config
-                .get("cluster_domain")
-                .and_then(Value::as_str)
-                .unwrap_or("cluster.local");
+            let cluster_domains = normalized_cluster_domains(config);
             let (route_metadata_present, route_upstreams) =
                 parse_node_waypoint_route_upstreams(config)?;
             has_route_upstream_metadata = route_metadata_present;
-            destination_policy_scope_index(&slice, cluster_domain, &route_upstreams)
+            destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
         } else {
             DestinationPolicyScopeIndex::default()
         };

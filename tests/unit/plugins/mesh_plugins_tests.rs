@@ -2980,6 +2980,45 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
 }
 
 #[tokio::test]
+async fn mesh_authz_node_waypoint_direct_service_backend_uses_route_cluster_domain_alias() {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "cluster_domain": "cluster.local",
+        "cluster_domains": ["cluster.local", "corp.example"],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let direct_service_proxy = Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "gwapi-direct-service-custom-domain",
+            "namespace": "default",
+            "hosts": ["api.example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "dst.default.svc.corp.example",
+            "backend_port": 80
+        }))
+        .expect("proxy"),
+    );
+
+    let mut trusted = request_context(Some("spiffe://cluster.local/ns/default/sa/trusted"));
+    trusted.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/trusted").expect("spiffe"),
+        "default",
+        HashMap::from([("app".to_string(), "src".to_string())]),
+    )));
+    trusted.matched_proxy = Some(direct_service_proxy);
+    let result = plugin.authorize(&mut trusted).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "trusted source should be allowed through K8s route-domain service alias, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_node_waypoint_unknown_virtual_service_upstream_fails_closed() {
     use ferrum_edge::identity::SpiffeId;
     use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
@@ -3194,7 +3233,7 @@ fn node_waypoint_endpoint_route_slice() -> MeshSlice {
                 port: 80,
                 protocol: AppProtocol::Http,
                 name: None,
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Number(8080)),
             }],
             workloads: vec![WorkloadRef {
                 spiffe_id: dst_spiffe.clone(),
@@ -3291,6 +3330,63 @@ async fn mesh_authz_node_waypoint_route_upstream_uses_endpoint_service_metadata(
 }
 
 #[tokio::test]
+async fn mesh_authz_node_waypoint_direct_endpoint_backend_uses_destination_scope() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let direct_endpoint_proxy = Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "gwapi-direct-endpoint",
+            "namespace": "default",
+            "hosts": ["api.example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.0.20",
+            "backend_port": 8080
+        }))
+        .expect("proxy"),
+    );
+
+    let mut untrusted = request_context(Some("spiffe://cluster.local/ns/default/sa/untrusted"));
+    untrusted.node_waypoint_policy_scope = Some(Arc::new(
+        ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
+            SpiffeId::new("spiffe://cluster.local/ns/default/sa/untrusted").expect("spiffe"),
+            "default",
+            HashMap::from([("app".to_string(), "src".to_string())]),
+        ),
+    ));
+    untrusted.matched_proxy = Some(Arc::clone(&direct_endpoint_proxy));
+    match plugin.authorize(&mut untrusted).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("direct endpoint backend must evaluate destination policy, got {other:?}"),
+    }
+
+    let mut trusted = request_context(Some("spiffe://cluster.local/ns/default/sa/trusted"));
+    trusted.node_waypoint_policy_scope = Some(Arc::new(
+        ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
+            SpiffeId::new("spiffe://cluster.local/ns/default/sa/trusted").expect("spiffe"),
+            "default",
+            HashMap::from([("app".to_string(), "src".to_string())]),
+        ),
+    ));
+    trusted.matched_proxy = Some(direct_endpoint_proxy);
+    let result = plugin.authorize(&mut trusted).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "trusted source should be allowed through direct endpoint backend, got {result:?}"
+    );
+    assert_eq!(
+        trusted
+            .metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.0.0.20|8080")
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_node_waypoint_route_upstream_with_mixed_unscoped_target_fails_closed() {
     let upstream_id = "gwapi-route-upstream-default-api-0";
     let plugin = MeshAuthz::new(&json!({
@@ -3317,6 +3413,33 @@ async fn mesh_authz_node_waypoint_route_upstream_with_mixed_unscoped_target_fail
     match plugin.authorize(&mut ctx).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
         other => panic!("mixed scoped/unscoped route upstream must fail closed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_route_upstream_with_unmodeled_service_endpoint_fails_closed() {
+    let upstream_id = "gwapi-route-upstream-default-api-0";
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+        "node_waypoint_route_upstreams": [{
+            "id": upstream_id,
+            "namespace": "default",
+            "targets": [{
+                "host": "10.0.0.99",
+                "port": 8080,
+                "service_namespace": "default",
+                "service_name": "dst",
+                "service_port": 80
+            }]
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = node_waypoint_scoped_context("trusted", upstream_id);
+
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("route target with unmodeled endpoint must fail closed, got {other:?}"),
     }
 }
 
