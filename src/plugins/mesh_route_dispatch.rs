@@ -27,9 +27,13 @@
 //! The plugin intentionally runs after authentication, authorization, and
 //! rate limiting. Those admission decisions use the public listener proxy
 //! identity; only downstream `before_proxy` plugins and backend dispatch see
-//! the effective override destination. WebSocket support applies to the
-//! HTTP upgrade handshake destination only — once upgraded, a WebSocket
-//! connection stays pinned to that backend and is not re-routed per frame.
+//! the effective override destination. Node-waypoint Service egress with
+//! scoped mesh policies is the exception: `mesh_authz` stamps the authorized
+//! Service upstream, and this plugin rejects any matching rule that would
+//! rewrite that request to a different upstream or direct backend. WebSocket
+//! support applies to the HTTP upgrade handshake destination only — once
+//! upgraded, a WebSocket connection stays pinned to that backend and is not
+//! re-routed per frame.
 //! HBONE CONNECT traffic now flows through the standard `before_proxy` chain
 //! before the HBONE relay branch in `proxy/mod.rs`, so this plugin can
 //! match on the outer CONNECT request (method, headers, query params) and
@@ -62,6 +66,7 @@ use crate::config::types::{
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
+use crate::plugins::mesh::authz::NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA;
 use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
@@ -1001,6 +1006,30 @@ impl RouteDestination {
     }
 }
 
+fn reject_node_waypoint_authz_destination_override(
+    ctx: &RequestContext,
+    destination: &RouteDestination,
+) -> Option<PluginResult> {
+    let authorized_upstream_id = ctx
+        .metadata
+        .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA)?;
+    if destination.is_empty()
+        || (destination.upstream_id.as_deref() == Some(authorized_upstream_id.as_str())
+            && destination.backend_host.is_none()
+            && destination.backend_port.is_none()
+            && destination.backend_tls.is_none())
+    {
+        return None;
+    }
+    Some(PluginResult::Reject {
+        status_code: 403,
+        body:
+            "node-waypoint mesh authorization forbids route override to an unauthorized destination"
+                .to_string(),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+    })
+}
+
 /// Per-rule fault action carried by a single [`RouteRule`]. Projects Istio
 /// `VirtualService.http[].fault` onto the matching dispatch rule so a
 /// fault-carrying route does not have to spin up a separate proxy-scoped
@@ -1511,6 +1540,11 @@ impl Plugin for MeshRouteDispatch {
                 // stage).
                 if let Some(fault) = rule.fault.as_ref()
                     && let Some(result) = apply_fault_action(ctx, headers, rule, fault).await
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    reject_node_waypoint_authz_destination_override(ctx, &rule.destination)
                 {
                     return result;
                 }

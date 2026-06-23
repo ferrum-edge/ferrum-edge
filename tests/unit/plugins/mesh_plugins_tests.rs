@@ -2411,6 +2411,180 @@ async fn mesh_authz_node_waypoint_service_egress_uses_destination_policy_scope()
             "destination-scoped ALLOW must remain applicable and implicit-deny untrusted source, got {other:?}"
         ),
     }
+
+    let mut trusted_ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/trusted"));
+    trusted_ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/trusted").expect("spiffe"),
+        "default",
+        HashMap::from([("app".to_string(), "src".to_string())]),
+    )));
+    trusted_ctx.matched_proxy = ctx.matched_proxy.clone();
+
+    let result = plugin.authorize(&mut trusted_ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "trusted source should be allowed for the destination workload, got {result:?}"
+    );
+    assert_eq!(
+        trusted_ctx
+            .metadata
+            .get("mesh_authz.node_waypoint_authorized_upstream_id")
+            .map(String::as_str),
+        Some("__mesh-out-upstream-default-dst-80")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_service_egress_requires_all_destination_scopes_to_allow() {
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    fn workload_allow_policy(name: &str, track: &str, source_principal: &str) -> MeshPolicy {
+        MeshPolicy {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("track".to_string(), track.to_string())]),
+                    namespace: None,
+                },
+            },
+            rules: vec![MeshRule {
+                from: vec![PrincipalMatch {
+                    spiffe_id_pattern: Some(source_principal.to_string()),
+                    namespace_pattern: None,
+                    trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                    trust_domain_pattern: None,
+                }],
+                to: Vec::new(),
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Allow,
+            }],
+        }
+    }
+
+    let stable_spiffe =
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/stable").expect("spiffe");
+    let canary_spiffe =
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/canary").expect("spiffe");
+    let slice = MeshSlice {
+        mesh_policies: vec![
+            workload_allow_policy(
+                "stable-allow-trusted",
+                "stable",
+                "spiffe://cluster.local/ns/default/sa/trusted",
+            ),
+            workload_allow_policy(
+                "canary-allow-canary-client",
+                "canary",
+                "spiffe://cluster.local/ns/default/sa/canary-client",
+            ),
+        ],
+        services: vec![MeshService {
+            name: "dst".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: None,
+                target_port: None,
+            }],
+            workloads: vec![
+                WorkloadRef {
+                    spiffe_id: stable_spiffe.clone(),
+                },
+                WorkloadRef {
+                    spiffe_id: canary_spiffe.clone(),
+                },
+            ],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        }],
+        workloads: vec![
+            Workload {
+                spiffe_id: stable_spiffe,
+                selector: WorkloadSelector {
+                    labels: HashMap::from([
+                        ("app".to_string(), "dst".to_string()),
+                        ("track".to_string(), "stable".to_string()),
+                    ]),
+                    namespace: None,
+                },
+                service_name: "dst".to_string(),
+                addresses: vec!["10.0.0.20".to_string()],
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+                namespace: "default".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
+                pod_uid: None,
+                remote_provenance: false,
+            },
+            Workload {
+                spiffe_id: canary_spiffe,
+                selector: WorkloadSelector {
+                    labels: HashMap::from([
+                        ("app".to_string(), "dst".to_string()),
+                        ("track".to_string(), "canary".to_string()),
+                    ]),
+                    namespace: None,
+                },
+                service_name: "dst".to_string(),
+                addresses: vec!["10.0.0.21".to_string()],
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+                namespace: "default".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
+                pod_uid: None,
+                remote_provenance: false,
+            },
+        ],
+        ..MeshSlice::default()
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/trusted"));
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/trusted").expect("spiffe"),
+        "default",
+        HashMap::from([("app".to_string(), "src".to_string())]),
+    )));
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-outbound-default-dst-80",
+            "namespace": "default",
+            "hosts": ["dst.default.svc.cluster.local"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "__mesh-out-upstream-default-dst-80"
+        }))
+        .expect("proxy"),
+    ));
+
+    let result = plugin.authorize(&mut ctx).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!(
+            "source allowed for only one possible Service backend must be denied, got {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]

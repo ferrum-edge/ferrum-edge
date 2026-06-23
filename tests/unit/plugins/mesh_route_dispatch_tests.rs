@@ -9,7 +9,9 @@ use std::sync::Arc;
 use ferrum_edge::config::types::{
     BackendTlsConfig, Proxy, ResolvedPortOverride, Upstream, UpstreamPortOverride,
 };
-use ferrum_edge::plugins::RequestContext;
+use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use serde_json::json;
 
 fn test_proxy() -> Arc<Proxy> {
     let p: Proxy = serde_json::from_value(serde_json::json!({
@@ -58,6 +60,79 @@ fn ctx() -> RequestContext {
         "GET".to_string(),
         "/api".to_string(),
     )
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_allows_node_waypoint_authorized_upstream_override() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "stable"}
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = ctx();
+    ctx.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_upstream_id".to_string(),
+        "stable".to_string(),
+    );
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("stable"));
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_rejects_node_waypoint_unauthorized_upstream_override() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "canary"}
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = ctx();
+    ctx.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_upstream_id".to_string(),
+        "stable".to_string(),
+    );
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("unauthorized NodeWaypoint route override must reject, got {other:?}"),
+    }
+    assert!(ctx.route_override_upstream_id.is_none());
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_rejects_node_waypoint_direct_backend_override() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "direct.svc", "backend_port": 8080}
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = ctx();
+    ctx.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_upstream_id".to_string(),
+        "stable".to_string(),
+    );
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("NodeWaypoint authz must forbid direct backend overrides, got {other:?}"),
+    }
+    assert!(ctx.route_override_backend_host.is_none());
+    assert!(ctx.route_override_backend_port.is_none());
 }
 
 #[test]

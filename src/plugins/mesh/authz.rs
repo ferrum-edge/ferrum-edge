@@ -150,6 +150,8 @@ const ATTR_DESTINATION_PORT: &str = "destination.port";
 const ATTR_CONNECTION_SNI: &str = "connection.sni";
 const ATTR_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
 const ATTR_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+pub(crate) const NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA: &str =
+    "mesh_authz.node_waypoint_authorized_upstream_id";
 
 impl ConditionAttributeKeys {
     fn from_policies(policies: &[MeshPolicy]) -> Self {
@@ -227,11 +229,34 @@ fn destination_policy_scopes_by_upstream(
     scopes_by_upstream
 }
 
-fn policy_applies_to_any_scope<'a>(
-    policy: &MeshPolicy,
-    scopes: impl IntoIterator<Item = &'a crate::modes::mesh::runtime::PolicyScopeCache>,
-) -> bool {
-    scopes.into_iter().any(|scope| scope.policy_applies(policy))
+fn evaluate_destination_policy_scopes(
+    policies: &[MeshPolicy],
+    scopes: &[crate::modes::mesh::runtime::PolicyScopeCache],
+    request: &MeshAuthzRequest,
+) -> MeshAuthzDecision {
+    let mut audit_policy = None;
+    for scope in scopes {
+        let decision = evaluate_mesh_authorization_policies(
+            policies
+                .iter()
+                .filter(|policy| scope.policy_applies(policy)),
+            request,
+        );
+        match decision {
+            MeshAuthzDecision::Deny { policy } => {
+                return MeshAuthzDecision::Deny { policy };
+            }
+            MeshAuthzDecision::Audit { policy } => {
+                audit_policy.get_or_insert(policy);
+            }
+            MeshAuthzDecision::Allow => {}
+        }
+    }
+    if let Some(policy) = audit_policy {
+        MeshAuthzDecision::Audit { policy }
+    } else {
+        MeshAuthzDecision::Allow
+    }
 }
 
 /// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
@@ -1075,6 +1100,7 @@ impl Plugin for MeshAuthz {
         // never clones the full `MeshSlice` (which carries workloads,
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
+        let mut node_waypoint_authorized_upstream_id = None;
         let decision = if self.per_pod_policy_scoping {
             scope_missing = ctx.node_waypoint_policy_scope.is_none();
             // Fail closed when scoped policies exist and this request's pod has
@@ -1104,24 +1130,33 @@ impl Plugin for MeshAuthz {
                     headers: HashMap::new(),
                 };
             }
-            let destination_scopes = ctx
+            let destination_upstream_id = ctx
                 .matched_proxy
                 .as_ref()
                 .and_then(|proxy| proxy.upstream_id.as_deref())
-                .and_then(|upstream_id| {
+                .map(str::to_string);
+            if let Some(destination_scopes) =
+                destination_upstream_id.as_deref().and_then(|upstream_id| {
                     self.destination_policy_scopes_by_upstream
                         .get(upstream_id)
                         .map(Vec::as_slice)
-                });
-            let scope = ctx.node_waypoint_policy_scope.as_deref();
-            let policies = self.slice.mesh_policies.iter().filter(|policy| {
-                if let Some(destination_scopes) = destination_scopes {
-                    policy_applies_to_any_scope(policy, destination_scopes.iter())
-                } else {
-                    Self::policy_applies_to_pod(policy, scope)
-                }
-            });
-            evaluate_mesh_authorization_policies(policies, &request)
+                })
+            {
+                node_waypoint_authorized_upstream_id = destination_upstream_id;
+                evaluate_destination_policy_scopes(
+                    &self.slice.mesh_policies,
+                    destination_scopes,
+                    &request,
+                )
+            } else {
+                let scope = ctx.node_waypoint_policy_scope.as_deref();
+                let policies = self
+                    .slice
+                    .mesh_policies
+                    .iter()
+                    .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+                evaluate_mesh_authorization_policies(policies, &request)
+            }
         } else {
             evaluate_mesh_authorization(&self.slice, &request)
         };
@@ -1134,6 +1169,15 @@ impl Plugin for MeshAuthz {
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
         }
         let result = self.decision_to_result(decision, &mut ctx.metadata);
+        if self.has_scoped_policies
+            && matches!(result, PluginResult::Continue)
+            && let Some(upstream_id) = node_waypoint_authorized_upstream_id
+        {
+            ctx.metadata.insert(
+                NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA.to_string(),
+                upstream_id,
+            );
+        }
         if matches!(
             result,
             PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
