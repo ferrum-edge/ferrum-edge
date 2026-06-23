@@ -4960,6 +4960,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         };
 
@@ -5083,6 +5084,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         };
         let canonical_ip = "10.0.0.7".parse().unwrap();
@@ -5179,6 +5181,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         };
         let service = |name: &str, port: u16| MeshService {

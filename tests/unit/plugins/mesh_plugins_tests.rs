@@ -2374,6 +2374,7 @@ async fn mesh_authz_node_waypoint_service_egress_uses_destination_policy_scope()
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         ..MeshSlice::default()
@@ -2525,6 +2526,7 @@ async fn mesh_authz_node_waypoint_service_egress_requires_all_destination_scopes
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
             Workload {
@@ -2547,6 +2549,7 @@ async fn mesh_authz_node_waypoint_service_egress_requires_all_destination_scopes
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
         ],
@@ -2652,6 +2655,7 @@ async fn mesh_authz_node_waypoint_direct_service_backend_uses_destination_scope(
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         ..MeshSlice::default()
@@ -2781,6 +2785,7 @@ async fn mesh_authz_node_waypoint_does_not_authorize_backend_when_upstream_is_se
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         ..MeshSlice::default()
@@ -2912,6 +2917,7 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
             Workload {
@@ -2931,6 +2937,7 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
         ],
@@ -3142,6 +3149,7 @@ async fn mesh_authz_node_waypoint_virtual_service_split_upstream_uses_route_targ
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         ..MeshSlice::default()
@@ -3266,6 +3274,7 @@ fn node_waypoint_endpoint_route_slice() -> MeshSlice {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         ..MeshSlice::default()
@@ -3572,6 +3581,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_follow_target_port_eligibil
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
             Workload {
@@ -3594,6 +3604,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_follow_target_port_eligibil
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
         ],
@@ -3723,6 +3734,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_skip_unroutable_workloads()
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
             Workload {
@@ -3745,6 +3757,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_skip_unroutable_workloads()
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             },
         ],

@@ -2212,6 +2212,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         // WorkloadEntry is a VM/static workload with no Kubernetes pod UID;
         // node-waypoint scope falls back to SPIFFE keying for these.
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     })
 }

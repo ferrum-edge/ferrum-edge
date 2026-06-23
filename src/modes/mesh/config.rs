@@ -101,6 +101,13 @@ pub struct Workload {
     /// labels are scoped independently instead of collapsed to one merged scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<String>,
+    /// Destination NodeWaypoint endpoint for the node hosting this workload.
+    /// NodeWaypoint secured transport dials this endpoint over HBONE and pins
+    /// `spiffe_id`, while the CONNECT authority remains the selected workload
+    /// address/app port. Missing metadata must fail closed once the secured
+    /// NodeWaypoint transport is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_waypoint: Option<NodeWaypointEndpoint>,
     /// Runtime-only RESERVED remote-cluster provenance marker: `true` iff this
     /// workload was ingested from a REMOTE cluster's discovery slice. Set by
     /// [`crate::modes::mesh::multicluster::tag_remote_workloads`] at the DP-side
@@ -116,6 +123,43 @@ pub struct Workload {
     /// ever set locally, after `fetch()`, by the remote-poll loop.
     #[serde(skip)]
     pub remote_provenance: bool,
+}
+
+/// Destination NodeWaypoint transport endpoint for a workload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeWaypointEndpoint {
+    /// IP or DNS name of the destination NodeWaypoint instance that owns the
+    /// selected workload's node. This is the outer TCP/TLS dial target.
+    pub address: String,
+    /// HBONE listener port on `address`. Defaults to Istio's standard 15008
+    /// when omitted so older explicit endpoints can stay compact.
+    #[serde(
+        default = "default_node_waypoint_hbone_port",
+        skip_serializing_if = "is_default_node_waypoint_hbone_port"
+    )]
+    pub hbone_port: u16,
+    /// Exact SPIFFE ID expected in the destination NodeWaypoint's server SVID.
+    pub spiffe_id: SpiffeId,
+    /// Kubernetes node name that owns this NodeWaypoint endpoint, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    /// Kubernetes node UID that owns this NodeWaypoint endpoint, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_uid: Option<String>,
+    /// Network/locality identity for multi-network selection, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Cluster identity for multi-cluster routing, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+}
+
+pub fn default_node_waypoint_hbone_port() -> u16 {
+    crate::modes::mesh::hbone::ISTIO_HBONE_PORT
+}
+
+fn is_default_node_waypoint_hbone_port(port: &u16) -> bool {
+    *port == default_node_waypoint_hbone_port()
 }
 
 /// A port advertised by a workload.
@@ -2436,6 +2480,58 @@ fn validate_mesh_config_internal(
                 "Workload '{}': cluster must not be empty when set",
                 wl.spiffe_id
             ));
+        }
+        if let Some(endpoint) = &wl.node_waypoint {
+            validate_non_empty_string(
+                format!("Workload '{}'.node_waypoint.address", wl.spiffe_id),
+                &endpoint.address,
+                &mut errors,
+            );
+            validate_non_zero_port(
+                format!("Workload '{}'.node_waypoint.hbone_port", wl.spiffe_id),
+                endpoint.hbone_port,
+                &mut errors,
+            );
+            if endpoint
+                .node_name
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.node_name: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
+            if endpoint
+                .node_uid
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.node_uid: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
+            if endpoint
+                .network
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.network: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
+            if endpoint
+                .cluster
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.cluster: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
         }
     }
 

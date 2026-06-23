@@ -54,6 +54,7 @@ fn mesh_config_round_trips_through_serde() {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             }],
             services: vec![MeshService {
@@ -79,6 +80,58 @@ fn mesh_config_round_trips_through_serde() {
     assert_eq!(mesh.workloads.len(), 1);
     assert_eq!(mesh.services.len(), 1);
     assert_eq!(mesh.workloads[0].service_name, "api");
+}
+
+#[test]
+fn workload_node_waypoint_endpoint_defaults_and_round_trips() {
+    let workload_json = serde_json::json!({
+        "spiffe_id": "spiffe://prod.example.com/ns/svc/sa/api",
+        "selector": {"labels": {"app": "api"}, "namespace": "svc"},
+        "service_name": "api",
+        "addresses": ["10.1.2.3"],
+        "ports": [{"port": 8443, "protocol": "http2", "name": "https"}],
+        "trust_domain": "prod.example.com",
+        "namespace": "svc",
+        "node_waypoint": {
+            "address": "10.2.0.17",
+            "spiffe_id": "spiffe://prod.example.com/ns/ferrum-system/sa/node-waypoint",
+            "node_name": "worker-a",
+            "node_uid": "node-uid-a",
+            "network": "network-a",
+            "cluster": "cluster-a"
+        }
+    });
+
+    let workload: Workload = serde_json::from_value(workload_json).expect("workload decodes");
+    let endpoint = workload
+        .node_waypoint
+        .as_ref()
+        .expect("node waypoint endpoint present");
+    assert_eq!(endpoint.address, "10.2.0.17");
+    assert_eq!(endpoint.hbone_port, 15008);
+    assert_eq!(
+        endpoint.spiffe_id.as_str(),
+        "spiffe://prod.example.com/ns/ferrum-system/sa/node-waypoint"
+    );
+    assert_eq!(endpoint.node_name.as_deref(), Some("worker-a"));
+    assert_eq!(endpoint.node_uid.as_deref(), Some("node-uid-a"));
+    assert_eq!(endpoint.network.as_deref(), Some("network-a"));
+    assert_eq!(endpoint.cluster.as_deref(), Some("cluster-a"));
+
+    let encoded = serde_json::to_value(&workload).expect("workload encodes");
+    assert!(
+        encoded["node_waypoint"].get("hbone_port").is_none(),
+        "default HBONE port should stay compact on the wire"
+    );
+
+    let mut non_default = workload;
+    non_default
+        .node_waypoint
+        .as_mut()
+        .expect("endpoint present")
+        .hbone_port = 16008;
+    let encoded = serde_json::to_value(&non_default).expect("workload encodes");
+    assert_eq!(encoded["node_waypoint"]["hbone_port"], 16008);
 }
 
 #[test]

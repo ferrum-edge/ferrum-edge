@@ -22366,6 +22366,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         };
 
@@ -27511,6 +27512,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         });
         // Now the workload's declared application port is allowed on loopback...
@@ -28399,6 +28401,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             }
         }

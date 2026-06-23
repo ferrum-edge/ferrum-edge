@@ -141,6 +141,7 @@ pub fn workload_for(
         locality: None,
         service_account: Some(service_account),
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     }
 }

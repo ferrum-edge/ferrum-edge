@@ -6850,6 +6850,7 @@ mod node_waypoint_stream_scope_tests {
             locality: None,
             service_account: None,
             pod_uid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            node_waypoint: None,
             remote_provenance: false,
         };
         resolver.install_policy_scopes_from_workloads(&[workload]);

@@ -48,6 +48,11 @@ time. A routable workload endpoint needs:
   and multi-network policy to choose a workload before the secured hop is
   opened.
 
+The wire contract is `Workload.node_waypoint`: `address`, `hbone_port`
+(default `15008`), `spiffe_id`, and optional `node_name`, `node_uid`,
+`network`, and `cluster`. The data plane must treat this as destination
+metadata for the selected workload, not as a replacement workload identity.
+
 The control plane may derive this from Kubernetes Pods, Nodes, and DaemonSet
 endpoints, but the data plane consumes the explicit slice fields. If the slice
 does not name a destination NodeWaypoint for an enrolled in-mesh target, the

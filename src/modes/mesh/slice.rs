@@ -2703,9 +2703,9 @@ mod tests {
         MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
         MeshSidecarEgress, MeshSidecarIngress, MeshTelemetryConfig, MeshTelemetryResource,
         MeshWaypointBinding, MeshWaypointServiceRef, MtlsMode, MultiClusterConfig,
-        PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster, ServiceEntry,
-        ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
-        WorkloadRef, WorkloadSelector,
+        NodeWaypointEndpoint, PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster,
+        ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
+        WorkloadPort, WorkloadRef, WorkloadSelector,
     };
     use std::collections::HashMap;
 
@@ -2739,6 +2739,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }
     }
@@ -3426,6 +3427,44 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request("alpha"));
         assert_eq!(slice.workloads.len(), 2);
         assert!(slice.workloads.iter().all(|w| w.namespace == "alpha"));
+    }
+
+    #[test]
+    fn from_gateway_config_preserves_workload_node_waypoint_endpoint() {
+        let mut workload = make_workload("alpha", "svc-a", HashMap::new());
+        workload.node_waypoint = Some(NodeWaypointEndpoint {
+            address: "10.2.0.17".into(),
+            hbone_port: 16008,
+            spiffe_id: SpiffeId::new(
+                "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-worker-a",
+            )
+            .unwrap(),
+            node_name: Some("worker-a".into()),
+            node_uid: Some("node-uid-a".into()),
+            network: Some("network-a".into()),
+            cluster: Some("cluster-a".into()),
+        });
+        let config = config_with_mesh(MeshConfig {
+            workloads: vec![workload],
+            ..MeshConfig::default()
+        });
+
+        let slice = MeshSlice::from_gateway_config(&config, slice_request("alpha"));
+
+        let endpoint = slice.workloads[0]
+            .node_waypoint
+            .as_ref()
+            .expect("node waypoint endpoint survives projection");
+        assert_eq!(endpoint.address, "10.2.0.17");
+        assert_eq!(endpoint.hbone_port, 16008);
+        assert_eq!(
+            endpoint.spiffe_id.as_str(),
+            "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-worker-a"
+        );
+        assert_eq!(endpoint.node_name.as_deref(), Some("worker-a"));
+        assert_eq!(endpoint.node_uid.as_deref(), Some("node-uid-a"));
+        assert_eq!(endpoint.network.as_deref(), Some("network-a"));
+        assert_eq!(endpoint.cluster.as_deref(), Some("cluster-a"));
     }
 
     #[test]
@@ -5290,6 +5329,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             }],
             ..MeshSlice::default()
@@ -5323,6 +5363,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             }],
             ..MeshSlice::default()
