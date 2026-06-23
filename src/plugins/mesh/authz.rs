@@ -39,6 +39,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -69,7 +70,14 @@ pub struct MeshAuthz {
         HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_backend:
         HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    destination_policy_scopes_by_namespaced_backend: HashMap<
+        NamespacedDestinationBackendKey,
+        Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    >,
     destination_service_backend_hosts: HashSet<String>,
+    destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
+    destination_route_upstreams_requiring_scope: HashSet<String>,
+    has_route_upstream_metadata: bool,
     has_header_rules: bool,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
@@ -179,6 +187,66 @@ impl DestinationBackendKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NamespacedDestinationBackendKey {
+    namespace: String,
+    host: String,
+    port: u16,
+}
+
+impl NamespacedDestinationBackendKey {
+    fn new(namespace: &str, host: &str, port: u16) -> Option<Self> {
+        if port == 0 {
+            return None;
+        }
+        let namespace = normalize_destination_backend_host(namespace)?;
+        let host = normalize_destination_backend_host(host)?;
+        Some(Self {
+            namespace,
+            host,
+            port,
+        })
+    }
+
+    fn backend_key(&self) -> DestinationBackendKey {
+        DestinationBackendKey {
+            host: self.host.clone(),
+            port: self.port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NamespacedDestinationBackendHostKey {
+    namespace: String,
+    host: String,
+}
+
+impl NamespacedDestinationBackendHostKey {
+    fn new(namespace: &str, host: &str) -> Option<Self> {
+        let namespace = normalize_destination_backend_host(namespace)?;
+        let host = normalize_destination_backend_host(host)?;
+        Some(Self { namespace, host })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ServicePortKey {
+    namespace: String,
+    name: String,
+    port: u16,
+}
+
+impl ServicePortKey {
+    fn new(service: &crate::modes::mesh::config::MeshService, port: u16) -> Self {
+        Self {
+            namespace: service.namespace.clone(),
+            name: service.name.clone(),
+            port,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum NodeWaypointAuthorizedDestination {
     Upstream(String),
@@ -194,7 +262,27 @@ struct DestinationScopeMatch<'a> {
 struct DestinationPolicyScopeIndex {
     by_upstream: HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     by_backend: HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    by_namespaced_backend: HashMap<
+        NamespacedDestinationBackendKey,
+        Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    >,
     service_backend_hosts: HashSet<String>,
+    namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
+    route_upstreams_requiring_scope: HashSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeWaypointRouteUpstreamConfig {
+    id: String,
+    namespace: String,
+    #[serde(default)]
+    targets: Vec<NodeWaypointRouteTargetConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeWaypointRouteTargetConfig {
+    host: String,
+    port: u16,
 }
 
 impl ConditionAttributeKeys {
@@ -248,10 +336,14 @@ fn normalize_destination_backend_host(host: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn service_host_aliases(
+fn node_waypoint_generated_route_upstream_id(upstream_id: &str) -> bool {
+    upstream_id.starts_with("istio-vs-upstream-")
+        || upstream_id.starts_with("gwapi-route-upstream-")
+}
+
+fn service_qualified_host_aliases(
     service: &crate::modes::mesh::config::MeshService,
     cluster_domain: &str,
-    unique_short_name: bool,
 ) -> Vec<String> {
     let mut aliases = vec![
         format!("{}.{}", service.name, service.namespace),
@@ -263,9 +355,6 @@ fn service_host_aliases(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
         ));
-    }
-    if unique_short_name {
-        aliases.push(service.name.clone());
     }
     aliases
 }
@@ -279,6 +368,9 @@ fn destination_policy_scopes_for_service_port(
     crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
         .into_iter()
         .filter_map(|workload| {
+            if workload.addresses.is_empty() {
+                return None;
+            }
             let app_port = match service_port.target_port.as_ref() {
                 Some(_) => {
                     match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
@@ -296,29 +388,72 @@ fn destination_policy_scopes_for_service_port(
         .collect()
 }
 
+fn parse_node_waypoint_route_upstreams(
+    config: &Value,
+) -> Result<(bool, Vec<NodeWaypointRouteUpstreamConfig>), String> {
+    match config.get("node_waypoint_route_upstreams") {
+        Some(value) => {
+            serde_json::from_value::<Vec<NodeWaypointRouteUpstreamConfig>>(value.clone())
+                .map(|upstreams| (true, upstreams))
+                .map_err(|error| {
+                    format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")
+                })
+        }
+        None => Ok((false, Vec::new())),
+    }
+}
+
+fn service_port_key_for_backend(
+    host: &str,
+    port: u16,
+    default_namespace: &str,
+    qualified_service_ports: &HashMap<DestinationBackendKey, ServicePortKey>,
+    namespaced_service_ports: &HashMap<NamespacedDestinationBackendKey, ServicePortKey>,
+) -> Option<ServicePortKey> {
+    if let Some(key) = DestinationBackendKey::new(host, port)
+        && let Some(service_key) = qualified_service_ports.get(&key)
+    {
+        return Some(service_key.clone());
+    }
+    let key = NamespacedDestinationBackendKey::new(default_namespace, host, port)?;
+    namespaced_service_ports.get(&key).cloned()
+}
+
 fn destination_policy_scope_index(
     slice: &MeshSlice,
     cluster_domain: &str,
+    route_upstreams: &[NodeWaypointRouteUpstreamConfig],
 ) -> DestinationPolicyScopeIndex {
     let mut index = DestinationPolicyScopeIndex::default();
-    let mut service_name_counts = HashMap::new();
+    let mut service_port_scopes = HashMap::new();
+    let mut qualified_service_ports = HashMap::new();
+    let mut namespaced_service_ports = HashMap::new();
     for service in &slice.services {
-        *service_name_counts
-            .entry(service.name.as_str())
-            .or_insert(0usize) += 1;
-    }
-    for service in &slice.services {
-        let aliases = service_host_aliases(
-            service,
-            cluster_domain,
-            service_name_counts.get(service.name.as_str()) == Some(&1),
-        );
+        let aliases = service_qualified_host_aliases(service, cluster_domain);
         for alias in &aliases {
             if let Some(host) = normalize_destination_backend_host(alias) {
                 index.service_backend_hosts.insert(host);
             }
         }
+        if let Some(host_key) =
+            NamespacedDestinationBackendHostKey::new(&service.namespace, &service.name)
+        {
+            index.namespaced_service_backend_hosts.insert(host_key);
+        }
         for service_port in &service.ports {
+            let service_key = ServicePortKey::new(service, service_port.port);
+            for alias in &aliases {
+                if let Some(key) = DestinationBackendKey::new(alias, service_port.port) {
+                    qualified_service_ports.insert(key, service_key.clone());
+                }
+            }
+            if let Some(key) = NamespacedDestinationBackendKey::new(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            ) {
+                namespaced_service_ports.insert(key, service_key.clone());
+            }
             let scopes = destination_policy_scopes_for_service_port(
                 service,
                 service_port,
@@ -328,6 +463,7 @@ fn destination_policy_scope_index(
             if scopes.is_empty() {
                 continue;
             }
+            service_port_scopes.insert(service_key, scopes.clone());
             index.by_upstream.insert(
                 crate::modes::mesh::mesh_outbound_upstream_id(
                     &service.namespace,
@@ -341,6 +477,43 @@ fn destination_policy_scope_index(
                     index.by_backend.insert(key, scopes.clone());
                 }
             }
+            if let Some(key) = NamespacedDestinationBackendKey::new(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            ) {
+                index.by_namespaced_backend.insert(key, scopes.clone());
+            }
+        }
+    }
+    for upstream in route_upstreams {
+        let mut route_scopes = Vec::new();
+        let mut service_target_seen = false;
+        let mut seen_service_ports = HashSet::new();
+        for target in &upstream.targets {
+            let Some(service_key) = service_port_key_for_backend(
+                &target.host,
+                target.port,
+                &upstream.namespace,
+                &qualified_service_ports,
+                &namespaced_service_ports,
+            ) else {
+                continue;
+            };
+            service_target_seen = true;
+            if seen_service_ports.insert(service_key.clone())
+                && let Some(scopes) = service_port_scopes.get(&service_key)
+            {
+                route_scopes.extend(scopes.clone());
+            }
+        }
+        if service_target_seen {
+            index
+                .route_upstreams_requiring_scope
+                .insert(upstream.id.clone());
+        }
+        if !route_scopes.is_empty() {
+            index.by_upstream.insert(upstream.id.clone(), route_scopes);
         }
     }
     index
@@ -657,12 +830,16 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
+        let mut has_route_upstream_metadata = false;
         let destination_policy_scope_index = if per_pod_policy_scoping {
             let cluster_domain = config
                 .get("cluster_domain")
                 .and_then(Value::as_str)
                 .unwrap_or("cluster.local");
-            destination_policy_scope_index(&slice, cluster_domain)
+            let (route_metadata_present, route_upstreams) =
+                parse_node_waypoint_route_upstreams(config)?;
+            has_route_upstream_metadata = route_metadata_present;
+            destination_policy_scope_index(&slice, cluster_domain, &route_upstreams)
         } else {
             DestinationPolicyScopeIndex::default()
         };
@@ -670,7 +847,14 @@ impl MeshAuthz {
             slice,
             destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
             destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
+            destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
+                .by_namespaced_backend,
             destination_service_backend_hosts: destination_policy_scope_index.service_backend_hosts,
+            destination_namespaced_service_backend_hosts: destination_policy_scope_index
+                .namespaced_service_backend_hosts,
+            destination_route_upstreams_requiring_scope: destination_policy_scope_index
+                .route_upstreams_requiring_scope,
+            has_route_upstream_metadata,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
@@ -863,34 +1047,63 @@ impl MeshAuthz {
         &self,
         proxy: &Proxy,
     ) -> Option<DestinationScopeMatch<'_>> {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && let Some(scopes) = self.destination_policy_scopes_by_upstream.get(upstream_id)
-        {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            if let Some(scopes) = self.destination_policy_scopes_by_upstream.get(upstream_id) {
+                return Some(DestinationScopeMatch {
+                    authorized_destination: NodeWaypointAuthorizedDestination::Upstream(
+                        upstream_id.to_string(),
+                    ),
+                    scopes,
+                });
+            }
+            return None;
+        }
+        let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+        if let Some(scopes) = self.destination_policy_scopes_by_backend.get(&backend_key) {
             return Some(DestinationScopeMatch {
-                authorized_destination: NodeWaypointAuthorizedDestination::Upstream(
-                    upstream_id.to_string(),
-                ),
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend(backend_key),
                 scopes,
             });
         }
-        let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
-        self.destination_policy_scopes_by_backend
-            .get(&backend_key)
+        let namespaced_backend_key = NamespacedDestinationBackendKey::new(
+            &proxy.namespace,
+            &proxy.backend_host,
+            proxy.backend_port,
+        )?;
+        self.destination_policy_scopes_by_namespaced_backend
+            .get(&namespaced_backend_key)
             .map(|scopes| DestinationScopeMatch {
-                authorized_destination: NodeWaypointAuthorizedDestination::Backend(backend_key),
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend(
+                    namespaced_backend_key.backend_key(),
+                ),
                 scopes,
             })
     }
 
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && (upstream_id.starts_with("__mesh-out-upstream-")
-                || upstream_id.starts_with("istio-vs-upstream-"))
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            if upstream_id.starts_with("__mesh-out-upstream-") {
+                return true;
+            }
+            if node_waypoint_generated_route_upstream_id(upstream_id) {
+                return !self.has_route_upstream_metadata
+                    || self
+                        .destination_route_upstreams_requiring_scope
+                        .contains(upstream_id);
+            }
+            return false;
+        }
+        if DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)
+            .is_some_and(|key| self.destination_service_backend_hosts.contains(&key.host))
         {
             return true;
         }
-        DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)
-            .is_some_and(|key| self.destination_service_backend_hosts.contains(&key.host))
+        NamespacedDestinationBackendHostKey::new(&proxy.namespace, &proxy.backend_host).is_some_and(
+            |key| {
+                self.destination_namespaced_service_backend_hosts
+                    .contains(&key)
+            },
+        )
     }
 
     fn decision_to_result(

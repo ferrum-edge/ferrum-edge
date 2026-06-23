@@ -6533,6 +6533,11 @@ fn sanitize_egress_host_id_part(value: &str) -> String {
     out
 }
 
+fn node_waypoint_route_upstream_for_authz(upstream_id: &str) -> bool {
+    upstream_id.starts_with("istio-vs-upstream-")
+        || upstream_id.starts_with("gwapi-route-upstream-")
+}
+
 fn inject_mesh_global_plugins(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -6569,6 +6574,26 @@ fn inject_mesh_global_plugins(
         "trust_domain_aliases": trust_domain_aliases,
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
     });
+    if runtime.topology == MeshTopology::NodeWaypoint {
+        let route_upstreams: Vec<_> = config
+            .upstreams
+            .iter()
+            .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
+            .map(|upstream| {
+                serde_json::json!({
+                    "id": upstream.id.clone(),
+                    "namespace": upstream.namespace.clone(),
+                    "targets": upstream.targets.iter().map(|target| {
+                        serde_json::json!({
+                            "host": target.host.clone(),
+                            "port": target.port,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        mesh_authz_config["node_waypoint_route_upstreams"] = serde_json::json!(route_upstreams);
+    }
     // Only thread the operator-set assertor list when present; otherwise
     // let mesh_authz fall back to its built-in defaults (ztunnel, waypoint).
     // Passing an empty array would lock baggage rewriting down entirely, so
@@ -17335,6 +17360,51 @@ mod tests {
             .find(|plugin| plugin.id == MESH_BPF_METRICS_PLUGIN_ID)
             .expect("bpf_metrics plugin auto-injected on NodeWaypoint");
         assert_eq!(bpf_plugin.plugin_name, "__mesh_bpf_metrics");
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_threads_node_waypoint_route_upstreams_to_authz() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::NodeWaypoint;
+        let mut istio_route_upstream =
+            destination_rule_test_upstream("istio-vs-upstream-default-api-0", "dst");
+        istio_route_upstream.targets[0].port = 80;
+        let mut gwapi_route_upstream =
+            destination_rule_test_upstream("gwapi-route-upstream-default-api-1", "api.default");
+        gwapi_route_upstream.targets[0].port = 8080;
+        let mut custom_upstream = destination_rule_test_upstream("custom-upstream", "external");
+        custom_upstream.targets[0].port = 443;
+        let mut config = GatewayConfig {
+            upstreams: vec![istio_route_upstream, gwapi_route_upstream, custom_upstream],
+            ..GatewayConfig::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+        let authz = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .expect("mesh_authz plugin injected");
+        assert_eq!(
+            authz.config["node_waypoint_route_upstreams"],
+            serde_json::json!([
+                {
+                    "id": "istio-vs-upstream-default-api-0",
+                    "namespace": "default",
+                    "targets": [
+                        {"host": "dst", "port": 80}
+                    ]
+                },
+                {
+                    "id": "gwapi-route-upstream-default-api-1",
+                    "namespace": "default",
+                    "targets": [
+                        {"host": "api.default", "port": 8080}
+                    ]
+                }
+            ])
+        );
     }
 
     #[test]
