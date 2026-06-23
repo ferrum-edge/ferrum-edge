@@ -68,7 +68,7 @@ use crate::config::types::{
 };
 use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
-    NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA,
+    NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
 use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
@@ -998,6 +998,11 @@ pub struct RouteDestination {
     /// routes to a direct backend that uses different mTLS settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_tls: Option<BackendTlsConfig>,
+    /// Trusted translator marker for destinations that enter NodeWaypoint
+    /// Service authz. When scoped NodeWaypoint authz ran but did not stamp an
+    /// authorized destination, matching this rule must fail closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_node_waypoint_authz: bool,
 }
 
 impl RouteDestination {
@@ -1021,6 +1026,21 @@ fn reject_node_waypoint_authz_destination_override(
         .metadata
         .get(NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA);
     if authorized_upstream_id.is_none() && authorized_backend.is_none() {
+        if destination.requires_node_waypoint_authz
+            && !destination.is_empty()
+            && ctx
+                .metadata
+                .get(NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA)
+                .is_some_and(|value| value == "true")
+        {
+            return Some(PluginResult::Reject {
+                status_code: 403,
+                body:
+                    "node-waypoint mesh authorization requires an authorized destination before route override"
+                        .to_string(),
+                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            });
+        }
         return None;
     }
     if destination.is_empty() {

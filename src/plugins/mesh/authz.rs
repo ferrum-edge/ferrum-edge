@@ -78,6 +78,8 @@ pub struct MeshAuthz {
         HashMap<DestinationBackendKey, Vec<DestinationBackendKey>>,
     destination_backend_aliases_by_namespaced_backend:
         HashMap<NamespacedDestinationBackendKey, Vec<DestinationBackendKey>>,
+    destination_same_namespace_backend_alias_by_backend:
+        HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
     destination_service_backend_hosts: HashSet<String>,
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: HashSet<String>,
@@ -172,6 +174,8 @@ pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA: &str =
     "mesh_authz.node_waypoint_authorized_backend";
 pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA: &str =
     "mesh_authz.node_waypoint_authorized_backend_aliases";
+pub(crate) const NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA: &str =
+    "mesh_authz.node_waypoint_scoped_authz_active";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DestinationBackendKey {
@@ -289,6 +293,8 @@ struct DestinationPolicyScopeIndex {
     backend_aliases_by_backend: HashMap<DestinationBackendKey, Vec<DestinationBackendKey>>,
     backend_aliases_by_namespaced_backend:
         HashMap<NamespacedDestinationBackendKey, Vec<DestinationBackendKey>>,
+    same_namespace_backend_alias_by_backend:
+        HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
     service_backend_hosts: HashSet<String>,
     namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     route_upstreams_requiring_scope: HashSet<String>,
@@ -608,6 +614,7 @@ fn destination_policy_scope_index(
                 &aliases,
                 false,
             );
+            let short_backend_alias = DestinationBackendKey::new(&service.name, service_port.port);
             let namespaced_backend_aliases = destination_backend_aliases_for_service_port(
                 service,
                 service_port.port,
@@ -662,6 +669,18 @@ fn destination_policy_scope_index(
                 index
                     .backend_aliases_by_backend
                     .insert(alias_key.clone(), qualified_backend_aliases.clone());
+                if let (Some(namespaced_alias_key), Some(short_backend_alias)) = (
+                    NamespacedDestinationBackendKey::new(
+                        &service.namespace,
+                        &alias_key.host,
+                        alias_key.port,
+                    ),
+                    short_backend_alias.clone(),
+                ) {
+                    index
+                        .same_namespace_backend_alias_by_backend
+                        .insert(namespaced_alias_key, short_backend_alias);
+                }
             }
             if let Some(key) = NamespacedDestinationBackendKey::new(
                 &service.namespace,
@@ -1072,6 +1091,8 @@ impl MeshAuthz {
                 .backend_aliases_by_backend,
             destination_backend_aliases_by_namespaced_backend: destination_policy_scope_index
                 .backend_aliases_by_namespaced_backend,
+            destination_same_namespace_backend_alias_by_backend: destination_policy_scope_index
+                .same_namespace_backend_alias_by_backend,
             destination_service_backend_hosts: destination_policy_scope_index.service_backend_hosts,
             destination_namespaced_service_backend_hosts: destination_policy_scope_index
                 .namespaced_service_backend_hosts,
@@ -1283,11 +1304,22 @@ impl MeshAuthz {
         }
         let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
         if let Some(scopes) = self.destination_policy_scopes_by_backend.get(&backend_key) {
-            let aliases = self
+            let mut aliases = self
                 .destination_backend_aliases_by_backend
                 .get(&backend_key)
                 .cloned()
                 .unwrap_or_else(|| vec![backend_key.clone()]);
+            if let Some(namespaced_backend_key) = NamespacedDestinationBackendKey::new(
+                &proxy.namespace,
+                &backend_key.host,
+                backend_key.port,
+            ) && let Some(short_alias) = self
+                .destination_same_namespace_backend_alias_by_backend
+                .get(&namespaced_backend_key)
+                && !aliases.contains(short_alias)
+            {
+                aliases.push(short_alias.clone());
+            }
             return Some(DestinationScopeMatch {
                 authorized_destination: NodeWaypointAuthorizedDestination::Backend {
                     key: backend_key,
@@ -1708,6 +1740,12 @@ impl Plugin for MeshAuthz {
         let mut scope_missing = false;
         let mut node_waypoint_authorized_destination = None;
         let decision = if self.per_pod_policy_scoping {
+            if self.has_scoped_policies {
+                ctx.metadata.insert(
+                    NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA.to_string(),
+                    "true".to_string(),
+                );
+            }
             scope_missing = ctx.node_waypoint_policy_scope.is_none();
             // Fail closed when scoped policies exist and this request's pod has
             // no current scope — matching the stream path (`on_stream_connect`).

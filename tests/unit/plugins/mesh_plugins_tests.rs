@@ -2706,6 +2706,14 @@ async fn mesh_authz_node_waypoint_direct_service_backend_uses_destination_scope(
             .map(String::as_str),
         Some("dst.default.svc.cluster.local|80")
     );
+    let aliases = trusted
+        .metadata
+        .get("mesh_authz.node_waypoint_authorized_backend_aliases")
+        .expect("authorized backend aliases");
+    assert!(
+        aliases.split(',').any(|value| value == "dst|80"),
+        "same-namespace short Service alias should be authorized for route overrides: {aliases}"
+    );
 }
 
 #[tokio::test]

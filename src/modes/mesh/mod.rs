@@ -6550,78 +6550,13 @@ fn push_node_waypoint_authz_cluster_domain(
     }
 }
 
-fn note_node_waypoint_service_host_cluster_domain(
-    host: &str,
-    service_port: u16,
-    mesh_slice: &MeshSlice,
-    domains: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) {
-    if service_port == 0 {
-        return;
-    }
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
-        return;
-    }
-    for service in &mesh_slice.services {
-        if !service.ports.iter().any(|port| port.port == service_port) {
-            continue;
-        }
-        let prefix = format!(
-            "{}.{}.svc.",
-            service.name.to_ascii_lowercase(),
-            service.namespace.to_ascii_lowercase()
-        );
-        if let Some(domain) = host.strip_prefix(&prefix) {
-            push_node_waypoint_authz_cluster_domain(domains, seen, domain);
-        }
-    }
-}
-
-fn node_waypoint_authz_cluster_domains(
-    primary_cluster_domain: &str,
-    config: &GatewayConfig,
-    mesh_slice: &MeshSlice,
-) -> Vec<String> {
+fn node_waypoint_authz_cluster_domains(primary_cluster_domain: &str) -> Vec<String> {
     let mut domains = Vec::new();
     let mut seen = HashSet::new();
     push_node_waypoint_authz_cluster_domain(&mut domains, &mut seen, primary_cluster_domain);
-    for proxy in config
-        .proxies
-        .iter()
-        .filter(|proxy| proxy.upstream_id.is_none())
-    {
-        note_node_waypoint_service_host_cluster_domain(
-            &proxy.backend_host,
-            proxy.backend_port,
-            mesh_slice,
-            &mut domains,
-            &mut seen,
-        );
-    }
-    for upstream in config
-        .upstreams
-        .iter()
-        .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
-    {
-        for target in &upstream.targets {
-            let service_port = target.service_port_policy_key.or_else(|| {
-                target
-                    .tags
-                    .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
-                    .and_then(|value| value.parse::<u16>().ok())
-                    .filter(|port| *port != 0)
-            });
-            note_node_waypoint_service_host_cluster_domain(
-                &target.host,
-                service_port.unwrap_or(target.port),
-                mesh_slice,
-                &mut domains,
-                &mut seen,
-            );
-        }
-    }
+    let k8s_cluster_domain = resolve_ferrum_var("FERRUM_K8S_CLUSTER_DOMAIN")
+        .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
+    push_node_waypoint_authz_cluster_domain(&mut domains, &mut seen, &k8s_cluster_domain);
     domains
 }
 
@@ -6662,9 +6597,8 @@ fn inject_mesh_global_plugins(
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
     });
     if runtime.topology == MeshTopology::NodeWaypoint {
-        mesh_authz_config["cluster_domains"] = serde_json::json!(
-            node_waypoint_authz_cluster_domains(&runtime.cluster_domain, config, mesh_slice)
-        );
+        mesh_authz_config["cluster_domains"] =
+            serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
         let route_upstreams: Vec<_> = config
             .upstreams
             .iter()
@@ -11113,6 +11047,7 @@ mod tests {
             "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES",
             "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES",
             "FERRUM_MESH_CLUSTER_DOMAIN",
+            "FERRUM_K8S_CLUSTER_DOMAIN",
             "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY",
             "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS",
             "FERRUM_MESH_SIDECAR_ENFORCED",
@@ -17519,50 +17454,39 @@ mod tests {
 
     #[test]
     fn inject_mesh_global_plugins_threads_node_waypoint_route_cluster_domains_to_authz() {
-        let mut runtime = test_mesh_runtime_config();
-        runtime.topology = MeshTopology::NodeWaypoint;
-        let direct_proxy = serde_json::from_value::<Proxy>(serde_json::json!({
-            "id": "gwapi-direct",
-            "namespace": "default",
-            "hosts": ["api.example.com"],
-            "listen_path": "/",
-            "backend_scheme": "http",
-            "backend_host": "dst.default.svc.corp.example",
-            "backend_port": 80
-        }))
-        .expect("proxy");
-        let mesh_slice = MeshSlice {
-            services: vec![MeshService {
-                name: "dst".to_string(),
-                namespace: "default".to_string(),
-                ports: vec![ServicePort {
-                    port: 80,
-                    protocol: AppProtocol::Http,
-                    name: None,
-                    target_port: None,
+        with_mesh_env(&[("FERRUM_K8S_CLUSTER_DOMAIN", "corp.example")], || {
+            let mut runtime = test_mesh_runtime_config();
+            runtime.topology = MeshTopology::NodeWaypoint;
+            let mesh_slice = MeshSlice {
+                services: vec![MeshService {
+                    name: "dst".to_string(),
+                    namespace: "default".to_string(),
+                    ports: vec![ServicePort {
+                        port: 80,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                        target_port: None,
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: HashMap::new(),
+                    cluster_ips: Vec::new(),
                 }],
-                workloads: Vec::new(),
-                protocol_overrides: HashMap::new(),
-                cluster_ips: Vec::new(),
-            }],
-            ..MeshSlice::default()
-        };
-        let mut config = GatewayConfig {
-            proxies: vec![direct_proxy],
-            ..GatewayConfig::default()
-        };
+                ..MeshSlice::default()
+            };
+            let mut config = GatewayConfig::default();
 
-        inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
+            inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
 
-        let authz = config
-            .plugin_configs
-            .iter()
-            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
-            .expect("mesh_authz plugin injected");
-        assert_eq!(
-            authz.config["cluster_domains"],
-            serde_json::json!(["cluster.local", "corp.example"])
-        );
+            let authz = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                .expect("mesh_authz plugin injected");
+            assert_eq!(
+                authz.config["cluster_domains"],
+                serde_json::json!(["cluster.local", "corp.example"])
+            );
+        });
     }
 
     #[test]

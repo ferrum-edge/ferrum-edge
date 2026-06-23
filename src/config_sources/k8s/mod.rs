@@ -1361,6 +1361,7 @@ pub(crate) struct MeshRouteDispatchDestination<'a> {
     pub backend_host: &'a str,
     pub backend_port: u16,
     pub upstream_id: Option<&'a str>,
+    pub requires_node_waypoint_authz: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1896,6 +1897,12 @@ fn route_dispatch_destination_value(
     } else {
         return None;
     }
+    if route_destination.requires_node_waypoint_authz {
+        destination.insert(
+            "requires_node_waypoint_authz".to_string(),
+            Value::Bool(true),
+        );
+    }
     Some(destination)
 }
 
@@ -2339,6 +2346,14 @@ pub(crate) struct RouteBackend {
     pub service_namespace: Option<String>,
     pub service_name: Option<String>,
     pub service_port: Option<u16>,
+}
+
+pub(crate) fn route_backends_require_node_waypoint_authz(backends: &[RouteBackend]) -> bool {
+    backends.iter().any(|backend| {
+        backend.service_namespace.is_some()
+            && backend.service_name.is_some()
+            && backend.service_port.is_some()
+    })
 }
 
 pub(crate) fn upstream_for_route(
