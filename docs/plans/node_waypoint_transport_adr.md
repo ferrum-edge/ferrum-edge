@@ -86,9 +86,13 @@ inner CONNECT authority remains the selected workload app address and port.
 Kubernetes pod discovery now populates `node_waypoint` for service-backed
 workloads when their node has a trusted ready NodeWaypoint proxy Pod;
 identity-backed source NodeWaypoint runtimes now make missing destination
-metadata fail closed by skipping those targets during materialization. The
-temporary plaintext compatibility fallback remains only for explicit
-no-CA/no-identity development runs.
+metadata fail closed by skipping those targets during materialization. For
+identity-backed NodeWaypoint, the mesh-managed destination `mesh_authz` and
+`workload_metrics` plugins derive their `trusted_hbone_assertors` list from the
+exact `Workload.node_waypoint.spiffe_id` values in the accepted slice; if none
+exist, the generated list is empty so asserted workload identity is not honored.
+The temporary plaintext compatibility fallback and built-in bare service-account
+assertor defaults remain only for explicit no-CA/no-identity development runs.
 
 ## Destination NodeWaypoint Identity
 
