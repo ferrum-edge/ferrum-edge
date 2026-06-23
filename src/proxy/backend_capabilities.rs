@@ -323,20 +323,33 @@ impl BackendCapabilityRegistry {
         }
     }
 
-    /// Downgrade the cached HBONE classification for a backend target after a
-    /// live gateway-to-mesh tunnel failure. No-op when the target has no
-    /// cached record.
+    /// Downgrade the HBONE classification for a backend target after a live
+    /// gateway-to-mesh tunnel failure. If no refresh record exists yet, insert
+    /// an HBONE-only `Unsupported` record so cold-start live failures are
+    /// cached immediately instead of redialing the same unavailable waypoint on
+    /// every request until the next refresh.
     pub fn mark_hbone_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) {
         let key = capability_key_for_proxy_target(proxy, target);
-        if let Some(mut entry) = self.entries.get_mut(&key)
-            && !matches!(entry.hbone, ProtocolSupport::Unsupported)
-        {
-            let mut new_record = (**entry).clone();
-            new_record.hbone = ProtocolSupport::Unsupported;
-            new_record.last_probe_at_unix_secs = now_unix_secs();
-            new_record.last_probe_error =
-                Some("HBONE downgraded after tunnel failure on request path".to_string());
-            *entry = Arc::new(new_record);
+        let error = Some("HBONE downgraded after tunnel failure on request path".to_string());
+        match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if matches!(entry.get().hbone, ProtocolSupport::Unsupported) {
+                    return;
+                }
+                let mut new_record = (**entry.get()).clone();
+                new_record.hbone = ProtocolSupport::Unsupported;
+                new_record.last_probe_at_unix_secs = now_unix_secs();
+                new_record.last_probe_error = error;
+                entry.insert(Arc::new(new_record));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(BackendCapabilityRecord {
+                    hbone: ProtocolSupport::Unsupported,
+                    last_probe_at_unix_secs: now_unix_secs(),
+                    last_probe_error: error,
+                    ..Default::default()
+                }));
+            }
         }
     }
 
@@ -892,11 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_mark_hbone_unsupported_is_noop_when_no_cached_entry() {
+    fn registry_mark_hbone_unsupported_creates_entry_when_no_cached_record_exists() {
         let registry = BackendCapabilityRegistry::new();
         let proxy = minimal_proxy();
         registry.mark_hbone_unsupported(&proxy, None);
-        assert!(registry.get(&proxy, None).is_none());
+        let fetched = registry
+            .get(&proxy, None)
+            .expect("live HBONE failure should create cached unsupported verdict");
+        assert_eq!(fetched.hbone, ProtocolSupport::Unsupported);
+        assert!(fetched.last_probe_error.is_some());
     }
 
     #[test]

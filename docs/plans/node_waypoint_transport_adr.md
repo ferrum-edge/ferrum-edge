@@ -54,19 +54,37 @@ The wire contract is `Workload.node_waypoint`: `address`, `hbone_port`
 metadata for the selected workload, not as a replacement workload identity.
 
 The control plane may derive this from Kubernetes Pods, Nodes, and DaemonSet
-endpoints, but the data plane consumes the explicit slice fields. If the slice
-does not name a destination NodeWaypoint for an enrolled in-mesh target, the
-route fails closed.
+endpoints, but the data plane consumes the explicit slice fields. The
+Kubernetes core translator now derives the endpoint for service-backed
+workloads from a trusted ready host-network NodeWaypoint proxy Pod on the same
+node. The proxy Pod must live in `FERRUM_K8S_CONTROLLER_NAMESPACE`, carry
+`app.kubernetes.io/name=ferrum-mesh-ambient`, use service account
+`ferrum-mesh`, and advertise `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped
+workload watches include that namespace for Pod discovery. Helm sets this to
+the release namespace by default and refuses `node_waypoint` renders that
+disable the ambient admin health listener, so Kubernetes Pod Ready is backed by
+a concrete readiness probe. The proxy Pod IP becomes `address`,
+`FERRUM_MESH_HBONE_LISTEN_ADDR` supplies `hbone_port` when present before
+falling back to the named `hbone` container port/default,
+`FERRUM_MESH_WORKLOAD_SPIFFE_ID` or `FERRUM_GATEWAY_SPIFFE_ID` supplies the
+expected `spiffe_id`, and the owning Node object supplies `node_uid` when
+available. Pods with `FERRUM_MESH_ALLOW_NO_CA=true` or without an explicit
+waypoint SVID identity remain recognized as NodeWaypoint proxy pods for
+exclusion purposes, but do not publish `node_waypoint` metadata; this preserves
+the current plaintext compatibility fallback until secured transport material
+exists. If the slice does not name a destination NodeWaypoint for an enrolled
+in-mesh target, the route fails closed.
 
 Implementation status: the data plane now consumes `Workload.node_waypoint`
 when it is present on a selected captured-Service workload. It materializes a
 secured HBONE target whose outer dial host is the destination NodeWaypoint
 endpoint, whose pinned peer identity is the NodeWaypoint SPIFFE ID, and whose
 inner CONNECT authority remains the selected workload app address and port.
-Until the CP/Kubernetes population PR makes `node_waypoint` available for every
-eligible workload, metadata-absent targets retain the current compatibility
-fallback; the H2 enforcement PR must remove that fallback for enrolled in-mesh
-destinations and make missing metadata fail closed.
+Kubernetes pod discovery now populates `node_waypoint` for service-backed
+workloads when their node has a trusted ready NodeWaypoint proxy Pod;
+metadata-absent targets retain the current compatibility fallback until the H2
+enforcement PR removes that fallback for enrolled in-mesh destinations and
+makes missing metadata fail closed.
 
 ## Destination NodeWaypoint Identity
 

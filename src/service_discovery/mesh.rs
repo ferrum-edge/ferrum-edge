@@ -341,7 +341,7 @@ fn protocol_tag(protocol: AppProtocol) -> &'static str {
 /// ([`MeshServiceDiscoverer::tags_for_target`]) and by Ambient outbound route
 /// materialization (`modes::mesh::build_outbound_mesh_targets`) so the two paths
 /// cannot drift on the tag contract that `proxy::hbone_pool` and
-/// `supports_hbone_backend` consume.
+/// `can_attempt_hbone_backend` consume.
 pub(crate) fn mesh_hbone_target_tags(
     service: &MeshService,
     workload: &Workload,

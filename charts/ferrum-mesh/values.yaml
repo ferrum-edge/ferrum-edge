@@ -36,7 +36,10 @@ controlPlane:
     # turn them off with a one-line env override without editing the
     # chart values. Same applies to FERRUM_K8S_WATCH_NAMESPACES: when
     # unset, the controller follows the T2-A CP namespace scope
-    # (FERRUM_CP_NAMESPACES).
+    # (FERRUM_CP_NAMESPACES). The chart renders
+    # FERRUM_K8S_CONTROLLER_NAMESPACE to the Helm release namespace unless
+    # explicitly overridden here, so managed workload namespace settings do
+    # not affect trusted NodeWaypoint discovery.
   database:
     # One of: sqlite, postgres, mysql, mongodb. Required when controlPlane.enabled
     # or ca.enabled is true.

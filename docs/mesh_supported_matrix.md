@@ -70,11 +70,16 @@ need them, or because they are blocked upstream / architecturally:
 - **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
   NodeWaypoint eBPF live gate now admits captured IPv6 Service traffic through a
   pod-netns `[::1]` listener with `.ready6` evidence. The mesh slice now has a
-  `Workload.node_waypoint` destination endpoint contract, and captured Service
-  targets consume that metadata when present by dialing the destination
-  NodeWaypoint over SPIFFE-mTLS HBONE while preserving the selected workload as
-  the inner CONNECT authority. Broader promotion still waits on metadata
-  population for all eligible workloads, mandatory fail-closed enforcement,
+  `Workload.node_waypoint` destination endpoint contract. Kubernetes pod
+  discovery populates it from trusted ready host-network NodeWaypoint proxy
+  Pods in `FERRUM_K8S_CONTROLLER_NAMESPACE`, preferring the proxy pod's
+  configured HBONE listen address and requiring an explicit waypoint SPIFFE ID
+  (`FERRUM_MESH_WORKLOAD_SPIFFE_ID` or `FERRUM_GATEWAY_SPIFFE_ID`) before
+  publishing secured metadata. Captured Service targets consume that metadata
+  when present by dialing the destination NodeWaypoint over SPIFFE-mTLS HBONE
+  while preserving the selected workload as the inner CONNECT authority; no-CA
+  and no-identity waypoint pods retain the current plaintext compatibility
+  fallback. Broader promotion still waits on mandatory fail-closed enforcement,
   production SPIRE, and inbound direct-pod enforcement.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS

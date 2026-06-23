@@ -5,13 +5,13 @@ use sha2::{Digest as _, Sha256};
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    AppProtocol, MeshService, ServicePort, ServiceTargetPort, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    AppProtocol, MeshService, NodeWaypointEndpoint, ServicePort, ServiceTargetPort, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector, default_node_waypoint_hbone_port,
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, RouteBackend, port_from_u64,
-    string_field,
+    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, K8sTranslationOptions,
+    RouteBackend, port_from_u64, string_field,
 };
 
 #[derive(Debug, Default)]
@@ -22,6 +22,8 @@ pub(super) struct CoreState {
     pod_by_ip: HashMap<String, PodKey>,
     endpoint_slices: Vec<CoreEndpointSlice>,
     node_localities: HashMap<String, String>,
+    node_uids: HashMap<String, String>,
+    node_waypoints_by_node: HashMap<String, CoreNodeWaypointPod>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -71,6 +73,7 @@ struct CorePod {
     ports: Vec<WorkloadPort>,
     node_name: Option<String>,
     ready: bool,
+    node_waypoint_proxy: bool,
 }
 
 #[derive(Debug)]
@@ -92,6 +95,13 @@ struct CoreEndpoint {
     addresses: Vec<String>,
     ready: bool,
     node_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreNodeWaypointPod {
+    address: String,
+    hbone_port: u16,
+    spiffe_id: SpiffeId,
 }
 
 #[derive(Debug)]
@@ -309,7 +319,7 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
             );
         }
     }
-    let pod = CorePod {
+    let mut pod = CorePod {
         namespace: object.metadata.namespace.clone(),
         name: object.metadata.name.clone(),
         uid: object.metadata.uid.clone(),
@@ -322,7 +332,21 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         ports: pod_ports(object),
         node_name: string_field(&object.spec, "nodeName").map(ToOwned::to_owned),
         ready: pod_is_ready(object),
+        node_waypoint_proxy: false,
     };
+    if let Some((node_name, address)) = node_waypoint_pod_candidate(acc, object, &pod) {
+        pod.node_waypoint_proxy = true;
+        for address in &pod.addresses {
+            if acc.core.pod_by_ip.get(address) == Some(&key) {
+                acc.core.pod_by_ip.remove(address);
+            }
+        }
+        if let Some(node_waypoint) = node_waypoint_pod_endpoint(object, &pod, address) {
+            acc.core
+                .node_waypoints_by_node
+                .insert(node_name, node_waypoint);
+        }
+    }
     acc.core.pods.insert(key, pod);
 }
 
@@ -592,6 +616,11 @@ fn endpoint_backend_port(
 }
 
 fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {
+    if !object.metadata.uid.is_empty() {
+        acc.core
+            .node_uids
+            .insert(object.metadata.name.clone(), object.metadata.uid.clone());
+    }
     let Some(locality) = node_locality(&object.metadata.labels) else {
         return;
     };
@@ -649,7 +678,7 @@ fn auto_workloads_for_service(
         };
         // EndpointSlice readiness controls service membership, while pod readiness
         // keeps stale cache entries from resurfacing terminating pods.
-        if !pod.ready {
+        if !pod.ready || pod.node_waypoint_proxy {
             continue;
         }
         workloads.push(CoreAutoWorkload {
@@ -673,7 +702,7 @@ fn add_identity_only_workloads(
         let Some(pod) = acc.core.pods.get(&pod_key) else {
             continue;
         };
-        if !pod.ready || pod.uid.is_empty() {
+        if !pod.ready || pod.uid.is_empty() || pod.node_waypoint_proxy {
             continue;
         }
         acc.mesh
@@ -701,6 +730,7 @@ fn workload_from_pod(
     addresses.dedup();
     let node_name = endpoint.node_name.as_deref().or(pod.node_name.as_deref());
     let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
+    let node_waypoint = node_name.and_then(|node| node_waypoint_for_node(acc, node));
 
     Ok(Workload {
         spiffe_id,
@@ -721,7 +751,7 @@ fn workload_from_pod(
         // Per-pod UID for node-waypoint scope keying; `None` when the pod
         // object carried no UID so the resolver falls back to SPIFFE scope.
         pod_uid: (!pod.uid.is_empty()).then(|| pod.uid.clone()),
-        node_waypoint: None,
+        node_waypoint,
         remote_provenance: false,
     })
 }
@@ -763,6 +793,154 @@ fn identity_only_workload_from_pod(
     })
 }
 
+fn node_waypoint_pod_candidate(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    pod: &CorePod,
+) -> Option<(String, String)> {
+    if !pod.ready
+        || !trusted_node_waypoint_pod_object(&acc.options, object)
+        || !pod_host_network(object)
+    {
+        return None;
+    }
+    let topology = pod_env_value(object, "FERRUM_MESH_TOPOLOGY")?;
+    if !matches_node_waypoint_topology(topology) {
+        return None;
+    }
+    let node_name = pod.node_name.as_ref()?.trim();
+    if node_name.is_empty() {
+        return None;
+    }
+    let address = pod
+        .addresses
+        .iter()
+        .find(|address| !address.trim().is_empty())?
+        .clone();
+    Some((node_name.to_string(), address))
+}
+
+fn node_waypoint_pod_endpoint(
+    object: &K8sObject,
+    pod: &CorePod,
+    address: String,
+) -> Option<CoreNodeWaypointPod> {
+    let hbone_port = node_waypoint_hbone_port(object, pod);
+    let spiffe_id = node_waypoint_spiffe_id(object)?;
+    Some(CoreNodeWaypointPod {
+        address,
+        hbone_port,
+        spiffe_id,
+    })
+}
+
+pub(super) fn trusted_node_waypoint_pod_object(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> bool {
+    object.kind == "Pod"
+        && object.metadata.namespace == options.node_waypoint_namespace
+        && pod_host_network(object)
+        && object
+            .metadata
+            .labels
+            .get("app.kubernetes.io/name")
+            .is_some_and(|value| value == "ferrum-mesh-ambient")
+        && string_field(&object.spec, "serviceAccountName") == Some("ferrum-mesh")
+        && pod_env_value(object, "FERRUM_MESH_TOPOLOGY").is_some_and(matches_node_waypoint_topology)
+}
+
+fn node_waypoint_hbone_port(object: &K8sObject, pod: &CorePod) -> u16 {
+    pod_env_value(object, "FERRUM_MESH_HBONE_LISTEN_ADDR")
+        .and_then(port_from_socket_addr_env)
+        .or_else(|| {
+            pod.ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some("hbone") && port.port != 0)
+                .map(|port| port.port)
+        })
+        .unwrap_or_else(default_node_waypoint_hbone_port)
+}
+
+fn port_from_socket_addr_env(value: &str) -> Option<u16> {
+    value
+        .trim()
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+        .filter(|port| *port != 0)
+}
+
+fn node_waypoint_spiffe_id(object: &K8sObject) -> Option<SpiffeId> {
+    if pod_env_bool_true(object, "FERRUM_MESH_ALLOW_NO_CA") {
+        return None;
+    }
+    for name in ["FERRUM_MESH_WORKLOAD_SPIFFE_ID", "FERRUM_GATEWAY_SPIFFE_ID"] {
+        if let Some(spiffe_id) =
+            pod_env_value(object, name).and_then(|value| SpiffeId::new(value).ok())
+        {
+            return Some(spiffe_id);
+        }
+    }
+    None
+}
+
+fn node_waypoint_for_node(acc: &K8sAccumulator, node_name: &str) -> Option<NodeWaypointEndpoint> {
+    let waypoint = acc.core.node_waypoints_by_node.get(node_name)?;
+    Some(NodeWaypointEndpoint {
+        address: waypoint.address.clone(),
+        hbone_port: waypoint.hbone_port,
+        spiffe_id: waypoint.spiffe_id.clone(),
+        node_name: Some(node_name.to_string()),
+        node_uid: acc.core.node_uids.get(node_name).cloned(),
+        network: None,
+        cluster: None,
+    })
+}
+
+fn matches_node_waypoint_topology(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    normalized == "node_waypoint"
+}
+
+fn pod_host_network(object: &K8sObject) -> bool {
+    object
+        .spec
+        .get("hostNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn pod_env_value<'a>(object: &'a K8sObject, name: &str) -> Option<&'a str> {
+    object
+        .spec
+        .get("containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|container| {
+            container
+                .get("env")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find_map(|env| {
+            (string_field(env, "name") == Some(name))
+                .then(|| string_field(env, "value"))
+                .flatten()
+        })
+}
+
+fn pod_env_bool_true(object: &K8sObject, name: &str) -> bool {
+    pod_env_value(object, name).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "y" | "on"
+        )
+    })
+}
+
 fn invalid_resource_for_core_pod(pod: &CorePod, message: impl Into<String>) -> K8sTranslateError {
     K8sTranslateError::InvalidResource {
         kind: "Pod".to_string(),
@@ -773,9 +951,14 @@ fn invalid_resource_for_core_pod(pod: &CorePod, message: impl Into<String>) -> K
 }
 
 fn pod_key_for_endpoint_addresses(state: &CoreState, addresses: &[String]) -> Option<PodKey> {
-    addresses
-        .iter()
-        .find_map(|address| state.pod_by_ip.get(address).cloned())
+    addresses.iter().find_map(|address| {
+        let pod_key = state.pod_by_ip.get(address)?;
+        state
+            .pods
+            .get(pod_key)
+            .is_some_and(|pod| !pod.node_waypoint_proxy)
+            .then(|| pod_key.clone())
+    })
 }
 
 fn pod_addresses(object: &K8sObject) -> Vec<String> {

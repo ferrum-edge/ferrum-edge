@@ -14,11 +14,24 @@
 {{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
 {{- $ambientAdminPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTP_PORT") -}}
 {{- end -}}
+{{- $ambientAdminBindAddress := "0.0.0.0" -}}
+{{- if hasKey $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS" -}}
+{{- $ambientAdminBindAddress = toString (index $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS") -}}
+{{- end -}}
+{{- $ambientAdminProbeHost := $ambientAdminBindAddress -}}
+{{- if or (eq $ambientAdminProbeHost "") (eq $ambientAdminProbeHost "0.0.0.0") (eq $ambientAdminProbeHost "*") -}}
+{{- $ambientAdminProbeHost = "127.0.0.1" -}}
+{{- else if eq $ambientAdminProbeHost "::" -}}
+{{- $ambientAdminProbeHost = "::1" -}}
+{{- end -}}
 {{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
 {{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
 {{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
 {{- end -}}
 {{- if $nodeWaypointRegistryEnabled -}}
+{{- if eq $ambientAdminPort "0" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires FERRUM_ADMIN_HTTP_PORT to stay enabled for the Kubernetes readiness probe" -}}
+{{- end -}}
 {{- if not .Values.nodeAgent.enabled -}}
 {{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.enabled=true" -}}
 {{- end -}}
@@ -108,6 +121,21 @@ spec:
               readOnly: true
             - name: node-waypoint-pod-registry
               mountPath: {{ $nodeWaypointRegistryMountPath }}
+          {{- end }}
+          {{- if $nodeWaypointRegistryEnabled }}
+          readinessProbe:
+            exec:
+              command:
+                - /app/ferrum-edge
+                - health
+                - --host
+                - {{ $ambientAdminProbeHost | quote }}
+                - -p
+                - {{ $ambientAdminPort | quote }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           {{- end }}
       {{- if $nodeWaypointRegistryEnabled }}
       volumes:

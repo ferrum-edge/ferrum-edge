@@ -223,6 +223,18 @@ render_chart_assertions() {
     grep -nE "name: ferrum-mesh-(ambient|node-agent)|FERRUM_ADMIN_HTTP_PORT|value: \"?(9000|$AMBIENT_ADMIN_PORT|$NODE_AGENT_ADMIN_PORT)\"?" <<<"$rendered" >&2 || true
     exit 1
   fi
+  local ambient_block
+  ambient_block="$(awk '
+    /name: ferrum-mesh-ambient/ { in_ambient = 1 }
+    in_ambient { print }
+    /name: ferrum-mesh-node-agent/ && in_ambient { exit }
+  ' <<<"$rendered")"
+  if ! grep -q "readinessProbe:" <<<"$ambient_block" ||
+    ! grep -A15 "readinessProbe:" <<<"$ambient_block" | grep -q -- "- \"$AMBIENT_ADMIN_PORT\""; then
+    echo "NodeWaypoint ambient render did not add an admin health readiness probe" >&2
+    grep -nA18 "readinessProbe:" <<<"$ambient_block" >&2 || true
+    exit 1
+  fi
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
@@ -277,6 +289,40 @@ render_chart_assertions() {
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-default-admin-port-render.out 2>&1; then
     echo "NodeWaypoint render rejected the non-conflicting default node-agent admin port" >&2
     cat /tmp/ferrum-node-waypoint-default-admin-port-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=0 \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-ambient-admin-disabled-render.out 2>&1; then
+    echo "NodeWaypoint render accepted disabled ambient admin readiness port" >&2
+    cat /tmp/ferrum-node-waypoint-ambient-admin-disabled-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "requires FERRUM_ADMIN_HTTP_PORT to stay enabled" /tmp/ferrum-node-waypoint-ambient-admin-disabled-render.out; then
+    echo "NodeWaypoint render rejected disabled ambient admin port without a clear error" >&2
+    cat /tmp/ferrum-node-waypoint-ambient-admin-disabled-render.out >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set controlPlane.enabled=true \
+    --set controlPlane.database.type=sqlite \
+    --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+    --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
+    --set-string "controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret" \
+    --set-string "controlPlane.env.FERRUM_NAMESPACE=$WORKLOAD_NS")"
+  if ! grep -A1 "name: FERRUM_K8S_CONTROLLER_NAMESPACE" <<<"$rendered" | grep -q "value: \"$MESH_NS\"" ||
+    ! grep -A1 "name: FERRUM_NAMESPACE" <<<"$rendered" | grep -q "value: \"$WORKLOAD_NS\""; then
+    echo "Control-plane render did not keep install and managed namespaces separate" >&2
+    grep -nE 'FERRUM_K8S_CONTROLLER_NAMESPACE|FERRUM_NAMESPACE' <<<"$rendered" >&2 || true
     exit 1
   fi
 

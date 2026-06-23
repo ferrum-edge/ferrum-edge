@@ -1115,6 +1115,7 @@ pub async fn run(
         };
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
+            controller_namespace: env_config.k8s_controller_namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
             cluster_domain: env_config.k8s_cluster_domain.clone(),
             istio_root_namespace: env_config.k8s_istio_root_namespace.clone(),

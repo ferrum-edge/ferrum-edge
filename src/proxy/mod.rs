@@ -1567,21 +1567,21 @@ fn proxy_can_dispatch_hbone(proxy: &Proxy) -> bool {
     proxy.dispatch_kind == DispatchKind::HttpPool
 }
 
-fn supports_hbone_backend(
-    state: &ProxyState,
+fn can_attempt_hbone_backend(
+    registry: &BackendCapabilityRegistry,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
+    gateway_svid_loaded: bool,
 ) -> bool {
     let Some(target) = upstream_target else {
         return false;
     };
     proxy_can_dispatch_hbone(proxy)
         && hbone_pool::target_hbone_enabled(target)
-        && state.gateway_svid_bundle.load().is_some()
-        && state
-            .backend_capabilities
+        && gateway_svid_loaded
+        && registry
             .get(proxy, Some(target))
-            .is_some_and(|record| record.hbone.is_supported())
+            .is_none_or(|record| !matches!(record.hbone, ProtocolSupport::Unsupported))
 }
 
 /// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
@@ -2780,11 +2780,12 @@ pub struct ProxyState {
     /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
-    /// This is live, not staged: `supports_hbone_backend` gates HBONE dispatch
-    /// on this slot being loaded (see `current_dispatch_hbone` →
-    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes it
-    /// to originate peer mTLS automatically. The slot shape matches mesh SVID
-    /// rotation so trust-bundle updates hot-swap without blocking proxy readers.
+    /// This is live, not staged: `can_attempt_hbone_backend` gates HBONE
+    /// dispatch on this slot being loaded (see `current_dispatch_hbone` →
+    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes
+    /// it to originate peer mTLS automatically. The slot shape matches mesh
+    /// SVID rotation so trust-bundle updates hot-swap without blocking proxy
+    /// readers.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
@@ -8571,7 +8572,7 @@ enum MeshWsEgress {
 /// so the upgrade fails closed in `connect_mesh_websocket_backend` (where the
 /// pool errors `NoSvid` before any dial) rather than silently falling back to a
 /// plaintext dial of a `mesh.mtls`/`mesh.hbone` destination. This is the
-/// WebSocket analogue of the `supports_mesh_mtls_backend` / `supports_hbone_backend`
+/// WebSocket analogue of the `supports_mesh_mtls_backend` / `can_attempt_hbone_backend`
 /// fail-closed contract, but the SVID/capability check is deferred to the dial
 /// because returning `None` here would route to the plaintext path.
 fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
@@ -15130,7 +15131,12 @@ async fn handle_proxy_request_inner(
             requires_request_body_buffering,
             stream_request_body,
         )
-        && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
+        && can_attempt_hbone_backend(
+            state.backend_capabilities.as_ref(),
+            &proxy,
+            upstream_target.as_deref(),
+            state.gateway_svid_bundle.load().is_some(),
+        );
     if hbone_required && !current_dispatch_hbone {
         let block_reason = if has_retry {
             "effective retry config disables HBONE dispatch"
@@ -26422,6 +26428,7 @@ mod tests {
 
     use super::backend_capabilities::{
         BackendCapabilityRecord, BackendCapabilityRegistry, ProtocolSupport, capability_key,
+        capability_key_for_proxy_target,
     };
     use crate::config::types::{BackendScheme, DispatchKind, Upstream};
 
@@ -27358,6 +27365,77 @@ mod tests {
         assert!(
             !proxy_can_dispatch_hbone(&https_proxy),
             "HTTPS backends require TLS-over-tunnel support before HBONE dispatch is safe"
+        );
+    }
+
+    fn hbone_dispatch_test_target() -> UpstreamTarget {
+        UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::from([(hbone_pool::HBONE_TARGET_TAG.to_string(), "true".to_string())]),
+            locality: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn hbone_dispatch_attempts_unknown_capability_but_not_unsupported() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("ambient", BackendScheme::Http, "10.0.0.8", 8080);
+        let target = hbone_dispatch_test_target();
+
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "missing capability record must attempt HBONE so a cold probe cannot block mesh.hbone targets before the live tunnel can prove or downgrade them"
+        );
+
+        let key = capability_key_for_proxy_target(&proxy, Some(&target));
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Unknown,
+            ..Default::default()
+        };
+        registry.upsert(key.clone(), record);
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Unknown must attempt HBONE; startup probes can time out before the first request"
+        );
+
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Supported,
+            ..Default::default()
+        };
+        registry.upsert(key.clone(), record);
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Supported should dispatch through the tunnel"
+        );
+
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Unsupported,
+            ..Default::default()
+        };
+        registry.upsert(key.clone(), record);
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Unsupported must stay fail-closed instead of plaintext direct-backend fallback"
+        );
+
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&target), false),
+            "missing gateway SVID must fail closed before any HBONE dial"
+        );
+        let https_proxy = warmup_test_proxy("https", BackendScheme::Https, "10.0.0.8", 8443);
+        assert!(
+            !can_attempt_hbone_backend(&registry, &https_proxy, Some(&target), true),
+            "HTTPS backends are not yet safe for HTTP-over-HBONE dispatch"
+        );
+        let mut untagged = target;
+        untagged.tags.clear();
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&untagged), true),
+            "only mesh.hbone=true targets use the HBONE backend path"
         );
     }
 
