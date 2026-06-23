@@ -606,7 +606,11 @@ impl MeshConfigSync for MeshGrpcServer {
 mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
-    use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+    use crate::identity::spiffe::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::config::{
+        AppProtocol, MeshConfig, MeshService, NodeWaypointEndpoint, ServicePort, Workload,
+        WorkloadSelector,
+    };
     use chrono::{TimeZone, Utc};
 
     fn mesh_config_with_service(version_second: u32) -> GatewayConfig {
@@ -635,6 +639,50 @@ mod tests {
                 .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
                 .unwrap(),
             ..GatewayConfig::default()
+        }
+    }
+
+    fn node_waypoint_workload(
+        namespace: &str,
+        service_name: &str,
+        waypoint_spiffe: &str,
+        address: &str,
+    ) -> Workload {
+        Workload {
+            spiffe_id: SpiffeId::new(format!(
+                "spiffe://test.local/ns/{namespace}/sa/{service_name}"
+            ))
+            .expect("fixture SPIFFE ID should be valid"),
+            selector: WorkloadSelector {
+                labels: std::collections::HashMap::from([(
+                    "app".to_string(),
+                    service_name.to_string(),
+                )]),
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: service_name.to_string(),
+            addresses: vec![address.to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("test.local")
+                .expect("fixture trust domain should be valid"),
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(service_name.to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: address.to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(waypoint_spiffe)
+                    .expect("fixture waypoint SPIFFE ID should be valid"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
         }
     }
 
@@ -745,6 +793,90 @@ mod tests {
         // next delta applies on top of it rather than re-diverging. (The fix
         // makes this advancement unconditional — it no longer hinges on the wire
         // frame building successfully; see apply_mesh_delta_to_stream_config.)
+    }
+
+    #[test]
+    fn mesh_delta_refilter_preserves_carried_node_waypoint_assertors() {
+        let waypoint_alpha = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-alpha";
+        let waypoint_beta = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-beta";
+        let full_config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    node_waypoint_workload("alpha", "client", waypoint_alpha, "10.2.0.11"),
+                    node_waypoint_workload("beta", "reviews", waypoint_beta, "10.2.0.12"),
+                ],
+                ..MeshConfig::default()
+            })),
+            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            ..GatewayConfig::default()
+        };
+        let slice_request = MeshSliceRequest {
+            namespace: "beta".to_string(),
+            ..MeshSliceRequest::default()
+        };
+        let mut scope = std::collections::HashSet::new();
+        scope.insert("alpha".to_string());
+        scope.insert("beta".to_string());
+        let scope = CpScope::Set(scope);
+        let mut stream_config = MeshGrpcServer::filter_config_for_request_and_scope(
+            &full_config,
+            &slice_request,
+            &scope,
+        );
+        let mesh = stream_config.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(mesh.workloads.len(), 1);
+        assert_eq!(mesh.workloads[0].namespace, "beta");
+        assert_eq!(
+            mesh.node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_alpha, waypoint_beta]
+        );
+        let previous_slice = MeshSlice::from_gateway_config(&stream_config, slice_request.clone());
+        let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 42).unwrap();
+        let delta = IncrementalResult {
+            added_or_modified_proxies: Vec::new(),
+            removed_proxy_ids: Vec::new(),
+            added_or_modified_consumers: Vec::new(),
+            removed_consumer_ids: Vec::new(),
+            added_or_modified_plugin_configs: Vec::new(),
+            removed_plugin_config_ids: Vec::new(),
+            added_or_modified_upstreams: Vec::new(),
+            removed_upstream_ids: vec!["unrelated-upstream".to_string()],
+            sequence_cursor: 0,
+            poll_timestamp,
+        };
+
+        let (next_slice, _update) = MeshGrpcServer::apply_mesh_delta_to_stream_config(
+            &mut stream_config,
+            delta,
+            slice_request,
+            &previous_slice,
+            &scope,
+        )
+        .expect("mesh delta should build");
+
+        assert_eq!(
+            stream_config
+                .mesh
+                .as_ref()
+                .expect("mesh should remain")
+                .node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_alpha, waypoint_beta],
+            "incremental refiltering must not shrink carried source assertors"
+        );
+        assert_eq!(
+            next_slice
+                .node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_alpha, waypoint_beta]
+        );
     }
 
     #[test]

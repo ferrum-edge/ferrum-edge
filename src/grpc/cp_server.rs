@@ -759,12 +759,19 @@ impl CpGrpcServer {
         Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
         let istio_root_namespace = mesh.istio_root_namespace.clone();
 
-        mesh.node_waypoint_assertors = Self::node_waypoint_assertors_for_request(
-            mesh,
-            namespace,
-            allow_cross_namespace_mesh_visibility,
-            scope,
-        );
+        // Raw authoritative configs never carry this runtime-only field. When
+        // a stream-local config is refiltered after an incremental delta,
+        // though, it may already contain source assertors that are no longer
+        // visible in `mesh.workloads`; preserve them rather than shrinking the
+        // allow-list to the destination-visible workload slice.
+        if mesh.node_waypoint_assertors.is_empty() {
+            mesh.node_waypoint_assertors = Self::node_waypoint_assertors_for_request(
+                mesh,
+                namespace,
+                allow_cross_namespace_mesh_visibility,
+                scope,
+            );
+        }
         mesh.workloads
             .retain(|workload| visible_namespaces.contains(&workload.namespace));
         let workload_ids: HashSet<_> = mesh
