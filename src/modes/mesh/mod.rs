@@ -6781,6 +6781,10 @@ fn node_waypoint_authz_cluster_domains(primary_cluster_domain: &str) -> Vec<Stri
 fn node_waypoint_assertor_spiffe_ids(mesh_slice: &MeshSlice) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for workload in &mesh_slice.workloads {
+        // The accepted slice models source workloads as well as destination
+        // endpoints. Collecting every workload's node waypoint authorizes the
+        // assertor for cross-node source identity rewrites without falling back
+        // to service-account defaults.
         if let Some(node_waypoint) = workload.node_waypoint.as_ref() {
             ids.insert(node_waypoint.spiffe_id.as_str().to_string());
         }
@@ -18384,6 +18388,72 @@ mod tests {
             workload_metrics.config.get("trusted_hbone_assertors"),
             Some(&expected),
             "telemetry attribution must mirror the same exact assertor gate as authz"
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_node_waypoint_assertors_include_source_workload_nodes() {
+        let runtime = identity_backed_node_waypoint_runtime();
+        let source_workload_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+        let destination_workload_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let source_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-source";
+        let destination_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-destination";
+        let mut client = workload_with_address("client", "client", "10.0.0.10");
+        client.spiffe_id = SpiffeId::new(source_workload_spiffe).unwrap();
+        client.node_waypoint = Some(NodeWaypointEndpoint {
+            address: "10.9.0.10".to_string(),
+            hbone_port: 15008,
+            spiffe_id: SpiffeId::new(source_waypoint).unwrap(),
+            node_name: Some("worker-source".to_string()),
+            node_uid: Some("node-uid-source".to_string()),
+            network: None,
+            cluster: None,
+        });
+        let mut reviews = workload_with_address("reviews", "reviews", "10.0.0.20");
+        reviews.spiffe_id = SpiffeId::new(destination_workload_spiffe).unwrap();
+        reviews.node_waypoint = Some(NodeWaypointEndpoint {
+            address: "10.9.0.20".to_string(),
+            hbone_port: 15008,
+            spiffe_id: SpiffeId::new(destination_waypoint).unwrap(),
+            node_name: Some("worker-destination".to_string()),
+            node_uid: Some("node-uid-destination".to_string()),
+            network: None,
+            cluster: None,
+        });
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![client, reviews],
+            services: vec![http_mesh_service(
+                "reviews",
+                8080,
+                destination_workload_spiffe,
+            )],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+
+        inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
+
+        let expected = serde_json::json!([destination_waypoint, source_waypoint]);
+        let authz = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .expect("mesh_authz plugin injected");
+        assert_eq!(
+            authz.config.get("trusted_hbone_assertors"),
+            Some(&expected),
+            "source workload node waypoints must stay trusted for cross-node source identity rewrites"
+        );
+        let workload_metrics = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+        assert_eq!(
+            workload_metrics.config.get("trusted_hbone_assertors"),
+            Some(&expected),
+            "workload_metrics must accept the same cross-node source assertors as authz"
         );
     }
 
