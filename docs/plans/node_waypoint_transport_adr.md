@@ -1,6 +1,6 @@
 # NodeWaypoint Secured Transport ADR
 
-Status: Proposed for H2 implementation
+Status: H2 implementation in progress
 
 ## Context
 
@@ -9,9 +9,10 @@ traffic captured from many node-local pods. The current live gate proves the
 IPv4/IPv6 eBPF capture path, source pod attribution, same-node and cross-node
 Service authorization, stale source identity cleanup, production SPIRE Workload
 API issuance for per-node NodeWaypoint SVIDs, and direct Pod-IP fail-closed
-checks on a two-worker kind cluster. Authenticated node-to-node transport,
-destination-side NodeWaypoint policy enforcement, and explicit direct-inbound
-enforcement remain H2 work.
+checks on a two-worker kind cluster. Authenticated node-to-node transport and
+destination-side NodeWaypoint policy enforcement are wired through the
+SPIFFE-mTLS HBONE relay path; broader explicit direct-inbound enforcement
+remains H2 work.
 
 This ADR defines the target transport so implementation can proceed without
 adding a plaintext shortcut or routing to a non-existent per-pod HBONE listener.

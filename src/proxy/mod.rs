@@ -17673,6 +17673,7 @@ async fn proxy_to_backend(
             client_request_body,
             upstream_target,
             plugins,
+            Some(request_ctx),
             response_decision_ctx,
             stream_response,
             client_ip,
@@ -19550,6 +19551,7 @@ async fn proxy_to_backend_hbone(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
+    source_identity_ctx: Option<&RequestContext>,
     ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
@@ -19676,6 +19678,7 @@ async fn proxy_to_backend_hbone(
             target.dispatch_policy_port(),
             hbone_port,
             expected_peer.as_ref(),
+            source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref()),
         )
         .await
     {

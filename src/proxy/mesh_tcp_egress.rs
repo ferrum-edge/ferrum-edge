@@ -157,6 +157,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
                 target.dispatch_policy_port(),
                 hbone_port,
                 expected_peer.as_ref(),
+                None,
             )
             .await
         {

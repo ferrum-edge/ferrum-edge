@@ -3404,6 +3404,98 @@ async fn mesh_authz_node_waypoint_direct_endpoint_backend_uses_destination_scope
 }
 
 #[tokio::test]
+async fn mesh_authz_node_waypoint_hbone_relay_uses_destination_scope_without_source_pod_scope() {
+    let source_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-source";
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+        "trusted_hbone_assertors": [source_waypoint],
+    }))
+    .expect("plugin config");
+    let relay_proxy = Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.0.20",
+            "backend_port": 8080
+        }))
+        .expect("proxy"),
+    );
+
+    let mut ctx = request_context(Some(source_waypoint));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.headers.insert(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/trusted".to_string(),
+    );
+    ctx.matched_proxy = Some(relay_proxy);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "authenticated NodeWaypoint relay should evaluate destination scope without a captured source pod scope, got {result:?}"
+    );
+    assert!(
+        !ctx.metadata.contains_key("mesh_authz.scope_missing"),
+        "destination-scoped HBONE relay must not be rejected as missing a source pod scope"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.0.0.20|8080")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_destination_scope_without_hbone_still_requires_source_scope() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": node_waypoint_endpoint_route_slice(),
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let relay_proxy = Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.0.20",
+            "backend_port": 8080
+        }))
+        .expect("proxy"),
+    );
+
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/trusted"));
+    ctx.matched_proxy = Some(relay_proxy);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "non-HBONE missing-source-scope traffic must remain fail-closed, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("scope_missing")
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_node_waypoint_route_upstream_with_mixed_unscoped_target_fails_closed() {
     let upstream_id = "gwapi-route-upstream-default-api-0";
     let plugin = MeshAuthz::new(&json!({
