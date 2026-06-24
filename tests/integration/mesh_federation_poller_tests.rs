@@ -1,6 +1,6 @@
 //! End-to-end coverage for the SPIFFE trust-bundle federation poller (GAP-3C).
 //!
-//! These tests stand up a tiny tokio HTTP responder and point the poller at
+//! These tests stand up a tiny tokio HTTPS responder and point the poller at
 //! it. We use the polling task directly via `spawn_federation_poller` so the
 //! tests do not need a full mesh runtime. A `GET /mesh/federation` admin
 //! exercise verifies the snapshot lands in the AdminState surface, and a
@@ -45,16 +45,97 @@ fn td(value: &str) -> TrustDomain {
     TrustDomain::new(value).expect("valid trust domain")
 }
 
-/// Tiny tokio HTTP responder that serves a static body on the first hit and
+struct MockFederationEndpoint {
+    endpoint: String,
+    request_count: Arc<AtomicUsize>,
+    shutdown: watch::Sender<bool>,
+    http_client: PluginHttpClient,
+    _ca_dir: tempfile::TempDir,
+}
+
+fn generate_mock_federation_tls() -> (String, String, String) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let mut leaf_params =
+        CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("loopback leaf params");
+    leaf_params.distinguished_name = DistinguishedName::new();
+    leaf_params.is_ca = IsCa::ExplicitNoCa;
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf cert");
+
+    (ca_pem, leaf_cert.pem(), leaf_key.serialize_pem())
+}
+
+fn mock_federation_server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
+    let cert_chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .filter_map(|cert| cert.ok())
+        .collect();
+    let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .expect("parse private key")
+        .expect("private key");
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .expect("server TLS config");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
+fn poller_http_client_with_ca(ca_bundle_path: &str) -> PluginHttpClient {
+    PluginHttpClient::new(
+        &ferrum_edge::config::PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        Some(ca_bundle_path),
+        Arc::new(Vec::new()),
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        ferrum_edge::config::BackendAllowIps::Both,
+        Arc::new(Vec::new()),
+        0,
+    )
+}
+
+/// Tiny tokio HTTPS responder that serves a static body on the first hit and
 /// can be reconfigured to return errors after that. The poller is driven
 /// through it to exercise success → backoff → recovery in a single test.
 async fn start_mock_federation_endpoint(
     body: String,
     extra_failures_before_success: usize,
-) -> (String, Arc<AtomicUsize>, watch::Sender<bool>) {
+) -> MockFederationEndpoint {
+    let (ca_pem, cert_pem, key_pem) = generate_mock_federation_tls();
+    let ca_dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = ca_dir.path().join("mock-federation-ca.pem");
+    std::fs::write(&ca_path, ca_pem).expect("write CA bundle");
+    let http_client =
+        poller_http_client_with_ca(ca_path.to_str().expect("CA bundle path is UTF-8"));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(mock_federation_server_config(
+        &cert_pem, &key_pem,
+    )));
+
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
-    let url = format!("http://{addr}/.well-known/spiffe");
+    let endpoint = format!("https://{addr}/.well-known/spiffe");
     let request_count = Arc::new(AtomicUsize::new(0));
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let counter = request_count.clone();
@@ -62,10 +143,12 @@ async fn start_mock_federation_endpoint(
         loop {
             tokio::select! {
                 accept = listener.accept() => {
-                    let Ok((mut stream, _)) = accept else { return };
+                    let Ok((stream, _)) = accept else { return };
                     let body = body.clone();
                     let counter = counter.clone();
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
+                        let Ok(mut stream) = acceptor.accept(stream).await else { return };
                         let mut buf = vec![0u8; 4096];
                         let _ = stream.read(&mut buf).await;
                         let n = counter.fetch_add(1, Ordering::SeqCst);
@@ -89,7 +172,13 @@ async fn start_mock_federation_endpoint(
             }
         }
     });
-    (url, request_count, shutdown_tx)
+    MockFederationEndpoint {
+        endpoint,
+        request_count,
+        shutdown: shutdown_tx,
+        http_client,
+        _ca_dir: ca_dir,
+    }
 }
 
 fn poller_http_client() -> PluginHttpClient {
@@ -114,12 +203,11 @@ async fn federation_poller_populates_store_on_success() {
         "refresh_hint_seconds": 60u64,
     })
     .to_string();
-    let (endpoint, request_count, _shutdown_endpoint) =
-        start_mock_federation_endpoint(body, 0).await;
+    let mock = start_mock_federation_endpoint(body, 0).await;
     let multi_cluster = MultiClusterConfig {
         local_cluster: Some("local-cluster".to_string()),
         federation_endpoint: None,
-        remote_clusters: vec![remote_cluster("remote", &endpoint)],
+        remote_clusters: vec![remote_cluster("remote", &mock.endpoint)],
         east_west_gateways: Vec::new(),
     };
     let store = FederationStore::new();
@@ -127,7 +215,7 @@ async fn federation_poller_populates_store_on_success() {
     let handles = spawn_federation_poller(
         Some(&multi_cluster),
         FederationPollerConfig::from_env(30, 5, false),
-        poller_http_client(),
+        mock.http_client.clone(),
         store.clone(),
         shutdown_rx,
     )
@@ -151,11 +239,12 @@ async fn federation_poller_populates_store_on_success() {
         .expect("expected trust domain present");
     assert_eq!(bundle.bundle.x509_authorities.len(), 1);
     assert_eq!(bundle.bundle.refresh_hint_seconds, Some(60));
-    assert_eq!(bundle.endpoint, endpoint);
+    assert_eq!(bundle.endpoint, mock.endpoint);
     assert_eq!(bundle.cluster_name, "remote");
-    assert!(request_count.load(Ordering::SeqCst) >= 1);
+    assert!(mock.request_count.load(Ordering::SeqCst) >= 1);
 
     let _ = shutdown_tx.send(true);
+    let _ = mock.shutdown.send(true);
     for h in handles.tasks {
         let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
     }
@@ -171,12 +260,11 @@ async fn federation_poller_keeps_last_good_after_transient_failure() {
         "x509_authorities": [sample_cert_base64()],
     })
     .to_string();
-    let (endpoint, request_count, _shutdown_endpoint) =
-        start_mock_federation_endpoint(body, 2).await;
+    let mock = start_mock_federation_endpoint(body, 2).await;
     let multi_cluster = MultiClusterConfig {
         local_cluster: Some("local-cluster".to_string()),
         federation_endpoint: None,
-        remote_clusters: vec![remote_cluster("remote", &endpoint)],
+        remote_clusters: vec![remote_cluster("remote", &mock.endpoint)],
         east_west_gateways: Vec::new(),
     };
     let store = FederationStore::new();
@@ -184,7 +272,7 @@ async fn federation_poller_keeps_last_good_after_transient_failure() {
     let handles = spawn_federation_poller(
         Some(&multi_cluster),
         FederationPollerConfig::from_env(30, 5, true),
-        poller_http_client(),
+        mock.http_client.clone(),
         store.clone(),
         shutdown_rx,
     )
@@ -202,12 +290,13 @@ async fn federation_poller_keeps_last_good_after_transient_failure() {
     let snapshot = store.snapshot();
     assert!(snapshot.bundles.contains_key(&td(TEST_TRUST_DOMAIN)));
     assert!(
-        request_count.load(Ordering::SeqCst) >= 3,
+        mock.request_count.load(Ordering::SeqCst) >= 3,
         "expected at least 3 endpoint hits (2 fails + 1 success), saw {}",
-        request_count.load(Ordering::SeqCst)
+        mock.request_count.load(Ordering::SeqCst)
     );
 
     let _ = shutdown_tx.send(true);
+    let _ = mock.shutdown.send(true);
     for h in handles.tasks {
         let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
     }
@@ -396,19 +485,19 @@ async fn mesh_federation_endpoint_returns_polled_bundles() {
         "x509_authorities": [sample_cert_base64(), sample_cert_base64()],
     })
     .to_string();
-    let (endpoint, _count, _shutdown_endpoint) = start_mock_federation_endpoint(body, 0).await;
+    let mock = start_mock_federation_endpoint(body, 0).await;
     let mesh_runtime = MeshRuntimeState::new();
     let multi_cluster = MultiClusterConfig {
         local_cluster: Some("local-cluster".to_string()),
         federation_endpoint: None,
-        remote_clusters: vec![remote_cluster("remote", &endpoint)],
+        remote_clusters: vec![remote_cluster("remote", &mock.endpoint)],
         east_west_gateways: Vec::new(),
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handles = spawn_federation_poller(
         Some(&multi_cluster),
         FederationPollerConfig::from_env(30, 5, false),
-        poller_http_client(),
+        mock.http_client.clone(),
         mesh_runtime.federation_store().clone(),
         shutdown_rx,
     )
@@ -441,6 +530,7 @@ async fn mesh_federation_endpoint_returns_polled_bundles() {
     assert_eq!(bundles[0]["jwt_authorities"], 0);
 
     let _ = shutdown_tx.send(true);
+    let _ = mock.shutdown.send(true);
     for h in handles.tasks {
         let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
     }
