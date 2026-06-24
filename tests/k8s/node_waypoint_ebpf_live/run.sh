@@ -33,6 +33,7 @@ DOCKER_NODE_EVIDENCE="${FERRUM_LIVE_DOCKER_NODE_EVIDENCE:-false}"
 NODE_WAYPOINT_REGISTRY_DIR="${FERRUM_LIVE_NODE_WAYPOINT_REGISTRY_DIR:-/run/ferrum/node-waypoint-pods}"
 AMBIENT_ADMIN_PORT="${FERRUM_LIVE_AMBIENT_ADMIN_PORT:-19010}"
 NODE_AGENT_ADMIN_PORT="${FERRUM_LIVE_NODE_AGENT_ADMIN_PORT:-19090}"
+DIAGNOSTIC_TIMEOUT_SECONDS="${FERRUM_LIVE_DIAGNOSTIC_TIMEOUT_SECONDS:-30}"
 ADMIN_JWT_SECRET="${FERRUM_LIVE_ADMIN_JWT_SECRET:-ferrum-edge-node-waypoint-live-admin-secret}"
 ADMIN_JWT_ISSUER="${FERRUM_LIVE_ADMIN_JWT_ISSUER:-ferrum-edge}"
 KUBE_CONTEXT="${FERRUM_LIVE_KUBE_CONTEXT:-}"
@@ -121,6 +122,28 @@ fi
 
 log() {
   printf '\n[node-waypoint-ebpf-live] %s\n' "$*"
+}
+
+diagnostic_timeout() {
+  local label="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    local -a timeout_args
+    if timeout --foreground 1s true >/dev/null 2>&1; then
+      timeout_args=(--foreground "${DIAGNOSTIC_TIMEOUT_SECONDS}s")
+    else
+      timeout_args=("${DIAGNOSTIC_TIMEOUT_SECONDS}s")
+    fi
+    timeout "${timeout_args[@]}" "$@" || {
+      local status=$?
+      if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+        echo "$label timed out after ${DIAGNOSTIC_TIMEOUT_SECONDS}s" >&2
+      fi
+      return "$status"
+    }
+  else
+    "$@"
+  fi
 }
 
 select_kube_context() {
@@ -1724,6 +1747,7 @@ dump_node_waypoint_runtime_state() {
   local out="$RESULTS_DIR/node-waypoint-runtime-$node.txt"
   mkdir -p "$RESULTS_DIR"
   if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    diagnostic_timeout "node waypoint runtime state for $node" \
     docker exec "$node" sh -eu -c '
       echo "## host interfaces"
       ip -o link show 2>/dev/null || true
@@ -1774,6 +1798,7 @@ dump_node_waypoint_runtime_state() {
         done
     ' >"$out" 2>&1 || true
   else
+    diagnostic_timeout "node waypoint runtime state for $node" \
     kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
       chroot /host sh -eu -c '
         echo "## host interfaces"
