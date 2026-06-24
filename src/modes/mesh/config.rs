@@ -2256,7 +2256,7 @@ pub struct MeshInboundTcpRoute {
     /// `true` for client-first stream protocols whose opening bytes should be
     /// made available to first-bytes-aware plugins (stream WAF, TCP TLS-shape
     /// checks). `false` for known server-first raw-TCP protocols (Mongo/MySQL/
-    /// Postgres), whose clients send nothing until the backend greeting.
+    /// Postgres/Redis), whose clients send nothing until the backend greeting.
     pub first_bytes_inspect: bool,
 }
 

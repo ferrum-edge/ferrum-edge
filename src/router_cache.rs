@@ -279,8 +279,9 @@ pub(crate) struct MeshTcpInboundEntry {
     pub(crate) tls_inspect: bool,
     /// `true` for client-first stream protocols whose opening bytes should be
     /// made available to first-bytes-aware plugins. `false` for known
-    /// server-first raw-TCP protocols, where peeking would block the relay on
-    /// the handshake clock before the backend greeting can arrive.
+    /// server-first raw-TCP protocols (Redis/Mongo/MySQL/Postgres), where
+    /// peeking would block the relay on the handshake clock before the backend
+    /// greeting can arrive.
     pub(crate) first_bytes_inspect: bool,
 }
 
@@ -4699,7 +4700,7 @@ mod tests {
         use crate::config::types::BackendScheme;
         use crate::modes::mesh::config::{MeshConfig, MeshInboundTcpRoute};
 
-        let route = MeshInboundTcpRoute {
+        let redis_route = MeshInboundTcpRoute {
             match_port: 6380,
             backend_addr: "127.0.0.1:6380".parse().unwrap(),
             namespace: "default".to_string(),
@@ -4707,13 +4708,22 @@ mod tests {
             service_fqdn: "redis.default.svc.cluster.local".to_string(),
             // Redis is not opaque TLS: the relay must NOT peek SNI for this port.
             tls_inspect: false,
-            // Redis can be client-first, so first-bytes-aware plugins must see
-            // the opening plaintext bytes.
+            // Redis is server-first: the relay must not block before dialing loopback.
+            first_bytes_inspect: false,
+        };
+        let tcp_route = MeshInboundTcpRoute {
+            match_port: 7000,
+            backend_addr: "127.0.0.1:7000".parse().unwrap(),
+            namespace: "default".to_string(),
+            service_name: "tcpapp".to_string(),
+            service_fqdn: "tcpapp.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            // Generic TCP is client-first for first-byte stream plugin inspection.
             first_bytes_inspect: true,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                local_inbound_tcp_routes: vec![route],
+                local_inbound_tcp_routes: vec![redis_route, tcp_route],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
@@ -4731,13 +4741,22 @@ mod tests {
             "non-TLS raw-TCP inbound entries must not SNI-peek"
         );
         assert!(
-            entry.first_bytes_inspect,
-            "client-first plaintext raw-TCP inbound entries must expose first bytes to stream plugins"
+            !entry.first_bytes_inspect,
+            "Redis inbound entries are server-first and must not pre-dial peek first bytes"
         );
         assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert_eq!(
             entry.relay_proxy.id,
             "__mesh-in-tcp-relay-default-redis-6380"
+        );
+
+        let tcp_entry = table
+            .mesh_tcp_inbound_entry("10.0.0.7:7000".parse().unwrap())
+            .expect("captured generic TCP app port should route");
+        assert_eq!(tcp_entry.backend_addr, "127.0.0.1:7000".parse().unwrap());
+        assert!(
+            tcp_entry.first_bytes_inspect,
+            "generic TCP inbound entries must expose first bytes to stream plugins"
         );
 
         assert!(

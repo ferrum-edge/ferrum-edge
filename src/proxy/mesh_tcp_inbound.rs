@@ -124,12 +124,11 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // prefix it would see on the generic TCP proxy. The peek is non-destructive;
     // the relay re-reads the same bytes.
     //
-    // FIRST-BYTES GATE: only skip the pre-dial peek for protocols known to be
-    // server-first (Mongo/MySQL/Postgres), where clients do not send bytes until
-    // the backend greeting and peeking would park the relay on the handshake
-    // clock before loopback is dialed. Opaque TLS, generic TCP, and Redis can
-    // be client-first, so their opening bytes remain available to WAF / TLS
-    // shape plugins instead of being reported as unavailable.
+    // FIRST-BYTES GATE: only pre-dial peek for stream protocols known to be
+    // client-first (opaque TLS and generic TCP). Server-first protocols
+    // (Redis/Mongo/MySQL/Postgres) do not send client bytes until the backend
+    // greeting and peeking would park the relay on the handshake clock before
+    // loopback is dialed.
     //
     // The byte-kind mirrors the generic TCP proxy's wire classification: this
     // handler NEVER terminates TLS (it relays the captured stream verbatim to
