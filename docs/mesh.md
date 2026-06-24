@@ -1532,7 +1532,7 @@ The injector supports per-pod capture overrides via annotations. The Istio annot
 | `ferrum.io/includeOutboundPorts` | outbound | Ferrum-native alias for the above |
 | `traffic.sidecar.istio.io/excludeOutboundPorts` | outbound | Comma-separated TCP destination ports excluded from outbound capture (Istio-compatible) |
 | `ferrum.io/excludeOutboundPorts` | outbound | Ferrum-native alias for the above |
-| `traffic.sidecar.istio.io/excludeInboundPorts` | inbound | Comma-separated TCP destination ports excluded from inbound capture (Istio-compatible). RETURN rules are emitted BEFORE the inbound REDIRECT so the exclusion is honored |
+| `traffic.sidecar.istio.io/excludeInboundPorts` | inbound | Comma-separated TCP and UDP destination ports excluded from inbound capture (Istio-compatible). RETURN rules are emitted BEFORE the inbound REDIRECT/TPROXY catch-all so the exclusion is honored |
 | `ferrum.io/excludeInboundPorts` | inbound | Ferrum-native alias for the above |
 | `traffic.sidecar.istio.io/excludeOutboundIPRanges` | outbound | Comma-separated CIDRs appended to the env-derived outbound exclude list (matches Istio: per-pod additive) |
 | `traffic.sidecar.istio.io/includeOutboundIPRanges` | outbound | Comma-separated CIDRs that REPLACE the env-derived outbound include list when present (matches Istio: include-overrides-include) |
@@ -1598,15 +1598,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   per-datagram from the `IP_RECVORIGDSTADDR` cmsg. New `mangle`-table chains
   mirror the TCP include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
   <FERRUM_MESH_CAPTURE_UDP_PORT> --tproxy-mark <FERRUM_MESH_TPROXY_MARK>/<mask>`,
-  jumped from `mangle PREROUTING`. **Capture is EGRESS-ONLY (#1808):** only
-  `FERRUM_MESH_UDP_OUTBOUND` (plus the `FERRUM_MESH_UDP_OUTPUT_MARK` /
-  `FERRUM_MESH_UDP_REINJECT` locally-generated-egress loop) is emitted. The
-  `FERRUM_MESH_UDP_INBOUND` catch-all is **gated off** (`emit_inbound = false`)
-  because there is no inbound UDP relay yet — the egress-only capture listener
-  would divert pod-app-bound (`--dst-type LOCAL`) UDP and drop it, so inbound-to-pod
-  UDP is left uncaptured and flows normally to the app. Teardown still reaps any
-  prior inbound chain (mark-independent), so an upgrade from a build that installed
-  it is cleaned up. These dst-based PREROUTING chains are
+  jumped from `mangle PREROUTING`. Sidecar UDP capture emits
+  `FERRUM_MESH_UDP_OUTBOUND`, `FERRUM_MESH_UDP_INBOUND`, and the
+  `FERRUM_MESH_UDP_OUTPUT_MARK` / `FERRUM_MESH_UDP_REINJECT`
+  locally-generated-egress loop. **Inbound UDP is fail-closed by default:** direct
+  pod-app-bound (`--dst-type LOCAL`) datagrams are captured rather than allowed to
+  bypass mesh identity and `mesh_authz`. Until a dedicated plaintext inbound UDP
+  relay exists, those direct datagrams do not match the egress route table and are
+  dropped by the capture listener; authenticated datagram-over-mesh traffic still
+  reaches the destination through the mesh UDP relay. Operators that intentionally
+  need plaintext/direct inbound UDP for a port must configure
+  `traffic.sidecar.istio.io/excludeInboundPorts`, `ferrum.io/excludeInboundPorts`,
+  or `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` so the inbound RETURN rule is
+  emitted before the UDP TPROXY catch-all. These dst-based PREROUTING chains are
   **PREROUTING-only**, so — unlike the TCP `nat OUTPUT` outbound chain — they carry
   **no proxy-UID `-m owner --uid-owner` self-exclusion** (owner-match is
   OUTPUT-context only). The pod's **own** locally-generated UDP egress (which never
@@ -2053,7 +2057,7 @@ Set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` only when running a custom node-a
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP and UDP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it when IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
 
 ## VirtualService Translation
@@ -2410,7 +2414,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | `0.0.0.0/0` | CIDRs to capture for outbound traffic |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | (empty) | CIDRs to exclude from outbound capture (highest priority) |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP and UDP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
 
 ### Injector
 
