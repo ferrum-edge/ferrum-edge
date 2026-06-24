@@ -1,0 +1,288 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+  labels:
+    ferrum.io/mesh: enabled
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: src-a
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: src-b
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dst-a
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dst-b
+  namespace: __NAMESPACE__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: src-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: src-a
+  template:
+    metadata:
+      labels:
+        app: src-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: src-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: src-b
+  template:
+    metadata:
+      labels:
+        app: src-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: src-b
+      nodeSelector:
+        ferrum.io/live-node: b
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dst-a
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dst-a
+  template:
+    metadata:
+      labels:
+        app: dst-a
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-a
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: http
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+              import threading
+              import time
+
+              RESPONSE = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nok-a\n"
+
+              def serve(family, addr):
+                  s = socket.socket(family, socket.SOCK_STREAM)
+                  if family == socket.AF_INET6:
+                      s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(addr)
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(1024)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+
+              threading.Thread(target=serve, args=(socket.AF_INET, ("0.0.0.0", 8080)), daemon=True).start()
+              try:
+                  threading.Thread(target=serve, args=(socket.AF_INET6, ("::", 8080, 0, 0)), daemon=True).start()
+              except OSError:
+                  pass
+              while True:
+                  time.sleep(3600)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dst-b
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dst-b
+  template:
+    metadata:
+      labels:
+        app: dst-b
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: dst-b
+      nodeSelector:
+        ferrum.io/live-node: b
+      containers:
+        - name: http
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+              import threading
+              import time
+
+              RESPONSE = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nok-b\n"
+
+              def serve(family, addr):
+                  s = socket.socket(family, socket.SOCK_STREAM)
+                  if family == socket.AF_INET6:
+                      s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(addr)
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(1024)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+
+              threading.Thread(target=serve, args=(socket.AF_INET, ("0.0.0.0", 8080)), daemon=True).start()
+              try:
+                  threading.Thread(target=serve, args=(socket.AF_INET6, ("::", 8080, 0, 0)), daemon=True).start()
+              except OSError:
+                  pass
+              while True:
+                  time.sleep(3600)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dst-a
+  namespace: __NAMESPACE__
+spec:
+  __SERVICE_IP_FAMILY_BLOCK__
+  selector:
+    app: dst-a
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dst-b
+  namespace: __NAMESPACE__
+spec:
+  __SERVICE_IP_FAMILY_BLOCK__
+  selector:
+    app: dst-b
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: __NAMESPACE__
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-src-b
+  namespace: __NAMESPACE__
+spec:
+  action: DENY
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/__NAMESPACE__/sa/src-b
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-src-a-to-destinations
+  namespace: __NAMESPACE__
+spec:
+  action: ALLOW
+  selector:
+    matchLabels:
+      app: dst-a
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/__NAMESPACE__/sa/src-a
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-src-a-cross-node
+  namespace: __NAMESPACE__
+spec:
+  action: ALLOW
+  selector:
+    matchLabels:
+      app: dst-b
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/__NAMESPACE__/sa/src-a

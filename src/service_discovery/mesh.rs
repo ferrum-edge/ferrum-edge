@@ -341,7 +341,7 @@ fn protocol_tag(protocol: AppProtocol) -> &'static str {
 /// ([`MeshServiceDiscoverer::tags_for_target`]) and by Ambient outbound route
 /// materialization (`modes::mesh::build_outbound_mesh_targets`) so the two paths
 /// cannot drift on the tag contract that `proxy::hbone_pool` and
-/// `supports_hbone_backend` consume.
+/// `can_attempt_hbone_backend` consume.
 pub(crate) fn mesh_hbone_target_tags(
     service: &MeshService,
     workload: &Workload,
@@ -352,6 +352,60 @@ pub(crate) fn mesh_hbone_target_tags(
     tags.insert(
         crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
         "true".to_string(),
+    );
+    tags
+}
+
+/// Build the `mesh.*` UpstreamTarget tags for NodeWaypoint captured-Service
+/// HTTP dispatch. The in-pod-netns capture listener has already attributed the
+/// source pod and runs `mesh_authz`; there is no reachable backing-pod HBONE or
+/// sidecar-mTLS listener to tag here, so this intentionally carries destination
+/// identity and service metadata without a mesh transport tag.
+pub(crate) fn mesh_node_waypoint_plaintext_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    mesh_target_tags_core(service, workload, protocol, port_name)
+}
+
+/// Build the `mesh.*` UpstreamTarget tags for NodeWaypoint captured-Service
+/// HTTP dispatch. When the selected workload carries destination NodeWaypoint
+/// metadata, the target is marked for HBONE dispatch to that NodeWaypoint and
+/// pins the NodeWaypoint SVID. The target host/port still name the selected
+/// workload app endpoint and therefore become the CONNECT authority. When the
+/// metadata is absent, this helper returns the temporary plaintext target shape;
+/// identity-backed NodeWaypoint materialization gates those targets out before
+/// dispatch so missing metadata fails closed instead of becoming a plaintext
+/// backend.
+pub(crate) fn mesh_node_waypoint_target_tags(
+    service: &MeshService,
+    workload: &Workload,
+    protocol: AppProtocol,
+    port_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut tags = mesh_node_waypoint_plaintext_target_tags(service, workload, protocol, port_name);
+    let Some(node_waypoint) = &workload.node_waypoint else {
+        return tags;
+    };
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+        "true".to_string(),
+    );
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG.to_string(),
+        node_waypoint.address.clone(),
+    );
+    if node_waypoint.hbone_port != crate::modes::mesh::hbone::ISTIO_HBONE_PORT {
+        tags.insert(
+            crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+            node_waypoint.hbone_port.to_string(),
+        );
+    }
+    tags.insert(
+        crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG.to_string(),
+        node_waypoint.spiffe_id.as_str().to_string(),
     );
     tags
 }
@@ -452,6 +506,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }
     }

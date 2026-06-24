@@ -99,13 +99,17 @@ pub struct BackendCapabilityProbeTarget {
     pub hbone_hint: bool,
     /// Sidecar HBONE listener port for this target. Defaults to Istio 15008.
     pub hbone_port: u16,
+    /// Outer HBONE dial host. Defaults to the target host; NodeWaypoint targets
+    /// override it with the destination NodeWaypoint endpoint.
+    pub hbone_dial_host: String,
     /// DestinationRule policy port for this target. The probe still dials
     /// `.proxy.backend_port`, but per-port keepalive policy may be keyed by the
     /// owning Service port when mesh targetPort remaps are in play.
     pub dispatch_policy_port: u16,
-    /// Destination identity the HBONE probe handshake must pin
-    /// (`mesh.spiffe_id` tag), mirroring the request path so a probe cannot
-    /// classify a peer Supported under weaker verification than dispatch uses.
+    /// Peer identity the HBONE probe handshake must pin
+    /// (`mesh.hbone_peer_spiffe_id` override, else `mesh.spiffe_id`), mirroring
+    /// the request path so a probe cannot classify a peer Supported under
+    /// weaker verification than dispatch uses.
     pub hbone_expected_peer: Option<crate::identity::SpiffeId>,
 }
 
@@ -114,6 +118,7 @@ impl BackendCapabilityProbeTarget {
         let mut probe_proxy = proxy.clone();
         let mut hbone_hint = false;
         let mut hbone_port = crate::modes::mesh::hbone::ISTIO_HBONE_PORT;
+        let mut hbone_dial_host = probe_proxy.backend_host.clone();
         let mut dispatch_policy_port = proxy.backend_port;
         let mut hbone_expected_peer = None;
         if let Some(target) = target {
@@ -122,6 +127,17 @@ impl BackendCapabilityProbeTarget {
             dispatch_policy_port = target.dispatch_policy_port();
             hbone_hint = crate::proxy::hbone_pool::target_hbone_enabled(target);
             hbone_port = crate::proxy::hbone_pool::target_hbone_port(target);
+            match crate::proxy::hbone_pool::target_hbone_dial_host(target) {
+                Ok(host) => hbone_dial_host = host.to_string(),
+                Err(err) => {
+                    tracing::debug!(
+                        target_host = %target.host,
+                        error = %err,
+                        "Skipping HBONE capability probe: invalid mesh.hbone_dial_host tag"
+                    );
+                    hbone_hint = false;
+                }
+            }
             match crate::proxy::hbone_pool::target_expected_peer_spiffe(target) {
                 Ok(peer) => hbone_expected_peer = peer,
                 Err(err) => {
@@ -146,6 +162,7 @@ impl BackendCapabilityProbeTarget {
             proxy: probe_proxy,
             hbone_hint,
             hbone_port,
+            hbone_dial_host,
             dispatch_policy_port,
             hbone_expected_peer,
         }
@@ -306,20 +323,33 @@ impl BackendCapabilityRegistry {
         }
     }
 
-    /// Downgrade the cached HBONE classification for a backend target after a
-    /// live gateway-to-mesh tunnel failure. No-op when the target has no
-    /// cached record.
+    /// Downgrade the HBONE classification for a backend target after a live
+    /// gateway-to-mesh tunnel failure. If no refresh record exists yet, insert
+    /// an HBONE-only `Unsupported` record so cold-start live failures are
+    /// cached immediately instead of redialing the same unavailable waypoint on
+    /// every request until the next refresh.
     pub fn mark_hbone_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) {
         let key = capability_key_for_proxy_target(proxy, target);
-        if let Some(mut entry) = self.entries.get_mut(&key)
-            && !matches!(entry.hbone, ProtocolSupport::Unsupported)
-        {
-            let mut new_record = (**entry).clone();
-            new_record.hbone = ProtocolSupport::Unsupported;
-            new_record.last_probe_at_unix_secs = now_unix_secs();
-            new_record.last_probe_error =
-                Some("HBONE downgraded after tunnel failure on request path".to_string());
-            *entry = Arc::new(new_record);
+        let error = Some("HBONE downgraded after tunnel failure on request path".to_string());
+        match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if matches!(entry.get().hbone, ProtocolSupport::Unsupported) {
+                    return;
+                }
+                let mut new_record = (**entry.get()).clone();
+                new_record.hbone = ProtocolSupport::Unsupported;
+                new_record.last_probe_at_unix_secs = now_unix_secs();
+                new_record.last_probe_error = error;
+                entry.insert(Arc::new(new_record));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(BackendCapabilityRecord {
+                    hbone: ProtocolSupport::Unsupported,
+                    last_probe_at_unix_secs: now_unix_secs(),
+                    last_probe_error: error,
+                    ..Default::default()
+                }));
+            }
         }
     }
 
@@ -372,21 +402,49 @@ pub fn capability_key(proxy: &Proxy) -> String {
 /// they're reusing one (see `BackendCapabilityRegistry::get`).
 ///
 /// Key shape:
-/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=static|hbone_port`.
+/// `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=static|hbone_port|hbone_dial_host|hbone_peer_spiffe`.
 /// `|` delimiter matches the pool-key conventions in the rest of the code;
 /// user/config-controlled components are escaped before separators are appended.
-/// The HBONE port field is populated only when the upstream target opts into
+/// The HBONE fields are populated only when the upstream target opts into
 /// HBONE; direct backend capability observations remain shared for ordinary
-/// targets that use the same connection identity.
+/// targets that use the same connection identity. Invalid HBONE metadata uses
+/// raw tag values in the key so malformed secured targets do not reuse probe
+/// results from a different waypoint or peer.
 fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&UpstreamTarget>) {
     let scheme = proxy.backend_scheme.unwrap_or(BackendScheme::Https);
     let (host, port) = match target {
         Some(t) => (t.host.as_str(), t.port),
         None => (proxy.backend_host.as_str(), proxy.backend_port),
     };
-    let hbone_port = target
+    let hbone_key_fields = target
         .filter(|t| crate::proxy::hbone_pool::target_hbone_enabled(t))
-        .map(crate::proxy::hbone_pool::target_hbone_port);
+        .map(|target| {
+            let hbone_port = crate::proxy::hbone_pool::target_hbone_port(target);
+            let hbone_dial_host = crate::proxy::hbone_pool::target_hbone_dial_host(target)
+                .ok()
+                .or_else(|| {
+                    target
+                        .tags
+                        .get(crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG)
+                        .map(String::as_str)
+                });
+            let hbone_peer_spiffe = crate::proxy::hbone_pool::target_expected_peer_spiffe(target)
+                .ok()
+                .flatten()
+                .map(|spiffe| spiffe.to_string())
+                .or_else(|| {
+                    target
+                        .tags
+                        .get(crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG)
+                        .or_else(|| {
+                            target
+                                .tags
+                                .get(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG)
+                        })
+                        .cloned()
+                });
+            (hbone_port, hbone_dial_host, hbone_peer_spiffe)
+        });
     buf.push_str(scheme.to_scheme_str());
     buf.push('|');
     append_pool_key_component(buf, host);
@@ -402,8 +460,12 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
         None,
     );
     buf.push('|');
-    if let Some(port) = hbone_port {
+    if let Some((port, dial_host, peer_spiffe)) = hbone_key_fields {
         let _ = write!(buf, "{port}");
+        buf.push('|');
+        append_optional_pool_key_component(buf, dial_host);
+        buf.push('|');
+        append_optional_pool_key_component(buf, peer_spiffe.as_deref());
     }
 }
 
@@ -727,6 +789,7 @@ mod tests {
         let mut tags = std::collections::HashMap::new();
         tags.insert("mesh.hbone".to_string(), "true".to_string());
         tags.insert("mesh.hbone_port".to_string(), "16008".to_string());
+        tags.insert("mesh.hbone_dial_host".to_string(), "10.9.0.7".to_string());
         let target = UpstreamTarget {
             host: "orders.default.svc.cluster.local".to_string(),
             port: 8080,
@@ -741,6 +804,7 @@ mod tests {
 
         assert!(probe_target.hbone_hint);
         assert_eq!(probe_target.hbone_port, 16008);
+        assert_eq!(probe_target.hbone_dial_host, "10.9.0.7");
         assert_eq!(probe_target.host(), "orders.default.svc.cluster.local");
         assert_eq!(probe_target.port(), 8080);
         assert_eq!(
@@ -758,6 +822,27 @@ mod tests {
             "HBONE targets sharing the same app host:port must not share capability entries when sidecar ports differ"
         );
 
+        let mut other_dial_host = target.clone();
+        other_dial_host
+            .tags
+            .insert("mesh.hbone_dial_host".to_string(), "10.9.0.8".to_string());
+        assert_ne!(
+            capability_key_for_proxy_target(&proxy, Some(&target)),
+            capability_key_for_proxy_target(&proxy, Some(&other_dial_host)),
+            "HBONE targets sharing the same app host:port must not share capability entries when waypoint dial hosts differ"
+        );
+
+        let mut other_peer = target.clone();
+        other_peer.tags.insert(
+            "mesh.hbone_peer_spiffe_id".to_string(),
+            "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-b".to_string(),
+        );
+        assert_ne!(
+            capability_key_for_proxy_target(&proxy, Some(&target)),
+            capability_key_for_proxy_target(&proxy, Some(&other_peer)),
+            "HBONE targets sharing the same app host:port must not share capability entries when pinned peer identities differ"
+        );
+
         let mut direct_target = target.clone();
         direct_target.tags.clear();
         assert_ne!(
@@ -765,6 +850,31 @@ mod tests {
             capability_key_for_proxy_target(&proxy, Some(&direct_target)),
             "HBONE opt-in must be part of the capability key"
         );
+    }
+
+    #[test]
+    fn probe_target_rejects_empty_hbone_dial_host_override() {
+        let proxy = minimal_proxy();
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("mesh.hbone".to_string(), "true".to_string());
+        tags.insert("mesh.hbone_dial_host".to_string(), " ".to_string());
+        let target = UpstreamTarget {
+            host: "orders.default.svc.cluster.local".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags,
+            locality: None,
+            path: None,
+        };
+
+        let probe_target = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+
+        assert!(
+            !probe_target.hbone_hint,
+            "malformed dial host must skip HBONE probing so dispatch fails closed"
+        );
+        assert_eq!(probe_target.hbone_dial_host, proxy.backend_host);
     }
 
     #[test]
@@ -795,11 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_mark_hbone_unsupported_is_noop_when_no_cached_entry() {
+    fn registry_mark_hbone_unsupported_creates_entry_when_no_cached_record_exists() {
         let registry = BackendCapabilityRegistry::new();
         let proxy = minimal_proxy();
         registry.mark_hbone_unsupported(&proxy, None);
-        assert!(registry.get(&proxy, None).is_none());
+        let fetched = registry
+            .get(&proxy, None)
+            .expect("live HBONE failure should create cached unsupported verdict");
+        assert_eq!(fetched.hbone, ProtocolSupport::Unsupported);
+        assert!(fetched.last_probe_error.is_some());
     }
 
     #[test]

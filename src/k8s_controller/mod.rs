@@ -33,6 +33,7 @@ use watcher::{WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
 
 pub struct K8sControllerConfig {
     pub namespace: String,
+    pub controller_namespace: String,
     pub trust_domain: String,
     pub cluster_domain: String,
     pub istio_root_namespace: String,
@@ -101,6 +102,7 @@ pub async fn start_k8s_controller(
         istio_root_namespace = %controller_config.istio_root_namespace,
         watch_namespaces = ?controller_config.watch_namespaces,
         namespace = controller_config.namespace,
+        controller_namespace = controller_config.controller_namespace,
         "Starting Kubernetes controller"
     );
 
@@ -125,6 +127,7 @@ pub async fn start_k8s_controller(
         // associated RBAC requirement are skipped automatically.
         watch_mesh_config: controller_config.watch_istio && controller_config.watch_mesh_config,
     };
+    let controller_namespace = controller_config.controller_namespace.clone();
     let istio_root_namespace = controller_config.istio_root_namespace.clone();
     let gateway_api_data_plane_service_namespace = controller_config
         .gateway_api_data_plane_service_namespace
@@ -135,6 +138,7 @@ pub async fn start_k8s_controller(
         store_set.clone(),
         watcher_selection,
         controller_config.watch_namespaces.clone(),
+        controller_namespace.clone(),
         istio_root_namespace.clone(),
         gateway_api_data_plane_service_namespace.clone(),
         shutdown.clone(),
@@ -145,6 +149,7 @@ pub async fn start_k8s_controller(
 
     let reconciler_config = ReconcilerConfig {
         namespace: controller_config.namespace,
+        controller_namespace: controller_config.controller_namespace,
         trust_domain: controller_config.trust_domain,
         cluster_domain: controller_config.cluster_domain,
         istio_root_namespace: controller_config.istio_root_namespace,
@@ -191,6 +196,7 @@ pub async fn start_k8s_controller(
         store_set,
         watcher_selection,
         controller_config.watch_namespaces,
+        controller_namespace,
         istio_root_namespace,
         gateway_api_data_plane_service_namespace,
         shutdown,

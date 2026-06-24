@@ -67,7 +67,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -96,7 +96,7 @@ use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
 use crate::modes::mesh::node_waypoint::{
-    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver,
+    NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
@@ -253,8 +253,19 @@ fn record_node_waypoint_identity_drop(
         NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
             crate::overload::NodeWaypointDropReason::HashMismatch
         }
+        NodeWaypointIdentityError::PodUidMismatch { .. } => {
+            crate::overload::NodeWaypointDropReason::HashMismatch
+        }
     };
     overload.record_node_waypoint_drop(reason);
+}
+
+fn node_waypoint_listener_uid_fallback_allowed(error: &NodeWaypointIdentityError) -> bool {
+    matches!(
+        error,
+        NodeWaypointIdentityError::SocketCookieUnavailable(_)
+            | NodeWaypointIdentityError::UnknownCookie(_)
+    )
 }
 
 /// Validate that every `mesh_route_dispatch` rule's
@@ -344,6 +355,7 @@ struct H3ProbeOutcome {
 
 struct HboneProbeTarget<'a> {
     host: &'a str,
+    dial_host: &'a str,
     port: u16,
     policy_port: u16,
     hbone_port: u16,
@@ -1555,21 +1567,21 @@ fn proxy_can_dispatch_hbone(proxy: &Proxy) -> bool {
     proxy.dispatch_kind == DispatchKind::HttpPool
 }
 
-fn supports_hbone_backend(
-    state: &ProxyState,
+fn can_attempt_hbone_backend(
+    registry: &BackendCapabilityRegistry,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
+    gateway_svid_loaded: bool,
 ) -> bool {
     let Some(target) = upstream_target else {
         return false;
     };
     proxy_can_dispatch_hbone(proxy)
         && hbone_pool::target_hbone_enabled(target)
-        && state.gateway_svid_bundle.load().is_some()
-        && state
-            .backend_capabilities
+        && gateway_svid_loaded
+        && registry
             .get(proxy, Some(target))
-            .is_some_and(|record| record.hbone.is_supported())
+            .is_none_or(|record| !matches!(record.hbone, ProtocolSupport::Unsupported))
 }
 
 /// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
@@ -2692,6 +2704,13 @@ pub struct ProxyState {
     pub add_forwarded_header: bool,
     /// Environment config for backend TLS settings (WebSocket, etc.)
     pub env_config: Arc<crate::config::EnvConfig>,
+    /// Gateway-owned listener ports used for stream proxy conflict validation.
+    ///
+    /// Most modes derive this from [`EnvConfig::reserved_gateway_ports`]. File
+    /// mode can adopt pre-bound listeners whose live ports differ from
+    /// `EnvConfig`; storing the effective startup set here keeps later reload
+    /// validation aligned with the sockets the process actually owns.
+    pub reserved_gateway_ports: Arc<HashSet<u16>>,
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -2754,16 +2773,19 @@ pub struct ProxyState {
     /// mesh-internal identity claims (e.g. `source.principal`) from leaking
     /// to non-mesh upstream services.
     pub mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
-    /// Node-waypoint source identity resolver. When present, accepted sockets
-    /// must carry a node-agent/eBPF cookie record or the connection is dropped
-    /// fail-closed before TLS/HBONE processing.
+    /// Node-waypoint source identity resolver. Outbound capture sockets accepted
+    /// from per-pod in-netns listeners must carry a node-agent/eBPF cookie record
+    /// or the connection is dropped fail-closed before request processing.
+    /// Inbound HBONE sockets from peer proxies do not carry those pod-loopback
+    /// cookies and are authenticated by the HBONE/TLS path instead.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
     /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
-    /// This is live, not staged: `supports_hbone_backend` gates HBONE dispatch
-    /// on this slot being loaded (see `current_dispatch_hbone` →
-    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes it
-    /// to originate peer mTLS automatically. The slot shape matches mesh SVID
-    /// rotation so trust-bundle updates hot-swap without blocking proxy readers.
+    /// This is live, not staged: `can_attempt_hbone_backend` gates HBONE
+    /// dispatch on this slot being loaded (see `current_dispatch_hbone` →
+    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes
+    /// it to originate peer mTLS automatically. The slot shape matches mesh
+    /// SVID rotation so trust-bundle updates hot-swap without blocking proxy
+    /// readers.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
@@ -2778,6 +2800,12 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Whether the current mesh inbound TLS posture is actually terminating
+    /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
+    /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
+    /// gateway SVID slot and stays false for plaintext or passthrough
+    /// topologies.
+    pub mesh_inbound_spiffe_verifier_active: Arc<AtomicBool>,
     /// Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement for stream-
     /// family egress (TCP / UDP / TCP+TLS / UDP+DTLS). `Some` only when
     /// (a) the gateway runs in mesh mode, (b) the resolved policy is
@@ -2885,7 +2913,9 @@ struct RequestConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// Pre-NAT original destination of an iptables-REDIRECTed connection,
     /// read once at accept on mesh outbound capture listeners
-    /// (`SO_ORIGINAL_DST`). `None` everywhere else — see
+    /// (`SO_ORIGINAL_DST`). NodeWaypoint eBPF capture can also supply this from
+    /// the resolver cookie record because cgroup/connect rewrites do not create
+    /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
 }
@@ -3861,13 +3891,40 @@ impl ProxyState {
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
-        Self::new_with_bpf_metrics(
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
             config,
             dns_cache,
             env_config,
             tls_policy,
             health_check_shutdown_rx,
             None,
+            reserved_gateway_ports,
+        )
+    }
+
+    /// Constructor variant that accepts the effective gateway-owned listener
+    /// ports for stream proxy conflict validation.
+    ///
+    /// File mode uses this when adopting pre-bound listeners so initial
+    /// validation, SIGHUP reloads, and programmatic `update_config` calls all
+    /// use the same actual socket set instead of recalculating from `EnvConfig`.
+    pub fn new_with_reserved_gateway_ports(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        reserved_gateway_ports: HashSet<u16>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            None,
+            reserved_gateway_ports,
         )
     }
 
@@ -3881,12 +3938,33 @@ impl ProxyState {
     /// metrics state at startup. Keeping the parameter optional avoids
     /// forcing every other entry point to plumb a placeholder.
     pub fn new_with_bpf_metrics(
+        config: GatewayConfig,
+        dns_cache: DnsCache,
+        env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        Self::new_with_bpf_metrics_and_reserved_gateway_ports(
+            config,
+            dns_cache,
+            env_config,
+            tls_policy,
+            health_check_shutdown_rx,
+            bpf_metrics_state,
+            reserved_gateway_ports,
+        )
+    }
+
+    fn new_with_bpf_metrics_and_reserved_gateway_ports(
         mut config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+        reserved_gateway_ports: HashSet<u16>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
             for msg in &errors {
@@ -3980,6 +4058,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
@@ -4326,6 +4405,7 @@ impl ProxyState {
             )),
             early_data_methods: Arc::new(env_config_arc.tls_early_data_methods.clone()),
             env_config: env_config_arc,
+            reserved_gateway_ports: Arc::new(reserved_gateway_ports),
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_header_count,
@@ -4364,6 +4444,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
             backend_svid_generation,
@@ -4803,6 +4884,7 @@ impl ProxyState {
                 probe_timeout,
                 HboneProbeTarget {
                     host,
+                    dial_host: target.hbone_dial_host.as_str(),
                     port,
                     policy_port: target.dispatch_policy_port,
                     hbone_port: target.hbone_port,
@@ -4921,6 +5003,7 @@ impl ProxyState {
         record: &mut BackendCapabilityRecord,
     ) {
         let host = target.host;
+        let dial_host = target.dial_host;
         let port = target.port;
         let hbone_port = target.hbone_port;
         if self.gateway_svid_bundle.load().is_none() {
@@ -4940,8 +5023,9 @@ impl ProxyState {
         let warmup = async {
             if target.is_udp {
                 self.hbone_pool
-                    .warmup_datagram_connection(
+                    .warmup_datagram_connection_via(
                         probe_proxy,
+                        dial_host,
                         host,
                         port,
                         target.policy_port,
@@ -4951,8 +5035,9 @@ impl ProxyState {
                     .await
             } else {
                 self.hbone_pool
-                    .warmup_connection(
+                    .warmup_connection_via(
                         probe_proxy,
+                        dial_host,
                         host,
                         port,
                         target.policy_port,
@@ -5611,8 +5696,9 @@ impl ProxyState {
         // Stream proxy port conflicts — reject in non-DP modes, warn in DP
         // mode. The DP doesn't control its config and one bad stream proxy
         // port shouldn't block all other config updates pushed by the CP.
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errs) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        if let Err(errs) =
+            config.validate_stream_proxy_port_conflicts(self.reserved_gateway_ports.as_ref())
+        {
             if matches!(
                 self.env_config.mode,
                 crate::config::env_config::OperatingMode::DataPlane
@@ -6596,9 +6682,6 @@ impl ProxyState {
             &self.env_config.namespace,
         );
         if let Err(errors) = self.validate_full_config(&new_config) {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
             return ConfigApplyOutcome::rejected(errors);
         }
 
@@ -6632,10 +6715,6 @@ impl ProxyState {
             Ok(None) => return ConfigApplyOutcome::Unchanged,
             Err(e) => {
                 let message = format!("security plugin validation failed: {e}");
-                error!(
-                    "Incremental config rejected — security plugin validation failed: {}",
-                    e
-                );
                 return ConfigApplyOutcome::rejected_one(message);
             }
         };
@@ -8493,7 +8572,7 @@ enum MeshWsEgress {
 /// so the upgrade fails closed in `connect_mesh_websocket_backend` (where the
 /// pool errors `NoSvid` before any dial) rather than silently falling back to a
 /// plaintext dial of a `mesh.mtls`/`mesh.hbone` destination. This is the
-/// WebSocket analogue of the `supports_mesh_mtls_backend` / `supports_hbone_backend`
+/// WebSocket analogue of the `supports_mesh_mtls_backend` / `can_attempt_hbone_backend`
 /// fail-closed contract, but the SVID/capability check is deferred to the dial
 /// because returning `None` here would route to the plaintext path.
 fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
@@ -8628,6 +8707,7 @@ async fn connect_mesh_websocket_backend(
         MeshWsEgress::AmbientHbone => {
             let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
             let hbone_port = hbone_pool::target_hbone_port(target);
+            let dial_host = hbone_pool::target_hbone_dial_host(target)?;
             // Bare HBONE byte tunnel to the destination workload's app addr:port
             // (the CONNECT `:authority` the relay byte-copies to) — NOT an
             // Extended CONNECT (see this fn's doc comment + `get_ws_byte_tunnel`).
@@ -8635,7 +8715,7 @@ async fn connect_mesh_websocket_backend(
                 .hbone_pool
                 .get_ws_byte_tunnel(
                     proxy,
-                    &target.host,
+                    dial_host,
                     hbone_port,
                     &target.host,
                     target.port,
@@ -9843,6 +9923,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         None,
         0,
         SourceIpOverride::none(),
+        None,
     )
     .await;
     Ok(())
@@ -10174,6 +10255,62 @@ struct TlsConnectionMetadata {
     orig_dst: Option<SocketAddr>,
 }
 
+struct NodeWaypointAcceptIdentity {
+    identity: Arc<NodeWaypointIdentity>,
+    orig_dst: Option<SocketAddr>,
+    cookie_error: Option<NodeWaypointIdentityError>,
+}
+
+struct NodeWaypointAcceptIdentityDrop {
+    error: NodeWaypointIdentityError,
+    cookie_error: Option<NodeWaypointIdentityError>,
+}
+
+fn resolve_node_waypoint_accept_identity(
+    resolver: &NodeWaypointIdentityResolver,
+    stream: &tokio::net::TcpStream,
+    expected_pod_uid: Option<[u8; 16]>,
+) -> Result<NodeWaypointAcceptIdentity, NodeWaypointAcceptIdentityDrop> {
+    let Some(expected_pod_uid) = expected_pod_uid else {
+        return resolver
+            .resolve_stream(stream)
+            .map(|resolved| NodeWaypointAcceptIdentity {
+                identity: resolved.identity,
+                orig_dst: Some(resolved.orig_dst),
+                cookie_error: None,
+            })
+            .map_err(|error| NodeWaypointAcceptIdentityDrop {
+                error,
+                cookie_error: None,
+            });
+    };
+
+    match resolver.resolve_stream_for_expected_pod(stream, expected_pod_uid) {
+        Ok(resolved) => Ok(NodeWaypointAcceptIdentity {
+            identity: resolved.identity,
+            orig_dst: Some(resolved.orig_dst),
+            cookie_error: None,
+        }),
+        Err(error) if node_waypoint_listener_uid_fallback_allowed(&error) => {
+            match resolver.resolve_expected_pod_identity(expected_pod_uid) {
+                Ok((identity, _scope)) => Ok(NodeWaypointAcceptIdentity {
+                    identity,
+                    orig_dst: None,
+                    cookie_error: Some(error),
+                }),
+                Err(fallback_error) => Err(NodeWaypointAcceptIdentityDrop {
+                    error: fallback_error,
+                    cookie_error: Some(error),
+                }),
+            }
+        }
+        Err(error) => Err(NodeWaypointAcceptIdentityDrop {
+            error,
+            cookie_error: None,
+        }),
+    }
+}
+
 async fn start_proxy_listener_with_tls_source_and_signal(
     addr: SocketAddr,
     state: ProxyState,
@@ -10250,6 +10387,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     mesh_direction,
                     i,
                     SourceIpOverride::none(),
+                    None,
                 )
                 .await;
             }));
@@ -10273,6 +10411,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             mesh_direction,
             0,
             SourceIpOverride::none(),
+            None,
         )
         .await;
 
@@ -10296,6 +10435,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             mesh_direction,
             0,
             SourceIpOverride::none(),
+            None,
         )
         .await;
     }
@@ -10321,6 +10461,34 @@ impl SourceIpOverride {
     }
 }
 
+fn select_mesh_original_dst(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    socket_original_dst: Option<SocketAddr>,
+    node_waypoint_original_dst: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    match mesh_direction {
+        Some(crate::modes::mesh::MeshTrafficDirection::Outbound) => {
+            node_waypoint_original_dst.or(socket_original_dst)
+        }
+        Some(crate::modes::mesh::MeshTrafficDirection::Inbound) => socket_original_dst,
+        None => None,
+    }
+}
+
+fn should_resolve_node_waypoint_identity(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+}
+
+fn should_use_direct_pod_ip_http_route(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    has_node_waypoint_identity: bool,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+        && has_node_waypoint_identity
+}
+
 /// Accept loop that runs on a single listener socket. Multiple instances can
 /// run concurrently on the same address when SO_REUSEPORT is enabled.
 #[allow(clippy::too_many_arguments)]
@@ -10338,6 +10506,7 @@ async fn run_accept_loop(
     // pod IP so client-IP authz conditions, logs, and IP-keyed plugins see the
     // pod instead of loopback.
     source_ip_override: SourceIpOverride,
+    node_waypoint_expected_pod_uid: Option<[u8; 16]>,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     // Count consecutive accept() failures to back off a busy-loop. Under fd
@@ -10389,21 +10558,69 @@ async fn run_accept_loop(
                         };
 
                         let state = Arc::clone(&state);
+                        let mut node_waypoint_orig_dst = None;
                         let node_waypoint_identity =
-                            if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
-                                match resolver.resolve_stream(&stream) {
-                                    // HTTP/HBONE re-queries the per-pod scope per
-                                    // request, so the accept-time scope is unused
-                                    // here; keep only the identity on the
+                            if should_resolve_node_waypoint_identity(mesh_direction)
+                                && let Some(resolver) =
+                                    state.node_waypoint_identity_resolver.as_ref()
+                            {
+                                match resolve_node_waypoint_accept_identity(
+                                    resolver,
+                                    &stream,
+                                    node_waypoint_expected_pod_uid,
+                                ) {
+                                    // HTTP/HBONE re-queries the per-pod scope
+                                    // per request, so the accept-time scope is
+                                    // unused here; keep only the identity and
+                                    // optional original destination on the
                                     // connection metadata.
-                                    Ok((identity, _scope)) => Some(identity),
-                                    Err(error) => {
-                                        record_node_waypoint_identity_drop(&state.overload, &error);
-                                        debug!(
-                                            remote_addr = %remote_addr,
-                                            error = %error,
-                                            "Dropping node-waypoint connection without a resolved pod identity"
+                                    Ok(resolved) => {
+                                        node_waypoint_orig_dst = resolved.orig_dst;
+                                        if let Some(cookie_error) = resolved.cookie_error.as_ref() {
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            info!(
+                                                remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
+                                                error = %cookie_error,
+                                                "Admitting node-waypoint in-netns connection by listener pod UID after cookie lookup miss"
+                                            );
+                                        }
+                                        Some(resolved.identity)
+                                    }
+                                    Err(drop_reason) => {
+                                        record_node_waypoint_identity_drop(
+                                            &state.overload,
+                                            &drop_reason.error,
                                         );
+                                        if let Some(cookie_error) =
+                                            drop_reason.cookie_error.as_ref()
+                                        {
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            warn!(
+                                                remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
+                                                cookie_error = %cookie_error,
+                                                error = %drop_reason.error,
+                                                "Dropping node-waypoint connection without a resolved pod identity"
+                                            );
+                                        } else {
+                                            let expected_pod_uid =
+                                                node_waypoint_expected_pod_uid.map(|uid| {
+                                                    pod_uid_label(&uid)
+                                                });
+                                            warn!(
+                                                remote_addr = %remote_addr,
+                                                expected_pod_uid = expected_pod_uid.as_deref().unwrap_or("<shared>"),
+                                                error = %drop_reason.error,
+                                                "Dropping node-waypoint connection without a resolved pod identity"
+                                            );
+                                        }
                                         drop(stream);
                                         continue;
                                     }
@@ -10431,19 +10648,21 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
-                        // Read the captured connection's pre-NAT original
-                        // destination ONCE per accept, only on mesh capture
-                        // listeners (one getsockopt; every request on the
-                        // connection shares it). Outbound: `:15001` REDIRECT
-                        // capture, port = the dialed SERVICE port. Inbound:
-                        // the injector also REDIRECTs a sidecar-less client's
-                        // direct dial of the app port to `:15006`, port = the
-                        // CONTAINER port (peer-sidecar dials are direct and
-                        // yield `None` per the `socket_opts::original_dst`
-                        // contract). `None` everywhere else and for
-                        // non-redirected traffic.
+                        // Read the captured connection's original destination
+                        // ONCE per accept, only on mesh capture listeners. For
+                        // iptables REDIRECT capture, `SO_ORIGINAL_DST` carries
+                        // the pre-NAT address. For NodeWaypoint cgroup/connect
+                        // capture there is no conntrack original-dst state, so
+                        // the eBPF resolver's original destination wins for
+                        // outbound. Every request on the connection shares this
+                        // value. `None` everywhere else and for non-redirected
+                        // traffic.
                         let orig_dst = if mesh_direction.is_some() {
-                            crate::socket_opts::original_dst(&stream)
+                            select_mesh_original_dst(
+                                mesh_direction,
+                                crate::socket_opts::original_dst(&stream),
+                                node_waypoint_orig_dst,
+                            )
                         } else {
                             None
                         };
@@ -10481,15 +10700,25 @@ async fn run_accept_loop(
                                 // service port)`), then fall back to the
                                 // direct-pod-IP / headless by-workload index
                                 // (strict `(workload IP, target port)`, F3 §3.4)
-                                // — a client that resolved a headless service
-                                // itself dials a POD IP, bypassing the VIP table.
+                                // only when no HTTP direct-pod-IP route owns the
+                                // same target. HTTP direct-pod-IP egress needs the
+                                // HTTP request path for Host-independent routing
+                                // and AuthorizationPolicy evaluation.
+                                let http_direct_pod_ip_owner = epoch
+                                    .route_table
+                                    .mesh_http_egress_by_workload_decision(dst)
+                                    .is_some();
                                 let decision = epoch
                                     .route_table
                                     .mesh_tcp_egress_decision(dst)
                                     .or_else(|| {
-                                        epoch
-                                            .route_table
-                                            .mesh_tcp_egress_by_workload_decision(dst)
+                                        if http_direct_pod_ip_owner {
+                                            None
+                                        } else {
+                                            epoch
+                                                .route_table
+                                                .mesh_tcp_egress_by_workload_decision(dst)
+                                        }
                                     })
                                     .cloned();
                                 match decision {
@@ -11828,13 +12057,59 @@ async fn handle_proxy_request_inner(
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
     let epoch = state.request_epoch.load();
 
+    // Direct Pod-IP HTTP mesh egress is selected by captured original
+    // destination before Host routing. The client-controlled Host header cannot
+    // safely identify the destination service for a direct pod-IP dial.
+    let direct_pod_ip_http_route = if should_use_direct_pod_ip_http_route(
+        ctx.mesh_direction,
+        ctx.node_waypoint_pod_uid.is_some(),
+    ) {
+        ctx.orig_dst.and_then(|orig_dst| {
+            epoch
+                .route_table
+                .mesh_http_egress_by_workload_decision(orig_dst)
+                .cloned()
+        })
+    } else {
+        None
+    };
+
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state.router_cache.find_proxy_in_snapshot(
-        &epoch.route_table,
-        epoch.route_generation,
-        request_host.as_deref(),
-        &path,
-    );
+    let route_match = match direct_pod_ip_http_route {
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {
+            proxy,
+            service_port,
+        }) => {
+            ctx.mesh_outbound_destination_authz_port = Some(service_port);
+            Some(crate::router_cache::RouteMatch {
+                proxy,
+                path_params: Vec::new(),
+                matched_prefix_len: 0,
+            })
+        }
+        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::CloseNotRoutable) => {
+            debug!(
+                orig_dst = ?ctx.orig_dst,
+                client_ip = %ctx.client_ip,
+                "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
+            );
+            state.request_count.fetch_add(1, Ordering::Relaxed);
+            let reject = normalize_reject_response(
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
+                &EMPTY_HEADERS,
+                request_uses_grpc_content_type,
+            );
+            record_status(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+        None => state.router_cache.find_proxy_in_snapshot(
+            &epoch.route_table,
+            epoch.route_generation,
+            request_host.as_deref(),
+            &path,
+        ),
+    };
 
     // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
     // direction-scoped: the inbound and outbound capture listeners share one
@@ -11871,7 +12146,8 @@ async fn handle_proxy_request_inner(
     let route_match = match route_match {
         Some(rm)
             if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
-                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id) =>
+                && crate::modes::mesh::is_mesh_outbound_route_id(&rm.proxy.id)
+                && !crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&rm.proxy.id) =>
         {
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
@@ -14855,7 +15131,12 @@ async fn handle_proxy_request_inner(
             requires_request_body_buffering,
             stream_request_body,
         )
-        && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
+        && can_attempt_hbone_backend(
+            state.backend_capabilities.as_ref(),
+            &proxy,
+            upstream_target.as_deref(),
+            state.gateway_svid_bundle.load().is_some(),
+        );
     if hbone_required && !current_dispatch_hbone {
         let block_reason = if has_retry {
             "effective retry config disables HBONE dispatch"
@@ -16391,17 +16672,10 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
     });
 
-    // Per-port `maxRequestsPerConnection` is wire-projected end-to-end onto
-    // `Proxy.pool_max_requests_per_connection`. Hyper does not yet expose a
-    // close-after-N-requests builder knob, so the runtime effect remains
-    // pending (same status as the proxy-level field's existing docstring) —
-    // wiring the per-port projection here means the field will light up the
-    // moment a request-count wrapper is introduced. The proxy field is
-    // `Option<u64>`; widen the `u32` override to match the schema.
-    let max_reqs_override = override_config
-        .http_max_requests_per_connection
-        .map(u64::from)
-        .filter(|new| Some(*new) != proxy.pool_max_requests_per_connection);
+    // `maxRequestsPerConnection` is intentionally not projected from
+    // DestinationRule-derived port overrides. It has no backend close-after-N
+    // runtime behavior, so translation/status report it as deferred instead of
+    // letting a legacy carried value appear effective here.
 
     // Per-port backend TLS (DestinationRule `portLevelSettings[].tls`), resolved
     // at apply time. Overrides the proxy's upstream-/subset-level `resolved_tls`
@@ -16433,7 +16707,6 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
-        && max_reqs_override.is_none()
         && tls_override.is_none()
         && h2_upgrade_override.is_none()
         && http1_pending_override.is_none()
@@ -16450,9 +16723,6 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(secs) = idle_seconds_override {
         owned.pool_idle_timeout_seconds = Some(secs);
-    }
-    if let Some(n) = max_reqs_override {
-        owned.pool_max_requests_per_connection = Some(n);
     }
     if let Some(tls) = tls_override {
         owned.resolved_tls = tls.clone();
@@ -19361,9 +19631,25 @@ async fn proxy_to_backend_hbone(
     }
 
     let hbone_port = hbone_pool::target_hbone_port(target);
-    // Pin the destination workload identity declared on the target. A present
-    // but corrupt `mesh.spiffe_id` tag fails CLOSED here — never silently
-    // downgrade a pinned dial to trust-domain-only verification.
+    let dial_host = match hbone_pool::target_hbone_dial_host(target) {
+        Ok(host) => host,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing HBONE dispatch: invalid dial host tag"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
+    // Pin the peer identity declared on the target. A present but corrupt
+    // `mesh.hbone_peer_spiffe_id` / `mesh.spiffe_id` tag fails CLOSED here —
+    // never silently downgrade a pinned dial to trust-domain-only verification.
     let expected_peer = match hbone_pool::target_expected_peer_spiffe(target) {
         Ok(peer) => peer,
         Err(err) => {
@@ -19382,8 +19668,9 @@ async fn proxy_to_backend_hbone(
     };
     let tunnel = match state
         .hbone_pool
-        .get_tunnel(
+        .get_tunnel_via(
             proxy,
+            dial_host,
             &target.host,
             target.port,
             target.dispatch_policy_port(),
@@ -21896,6 +22183,121 @@ mod tests {
     }
 
     #[test]
+    fn node_waypoint_outbound_prefers_ebpf_original_destination() {
+        let socket_capture_endpoint: SocketAddr = "127.0.0.1:15001".parse().unwrap();
+        let ebpf_original_dst: SocketAddr = "10.244.1.4:8080".parse().unwrap();
+
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                Some(socket_capture_endpoint),
+                Some(ebpf_original_dst),
+            ),
+            Some(ebpf_original_dst),
+            "cgroup/connect capture has no conntrack original-dst, so direct Pod-IP HTTP must route by the eBPF original destination"
+        );
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                Some(socket_capture_endpoint),
+                None,
+            ),
+            Some(socket_capture_endpoint),
+            "non-node-waypoint outbound REDIRECT capture still uses SO_ORIGINAL_DST"
+        );
+        assert_eq!(
+            select_mesh_original_dst(
+                Some(crate::modes::mesh::MeshTrafficDirection::Inbound),
+                Some(socket_capture_endpoint),
+                Some(ebpf_original_dst),
+            ),
+            Some(socket_capture_endpoint),
+            "inbound capture is still the iptables original-dst path"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_identity_resolution_is_outbound_capture_only() {
+        assert!(
+            should_resolve_node_waypoint_identity(Some(
+                crate::modes::mesh::MeshTrafficDirection::Outbound
+            )),
+            "pod-loopback outbound capture must resolve the eBPF cookie before request handling"
+        );
+        assert!(
+            !should_resolve_node_waypoint_identity(Some(
+                crate::modes::mesh::MeshTrafficDirection::Inbound
+            )),
+            "peer HBONE connections on the inbound listener do not carry pod-loopback cookies"
+        );
+        assert!(
+            !should_resolve_node_waypoint_identity(None),
+            "non-mesh listeners must not be coupled to the NodeWaypoint identity resolver"
+        );
+    }
+
+    #[test]
+    fn node_waypoint_listener_uid_fallback_is_cookie_lookup_only() {
+        let pod_uid = [1u8; 16];
+        let other_uid = [2u8; 16];
+
+        assert!(node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::SocketCookieUnavailable("not supported".to_string())
+        ));
+        assert!(node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::UnknownCookie(7)
+        ));
+
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::MissingPodUid(7)
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::MissingWorkloadHash { cookie: 7, pod_uid }
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::UnknownPod(pod_uid)
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::WorkloadHashMismatch {
+                pod_uid,
+                expected: 1,
+                actual: 2,
+            }
+        ));
+        assert!(!node_waypoint_listener_uid_fallback_allowed(
+            &NodeWaypointIdentityError::PodUidMismatch {
+                expected: pod_uid,
+                actual: other_uid,
+            }
+        ));
+    }
+
+    #[test]
+    fn direct_pod_ip_http_route_is_node_waypoint_only() {
+        assert!(
+            should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                true
+            ),
+            "NodeWaypoint outbound capture with a resolved source pod identity may route by original pod IP"
+        );
+        assert!(
+            !should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Outbound),
+                false
+            ),
+            "Sidecar and other outbound listeners keep Host routing because they do not have NodeWaypoint pod identity"
+        );
+        assert!(
+            !should_use_direct_pod_ip_http_route(
+                Some(crate::modes::mesh::MeshTrafficDirection::Inbound),
+                true
+            ),
+            "inbound HBONE relay traffic must not use the outbound direct-pod-IP lookup"
+        );
+    }
+
+    #[test]
     fn grpc_streaming_defers_passive_unhealthy_2xx_until_body_terminal() {
         let proxy = streaming_dispatch_test_proxy();
 
@@ -21992,6 +22394,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         };
 
@@ -26024,6 +26427,7 @@ mod tests {
 
     use super::backend_capabilities::{
         BackendCapabilityRecord, BackendCapabilityRegistry, ProtocolSupport, capability_key,
+        capability_key_for_proxy_target,
     };
     use crate::config::types::{BackendScheme, DispatchKind, Upstream};
 
@@ -26975,6 +27379,77 @@ mod tests {
         );
     }
 
+    fn hbone_dispatch_test_target() -> UpstreamTarget {
+        UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::from([(hbone_pool::HBONE_TARGET_TAG.to_string(), "true".to_string())]),
+            locality: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn hbone_dispatch_attempts_unknown_capability_but_not_unsupported() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = warmup_test_proxy("ambient", BackendScheme::Http, "10.0.0.8", 8080);
+        let target = hbone_dispatch_test_target();
+
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "missing capability record must attempt HBONE so a cold probe cannot block mesh.hbone targets before the live tunnel can prove or downgrade them"
+        );
+
+        let key = capability_key_for_proxy_target(&proxy, Some(&target));
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Unknown,
+            ..Default::default()
+        };
+        registry.upsert(key.clone(), record);
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Unknown must attempt HBONE; startup probes can time out before the first request"
+        );
+
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Supported,
+            ..Default::default()
+        };
+        registry.upsert(key.clone(), record);
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Supported should dispatch through the tunnel"
+        );
+
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Unsupported,
+            ..Default::default()
+        };
+        registry.upsert(key.clone(), record);
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Unsupported must stay fail-closed instead of plaintext direct-backend fallback"
+        );
+
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&target), false),
+            "missing gateway SVID must fail closed before any HBONE dial"
+        );
+        let https_proxy = warmup_test_proxy("https", BackendScheme::Https, "10.0.0.8", 8443);
+        assert!(
+            !can_attempt_hbone_backend(&registry, &https_proxy, Some(&target), true),
+            "HTTPS backends are not yet safe for HTTP-over-HBONE dispatch"
+        );
+        let mut untagged = target;
+        untagged.tags.clear();
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&untagged), true),
+            "only mesh.hbone=true targets use the HBONE backend path"
+        );
+    }
+
     #[test]
     fn hbone_http1_host_authority_includes_backend_port() {
         assert_eq!(
@@ -27149,6 +27624,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         });
         // Now the workload's declared application port is allowed on loopback...
@@ -27294,10 +27770,30 @@ mod tests {
         initial_config: GatewayConfig,
         env_config: crate::config::env_config::EnvConfig,
     ) -> ProxyState {
+        let reserved_gateway_ports = env_config.reserved_gateway_ports();
+        make_test_proxy_state_with_reserved_ports(
+            initial_config,
+            env_config,
+            reserved_gateway_ports,
+        )
+    }
+
+    fn make_test_proxy_state_with_reserved_ports(
+        initial_config: GatewayConfig,
+        env_config: crate::config::env_config::EnvConfig,
+        reserved_gateway_ports: HashSet<u16>,
+    ) -> ProxyState {
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
-        ProxyState::new(initial_config, dns_cache, env_config, None, None)
-            .expect("ProxyState construction should succeed in tests")
-            .0
+        ProxyState::new_with_reserved_gateway_ports(
+            initial_config,
+            dns_cache,
+            env_config,
+            None,
+            None,
+            reserved_gateway_ports,
+        )
+        .expect("ProxyState construction should succeed in tests")
+        .0
     }
 
     fn header_value<'a>(
@@ -27350,6 +27846,22 @@ mod tests {
             "backend_tls_verify_server_cert": true,
         }))
         .expect("validation test proxy should deserialize")
+    }
+
+    fn make_validation_stream_proxy(id: &str, listen_port: u16) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": "test-stream-proxy",
+            "listen_port": listen_port,
+            "backend_scheme": "tcp",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "backend_tls_verify_server_cert": true,
+        }))
+        .expect("validation test stream proxy should deserialize");
+        proxy.normalize_fields();
+        proxy
     }
 
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
@@ -27722,6 +28234,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_full_config_uses_effective_reserved_ports_for_reload() {
+        let env_config = crate::config::env_config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 41_001,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            ..crate::config::env_config::EnvConfig::default()
+        };
+        let state = make_test_proxy_state_with_reserved_ports(
+            make_validation_config(vec![]),
+            env_config,
+            HashSet::from([41_000]),
+        );
+
+        let actual_reserved =
+            make_validation_config(vec![make_validation_stream_proxy("stream-actual", 41_000)]);
+        let err = state
+            .validate_full_config(&actual_reserved)
+            .expect_err("effective reserved port must be rejected");
+        assert!(
+            err.iter().any(|msg| msg.contains("gateway reserved port")),
+            "error must identify gateway reserved-port conflict; got {err:?}"
+        );
+
+        let stale_env_port =
+            make_validation_config(vec![make_validation_stream_proxy("stream-env", 41_001)]);
+        assert!(
+            state.validate_full_config(&stale_env_port).is_ok(),
+            "reload validation must not reject an EnvConfig port that is not in the effective reserved set",
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_effective_reserved_port_without_swapping() {
+        let env_config = crate::config::env_config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 41_001,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            ..crate::config::env_config::EnvConfig::default()
+        };
+        let state = make_test_proxy_state_with_reserved_ports(
+            make_validation_config(vec![]),
+            env_config,
+            HashSet::from([41_000]),
+        );
+        let pre_swap_loaded_at = state.config.load_full().loaded_at;
+        let rejected =
+            make_validation_config(vec![make_validation_stream_proxy("stream-actual", 41_000)]);
+
+        let outcome = state.update_config(rejected);
+
+        assert!(
+            matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+            "reserved stream port must reject reload; got {outcome:?}"
+        );
+        let post_attempt_config = state.config.load_full();
+        assert!(
+            post_attempt_config.proxies.is_empty(),
+            "rejected reserved-port reload must preserve previous config"
+        );
+        assert_eq!(
+            post_attempt_config.loaded_at, pre_swap_loaded_at,
+            "loaded_at must not advance when reserved-port validation rejects reload"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_full_config_rejects_dangling_mesh_route_dispatch_upstream_id() {
         // External-review P2: mesh_route_dispatch.destination.upstream_id
         // typos used to be warn-only and silently routed matched traffic
@@ -27870,6 +28452,7 @@ mod tests {
                 removed_plugin_config_ids: vec!["pc1".to_string()],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
+                sequence_cursor: 0,
                 poll_timestamp: now,
             })
             .await;
@@ -27930,6 +28513,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             }
         }
@@ -28356,8 +28940,9 @@ mod tests {
     // ── T1-C: HTTP connection-pool projection onto effective proxy ───────
 
     /// Helper: clone the standard test proxy and add a per-port override
-    /// carrying the three new HTTP fields plus the existing connect timeout
-    /// so each test can dial in only the field it cares about.
+    /// carrying the supported HTTP fields plus a legacy
+    /// maxRequestsPerConnection carrier and the existing connect timeout so
+    /// each test can dial in only the field it cares about.
     fn proxy_with_http_overrides_for_test(
         connect_ms: u64,
         h2_streams: Option<u32>,
@@ -28407,15 +28992,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_effective_proxy_projects_max_requests_per_connection_as_u64() {
-        // Per-port wire field is `u32`; `Proxy.pool_max_requests_per_connection`
-        // is `Option<u64>` for schema compatibility. The widening conversion
-        // must round-trip without sign drift or truncation.
+    fn resolve_effective_proxy_ignores_legacy_max_requests_per_connection() {
+        // The field has no close-after-N runtime behavior. A legacy carried
+        // override must not make the effective proxy look programmed.
         let proxy = proxy_with_http_overrides_for_test(5000, None, None, Some(40));
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
-        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
-        assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "a legacy-only maxRequestsPerConnection override must be ignored"
+        );
+        assert_eq!(effective.pool_max_requests_per_connection, None);
     }
 
     #[test]
@@ -28445,7 +29032,6 @@ mod tests {
             proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
         proxy.pool_http2_max_concurrent_streams = Some(250);
         proxy.pool_idle_timeout_seconds = Some(120);
-        proxy.pool_max_requests_per_connection = Some(40);
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(
@@ -28464,7 +29050,6 @@ mod tests {
             proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
         proxy.backend_connect_timeout_ms = 5000; // override = 5000 too, no diff
         proxy.pool_idle_timeout_seconds = Some(120); // matches override
-        proxy.pool_max_requests_per_connection = Some(40); // matches override
         // h2 streams currently None → override Some(250) differs.
         // Override `connect_timeout_ms` to a different value so it's a diff
         // too: but we already set proxy=5000 and override=5000 above → matches.
@@ -28483,7 +29068,7 @@ mod tests {
         assert_eq!(owned.pool_http2_max_concurrent_streams, Some(250));
         // Unchanged fields preserved from proxy:
         assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
-        assert_eq!(owned.pool_max_requests_per_connection, Some(40));
+        assert_eq!(owned.pool_max_requests_per_connection, None);
     }
 
     // ── F5.1: h2UpgradePolicy projection + dispatch decision ─────────────

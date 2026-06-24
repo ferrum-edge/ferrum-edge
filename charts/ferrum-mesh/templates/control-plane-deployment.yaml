@@ -30,6 +30,10 @@ spec:
               containerPort: {{ .Values.controlPlane.grpcPort }}
           env:
             {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
+            {{- if not (hasKey .Values.controlPlane.env "FERRUM_K8S_CONTROLLER_NAMESPACE") }}
+            - name: FERRUM_K8S_CONTROLLER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            {{- end }}
             {{- range $name, $value := .Values.controlPlane.env }}
             {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET")) }}
             - name: {{ $name }}

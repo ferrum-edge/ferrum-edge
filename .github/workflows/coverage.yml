@@ -38,7 +38,7 @@ jobs:
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
           fetch-depth: 0
 
@@ -55,7 +55,7 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             mode=skip
             reason="no plugin coverage-relevant files changed"
-            base_ref="${BASE_SHA:-origin/${BASE_REF}}"
+            base_ref="origin/${BASE_REF}"
             git diff --name-only "${base_ref}...HEAD" > "$changed_files"
 
             plugin_pattern='^(\.github/workflows/coverage\.yml|scripts/check_coverage_thresholds\.py|src/plugin_cache\.rs|tests/functional/functional_redis_rate_limiting_test\.rs)$|^(src/plugins/|tests/unit/plugins/)'
@@ -84,7 +84,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BASE_REF: ${{ github.base_ref }}
 
   coverage-shard:
@@ -170,17 +169,18 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
+              integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_offline_bootstrap_tests
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-coverage"
 
       - name: Install cargo-llvm-cov and cargo-nextest
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -273,7 +273,7 @@ jobs:
         if: needs.coverage-plan.outputs.mode == 'full' && needs.coverage-shard.result != 'success'
         run: exit 1
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         if: needs.coverage-plan.outputs.mode != 'skip'
         with:
           fetch-depth: 0
@@ -285,7 +285,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.coverage-plan.outputs.mode != 'skip'
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-llvm-cov
 
@@ -413,7 +413,7 @@ jobs:
 
           changed_base_args=()
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            base_ref="${BASE_SHA:-origin/${BASE_REF}}"
+            base_ref="origin/${BASE_REF}"
             changed_base_args=(--changed-base "$base_ref")
           fi
 
@@ -425,7 +425,6 @@ jobs:
         env:
           COVERAGE_MODE: ${{ needs.coverage-plan.outputs.mode }}
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BASE_REF: ${{ github.base_ref }}
 
       - name: Upload coverage report

@@ -108,11 +108,20 @@ These settings have no effect when `FERRUM_DB_TYPE=mongodb`:
 ## Read Consistency
 
 Ferrum's MongoDB config store uses primary reads for startup full loads,
-incremental polling, deletion detection, relationship reads, and admin reads.
+incremental change-log polling, relationship reads, and admin reads.
 If `FERRUM_DB_URL` includes a `readPreference` option, Ferrum logs a warning and
 overrides it to primary when building the MongoDB client. This prevents replica
 lag from hiding runtime config changes or advancing polling cursors against a
 stale secondary.
+
+When `FERRUM_MONGO_REPLICA_SET` is configured, startup and fallback full loads
+run inside a snapshot transaction so proxies, consumers, plugin configs, and
+upstreams come from one multi-collection view. A full-load query, decode, or
+validation failure rejects the complete candidate and the gateway keeps serving
+the last known-good runtime configuration. Standalone MongoDB deployments cannot
+provide multi-collection snapshots; Ferrum uses sequential primary reads there
+and rejects candidates only for errors and validation checks enforced by the
+runtime load path, so concurrent writes can require a later poll to converge.
 
 `FERRUM_DB_READ_REPLICA_URL` is SQL-only. MongoDB replica sets are still useful
 for primary failover, transactions, and majority write concern; they are not a
@@ -169,7 +178,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key      # mTLS
 
 `FERRUM_DB_TLS_MODE=require` enables encrypted MongoDB connections but allows invalid server certificates. `FERRUM_DB_TLS_MODE=verify-full` enables TLS and validates the server certificate chain, using `FERRUM_DB_TLS_CA_CERT_PATH` when provided.
 
-**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate cert/key files and the gateway automatically combines them into a PID-scoped temp file (`/tmp/ferrum-mongo-client-{pid}.pem`).
+**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate cert/key files and the gateway automatically combines them into an owner-scoped temporary PEM. Generated PEMs use restrictive permissions, remain available while the active MongoDB driver client may need them, and are removed automatically after the owning connection bundle is dropped.
 
 ### Approach 2: Connection String Options
 
@@ -340,11 +349,14 @@ New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `Plu
 
 ## Incremental Polling
 
-MongoDB uses the same incremental polling strategy as SQL backends:
+MongoDB replica sets use the same durable incremental polling strategy as SQL backends:
 
-1. **Startup:** Full collection scan loads all documents
-2. **Subsequent polls:** `updated_at > last_poll_timestamp` queries fetch only changed documents (indexed)
-3. **Deletion detection:** Lightweight `_id` projection queries detect removed documents
-4. **Fallback:** If incremental poll fails, falls back to full collection scan
+1. **Startup:** A full load reads all runtime collections and seeds the latest accepted `config_changes.sequence`. Replica sets use a snapshot transaction; standalone deployments use sequential primary reads and only reject inconsistencies caught by the runtime load validation path.
+2. **Subsequent polls:** Pollers read ordered `config_changes` documents after the accepted sequence cursor, collapse each resource to its final operation in the batch, and point-load changed IDs only.
+3. **Deletion detection:** Deletes are delivered by durable `config_changes` delete records; normal incremental polling does not scan every runtime collection ID.
+4. **Retention:** Old change records are compacted after the retained per-namespace window. If a poller's cursor is older than retained history, it falls back to the same full-load path and reseeds the sequence cursor.
+5. **Fallback:** If incremental poll fails, Ferrum falls back to the same full-load path and rejects the candidate on any query, decode, or runtime load validation error.
 
-The `updated_at` indexes on all four collections ensure polling queries use index scans, not full collection scans.
+The `config_changes` collection has `{namespace, sequence}` and `{sequence}` indexes so polling cost is proportional to the number of retained changes read, not total runtime resource count.
+
+Standalone MongoDB does not provide multi-document transactions, so resource writes and their `config_changes` records cannot be made crash-atomic. Ferrum therefore forces standalone MongoDB pollers through the full-load fallback path instead of accepting an incremental cursor that could miss a resource mutation whose change record was not committed.

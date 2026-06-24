@@ -526,19 +526,63 @@ async fn open_grpc_stream(
     })
 }
 
-/// Wait for the gateway to start by attempting TCP connections.
+async fn probe_gateway_h2c(
+    gateway_addr: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use hyper::client::conn::http2;
+
+    let addr: SocketAddr = gateway_addr.parse()?;
+    let stream = tokio::time::timeout(
+        Duration::from_millis(750),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await??;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = tokio::time::timeout(
+        Duration::from_secs(1),
+        http2::handshake(TokioExecutor::new(), io),
+    )
+    .await??;
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/__ferrum_startup_probe")
+        .body(Full::new(Bytes::new()))?;
+    let response = tokio::time::timeout(Duration::from_secs(1), sender.send_request(req)).await??;
+    let _ = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect()).await??;
+    conn_task.abort();
+
+    Ok(())
+}
+
+/// Wait for the gateway to start by proving the selected port speaks h2c.
 /// Returns Ok(()) on success, Err on timeout — does not panic.
-async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+async fn wait_for_gateway(
+    gateway_port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let addr = format!("127.0.0.1:{}", gateway_port);
+    let mut last_err = String::new();
 
     loop {
-        if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 15 seconds".into());
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Gateway did not become h2c-ready within 15 seconds: {}",
+                last_err
+            )
+            .into());
         }
-        match tokio::net::TcpStream::connect(&addr).await {
+        match probe_gateway_h2c(&addr).await {
             Ok(_) => return Ok(()),
-            Err(_) => sleep(Duration::from_millis(300)).await,
+            Err(e) => {
+                last_err = e.to_string();
+                sleep(Duration::from_millis(300)).await;
+            }
         }
     }
 }
@@ -563,7 +607,25 @@ async fn start_gateway_with_retry_extra_env(
         let gateway_port = free_port().await;
         match start_gateway_with_extra_env(config_path, gateway_port, extra_env) {
             Ok(mut child) => match wait_for_gateway(gateway_port).await {
-                Ok(()) => return (child, gateway_port),
+                Ok(()) => match child.try_wait() {
+                    Ok(Some(status)) => {
+                        last_err = format!("gateway exited during startup with status {status}");
+                        eprintln!(
+                            "Gateway startup attempt {}/{} failed (port {}): {}",
+                            attempt, MAX_ATTEMPTS, gateway_port, last_err
+                        );
+                    }
+                    Ok(None) => return (child, gateway_port),
+                    Err(e) => {
+                        last_err = format!("failed to inspect gateway process status: {e}");
+                        eprintln!(
+                            "Gateway startup attempt {}/{} failed (port {}): {}",
+                            attempt, MAX_ATTEMPTS, gateway_port, last_err
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                },
                 Err(e) => {
                     last_err = e.to_string();
                     eprintln!(

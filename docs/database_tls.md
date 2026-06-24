@@ -277,7 +277,7 @@ export FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.crt
 export FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client.key
 ```
 
-**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` files and the gateway will combine them into a temporary PEM file at startup.
+**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` files and the gateway will combine them into an owner-scoped temporary PEM. Generated PEMs use restrictive permissions, remain available while the active MongoDB driver client may need them, and are removed automatically after the owning connection bundle is dropped.
 
 #### Encrypted Only (No Server Certificate Verification)
 
