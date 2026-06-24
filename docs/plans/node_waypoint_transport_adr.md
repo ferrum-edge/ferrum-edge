@@ -196,9 +196,10 @@ policy.
 
 The live gate asserts both denied in-mesh sources and unmanaged non-mesh sources
 cannot reach enrolled destination pods directly over IPv4, plus the unmanaged
-IPv6 direct-inbound path when the cluster is dual-stack. H2 is not complete
-until stale-IP reuse and the remaining production identity-profile cases are
-covered.
+IPv6 direct-inbound path when the cluster is dual-stack. It also forces source
+workload IPv4 reuse in the disposable kind CNI and proves the replacement
+UID/identity is admitted while stale registry state is gone. H2 is not complete
+until the remaining production identity-profile cases are covered.
 
 ## Failure Behavior
 
@@ -251,6 +252,7 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv4.direct_inbound_guard_same_node`
 - `node_waypoint.ipv4.direct_inbound_guard_cross_node`
 - `node_waypoint.identity.stale_cleanup`
+- `node_waypoint.identity.stale_ip_reuse`
 - `node_waypoint.identity.spire_chart_profile`
 - `node_waypoint.identity.plaintext_hbone_rejected`
 - `node_waypoint.identity.unauthenticated_hbone_rejected`

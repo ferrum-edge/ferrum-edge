@@ -42,6 +42,10 @@ TRUST_DOMAIN="${FERRUM_LIVE_TRUST_DOMAIN:-cluster.local}"
 RESULTS_DIR="$ROOT_DIR/target/node-waypoint-ebpf-live"
 LIVE_ASSERTIONS_FILE="${FERRUM_LIVE_ASSERTIONS_FILE:-$RESULTS_DIR/live-assertions.json}"
 LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-dual-stack-node-waypoint-ebpf}"
+STALE_IP_REUSE_HOST_LOCAL_PROFILE=false
+if [[ "$LIVE_PLATFORM_PROFILE" == "kind-dual-stack-node-waypoint-ebpf" ]]; then
+  STALE_IP_REUSE_HOST_LOCAL_PROFILE=true
+fi
 LIVE_ASSERTIONS_INITIALIZED=false
 RECORDED_LIVE_ASSERTIONS=" "
 TRUSTED_KUBELET_PROBE_IPS=""
@@ -62,6 +66,11 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.identity.stale_cleanup
   node_waypoint.identity.spire_chart_profile
 )
+if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" == "true" ]]; then
+  REQUIRED_LIVE_ASSERTIONS+=(
+    node_waypoint.identity.stale_ip_reuse
+  )
+fi
 if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
     node_waypoint.ebpf.registry_ready_ipv6
@@ -1520,6 +1529,163 @@ node_host_file_exists() {
   fi
 }
 
+ipv4_predecessor() {
+  local ip="$1"
+  python3 - "$ip" <<'PY'
+import ipaddress
+import sys
+
+ip = ipaddress.IPv4Address(sys.argv[1])
+if int(ip) == 0:
+    raise SystemExit("0.0.0.0 has no predecessor")
+print(ipaddress.IPv4Address(int(ip) - 1))
+PY
+}
+
+kind_cni_network_dir_for_ip() {
+  local node="$1"
+  local ip="$2"
+  if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    docker exec "$node" sh -eu -c '
+      ip="$1"
+      cni_roots() {
+        printf "%s\n" /run/cni-ipam-state /var/lib/cni/networks
+        [ -d /etc/cni/net.d ] || return 0
+        find /etc/cni/net.d -maxdepth 1 -type f \( -name "*.conf" -o -name "*.conflist" -o -name "*.json" \) -print 2>/dev/null |
+          while IFS= read -r config; do
+            sed -n "s/.*\"dataDir\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$config" 2>/dev/null || true
+          done
+      }
+      path=""
+      roots="$(cni_roots)"
+      while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        [ -d "$root" ] || continue
+        candidate="$(find "$root" -mindepth 2 -maxdepth 2 -type f -name "$ip" -print -quit 2>/dev/null || true)"
+        if [ -n "$candidate" ]; then
+          path="$candidate"
+          break
+        fi
+      done <<EOF
+$roots
+EOF
+      [ -n "$path" ] || exit 1
+      dirname "$path"
+    ' sh "$ip"
+  else
+    kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
+      chroot /host sh -eu -c '
+        ip="$1"
+        cni_roots() {
+          printf "%s\n" /run/cni-ipam-state /var/lib/cni/networks
+          [ -d /etc/cni/net.d ] || return 0
+          find /etc/cni/net.d -maxdepth 1 -type f \( -name "*.conf" -o -name "*.conflist" -o -name "*.json" \) -print 2>/dev/null |
+            while IFS= read -r config; do
+              sed -n "s/.*\"dataDir\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$config" 2>/dev/null || true
+            done
+        }
+        path=""
+        roots="$(cni_roots)"
+        while IFS= read -r root; do
+          [ -n "$root" ] || continue
+          [ -d "$root" ] || continue
+          candidate="$(find "$root" -mindepth 2 -maxdepth 2 -type f -name "$ip" -print -quit 2>/dev/null || true)"
+          if [ -n "$candidate" ]; then
+            path="$candidate"
+            break
+          fi
+        done <<EOF
+$roots
+EOF
+        [ -n "$path" ] || exit 1
+        dirname "$path"
+      ' sh "$ip"
+  fi
+}
+
+force_next_kind_ipv4_pod_ip_reuse() {
+  local node="$1"
+  local cni_network_dir="$2"
+  local ip="$3"
+  local predecessor
+  predecessor="$(ipv4_predecessor "$ip")"
+  mkdir -p "$RESULTS_DIR/cni-ip-reuse"
+  local out="$RESULTS_DIR/cni-ip-reuse/$node.txt"
+  # The CI profile is disposable kind with host-local CNI. Resetting
+  # last_reserved_ip to the predecessor makes the next pod allocation reuse
+  # this IPv4 address while preserving the real CNI allocation path.
+  if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    docker exec "$node" sh -eu -c '
+      dir="$1"
+      ip="$2"
+      predecessor="$3"
+      [ -d "$dir" ] || {
+        echo "missing CNI host-local network directory $dir" >&2
+        exit 1
+      }
+      [ ! -e "$dir/$ip" ] || {
+        echo "CNI lease $dir/$ip still exists; refusing to force reuse" >&2
+        exit 1
+      }
+      cursor_files="$(
+        find "$dir" -maxdepth 1 -type f \( -name last_reserved_ip -o -name "last_reserved_ip.*" \) -print |
+          while IFS= read -r candidate; do
+            current="$(cat "$candidate" 2>/dev/null || true)"
+            printf "%s\n" "$current" | grep -q ":" && continue
+            printf "%s\n" "$candidate"
+          done
+      )"
+      [ -n "$cursor_files" ] || cursor_files="$dir/last_reserved_ip.0"
+      printf "%s\n" "$cursor_files" |
+        while IFS= read -r cursor; do
+          [ -n "$cursor" ] || continue
+          printf "%s\n" "$predecessor" >"$cursor"
+        done
+      printf "network_dir=%s\nforced_next_ip=%s\n" "$dir" "$ip"
+      printf "%s\n" "$cursor_files" |
+        while IFS= read -r cursor; do
+          [ -n "$cursor" ] || continue
+          printf "cursor_file=%s\ncursor_value=%s\n" "$cursor" "$(cat "$cursor")"
+        done
+    ' sh "$cni_network_dir" "$ip" "$predecessor" >"$out"
+  else
+    kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
+      chroot /host sh -eu -c '
+        dir="$1"
+        ip="$2"
+        predecessor="$3"
+        [ -d "$dir" ] || {
+          echo "missing CNI host-local network directory $dir" >&2
+          exit 1
+        }
+        [ ! -e "$dir/$ip" ] || {
+          echo "CNI lease $dir/$ip still exists; refusing to force reuse" >&2
+          exit 1
+        }
+        cursor_files="$(
+          find "$dir" -maxdepth 1 -type f \( -name last_reserved_ip -o -name "last_reserved_ip.*" \) -print |
+            while IFS= read -r candidate; do
+              current="$(cat "$candidate" 2>/dev/null || true)"
+              printf "%s\n" "$current" | grep -q ":" && continue
+              printf "%s\n" "$candidate"
+            done
+        )"
+        [ -n "$cursor_files" ] || cursor_files="$dir/last_reserved_ip.0"
+        printf "%s\n" "$cursor_files" |
+          while IFS= read -r cursor; do
+            [ -n "$cursor" ] || continue
+            printf "%s\n" "$predecessor" >"$cursor"
+          done
+        printf "network_dir=%s\nforced_next_ip=%s\n" "$dir" "$ip"
+        printf "%s\n" "$cursor_files" |
+          while IFS= read -r cursor; do
+            [ -n "$cursor" ] || continue
+            printf "cursor_file=%s\ncursor_value=%s\n" "$cursor" "$(cat "$cursor")"
+          done
+      ' sh "$cni_network_dir" "$ip" "$predecessor" >"$out"
+  fi
+}
+
 dump_node_waypoint_registry() {
   local node="$1"
   local out="$RESULTS_DIR/node-waypoint-registry-$node.txt"
@@ -1953,7 +2119,7 @@ curl_for_family_from_namespace() {
   esac
 }
 
-wait_for_node_waypoint_admission() {
+try_wait_for_node_waypoint_admission() {
   local from="$1"
   local label="$2"
   local url="$3"
@@ -1964,7 +2130,7 @@ wait_for_node_waypoint_admission() {
   if [[ -z "${uid:-}" || -z "${node:-}" || -z "${pod:-}" ]]; then
     echo "could not resolve workload pod record for app=$from" >&2
     kubectl -n "$WORKLOAD_NS" get pods -o wide >&2 || true
-    exit 1
+    return 1
   fi
 
   log "waiting for NodeWaypoint admission for $label ($pod on $node)"
@@ -2006,7 +2172,11 @@ wait_for_node_waypoint_admission() {
   fi
   collect_traffic_failure_diagnostics
   summarize_orig_dst4_records_for_uid "$node" "$uid" 8080 >&2 || true
-  exit 1
+  return 1
+}
+
+wait_for_node_waypoint_admission() {
+  try_wait_for_node_waypoint_admission "$@" || exit 1
 }
 
 expect_allowed() {
@@ -2611,16 +2781,182 @@ run_traffic_checks() {
 
   run_hbone_identity_negative_checks
 
-  log "checking stale identity cleanup across source workload recreation"
-  local old_src_a_uid old_src_a_node
-  old_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
-  old_src_a_node="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].spec.nodeName}')"
-  kubectl -n "$WORKLOAD_NS" delete pod -l app=src-a --wait=true
+  if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" != "true" ]]; then
+    log "checking stale identity cleanup across source workload recreation"
+    local old_src_a_uid old_src_a_node
+    old_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
+    old_src_a_node="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].spec.nodeName}')"
+    kubectl -n "$WORKLOAD_NS" delete pod -l app=src-a --wait=true
+    wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"
+    kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
+    wait_for_node_waypoint_ready_markers
+    wait_for_ambient_mesh_slice
+    wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+    wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+    if ! expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4; then
+      record_live_assertion \
+        node_waypoint.identity.stale_cleanup \
+        fail \
+        src-a \
+        dst-a \
+        "recreated-source-not-admitted" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)"
+      return 1
+    fi
+    if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+      record_live_assertion \
+        node_waypoint.identity.stale_cleanup \
+        fail \
+        src-b \
+        dst-a \
+        "post-recreation-deny-regressed" \
+        "$(spiffe_for_sa src-b)" \
+        "$(spiffe_for_sa dst-a)"
+      return 1
+    fi
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      pass \
+      src-a \
+      dst-a \
+      "deleted-source-registry-marker-removed-and-recreated-source-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return
+  fi
+
+  log "checking stale identity cleanup across forced source workload IPv4 reuse"
+  local old_src_a_uid old_src_a_node old_src_a_pod old_src_a_ip old_src_a_cni_dir
+  local new_src_a_uid new_src_a_ip src_a_reuse_identities_file
+  IFS=$'\t' read -r old_src_a_uid old_src_a_node old_src_a_pod < <(workload_pod_record_for_app src-a)
+  old_src_a_ip="$(pod_ip src-a)"
+  if [[ -z "$old_src_a_uid" || -z "$old_src_a_node" || -z "$old_src_a_pod" || -z "$old_src_a_ip" ]]; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "could-not-resolve-original-source-pod-for-ip-reuse" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return 1
+  fi
+  if [[ "$old_src_a_ip" == *:* ]]; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "source-pod-primary-ip-is-not-ipv4-$old_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return 1
+  fi
+  if ! old_src_a_cni_dir="$(kind_cni_network_dir_for_ip "$old_src_a_node" "$old_src_a_ip")"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "could-not-find-kind-cni-lease-for-$old_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  kubectl -n "$WORKLOAD_NS" scale deploy/src-a --replicas=0
+  if kubectl -n "$WORKLOAD_NS" get "pod/$old_src_a_pod" >/dev/null 2>&1; then
+    if ! kubectl -n "$WORKLOAD_NS" wait --for=delete "pod/$old_src_a_pod" --timeout=3m; then
+      record_live_assertion \
+        node_waypoint.identity.stale_ip_reuse \
+        fail \
+        src-a \
+        dst-a \
+        "source-pod-delete-timeout-before-ip-reuse" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+  fi
   wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"
+  if ! force_next_kind_ipv4_pod_ip_reuse "$old_src_a_node" "$old_src_a_cni_dir" "$old_src_a_ip"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "could-not-force-kind-cni-reuse-for-$old_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  kubectl -n "$WORKLOAD_NS" scale deploy/src-a --replicas=1
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
-  wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  new_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
+  new_src_a_ip="$(pod_ip src-a)"
+  if [[ "$new_src_a_uid" == "$old_src_a_uid" || "$new_src_a_ip" != "$old_src_a_ip" ]]; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "expected-new-uid-with-reused-ip-$old_src_a_ip-got-uid-$new_src_a_uid-ip-$new_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! try_wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-a \
+      dst-a \
+      "recreated-source-not-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "reused-ip-replacement-source-not-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    return 1
+  fi
+  src_a_reuse_identities_file="$RESULTS_DIR/ambient-node-waypoint-admission/src-a-$new_src_a_uid.json"
+  if [[ ! -f "$src_a_reuse_identities_file" ]] ||
+    node_waypoint_identities_include_uid "$src_a_reuse_identities_file" "$old_src_a_uid"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "reused-ip-identity-snapshot-still-contained-old-uid-$old_src_a_uid" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  record_live_assertion \
+    node_waypoint.identity.stale_ip_reuse \
+    pass \
+    src-a \
+    dst-a \
+    "source-workload-recreated-with-new-uid-reused-ip-$old_src_a_ip-and-old-uid-absent" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)" \
+    "cni-ip-reuse"
   wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
   if ! expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4; then
     record_live_assertion \

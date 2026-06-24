@@ -21,10 +21,17 @@ matching `ferrum_mesh_cert_expiry_seconds{source="workload_api"}` metric, checks
 program/link/map evidence with `bpftool`, creates same-node and cross-node
 source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
 verifies `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the
-live `AuthorizationPolicy`, and checks stale source identities stay denied after
-pod recreation. In production SPIRE mode it also verifies that every ambient
-DaemonSet pod rejects plaintext and no-client-SVID connections to the HBONE
-listener. The no-client-SVID probe uses a valid authority-form CONNECT target
+live `AuthorizationPolicy`, and forces the `src-a` workload to be recreated with
+a new UID on the same IPv4 address so stale source identity and registry state
+cannot be reused or block the replacement; the runtime identity snapshot for the
+replacement must not contain the deleted pod's old UID. The same-IPv4 reuse
+assertion is specific to the default `kind-dual-stack-node-waypoint-ebpf`
+profile and its host-local CNI lease files; other disposable profiles retain the
+non-forced delete/recreate stale-cleanup check without requiring
+`stale_ip_reuse`. In
+production SPIRE mode it also verifies that every ambient DaemonSet pod rejects
+plaintext and no-client-SVID connections to the HBONE listener. The
+no-client-SVID probe uses a valid authority-form CONNECT target
 and accepts only a transport/protocol failure or Ferrum's explicit
 `{"error":"Mesh authorization denied: missing per-pod policy scope"}` 403 denial,
 not a generic non-200 response. It then temporarily pins the trusted HBONE
