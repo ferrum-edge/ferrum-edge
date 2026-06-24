@@ -900,7 +900,7 @@ PY
     fetched=false
     for _ in $(seq 1 40); do
       if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
-        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"spire_agent\"}" "$metrics_file"; then
+        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"workload_api\"}" "$metrics_file"; then
           fetched=true
           break
         fi
