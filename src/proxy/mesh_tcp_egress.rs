@@ -135,10 +135,23 @@ pub(crate) async fn handle_mesh_tcp_egress(
             }
         };
         let hbone_port = hbone_pool::target_hbone_port(&target);
+        let dial_host = match hbone_pool::target_hbone_dial_host(&target) {
+            Ok(host) => host,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    error = %err,
+                    "Raw-TCP mesh egress target carries a corrupt HBONE dial host; refusing dial"
+                );
+                return;
+            }
+        };
         match state
             .hbone_pool
-            .get_tunnel(
+            .get_tunnel_via(
                 proxy,
+                dial_host,
                 &target.host,
                 target.port,
                 target.dispatch_policy_port(),

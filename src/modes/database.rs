@@ -6,22 +6,23 @@
 //! 3. Load full config from DB (falls back to on-disk JSON backup if DB is unreachable)
 //! 4. Build all caches (router, plugin, consumer, load balancer, circuit breaker)
 //! 5. Start proxy + admin listeners
-//! 6. Enter the polling loop: incremental `WHERE updated_at > ?` queries every N seconds,
-//!    with automatic fallback to full reload + DB failover on error
+//! 6. Enter the polling loop: read durable config changes after the accepted
+//!    sequence cursor, with automatic fallback to full reload + DB failover on error
 //!
 //! The admin API is read/write in this mode. A `db_available` AtomicBool gates
 //! write endpoints — when the DB is unreachable, the admin API becomes temporarily
 //! read-only and returns 503 on mutations.
 
 use anyhow::Context;
-use std::collections::HashSet;
+use arc_swap::ArcSwap;
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -30,6 +31,7 @@ use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
+use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::file::{
     ListenerJoinHandle, await_fallible_listener_handles, join_background_handles,
@@ -54,6 +56,781 @@ async fn shutdown_database_runtime_tasks(
     background_handles.extend(proxy_state.health_checker.take_active_check_handles());
     join_background_handles(background_handles, Duration::from_secs(5)).await;
     listener_result
+}
+
+pub const DATABASE_DELTA_RESOURCE_CATEGORY_LABELS: [&str; 6] = [
+    "none",
+    "proxy",
+    "consumer",
+    "plugin_config",
+    "upstream",
+    "mixed",
+];
+pub const DATABASE_DELTA_BACKOFF_BUCKET_LABELS: [&str; 6] =
+    ["none", "lt_5s", "lt_30s", "lt_5m", "gte_5m", "max"];
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct DatabaseDeltaPollDegraded {
+    pub reason: &'static str,
+    pub resource_category: &'static str,
+    pub validation_category: &'static str,
+    pub consecutive_identical_rejections: u64,
+    pub current_backoff_bucket: &'static str,
+    pub current_backoff_seconds: u64,
+    pub escalated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct DatabaseDeltaPollMetricsSnapshot {
+    pub rejected_deltas_total: u64,
+    pub rejected_deltas_by_resource_category: BTreeMap<&'static str, u64>,
+    pub consecutive_identical_rejections: u64,
+    pub current_backoff_bucket: &'static str,
+    pub current_backoff_seconds: u64,
+    pub forced_full_reloads_total: u64,
+    pub recoveries_total: u64,
+    pub last_resource_category: &'static str,
+    pub degraded: Option<DatabaseDeltaPollDegraded>,
+}
+
+/// Bounded observability for database incremental-delta rejections.
+///
+/// The metric dimensions are fixed enums. Resource IDs and validation strings
+/// are hashed or classified before reaching this type so `/metrics` cannot
+/// grow unbounded time series from hostile or malformed database rows.
+#[derive(Debug)]
+pub struct DatabaseDeltaPollMetrics {
+    rejected_deltas_total: AtomicU64,
+    rejected_none: AtomicU64,
+    rejected_proxy: AtomicU64,
+    rejected_consumer: AtomicU64,
+    rejected_plugin_config: AtomicU64,
+    rejected_upstream: AtomicU64,
+    rejected_mixed: AtomicU64,
+    consecutive_identical_rejections: AtomicU64,
+    current_backoff_bucket: AtomicU8,
+    current_backoff_seconds: AtomicU64,
+    forced_full_reloads_total: AtomicU64,
+    recoveries_total: AtomicU64,
+    last_resource_category: AtomicU8,
+    degraded: ArcSwap<Option<DatabaseDeltaPollDegraded>>,
+}
+
+impl Default for DatabaseDeltaPollMetrics {
+    fn default() -> Self {
+        Self {
+            rejected_deltas_total: AtomicU64::new(0),
+            rejected_none: AtomicU64::new(0),
+            rejected_proxy: AtomicU64::new(0),
+            rejected_consumer: AtomicU64::new(0),
+            rejected_plugin_config: AtomicU64::new(0),
+            rejected_upstream: AtomicU64::new(0),
+            rejected_mixed: AtomicU64::new(0),
+            consecutive_identical_rejections: AtomicU64::new(0),
+            current_backoff_bucket: AtomicU8::new(DatabaseDeltaBackoffBucket::None as u8),
+            current_backoff_seconds: AtomicU64::new(0),
+            forced_full_reloads_total: AtomicU64::new(0),
+            recoveries_total: AtomicU64::new(0),
+            last_resource_category: AtomicU8::new(DatabaseDeltaResourceCategory::None as u8),
+            degraded: ArcSwap::from_pointee(None),
+        }
+    }
+}
+
+impl DatabaseDeltaPollMetrics {
+    fn record_rejection(
+        &self,
+        category: DatabaseDeltaResourceCategory,
+        validation_category: DatabaseDeltaValidationCategory,
+        consecutive: u64,
+        backoff: Duration,
+        max_backoff: Duration,
+        escalated: bool,
+    ) {
+        self.rejected_deltas_total.fetch_add(1, Ordering::Relaxed);
+        self.counter_for_category(category)
+            .fetch_add(1, Ordering::Relaxed);
+        self.consecutive_identical_rejections
+            .store(consecutive, Ordering::Relaxed);
+        self.current_backoff_bucket.store(
+            DatabaseDeltaBackoffBucket::for_duration(backoff, max_backoff) as u8,
+            Ordering::Relaxed,
+        );
+        self.current_backoff_seconds
+            .store(backoff.as_secs(), Ordering::Relaxed);
+        self.last_resource_category
+            .store(category as u8, Ordering::Relaxed);
+        self.degraded
+            .store(Arc::new(Some(DatabaseDeltaPollDegraded {
+                reason: if escalated {
+                    "rejected_incremental_delta_escalated"
+                } else {
+                    "rejected_incremental_delta"
+                },
+                resource_category: category.as_str(),
+                validation_category: validation_category.as_str(),
+                consecutive_identical_rejections: consecutive,
+                current_backoff_bucket: DatabaseDeltaBackoffBucket::for_duration(
+                    backoff,
+                    max_backoff,
+                )
+                .as_str(),
+                current_backoff_seconds: backoff.as_secs(),
+                escalated,
+            })));
+        invalidate_database_delta_poll_metrics_cache();
+    }
+
+    fn record_forced_full_reload(&self) {
+        self.forced_full_reloads_total
+            .fetch_add(1, Ordering::Relaxed);
+        invalidate_database_delta_poll_metrics_cache();
+    }
+
+    fn record_recovery_if_degraded(&self) {
+        let degraded = self.degraded.load();
+        if (**degraded).is_some() {
+            self.recoveries_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.clear_active_rejection();
+    }
+
+    fn clear_active_rejection(&self) {
+        let had_active_rejection = self
+            .consecutive_identical_rejections
+            .load(Ordering::Relaxed)
+            != 0
+            || self.current_backoff_seconds.load(Ordering::Relaxed) != 0
+            || (**self.degraded.load()).is_some();
+        self.consecutive_identical_rejections
+            .store(0, Ordering::Relaxed);
+        self.current_backoff_bucket
+            .store(DatabaseDeltaBackoffBucket::None as u8, Ordering::Relaxed);
+        self.current_backoff_seconds.store(0, Ordering::Relaxed);
+        self.degraded.store(Arc::new(None));
+        if had_active_rejection {
+            invalidate_database_delta_poll_metrics_cache();
+        }
+    }
+
+    pub fn degraded(&self) -> Option<DatabaseDeltaPollDegraded> {
+        self.degraded.load_full().as_ref().clone()
+    }
+
+    pub fn snapshot(&self) -> DatabaseDeltaPollMetricsSnapshot {
+        let mut rejected_deltas_by_resource_category = BTreeMap::new();
+        for category in DatabaseDeltaResourceCategory::ALL {
+            rejected_deltas_by_resource_category.insert(
+                category.as_str(),
+                self.counter_for_category(category).load(Ordering::Relaxed),
+            );
+        }
+
+        DatabaseDeltaPollMetricsSnapshot {
+            rejected_deltas_total: self.rejected_deltas_total.load(Ordering::Relaxed),
+            rejected_deltas_by_resource_category,
+            consecutive_identical_rejections: self
+                .consecutive_identical_rejections
+                .load(Ordering::Relaxed),
+            current_backoff_bucket: DatabaseDeltaBackoffBucket::from_u8(
+                self.current_backoff_bucket.load(Ordering::Relaxed),
+            )
+            .as_str(),
+            current_backoff_seconds: self.current_backoff_seconds.load(Ordering::Relaxed),
+            forced_full_reloads_total: self.forced_full_reloads_total.load(Ordering::Relaxed),
+            recoveries_total: self.recoveries_total.load(Ordering::Relaxed),
+            last_resource_category: DatabaseDeltaResourceCategory::from_u8(
+                self.last_resource_category.load(Ordering::Relaxed),
+            )
+            .as_str(),
+            degraded: self.degraded(),
+        }
+    }
+
+    fn counter_for_category(&self, category: DatabaseDeltaResourceCategory) -> &AtomicU64 {
+        match category {
+            DatabaseDeltaResourceCategory::None => &self.rejected_none,
+            DatabaseDeltaResourceCategory::Proxy => &self.rejected_proxy,
+            DatabaseDeltaResourceCategory::Consumer => &self.rejected_consumer,
+            DatabaseDeltaResourceCategory::PluginConfig => &self.rejected_plugin_config,
+            DatabaseDeltaResourceCategory::Upstream => &self.rejected_upstream,
+            DatabaseDeltaResourceCategory::Mixed => &self.rejected_mixed,
+        }
+    }
+}
+
+fn invalidate_database_delta_poll_metrics_cache() {
+    crate::plugins::prometheus_metrics::global_registry()
+        .invalidate_database_delta_poll_metrics_cache();
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DatabaseDeltaResourceCategory {
+    None = 0,
+    Proxy = 1,
+    Consumer = 2,
+    PluginConfig = 3,
+    Upstream = 4,
+    Mixed = 5,
+}
+
+impl DatabaseDeltaResourceCategory {
+    const ALL: [Self; 6] = [
+        Self::None,
+        Self::Proxy,
+        Self::Consumer,
+        Self::PluginConfig,
+        Self::Upstream,
+        Self::Mixed,
+    ];
+
+    fn as_str(self) -> &'static str {
+        DATABASE_DELTA_RESOURCE_CATEGORY_LABELS[self as usize]
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Proxy,
+            2 => Self::Consumer,
+            3 => Self::PluginConfig,
+            4 => Self::Upstream,
+            5 => Self::Mixed,
+            _ => Self::None,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseDeltaBackoffBucket {
+    None = 0,
+    UnderFiveSeconds = 1,
+    UnderThirtySeconds = 2,
+    UnderFiveMinutes = 3,
+    AtLeastFiveMinutes = 4,
+    Max = 5,
+}
+
+impl DatabaseDeltaBackoffBucket {
+    fn as_str(self) -> &'static str {
+        DATABASE_DELTA_BACKOFF_BUCKET_LABELS[self as usize]
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::UnderFiveSeconds,
+            2 => Self::UnderThirtySeconds,
+            3 => Self::UnderFiveMinutes,
+            4 => Self::AtLeastFiveMinutes,
+            5 => Self::Max,
+            _ => Self::None,
+        }
+    }
+
+    fn for_duration(backoff: Duration, max_backoff: Duration) -> Self {
+        if backoff.is_zero() {
+            Self::None
+        } else if backoff >= max_backoff {
+            Self::Max
+        } else if backoff < Duration::from_secs(5) {
+            Self::UnderFiveSeconds
+        } else if backoff < Duration::from_secs(30) {
+            Self::UnderThirtySeconds
+        } else if backoff < Duration::from_secs(300) {
+            Self::UnderFiveMinutes
+        } else {
+            Self::AtLeastFiveMinutes
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DatabaseDeltaValidationCategory {
+    SecurityPlugin,
+    DuplicateRoute,
+    Listener,
+    UpstreamReference,
+    PluginReference,
+    Tls,
+    Other,
+}
+
+impl DatabaseDeltaValidationCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SecurityPlugin => "security_plugin",
+            Self::DuplicateRoute => "duplicate_route",
+            Self::Listener => "listener",
+            Self::UpstreamReference => "upstream_reference",
+            Self::PluginReference => "plugin_reference",
+            Self::Tls => "tls",
+            Self::Other => "other",
+        }
+    }
+
+    fn classify(errors: &[String]) -> Self {
+        const MAX_CLASSIFIED_ERRORS: usize = 32;
+        const MAX_CLASSIFIED_ERROR_CHARS: usize = 256;
+
+        let mut security_plugin = false;
+        let mut duplicate_route = false;
+        let mut listener = false;
+        let mut upstream_reference = false;
+        let mut plugin_reference = false;
+        let mut tls = false;
+
+        for error in errors.iter().take(MAX_CLASSIFIED_ERRORS) {
+            let normalized = error
+                .chars()
+                .take(MAX_CLASSIFIED_ERROR_CHARS)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            security_plugin |= normalized.contains("security plugin");
+            duplicate_route |=
+                normalized.contains("duplicate") || normalized.contains("listen path");
+            listener |= normalized.contains("listen")
+                || normalized.contains("port")
+                || normalized.contains("bind");
+            upstream_reference |= normalized.contains("upstream");
+            plugin_reference |= normalized.contains("plugin");
+            tls |= normalized.contains("tls") || normalized.contains("certificate");
+        }
+
+        if security_plugin {
+            Self::SecurityPlugin
+        } else if duplicate_route {
+            Self::DuplicateRoute
+        } else if listener {
+            Self::Listener
+        } else if upstream_reference {
+            Self::UpstreamReference
+        } else if plugin_reference {
+            Self::PluginReference
+        } else if tls {
+            Self::Tls
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RejectedDeltaIdentity {
+    after_sequence: u64,
+    resource_category: DatabaseDeltaResourceCategory,
+    change_set_hash: u64,
+}
+
+impl RejectedDeltaIdentity {
+    fn from_incremental(after_sequence: u64, result: &db_backend::IncrementalResult) -> Self {
+        Self {
+            after_sequence,
+            resource_category: rejected_delta_resource_category(result),
+            change_set_hash: rejected_delta_change_set_hash(result),
+        }
+    }
+
+    fn with_validation(self, errors: &[String]) -> RejectedDeltaFingerprint {
+        RejectedDeltaFingerprint {
+            after_sequence: self.after_sequence,
+            resource_category: self.resource_category,
+            validation_category: DatabaseDeltaValidationCategory::classify(errors),
+            change_set_hash: self.change_set_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RejectedDeltaFingerprint {
+    after_sequence: u64,
+    resource_category: DatabaseDeltaResourceCategory,
+    validation_category: DatabaseDeltaValidationCategory,
+    change_set_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RejectedDeltaState {
+    fingerprint: RejectedDeltaFingerprint,
+    consecutive: u64,
+    next_backoff: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectedDeltaLogAction {
+    First,
+    BackoffTransition,
+    Escalation,
+    ValidationCategoryChanged,
+    Suppressed,
+}
+
+#[derive(Debug, Clone)]
+struct RejectedDeltaDecision {
+    fingerprint: RejectedDeltaFingerprint,
+    consecutive: u64,
+    backoff: Duration,
+    log_action: RejectedDeltaLogAction,
+    should_escalate: bool,
+}
+
+struct RejectedDeltaTracker {
+    current: Option<RejectedDeltaState>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    full_reload_threshold: u64,
+    metrics: Arc<DatabaseDeltaPollMetrics>,
+}
+
+impl RejectedDeltaTracker {
+    fn new(
+        initial_backoff: Duration,
+        max_backoff: Duration,
+        full_reload_threshold: u64,
+        metrics: Arc<DatabaseDeltaPollMetrics>,
+    ) -> Self {
+        let max_backoff = max_backoff.max(initial_backoff);
+        Self {
+            current: None,
+            initial_backoff,
+            max_backoff,
+            full_reload_threshold: full_reload_threshold.max(1),
+            metrics,
+        }
+    }
+
+    fn record_rejection(&mut self, fingerprint: RejectedDeltaFingerprint) -> RejectedDeltaDecision {
+        let mut log_action = RejectedDeltaLogAction::First;
+        let mut consecutive = 1;
+        let mut backoff = self.initial_backoff;
+
+        match &mut self.current {
+            Some(state) if state.fingerprint == fingerprint => {
+                state.consecutive = state.consecutive.saturating_add(1);
+                consecutive = state.consecutive;
+                backoff = state.next_backoff;
+                log_action = if consecutive >= self.full_reload_threshold
+                    && (consecutive - self.full_reload_threshold)
+                        .is_multiple_of(self.full_reload_threshold)
+                {
+                    RejectedDeltaLogAction::Escalation
+                } else if backoff < self.max_backoff {
+                    RejectedDeltaLogAction::BackoffTransition
+                } else {
+                    RejectedDeltaLogAction::Suppressed
+                };
+                state.next_backoff = next_rejected_delta_backoff(backoff, self.max_backoff);
+            }
+            Some(state) => {
+                log_action =
+                    if state.fingerprint.validation_category != fingerprint.validation_category {
+                        RejectedDeltaLogAction::ValidationCategoryChanged
+                    } else {
+                        RejectedDeltaLogAction::First
+                    };
+                *state = RejectedDeltaState {
+                    fingerprint: fingerprint.clone(),
+                    consecutive,
+                    next_backoff: next_rejected_delta_backoff(backoff, self.max_backoff),
+                };
+            }
+            None => {
+                self.current = Some(RejectedDeltaState {
+                    fingerprint: fingerprint.clone(),
+                    consecutive,
+                    next_backoff: next_rejected_delta_backoff(backoff, self.max_backoff),
+                });
+            }
+        }
+
+        let should_escalate = consecutive >= self.full_reload_threshold
+            && (consecutive - self.full_reload_threshold)
+                .is_multiple_of(self.full_reload_threshold);
+        if should_escalate {
+            log_action = RejectedDeltaLogAction::Escalation;
+        }
+        self.metrics.record_rejection(
+            fingerprint.resource_category,
+            fingerprint.validation_category,
+            consecutive,
+            backoff,
+            self.max_backoff,
+            should_escalate,
+        );
+
+        RejectedDeltaDecision {
+            fingerprint,
+            consecutive,
+            backoff,
+            log_action,
+            should_escalate,
+        }
+    }
+
+    fn record_accepted(&mut self) {
+        if self.current.take().is_some() {
+            self.metrics.record_recovery_if_degraded();
+        } else {
+            self.metrics.clear_active_rejection();
+        }
+    }
+}
+
+fn next_rejected_delta_backoff(current: Duration, max_backoff: Duration) -> Duration {
+    let next_secs = current
+        .as_secs()
+        .max(1)
+        .saturating_mul(2)
+        .min(max_backoff.as_secs().max(1));
+    Duration::from_secs(next_secs)
+}
+
+fn rejected_delta_resource_category(
+    result: &db_backend::IncrementalResult,
+) -> DatabaseDeltaResourceCategory {
+    let proxy_changed =
+        !result.added_or_modified_proxies.is_empty() || !result.removed_proxy_ids.is_empty();
+    let consumer_changed =
+        !result.added_or_modified_consumers.is_empty() || !result.removed_consumer_ids.is_empty();
+    let plugin_config_changed = !result.added_or_modified_plugin_configs.is_empty()
+        || !result.removed_plugin_config_ids.is_empty();
+    let upstream_changed =
+        !result.added_or_modified_upstreams.is_empty() || !result.removed_upstream_ids.is_empty();
+    let changed_count = [
+        proxy_changed,
+        consumer_changed,
+        plugin_config_changed,
+        upstream_changed,
+    ]
+    .into_iter()
+    .filter(|changed| *changed)
+    .count();
+
+    match changed_count {
+        0 => DatabaseDeltaResourceCategory::None,
+        1 if proxy_changed => DatabaseDeltaResourceCategory::Proxy,
+        1 if consumer_changed => DatabaseDeltaResourceCategory::Consumer,
+        1 if plugin_config_changed => DatabaseDeltaResourceCategory::PluginConfig,
+        1 if upstream_changed => DatabaseDeltaResourceCategory::Upstream,
+        _ => DatabaseDeltaResourceCategory::Mixed,
+    }
+}
+
+fn rejected_delta_change_set_hash(result: &db_backend::IncrementalResult) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_sorted_resource_fingerprints(
+        &mut hasher,
+        "added_or_modified_proxies",
+        result
+            .added_or_modified_proxies
+            .iter()
+            .map(|proxy| (proxy.id.as_str(), proxy)),
+    );
+    hash_sorted_ids(
+        &mut hasher,
+        "removed_proxy_ids",
+        result.removed_proxy_ids.iter().map(String::as_str),
+    );
+    hash_sorted_resource_fingerprints(
+        &mut hasher,
+        "added_or_modified_consumers",
+        result
+            .added_or_modified_consumers
+            .iter()
+            .map(|consumer| (consumer.id.as_str(), consumer)),
+    );
+    hash_sorted_ids(
+        &mut hasher,
+        "removed_consumer_ids",
+        result.removed_consumer_ids.iter().map(String::as_str),
+    );
+    hash_sorted_resource_fingerprints(
+        &mut hasher,
+        "added_or_modified_plugin_configs",
+        result
+            .added_or_modified_plugin_configs
+            .iter()
+            .map(|plugin_config| (plugin_config.id.as_str(), plugin_config)),
+    );
+    hash_sorted_ids(
+        &mut hasher,
+        "removed_plugin_config_ids",
+        result.removed_plugin_config_ids.iter().map(String::as_str),
+    );
+    hash_sorted_resource_fingerprints(
+        &mut hasher,
+        "added_or_modified_upstreams",
+        result
+            .added_or_modified_upstreams
+            .iter()
+            .map(|upstream| (upstream.id.as_str(), upstream)),
+    );
+    hash_sorted_ids(
+        &mut hasher,
+        "removed_upstream_ids",
+        result.removed_upstream_ids.iter().map(String::as_str),
+    );
+    hasher.finish()
+}
+
+fn hash_sorted_resource_fingerprints<'a, T>(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    label: &'static str,
+    resources: impl Iterator<Item = (&'a str, &'a T)>,
+) where
+    T: serde::Serialize + 'a,
+{
+    label.hash(hasher);
+    let mut resources: Vec<(&str, u64)> = resources
+        .map(|(id, resource)| (id, stable_json_hash(resource)))
+        .collect();
+    resources.sort_unstable_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
+    resources.len().hash(hasher);
+    for (id, content_hash) in resources {
+        id.hash(hasher);
+        content_hash.hash(hasher);
+    }
+}
+
+fn stable_json_hash<T: serde::Serialize>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match serde_json::to_value(value) {
+        Ok(value) => hash_json_value(&mut hasher, &value),
+        Err(_) => "serialization_error".hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+fn hash_json_value(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    value: &serde_json::Value,
+) {
+    match value {
+        serde_json::Value::Null => {
+            "null".hash(hasher);
+        }
+        serde_json::Value::Bool(value) => {
+            "bool".hash(hasher);
+            value.hash(hasher);
+        }
+        serde_json::Value::Number(value) => {
+            "number".hash(hasher);
+            value.to_string().hash(hasher);
+        }
+        serde_json::Value::String(value) => {
+            "string".hash(hasher);
+            value.hash(hasher);
+        }
+        serde_json::Value::Array(values) => {
+            "array".hash(hasher);
+            values.len().hash(hasher);
+            for value in values {
+                hash_json_value(hasher, value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            "object".hash(hasher);
+            let mut keys: Vec<&String> = values.keys().collect();
+            keys.sort_unstable();
+            keys.len().hash(hasher);
+            for key in keys {
+                key.hash(hasher);
+                if let Some(value) = values.get(key) {
+                    hash_json_value(hasher, value);
+                }
+            }
+        }
+    }
+}
+
+fn hash_sorted_ids<'a>(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    label: &'static str,
+    ids: impl Iterator<Item = &'a str>,
+) {
+    label.hash(hasher);
+    let mut ids: Vec<&str> = ids.collect();
+    ids.sort_unstable();
+    ids.len().hash(hasher);
+    for id in ids {
+        id.hash(hasher);
+    }
+}
+
+fn log_rejected_delta_decision(decision: &RejectedDeltaDecision, errors: &[String]) {
+    let category = decision.fingerprint.resource_category.as_str();
+    let validation_category = decision.fingerprint.validation_category.as_str();
+    let change_set_hash = format!("{:016x}", decision.fingerprint.change_set_hash);
+    let backoff_seconds = decision.backoff.as_secs();
+    let error_count = errors.len();
+    let errors_for_log = bounded_rejection_errors_for_log(errors);
+
+    match decision.log_action {
+        RejectedDeltaLogAction::First => warn!(
+            resource_category = category,
+            validation_category = validation_category,
+            consecutive_identical_rejections = decision.consecutive,
+            backoff_seconds = backoff_seconds,
+            change_set_hash = %change_set_hash,
+            error_count = error_count,
+            validation_errors = ?errors_for_log,
+            "Incremental config update rejected by validation; keeping poll cursor unchanged and backing off before retry"
+        ),
+        RejectedDeltaLogAction::BackoffTransition => warn!(
+            resource_category = category,
+            validation_category = validation_category,
+            consecutive_identical_rejections = decision.consecutive,
+            backoff_seconds = backoff_seconds,
+            change_set_hash = %change_set_hash,
+            "Repeated database delta rejection; increasing bounded retry backoff"
+        ),
+        RejectedDeltaLogAction::Escalation => error!(
+            resource_category = category,
+            validation_category = validation_category,
+            consecutive_identical_rejections = decision.consecutive,
+            backoff_seconds = backoff_seconds,
+            change_set_hash = %change_set_hash,
+            error_count = error_count,
+            validation_errors = ?errors_for_log,
+            "Repeated database delta rejection reached threshold; attempting authoritative full reload"
+        ),
+        RejectedDeltaLogAction::ValidationCategoryChanged => warn!(
+            resource_category = category,
+            validation_category = validation_category,
+            consecutive_identical_rejections = decision.consecutive,
+            backoff_seconds = backoff_seconds,
+            change_set_hash = %change_set_hash,
+            error_count = error_count,
+            validation_errors = ?errors_for_log,
+            "Database delta rejection category changed; resetting rejected-delta backoff state"
+        ),
+        RejectedDeltaLogAction::Suppressed => debug!(
+            resource_category = category,
+            validation_category = validation_category,
+            consecutive_identical_rejections = decision.consecutive,
+            backoff_seconds = backoff_seconds,
+            change_set_hash = %change_set_hash,
+            "Repeated database delta rejection unchanged; retry log suppressed"
+        ),
+    }
+}
+
+fn bounded_rejection_errors_for_log(errors: &[String]) -> Vec<String> {
+    errors
+        .iter()
+        .take(3)
+        .map(|error| truncate_for_log(error, 256))
+        .collect()
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 pub async fn run(
@@ -237,47 +1014,51 @@ pub async fn run(
         .await?;
     }
 
-    // Load initial config from database, falling back to backup file if configured
+    // Load initial config from database, falling back to backup file if configured.
+    // Successful DB loads seed the durable change cursor so the first poll can
+    // use config_changes immediately; backup loads intentionally start without
+    // a cursor and force an authoritative DB reload after recovery.
     let backup_path = env_config.db_config_backup_path.clone();
-    let config = match db.load_full_config(&env_config.namespace).await {
-        Ok(cfg) => {
-            info!(
-                "Database mode: loaded {} proxies, {} consumers",
-                cfg.proxies.len(),
-                cfg.consumers.len()
-            );
-            cfg
-        }
-        Err(e) => {
-            // Database unreachable — try backup file for pod restart resilience
-            if let Some(ref path) = backup_path {
-                warn!(
-                    "Database load failed ({}), attempting backup file: {}",
-                    e, path
+    let (config, initial_change_sequence) =
+        match load_full_config_with_sequence(&db, &env_config.namespace).await {
+            Ok((cfg, sequence)) => {
+                info!(
+                    "Database mode: loaded {} proxies, {} consumers",
+                    cfg.proxies.len(),
+                    cfg.consumers.len()
                 );
-                match load_config_backup(path) {
-                    Some(cfg) => {
-                        warn!(
-                            "Starting with backup config ({} proxies, {} consumers). \
-                             Database polling will retry and update when DB recovers.",
-                            cfg.proxies.len(),
-                            cfg.consumers.len()
-                        );
-                        cfg
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!(
-                            "Database load failed and no usable backup at {}: {}",
-                            path,
-                            e
-                        ));
-                    }
-                }
-            } else {
-                return Err(e);
+                (cfg, Some(sequence))
             }
-        }
-    };
+            Err(e) => {
+                // Database unreachable — try backup file for pod restart resilience
+                if let Some(ref path) = backup_path {
+                    warn!(
+                        "Database load failed ({}), attempting backup file: {}",
+                        e, path
+                    );
+                    match load_config_backup(path) {
+                        Some(cfg) => {
+                            warn!(
+                                "Starting with backup config ({} proxies, {} consumers). \
+                                 Database polling will retry and update when DB recovers.",
+                                cfg.proxies.len(),
+                                cfg.consumers.len()
+                            );
+                            (cfg, None)
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Database load failed and no usable backup at {}: {}",
+                                path,
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
     // Validate stream proxy ports don't conflict with gateway reserved ports
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -759,6 +1540,9 @@ pub async fn run(
     // immediately — before the first polling tick runs.
     let startup_ready = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(!bootstrap_from_backup));
+    let database_delta_poll_metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
 
     let admin_state = AdminState {
         db: Some(db.clone()),
@@ -983,14 +1767,19 @@ pub async fn run(
     // Database polling loop (with shutdown) — uses incremental polling
     // to avoid full table scans on every cycle.
     //
-    // First poll after startup seeds the known ID sets from the initial config.
-    // Subsequent polls use `load_incremental_config()` which fetches only
-    // rows with `updated_at > last_poll_at` and detects deletions via
-    // lightweight `SELECT id` queries.
+    // Normal startup seeds the durable config-change sequence cursor before
+    // this task starts. Backup/offline bootstrap leaves the cursor empty so the
+    // first recovered poll performs an authoritative full reload.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let proxy_state_poll = proxy_state.clone();
     let db_available_poll = db_available.clone();
+    let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
+    let rejected_delta_initial_backoff =
+        Duration::from_secs(env_config.db_rejected_delta_backoff_initial_seconds);
+    let rejected_delta_max_backoff =
+        Duration::from_secs(env_config.db_rejected_delta_backoff_max_seconds);
+    let rejected_delta_full_reload_threshold = env_config.db_rejected_delta_full_reload_threshold;
     let mut poll_shutdown = shutdown_tx.subscribe();
 
     // DNS re-resolution for the database FQDN: if the URL contains a hostname
@@ -1007,6 +1796,7 @@ pub async fn run(
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // skip first immediate tick
 
         // Track the last known set of resolved IPs for the DB hostname.
@@ -1016,27 +1806,14 @@ pub async fn run(
             Arc::new(tokio::sync::Mutex::new(None));
         let mut force_full_reload = false;
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+        let mut rejected_delta_tracker = RejectedDeltaTracker::new(
+            rejected_delta_initial_backoff,
+            rejected_delta_max_backoff,
+            rejected_delta_full_reload_threshold,
+            database_delta_poll_metrics_for_poll,
+        );
 
-        // Seed incremental state from the initial config load
-        let initial_config = proxy_state_poll.current_config();
-        let (
-            mut known_proxy_ids,
-            mut known_consumer_ids,
-            mut known_plugin_config_ids,
-            mut known_upstream_ids,
-        ) = db_backend::extract_known_ids(&initial_config);
-        // If startup used the on-disk backup fallback, force the first
-        // successful poll path to do a full DB reload instead of seeding
-        // incremental polling from `initial_config.loaded_at`.
-        //
-        // Why: backup JSON may omit `loaded_at` (serde defaults to "now"),
-        // which can be newer than many existing DB rows. Starting incremental
-        // from that timestamp can skip unchanged DB state indefinitely.
-        let mut last_poll_at: Option<DateTime<Utc>> = if bootstrap_from_backup {
-            None
-        } else {
-            Some(initial_config.loaded_at)
-        };
+        let mut last_change_sequence: Option<u64> = initial_change_sequence;
 
         loop {
             tokio::select! {
@@ -1078,23 +1855,23 @@ pub async fn run(
                     }
 
                     if force_full_reload {
-                        match db_poll.load_full_config(&poll_namespace).await {
-                            Ok(new_config) => {
+                        match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
+                            Ok((new_config, sequence)) => {
+                                mark_db_available_after_successful_poll_load(
+                                    &db_poll,
+                                    &db_available_poll,
+                                    "full reload after DB DNS reconnect",
+                                )
+                                .await;
                                 let outcome = proxy_state_poll.update_config(new_config);
                                 if commit_full_reload_poll_state(
                                     "after DB DNS reconnect",
                                     outcome,
-                                    &proxy_state_poll,
-                                    full_reload_poll_state(
-                                        &mut known_proxy_ids,
-                                        &mut known_consumer_ids,
-                                        &mut known_plugin_config_ids,
-                                        &mut known_upstream_ids,
-                                        &mut last_poll_at,
-                                    ),
+                                    &mut last_change_sequence,
+                                    sequence,
                                 ) {
                                     force_full_reload = false;
-                                    db_available_poll.store(true, Ordering::Relaxed);
+                                    rejected_delta_tracker.record_accepted();
                                     debug!("Full config reload complete after DB DNS reconnect");
                                 }
                             }
@@ -1107,86 +1884,142 @@ pub async fn run(
                                 continue;
                             }
                         }
-                    } else if let Some(since) = last_poll_at {
-                        // Incremental poll — only fetch changes since last poll
-                        match db_poll.load_incremental_config(
-                            &poll_namespace,
-                            since,
-                            &known_proxy_ids,
-                            &known_consumer_ids,
-                            &known_plugin_config_ids,
-                            &known_upstream_ids,
-                        ).await {
+                    } else if let Some(after_sequence) = last_change_sequence {
+                        match db_poll
+                            .load_incremental_config(&poll_namespace, after_sequence)
+                            .await
+                        {
                             Ok(result) => {
-                                // Catch the lazy-pool-connects-directly case:
-                                // if offline bootstrap left `migrations_pending`
-                                // set, the query above succeeded without
-                                // `reconnect()` ever firing. Run deferred
-                                // migrations now before flipping
-                                // `db_available` — otherwise admin writes
-                                // could hit an outdated schema.
-                                // No-op when nothing is pending.
-                                match db_poll.maybe_apply_deferred_migrations().await {
-                                    Ok(_) => db_available_poll.store(true, Ordering::Relaxed),
-                                    Err(e) => {
-                                        warn!(
-                                            "Deferred migrations failed despite successful incremental poll: {}. \
-                                             Admin writes remain blocked until schema is applied.",
-                                            e
-                                        );
-                                        db_available_poll.store(false, Ordering::Relaxed);
-                                    }
-                                }
-                                let poll_ts = result.poll_timestamp;
-                                // Collect ID changes before moving result into apply_incremental
-                                let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
-                                let removed_proxy_ids = result.removed_proxy_ids.clone();
-                                let added_consumer_ids: Vec<String> = result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect();
-                                let removed_consumer_ids = result.removed_consumer_ids.clone();
-                                let added_plugin_config_ids: Vec<String> = result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect();
-                                let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
-                                let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
-                                let removed_upstream_ids = result.removed_upstream_ids.clone();
+                                mark_db_available_after_successful_poll_load(
+                                    &db_poll,
+                                    &db_available_poll,
+                                    "incremental poll",
+                                )
+                                .await;
+                                let next_sequence = result.sequence_cursor;
+                                let rejected_delta_identity =
+                                    RejectedDeltaIdentity::from_incremental(after_sequence, &result);
 
                                 match proxy_state_poll.apply_incremental(result).await {
                                     proxy::ConfigApplyOutcome::Applied => {
-                                        // Update known IDs only after successful apply to keep them
-                                        // in sync with actual proxy state.
-                                        update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
-                                        update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
-                                        update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
-                                        update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
+                                        last_change_sequence = Some(next_sequence);
                                         debug!("Incremental config reload complete");
-                                        last_poll_at = Some(poll_ts);
+                                        rejected_delta_tracker.record_accepted();
                                     }
                                     proxy::ConfigApplyOutcome::Unchanged => {
-                                        // Nothing to apply this cycle. Advance the cursor
-                                        // so the next poll only fetches truly newer rows.
-                                        last_poll_at = Some(poll_ts);
+                                        last_change_sequence = Some(next_sequence);
                                         debug!("Incremental config poll valid but unchanged");
+                                        rejected_delta_tracker.record_accepted();
                                     }
-                                    proxy::ConfigApplyOutcome::Rejected { .. } => {
-                                        // Validation rejected the patched config (e.g. security
-                                        // plugin / unique listen-path). Leave `last_poll_at`
-                                        // unchanged so the next poll re-fetches the same rows
-                                        // and tries again. Without this, a rejected resource
-                                        // older than the 1-second `since_safe` margin would
-                                        // silently disappear from the gateway's view of the
-                                        // DB, leaving permanent divergence between DB state
-                                        // and in-memory config until a full reload.
-                                        //
-                                        // Known follow-up: if the same poll timestamp keeps
-                                        // failing validation (a malformed row stuck in the
-                                        // DB), the loop will spin re-fetching it forever.
-                                        // A future change should escalate after N consecutive
-                                        // rejections at the same `poll_ts` — log an error and
-                                        // trigger a full reload to recover (or mark the
-                                        // offending IDs and skip them with operator alert).
-                                        warn!(
-                                            "Incremental config update rejected by validation; \
-                                             leaving last_poll_at unchanged so the next poll \
-                                             retries the same rows"
+                                    proxy::ConfigApplyOutcome::Rejected { errors } => {
+                                        let decision = rejected_delta_tracker.record_rejection(
+                                            rejected_delta_identity.with_validation(&errors),
                                         );
+                                        log_rejected_delta_decision(&decision, &errors);
+
+                                        let mut recovered_by_full_reload = false;
+                                        if decision.should_escalate {
+                                            rejected_delta_tracker
+                                                .metrics
+                                                .record_forced_full_reload();
+                                            match load_full_config_with_sequence(
+                                                &db_poll,
+                                                &poll_namespace,
+                                            )
+                                            .await
+                                            {
+                                                Ok((new_config, sequence)) => {
+                                                    mark_db_available_after_successful_poll_load(
+                                                        &db_poll,
+                                                        &db_available_poll,
+                                                        "rejected-delta escalation full reload",
+                                                    )
+                                                    .await;
+                                                    let outcome =
+                                                        proxy_state_poll.update_config(new_config);
+                                                    if commit_full_reload_poll_state(
+                                                        "rejected delta escalation",
+                                                        outcome,
+                                                        &mut last_change_sequence,
+                                                        sequence,
+                                                    ) {
+                                                        rejected_delta_tracker.record_accepted();
+                                                        recovered_by_full_reload = true;
+                                                        info!(
+                                                            "Rejected database delta recovered by authoritative full reload"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Authoritative primary full reload failed after repeated rejected delta; keeping last known-good runtime config: {}",
+                                                        e
+                                                    );
+                                                    match db_poll
+                                                        .try_failover_reconnect(
+                                                            &db_url_for_reconnect,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(_url) => {
+                                                            match load_full_config_with_sequence(
+                                                                &db_poll,
+                                                                &poll_namespace,
+                                                            )
+                                                            .await
+                                                            {
+                                                                Ok((new_config, sequence)) => {
+                                                                    mark_db_available_after_successful_poll_load(
+                                                                        &db_poll,
+                                                                        &db_available_poll,
+                                                                        "rejected-delta escalation failover reload",
+                                                                    )
+                                                                    .await;
+                                                                    let outcome = proxy_state_poll
+                                                                        .update_config(new_config);
+                                                                    if commit_full_reload_poll_state(
+                                                                        "rejected delta escalation failover",
+                                                                        outcome,
+                                                                        &mut last_change_sequence,
+                                                                        sequence,
+                                                                    ) {
+                                                                        rejected_delta_tracker
+                                                                            .record_accepted();
+                                                                        recovered_by_full_reload =
+                                                                            true;
+                                                                        info!(
+                                                                            "Rejected database delta recovered by authoritative failover full reload"
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Err(e2) => {
+                                                                    db_available_poll.store(
+                                                                        false,
+                                                                        Ordering::Relaxed,
+                                                                    );
+                                                                    warn!(
+                                                                        "Authoritative failover full reload also failed after repeated rejected delta; keeping last known-good runtime config: {}",
+                                                                        e2
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e2) => {
+                                                            db_available_poll
+                                                                .store(false, Ordering::Relaxed);
+                                                            warn!(
+                                                                "Database failover reconnect failed after rejected-delta escalation reload error: {}",
+                                                                e2
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if !recovered_by_full_reload {
+                                            interval.reset_after(decision.backoff);
+                                        }
                                     }
                                 }
                             }
@@ -1195,46 +2028,54 @@ pub async fn run(
                                     "Authoritative primary incremental poll failed, falling back to full reload: {}",
                                     e
                                 );
-                                // Fallback to full config load
-                                match db_poll.load_full_config(&poll_namespace).await {
-                                    Ok(new_config) => {
-                                        db_available_poll.store(true, Ordering::Relaxed);
+                                match load_full_config_with_sequence(&db_poll, &poll_namespace).await
+                                {
+                                    Ok((new_config, sequence)) => {
+                                        mark_db_available_after_successful_poll_load(
+                                            &db_poll,
+                                            &db_available_poll,
+                                            "full fallback reload",
+                                        )
+                                        .await;
                                         let outcome = proxy_state_poll.update_config(new_config);
-                                        commit_full_reload_poll_state(
+                                        if commit_full_reload_poll_state(
                                             "full fallback",
                                             outcome,
-                                            &proxy_state_poll,
-                                            full_reload_poll_state(
-                                                &mut known_proxy_ids,
-                                                &mut known_consumer_ids,
-                                                &mut known_plugin_config_ids,
-                                                &mut known_upstream_ids,
-                                                &mut last_poll_at,
-                                            ),
-                                        );
+                                            &mut last_change_sequence,
+                                            sequence,
+                                        ) {
+                                            rejected_delta_tracker.record_accepted();
+                                        }
                                     }
                                     Err(e2) => {
-                                        // Both incremental and full reload failed —
-                                        // try failover URLs before giving up.
-                                        match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
+                                        match db_poll
+                                            .try_failover_reconnect(&db_url_for_reconnect)
+                                            .await
+                                        {
                                             Ok(_url) => {
-                                                // Reconnected to a failover DB — try full reload
-                                                match db_poll.load_full_config(&poll_namespace).await {
-                                                    Ok(new_config) => {
-                                                        db_available_poll.store(true, Ordering::Relaxed);
-                                                        let outcome = proxy_state_poll.update_config(new_config);
-                                                        commit_full_reload_poll_state(
+                                                match load_full_config_with_sequence(
+                                                    &db_poll,
+                                                    &poll_namespace,
+                                                )
+                                                .await
+                                                {
+                                                    Ok((new_config, sequence)) => {
+                                                        mark_db_available_after_successful_poll_load(
+                                                            &db_poll,
+                                                            &db_available_poll,
+                                                            "failover full reload",
+                                                        )
+                                                        .await;
+                                                        let outcome =
+                                                            proxy_state_poll.update_config(new_config);
+                                                        if commit_full_reload_poll_state(
                                                             "failover",
                                                             outcome,
-                                                            &proxy_state_poll,
-                                                            full_reload_poll_state(
-                                                                &mut known_proxy_ids,
-                                                                &mut known_consumer_ids,
-                                                                &mut known_plugin_config_ids,
-                                                                &mut known_upstream_ids,
-                                                                &mut last_poll_at,
-                                                            ),
-                                                        );
+                                                            &mut last_change_sequence,
+                                                            sequence,
+                                                        ) {
+                                                            rejected_delta_tracker.record_accepted();
+                                                        }
                                                     }
                                                     Err(e3) => {
                                                         db_available_poll.store(false, Ordering::Relaxed);
@@ -1258,38 +2099,23 @@ pub async fn run(
                             }
                         }
                     } else {
-                        // First poll — full load to seed state. This path can
-                        // fire when the startup `load_full_config` failed (we
-                        // bootstrapped from backup) but the lazy pool is now
-                        // reaching a live DB. Run deferred migrations if any
-                        // before flipping `db_available` — see comment in the
-                        // incremental-success branch above.
-                        match db_poll.load_full_config(&poll_namespace).await {
-                            Ok(new_config) => {
-                                match db_poll.maybe_apply_deferred_migrations().await {
-                                    Ok(_) => db_available_poll.store(true, Ordering::Relaxed),
-                                    Err(e) => {
-                                        warn!(
-                                            "Deferred migrations failed despite successful full reload: {}. \
-                                             Admin writes remain blocked until schema is applied.",
-                                            e
-                                        );
-                                        db_available_poll.store(false, Ordering::Relaxed);
-                                    }
-                                }
+                        match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
+                            Ok((new_config, sequence)) => {
+                                mark_db_available_after_successful_poll_load(
+                                    &db_poll,
+                                    &db_available_poll,
+                                    "first full reload",
+                                )
+                                .await;
                                 let outcome = proxy_state_poll.update_config(new_config);
-                                commit_full_reload_poll_state(
+                                if commit_full_reload_poll_state(
                                     "initial full poll",
                                     outcome,
-                                    &proxy_state_poll,
-                                    full_reload_poll_state(
-                                        &mut known_proxy_ids,
-                                        &mut known_consumer_ids,
-                                        &mut known_plugin_config_ids,
-                                        &mut known_upstream_ids,
-                                        &mut last_poll_at,
-                                    ),
-                                );
+                                    &mut last_change_sequence,
+                                    sequence,
+                                ) {
+                                    rejected_delta_tracker.record_accepted();
+                                }
                             }
                             Err(e) => {
                                 db_available_poll.store(false, Ordering::Relaxed);
@@ -1372,67 +2198,36 @@ pub async fn run(
     Ok(())
 }
 
-struct FullReloadPollState<'a> {
-    known_proxy_ids: &'a mut HashSet<String>,
-    known_consumer_ids: &'a mut HashSet<String>,
-    known_plugin_config_ids: &'a mut HashSet<String>,
-    known_upstream_ids: &'a mut HashSet<String>,
-    last_poll_at: &'a mut Option<DateTime<Utc>>,
-}
-
-impl FullReloadPollState<'_> {
-    fn commit_from_proxy_state(self, proxy_state: &ProxyState) {
-        let published_config = proxy_state.current_config();
-        let (
-            next_known_proxy_ids,
-            next_known_consumer_ids,
-            next_known_plugin_config_ids,
-            next_known_upstream_ids,
-        ) = db_backend::extract_known_ids(&published_config);
-        *self.known_proxy_ids = next_known_proxy_ids;
-        *self.known_consumer_ids = next_known_consumer_ids;
-        *self.known_plugin_config_ids = next_known_plugin_config_ids;
-        *self.known_upstream_ids = next_known_upstream_ids;
-        *self.last_poll_at = Some(published_config.loaded_at);
-    }
-}
-
-fn full_reload_poll_state<'a>(
-    known_proxy_ids: &'a mut HashSet<String>,
-    known_consumer_ids: &'a mut HashSet<String>,
-    known_plugin_config_ids: &'a mut HashSet<String>,
-    known_upstream_ids: &'a mut HashSet<String>,
-    last_poll_at: &'a mut Option<DateTime<Utc>>,
-) -> FullReloadPollState<'a> {
-    FullReloadPollState {
-        known_proxy_ids,
-        known_consumer_ids,
-        known_plugin_config_ids,
-        known_upstream_ids,
-        last_poll_at,
-    }
+async fn load_full_config_with_sequence(
+    db: &Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<(GatewayConfig, u64), anyhow::Error> {
+    db.maybe_apply_deferred_migrations().await?;
+    let sequence = db.latest_change_sequence(namespace).await?;
+    let config = db.load_full_config(namespace).await?;
+    Ok((config, sequence))
 }
 
 fn commit_full_reload_poll_state(
     context: &str,
     outcome: proxy::ConfigApplyOutcome,
-    proxy_state: &ProxyState,
-    poll_state: FullReloadPollState<'_>,
+    last_change_sequence: &mut Option<u64>,
+    sequence: u64,
 ) -> bool {
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
-            poll_state.commit_from_proxy_state(proxy_state);
+            *last_change_sequence = Some(sequence);
             info!("Configuration applied from database ({})", context);
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
-            poll_state.commit_from_proxy_state(proxy_state);
+            *last_change_sequence = Some(sequence);
             debug!("Database configuration valid but unchanged ({})", context);
             true
         }
         proxy::ConfigApplyOutcome::Rejected { .. } => {
             warn!(
-                "Database configuration candidate rejected ({}); keeping previous runtime config, poll cursor, and known ID sets",
+                "Database configuration candidate rejected ({}); keeping previous runtime config and poll cursor",
                 context
             );
             false
@@ -1440,126 +2235,461 @@ fn commit_full_reload_poll_state(
     }
 }
 
-/// Update a known ID set by adding new IDs and removing deleted ones.
-fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &[String]) {
-    for id in removed {
-        known.remove(id);
-    }
-    for id in added {
-        known.insert(id.clone());
+async fn mark_db_available_after_successful_poll_load(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    context: &str,
+) {
+    match db.maybe_apply_deferred_migrations().await {
+        Ok(_) => db_available.store(true, Ordering::Relaxed),
+        Err(e) => {
+            warn!(
+                "Deferred migrations failed despite successful {}: {}. \
+                 Admin writes remain blocked until schema is applied.",
+                context, e
+            );
+            db_available.store(false, Ordering::Relaxed);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
 
-    fn empty_proxy_state_for_poll_tests() -> ProxyState {
-        let dns_cache = DnsCache::new(DnsConfig::default());
-        let env_config = EnvConfig::default();
-        let (state, _health_check_handles) =
-            ProxyState::new(Default::default(), dns_cache, env_config, None, None)
-                .expect("default proxy state should build");
-        state
+    #[test]
+    fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
+        let source = include_str!("database.rs");
+        assert!(
+            source.contains("let (config, initial_change_sequence) ="),
+            "database startup must retain the initial full-load change sequence"
+        );
+        assert!(
+            source.contains("let mut last_change_sequence: Option<u64> = initial_change_sequence;"),
+            "poll loop must start from the initial full-load cursor"
+        );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_reload_unchanged_commits_cursor_and_known_ids() {
-        let state = empty_proxy_state_for_poll_tests();
-        let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
-        let mut last_poll_at = Some(previous_poll_at);
-        let mut known_proxy_ids: HashSet<String> = HashSet::from(["stale-proxy".to_string()]);
-        let mut known_consumer_ids: HashSet<String> = HashSet::from(["stale-consumer".to_string()]);
-        let mut known_plugin_config_ids: HashSet<String> =
-            HashSet::from(["stale-plugin".to_string()]);
-        let mut known_upstream_ids: HashSet<String> = HashSet::from(["stale-upstream".to_string()]);
+    #[test]
+    fn full_reload_applies_deferred_migrations_before_sequence_cursor_read() {
+        let source = include_str!("database.rs");
+        let helper_start = source
+            .find("async fn load_full_config_with_sequence")
+            .expect("load_full_config_with_sequence helper must exist");
+        let helper_end = source[helper_start..]
+            .find("fn commit_full_reload_poll_state")
+            .expect("commit_full_reload_poll_state helper must follow full load helper");
+        let helper_source = &source[helper_start..helper_start + helper_end];
+
+        let migration_hook = helper_source
+            .find("maybe_apply_deferred_migrations")
+            .expect("full reload helper must apply deferred migrations");
+        let sequence_read = helper_source
+            .find("latest_change_sequence")
+            .expect("full reload helper must read latest change sequence");
+
+        assert!(
+            migration_hook < sequence_read,
+            "deferred migrations must run before reading config_changes"
+        );
+    }
+
+    #[test]
+    fn full_reload_unchanged_commits_sequence_cursor() {
+        let mut last_change_sequence = Some(7);
+        let sequence = 42;
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
             proxy::ConfigApplyOutcome::Unchanged,
-            &state,
-            full_reload_poll_state(
-                &mut known_proxy_ids,
-                &mut known_consumer_ids,
-                &mut known_plugin_config_ids,
-                &mut known_upstream_ids,
-                &mut last_poll_at,
-            ),
+            &mut last_change_sequence,
+            sequence,
         );
 
         assert!(accepted);
-        assert!(known_proxy_ids.is_empty());
-        assert!(known_consumer_ids.is_empty());
-        assert!(known_plugin_config_ids.is_empty());
-        assert!(known_upstream_ids.is_empty());
-        assert_eq!(last_poll_at, Some(state.current_config().loaded_at));
-        assert_ne!(last_poll_at, Some(previous_poll_at));
+        assert_eq!(last_change_sequence, Some(sequence));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_reload_rejected_preserves_cursor_and_known_ids() {
-        let state = empty_proxy_state_for_poll_tests();
-        let previous_poll_at = Utc::now() - chrono::Duration::seconds(60);
-        let mut last_poll_at = Some(previous_poll_at);
-        let mut known_proxy_ids: HashSet<String> = HashSet::from(["proxy-a".to_string()]);
-        let mut known_consumer_ids: HashSet<String> = HashSet::from(["consumer-a".to_string()]);
-        let mut known_plugin_config_ids: HashSet<String> = HashSet::from(["plugin-a".to_string()]);
-        let mut known_upstream_ids: HashSet<String> = HashSet::from(["upstream-a".to_string()]);
+    #[test]
+    fn full_reload_rejected_preserves_sequence_cursor() {
+        let previous_sequence = Some(7);
+        let mut last_change_sequence = previous_sequence;
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
             proxy::ConfigApplyOutcome::Rejected {
                 errors: vec!["invalid candidate".to_string()],
             },
-            &state,
-            full_reload_poll_state(
-                &mut known_proxy_ids,
-                &mut known_consumer_ids,
-                &mut known_plugin_config_ids,
-                &mut known_upstream_ids,
-                &mut last_poll_at,
-            ),
+            &mut last_change_sequence,
+            42,
         );
 
         assert!(!accepted);
-        assert_eq!(known_proxy_ids, HashSet::from(["proxy-a".to_string()]));
-        assert_eq!(
-            known_consumer_ids,
-            HashSet::from(["consumer-a".to_string()])
-        );
-        assert_eq!(
-            known_plugin_config_ids,
-            HashSet::from(["plugin-a".to_string()])
-        );
-        assert_eq!(
-            known_upstream_ids,
-            HashSet::from(["upstream-a".to_string()])
-        );
-        assert_eq!(last_poll_at, Some(previous_poll_at));
+        assert_eq!(last_change_sequence, previous_sequence);
+    }
+
+    fn incremental_with_removed_proxy(
+        proxy_id: &str,
+        poll_timestamp: DateTime<Utc>,
+    ) -> db_backend::IncrementalResult {
+        db_backend::IncrementalResult {
+            added_or_modified_proxies: vec![],
+            removed_proxy_ids: vec![proxy_id.to_string()],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            sequence_cursor: 1,
+            poll_timestamp,
+        }
+    }
+
+    fn incremental_with_plugin_config(
+        config: serde_json::Value,
+        poll_timestamp: DateTime<Utc>,
+    ) -> db_backend::IncrementalResult {
+        let timestamp = poll_timestamp;
+        db_backend::IncrementalResult {
+            added_or_modified_proxies: vec![],
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![crate::config::types::PluginConfig {
+                id: "plugin-a".to_string(),
+                plugin_name: "rate_limiting".to_string(),
+                namespace: crate::config::types::default_namespace(),
+                config,
+                scope: crate::config::types::PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            }],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            sequence_cursor: 1,
+            poll_timestamp,
+        }
     }
 
     #[test]
-    fn update_known_ids_adds_and_removes() {
-        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
-        assert!(known.contains("a"));
-        assert!(!known.contains("b"));
-        assert!(known.contains("c"));
-        assert!(known.contains("d"));
-        assert_eq!(known.len(), 3);
+    fn rejected_delta_identity_ignores_poll_timestamp_for_same_effective_delta() {
+        let after_sequence = 9;
+        let first = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let second =
+            incremental_with_removed_proxy("proxy-a", Utc::now() + chrono::Duration::seconds(5));
+
+        assert_eq!(
+            RejectedDeltaIdentity::from_incremental(after_sequence, &first),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second),
+            "same cursor and change set should classify as the same rejected delta even when poll timestamps differ"
+        );
     }
 
     #[test]
-    fn update_known_ids_remove_nonexistent_is_noop() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
-        assert_eq!(known.len(), 1);
+    fn rejected_delta_identity_includes_content_for_same_ids() {
+        let after_sequence = 9;
+        let poll_timestamp = Utc::now();
+        let first = incremental_with_plugin_config(
+            serde_json::json!({"limit": 10, "window_seconds": 60}),
+            poll_timestamp,
+        );
+        let second = incremental_with_plugin_config(
+            serde_json::json!({"limit": 20, "window_seconds": 60}),
+            poll_timestamp,
+        );
+
+        assert_ne!(
+            RejectedDeltaIdentity::from_incremental(after_sequence, &first),
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second),
+            "same resource IDs with different content must reset rejected-delta backoff state"
+        );
     }
 
     #[test]
-    fn update_known_ids_duplicate_add_is_idempotent() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec!["a".to_string(), "a".to_string()], &[]);
-        assert_eq!(known.len(), 1);
+    fn validation_category_classification_bounds_error_input() {
+        let mut too_many_errors = vec!["unrelated validation failure".repeat(200); 32];
+        too_many_errors.push("security plugin missing".to_string());
+        assert_eq!(
+            DatabaseDeltaValidationCategory::classify(&too_many_errors),
+            DatabaseDeltaValidationCategory::Other
+        );
+
+        let long_error = format!("{} tls certificate invalid", "x".repeat(300));
+        assert_eq!(
+            DatabaseDeltaValidationCategory::classify(&[long_error]),
+            DatabaseDeltaValidationCategory::Other
+        );
+
+        assert_eq!(
+            DatabaseDeltaValidationCategory::classify(&[
+                "duplicate listen path".to_string(),
+                "security plugin missing".to_string(),
+            ]),
+            DatabaseDeltaValidationCategory::SecurityPlugin
+        );
+    }
+
+    #[test]
+    fn backoff_bucket_reports_long_non_max_backoff_separately() {
+        assert_eq!(
+            DatabaseDeltaBackoffBucket::for_duration(
+                Duration::from_secs(600),
+                Duration::from_secs(3600),
+            )
+            .as_str(),
+            "gte_5m"
+        );
+        assert_eq!(
+            DatabaseDeltaBackoffBucket::for_duration(
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+            )
+            .as_str(),
+            "max"
+        );
+    }
+
+    #[test]
+    fn rejected_delta_tracker_backs_off_to_max_and_escalates() {
+        let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+        let mut tracker = RejectedDeltaTracker::new(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            3,
+            metrics.clone(),
+        );
+        let after_sequence = 9;
+        let result = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &result);
+        let errors = vec!["duplicate listen path '/api'".to_string()];
+
+        let first = tracker.record_rejection(identity.clone().with_validation(&errors));
+        assert_eq!(first.consecutive, 1);
+        assert_eq!(first.backoff, Duration::from_secs(1));
+        assert_eq!(first.log_action, RejectedDeltaLogAction::First);
+        assert!(!first.should_escalate);
+
+        let second = tracker.record_rejection(identity.clone().with_validation(&errors));
+        assert_eq!(second.consecutive, 2);
+        assert_eq!(second.backoff, Duration::from_secs(2));
+        assert_eq!(second.log_action, RejectedDeltaLogAction::BackoffTransition);
+        assert!(!second.should_escalate);
+
+        let third = tracker.record_rejection(identity.clone().with_validation(&errors));
+        assert_eq!(third.consecutive, 3);
+        assert_eq!(third.backoff, Duration::from_secs(4));
+        assert_eq!(third.log_action, RejectedDeltaLogAction::Escalation);
+        assert!(third.should_escalate);
+
+        let fourth = tracker.record_rejection(identity.with_validation(&errors));
+        assert_eq!(fourth.consecutive, 4);
+        assert_eq!(fourth.backoff, Duration::from_secs(4));
+        assert_eq!(fourth.log_action, RejectedDeltaLogAction::Suppressed);
+        assert!(!fourth.should_escalate);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.consecutive_identical_rejections, 4);
+        assert_eq!(snapshot.current_backoff_bucket, "max");
+        assert_eq!(
+            snapshot
+                .rejected_deltas_by_resource_category
+                .get("proxy")
+                .copied(),
+            Some(4)
+        );
+        assert!(snapshot.degraded.is_some());
+    }
+
+    #[test]
+    fn rejected_delta_tracker_resets_for_different_delta_and_recovery() {
+        let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+        let mut tracker = RejectedDeltaTracker::new(
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            3,
+            metrics.clone(),
+        );
+        let after_sequence = 9;
+        let first_delta = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let second_delta = incremental_with_removed_proxy("proxy-b", Utc::now());
+        let errors = vec!["duplicate listen path '/api'".to_string()];
+
+        let first_identity = RejectedDeltaIdentity::from_incremental(after_sequence, &first_delta);
+        tracker.record_rejection(first_identity.clone().with_validation(&errors));
+        tracker.record_rejection(first_identity.with_validation(&errors));
+
+        let second_identity =
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second_delta);
+        let different = tracker.record_rejection(second_identity.with_validation(&errors));
+        assert_eq!(different.consecutive, 1);
+        assert_eq!(different.backoff, Duration::from_secs(1));
+        assert_eq!(different.log_action, RejectedDeltaLogAction::First);
+
+        tracker.record_accepted();
+        let recovered = metrics.snapshot();
+        assert_eq!(recovered.consecutive_identical_rejections, 0);
+        assert_eq!(recovered.current_backoff_bucket, "none");
+        assert_eq!(recovered.current_backoff_seconds, 0);
+        assert_eq!(recovered.recoveries_total, 1);
+        assert!(recovered.degraded.is_none());
+
+        let next = tracker.record_rejection(
+            RejectedDeltaIdentity::from_incremental(after_sequence, &second_delta)
+                .with_validation(&errors),
+        );
+        assert_eq!(next.consecutive, 1);
+        assert_eq!(next.backoff, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rejected_delta_tracker_surfaces_category_change_and_bounded_metrics() {
+        let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+        let mut tracker = RejectedDeltaTracker::new(
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            3,
+            metrics.clone(),
+        );
+        let after_sequence = 9;
+        let delta = incremental_with_removed_proxy("secret-proxy-id", Utc::now());
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
+
+        tracker.record_rejection(
+            identity
+                .clone()
+                .with_validation(&["duplicate listen path".to_string()]),
+        );
+        let changed = tracker.record_rejection(
+            identity.with_validation(&["TLS certificate path invalid".to_string()]),
+        );
+
+        assert_eq!(
+            changed.log_action,
+            RejectedDeltaLogAction::ValidationCategoryChanged
+        );
+        assert_eq!(changed.consecutive, 1);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.last_resource_category, "proxy");
+        assert!(
+            snapshot
+                .rejected_deltas_by_resource_category
+                .keys()
+                .all(|label| !label.contains("secret-proxy-id"))
+        );
+        let degraded = snapshot.degraded.expect("active rejection is degraded");
+        assert_eq!(degraded.reason, "rejected_incremental_delta");
+        assert_eq!(degraded.resource_category, "proxy");
+        assert_eq!(degraded.validation_category, "tls");
+    }
+
+    #[test]
+    fn prometheus_registry_renders_database_delta_poll_metrics() {
+        let registry = crate::plugins::prometheus_metrics::MetricsRegistry::new();
+        registry.configure(5, 3600, 0, "ops");
+        assert!(registry.database_delta_poll_metrics_snapshot().is_none());
+
+        let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+        let mut tracker = RejectedDeltaTracker::new(
+            Duration::from_secs(4),
+            Duration::from_secs(4),
+            1,
+            metrics.clone(),
+        );
+        let after_sequence = 9;
+        let delta = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
+        let decision = tracker
+            .record_rejection(identity.with_validation(&["missing plugin reference".to_string()]));
+        assert!(decision.should_escalate);
+        metrics.record_forced_full_reload();
+
+        registry.set_database_delta_poll_metrics(metrics.clone());
+        let snapshot = registry
+            .database_delta_poll_metrics_snapshot()
+            .expect("registered metrics should produce a snapshot");
+        assert_eq!(snapshot.rejected_deltas_total, 1);
+        assert_eq!(snapshot.consecutive_identical_rejections, 1);
+        assert_eq!(snapshot.current_backoff_bucket, "max");
+        assert_eq!(snapshot.forced_full_reloads_total, 1);
+
+        let output = registry.render_uncached();
+        assert!(output.contains("ferrum_database_delta_rejections_total"));
+        assert!(output.contains(
+            r#"ferrum_database_delta_rejections_total{resource_category="proxy",namespace="ops"} 1"#
+        ));
+        assert!(output.contains(
+            r#"ferrum_database_delta_rejections_total{resource_category="consumer",namespace="ops"} 0"#
+        ));
+        assert!(output.contains(
+            r#"ferrum_database_delta_consecutive_identical_rejections{namespace="ops"} 1"#
+        ));
+        assert!(
+            output.contains(
+                r#"ferrum_database_delta_backoff_bucket{bucket="max",namespace="ops"} 1"#
+            )
+        );
+        assert!(
+            output.contains(
+                r#"ferrum_database_delta_backoff_bucket{bucket="lt_5s",namespace="ops"} 0"#
+            )
+        );
+        assert!(output.contains(
+            r#"ferrum_database_delta_backoff_bucket{bucket="gte_5m",namespace="ops"} 0"#
+        ));
+        assert!(
+            output
+                .contains(r#"ferrum_database_delta_forced_full_reloads_total{namespace="ops"} 1"#)
+        );
+        assert!(output.contains(r#"ferrum_database_delta_recoveries_total{namespace="ops"} 0"#));
+
+        tracker.record_accepted();
+        let recovered = registry.render_uncached();
+        assert!(recovered.contains(
+            r#"ferrum_database_delta_consecutive_identical_rejections{namespace="ops"} 0"#
+        ));
+        assert!(
+            recovered.contains(
+                r#"ferrum_database_delta_backoff_bucket{bucket="none",namespace="ops"} 1"#
+            )
+        );
+        assert!(recovered.contains(r#"ferrum_database_delta_recoveries_total{namespace="ops"} 1"#));
+    }
+
+    #[test]
+    fn prometheus_registry_invalidates_cached_database_delta_poll_metrics() {
+        let registry = crate::plugins::prometheus_metrics::global_registry();
+        registry.configure(3600, 3600, 0, "ops-cache");
+
+        let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+        let mut tracker = RejectedDeltaTracker::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            3,
+            metrics.clone(),
+        );
+        registry.set_database_delta_poll_metrics(metrics);
+
+        let initial = registry.render();
+        assert!(initial.contains(
+            r#"ferrum_database_delta_rejections_total{resource_category="proxy",namespace="ops-cache"} 0"#
+        ));
+
+        let after_sequence = 9;
+        let delta = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
+        tracker.record_rejection(identity.with_validation(&["missing upstream".to_string()]));
+
+        let updated = registry.render();
+        assert!(updated.contains(
+            r#"ferrum_database_delta_rejections_total{resource_category="proxy",namespace="ops-cache"} 1"#
+        ));
     }
 }

@@ -128,6 +128,7 @@ pub async fn run_orig_dst_bridge(
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod production {
     use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -236,18 +237,42 @@ mod production {
     }
 
     /// Synchronous single-cookie lookup backing the accept-path fallback.
-    /// Returns `(pod_uid, workload_spiffe_hash)` when the cookie is present in
-    /// either pinned orig-dst map. One BPF map lookup per family; invoked only
-    /// on a resolver miss, so it stays off the steady-state hot path.
-    fn lookup_cookie(maps: &OpenMaps, cookie: u64) -> Option<([u8; 16], u64)> {
+    /// Returns `(pod_uid, workload_spiffe_hash, original destination)` when the
+    /// cookie is present in either pinned orig-dst map. One BPF map lookup per
+    /// family; invoked only on a resolver miss, so it stays off the steady-state
+    /// hot path.
+    fn lookup_cookie(maps: &OpenMaps, cookie: u64) -> Option<([u8; 16], u64, SocketAddr)> {
         let key = OrigDstKey { cookie };
         if let Ok(record) = maps.orig_dst4.get(&key, 0) {
-            return Some((record.pod_uid, record.workload_spiffe_hash));
+            return Some((
+                record.pod_uid,
+                record.workload_spiffe_hash,
+                orig_dst4_socket_addr(&record),
+            ));
         }
         if let Ok(record) = maps.orig_dst6.get(&key, 0) {
-            return Some((record.pod_uid, record.workload_spiffe_hash));
+            return Some((
+                record.pod_uid,
+                record.workload_spiffe_hash,
+                orig_dst6_socket_addr(&record),
+            ));
         }
         None
+    }
+
+    fn orig_dst4_socket_addr(record: &OrigDst4) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::from(record.addr.to_ne_bytes())),
+            record.port as u16,
+        )
+    }
+
+    fn orig_dst6_socket_addr(record: &OrigDst6) -> SocketAddr {
+        let mut octets = [0u8; 16];
+        for (idx, word) in record.addr.iter().enumerate() {
+            octets[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), record.port as u16)
     }
 
     /// One poll: re-sync the resolver's cookie records from the live BPF maps.

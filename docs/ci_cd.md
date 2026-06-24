@@ -137,7 +137,40 @@ cargo clippy --all-targets -- -D warnings
 
 The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed, the job no-ops and reports success.
 
-#### 5. Performance Regression Job
+#### 5. NodeWaypoint eBPF Live Datapath Workflow
+
+**Runs**: `ubuntu-24.04`
+
+`node-waypoint-ebpf-live` runs on PRs that touch eBPF, node-agent, NodeWaypoint
+identity, netns capture, socket option, TCP scope, chart, or live harness files.
+It builds the normal runtime Docker image from the host-built binary, builds the
+eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
+`ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime
+image from those cached host-built artifacts instead of recompiling inside
+Docker. It then creates a disposable dual-stack kind cluster with two workers,
+mounts bpffs in each kind node, loads both images into the cluster, and installs
+the Istio policy CRDs. The runner must provide Docker and a Linux kernel with
+cgroup v2 and kernel >= 5.7.
+
+The harness renders the Helm chart to assert enabled eBPF topologies select the
+`-ebpf` image, installs NodeWaypoint eBPF mode, checks
+`ferrum_node_agent_capture_state`, collects `bpftool` program/link/map evidence,
+checks the shared node-agent ↔ ambient pod registry plus per-pod in-netns ready
+markers, and verifies every ambient proxy accepted a mesh slice with the live
+workloads and policies before traffic starts. It then runs same-node and
+cross-node source/destination pod traffic, requiring `src-a` Service ClusterIP
+requests to succeed and `src-b` Service ClusterIP plus direct Pod-IP attempts to
+be rejected by live `AuthorizationPolicy`. The dual-stack pass verifies IPv6 is
+rejected before traffic is admitted until the end-to-end IPv6 NodeWaypoint path
+is completed. The harness also emits
+`target/node-waypoint-ebpf-live/live-assertions.json`, a machine-readable H2
+evidence file using the shared live-assertion schema. These assertion IDs are
+observational while NodeWaypoint remains Experimental; they are not part of the
+release-blocking sidecar GA contract. The workflow uploads Kubernetes
+diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
+`bpftool` evidence with 14-day retention.
+
+#### 6. Performance Regression Job
 
 **Runs**: `ubuntu-latest`
 
@@ -162,13 +195,13 @@ python3 tests/performance/ci_overhead_bench.py \
 - Indicate performance regression issues
 - Must be fixed before merging
 
-#### 6. Cross-Platform Build Jobs
+#### 7. Cross-Platform Build Jobs
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
 Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. The job installs the same prerequisites as the Release pipeline matrix — `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
-#### 7. Latest Release and Docker Jobs
+#### 8. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`
 

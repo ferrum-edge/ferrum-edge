@@ -911,11 +911,23 @@ async fn run_udp_egress_session(
             }
         };
         let hbone_port = crate::proxy::hbone_pool::target_hbone_port(&target);
+        let dial_host = match crate::proxy::hbone_pool::target_hbone_dial_host(&target) {
+            Ok(host) => host,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    error = %err,
+                    "Mesh UDP egress target carries a corrupt HBONE dial host; refusing dial"
+                );
+                return;
+            }
+        };
         match state
             .hbone_pool
             .get_datagram_tunnel(
                 proxy,
-                &target.host,
+                dial_host,
                 hbone_port,
                 &target.host,
                 target.port,

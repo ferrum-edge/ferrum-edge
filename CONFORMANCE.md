@@ -122,6 +122,23 @@ After the run, two artifacts land in `target/conformance/`:
 Both files are written atomically (write to `.tmp`, rename) so a concurrent
 `cat target/conformance/coverage.md` never observes a partial line.
 
+## GA product contract
+
+The machine-readable GA contract lives in
+`tests/conformance/ga_contract.yaml`. It is the source of truth for the
+semantic GA rows enforced by `tests/conformance/ga_scope.rs` and for the live
+datapath assertion IDs that Kubernetes suites must eventually emit.
+
+Every GA capability entry declares a stable capability ID, maturity, topology,
+config protocol, semantic conformance rows, required live suite, required live
+assertion IDs, platform profile, docs anchor, and owner.
+
+`cargo test --test conformance_tests -- --test-threads=1` with
+`FERRUM_CONFORMANCE_STRICT_GATE=1` fails when a GA semantic row is deleted,
+renamed, filtered out, or tagged GA without a manifest entry. The emitted
+`coverage.json` and `coverage.md` include the manifest-backed GA contract so
+reviewers can compare the generated matrix to the declared product promise.
+
 ## Status values
 
 The matrix tags each feature with one of three statuses:
@@ -156,6 +173,12 @@ removed or fixed before they land — the suite is all-green in `main`.
 5. Avoid any test that requires a real Kubernetes cluster, real network,
    or real timeout. The suite must be deterministic so CI gates can
    trust it.
+
+To promote a feature into the GA contract, add or update the capability in
+`tests/conformance/ga_contract.yaml`, tag the registering semantic row with
+`Maturity::Ga`, and include the required live assertion IDs. Do not label a
+feature GA from in-process coverage alone; required live IDs must correspond to
+real Kubernetes datapath assertions.
 
 The macro stamps `module_path!()` as the `test` column in the matrix; the
 test function name surfaces via the standard cargo-test output. Operators

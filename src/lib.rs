@@ -446,7 +446,7 @@ pub mod _test_support {
     }
 
     pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
-        crate::config::db_loader::diff_removed(known, current)
+        known.difference(current).cloned().collect()
     }
 
     pub fn parse_scheme(s: &str) -> Result<BackendScheme, String> {

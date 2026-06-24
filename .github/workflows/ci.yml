@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 concurrency:
   group: ci-publish-${{ github.ref }}
@@ -21,7 +22,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -37,7 +38,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -53,7 +54,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -84,7 +85,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -131,7 +132,7 @@ jobs:
             features: "secrets-vault,secrets-aws,secrets-gcp,secrets-azure"
             filters: "cross_backend"
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -170,7 +171,7 @@ jobs:
           - name: ldap
             filters: ldap
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -187,7 +188,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -229,14 +230,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test-integration-archive"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-nextest
 
@@ -278,7 +279,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below groups the 58 test files into 5 logical buckets sized roughly by
+    # below groups the 59 test files into 5 logical buckets sized roughly by
     # test count (admin-api ~153, admin-config ~152, mesh-routing ~158,
     # mesh-platform ~60, protocols-data-plane ~150). Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
@@ -337,6 +338,7 @@ jobs:
               integration::mesh_destination_rule_locality_lb_tests
               integration::mesh_destination_rule_port_policy_tests
               integration::mesh_destination_rule_max_connections_tests
+              integration::mesh_destination_rule_connection_pool_audit_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
           - shard: mesh-platform
@@ -382,10 +384,11 @@ jobs:
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
+              integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_offline_bootstrap_tests
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install Rust
         # The shard runs a prebuilt nextest archive, so it only needs `cargo`
@@ -399,7 +402,7 @@ jobs:
         # Same prebuilt-binary install action as `test-functional`. Nextest
         # gives us per-test process isolation, OR'd substring filters via
         # positional args, and a much nicer progress UI than libtest.
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-nextest
 
@@ -469,7 +472,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test-integration
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Verify every integration_tests module is sharded
         run: |
@@ -500,7 +503,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -531,13 +534,13 @@ jobs:
 
   build-gateway-binary:
     name: Build Gateway Binary (functional tests)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     # This binary is also packaged into a distroless Debian 13 image for the
     # Gateway API conformance lab. Pin the build host so its glibc stays no
     # newer than the runtime image glibc.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -569,14 +572,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-test-functional"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-nextest
 
@@ -723,7 +726,7 @@ jobs:
               functional_tls_only_test
               functional_client_ip_env_test
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install Rust
         # The shard runs a prebuilt nextest archive, so it only needs `cargo`
@@ -738,7 +741,7 @@ jobs:
         # Nextest's process-per-test model isolates port/process contention
         # and ships built-in slow-test + retry support, which fits this E2E
         # suite better than libtest's shared-process scheduler.
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-nextest
 
@@ -867,7 +870,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -875,7 +878,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-nextest
 
@@ -950,7 +953,7 @@ jobs:
       GATEWAY_API_PROFILE: GATEWAY-HTTP
       GATEWAY_API_SUPPORTED_FEATURES: Gateway,ReferenceGrant,HTTPRoute
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -1025,6 +1028,85 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Skipped: this PR does not touch Gateway API, controller, data-plane, routing, chart, image, proto, script, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
 
+  mesh-multicluster-federation:
+    name: Mesh Multicluster Federation
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: build-gateway-binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      FERRUM_IMAGE: ferrum-edge:multicluster-federation
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.3
+      FERRUM_MULTICLUSTER_DEPLOY_ONLY: "1"
+      FERRUM_SKIP_IMAGE_BUILD: "1"
+      FERRUM_IMAGE_REPOSITORY: ferrum-edge
+      FERRUM_IMAGE_TAG: multicluster-federation
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check for mesh federation changes
+        id: changes
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mesh_federation_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/ci\.yml|\.github/actions/package-ferrum-runtime-image/|tests/k8s/multicluster-federation/|docs/(mesh|mesh_multicluster_federation_runbook|spire_deployment)\.md|docs/configuration\.md|ferrum\.conf|openapi\.yaml|charts/ferrum-mesh/|proto/|src/admin/(mesh_remote_clusters|mod)\.rs|src/config/env_config\.rs|src/grpc/|src/identity/|src/modes/mesh/|src/proxy/|src/tls/|Cargo\.(toml|lock))'; then
+            echo "mesh_federation_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mesh_federation_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Kubernetes tools
+        if: steps.changes.outputs.mesh_federation_changed == 'true'
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Download prebuilt gateway binary
+        if: steps.changes.outputs.mesh_federation_changed == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug
+
+      - name: Package Ferrum image
+        if: steps.changes.outputs.mesh_federation_changed == 'true'
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/debug/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE }}
+
+      - name: Run two-cluster deployment smoke
+        if: steps.changes.outputs.mesh_federation_changed == 'true'
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/ferrum-multicluster-federation
+        run: tests/k8s/multicluster-federation/run.sh
+
+      - name: Upload mesh federation diagnostics
+        if: always() && steps.changes.outputs.mesh_federation_changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferrum-multicluster-federation
+          path: ${{ runner.temp }}/ferrum-multicluster-federation
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summarize mesh federation skip
+        if: steps.changes.outputs.mesh_federation_changed != 'true'
+        run: |
+          echo "## Mesh Multicluster Federation" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch mesh federation, discovery, SPIFFE identity, proxy, chart, image, proto, docs, config, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+
   helm-chart:
     name: Helm Chart
     if: github.event_name == 'pull_request'
@@ -1036,7 +1118,7 @@ jobs:
       KIND_VERSION: v0.27.0
       KUBECTL_VERSION: v1.32.3
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install Kubernetes tools
         run: |
@@ -1292,6 +1374,7 @@ jobs:
       - test-functional
       - plugin-hardening-redis-regression
       - gateway-api-conformance
+      - mesh-multicluster-federation
       - helm-chart
     runs-on: ubuntu-latest
     steps:
@@ -1314,6 +1397,7 @@ jobs:
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Plugin hardening Redis regression | ${{ needs.plugin-hardening-redis-regression.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Mesh multicluster federation | ${{ needs.mesh-multicluster-federation.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Helm chart | ${{ needs.helm-chart.result }} |" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
@@ -1329,6 +1413,7 @@ jobs:
              [ "${{ needs.test-functional.result }}" != "success" ] ||
              [ "${{ needs.plugin-hardening-redis-regression.result }}" != "success" ] ||
              [ "${{ needs.gateway-api-conformance.result }}" != "success" ] ||
+             [ "${{ needs.mesh-multicluster-federation.result }}" != "success" ] ||
              [ "${{ needs.helm-chart.result }}" != "success" ]; then
             exit 1
           fi
@@ -1338,7 +1423,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -1353,7 +1438,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
           fetch-depth: 0
 
@@ -1408,7 +1493,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -1430,7 +1515,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
@@ -1477,7 +1562,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -1520,7 +1605,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -1658,7 +1743,7 @@ jobs:
             asset_name: ferrum-edge-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -1692,7 +1777,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
           fi
 
       - name: Install protoc (macOS)
@@ -1718,6 +1803,7 @@ jobs:
           RUSTFLAGS: ""
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
 
       - name: Build release binary (cross)
@@ -1728,6 +1814,7 @@ jobs:
           RUSTFLAGS: ""
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
 
       - name: Build PR verification binary (cargo)
@@ -1773,7 +1860,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Download all binary artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1860,7 +1947,7 @@ jobs:
             cni_asset: ferrum-cni-linux-aarch64
             arch_dir: arm64
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
       - name: Download Linux binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

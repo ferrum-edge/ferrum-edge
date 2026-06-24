@@ -65,7 +65,12 @@ fn etag_value_is_weak(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("W/") else {
         return false;
     };
-    rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"')
+    let Some(opaque_tag) = rest.strip_prefix('"').and_then(|tag| tag.strip_suffix('"')) else {
+        return false;
+    };
+    opaque_tag
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x7e | 0x80..=0xff))
 }
 
 pub(crate) fn headers_have_strong_etag(headers: &HashMap<String, String>) -> bool {

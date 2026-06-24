@@ -37,6 +37,13 @@ use arc_swap::ArcSwap;
 
 pub const HBONE_TARGET_TAG: &str = "mesh.hbone";
 pub const HBONE_PORT_TAG: &str = "mesh.hbone_port";
+/// Optional tag carrying the outer TCP/TLS dial host for an HBONE target. When
+/// absent, the target host is both the dial host and CONNECT authority host.
+pub const HBONE_DIAL_HOST_TAG: &str = "mesh.hbone_dial_host";
+/// Optional tag overriding the server SVID the HBONE mTLS handshake pins. This
+/// is used when the peer is a waypoint/relay identity rather than the workload
+/// identity carried in [`MESH_SPIFFE_ID_TAG`].
+pub const HBONE_PEER_SPIFFE_ID_TAG: &str = "mesh.hbone_peer_spiffe_id";
 /// Tag carrying the destination workload's SPIFFE id. When present on a mesh
 /// target it is the identity the outbound SVID-mTLS handshake must PIN: the
 /// peer's server SVID URI SAN has to equal it exactly, not merely share a trust
@@ -94,6 +101,8 @@ pub enum HbonePoolError {
     },
     #[error("invalid HBONE server name {host}: {message}")]
     InvalidServerName { host: String, message: String },
+    #[error("invalid {HBONE_DIAL_HOST_TAG} tag '{value}' on mesh target: {message}")]
+    InvalidDialHostTag { value: String, message: String },
     #[error("invalid {MESH_SPIFFE_ID_TAG} tag '{value}' on mesh target: {message}")]
     InvalidPeerSpiffeTag { value: String, message: String },
     #[error("SPIFFE TLS config failed: {0}")]
@@ -121,6 +130,7 @@ impl HbonePoolError {
             Self::NoSvid
             | Self::NoLeafCert
             | Self::TlsConfig(_)
+            | Self::InvalidDialHostTag { .. }
             | Self::InvalidPeerSpiffeTag { .. } => ErrorClass::ConnectionPoolError,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
@@ -242,12 +252,14 @@ impl HboneConnectionPool {
         }
     }
 
-    pub async fn warmup_connection(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn warmup_connection_via(
         &self,
         proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        target_policy_port: u16,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
@@ -255,8 +267,8 @@ impl HboneConnectionPool {
         let pool_config = self.pool_config.for_proxy(proxy);
 
         let fast_sender = with_hbone_pool_key(
-            target_host,
-            target_port,
+            dial_host,
+            app_port,
             hbone_port,
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
@@ -269,8 +281,8 @@ impl HboneConnectionPool {
             sender
         } else {
             let key = with_hbone_pool_key(
-                target_host,
-                target_port,
+                dial_host,
+                app_port,
                 hbone_port,
                 proxy.dns_override.as_deref(),
                 fingerprint.as_ref(),
@@ -280,9 +292,10 @@ impl HboneConnectionPool {
             );
             self.get_or_create_sender(
                 proxy,
-                target_host,
-                target_port,
-                target_policy_port,
+                dial_host,
+                app_host,
+                app_port,
+                app_policy_port,
                 hbone_port,
                 expected_peer,
                 &key,
@@ -292,11 +305,11 @@ impl HboneConnectionPool {
         };
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            self.open_connect_stream(sender, target_host, target_port, &source_identity),
+            self.open_connect_stream(sender, app_host, app_port, &source_identity),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority_for_host_port(target_host, target_port),
+            authority: authority_for_host_port(app_host, app_port),
             message: format!(
                 "timed out after {}ms waiting for HBONE CONNECT probe response",
                 proxy.backend_connect_timeout_ms
@@ -474,12 +487,19 @@ impl HboneConnectionPool {
         record_hbone_evictions(evicted);
     }
 
-    pub async fn get_tunnel(
+    /// Open a pooled bare HBONE CONNECT byte tunnel. The HTTP/2 connection is
+    /// dialed to `dial_host:hbone_port`; the CONNECT `:authority` is
+    /// `app_host:app_port`. The ordinary Ambient path passes the same host for
+    /// both. NodeWaypoint secured egress passes the destination NodeWaypoint as
+    /// `dial_host` while preserving the selected workload IP/DNS as `app_host`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_tunnel_via(
         &self,
         proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        target_policy_port: u16,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
@@ -487,8 +507,8 @@ impl HboneConnectionPool {
         let pool_config = self.pool_config.for_proxy(proxy);
 
         let fast_sender = with_hbone_pool_key(
-            target_host,
-            target_port,
+            dial_host,
+            app_port,
             hbone_port,
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
@@ -501,8 +521,8 @@ impl HboneConnectionPool {
             sender
         } else {
             let key = with_hbone_pool_key(
-                target_host,
-                target_port,
+                dial_host,
+                app_port,
                 hbone_port,
                 proxy.dns_override.as_deref(),
                 fingerprint.as_ref(),
@@ -512,9 +532,10 @@ impl HboneConnectionPool {
             );
             self.get_or_create_sender(
                 proxy,
-                target_host,
-                target_port,
-                target_policy_port,
+                dial_host,
+                app_host,
+                app_port,
+                app_policy_port,
                 hbone_port,
                 expected_peer,
                 &key,
@@ -524,11 +545,11 @@ impl HboneConnectionPool {
         };
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            self.open_connect_stream(sender, target_host, target_port, &source_identity),
+            self.open_connect_stream(sender, app_host, app_port, &source_identity),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority_for_host_port(target_host, target_port),
+            authority: authority_for_host_port(app_host, app_port),
             message: format!(
                 "timed out after {}ms waiting for HBONE CONNECT response",
                 proxy.backend_connect_timeout_ms
@@ -714,25 +735,25 @@ impl HboneConnectionPool {
     /// P1). Like the dispatch path this dials its OWN H2 connection (no pooled
     /// `hbone`-vs-`udp` marker ambiguity); the connection is dropped with the
     /// tunnel when the probe returns.
-    pub async fn warmup_datagram_connection(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn warmup_datagram_connection_via(
         &self,
         proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        target_policy_port: u16,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
-        // dial_host == app_host == target_host (mirrors the egress datapath,
-        // which dials the peer pod IP and CONNECTs to that same app addr:port).
         let _tunnel = self
             .get_datagram_tunnel(
                 proxy,
-                target_host,
+                dial_host,
                 hbone_port,
-                target_host,
-                target_port,
-                target_policy_port,
+                app_host,
+                app_port,
+                app_policy_port,
                 expected_peer,
             )
             .await?;
@@ -743,9 +764,10 @@ impl HboneConnectionPool {
     async fn get_or_create_sender(
         &self,
         proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        target_policy_port: u16,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
         key: &str,
@@ -756,7 +778,7 @@ impl HboneConnectionPool {
         match self.cached_sender(key, max_entries) {
             Some(CachedSender::Ready(sender)) => return Ok(sender),
             Some(CachedSender::Pending(sender)) => {
-                let authority = authority_for_host_port(target_host, target_port);
+                let authority = authority_for_host_port(app_host, app_port);
                 match tokio::time::timeout(
                     Duration::from_millis(proxy.backend_connect_timeout_ms),
                     sender.ready(),
@@ -766,8 +788,9 @@ impl HboneConnectionPool {
                     Ok(Ok(sender)) => return Ok(sender),
                     Ok(Err(err)) => {
                         debug!(
-                            target_host,
-                            target_port,
+                            dial_host,
+                            app_host,
+                            app_port,
                             hbone_port,
                             error = %err,
                             "Cached HBONE HTTP/2 sender closed while waiting for readiness; creating a replacement"
@@ -789,7 +812,7 @@ impl HboneConnectionPool {
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let creation_started = Instant::now();
-        let authority = authority_for_host_port(target_host, target_port);
+        let authority = authority_for_host_port(app_host, app_port);
         let creation_lock = self
             .creation_locks
             .entry(key.to_string())
@@ -826,8 +849,9 @@ impl HboneConnectionPool {
                     }
                     Ok(Err(err)) => {
                         debug!(
-                            target_host,
-                            target_port,
+                            dial_host,
+                            app_host,
+                            app_port,
                             hbone_port,
                             error = %err,
                             "Cached HBONE HTTP/2 sender closed after coalesced creation wait; creating a replacement"
@@ -873,13 +897,13 @@ impl HboneConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_policy_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
             self.create_sender(
                 proxy,
-                target_host,
+                dial_host,
                 hbone_port,
                 expected_peer,
                 pool_config,
@@ -930,8 +954,9 @@ impl HboneConnectionPool {
             .is_some_and(|(_, current)| hbone_key_svid_fingerprint(key) == Some(current.as_ref()));
         if !svid_slot_unchanged || !key_fingerprint_is_current {
             debug!(
-                target_host,
-                target_port,
+                dial_host,
+                app_host,
+                app_port,
                 hbone_port,
                 "HBONE HTTP/2 connection completed under a rotated SVID; serving without pooling"
             );
@@ -961,8 +986,8 @@ impl HboneConnectionPool {
                 }]
             });
         debug!(
-            target_host,
-            target_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
+            dial_host,
+            app_host, app_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
         );
         Ok(sender)
     }
@@ -1665,16 +1690,41 @@ pub fn target_hbone_port(target: &UpstreamTarget) -> u16 {
         .unwrap_or(ISTIO_HBONE_PORT)
 }
 
+/// The outer TCP/TLS host to dial for an HBONE target. Defaults to the target
+/// host. A present-but-empty override fails closed so a malformed waypoint
+/// target cannot silently downgrade to a direct workload dial.
+pub fn target_hbone_dial_host(target: &UpstreamTarget) -> Result<&str, HbonePoolError> {
+    match target.tags.get(HBONE_DIAL_HOST_TAG) {
+        None => Ok(target.host.as_str()),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Err(HbonePoolError::InvalidDialHostTag {
+                    value: value.clone(),
+                    message: "dial host must not be empty".to_string(),
+                })
+            } else {
+                Ok(trimmed)
+            }
+        }
+    }
+}
+
 /// The destination identity an outbound mesh dial must PIN, read from the
-/// target's [`MESH_SPIFFE_ID_TAG`]. `Ok(None)` when the tag is absent —
-/// operator-supplied targets without a declared peer identity keep
-/// trust-domain-only verification. A PRESENT but unparseable tag is an error so
-/// a corrupted identity fails the dial closed instead of silently downgrading
-/// to unpinned verification.
+/// target's [`HBONE_PEER_SPIFFE_ID_TAG`] override, or else
+/// [`MESH_SPIFFE_ID_TAG`]. `Ok(None)` when both are absent — operator-supplied
+/// targets without a declared peer identity keep trust-domain-only
+/// verification. A PRESENT but unparseable tag is an error so a corrupted
+/// identity fails the dial closed instead of silently downgrading to unpinned
+/// verification.
 pub fn target_expected_peer_spiffe(
     target: &UpstreamTarget,
 ) -> Result<Option<crate::identity::SpiffeId>, HbonePoolError> {
-    match target.tags.get(MESH_SPIFFE_ID_TAG) {
+    let value = target
+        .tags
+        .get(HBONE_PEER_SPIFFE_ID_TAG)
+        .or_else(|| target.tags.get(MESH_SPIFFE_ID_TAG));
+    match value {
         None => Ok(None),
         Some(value) => crate::identity::SpiffeId::new(value)
             .map(Some)
@@ -2044,6 +2094,45 @@ mod tests {
         assert_eq!(
             target_hbone_port(&target_with_tags(&[(HBONE_PORT_TAG, "not-a-port")])),
             ISTIO_HBONE_PORT
+        );
+    }
+
+    #[test]
+    fn hbone_dial_host_defaults_and_rejects_empty_override() {
+        assert_eq!(
+            target_hbone_dial_host(&target_with_tags(&[])).unwrap(),
+            "orders.default.svc.cluster.local"
+        );
+        assert_eq!(
+            target_hbone_dial_host(&target_with_tags(&[(HBONE_DIAL_HOST_TAG, "10.9.0.7")]))
+                .unwrap(),
+            "10.9.0.7"
+        );
+        assert!(matches!(
+            target_hbone_dial_host(&target_with_tags(&[(HBONE_DIAL_HOST_TAG, " ")])),
+            Err(HbonePoolError::InvalidDialHostTag { .. })
+        ));
+    }
+
+    #[test]
+    fn hbone_peer_spiffe_override_takes_precedence_over_workload_spiffe() {
+        let target = target_with_tags(&[
+            (
+                MESH_SPIFFE_ID_TAG,
+                "spiffe://cluster.local/ns/default/sa/orders",
+            ),
+            (
+                HBONE_PEER_SPIFFE_ID_TAG,
+                "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+            ),
+        ]);
+
+        let expected = target_expected_peer_spiffe(&target)
+            .expect("valid peer spiffe")
+            .expect("peer spiffe present");
+        assert_eq!(
+            expected.as_str(),
+            "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a"
         );
     }
 
@@ -2648,6 +2737,7 @@ mod tests {
         let err = pool
             .get_or_create_sender(
                 &proxy,
+                "orders.default.svc.cluster.local",
                 "orders.default.svc.cluster.local",
                 8080,
                 8080,

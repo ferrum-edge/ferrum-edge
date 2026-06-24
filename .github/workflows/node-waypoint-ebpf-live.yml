@@ -1,0 +1,234 @@
+name: NodeWaypoint eBPF Live Datapath
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/node-waypoint-ebpf-live.yml"
+      - ".github/actions/package-ferrum-runtime-image/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "Dockerfile.release"
+      - "build.rs"
+      - "proto/**"
+      - "ebpf/**"
+      - "src/capture/**"
+      - "src/ebpf/**"
+      - "src/grpc/**"
+      - "src/identity/**"
+      - "src/k8s_controller/**"
+      - "src/modes/control_plane.rs"
+      - "src/modes/mesh/**"
+      - "src/modes/node_agent.rs"
+      - "src/plugins/mesh/**"
+      - "src/plugins/prometheus_metrics.rs"
+      - "src/proxy/mod.rs"
+      - "src/proxy/hbone_proxy.rs"
+      - "src/proxy/netns_capture.rs"
+      - "src/proxy/tcp_proxy.rs"
+      - "src/router_cache.rs"
+      - "src/socket_opts.rs"
+      - "charts/ferrum-mesh/**"
+      - "tests/k8s/lib/**"
+      - "tests/k8s/node_waypoint_ebpf_live/**"
+      - "docs/mesh.md"
+      - "docs/mesh_supported_matrix.md"
+      - "docs/node_agent.md"
+      - "docs/ci_cd.md"
+      - "docs/plans/node_waypoint_transport_adr.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-waypoint-ebpf-live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: node-waypoint-ebpf-live
+  KIND_CLUSTER: ferrum-ebpf-live
+  KIND_VERSION: v0.27.0
+  KUBECTL_VERSION: v1.32.3
+  ISTIO_VERSION: 1.24.3
+
+jobs:
+  node-waypoint-ebpf-live:
+    name: NodeWaypoint eBPF live datapath
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-node-waypoint-ebpf-live"
+
+      - name: Build normal runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package normal image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Build eBPF runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge --features cloud-secrets,ebpf
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install bpf-linker
+        run: cargo +stable install bpf-linker --locked
+
+      - name: Build eBPF program
+        run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+
+      - name: Package eBPF image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
+          bpf-elf-path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
+
+      - name: Install Kubernetes tools
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Create disposable dual-stack kind cluster
+        run: |
+          set -euo pipefail
+          cat > kind-ebpf-live.yaml <<'YAML'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            ipFamily: dual
+            podSubnet: "10.244.0.0/16,fd00:10:244::/56"
+            serviceSubnet: "10.96.0.0/16,fd00:10:96::/112"
+          nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+          YAML
+          kind create cluster --name "$KIND_CLUSTER" --config kind-ebpf-live.yaml --wait 180s
+          kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" podCIDRs="}{.spec.podCIDRs}{"\n"}{end}'
+          for node in $(kind get nodes --name "$KIND_CLUSTER"); do
+            docker exec "$node" sh -eu -c '
+              mkdir -p /sys/fs/bpf
+              grep -q " /sys/fs/bpf bpf " /proc/mounts || mount -t bpf bpf /sys/fs/bpf
+              test -f /sys/fs/cgroup/cgroup.controllers
+              mount | grep -q " /sys/fs/bpf type bpf "
+            '
+          done
+
+      - name: Load images into kind
+        run: |
+          set -euo pipefail
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$KIND_CLUSTER"
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}-ebpf" --name "$KIND_CLUSTER"
+
+      - name: Install Istio policy CRDs
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side=true -f "https://raw.githubusercontent.com/istio/istio/${ISTIO_VERSION}/manifests/charts/base/files/crd-all.gen.yaml"
+          for crd in \
+            authorizationpolicies.security.istio.io \
+            peerauthentications.security.istio.io \
+            requestauthentications.security.istio.io \
+            destinationrules.networking.istio.io \
+            envoyfilters.networking.istio.io \
+            gateways.networking.istio.io \
+            proxyconfigs.networking.istio.io \
+            serviceentries.networking.istio.io \
+            sidecars.networking.istio.io \
+            virtualservices.networking.istio.io \
+            workloadentries.networking.istio.io \
+            workloadgroups.networking.istio.io \
+            telemetries.telemetry.istio.io; do
+            kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+          done
+
+      - name: Run live NodeWaypoint eBPF datapath validation
+        env:
+          FERRUM_EBPF_LIVE_ACK_DISPOSABLE: "true"
+          FERRUM_LIVE_KEEP_RESOURCES: "true"
+          FERRUM_LIVE_REQUIRE_DUAL_STACK: "true"
+          FERRUM_LIVE_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
+          FERRUM_LIVE_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
+          FERRUM_LIVE_DOCKER_NODE_EVIDENCE: "true"
+        run: tests/k8s/node_waypoint_ebpf_live/run.sh
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/node-waypoint-ebpf-live-results"
+          mkdir -p "$results"
+          kubectl get nodes -o wide > "$results/nodes.txt" 2>&1
+          kubectl get pods -A -o wide > "$results/pods.txt" 2>&1
+          kubectl get events -A --sort-by=.lastTimestamp > "$results/events.txt" 2>&1
+          kubectl -n ferrum get all -o wide > "$results/ferrum-all.txt" 2>&1
+          kubectl -n ferrum-ebpf-live get all -o wide > "$results/workloads-all.txt" 2>&1
+          kubectl -n ferrum-ebpf-live describe pods > "$results/workloads-pods-describe.txt" 2>&1
+          kubectl -n ferrum-ebpf-live describe svc > "$results/workloads-services-describe.txt" 2>&1
+          helm -n ferrum get values ferrum-live --all > "$results/helm-values.yaml" 2>&1
+          helm -n ferrum get manifest ferrum-live > "$results/helm-manifest.yaml" 2>&1
+          kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/control-plane-deployment-describe.txt" 2>&1
+          kubectl -n ferrum describe daemonset/ferrum-mesh-node-agent > "$results/node-agent-daemonset-describe.txt" 2>&1
+          kubectl -n ferrum describe daemonset/ferrum-mesh-ambient > "$results/ambient-daemonset-describe.txt" 2>&1
+          kubectl -n ferrum describe pods > "$results/ferrum-pods-describe.txt" 2>&1
+          kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=500 > "$results/control-plane.log" 2>&1
+          kubectl -n ferrum logs daemonset/ferrum-mesh-node-agent --all-containers --tail=500 > "$results/node-agent.log" 2>&1
+          kubectl -n ferrum logs daemonset/ferrum-mesh-ambient --all-containers --tail=500 > "$results/ambient.log" 2>&1
+          for pod in $(kubectl -n ferrum get pods -o name 2>/dev/null); do
+            name="${pod#pod/}"
+            kubectl -n ferrum logs "$pod" --all-containers --tail=500 > "$results/${name}.log" 2>&1
+            kubectl -n ferrum logs "$pod" --previous --all-containers --tail=500 > "$results/${name}-previous.log" 2>&1
+          done
+          if command -v kind >/dev/null 2>&1 && command -v docker >/dev/null 2>&1; then
+            for node in $(kind get nodes --name "$KIND_CLUSTER" 2>/dev/null); do
+              docker exec "$node" sh -eu -c '
+                dir="${1:-/run/ferrum/node-waypoint-pods}"
+                if [ ! -d "$dir" ]; then
+                  echo "$dir does not exist"
+                  exit 0
+                fi
+                find "$dir" -maxdepth 2 -type f -print 2>/dev/null | sort | while IFS= read -r file; do
+                  echo "--- $file"
+                  sed -n "1,3p" "$file" 2>/dev/null || true
+                done
+              ' sh "${FERRUM_LIVE_NODE_WAYPOINT_REGISTRY_DIR:-/run/ferrum/node-waypoint-pods}" \
+                > "$results/node-waypoint-registry-${node}.txt" 2>&1
+            done
+          fi
+          if [ -d target/node-waypoint-ebpf-live ]; then
+            cp -R target/node-waypoint-ebpf-live "$results/bpf-evidence"
+          fi
+          if [ -f target/node-waypoint-ebpf-live/live-assertions.json ]; then
+            cp target/node-waypoint-ebpf-live/live-assertions.json "$results/live-assertions.json"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: node-waypoint-ebpf-live-results
+          path: node-waypoint-ebpf-live-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name "$KIND_CLUSTER" || true

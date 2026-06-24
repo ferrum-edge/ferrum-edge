@@ -14,7 +14,7 @@
 //!    case — a regression that forces a GA feature's test down to `Deferred`.
 //!
 //! 2. **Contract presence gate** ([`zz_ga_scope_contract_gate`]): asserts every
-//!    entry in [`GA_CONTRACT`] is present in the registry, `Supported`, and
+//!    entry in `ga_contract.yaml` is present in the registry, `Supported`, and
 //!    tagged `Ga`, and that no feature is tagged `Ga` without being declared
 //!    here. This catches a *deleted* or renamed GA test (its row vanishes) and
 //!    tag/contract drift.
@@ -32,32 +32,14 @@
 //! avoid false failures; the always-on per-call assertion still guards every
 //! run.
 //!
-//! Adding a row to [`GA_CONTRACT`] is a product promise. Removing one is a
-//! deliberate scope change. A feature earns its place here once its
+//! Adding a GA semantic assertion to `ga_contract.yaml` is a product promise.
+//! Removing one is a deliberate scope change. A feature earns its place here once its
 //! translation/semantics are stable and pinned by a conformance test; the
 //! *runtime* GA bar (live mTLS/authz/routing on real pods) is gated separately
 //! by the `mesh-e2e-sidecar` live-datapath suite.
 
+use super::contract::load_contract;
 use super::registry::{Maturity, Status, snapshot};
-
-/// Features Ferrum Edge promises as GA in the conformance/translation contract.
-/// Each MUST be registered by a conformance test as `Status::Supported` and
-/// tagged `maturity = Maturity::Ga`.
-///
-/// This list grows as each mesh area is verified. It is intentionally small at
-/// first: a feature is promoted here only when we are prepared to fail CI on
-/// its regression.
-pub(crate) const GA_CONTRACT: &[(&str, &str)] = &[
-    (
-        "istio_destination_rule",
-        "trafficPolicy.connectionPool.tcp.connectTimeout",
-    ),
-    (
-        "istio_destination_rule",
-        "trafficPolicy.connectionPool.tcp.maxConnections",
-    ),
-    ("istio_virtual_service", "http[].corsPolicy"),
-];
 
 /// Whether the (suite-completion-dependent) presence gate is enforced.
 fn strict_gate_enabled() -> bool {
@@ -67,20 +49,23 @@ fn strict_gate_enabled() -> bool {
 /// Enforce the GA contract. Invoked from the top-level `zz_`-named test in
 /// `mod.rs` so it runs after every feature has registered (see module docs).
 pub(crate) fn enforce_contract_gate() {
+    let contract = load_contract().expect("ga_contract.yaml must be valid");
+    let contract_ga_assertions = contract.ga_semantic_assertions();
     let snap = snapshot();
 
-    // Always safe: a feature tagged GA but not declared in GA_CONTRACT is drift
-    // (someone promoted a feature without recording the promise). A GA feature
-    // that has not yet run simply is not in `snap`, so this never false-fails.
+    // Always safe: a feature tagged GA but not declared in ga_contract.yaml is
+    // drift (someone promoted a feature without recording the promise). A GA
+    // feature that has not yet run simply is not in `snap`, so this never
+    // false-fails.
     for f in &snap {
         if f.maturity == Maturity::Ga {
-            let declared = GA_CONTRACT
-                .iter()
-                .any(|(c, ft)| *c == f.category && *ft == f.feature);
+            let declared = contract_ga_assertions.iter().any(|assertion| {
+                assertion.category == f.category && assertion.feature == f.feature
+            });
             assert!(
                 declared,
-                "feature `{}/{}` is tagged `Maturity::Ga` but is missing from GA_CONTRACT — \
-                 add it to the declared contract in tests/conformance/ga_scope.rs",
+                "feature `{}/{}` is tagged `Maturity::Ga` but is missing from \
+                 tests/conformance/ga_contract.yaml — add it to the declared product contract",
                 f.category, f.feature,
             );
         }
@@ -96,15 +81,17 @@ pub(crate) fn enforce_contract_gate() {
     // Strict (CI, single-threaded, runs last): every promised feature must be
     // present, Supported, and GA-tagged. A missing row means its test was
     // deleted/renamed/filtered.
-    for (cat, feat) in GA_CONTRACT {
+    for assertion in contract_ga_assertions {
+        let cat = assertion.category.as_str();
+        let feat = assertion.feature.as_str();
         let found = snap
             .iter()
-            .find(|f| f.category == *cat && f.feature == *feat)
+            .find(|f| f.category == cat && f.feature == feat)
             .unwrap_or_else(|| {
                 panic!(
                     "GA-contract feature `{cat}/{feat}` is absent from the conformance registry — \
                      its test was deleted, renamed, or filtered out. Restore the test, or amend \
-                     GA_CONTRACT in tests/conformance/ga_scope.rs if the removal is intentional."
+                     tests/conformance/ga_contract.yaml if the removal is intentional."
                 )
             });
         assert_eq!(

@@ -602,6 +602,14 @@ fn test_response_buffering_skips_strong_etag() {
         200,
         &headers
     ));
+
+    headers.insert("etag".to_string(), "W/\"old\", W/\"new\"".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
 }
 
 #[test]
@@ -945,6 +953,26 @@ async fn test_whitespace_after_weak_etag_prefix_is_preserved_like_malformed_etag
     assert!(!resp_headers.contains_key("content-encoding"));
     assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
     assert_eq!(resp_headers.get("etag").unwrap(), "W/ \"abc123\"");
+}
+
+#[tokio::test]
+async fn test_folded_duplicate_weak_etag_is_preserved_like_malformed_etag() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "W/\"old\", W/\"new\"".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "1000");
+    assert_eq!(resp_headers.get("etag").unwrap(), "W/\"old\", W/\"new\"");
 }
 
 #[tokio::test]
@@ -1890,7 +1918,7 @@ async fn test_valid_gzip_request_body_is_accepted_and_headers_stripped() {
 }
 
 #[tokio::test]
-async fn test_request_cache_control_no_transform_preserves_compressed_request_body() {
+async fn test_request_cache_control_no_transform_still_decompresses_request_body() {
     use flate2::write::GzEncoder;
     use std::io::Write;
 
@@ -1912,23 +1940,27 @@ async fn test_request_cache_control_no_transform_preserves_compressed_request_bo
         ctx.metadata
             .contains_key("compression:request_no_transform")
     );
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
     assert_eq!(
-        headers.get("content-encoding").map(String::as_str),
+        headers
+            .get("x-ferrum-original-content-encoding")
+            .map(String::as_str),
         Some("gzip")
     );
-    assert!(headers.contains_key("content-length"));
 
     let transformed = plugin
         .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
         .await;
-    assert!(
-        transformed.is_none(),
-        "Cache-Control: no-transform must leave the compressed request body intact"
+    assert_eq!(
+        transformed.as_deref(),
+        Some(original.as_slice()),
+        "Cache-Control: no-transform must not bypass request decompression"
     );
 }
 
 #[tokio::test]
-async fn test_original_request_no_transform_marker_restores_header_and_preserves_body() {
+async fn test_original_request_no_transform_marker_restores_header_and_decompresses_body() {
     use flate2::write::GzEncoder;
     use std::io::Write;
 
@@ -1953,11 +1985,14 @@ async fn test_original_request_no_transform_marker_restores_header_and_preserves
         ctx.metadata
             .contains_key("compression:request_no_transform")
     );
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
     assert_eq!(
-        headers.get("content-encoding").map(String::as_str),
+        headers
+            .get("x-ferrum-original-content-encoding")
+            .map(String::as_str),
         Some("gzip")
     );
-    assert!(headers.contains_key("content-length"));
     assert_eq!(
         headers.get("cache-control").map(String::as_str),
         Some("no-transform"),
@@ -1967,14 +2002,15 @@ async fn test_original_request_no_transform_marker_restores_header_and_preserves
     let transformed = plugin
         .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
         .await;
-    assert!(
-        transformed.is_none(),
-        "original Cache-Control: no-transform must leave the compressed request body intact"
+    assert_eq!(
+        transformed.as_deref(),
+        Some(original.as_slice()),
+        "original Cache-Control: no-transform must not bypass request decompression"
     );
 }
 
 #[tokio::test]
-async fn test_request_no_transform_metadata_skips_context_aware_decode_without_header() {
+async fn test_request_no_transform_metadata_does_not_skip_context_aware_decode() {
     use flate2::write::GzEncoder;
     use std::io::Write;
 
@@ -2001,14 +2037,15 @@ async fn test_request_no_transform_metadata_skips_context_aware_decode_without_h
             &headers,
         )
         .await;
-    assert!(
-        transformed.is_none(),
-        "request no-transform metadata must leave gzip bytes intact even if the header was removed"
+    assert_eq!(
+        transformed.as_deref(),
+        Some(original.as_slice()),
+        "request no-transform metadata must not leave gzip bytes opaque to final body hooks"
     );
 }
 
 #[test]
-fn test_original_request_no_transform_marker_skips_request_body_buffering() {
+fn test_original_request_no_transform_marker_keeps_request_body_buffering() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     let mut ctx = make_request_ctx_with_body("gzip", b"buffered gzip body");
 
@@ -2020,8 +2057,24 @@ fn test_original_request_no_transform_marker_skips_request_body_buffering() {
     );
 
     assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "stamped request no-transform must still buffer so compressed uploads are decoded before inspection"
+    );
+}
+
+#[test]
+fn test_unsupported_request_encoding_does_not_buffer_for_no_transform() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_request_ctx_with_body("zstd", b"streaming zstd body");
+
+    ctx.metadata.insert(
+        "ferrum:no_transform_request".to_string(),
+        "true".to_string(),
+    );
+
+    assert!(
         !plugin.should_buffer_request_body(&ctx),
-        "stamped request no-transform must keep compressed uploads streaming"
+        "unsupported encodings must not be buffered when the compression plugin cannot decode them"
     );
 }
 

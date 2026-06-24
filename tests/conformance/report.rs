@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use super::contract::{Capability, ContractMaturity, load_contract};
 use super::registry::{Feature, Maturity, Status, snapshot};
 
 const ARTIFACT_DIR: &str = "target/conformance";
@@ -24,6 +25,7 @@ const ARTIFACT_DIR: &str = "target/conformance";
 #[derive(Debug, Serialize)]
 struct CoverageReport {
     summary: CoverageSummary,
+    ga_contract: Vec<GaCapabilityReport>,
     categories: Vec<CategoryReport>,
 }
 
@@ -66,10 +68,30 @@ struct FeatureEntry {
     notes: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct GaCapabilityReport {
+    id: String,
+    display_name: String,
+    maturity: String,
+    topology: String,
+    config_protocol: String,
+    semantic_assertions: Vec<String>,
+    live_suite: String,
+    live_assertions: Vec<String>,
+    platform_profile: String,
+    docs_anchor: String,
+    owner: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exclusions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pr_path_filters: Vec<String>,
+}
+
 /// Drain the registry and write `coverage.json` + `coverage.md` to
 /// `target/conformance/`.
 pub(crate) fn emit_artifacts() -> std::io::Result<()> {
     let features = snapshot();
+    let contract = load_contract().map_err(std::io::Error::other)?;
 
     // Group by category — registry stores a `BTreeMap`, so ordering is
     // already deterministic by `(category, feature)`. We rebuild the
@@ -140,6 +162,11 @@ pub(crate) fn emit_artifacts() -> std::io::Result<()> {
             ga,
             by_category,
         },
+        ga_contract: contract
+            .ga_capabilities()
+            .into_iter()
+            .map(GaCapabilityReport::from)
+            .collect(),
         categories: category_reports,
     };
 
@@ -168,6 +195,14 @@ fn maturity_str(maturity: Maturity) -> &'static str {
         Maturity::Ga => "ga",
         Maturity::Beta => "beta",
         Maturity::Experimental => "experimental",
+    }
+}
+
+fn contract_maturity_str(maturity: ContractMaturity) -> &'static str {
+    match maturity {
+        ContractMaturity::Ga => "ga",
+        ContractMaturity::Beta => "beta",
+        ContractMaturity::Experimental => "experimental",
     }
 }
 
@@ -209,6 +244,34 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
     writeln!(w, "| Deferred | {} |", report.summary.deferred)?;
     writeln!(w, "| Out of scope | {} |", report.summary.out_of_scope)?;
     writeln!(w, "| GA contract (prescriptive) | {} |", report.summary.ga)?;
+    writeln!(w)?;
+
+    writeln!(w, "## GA Product Contract")?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "Rows below come from `tests/conformance/ga_contract.yaml`, the machine-readable product contract."
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "| Capability | Maturity | Topology | Config | Semantic assertions | Live suite | Live assertions | Docs |"
+    )?;
+    writeln!(w, "|---|---|---|---|---|---|---|---|")?;
+    for capability in &report.ga_contract {
+        writeln!(
+            w,
+            "| `{}` | {} | `{}` | `{}` | {} | `{}` | {} | `{}` |",
+            escape_md(&capability.id),
+            capability.maturity,
+            escape_md(&capability.topology),
+            escape_md(&capability.config_protocol),
+            escape_md(&capability.semantic_assertions.join("<br>")),
+            escape_md(&capability.live_suite),
+            escape_md(&capability.live_assertions.join("<br>")),
+            escape_md(&capability.docs_anchor),
+        )?;
+    }
     writeln!(w)?;
 
     writeln!(w, "## Status reference")?;
@@ -261,6 +324,30 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
         writeln!(w)?;
     }
     Ok(())
+}
+
+impl From<&Capability> for GaCapabilityReport {
+    fn from(capability: &Capability) -> Self {
+        Self {
+            id: capability.id.clone(),
+            display_name: capability.display_name.clone(),
+            maturity: contract_maturity_str(capability.maturity).to_string(),
+            topology: capability.topology.clone(),
+            config_protocol: capability.config_protocol.clone(),
+            semantic_assertions: capability
+                .semantic_assertions
+                .iter()
+                .map(|assertion| format!("{}/{}", assertion.category, assertion.feature))
+                .collect(),
+            live_suite: capability.live_suite.clone(),
+            live_assertions: capability.live_assertions.clone(),
+            platform_profile: capability.platform_profile.clone(),
+            docs_anchor: capability.docs_anchor.clone(),
+            owner: capability.owner.clone(),
+            exclusions: capability.exclusions.clone(),
+            pr_path_filters: capability.pr_path_filters.clone(),
+        }
+    }
 }
 
 /// Minimal Markdown-table escape: backticks survive, but pipes within a value
