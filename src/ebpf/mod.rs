@@ -21,7 +21,7 @@ pub mod veth;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub use loader::AyaEbpfBackend;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +53,8 @@ pub const BPF_MAP_ORIG_DST4: &str = "FERRUM_ORIG_DST4";
 pub const BPF_MAP_ORIG_DST6: &str = "FERRUM_ORIG_DST6";
 pub const BPF_MAP_POD_IPS: &str = "FERRUM_POD_IPS";
 pub const BPF_MAP_POD_IPS6: &str = "FERRUM_POD_IPS6";
+pub const BPF_MAP_NODE_IPS: &str = "FERRUM_NODE_IPS";
+pub const BPF_MAP_NODE_IPS6: &str = "FERRUM_NODE_IPS6";
 pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
 pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
 pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
@@ -132,6 +134,8 @@ pub struct CaptureBpfMaps {
     pub orig_dst6: &'static str,
     pub pod_ips: &'static str,
     pub pod_ips6: &'static str,
+    pub node_ips: &'static str,
+    pub node_ips6: &'static str,
     pub bypass_uids: &'static str,
     pub cidr_exclude4: &'static str,
     pub cidr_exclude6: &'static str,
@@ -149,6 +153,8 @@ impl Default for CaptureBpfMaps {
             orig_dst6: BPF_MAP_ORIG_DST6,
             pod_ips: BPF_MAP_POD_IPS,
             pod_ips6: BPF_MAP_POD_IPS6,
+            node_ips: BPF_MAP_NODE_IPS,
+            node_ips6: BPF_MAP_NODE_IPS6,
             bypass_uids: BPF_MAP_BYPASS_UIDS,
             cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
             cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
@@ -226,9 +232,13 @@ impl CaptureContract {
     }
 
     pub fn bpf_capture_config(&self) -> BpfCaptureConfig {
+        let inbound_auth_mark = match self.proxy_mode {
+            NodeAgentProxyMode::LocalPod => 0,
+            NodeAgentProxyMode::NodeWaypoint => self.node_waypoint_inbound_auth_mark,
+        };
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
             .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
-            .with_node_waypoint_inbound_auth_mark(self.node_waypoint_inbound_auth_mark)
+            .with_node_waypoint_inbound_auth_mark(inbound_auth_mark)
     }
 }
 
@@ -531,6 +541,8 @@ pub trait EbpfBackend: Send + Sync {
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
     fn update_pod_ip6(&mut self, ip: Ipv6Addr, info: &PodInfo) -> Result<(), String>;
     fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
+    fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
+    fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String>;
     fn update_cidr_exclude(&mut self, cidr: &str) -> Result<(), String>;
     fn update_cidr_include(&mut self, cidr: &str) -> Result<(), String>;
@@ -596,6 +608,8 @@ pub struct MockEbpfBackend {
     pub tc_attachments: Vec<(String, String, TcAttachDirection)>,
     pub pod_ips: HashMap<Ipv4Addr, PodInfo>,
     pub pod_ips6: HashMap<Ipv6Addr, PodInfo>,
+    pub node_ips: HashSet<Ipv4Addr>,
+    pub node_ips6: HashSet<Ipv6Addr>,
     pub bypass_uids: Vec<u32>,
     pub cidr_excludes: Vec<String>,
     pub cidr_includes: Vec<String>,
@@ -714,6 +728,16 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        self.node_ips.insert(ip);
+        Ok(())
+    }
+
+    fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        self.node_ips6.insert(ip);
+        Ok(())
+    }
+
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
         self.bypass_uids.push(uid);
         Ok(())
@@ -777,6 +801,8 @@ impl EbpfBackend for MockEbpfBackend {
         self.tc_attachments.clear();
         self.pod_ips.clear();
         self.pod_ips6.clear();
+        self.node_ips.clear();
+        self.node_ips6.clear();
         self.include_ports.clear();
         self.workload_identities.clear();
         self.sock_ops_attached_cgroup_root = None;
@@ -856,9 +882,30 @@ mod tests {
 
         assert_eq!(contract.proxy_mode, NodeAgentProxyMode::NodeWaypoint);
         assert_eq!(contract.bpf_maps.capture_config, BPF_MAP_CAPTURE_CONFIG);
+        assert_eq!(contract.bpf_maps.node_ips, BPF_MAP_NODE_IPS);
+        assert_eq!(contract.bpf_maps.node_ips6, BPF_MAP_NODE_IPS6);
         assert_eq!(
             contract.bpf_capture_config(),
             BpfCaptureConfig::new(16001, 16008)
+                .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
+        );
+    }
+
+    #[test]
+    fn capture_contract_disables_inbound_mark_for_local_pod() {
+        let contract = CaptureContract::new(
+            NodeAgentProxyMode::LocalPod,
+            16001,
+            16008,
+            "/tmp/ferrum.sock",
+        )
+        .unwrap();
+
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_inbound_auth_mark,
+            0
         );
     }
 
@@ -932,6 +979,10 @@ mod tests {
         assert_eq!(backend.pod_ips.get(&ip), Some(&info));
         backend.update_pod_ip6(ip6, &info).unwrap();
         assert_eq!(backend.pod_ips6.get(&ip6), Some(&info));
+        backend.update_node_ip(ip).unwrap();
+        assert!(backend.node_ips.contains(&ip));
+        backend.update_node_ip6(ip6).unwrap();
+        assert!(backend.node_ips6.contains(&ip6));
 
         backend.remove_pod_ip(ip).unwrap();
         assert!(!backend.pod_ips.contains_key(&ip));
@@ -964,6 +1015,8 @@ mod tests {
         assert!(backend.cgroup_attachments.is_empty());
         assert!(backend.pod_ips.is_empty());
         assert!(backend.pod_ips6.is_empty());
+        assert!(backend.node_ips.is_empty());
+        assert!(backend.node_ips6.is_empty());
     }
 
     #[test]

@@ -310,6 +310,16 @@ impl EbpfBackend for AyaEbpfBackend {
         maps.remove_pod_ip6(ip)
     }
 
+    fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_ip(ip)
+    }
+
+    fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_ip6(ip)
+    }
+
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_bypass_uid(uid)

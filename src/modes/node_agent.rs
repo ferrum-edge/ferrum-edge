@@ -272,6 +272,42 @@ fn cidr_is_ipv6(cidr: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn node_agent_node_source_ips_from_env() -> Result<PodSourceIps, String> {
+    let mut ips = PodSourceIps::default();
+    if let Some(raw) = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_IP") {
+        insert_node_source_ip(&mut ips, "FERRUM_NODE_AGENT_NODE_IP", raw.trim())?;
+    }
+    if let Some(raw) = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_IPS") {
+        for raw_ip in raw.split(',') {
+            insert_node_source_ip(&mut ips, "FERRUM_NODE_AGENT_NODE_IPS", raw_ip.trim())?;
+        }
+    }
+    Ok(ips)
+}
+
+fn insert_node_source_ip(ips: &mut PodSourceIps, var_name: &str, raw: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        return Ok(());
+    }
+    match raw.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            if ips.ipv4.is_none() {
+                ips.ipv4 = Some(ip);
+            }
+            Ok(())
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            if ips.ipv6.is_none() {
+                ips.ipv6 = Some(ip);
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "{var_name} contains invalid IP address '{raw}': {e}"
+        )),
+    }
+}
+
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -1540,7 +1576,18 @@ fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str
 }
 
 fn pending_capture_failure_key(state_key: &str, operation: &str, detail: &str) -> String {
-    format!("{state_key}:{operation}:{detail}")
+    format!(
+        "{state_key}:{operation}:{}",
+        encode_pending_capture_detail(detail)
+    )
+}
+
+fn encode_pending_capture_detail(detail: &str) -> String {
+    detail.replace('%', "%25").replace(':', "%3A")
+}
+
+fn decode_pending_capture_detail(detail: &str) -> String {
+    detail.replace("%3A", ":").replace("%25", "%")
 }
 
 #[derive(Debug, Clone)]
@@ -1553,7 +1600,7 @@ struct PendingCaptureFailure {
 
 fn parse_pending_capture_failure_key(key: &str) -> Option<PendingCaptureFailure> {
     let mut parts = key.rsplitn(3, ':');
-    let detail = parts.next()?;
+    let detail = decode_pending_capture_detail(parts.next()?);
     let operation = parts.next()?;
     let state_key = parts.next()?;
     if state_key.is_empty() || operation.is_empty() || detail.is_empty() {
@@ -1563,7 +1610,7 @@ fn parse_pending_capture_failure_key(key: &str) -> Option<PendingCaptureFailure>
         key: key.to_string(),
         state_key: state_key.to_string(),
         operation: operation.to_string(),
-        detail: detail.to_string(),
+        detail,
     })
 }
 
@@ -2032,7 +2079,9 @@ fn handle_pod_added(
             }
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
             drop(state);
-            if pod_ip_reconcile.recovered_pending_failure {
+            if pod_ip_reconcile.recovered_pending_failure
+                || pod_ip6_reconcile.recovered_pending_failure
+            {
                 clear_partial_capture_state_if_recovered(pod_states, metrics);
             }
             if let Some(ip) = pod_ip_reconcile.stale_pod_ip {
@@ -3275,10 +3324,43 @@ fn initialize_backend(
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         return Err(anyhow::Error::msg(e));
     }
+    let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
     if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
         metrics.set_topology_degraded("capture_unavailable");
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         return Err(anyhow::Error::msg(e));
+    }
+
+    if require_sock_ops {
+        let node_source_ips = match node_agent_node_source_ips_from_env() {
+            Ok(ips) => ips,
+            Err(e) => {
+                metrics.set_topology_degraded("capture_unavailable");
+                metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+                return Err(anyhow::Error::msg(e));
+            }
+        };
+        if let Some(ip) = node_source_ips.ipv4
+            && let Err(e) = backend.update_node_ip(ip)
+        {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
+        if let Some(ip) = node_source_ips.ipv6
+            && let Err(e) = backend.update_node_ip6(ip)
+        {
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(e));
+        }
+        if node_source_ips.ipv4.is_none() && node_source_ips.ipv6.is_none() {
+            warn!(
+                "NodeWaypoint inbound direct-pod guard has no FERRUM_NODE_AGENT_NODE_IP(S) \
+                 configured; Kubernetes host-network probes will not be exempt until the \
+                 node-agent receives the node source IP"
+            );
+        }
     }
 
     if let Some(uid) = config.capture_config.proxy_uid
@@ -3317,7 +3399,6 @@ fn initialize_backend(
     // node-global shape (CIDR includes/excludes, port excludes, proxy
     // UID bypass).
 
-    let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
     if require_sock_ops {
         // SOCK_OPS at the cgroup root carries BOTH TCP-layer telemetry AND the
         // GAP-2M accept-side cookie bridge that node-waypoint per-pod identity
@@ -3543,6 +3624,22 @@ mod tests {
     }
 
     #[test]
+    fn node_agent_node_source_ips_parse_from_env() {
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
+                ("FERRUM_NODE_AGENT_NODE_IPS", "fd00::10"),
+            ],
+            || {
+                let ips =
+                    node_agent_node_source_ips_from_env().expect("node source IPs should parse");
+                assert_eq!(ips.ipv4, Some(std::net::Ipv4Addr::new(192, 0, 2, 10)));
+                assert_eq!(ips.ipv6, Some("fd00::10".parse().unwrap()));
+            },
+        );
+    }
+
+    #[test]
     fn initialize_backend_populates_maps() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -3613,12 +3710,24 @@ mod tests {
 
         let mut backend = MockEbpfBackend::default();
         let metrics = NodeAgentMetrics::default();
-        initialize_backend(&mut backend, &config, &metrics).unwrap();
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
+                ("FERRUM_NODE_AGENT_NODE_IPS", "fd00::10"),
+            ],
+            || initialize_backend(&mut backend, &config, &metrics).unwrap(),
+        );
 
         assert_eq!(
             backend.sock_ops_attached_cgroup_root.as_deref(),
             Some("/sys/fs/cgroup")
         );
+        assert!(
+            backend
+                .node_ips
+                .contains(&std::net::Ipv4Addr::new(192, 0, 2, 10))
+        );
+        assert!(backend.node_ips6.contains(&"fd00::10".parse().unwrap()));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_READY
@@ -6511,6 +6620,47 @@ mod tests {
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_READY
+        );
+    }
+
+    #[test]
+    fn pending_ipv6_pod_ip_remove_retry_removes_stale_map_entry() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let ip: std::net::Ipv6Addr = "fd00::8".parse().unwrap();
+        backend
+            .update_pod_ip6(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+        let failure_key =
+            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            parse_pending_capture_failure_key(&failure_key)
+                .unwrap()
+                .detail,
+            ip.to_string()
+        );
+
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+
+        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(
+            !backend.pod_ips6.contains_key(&ip),
+            "retry must remove stale IPv6 pod map entries"
         );
     }
 

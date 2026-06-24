@@ -22,12 +22,17 @@ use ferrum_ebpf_common::{
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use super::{BPF_MAP_CAPTURE_CONFIG, BPF_MAP_POD_IPS6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo};
+use super::{
+    BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_POD_IPS6,
+    BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
+};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct BpfMaps {
     pod_ips: BpfHashMap<MapData, u32, BpfPodInfo>,
     pod_ips6: BpfHashMap<MapData, CidrKey6, BpfPodInfo>,
+    node_ips: Option<BpfHashMap<MapData, u32, u8>>,
+    node_ips6: Option<BpfHashMap<MapData, CidrKey6, u8>>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
@@ -53,6 +58,32 @@ impl BpfMaps {
                 .ok_or("FERRUM_POD_IPS6 map not found")?,
         )
         .map_err(|e| format!("FERRUM_POD_IPS6 type mismatch: {e}"))?;
+
+        let node_ips = match bpf.take_map(BPF_MAP_NODE_IPS) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_NODE_IPS type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_NODE_IPS map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
+        let node_ips6 = match bpf.take_map(BPF_MAP_NODE_IPS6) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_NODE_IPS6 type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_NODE_IPS6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
 
         let bypass_uids = BpfHashMap::try_from(
             bpf.take_map("FERRUM_BYPASS_UIDS")
@@ -142,6 +173,8 @@ impl BpfMaps {
         Ok(Self {
             pod_ips,
             pod_ips6,
+            node_ips,
+            node_ips6,
             bypass_uids,
             cidr_exclude4,
             cidr_exclude6,
@@ -161,6 +194,12 @@ impl BpfMaps {
         }
         if require_workload_identity && self.workload_identity.is_none() {
             missing.push(BPF_MAP_WORKLOAD_IDENTITY);
+        }
+        if require_workload_identity && self.node_ips.is_none() {
+            missing.push(BPF_MAP_NODE_IPS);
+        }
+        if require_workload_identity && self.node_ips6.is_none() {
+            missing.push(BPF_MAP_NODE_IPS6);
         }
         if missing.is_empty() {
             return Ok(());
@@ -205,6 +244,26 @@ impl BpfMaps {
         let map = &mut self.pod_ips6;
         map.remove(&key)
             .map_err(|e| format!("Failed to remove pod IPv6 {ip}: {e}"))
+    }
+
+    pub fn insert_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        let Some(node_ips) = self.node_ips.as_mut() else {
+            return Ok(());
+        };
+        let key = ipv4_to_nbo_key(ip);
+        node_ips
+            .insert(key, 1u8, 0)
+            .map_err(|e| format!("Failed to insert node IP {ip}: {e}"))
+    }
+
+    pub fn insert_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        let Some(node_ips6) = self.node_ips6.as_mut() else {
+            return Ok(());
+        };
+        let key = CidrKey6::host(ipv6_to_nbo_words(ip));
+        node_ips6
+            .insert(key, 1u8, 0)
+            .map_err(|e| format!("Failed to insert node IPv6 {ip}: {e}"))
     }
 
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {

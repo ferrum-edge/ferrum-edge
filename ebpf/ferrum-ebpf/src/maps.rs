@@ -67,6 +67,16 @@ pub static FERRUM_POD_IPS: HashMap<u32, PodInfo> = HashMap::with_max_entries(409
 #[map]
 pub static FERRUM_POD_IPS6: HashMap<CidrKey6, PodInfo> = HashMap::with_max_entries(4096, 0);
 
+/// Local node IPv4 addresses allowed to reach enrolled pods directly. This
+/// preserves kubelet host-network liveness/readiness probes while the
+/// NodeWaypoint guard drops other unmarked direct pod-IP traffic.
+#[map]
+pub static FERRUM_NODE_IPS: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
+
+/// Local node IPv6 addresses allowed to reach enrolled pods directly.
+#[map]
+pub static FERRUM_NODE_IPS6: HashMap<CidrKey6, u8> = HashMap::with_max_entries(16, 0);
+
 /// UIDs exempt from outbound capture (proxy UID 1337).
 /// Connect hooks skip rewrite when the calling process matches.
 #[map]

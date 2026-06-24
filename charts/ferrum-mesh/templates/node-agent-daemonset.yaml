@@ -67,6 +67,7 @@
   "FERRUM_ADMIN_BIND_ADDRESS"
   "FERRUM_ADMIN_HTTP_PORT"
   "FERRUM_NODE_AGENT_NODE_NAME"
+  "FERRUM_NODE_AGENT_NODE_IP"
   "FERRUM_NODE_AGENT_CNI_ENABLED"
   "FERRUM_NODE_AGENT_CNI_SOCKET_PATH"
 -}}
@@ -202,6 +203,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: FERRUM_NODE_AGENT_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             {{- if and $cni $cni.enabled }}
             - name: FERRUM_NODE_AGENT_CNI_ENABLED
               value: "true"

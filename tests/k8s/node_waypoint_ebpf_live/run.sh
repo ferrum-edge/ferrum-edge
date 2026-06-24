@@ -451,9 +451,10 @@ render_chart_assertions() {
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
     ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
+    ! grep -A3 "name: FERRUM_NODE_AGENT_NODE_IP" <<<"$rendered" | grep -q "fieldPath: status.hostIP" ||
     [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]]; then
     echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases" >&2
-    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|FERRUM_NODE_AGENT_NODE_IP|status.hostIP|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
     exit 1
   fi
 

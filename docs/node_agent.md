@@ -17,6 +17,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | Unix socket | `/run/ferrum/node-agent.sock` | Reserved IPC path for future node-agent/proxy coordination. Phase 1 treats this as inert contract metadata; no socket is created yet. |
 | BPF config map | `FERRUM_CAPTURE_CONFIG` | Singleton map keyed by `0`, containing outbound capture and HBONE redirect ports plus the NodeWaypoint inbound relay socket mark trusted by the pod-veth tc guard. |
 | BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set. |
+| BPF node maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6` | IPv4/IPv6 node host IPs exempt from the NodeWaypoint direct-inbound guard so kubelet host-network probes can still reach enrolled pods. Helm seeds `FERRUM_NODE_AGENT_NODE_IP` from `status.hostIP`; use `FERRUM_NODE_AGENT_NODE_IPS` for extra dual-stack/custom node IPs. |
 | BPF original destination maps | `FERRUM_ORIG_DST4`, `FERRUM_ORIG_DST6` | Socket-cookie keyed original destination records. The `connect4`/`connect6` hooks write them (stamped with the source pod's UID + SPIFFE hash from `FERRUM_WORKLOAD_IDENTITY`); the node-agent pins them at `/sys/fs/bpf/ferrum/orig_dst{4,6}`; the node-waypoint mesh-proxy's **orig-dst bridge** (`src/ebpf/orig_dst_bridge.rs`) mirrors each record into the `NodeWaypointIdentityResolver`. |
 | BPF workload identity map | `FERRUM_WORKLOAD_IDENTITY` | Per-cgroup source workload identity (`{pod_uid, workload_spiffe_hash}`), keyed by `bpf_get_current_cgroup_id`. The node-agent writes one entry per enrolled pod cgroup; the connect hooks read it to stamp orig-dst records. Absent entry → connect hooks store the all-zero sentinel, which node-waypoint resolution treats as fail-closed. |
 | BPF capture filters | `FERRUM_BYPASS_UIDS`, `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE` | UID, CIDR, and port exclusions applied before outbound rewrite. |
@@ -29,7 +30,7 @@ The node-agent watches pods on the local node via kube-rs (`spec.nodeName={node_
 
 | Event | Source trigger | Node-agent action |
 |---|---|---|
-| Initial `Apply` for a previously-unseen pod | Pod creation | Resolve cgroup path, attach `connect4`/`connect6`/`getpeername4`/`getpeername6` programs, attach the host-side pod-veth tc classifier on ingress, write `FERRUM_POD_IPS` / `FERRUM_POD_IPS6`, write `FERRUM_INCLUDE_PORTS` if the pod carries `includeOutboundPorts`. Counts toward `ferrum_node_agent_pods_enrolled_total`. |
+| Initial `Apply` for a previously-unseen pod | Pod creation | Resolve cgroup path, attach `connect4`/`connect6`/`getpeername4`/`getpeername6` programs, attach the host-side pod-veth tc classifier on ingress/egress, write `FERRUM_POD_IPS` / `FERRUM_POD_IPS6`, write `FERRUM_INCLUDE_PORTS` if the pod carries `includeOutboundPorts`. Counts toward `ferrum_node_agent_pods_enrolled_total`. |
 | Subsequent `Apply` for an already-tracked pod | Pod metadata, label, or annotation update; status/condition change; container restart | Re-evaluate enrollment criteria (opt-in/opt-out labels and annotations), reconcile pod IP, **diff the parsed `includeOutboundPorts` policy** against the stashed baseline. Identical policy is a structural no-op (no BPF syscalls). A changed policy re-programs `FERRUM_INCLUDE_PORTS` for that pod's cgroup id; removed annotation drops the entry. Opt-in→opt-out flip triggers un-enrollment, opt-out→opt-in triggers enrollment. |
 | `Delete` | Pod deletion | Detach BPF programs, remove `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` and `FERRUM_INCLUDE_PORTS` entries. Counts toward `ferrum_node_agent_pods_unenrolled_total`. |
 
@@ -247,11 +248,16 @@ fail closed instead of bypassing policy. The inbound `getpeername4`/
 
 For destination-side bypass protection, the same enrollment writes the pod's
 IPv4 and IPv6 addresses into `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` and attaches
-`ferrum_tc_inbound` to the host-side veth on ingress. Packets whose
-destination is an enrolled pod IP are dropped unless `skb->mark` matches the
-NodeWaypoint inbound relay auth mark from `FERRUM_CAPTURE_CONFIG`; the
-destination HBONE relay sets that mark with `SO_MARK` before dialing the local
-backend pod.
+`ferrum_tc_inbound` to the host-side veth on ingress/egress. In local-pod mode
+the BPF config carries a zero inbound mark and this guard passes traffic through.
+In NodeWaypoint mode, TCP packets whose destination is an enrolled pod IP are
+dropped unless `skb->mark` matches the inbound relay auth mark from
+`FERRUM_CAPTURE_CONFIG`; the destination HBONE relay sets that mark with
+`SO_MARK` before dialing the local backend pod. Direct UDP/DTLS to enrolled pod
+IPs fails closed because no authorized UDP relay path exists yet, while ARP/ICMP
+and other control traffic remains pass-through. Packets sourced from the local
+node IPs in `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` are exempt so kubelet
+host-network liveness/readiness probes continue to work.
 
 NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
 `connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal
