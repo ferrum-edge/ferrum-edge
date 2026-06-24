@@ -576,7 +576,12 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.config.decompress_request && ctx.headers.contains_key("content-encoding")
+        self.config.decompress_request
+            && ctx
+                .headers
+                .get("content-encoding")
+                .and_then(|value| supported_request_encoding(value))
+                .is_some()
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
@@ -584,7 +589,7 @@ impl Plugin for CompressionPlugin {
     /// Content-Encoding/Content-Length headers are stripped. Without this the
     /// body would only become available in `transform_request_body`, which
     /// cannot reject. This stays gated by `should_buffer_request_body`, so only
-    /// requests that actually carry a `Content-Encoding` header buffer early.
+    /// requests that carry a decodable `Content-Encoding` header buffer early.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.config.decompress_request
     }

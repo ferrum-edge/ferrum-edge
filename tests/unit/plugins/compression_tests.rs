@@ -1858,6 +1858,22 @@ fn test_original_request_no_transform_marker_keeps_request_body_buffering() {
     );
 }
 
+#[test]
+fn test_unsupported_request_encoding_does_not_buffer_for_no_transform() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_request_ctx_with_body("zstd", b"streaming zstd body");
+
+    ctx.metadata.insert(
+        "ferrum:no_transform_request".to_string(),
+        "true".to_string(),
+    );
+
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "unsupported encodings must not be buffered when the compression plugin cannot decode them"
+    );
+}
+
 /// #59: a double-compressed body whose decompressed payload is ITSELF valid
 /// gzip (e.g. a client uploading a `.gz` file with `Content-Encoding: gzip`)
 /// must be accepted — the gateway decodes exactly one transport layer and must
