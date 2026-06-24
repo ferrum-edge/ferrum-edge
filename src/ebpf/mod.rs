@@ -649,6 +649,7 @@ pub struct MockEbpfBackend {
     pub fail_update_capture_config: bool,
     pub fail_update_pod_ip: bool,
     pub fail_remove_pod_ip: bool,
+    pub fail_remove_node_probe_port: bool,
     pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
     /// When non-zero, the next N `update_workload_identity` calls return an
@@ -761,6 +762,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        if self.fail_remove_node_probe_port {
+            return Err(format!(
+                "injected node probe port remove failure for {ip}:{port}"
+            ));
+        }
         self.node_probe_ports.remove(&(ip, port));
         Ok(())
     }
@@ -771,6 +777,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        if self.fail_remove_node_probe_port {
+            return Err(format!(
+                "injected node IPv6 probe port remove failure for {ip}:{port}"
+            ));
+        }
         self.node_probe_ports6.remove(&(ip, port));
         Ok(())
     }

@@ -60,8 +60,11 @@ static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(D
 
 const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
 const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
+const CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE: &str = "node_probe_port_update";
+const CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE: &str = "node_probe_port_remove";
 const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
 const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
+const CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS: &str = "node_probe_ports";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -874,6 +877,11 @@ async fn run_with_backend(
                     &pod_states,
                     metrics.as_ref(),
                 );
+                retry_pending_node_probe_port_removals(
+                    backend.as_mut(),
+                    &pod_states,
+                    metrics.as_ref(),
+                );
             }
         }
     }
@@ -1471,10 +1479,11 @@ fn apply_workload_identity(
 fn cleanup_pre_enrollment_maps(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
     pod_uid: &str,
     state: &PodAttachmentState,
 ) {
-    cleanup_node_probe_ports(backend, pod_states, pod_uid, state);
+    cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, state);
     if let Some(ip) = state.pod_ip {
         if let Some(owner_pod_uid) = other_pod_owning_ip(pod_states, pod_uid, ip) {
             debug!(
@@ -1561,6 +1570,7 @@ fn apply_node_probe_ports(
 fn cleanup_node_probe_ports(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
     pod_uid: &str,
     state: &PodAttachmentState,
 ) {
@@ -1568,47 +1578,118 @@ fn cleanup_node_probe_ports(
         return;
     }
     if let Some(ip) = state.pod_ip {
-        if other_pod_owning_ip(pod_states, pod_uid, ip).is_none() {
-            for port in &state.node_probe_ports {
-                if let Err(e) = backend.remove_node_probe_port(ip, *port) {
-                    warn!(pod_uid, %ip, port = *port, error = %e, "Failed to remove node probe port from BPF map");
-                }
-            }
-        } else {
-            debug!(
+        for port in &state.node_probe_ports {
+            remove_node_probe_port_if_unowned(
+                backend,
+                pod_states,
+                metrics,
                 pod_uid,
-                %ip,
-                "Skipping node probe port cleanup; IPv4 is owned by another tracked pod"
+                std::net::IpAddr::V4(ip),
+                *port,
+                "pod cleanup",
             );
         }
     }
     if let Some(ip) = state.pod_ip6 {
-        if other_pod_owning_ip6(pod_states, pod_uid, ip).is_none() {
-            for port in &state.node_probe_ports {
-                if let Err(e) = backend.remove_node_probe_port6(ip, *port) {
-                    warn!(pod_uid, %ip, port = *port, error = %e, "Failed to remove node IPv6 probe port from BPF map");
-                }
-            }
-        } else {
-            debug!(
+        for port in &state.node_probe_ports {
+            remove_node_probe_port_if_unowned(
+                backend,
+                pod_states,
+                metrics,
                 pod_uid,
-                %ip,
-                "Skipping node probe port cleanup; IPv6 is owned by another tracked pod"
+                std::net::IpAddr::V6(ip),
+                *port,
+                "pod cleanup",
             );
         }
+    }
+}
+
+fn remove_node_probe_port_if_unowned(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    ip: std::net::IpAddr,
+    port: u16,
+    removal_reason: &'static str,
+) {
+    let state_key = pod_state_key(pod_states, pod_uid);
+    let detail = node_probe_port_failure_detail(ip, port);
+    if let Some(owner_pod_uid) = other_pod_owning_probe_port_addr(pod_states, pod_uid, ip, port) {
+        debug!(
+            pod_uid,
+            owner_pod_uid,
+            %ip,
+            port,
+            removal_reason,
+            "Skipping node probe-port map removal; key is owned by another tracked pod"
+        );
+        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE, &detail);
+        forget_pending_node_probe_port_remove_failures_for_key(pod_states, ip, port);
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
+        return;
+    }
+
+    let result = match ip {
+        std::net::IpAddr::V4(ip) => backend.remove_node_probe_port(ip, port),
+        std::net::IpAddr::V6(ip) => backend.remove_node_probe_port6(ip, port),
+    };
+    if let Err(e) = result {
+        warn!(
+            pod_uid,
+            %ip,
+            port,
+            error = %e,
+            removal_reason,
+            "Failed to remove node probe-port entry from BPF map"
+        );
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE,
+            &detail,
+        );
+        return;
+    }
+
+    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE, &detail);
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
+fn remove_node_probe_ports_for_ip(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    ip: std::net::IpAddr,
+    ports: &[u16],
+    removal_reason: &'static str,
+) {
+    for port in ports {
+        remove_node_probe_port_if_unowned(
+            backend,
+            pod_states,
+            metrics,
+            pod_uid,
+            ip,
+            *port,
+            removal_reason,
+        );
     }
 }
 
 fn cleanup_partial_pod_enrollment(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
     pod_uid: &str,
     state: &PodAttachmentState,
 ) {
     if let Err(e) = backend.detach_pod(pod_uid) {
         warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
     }
-    cleanup_pre_enrollment_maps(backend, pod_states, pod_uid, state);
+    cleanup_pre_enrollment_maps(backend, pod_states, metrics, pod_uid, state);
 }
 
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
@@ -1883,8 +1964,43 @@ fn remember_pending_capture_failure(state_key: &str, operation: &str, detail: &s
     );
 }
 
-fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str) {
-    PENDING_CAPTURE_FAILURES.remove(&pending_capture_failure_key(state_key, operation, detail));
+fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str) -> bool {
+    PENDING_CAPTURE_FAILURES
+        .remove(&pending_capture_failure_key(state_key, operation, detail))
+        .is_some()
+}
+
+fn node_probe_port_failure_detail(ip: std::net::IpAddr, port: u16) -> String {
+    format!("{ip},{port}")
+}
+
+fn parse_node_probe_port_failure_detail(detail: &str) -> Option<(std::net::IpAddr, u16)> {
+    let (ip, port) = detail.split_once(',')?;
+    Some((ip.parse().ok()?, port.parse().ok()?))
+}
+
+fn forget_pending_node_probe_port_remove_failures_for_key(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::IpAddr,
+    port: u16,
+) -> usize {
+    let key_prefix = pod_state_key_prefix(pod_states);
+    let detail = node_probe_port_failure_detail(ip, port);
+    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            (failure.state_key.starts_with(&key_prefix)
+                && failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
+                && failure.detail == detail)
+                .then_some(failure.key)
+        })
+        .collect();
+    let removed = keys.len();
+    for key in keys {
+        PENDING_CAPTURE_FAILURES.remove(&key);
+    }
+    removed
 }
 
 fn forget_pending_pod_ip_remove_failures_for_ip(
@@ -2099,6 +2215,74 @@ fn pending_pod_ip_removal_failures(
         .collect()
 }
 
+fn pending_node_probe_port_removal_failures(
+    pod_states: &DashMap<String, PodAttachmentState>,
+) -> Vec<(String, std::net::IpAddr, u16)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            if !failure.state_key.starts_with(&key_prefix)
+                || failure.operation != CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
+            {
+                return None;
+            }
+            let (ip, port) = parse_node_probe_port_failure_detail(&failure.detail)?;
+            Some((failure.key, ip, port))
+        })
+        .collect()
+}
+
+fn retry_pending_node_probe_port_removals(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+) {
+    let pending = pending_node_probe_port_removal_failures(pod_states);
+    if pending.is_empty() {
+        return;
+    }
+
+    for (failure_key, ip, port) in pending {
+        if let Some(owner_pod_uid) = pod_owning_probe_port_addr(pod_states, ip, port) {
+            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            debug!(
+                owner_pod_uid,
+                %ip,
+                port,
+                "Cleared pending node probe-port removal because another tracked pod owns the key"
+            );
+            continue;
+        }
+
+        let result = match ip {
+            std::net::IpAddr::V4(ip) => backend.remove_node_probe_port(ip, port),
+            std::net::IpAddr::V6(ip) => backend.remove_node_probe_port6(ip, port),
+        };
+        match result {
+            Ok(()) => {
+                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                debug!(%ip, port, "Recovered pending node probe-port map removal failure");
+            }
+            Err(e) => {
+                warn!(
+                    %ip,
+                    port,
+                    error = %e,
+                    "Retrying pending node probe-port map removal failed; keeping capture state degraded"
+                );
+            }
+        }
+    }
+
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
 fn retry_pending_pod_ip_removals(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -2305,6 +2489,7 @@ fn handle_pod_added(
             drop(state);
             handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         } else {
+            let previous_node_probe_ports = state.node_probe_ports.clone();
             let pod_ip_reconcile = reconcile_existing_pod_ip(
                 backend, config, metrics, &state_key, pod_uid, pod_ip, &mut state,
             );
@@ -2326,6 +2511,14 @@ fn handle_pod_added(
                 event.service_account,
                 &mut state,
             );
+            let node_probe_reconcile = reconcile_existing_node_probe_ports(
+                backend,
+                metrics,
+                &state_key,
+                pod_uid,
+                &event.node_probe_ports,
+                &mut state,
+            );
             if !pod_ip_reconcile.pod_ip_update_failed
                 && !pod_ip6_reconcile.pod_ip_update_failed
                 && let (Some(dir), Some(cgroup)) = (
@@ -2335,14 +2528,27 @@ fn handle_pod_added(
             {
                 publish_pod_registry(dir, pod_uid, cgroup, event.pod_source_ips);
             }
+            let current_pod_ip = state.pod_ip;
+            let current_pod_ip6 = state.pod_ip6;
+            let stale_node_probe_ports = node_probe_reconcile.stale_probe_ports.clone();
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
             drop(state);
             if pod_ip_reconcile.recovered_pending_failure
                 || pod_ip6_reconcile.recovered_pending_failure
+                || node_probe_reconcile.recovered_pending_failure
             {
                 clear_partial_capture_state_if_recovered(pod_states, metrics);
             }
             if let Some(ip) = pod_ip_reconcile.stale_pod_ip {
+                remove_node_probe_ports_for_ip(
+                    backend,
+                    pod_states,
+                    metrics,
+                    pod_uid,
+                    std::net::IpAddr::V4(ip),
+                    &previous_node_probe_ports,
+                    "pod IP changed",
+                );
                 remove_pod_ip_if_unowned(
                     backend,
                     pod_states,
@@ -2353,6 +2559,15 @@ fn handle_pod_added(
                 );
             }
             if let Some(ip) = pod_ip6_reconcile.stale_pod_ip {
+                remove_node_probe_ports_for_ip(
+                    backend,
+                    pod_states,
+                    metrics,
+                    pod_uid,
+                    std::net::IpAddr::V6(ip),
+                    &previous_node_probe_ports,
+                    "pod IPv6 changed",
+                );
                 remove_pod_ip6_if_unowned(
                     backend,
                     pod_states,
@@ -2361,6 +2576,30 @@ fn handle_pod_added(
                     ip,
                     "pod IPv6 changed",
                 );
+            }
+            if !stale_node_probe_ports.is_empty() {
+                if let Some(ip) = current_pod_ip {
+                    remove_node_probe_ports_for_ip(
+                        backend,
+                        pod_states,
+                        metrics,
+                        pod_uid,
+                        std::net::IpAddr::V4(ip),
+                        &stale_node_probe_ports,
+                        "probe ports changed",
+                    );
+                }
+                if let Some(ip) = current_pod_ip6 {
+                    remove_node_probe_ports_for_ip(
+                        backend,
+                        pod_states,
+                        metrics,
+                        pod_uid,
+                        std::net::IpAddr::V6(ip),
+                        &stale_node_probe_ports,
+                        "probe ports changed",
+                    );
+                }
             }
             return;
         }
@@ -2456,7 +2695,7 @@ fn handle_pod_added(
                     "Could not resolve pod veth interface, skipping attachment"
                 );
                 metrics.record_attach_error();
-                cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+                cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
                     attempt_signature,
@@ -2475,7 +2714,7 @@ fn handle_pod_added(
                         "Failed to attach tc program"
                     );
                     metrics.record_attach_error();
-                    cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+                    cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
                         attempt_signature,
@@ -2492,7 +2731,7 @@ fn handle_pod_added(
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.record_attach_error();
-                    cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+                    cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
                         attempt_signature,
@@ -2509,7 +2748,7 @@ fn handle_pod_added(
                 if let Err(e) = backend.update_pod_ip6(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
-                    cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+                    cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
                         attempt_signature,
@@ -2521,7 +2760,7 @@ fn handle_pod_added(
             if let Err(e) = apply_node_probe_ports(backend, pod_uid, &state) {
                 warn!(pod_uid, error = %e, "Failed to update node probe-port maps");
                 metrics.record_attach_error();
-                cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+                cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
                     attempt_signature,
@@ -2542,7 +2781,7 @@ fn handle_pod_added(
                 "Pod enrolled for eBPF capture"
             );
         } else {
-            cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+            cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
             remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         }
     } else {
@@ -2594,6 +2833,58 @@ impl<Ip> Default for PodIpReconcileResult<Ip> {
             recovered_pending_failure: false,
             pod_ip_update_failed: false,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NodeProbePortReconcileResult {
+    recovered_pending_failure: bool,
+    stale_probe_ports: Vec<u16>,
+}
+
+fn reconcile_existing_node_probe_ports(
+    backend: &mut dyn EbpfBackend,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    desired_ports: &[u16],
+    state: &mut PodAttachmentState,
+) -> NodeProbePortReconcileResult {
+    let stale_probe_ports: Vec<u16> = state
+        .node_probe_ports
+        .iter()
+        .copied()
+        .filter(|port| !desired_ports.contains(port))
+        .collect();
+    let mut desired_state = state.clone();
+    desired_state.node_probe_ports = desired_ports.to_vec();
+    if let Err(e) = apply_node_probe_ports(backend, pod_uid, &desired_state) {
+        warn!(
+            pod_uid,
+            error = %e,
+            "Failed to reconcile node probe-port maps for existing pod"
+        );
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
+            CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS,
+        );
+        return NodeProbePortReconcileResult {
+            recovered_pending_failure: false,
+            stale_probe_ports: Vec::new(),
+        };
+    }
+
+    let recovered_pending_failure = forget_pending_capture_failure(
+        state_key,
+        CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
+        CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS,
+    );
+    state.node_probe_ports = desired_ports.to_vec();
+    NodeProbePortReconcileResult {
+        recovered_pending_failure,
+        stale_probe_ports,
     }
 }
 
@@ -2787,6 +3078,23 @@ fn other_pod_owning_ip6(
     })
 }
 
+fn other_pod_owning_probe_port_addr(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+    ip: std::net::IpAddr,
+    port: u16,
+) -> Option<String> {
+    pod_states.iter().find_map(|entry| {
+        (entry.key().as_str() != pod_uid
+            && entry.value().node_probe_ports.contains(&port)
+            && match ip {
+                std::net::IpAddr::V4(ip) => entry.value().pod_ip == Some(ip),
+                std::net::IpAddr::V6(ip) => entry.value().pod_ip6 == Some(ip),
+            })
+        .then(|| entry.key().clone())
+    })
+}
+
 fn pod_owning_ip(
     pod_states: &DashMap<String, PodAttachmentState>,
     ip: std::net::Ipv4Addr,
@@ -2813,6 +3121,21 @@ fn pod_owning_ip_addr(
         std::net::IpAddr::V4(ip) => pod_owning_ip(pod_states, ip),
         std::net::IpAddr::V6(ip) => pod_owning_ip6(pod_states, ip),
     }
+}
+
+fn pod_owning_probe_port_addr(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::IpAddr,
+    port: u16,
+) -> Option<String> {
+    pod_states.iter().find_map(|entry| {
+        (entry.value().node_probe_ports.contains(&port)
+            && match ip {
+                std::net::IpAddr::V4(ip) => entry.value().pod_ip == Some(ip),
+                std::net::IpAddr::V6(ip) => entry.value().pod_ip6 == Some(ip),
+            })
+        .then(|| entry.key().clone())
+    })
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -3135,6 +3458,11 @@ pub fn handle_pod_removed(
         CAPTURE_FAILURE_POD_IP_UPDATE,
         CAPTURE_FAILURE_DETAIL_POD_IP6,
     );
+    forget_pending_capture_failure(
+        &state_key,
+        CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
+        CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS,
+    );
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -3157,7 +3485,7 @@ pub fn handle_pod_removed(
         if let Err(e) = backend.detach_pod(pod_uid) {
             warn!(pod_uid, error = %e, "Failed to detach BPF programs");
         }
-        cleanup_node_probe_ports(backend, pod_states, pod_uid, &state);
+        cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, &state);
         if let Some(ip) = state.pod_ip {
             remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
@@ -5855,6 +6183,264 @@ mod tests {
     }
 
     #[test]
+    fn existing_pod_ip_reconcile_writes_probe_ports_when_ip_appears() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                pod_ip6: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
+            },
+        );
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.8"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
+            node_probe_ports: vec![8080],
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(backend.pod_ips.contains_key(&ip));
+        assert!(
+            backend.node_probe_ports.contains(&(ip, 8080)),
+            "late pod-IP reconcile must write the matching probe-port exemption"
+        );
+    }
+
+    #[test]
+    fn existing_pod_probe_port_reconcile_removes_stale_current_ip_port() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080, 9090],
+            },
+        );
+        backend.update_node_probe_port(ip, 8080).unwrap();
+        backend.update_node_probe_port(ip, 9090).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.8"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
+            node_probe_ports: vec![9090],
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(
+            !backend.node_probe_ports.contains(&(ip, 8080)),
+            "probe ports removed from the pod spec must lose their exemption"
+        );
+        assert!(
+            backend.node_probe_ports.contains(&(ip, 9090)),
+            "probe ports still owned by the pod must remain exempt"
+        );
+        assert_eq!(
+            pod_states
+                .get("pod-uid-1")
+                .expect("pod state present")
+                .node_probe_ports
+                .as_slice(),
+            &[9090]
+        );
+    }
+
+    #[test]
+    fn existing_pod_ip_and_probe_port_reconcile_removes_old_ip_old_port() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let old_ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        let new_ip = std::net::Ipv4Addr::new(10, 0, 0, 9);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(old_ip),
+                pod_ip6: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
+            },
+        );
+        backend.update_node_probe_port(old_ip, 8080).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.9"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
+            node_probe_ports: vec![9090],
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(
+            !backend.node_probe_ports.contains(&(old_ip, 8080)),
+            "old pod-IP probe-port exemption must be removed using the previous port list"
+        );
+        assert!(
+            backend.node_probe_ports.contains(&(new_ip, 9090)),
+            "new pod-IP probe-port exemption must be written from the current pod spec"
+        );
+    }
+
+    #[test]
+    fn probe_port_cleanup_removes_only_ports_not_owned_by_replacement() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "old-pod".to_string(),
+            PodAttachmentState {
+                pod_uid: "old-pod".to_string(),
+                pod_name: "old".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-old".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080, 9090],
+            },
+        );
+        pod_states.insert(
+            "replacement-pod".to_string(),
+            PodAttachmentState {
+                pod_uid: "replacement-pod".to_string(),
+                pod_name: "replacement".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-new".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![9090],
+            },
+        );
+        backend.update_node_probe_port(ip, 8080).unwrap();
+        backend.update_node_probe_port(ip, 9090).unwrap();
+
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "old-pod");
+
+        assert!(
+            !backend.node_probe_ports.contains(&(ip, 8080)),
+            "old-only probe port must not survive IP reuse"
+        );
+        assert!(
+            backend.node_probe_ports.contains(&(ip, 9090)),
+            "probe port owned by replacement pod must remain"
+        );
+    }
+
+    #[test]
     fn relist_prunes_failed_enrollment_for_vanished_pod_but_keeps_present_one() {
         // Codex finding: a pod that fails enrollment before it is inserted into
         // `pod_states` keeps an owned snapshot in FAILED_POD_ENROLLMENT_ATTEMPTS.
@@ -7108,6 +7694,74 @@ mod tests {
         assert!(
             !backend.pod_ips.contains_key(&ip),
             "retry must remove the stale pod-IP map entry"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
+        );
+    }
+
+    #[test]
+    fn node_probe_port_remove_failure_retries_stale_map_entry() {
+        let mut backend = MockEbpfBackend {
+            fail_remove_node_probe_port: true,
+            ..MockEbpfBackend::default()
+        };
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: None,
+                veth_iface: Some("veth-mock".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
+            },
+        );
+        backend.update_node_probe_port(ip, 8080).unwrap();
+
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
+
+        let detail = node_probe_port_failure_detail(std::net::IpAddr::V4(ip), 8080);
+        let failure_key = pending_capture_failure_key(
+            &state_key,
+            CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE,
+            &detail,
+        );
+        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+
+        backend.fail_remove_node_probe_port = false;
+        retry_pending_node_probe_port_removals(&mut backend, &pod_states, &metrics);
+
+        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(
+            !backend.node_probe_ports.contains(&(ip, 8080)),
+            "retry must remove stale probe-port map entry"
         );
         assert_eq!(
             metrics.snapshot().capture_state,

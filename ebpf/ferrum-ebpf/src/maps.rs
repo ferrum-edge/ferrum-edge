@@ -70,12 +70,12 @@ pub static FERRUM_POD_IPS6: HashMap<CidrKey6, PodInfo> = HashMap::with_max_entri
 /// Local node IPv4 addresses that may be considered for the kubelet probe
 /// exemption. The tc guard also requires an exact pod-IP/probe-port entry.
 #[map]
-pub static FERRUM_NODE_IPS: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
+pub static FERRUM_NODE_IPS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
 
 /// Local node IPv6 addresses that may be considered for the kubelet probe
 /// exemption. The tc guard also requires an exact pod-IP/probe-port entry.
 #[map]
-pub static FERRUM_NODE_IPS6: HashMap<CidrKey6, u8> = HashMap::with_max_entries(16, 0);
+pub static FERRUM_NODE_IPS6: HashMap<CidrKey6, u8> = HashMap::with_max_entries(256, 0);
 
 /// Enrolled pod IPv4 TCP ports that may be reached directly from configured
 /// local node IPs for Kubernetes HTTP/TCP/gRPC probes.
