@@ -2869,7 +2869,9 @@ run_traffic_checks() {
   log "checking stale identity cleanup across forced source workload IPv4 reuse"
   local old_src_a_uid old_src_a_node old_src_a_pod old_src_a_ip old_src_a_cni_dir
   local new_src_a_uid new_src_a_ip src_a_reuse_identities_file
-  IFS=$'\t' read -r old_src_a_uid old_src_a_node old_src_a_pod < <(workload_pod_record_for_app src-a)
+  old_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
+  old_src_a_node="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].spec.nodeName}')"
+  old_src_a_pod="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.name}')"
   old_src_a_ip="$(pod_ip src-a)"
   if [[ -z "$old_src_a_uid" || -z "$old_src_a_node" || -z "$old_src_a_pod" || -z "$old_src_a_ip" ]]; then
     record_live_assertion \
