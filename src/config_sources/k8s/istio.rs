@@ -25,10 +25,10 @@ use super::{
     mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
     optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
     proxy_for_route, request_termination_plugin_for_proxy, resource_id,
-    route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
-    route_response_transformer_plugin_for_proxy, selector_from_istio, sidecar_selector_from_istio,
-    string_array, string_field, string_map, upstream_for_route,
-    workload_entry_service_key_from_host,
+    route_backends_require_node_waypoint_authz, route_local_fault_value_for_rule,
+    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
+    selector_from_istio, sidecar_selector_from_istio, string_array, string_field, string_map,
+    upstream_for_route, workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -982,7 +982,8 @@ fn destination_rule(
         .spec
         .get("trafficPolicy")
         .map(|tp| translate_traffic_policy(acc, object, tp, TrafficPolicyScope::TopLevelOrPort))
-        .transpose()?;
+        .transpose()?
+        .filter(traffic_policy_has_applied_fields);
 
     let port_level_settings = object
         .spec
@@ -1025,6 +1026,7 @@ fn translate_port_level_settings(
     })?;
 
     let mut out = HashMap::with_capacity(entries.len());
+    let mut seen_ports = HashSet::with_capacity(entries.len());
     for entry in entries {
         let port_value = entry
             .get("port")
@@ -1051,17 +1053,23 @@ fn translate_port_level_settings(
         }
         let port = port_u64 as u16;
 
-        let policy =
-            translate_traffic_policy(acc, object, entry, TrafficPolicyScope::TopLevelOrPort)?;
-
-        if out.insert(port, policy).is_some() {
+        if !seen_ports.insert(port) {
             return Err(invalid_resource(
                 object,
                 format!("trafficPolicy.portLevelSettings has duplicate port {port}"),
             ));
         }
+        let policy =
+            translate_traffic_policy(acc, object, entry, TrafficPolicyScope::TopLevelOrPort)?;
+        if traffic_policy_has_applied_fields(&policy) {
+            out.insert(port, policy);
+        }
     }
     Ok(out)
+}
+
+fn traffic_policy_has_applied_fields(policy: &MeshTrafficPolicy) -> bool {
+    policy != &MeshTrafficPolicy::default()
 }
 
 /// Where a `trafficPolicy` block sits in a DestinationRule. This scopes the
@@ -1070,12 +1078,14 @@ fn translate_port_level_settings(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrafficPolicyScope {
     /// `spec.trafficPolicy` or a `spec.trafficPolicy.portLevelSettings[]` entry.
-    /// `connectionPool.http.{h2UpgradePolicy,maxRetries}` are projected here.
+    /// `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
+    /// are projected here.
     TopLevelOrPort,
     /// `spec.subsets[].trafficPolicy`. The mesh apply path turns subsets into
     /// `SubsetTrafficPolicy` (LB / TLS / connect-timeout / passive-health only),
-    /// so `connectionPool.http.{h2UpgradePolicy,maxRetries}` NEVER reach the
-    /// `port_overrides` / effective `Proxy` for a subset — they are deferred.
+    /// so `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
+    /// NEVER reach the `port_overrides` / effective `Proxy` for a subset — they
+    /// are deferred.
     Subset,
 }
 
@@ -1284,17 +1294,17 @@ fn parse_keepalive_duration_seconds(
 
 /// Translate Istio `connectionPool.http` into Ferrum's typed HTTP overlay.
 ///
-/// Supported fields: `maxRequestsPerConnection`, `idleTimeout`,
-/// `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`, and
-/// `http1MaxPendingRequests`. At top-level / `portLevelSettings` scope every
-/// field is projected; there are no longer any deferred `connectionPool.http`
-/// knobs at that scope. (`h2UpgradePolicy` / `maxRetries` /
-/// `http1MaxPendingRequests` are still deferred-warned for a SUBSET
-/// `trafficPolicy` — see the `scope` note below — because a subset's
-/// `SubsetTrafficPolicy` carries no `connectionPool.http`.) Returning
-/// `Ok(None)` from this function signals "block was present but no supported
-/// field was set" so the caller can skip emitting an empty overlay on the
-/// slice.
+/// Supported fields: `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`,
+/// `maxRetries`, and `http1MaxPendingRequests`. `maxRequestsPerConnection` is
+/// parsed and validated for operator feedback, but is NOT projected because the
+/// runtime does not have close-after-N-requests behavior for the shared backend
+/// pools. At top-level / `portLevelSettings` scope every supported field is
+/// projected. (`h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests` are
+/// still deferred-warned for a SUBSET `trafficPolicy` — see the `scope` note
+/// below — because a subset's `SubsetTrafficPolicy` carries no
+/// `connectionPool.http`.) Returning `Ok(None)` from this function signals
+/// "block was present but no supported field was set" so the caller can skip
+/// emitting an empty overlay on the slice.
 ///
 /// `maxRetries` semantics differ honestly from Envoy: Envoy's
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
@@ -1327,19 +1337,18 @@ fn translate_connection_pool_http(
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
     use crate::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // `maxRequestsPerConnection: 0` is Istio's explicit "unlimited" value and is
-    // advertised as supported by the Ferrum schema/OpenAPI, so accept it here
-    // (`allow_zero = true`); the projected `Proxy.pool_max_requests_per_connection`
-    // validator likewise permits `0`.
-    let max_requests_per_connection = match http.get("maxRequestsPerConnection") {
-        Some(v) => Some(translate_http_uint32(
-            object,
-            "maxRequestsPerConnection",
-            v,
-            true,
-        )?),
-        None => None,
-    };
+    // `maxRequestsPerConnection` is parsed and validated so malformed
+    // DestinationRules still fail closed, but it is not carried on the mesh
+    // overlay: the runtime has no close-after-N backend request behavior for
+    // the shared reqwest/direct-H2/gRPC/H3/HBONE pools. Keep this warning and
+    // `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in `istio_status.rs` in sync.
+    if let Some(v) = http.get("maxRequestsPerConnection") {
+        let _ = translate_http_uint32(object, "maxRequestsPerConnection", v, true)?;
+        acc.warnings.push(format!(
+            "DestinationRule {}/{}: connectionPool.http.maxRequestsPerConnection is parsed and validated but not applied (backend close-after-N-requests is unsupported); use http2MaxRequests for HTTP/2-family concurrency instead",
+            object.metadata.namespace, object.metadata.name
+        ));
+    }
     let idle_timeout_ms = match string_field(http, "idleTimeout") {
         Some(raw) => Some(parse_http_idle_timeout_ms(object, raw)?),
         None => None,
@@ -1406,7 +1415,7 @@ fn translate_connection_pool_http(
     };
 
     let overlay = MeshConnectionPoolHttp {
-        max_requests_per_connection,
+        max_requests_per_connection: None,
         idle_timeout_ms,
         http2_max_requests,
         h2_upgrade_policy,
@@ -1457,9 +1466,8 @@ fn translate_h2_upgrade_policy(
 /// values are always rejected. `allow_zero` controls the lower bound: most
 /// knobs (`http2MaxRequests`, `maxRetries`) reject `0` as ambiguous, but
 /// `maxRequestsPerConnection` accepts `0` as Istio's documented "unlimited"
-/// sentinel (Istio default; the Ferrum schema/OpenAPI advertise `0` as the
-/// supported unlimited value for `Proxy.pool_max_requests_per_connection`),
-/// so blocking it here would reject a config the schema claims to accept.
+/// sentinel. The field is still deferred, but accepting `0` keeps validation
+/// compatible with Istio while status/warnings make the no-op visible.
 fn translate_http_uint32(
     object: &K8sObject,
     field: &str,
@@ -2001,7 +2009,8 @@ fn translate_subset(
     let traffic_policy = value
         .get("trafficPolicy")
         .map(|tp| translate_traffic_policy(acc, object, tp, TrafficPolicyScope::Subset))
-        .transpose()?;
+        .transpose()?
+        .filter(traffic_policy_has_applied_fields);
 
     // A subset's `connectionPool.tcp.connectTimeout`, `tls`, and the full
     // `outlierDetection` (both the *thresholds* and the `maxEjectionPercent`
@@ -2203,6 +2212,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         // WorkloadEntry is a VM/static workload with no Kubernetes pod UID;
         // node-waypoint scope falls back to SPIFFE keying for these.
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     })
 }
@@ -2538,6 +2548,7 @@ fn virtual_service_l4_proxies(
                     hosts: sni_hosts,
                     listen_path: None,
                     strip_listen_path: false,
+                    preserve_host_header: false,
                     backend_host: backend_host.clone(),
                     backend_port,
                     upstream_id: None,
@@ -2582,6 +2593,7 @@ fn virtual_service_l4_proxies(
                     hosts: Vec::new(),
                     listen_path: None,
                     strip_listen_path: false,
+                    preserve_host_header: false,
                     backend_host: backend_host.clone(),
                     backend_port,
                     upstream_id: None,
@@ -2648,29 +2660,44 @@ fn virtual_service_routes(
             }
         };
 
-        let (backend_host, backend_port, upstream_id) = if backends.is_empty() {
-            // Redirect-only route: no backend. The dispatch rule omits the
-            // destination and the redirect fires before backend dispatch.
-            (String::new(), 0, None)
-        } else if backends.len() == 1 {
-            let Some(backend) = backends.into_iter().next() else {
-                continue;
+        let (backend_host, backend_port, upstream_id, requires_node_waypoint_authz) =
+            if backends.is_empty() {
+                // Redirect-only route: no backend. The dispatch rule omits the
+                // destination and the redirect fires before backend dispatch.
+                (String::new(), 0, None, false)
+            } else if backends.len() == 1 {
+                let Some(backend) = backends.into_iter().next() else {
+                    continue;
+                };
+                let requires_node_waypoint_authz =
+                    route_backends_require_node_waypoint_authz(std::slice::from_ref(&backend));
+                (
+                    backend.host,
+                    backend.port,
+                    None,
+                    requires_node_waypoint_authz,
+                )
+            } else {
+                let requires_node_waypoint_authz =
+                    route_backends_require_node_waypoint_authz(&backends);
+                let upstream_id = resource_id(
+                    "istio-vs-upstream",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &index.to_string(),
+                );
+                upstreams.push(upstream_for_route(
+                    upstream_id.clone(),
+                    object.metadata.namespace.clone(),
+                    backends,
+                ));
+                (
+                    String::new(),
+                    0,
+                    Some(upstream_id),
+                    requires_node_waypoint_authz,
+                )
             };
-            (backend.host, backend.port, None)
-        } else {
-            let upstream_id = resource_id(
-                "istio-vs-upstream",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &index.to_string(),
-            );
-            upstreams.push(upstream_for_route(
-                upstream_id.clone(),
-                object.metadata.namespace.clone(),
-                backends,
-            ));
-            (String::new(), 0, Some(upstream_id))
-        };
 
         let retry = route_retry_config(http);
         let timeout_ms = route_timeout_ms(http);
@@ -2750,6 +2777,7 @@ fn virtual_service_routes(
                     backend_host: backend_host.as_str(),
                     backend_port,
                     upstream_id: upstream_id.as_deref(),
+                    requires_node_waypoint_authz,
                 },
                 MeshRouteDispatchPolicy {
                     timeout_ms,
@@ -2769,6 +2797,7 @@ fn virtual_service_routes(
                 hosts: hosts.clone(),
                 listen_path: dispatch_listen_path.clone(),
                 strip_listen_path: false,
+                preserve_host_header: false,
                 backend_host: backend_host.clone(),
                 backend_port,
                 upstream_id: upstream_id.clone(),
@@ -3075,10 +3104,26 @@ fn route_backends(
             ));
         };
         let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
+        let service_identity = service_host_components(
+            host,
+            &object.metadata.namespace,
+            &acc.options.cluster_domain,
+        )
+        .and_then(|(svc, ns)| {
+            acc.service_port_exists(ns, svc, port)
+                .then(|| (ns.to_string(), svc.to_string(), port))
+        });
         backends.push(RouteBackend {
             host: host.to_string(),
             port,
             weight,
+            service_namespace: service_identity
+                .as_ref()
+                .map(|(namespace, _, _)| namespace.clone()),
+            service_name: service_identity
+                .as_ref()
+                .map(|(_, service, _)| service.clone()),
+            service_port: service_identity.map(|(_, _, port)| port),
         });
     }
     if skipped_zero > 0 {
@@ -14997,9 +15042,20 @@ extensionProviders:
         let dr = &mesh.destination_rules[0];
         let tp = dr.traffic_policy.as_ref().expect("traffic policy");
         let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert_eq!(http.max_requests_per_connection, Some(100));
+        assert!(
+            http.max_requests_per_connection.is_none(),
+            "maxRequestsPerConnection is validated but deferred, not projected"
+        );
         assert_eq!(http.idle_timeout_ms, Some(300_000));
         assert_eq!(http.http2_max_requests, Some(1000));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -15068,9 +15124,20 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .expect("port http overlay");
-        assert_eq!(http.max_requests_per_connection, Some(50));
+        assert!(
+            http.max_requests_per_connection.is_none(),
+            "maxRequestsPerConnection is deferred at port level too"
+        );
         assert_eq!(http.idle_timeout_ms, Some(60_000));
         assert_eq!(http.http2_max_requests, Some(200));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "port-level unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -15125,11 +15192,10 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_accepts_zero_max_requests_per_connection() {
+    fn destination_rule_accepts_zero_max_requests_per_connection_but_defers_it() {
         // Istio's documented "unlimited" sentinel for maxRequestsPerConnection
-        // is `0`; the Ferrum schema/OpenAPI advertise `0` as supported, so the
-        // translator must accept it (unlike `http2MaxRequests`/`maxRetries`,
-        // which reject zero) and carry it through to the overlay.
+        // is `0`; keep accepting it for validation compatibility, but do not
+        // carry the unsupported field into the mesh overlay.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -15146,9 +15212,96 @@ extensionProviders:
 
         let mesh = result.config.mesh.expect("mesh config");
         let dr = &mesh.destination_rules[0];
-        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
-        let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert_eq!(http.max_requests_per_connection, Some(0));
+        assert!(
+            dr.traffic_policy.is_none(),
+            "maxRequestsPerConnection-only trafficPolicy must not synthesize an effective policy"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_drops_port_level_max_requests_only_policy() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {"maxRequestsPerConnection": 2}
+                                }
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("maxRequestsPerConnection-only port policy must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        assert!(
+            dr.traffic_policy.is_none(),
+            "top-level trafficPolicy containing only portLevelSettings must not become a default policy"
+        );
+        assert!(
+            dr.port_level_settings.is_empty(),
+            "maxRequestsPerConnection-only portLevelSettings entry must not synthesize an effective port policy"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| { w.contains("maxRequestsPerConnection") && w.contains("not applied") }),
+            "unsupported maxRequestsPerConnection must warn; warnings = {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_duplicate_port_level_settings_even_when_first_is_deferred_only() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "portLevelSettings": [
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {"maxRequestsPerConnection": 2}
+                                }
+                            },
+                            {
+                                "port": {"number": 8080},
+                                "connectionPool": {
+                                    "http": {"idleTimeout": "30s"}
+                                }
+                            }
+                        ]
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("duplicate port must still fail");
+
+        assert!(
+            err.to_string().contains("duplicate port 8080"),
+            "unexpected duplicate-port error: {err}"
+        );
     }
 
     #[test]
@@ -15272,8 +15425,8 @@ extensionProviders:
     fn destination_rule_projects_top_level_http_connection_pool_knobs_without_warning() {
         // After F5.1's final knob, ALL of `maxRetries`, `h2UpgradePolicy`, and
         // `http1MaxPendingRequests` are projected at top-level/portLevelSettings
-        // and must NOT warn. There are no longer any deferred connectionPool.http
-        // knobs at top-level scope. Every supported field lands on the overlay.
+        // and must NOT warn. `maxRequestsPerConnection` is the only top-level
+        // deferred connectionPool.http knob. Every supported field lands on the overlay.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",

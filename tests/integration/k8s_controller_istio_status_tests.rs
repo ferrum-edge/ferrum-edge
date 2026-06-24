@@ -519,13 +519,11 @@ fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
     assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"),);
 }
 
-/// DestinationRule deferred-fields tracking: after F5.1 there are NO
-/// universally-deferred `connectionPool.http` knobs at top-level /
-/// `portLevelSettings` — `maxRequestsPerConnection` / `idleTimeout` /
-/// `http2MaxRequests` / `maxRetries` / `h2UpgradePolicy` / `http1MaxPendingRequests`
-/// are all projected. The remaining deferred case is a `connectionPool.http` knob
+/// DestinationRule deferred-fields tracking. `maxRequestsPerConnection` is
+/// universally deferred because close-after-N backend requests are unsupported;
+/// this test focuses on the other deferred case: a `connectionPool.http` knob
 /// set inside a `subsets[].trafficPolicy` (the subset apply path builds a
-/// `SubsetTrafficPolicy` that carries no `connectionPool.http`). This test uses a
+/// `SubsetTrafficPolicy` that carries no `connectionPool.http`). It uses a
 /// subset-scoped `http1MaxPendingRequests` to confirm the deferred-fields detail
 /// block + message still surface that case so operators know Ferrum parsed it but
 /// does not apply it for subsets — while the TOP-LEVEL value is applied (not deferred).

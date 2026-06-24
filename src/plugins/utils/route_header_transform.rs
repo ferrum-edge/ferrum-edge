@@ -14,26 +14,19 @@
 //!
 //! Operations supported are the strict subset of header ops that the
 //! transformer plugins also expose:
-//! - `add` — insert if absent. NOT Istio's append-to-multi-value
-//!   semantics — the existing Ferrum `request_transformer` historically
-//!   uses insert-if-absent and we preserve that for consistency; use
-//!   `update` to overwrite.
+//! - `add` — append to an existing header value with a comma separator, or
+//!   insert when absent. This mirrors Gateway API / Istio header-modifier
+//!   semantics on Ferrum's single-value header map.
 //! - `update` — insert or replace (`headers.request.set` semantics).
 //! - `remove` — delete the header (all values for the key).
 //!
 //! Rename is intentionally not part of the route-level transform contract
 //! because Istio has no rename verb.
 //!
-//! ## Divergence note for VS authors
-//!
-//! Istio `headers.request.add` appends to multi-value headers (e.g.,
-//! `Forwarded`, `Via`, `X-Forwarded-For`). Ferrum's underlying
-//! `HashMap<String, String>` header storage does not natively model
-//! multi-value headers (set-cookie is the only multi-value carve-out, via a
-//! `\n` separator). A VirtualService relying on Istio's append semantics on
-//! a previously-set header will see the `add` become a no-op here. Operators
-//! who need to overwrite should use `headers.request.set` (translates to
-//! `update`), which has identical effect on single-value headers.
+//! Ferrum's underlying `HashMap<String, String>` header storage does not
+//! natively model repeated header fields, so append is represented in the
+//! HTTP/1-compatible comma-joined form. Operators who need overwrite semantics
+//! should use `set`, which translates to `update`.
 
 use std::collections::HashMap;
 
@@ -44,7 +37,7 @@ use serde_json::Value;
 /// Operation in a route-level header transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteHeaderTransformOp {
-    /// Insert if absent; do not replace existing.
+    /// Append with comma separator when present; insert when absent.
     Add,
     /// Insert or replace.
     Update,
@@ -154,8 +147,10 @@ pub fn parse_route_header_transforms(
 ///
 /// Operations are applied in declaration order so operators get
 /// predictable interleaving (e.g. an `add` after a `remove` reinstates the
-/// header with the new value). `Add` is insert-if-absent; `Update` is
-/// unconditional replace; `Remove` deletes the entry.
+/// header with the new value). `Add` appends with a comma separator when the
+/// header already exists, except `Set-Cookie`, which uses the proxy's
+/// newline-separated multi-value representation; `Update` is unconditional
+/// replace; `Remove` deletes the entry.
 pub fn apply_route_header_transforms(
     rules: &[RouteHeaderTransformRule],
     headers: &mut HashMap<String, String>,
@@ -166,6 +161,18 @@ pub fn apply_route_header_transforms(
                 if let Some(value) = rule.value.as_ref() {
                     headers
                         .entry(rule.key.clone())
+                        .and_modify(|existing| {
+                            if existing.is_empty() {
+                                existing.push_str(value);
+                            } else {
+                                if rule.key.eq_ignore_ascii_case("set-cookie") {
+                                    existing.push('\n');
+                                } else {
+                                    existing.push(',');
+                                }
+                                existing.push_str(value);
+                            }
+                        })
                         .or_insert_with(|| value.clone());
                 }
             }
@@ -347,15 +354,8 @@ mod tests {
         assert_eq!(headers.get("x-trace").map(String::as_str), Some("final"));
     }
 
-    /// Documents the insert-if-absent semantics of `add` — this is NOT
-    /// Istio's append-to-multi-value behavior. See module-level docs:
-    /// Ferrum's underlying `HashMap<String, String>` storage doesn't model
-    /// multi-value headers, and the existing `request_transformer` plugin
-    /// already uses insert-if-absent so we preserve consistency. Operators
-    /// who want overwrite semantics should use `headers.request.set` (which
-    /// translates to `update`).
     #[test]
-    fn apply_add_is_insert_if_absent_not_istio_append() {
+    fn apply_add_appends_with_comma_when_header_exists() {
         let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(serde_json::json!([
             {"operation": "add", "target": "header", "key": "X-Trace", "value": "from-add"},
         ]))
@@ -364,10 +364,26 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-trace".to_string(), "client".to_string());
         apply_route_header_transforms(&parsed, &mut headers);
-        // Pre-existing value is preserved; the `add` is effectively a no-op
-        // because the key is already present. Istio's `add` would append
-        // "from-add" as an additional value — we do not.
-        assert_eq!(headers.get("x-trace").map(String::as_str), Some("client"));
+        assert_eq!(
+            headers.get("x-trace").map(String::as_str),
+            Some("client,from-add")
+        );
+    }
+
+    #[test]
+    fn apply_add_preserves_set_cookie_as_separate_values() {
+        let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(serde_json::json!([
+            {"operation": "add", "target": "header", "key": "Set-Cookie", "value": "route=1; Path=/"},
+        ]))
+        .unwrap();
+        let parsed = parse_route_header_transforms(&raw, "ctx").unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("set-cookie".to_string(), "backend=1; Path=/".to_string());
+        apply_route_header_transforms(&parsed, &mut headers);
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("backend=1; Path=/\nroute=1; Path=/")
+        );
     }
 
     #[test]

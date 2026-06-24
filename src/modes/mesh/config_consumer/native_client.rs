@@ -396,4 +396,29 @@ mod tests {
         };
         assert_eq!(config.primary_retry_secs, 300);
     }
+
+    #[test]
+    fn mesh_client_self_minted_token_carries_namespace_claim() {
+        let token = generate_dp_jwt_with_issuer_and_namespace(
+            "test-secret",
+            "node-a",
+            "ferrum-edge-cp-dp",
+            Some("tenant-a"),
+        )
+        .expect("token should mint");
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.set_issuer(&["ferrum-edge-cp-dp"]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+            &validation,
+        )
+        .expect("token should decode");
+
+        assert_eq!(
+            decoded.claims.get("ns").and_then(|value| value.as_str()),
+            Some("tenant-a")
+        );
+    }
 }

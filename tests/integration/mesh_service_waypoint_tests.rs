@@ -323,8 +323,12 @@ fn k8s_translator_skips_non_waypoint_gateways() {
             "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
         }),
     )]);
-    let mesh = cfg.mesh.expect("mesh emitted");
-    assert!(mesh.waypoint_bindings.is_empty());
+    assert!(
+        cfg.mesh
+            .as_ref()
+            .is_none_or(|mesh| mesh.waypoint_bindings.is_empty()),
+        "non-waypoint Gateway must not create waypoint bindings"
+    );
 }
 
 fn destination_rule(name: &str, host: &str) -> MeshDestinationRule {
@@ -435,6 +439,7 @@ fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     }
 }

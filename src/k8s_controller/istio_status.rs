@@ -569,10 +569,10 @@ fn destination_rule_status(
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
             // Deferred fields: the parsed-but-dropped connectionPool.http knobs
-            // the translator only warns on. There are NO universally deferred
-            // connectionPool.http knobs anymore (all of maxRequestsPerConnection
-            // / idleTimeout / http2MaxRequests / maxRetries / h2UpgradePolicy /
-            // http1MaxPendingRequests are projected/enforced at top-level/port).
+            // the translator only warns on. `maxRequestsPerConnection` is
+            // universally deferred because Ferrum does not enforce
+            // close-after-N backend requests. The other top-level/port
+            // connectionPool.http knobs are projected/enforced as documented.
             // Subset-scoped deferred (codex round-1 Finding 4): h2UpgradePolicy +
             // maxRetries + http1MaxPendingRequests set inside a
             // `subsets[].trafficPolicy` are applied at top-level/port but NOT for
@@ -634,13 +634,18 @@ fn destination_rule_status(
 /// `src/config_sources/k8s/istio.rs`. Keep this list in sync with the
 /// translator's always-deferred loop.
 ///
-/// EMPTY as of F5.1's final knob: `maxRequestsPerConnection` (wire-projected),
-/// `idleTimeout`, `http2MaxRequests`, `maxRetries`, `h2UpgradePolicy`, AND
-/// `http1MaxPendingRequests` are now all projected/enforced at top-level/port
-/// scope. The three of those that a subset's `SubsetTrafficPolicy` cannot carry
+/// `maxRequestsPerConnection` is universally deferred: it is parsed and
+/// validated, but not projected because the backend pools do not support
+/// close-after-N-request semantics. `idleTimeout`, `http2MaxRequests`,
+/// `maxRetries`, `h2UpgradePolicy`, and `http1MaxPendingRequests` are
+/// projected/enforced at top-level/port scope. The three of those that a
+/// subset's `SubsetTrafficPolicy` cannot carry
 /// (`h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests`) are deferred
 /// ONLY for subsets — see `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS`.
-const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[];
+const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
+    "maxRequestsPerConnection",
+    "connectionPool.http.maxRequestsPerConnection (not applied: backend close-after-N-requests is unsupported)",
+)];
 
 /// `connectionPool.http` knobs that ARE applied at top-level /
 /// `portLevelSettings` but are deferred ONLY when set inside a
@@ -1901,8 +1906,8 @@ mod tests {
         // F5.1 final knob: `http1MaxPendingRequests` is now PROJECTED and
         // ENFORCED at top-level / `portLevelSettings` (per-`(host,port)` pending
         // gate on the reqwest/H1 path), so it must NOT appear in
-        // `deferred_fields` at port level. There are no longer any universally
-        // deferred connectionPool.http knobs.
+        // `deferred_fields` at port level. `maxRequestsPerConnection` remains
+        // the only universally deferred connectionPool.http knob.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1938,6 +1943,46 @@ mod tests {
         assert!(
             deferred.is_empty(),
             "a port-level connectionPool.http with only applied knobs must defer nothing, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_max_requests_per_connection_surfaces_as_deferred_all_scopes() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "max-reqs-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "trafficPolicy": {
+                    "connectionPool": { "http": { "maxRequestsPerConnection": 2 } },
+                    "portLevelSettings": [{
+                        "port": { "number": 8080 },
+                        "connectionPool": { "http": { "maxRequestsPerConnection": 3 } }
+                    }]
+                },
+                "subsets": [{
+                    "name": "v1",
+                    "labels": { "version": "v1" },
+                    "trafficPolicy": {
+                        "connectionPool": { "http": { "maxRequestsPerConnection": 4 } }
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred
+                .iter()
+                .any(|f| { f.contains("maxRequestsPerConnection") && f.contains("not applied") }),
+            "maxRequestsPerConnection must be operator-visible as deferred, got {deferred:?}"
         );
     }
 

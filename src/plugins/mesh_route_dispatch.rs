@@ -27,9 +27,13 @@
 //! The plugin intentionally runs after authentication, authorization, and
 //! rate limiting. Those admission decisions use the public listener proxy
 //! identity; only downstream `before_proxy` plugins and backend dispatch see
-//! the effective override destination. WebSocket support applies to the
-//! HTTP upgrade handshake destination only — once upgraded, a WebSocket
-//! connection stays pinned to that backend and is not re-routed per frame.
+//! the effective override destination. Node-waypoint Service egress with
+//! scoped mesh policies is the exception: `mesh_authz` stamps the authorized
+//! Service upstream, and this plugin rejects any matching rule that would
+//! rewrite that request to a different upstream or direct backend. WebSocket
+//! support applies to the HTTP upgrade handshake destination only — once
+//! upgraded, a WebSocket connection stays pinned to that backend and is not
+//! re-routed per frame.
 //! HBONE CONNECT traffic now flows through the standard `before_proxy` chain
 //! before the HBONE relay branch in `proxy/mod.rs`, so this plugin can
 //! match on the outer CONNECT request (method, headers, query params) and
@@ -61,6 +65,10 @@ use crate::config::types::{
     BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
+};
+use crate::plugins::mesh::authz::{
+    NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
+    NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
 use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
@@ -381,12 +389,6 @@ fn validate_and_normalize_redirect(
     rule_idx: usize,
     redirect: &mut RouteRedirectConfig,
 ) -> Result<(), String> {
-    if redirect.is_empty() {
-        return Err(format!(
-            "mesh_route_dispatch.rules[{rule_idx}].redirect must set at least one of \
-             'uri' / 'authority' / 'scheme' so the redirect target differs from the request"
-        ));
-    }
     if !(300..=399).contains(&redirect.redirect_code) {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got {}",
@@ -401,6 +403,11 @@ fn validate_and_normalize_redirect(
         }
         reject_crlf(rule_idx, "redirect.uri", uri)?;
     }
+    if let Some(prefix) = redirect.match_prefix.as_deref()
+        && prefix.is_empty()
+    {
+        redirect.match_prefix = None;
+    }
     if let Some(authority) = redirect.authority.as_mut() {
         if authority.is_empty() {
             return Err(format!(
@@ -413,6 +420,11 @@ fn validate_and_normalize_redirect(
                 "mesh_route_dispatch.rules[{rule_idx}].redirect.authority must not contain whitespace"
             ));
         }
+    }
+    if redirect.port == Some(0) {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].redirect.port must be in the 1-65535 range"
+        ));
     }
     if let Some(scheme) = redirect.scheme.as_mut() {
         *scheme = scheme.to_ascii_lowercase();
@@ -986,6 +998,11 @@ pub struct RouteDestination {
     /// routes to a direct backend that uses different mTLS settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_tls: Option<BackendTlsConfig>,
+    /// Trusted translator marker for destinations that enter NodeWaypoint
+    /// Service authz. When scoped NodeWaypoint authz ran but did not stamp an
+    /// authorized destination, matching this rule must fail closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_node_waypoint_authz: bool,
 }
 
 impl RouteDestination {
@@ -995,6 +1012,85 @@ impl RouteDestination {
             && self.backend_port.is_none()
             && self.backend_tls.is_none()
     }
+}
+
+fn reject_node_waypoint_authz_destination_override(
+    ctx: &RequestContext,
+    destination: &RouteDestination,
+) -> Option<PluginResult> {
+    let authorized_upstream_id = ctx
+        .metadata
+        .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA);
+    let authorized_backend = ctx.metadata.get(NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA);
+    let authorized_backend_aliases = ctx
+        .metadata
+        .get(NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA);
+    if authorized_upstream_id.is_none() && authorized_backend.is_none() {
+        if destination.requires_node_waypoint_authz
+            && !destination.is_empty()
+            && ctx
+                .metadata
+                .get(NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA)
+                .is_some_and(|value| value == "true")
+        {
+            return Some(PluginResult::Reject {
+                status_code: 403,
+                body:
+                    "node-waypoint mesh authorization requires an authorized destination before route override"
+                        .to_string(),
+                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            });
+        }
+        return None;
+    }
+    if destination.is_empty() {
+        return None;
+    }
+    if let Some(authorized_upstream_id) = authorized_upstream_id
+        && destination.upstream_id.as_deref() == Some(authorized_upstream_id.as_str())
+        && destination.backend_host.is_none()
+        && destination.backend_port.is_none()
+        && destination.backend_tls.is_none()
+    {
+        return None;
+    }
+    if let Some(authorized_backend) = authorized_backend
+        && destination.upstream_id.is_none()
+        && let Some(destination_backend) = destination.backend_host.as_deref().and_then(|host| {
+            destination
+                .backend_port
+                .and_then(|port| node_waypoint_backend_metadata_value(host, port))
+        })
+        && (destination_backend == *authorized_backend
+            || node_waypoint_backend_metadata_contains(
+                authorized_backend_aliases.map(String::as_str),
+                &destination_backend,
+            ))
+    {
+        return None;
+    }
+    Some(PluginResult::Reject {
+        status_code: 403,
+        body:
+            "node-waypoint mesh authorization forbids route override to an unauthorized destination"
+                .to_string(),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+    })
+}
+
+fn node_waypoint_backend_metadata_value(host: &str, port: u16) -> Option<String> {
+    if port == 0 {
+        return None;
+    }
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then(|| format!("{host}|{port}"))
+}
+
+fn node_waypoint_backend_metadata_contains(values: Option<&str>, backend: &str) -> bool {
+    values
+        .into_iter()
+        .flat_map(|values| values.split(','))
+        .any(|value| value.trim() == backend)
 }
 
 /// Per-rule fault action carried by a single [`RouteRule`]. Projects Istio
@@ -1093,19 +1189,27 @@ impl RouteRewriteConfig {
 /// rule matches, the plugin short-circuits the dispatch chain with a redirect
 /// response (3xx + `Location`) and the request never reaches a backend.
 ///
-/// At least one of `uri` / `authority` must be present so the redirect target
-/// differs from the request; an empty redirect is rejected at config-load
-/// time. `redirect_code` defaults to 301 and is constrained to the 3xx range.
+/// If `uri` / `authority` / `port` / `scheme` are all unset, the redirect keeps
+/// the original request URL and only changes the status code. `redirect_code`
+/// defaults to 301 and is constrained to the 3xx range.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RouteRedirectConfig {
     /// Replacement path for the `Location` header. When unset, the request's
     /// own path is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// When set, only this matched request-path prefix is replaced by `uri`
+    /// and the remainder of the original request path is preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_prefix: Option<String>,
     /// Replacement authority (host[:port]) for the `Location` header. When
     /// unset, the request's own `Host` / `:authority` is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<String>,
+    /// Replacement authority port for the `Location` header. When `authority`
+    /// is unset this preserves the request host and swaps only the port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// Replacement scheme (`http` / `https`) for the `Location` header. When
     /// unset, the request's own frontend scheme is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1117,12 +1221,6 @@ pub struct RouteRedirectConfig {
 
 fn default_redirect_code() -> u16 {
     301
-}
-
-impl RouteRedirectConfig {
-    fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.authority.is_none() && self.scheme.is_none()
-    }
 }
 
 #[derive(Debug)]
@@ -1508,6 +1606,11 @@ impl Plugin for MeshRouteDispatch {
                 {
                     return result;
                 }
+                if let Some(result) =
+                    reject_node_waypoint_authz_destination_override(ctx, &rule.destination)
+                {
+                    return result;
+                }
                 // Route overrides are a whole-destination decision, not a
                 // field-wise merge. If an earlier plugin instance matched,
                 // this matching instance intentionally replaces all four
@@ -1588,7 +1691,7 @@ impl Plugin for MeshRouteDispatch {
             return PluginResult::Reject {
                 status_code: 404,
                 body: "no route matched mesh_route_dispatch predicates".to_string(),
-                headers: HashMap::new(),
+                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
             };
         }
         PluginResult::Continue
@@ -1706,7 +1809,15 @@ fn build_redirect_response(
             .or_else(|| headers.get(":authority"))
             .map(String::as_str)
     });
-    let path = redirect.uri.as_deref().unwrap_or(ctx.path.as_str());
+    let authority = authority.map(|authority| match redirect.port {
+        Some(port) => authority_with_redirect_port(authority, port, scheme),
+        None => authority.to_string(),
+    });
+    let path = redirect
+        .uri
+        .as_deref()
+        .map(|uri| rewrite_request_path(&ctx.path, uri, redirect.match_prefix.as_deref()))
+        .unwrap_or_else(|| ctx.path.clone());
 
     // Istio/Envoy preserve the original request query string on redirect by
     // default (Envoy `RedirectAction.strip_query` defaults to `false`), unless
@@ -1731,13 +1842,56 @@ fn build_redirect_response(
         None => format!("{path}{query_suffix}"),
     };
 
-    let mut reject_headers = HashMap::with_capacity(1);
+    let mut reject_headers = HashMap::with_capacity(2);
     reject_headers.insert("location".to_string(), location);
+    reject_headers.insert("content-type".to_string(), "text/plain".to_string());
     PluginResult::Reject {
         status_code: redirect.redirect_code,
         body: String::new(),
         headers: reject_headers,
     }
+}
+
+fn authority_with_port(authority: &str, port: u16) -> String {
+    if let Some(bracketed_end) = authority.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let end = bracketed_end + 1;
+        return format!("{}:{port}", &authority[..=end]);
+    }
+    if authority.matches(':').count() == 1
+        && let Some((host, existing_port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && existing_port.parse::<u16>().is_ok()
+    {
+        return format!("{host}:{port}");
+    }
+    format!("{authority}:{port}")
+}
+
+fn authority_with_redirect_port(authority: &str, port: u16, scheme: &str) -> String {
+    if redirect_port_is_scheme_default(port, scheme) {
+        return authority_without_port(authority);
+    }
+    authority_with_port(authority, port)
+}
+
+fn redirect_port_is_scheme_default(port: u16, scheme: &str) -> bool {
+    (port == 80 && scheme.eq_ignore_ascii_case("http"))
+        || (port == 443 && scheme.eq_ignore_ascii_case("https"))
+}
+
+fn authority_without_port(authority: &str) -> String {
+    if let Some(bracketed_end) = authority.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let end = bracketed_end + 1;
+        return authority[..=end].to_string();
+    }
+    if authority.matches(':').count() == 1
+        && let Some((host, existing_port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && existing_port.parse::<u16>().is_ok()
+    {
+        return host.to_string();
+    }
+    authority.to_string()
 }
 
 /// Apply the per-rule fault action when the rule matched. Returns `Some` to
@@ -2533,10 +2687,16 @@ mod tests {
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         match result {
             PluginResult::Reject {
-                status_code, body, ..
+                status_code,
+                body,
+                headers,
             } => {
                 assert_eq!(status_code, 404);
                 assert!(body.contains("no route matched"), "got: {body}");
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("text/plain")
+                );
             }
             other => panic!("expected Reject 404, got {other:?}"),
         }
@@ -5076,11 +5236,44 @@ mod tests {
                     headers.get("location").map(String::as_str),
                     Some("https://elsewhere.example.com/new")
                 );
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("text/plain")
+                );
             }
             other => panic!("expected redirect Reject, got {other:?}"),
         }
         // A redirect must not leave a route override behind.
         assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_match_prefix_preserves_path_suffix() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {
+                    "uri": "/new",
+                    "match_prefix": "/old",
+                    "authority": "elsewhere.example.com",
+                    "redirect_code": 302
+                }
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/old/item");
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://elsewhere.example.com/new/item")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -5167,6 +5360,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirect_port_preserves_request_host_and_replaces_existing_port() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https", "port": 8443}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        let mut headers =
+            HashMap::from([("host".to_string(), "site.example.com:8080".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com:8443/keep/me")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_scheme_default_port_strips_existing_request_port() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https", "port": 443}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        let mut headers = HashMap::from([("host".to_string(), "site.example.com:80".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com/keep/me")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_port_preserves_bracketed_ipv6_host() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https", "port": 8443}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/v6");
+        let mut headers = HashMap::from([("host".to_string(), "[2001:db8::1]:8080".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://[2001:db8::1]:8443/v6")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn redirect_falls_back_to_relative_location_without_authority() {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{ "match": {}, "redirect": {"uri": "/relative"} }]
@@ -5194,13 +5454,31 @@ mod tests {
         assert!(err.contains("rewrite must set at least one"), "got: {err}");
     }
 
-    #[test]
-    fn rejects_empty_redirect() {
-        let err = MeshRouteDispatch::new(&json!({
-            "rules": [{"match": {"methods": ["GET"]}, "redirect": {}}]
+    #[tokio::test]
+    async fn redirect_status_only_preserves_request_url() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {"methods": ["GET"]}, "redirect": {"redirect_code": 302}}]
         }))
-        .unwrap_err();
-        assert!(err.contains("redirect must set at least one"), "got: {err}");
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        ctx.set_raw_query_string("token=abc".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::from([("host".to_string(), "site.example.com".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 302);
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com/keep/me?token=abc")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
     }
 
     #[test]

@@ -64,16 +64,17 @@ paths:
 - SQL wraps multi-step CRUD in `sqlx::Transaction`.
 - MongoDB single-doc writes are atomic. Multi-doc atomicity requires `FERRUM_MONGO_REPLICA_SET`; otherwise flows must be idempotent with poll-cycle cleanup.
 - `FERRUM_DB_FAILOVER_URLS` uses the same `FERRUM_DB_TYPE`.
-- `FERRUM_DB_READ_REPLICA_URL` offloads polling; writes always use primary.
-- MongoDB uses URL `readPreference` instead of read-replica env. Replica-set failover comes from listing members in `FERRUM_DB_URL`.
+- Runtime config polling is authoritative and primary-consistent: startup full loads, incremental change-log reads, relationship reads, cursor advancement, and accepted association state must not use SQL read replicas or MongoDB secondary read preferences.
+- `FERRUM_DB_READ_REPLICA_URL` is SQL-only and may offload eligible admin-only reads; writes and runtime polling always use primary. Replica query failure must mark the replica unavailable and retry the admin read on primary.
+- MongoDB replica-set failover comes from listing members in `FERRUM_DB_URL`; Ferrum's config store forces primary reads and ignores URL read preferences.
 - MongoDB pool sizing comes from driver URL options such as `maxPoolSize` and `minPoolSize`; `FERRUM_DB_POOL_*` is ignored.
 
 ## Incremental Polling And Broadcast
 
 - `FERRUM_DB_POLL_INTERVAL` defaults to 30s.
-- Startup performs a full load. Subsequent SQL polls use indexed `updated_at > ?` plus a lightweight `SELECT id` deletion diff with a 1s safety margin.
-- Poll results are validated before apply; on reject, known IDs remain unchanged.
-- Poll failure auto-falls back to full reload.
+- Startup performs a full load and seeds the accepted durable change sequence. Subsequent SQL and MongoDB polls read `config_changes` after that sequence, collapse each resource to its final operation in the batch, and point-load changed IDs only.
+- Poll results are validated before apply; on reject, the accepted sequence remains unchanged.
+- Poll failure or an expired retained sequence auto-falls back to full reload.
 - CP broadcasts deltas through a tokio broadcast channel sized by `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`.
 - Lagging DPs automatically receive a full snapshot.
 - If config source is unavailable, keep serving the last cached config.

@@ -1,17 +1,19 @@
 //! Database config loader with incremental polling.
 //!
-//! **Incremental polling strategy** (two-phase):
-//! 1. **Change detection**: Indexed `WHERE updated_at >= ?` queries on 4 tables to
-//!    fetch only rows modified since the last poll. A 1-second safety margin on the
-//!    timestamp prevents missing boundary writes due to clock skew or in-flight commits.
-//!    The `>=` (inclusive) ensures rows written at exactly the boundary are never missed;
-//!    duplicates from the overlap are harmless because the incremental result is merged by ID.
-//! 2. **Deletion detection**: Lightweight `SELECT id` queries on all 4 tables, diffed
-//!    against the poller's known ID sets to find removed rows.
+//! **Incremental polling strategy**:
+//! 1. Admin and import write paths append durable `config_changes` records in
+//!    the same transaction as SQL resource mutations.
+//! 2. Pollers read ordered change records after their accepted sequence cursor,
+//!    collapse each resource to its final operation in the batch, and point-load
+//!    only changed resource IDs.
+//! 3. Deletes are delivered from durable delete records; normal incremental
+//!    polling does not scan every resource ID or rely on wall-clock timestamps.
 //!
-//! On startup, a full `SELECT *` seeds the initial config and known ID sets.
-//! If an incremental poll fails for any reason, the loop falls back to a full
-//! reload and re-seeds. Known ID sets are only updated after successful apply.
+//! On startup, a transaction-scoped full load seeds the initial config and
+//! accepted sequence cursor. Full loads use deterministic keyset pagination
+//! (`id > last_id`) so mutable tables cannot shift under `OFFSET`. If an
+//! incremental poll fails or the cursor is older than retained change history,
+//! the loop falls back to a full reload and reseeds the accepted sequence.
 //!
 //! **Key implementation details**:
 //! - Postgres `?` → `$N` placeholder rewrite via `q()` method (sqlx `Any` uses `?`)
@@ -26,9 +28,9 @@ use crate::config::types::{
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
@@ -42,8 +44,7 @@ use tracing::{debug, info, warn};
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, GatewayTrustBundlePoll, IncrementalResult,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder, extract_db_hostname, extract_known_ids,
-    redact_url,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder, extract_db_hostname, redact_url,
 };
 
 struct PluginConfigRef {
@@ -258,38 +259,12 @@ fn store_canonical_resource_hash(
     })
 }
 
-/// Identifies a resource table for lightweight `SELECT id` queries.
-///
-/// Used by `load_table_ids()` to eliminate dynamic table-name interpolation
-/// and make SQL injection impossible by construction.
-#[derive(Clone, Copy)]
-enum ResourceTable {
-    Proxies,
-    Consumers,
-    PluginConfigs,
-    Upstreams,
-}
-
-impl ResourceTable {
-    /// Static SQL for loading IDs — no format!() needed.
-    const fn select_ids_sql(self) -> &'static str {
-        match self {
-            Self::Proxies => "SELECT id FROM proxies WHERE namespace = ?",
-            Self::Consumers => "SELECT id FROM consumers WHERE namespace = ?",
-            Self::PluginConfigs => "SELECT id FROM plugin_configs WHERE namespace = ?",
-            Self::Upstreams => "SELECT id FROM upstreams WHERE namespace = ?",
-        }
-    }
-
-    /// Label for slow-query logging.
-    const fn load_ids_label(self) -> &'static str {
-        match self {
-            Self::Proxies => "load_table_ids(proxies)",
-            Self::Consumers => "load_table_ids(consumers)",
-            Self::PluginConfigs => "load_table_ids(plugin_configs)",
-            Self::Upstreams => "load_table_ids(upstreams)",
-        }
-    }
+#[derive(Debug)]
+struct ConfigChangeRecord {
+    sequence: u64,
+    resource_type: String,
+    resource_id: String,
+    operation: String,
 }
 
 /// Database connection pool tuning parameters.
@@ -368,7 +343,8 @@ pub(crate) fn statement_timeout_sql(
 #[derive(Clone)]
 pub struct DatabaseStore {
     pool: Arc<ArcSwap<AnyPool>>,
-    read_replica_pool: Option<Arc<ArcSwap<AnyPool>>>,
+    read_replica_url: Option<String>,
+    read_replica_pool: Arc<ArcSwapOption<AnyPool>>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -387,6 +363,17 @@ pub struct DatabaseStore {
     /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
     /// same cleared-state after recovery.
     migrations_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminReadSource {
+    Primary,
+    ReadReplica,
+}
+
+struct AdminReadPool {
+    pool: AnyPool,
+    source: AdminReadSource,
 }
 
 impl DatabaseStore {
@@ -429,6 +416,42 @@ impl DatabaseStore {
             _ => self.q("INSERT INTO proxy_route_locks \
                  (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace, route_key_hash) DO NOTHING"),
+        }
+    }
+
+    fn config_change_lock_insert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT IGNORE INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?)"
+                .to_string(),
+            "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?)"
+                .to_string(),
+            _ => self.q("INSERT INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?) \
+                 ON CONFLICT (lock_name) DO NOTHING"),
+        }
+    }
+
+    fn config_change_retention_upsert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT INTO config_change_retention \
+                 (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE \
+                 retained_sequence = GREATEST(retained_sequence, VALUES(retained_sequence)), \
+                 updated_at = VALUES(updated_at)"
+                .to_string(),
+            "sqlite" => "INSERT INTO config_change_retention \
+                 (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 retained_sequence = max(config_change_retention.retained_sequence, excluded.retained_sequence), \
+                 updated_at = excluded.updated_at"
+                .to_string(),
+            _ => self.q("INSERT INTO config_change_retention \
+                 (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 retained_sequence = GREATEST(config_change_retention.retained_sequence, EXCLUDED.retained_sequence), \
+                 updated_at = EXCLUDED.updated_at"),
         }
     }
 
@@ -530,6 +553,38 @@ impl DatabaseStore {
             sqlx::query(&lock_sql)
                 .bind(namespace)
                 .bind(&route_key_hash)
+                .fetch_optional(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn lock_config_change_sequence_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        // Serialize SQL change-log inserts so auto-incremented sequences become
+        // visible to pollers in commit order.
+        let now = Utc::now().to_rfc3339();
+        let insert_sql = self.config_change_lock_insert_sql();
+        sqlx::query(&insert_sql)
+            .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+
+        if self.db_type == "sqlite" {
+            sqlx::query("UPDATE config_change_locks SET updated_at = ? WHERE lock_name = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            let lock_sql =
+                self.q("SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE");
+            sqlx::query(&lock_sql)
+                .bind(Self::CONFIG_CHANGE_LOCK_NAME)
                 .fetch_optional(&mut **tx)
                 .await?;
         }
@@ -700,7 +755,8 @@ impl DatabaseStore {
 
         let store = Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
-            read_replica_pool: None,
+            read_replica_url: None,
+            read_replica_pool: Arc::new(ArcSwapOption::empty()),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -756,7 +812,8 @@ impl DatabaseStore {
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
-            read_replica_pool: None,
+            read_replica_url: None,
+            read_replica_pool: Arc::new(ArcSwapOption::empty()),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -880,6 +937,21 @@ impl DatabaseStore {
         })
     }
 
+    fn proxy_plugin_reference_lookup_error(
+        operation: &str,
+        namespace: &str,
+        column: Option<&str>,
+        source: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        let column_context = column
+            .map(|column| format!(" column=plugin_configs.{column}"))
+            .unwrap_or_default();
+        anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+            "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+            operation, namespace, column_context, source
+        )))
+    }
+
     fn push_proxy_plugin_association_row(
         associations: &mut ProxyPluginAssociations,
         row: &AnyRow,
@@ -910,10 +982,11 @@ impl DatabaseStore {
         Ok(())
     }
 
-    async fn load_proxy_plugin_associations_for_namespace(
+    async fn load_proxy_plugin_associations_for_namespace_tx(
         &self,
         namespace: &str,
         operation: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<ProxyPluginAssociations, anyhow::Error> {
         let sql = self.q("SELECT pp.proxy_id, pp.plugin_config_id \
              FROM proxy_plugins pp \
@@ -921,7 +994,7 @@ impl DatabaseStore {
              WHERE p.namespace = ?");
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
-            .fetch_all(&self.rpool())
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| {
                 Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
@@ -944,13 +1017,26 @@ impl DatabaseStore {
             return Ok(HashMap::new());
         }
 
-        let mut associations: ProxyPluginAssociations = HashMap::new();
         let pool = if use_primary {
             self.pool()
         } else {
             self.rpool()
         };
+        self.load_proxy_plugin_associations_for_proxy_ids_from_pool(proxy_ids, operation, &pool)
+            .await
+    }
 
+    async fn load_proxy_plugin_associations_for_proxy_ids_from_pool(
+        &self,
+        proxy_ids: &[String],
+        operation: &str,
+        pool: &AnyPool,
+    ) -> Result<ProxyPluginAssociations, anyhow::Error> {
+        if proxy_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut associations: ProxyPluginAssociations = HashMap::new();
         for chunk in proxy_ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -964,7 +1050,7 @@ impl DatabaseStore {
                 query = query.bind(id);
             }
             let rows = query
-                .fetch_all(&pool)
+                .fetch_all(pool)
                 .await
                 .map_err(|e| Self::proxy_plugin_association_query_error(operation, None, e))?;
             for row in &rows {
@@ -982,7 +1068,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(std::slice::from_ref(proxy));
         let plugin_refs = self
-            .load_plugin_config_refs(&plugin_config_ids, &proxy.namespace)
+            .load_plugin_config_refs(&plugin_config_ids, &proxy.namespace, operation)
             .await?;
         let errors = Self::validate_loaded_proxy_plugin_associations_with_refs(
             &proxy.id,
@@ -1009,10 +1095,11 @@ impl DatabaseStore {
         operation: &str,
         namespace: &str,
         proxies: &[Proxy],
+        pool: &AnyPool,
     ) -> Result<(), anyhow::Error> {
         let plugin_config_ids = Self::loaded_proxy_plugin_config_ids(proxies);
         let plugin_refs = self
-            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, false)
+            .load_plugin_config_refs_from_pool(&plugin_config_ids, namespace, operation, pool)
             .await?;
         let mut errors = Vec::new();
         for proxy in proxies {
@@ -1126,10 +1213,14 @@ impl DatabaseStore {
         // Capture timestamp before queries so the incremental polling safety
         // margin covers the full load duration.
         let loaded_at = Utc::now();
-        let proxies = self.load_proxies(namespace).await?;
-        let consumers = self.load_consumers(namespace).await?;
-        let plugin_configs = self.load_plugin_configs(namespace).await?;
-        let upstreams = self.load_upstreams(namespace).await?;
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        let proxies = self.load_proxies_tx(namespace, &mut tx).await?;
+        let consumers = self.load_consumers_tx(namespace, &mut tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, &mut tx).await?;
+        let upstreams = self.load_upstreams_tx(namespace, &mut tx).await?;
+        tx.commit().await?;
 
         let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -1192,7 +1283,71 @@ impl DatabaseStore {
         Ok(config)
     }
 
-    async fn load_proxies(&self, namespace: &str) -> Result<Vec<Proxy>, anyhow::Error> {
+    async fn configure_full_load_snapshot(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        match self.db_type.as_str() {
+            "postgres" => {
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            "mysql" => {
+                let isolation = Self::mysql_transaction_isolation(tx).await?;
+                if !Self::is_mysql_repeatable_read(&isolation) {
+                    return Err(anyhow::anyhow!(
+                        "MySQL full-load transactions require REPEATABLE READ isolation; current transaction isolation is '{}'. Configure the MySQL server or Ferrum session default to REPEATABLE READ so full runtime loads fail closed instead of publishing mixed snapshots.",
+                        isolation
+                    ));
+                }
+            }
+            "sqlite" => {
+                // SQLite read transactions observe one database snapshot from
+                // the first read.
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn mysql_transaction_isolation(
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<String, anyhow::Error> {
+        match sqlx::query_scalar::<_, String>("SELECT @@transaction_isolation")
+            .fetch_one(&mut **tx)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(primary_error) => {
+                sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "failed to read MySQL transaction isolation: {}; fallback @@tx_isolation failed: {}",
+                            primary_error,
+                            fallback_error
+                        )
+                    })
+            }
+        }
+    }
+
+    fn is_mysql_repeatable_read(isolation: &str) -> bool {
+        isolation
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-' && *ch != '_')
+            .flat_map(char::to_uppercase)
+            .collect::<String>()
+            == "REPEATABLEREAD"
+    }
+
+    async fn load_proxies_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
         // Batch-load proxy_plugins for proxies in this namespace (eliminates N+1).
@@ -1200,32 +1355,39 @@ impl DatabaseStore {
         // query or decode error rejects the whole candidate instead of
         // publishing proxies with silently empty plugin lists.
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_namespace(namespace, "load_full_config")
+            .load_proxy_plugin_associations_for_namespace_tx(namespace, "load_full_config", tx)
             .await?;
 
         // Load proxies in chunks to avoid unbounded SELECT * at scale.
         let mut proxies = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-            )
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.rpool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM proxies WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
                 let id: String = row.try_get("id")?;
                 let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-                proxies.push(row_to_proxy(&row, id, plugins)?);
+                let proxy = row_to_proxy(&row, id.clone(), plugins)?;
+                proxies.push(proxy);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
         Self::ensure_no_unmatched_proxy_plugin_associations("load_full_config", &plugins_by_proxy)?;
 
@@ -1233,59 +1395,78 @@ impl DatabaseStore {
         Ok(proxies)
     }
 
-    async fn load_consumers(&self, namespace: &str) -> Result<Vec<Consumer>, anyhow::Error> {
+    async fn load_consumers_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let mut consumers = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-            )
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.rpool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM consumers WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
+                let id: String = row.try_get("id")?;
                 consumers.push(row_to_consumer(&row)?);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_consumers", start);
         Ok(consumers)
     }
 
-    async fn load_plugin_configs(
+    async fn load_plugin_configs_tx(
         &self,
         namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
         let mut configs = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(&self.q(
-                "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?",
-            ))
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.rpool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM plugin_configs WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
+                let id: String = row.try_get("id")?;
                 configs.push(row_to_plugin_config(&row)?);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_plugin_configs", start);
@@ -1512,6 +1693,10 @@ impl DatabaseStore {
             .await?;
         }
 
+        self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
+            .await?;
+        self.compact_config_changes_tx(&mut tx, &proxy.namespace)
+            .await?;
         tx.commit().await?;
 
         self.check_slow_query("create_proxy", start);
@@ -1628,6 +1813,10 @@ impl DatabaseStore {
                 .await?;
         }
 
+        self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
+            .await?;
+        self.compact_config_changes_tx(&mut tx, &proxy.namespace)
+            .await?;
         tx.commit().await?;
 
         self.check_slow_query("update_proxy", start);
@@ -1641,11 +1830,15 @@ impl DatabaseStore {
         // Look up the proxy's current upstream_id before deleting so we can
         // cascade-delete that upstream if it becomes orphaned. Also capture the
         // api_spec row, if this proxy owns one, before the FK cascade removes it.
-        let proxy_row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?"))
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let proxy_select_sql = if self.db_type == "sqlite" {
+            self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?")
+        } else {
+            self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ? FOR UPDATE")
+        };
+        let proxy_row: Option<AnyRow> = sqlx::query(&proxy_select_sql)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some(proxy_row) = proxy_row else {
             tx.rollback().await?;
             self.check_slow_query("delete_proxy", start);
@@ -1667,6 +1860,15 @@ impl DatabaseStore {
             self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
                 .await?;
         }
+        let proxy_scoped_plugin_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT id, namespace FROM plugin_configs WHERE proxy_id = ?"))
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let proxy_scoped_plugins: Vec<(String, String)> = proxy_scoped_plugin_rows
+            .iter()
+            .map(|row| Ok::<_, anyhow::Error>((row.try_get("id")?, row.try_get("namespace")?)))
+            .collect::<Result<_, _>>()?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
@@ -1693,11 +1895,32 @@ impl DatabaseStore {
         // spec id, not only the proxy's current upstream_id. Direct admin CRUD
         // can drift the pointer away from the original spec-owned upstream.
         if let Some((ref spec_id, ref namespace)) = spec_owner {
+            let upstream_rows: Vec<AnyRow> = sqlx::query(
+                &self.q("SELECT id FROM upstreams WHERE api_spec_id = ? AND namespace = ?"),
+            )
+            .bind(spec_id)
+            .bind(namespace)
+            .fetch_all(&mut *tx)
+            .await?;
+            let upstream_ids: Vec<String> = upstream_rows
+                .iter()
+                .map(|row| row.try_get("id"))
+                .collect::<Result<_, _>>()?;
             sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
                 .bind(spec_id)
                 .bind(namespace)
                 .execute(&mut *tx)
                 .await?;
+            for upstream_id in upstream_ids {
+                self.record_config_change_tx(
+                    &mut tx,
+                    namespace,
+                    "upstream",
+                    &upstream_id,
+                    "delete",
+                )
+                .await?;
+            }
         }
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
@@ -1705,6 +1928,21 @@ impl DatabaseStore {
             self.cleanup_orphaned_upstream_tx(&mut tx, uid).await?;
         }
 
+        self.record_config_change_tx(&mut tx, &proxy_namespace, "proxy", id, "delete")
+            .await?;
+        for (plugin_id, namespace) in proxy_scoped_plugins {
+            self.record_config_change_tx(
+                &mut tx,
+                &namespace,
+                "plugin_config",
+                &plugin_id,
+                "delete",
+            )
+            .await?;
+            self.compact_config_changes_tx(&mut tx, &namespace).await?;
+        }
+        self.compact_config_changes_tx(&mut tx, &proxy_namespace)
+            .await?;
         tx.commit().await?;
 
         self.check_slow_query("delete_proxy", start);
@@ -1742,6 +1980,9 @@ impl DatabaseStore {
                 .bind(namespace)
                 .execute(&mut **tx)
                 .await?;
+            self.record_config_change_tx(tx, namespace, "plugin_config", id, "delete")
+                .await?;
+            self.compact_config_changes_tx(tx, namespace).await?;
         }
 
         Ok(())
@@ -1789,6 +2030,9 @@ impl DatabaseStore {
                 .bind(&namespace)
                 .execute(&mut **tx)
                 .await?;
+            self.record_config_change_tx(tx, &namespace, "upstream", upstream_id, "delete")
+                .await?;
+            self.compact_config_changes_tx(tx, &namespace).await?;
         }
 
         Ok(())
@@ -1884,6 +2128,16 @@ impl DatabaseStore {
         .await?;
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
             .await?;
+        self.record_config_change_tx(
+            &mut tx,
+            &consumer.namespace,
+            "consumer",
+            &consumer.id,
+            "upsert",
+        )
+        .await?;
+        self.compact_config_changes_tx(&mut tx, &consumer.namespace)
+            .await?;
         tx.commit().await?;
 
         self.check_slow_query("create_consumer", start);
@@ -1910,6 +2164,16 @@ impl DatabaseStore {
         .execute(&mut *tx)
         .await?;
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
+            .await?;
+        self.record_config_change_tx(
+            &mut tx,
+            &consumer.namespace,
+            "consumer",
+            &consumer.id,
+            "upsert",
+        )
+        .await?;
+        self.compact_config_changes_tx(&mut tx, &consumer.namespace)
             .await?;
         tx.commit().await?;
 
@@ -1939,6 +2203,9 @@ impl DatabaseStore {
             .bind(&namespace)
             .execute(&mut *tx)
             .await?;
+        self.record_config_change_tx(&mut tx, &namespace, "consumer", id, "delete")
+            .await?;
+        self.compact_config_changes_tx(&mut tx, &namespace).await?;
         tx.commit().await?;
         self.check_slow_query("delete_consumer", start);
         Ok(result.rows_affected() > 0)
@@ -1971,6 +2238,7 @@ impl DatabaseStore {
             PluginScope::ProxyGroup => "proxy_group",
             PluginScope::Global => "global",
         };
+        let mut tx = self.pool().begin().await?;
         sqlx::query(
             &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
@@ -1984,8 +2252,19 @@ impl DatabaseStore {
         .bind(pc.priority_override.map(|v| v as i32))
         .bind(pc.created_at.to_rfc3339())
         .bind(pc.updated_at.to_rfc3339())
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
+            .await?;
+        if pc.scope == PluginScope::Proxy
+            && let Some(proxy_id) = pc.proxy_id.as_deref()
+        {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, &pc.namespace)
+            .await?;
+        tx.commit().await?;
 
         self.check_slow_query("create_plugin_config", start);
         Ok(())
@@ -1999,6 +2278,7 @@ impl DatabaseStore {
             PluginScope::ProxyGroup => "proxy_group",
             PluginScope::Global => "global",
         };
+        let mut tx = self.pool().begin().await?;
         sqlx::query(
             &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
         )
@@ -2011,8 +2291,19 @@ impl DatabaseStore {
         .bind(Utc::now().to_rfc3339())
         .bind(&pc.id)
         .bind(&pc.namespace)
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
+            .await?;
+        if pc.scope == PluginScope::Proxy
+            && let Some(proxy_id) = pc.proxy_id.as_deref()
+        {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, &pc.namespace)
+            .await?;
+        tx.commit().await?;
 
         self.check_slow_query("update_plugin_config", start);
         Ok(())
@@ -2053,7 +2344,7 @@ impl DatabaseStore {
         if !affected_proxy_ids.is_empty() {
             let updated_at = Utc::now().to_rfc3339();
             let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
-            for proxy_id in affected_proxy_ids {
+            for proxy_id in &affected_proxy_ids {
                 sqlx::query(&sql)
                     .bind(&updated_at)
                     .bind(proxy_id)
@@ -2069,6 +2360,13 @@ impl DatabaseStore {
                 .bind(&namespace)
                 .execute(&mut *tx)
                 .await?;
+        self.record_config_change_tx(&mut tx, &namespace, "plugin_config", id, "delete")
+            .await?;
+        for proxy_id in affected_proxy_ids {
+            self.record_config_change_tx(&mut tx, &namespace, "proxy", &proxy_id, "upsert")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, &namespace).await?;
 
         tx.commit().await?;
 
@@ -2097,28 +2395,39 @@ impl DatabaseStore {
 
     // ---- Upstream CRUD ----
 
-    async fn load_upstreams(&self, namespace: &str) -> Result<Vec<Upstream>, anyhow::Error> {
+    async fn load_upstreams_tx(
+        &self,
+        namespace: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let mut upstreams = Vec::new();
-        let mut offset: i64 = 0;
+        let mut last_id: Option<String> = None;
 
         loop {
-            let rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
-            )
-            .bind(namespace)
-            .bind(self.full_load_page_size)
-            .bind(offset)
-            .fetch_all(&self.rpool())
-            .await?;
+            let sql = if last_id.is_some() {
+                "SELECT * FROM upstreams WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&mut **tx)
+                .await?;
             let fetched = rows.len();
             for row in rows {
+                let id: String = row.try_get("id")?;
                 upstreams.push(row_to_upstream(&row)?);
+                last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_upstreams", start);
@@ -2134,12 +2443,44 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_proxies_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_proxies_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_proxies_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_proxies_paginated_from_admin_read(namespace, limit, offset, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_proxies_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_proxies_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM proxies WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2149,7 +2490,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         // Batch-load proxy_plugins for only the proxies in this page
@@ -2159,10 +2500,10 @@ impl DatabaseStore {
             .collect();
 
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_proxy_ids(
+            .load_proxy_plugin_associations_for_proxy_ids_from_pool(
                 &proxy_ids,
                 "list_proxies_paginated",
-                false,
+                pool,
             )
             .await?;
 
@@ -2182,6 +2523,7 @@ impl DatabaseStore {
             "list_proxies_paginated",
             namespace,
             &proxies,
+            pool,
         )
         .await?;
 
@@ -2199,12 +2541,49 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_consumers_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_consumers_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_consumers_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_consumers_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_consumers_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_consumers_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM consumers WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2214,7 +2593,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut consumers = Vec::new();
@@ -2236,12 +2615,56 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_plugin_configs_paginated_from_admin_read(
+                namespace,
+                limit,
+                offset,
+                &admin_read.pool,
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_plugin_configs_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_plugin_configs_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_plugin_configs_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!(
+                        "Admin read fallback to primary succeeded for list_plugin_configs_paginated"
+                    );
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_plugin_configs_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM plugin_configs WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2252,7 +2675,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut configs = Vec::new();
@@ -2274,12 +2697,49 @@ impl DatabaseStore {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_upstreams_paginated_from_admin_read(namespace, limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_upstreams_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_upstreams_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_upstreams_paginated_from_admin_read(
+                        namespace,
+                        limit,
+                        offset,
+                        &primary_pool,
+                    )
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_upstreams_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_upstreams_paginated_from_admin_read(
+        &self,
+        namespace: &str,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
         let start = Instant::now();
 
         let count_row =
             sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM upstreams WHERE namespace = ?"))
                 .bind(namespace)
-                .fetch_one(&self.rpool())
+                .fetch_one(pool)
                 .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
@@ -2289,7 +2749,7 @@ impl DatabaseStore {
         .bind(namespace)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&self.rpool())
+        .fetch_all(pool)
         .await?;
 
         let mut upstreams = Vec::new();
@@ -2334,6 +2794,7 @@ impl DatabaseStore {
             .transpose()?;
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
+        let mut tx = self.pool().begin().await?;
         sqlx::query(
             &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
@@ -2355,8 +2816,19 @@ impl DatabaseStore {
         .bind(&backend_tls_san_allow_list_json)
         .bind(upstream.created_at.to_rfc3339())
         .bind(upstream.updated_at.to_rfc3339())
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        self.record_config_change_tx(
+            &mut tx,
+            &upstream.namespace,
+            "upstream",
+            &upstream.id,
+            "upsert",
+        )
+        .await?;
+        self.compact_config_changes_tx(&mut tx, &upstream.namespace)
+            .await?;
+        tx.commit().await?;
 
         self.check_slow_query("create_upstream", start);
         Ok(())
@@ -2390,6 +2862,7 @@ impl DatabaseStore {
             .transpose()?;
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
+        let mut tx = self.pool().begin().await?;
         sqlx::query(
             &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
@@ -2410,8 +2883,19 @@ impl DatabaseStore {
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
         .bind(&upstream.namespace)
-        .execute(&self.pool())
+        .execute(&mut *tx)
         .await?;
+        self.record_config_change_tx(
+            &mut tx,
+            &upstream.namespace,
+            "upstream",
+            &upstream.id,
+            "upsert",
+        )
+        .await?;
+        self.compact_config_changes_tx(&mut tx, &upstream.namespace)
+            .await?;
+        tx.commit().await?;
 
         self.check_slow_query("update_upstream", start);
         Ok(())
@@ -2500,6 +2984,9 @@ impl DatabaseStore {
             .bind(&namespace)
             .execute(&mut *tx)
             .await?;
+        self.record_config_change_tx(&mut tx, &namespace, "upstream", id, "delete")
+            .await?;
+        self.compact_config_changes_tx(&mut tx, &namespace).await?;
 
         tx.commit().await?;
 
@@ -2852,7 +3339,11 @@ impl DatabaseStore {
         }
 
         let plugin_refs = self
-            .load_plugin_config_refs(&requested_ids, namespace)
+            .load_plugin_config_refs(
+                &requested_ids,
+                namespace,
+                "validate_proxy_plugin_associations",
+            )
             .await?;
 
         for assoc in associations {
@@ -2898,87 +3389,182 @@ impl DatabaseStore {
 
     // ---- Incremental Polling ----
 
-    /// Load only resources that changed since `since`, and detect deletions by
-    /// comparing current DB IDs against the caller's known ID sets.
-    ///
-    /// This replaces `load_full_config()` for subsequent polls after the initial
-    /// full load, reducing DB I/O from 4 full table scans to 4 indexed
-    /// `WHERE updated_at >= ?` queries plus 4 lightweight `SELECT id` queries.
+    pub async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        let row = sqlx::query(
+            &self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes WHERE namespace = ?"),
+        )
+        .bind(namespace)
+        .fetch_one(&self.pool())
+        .await?;
+        let max_sequence: i64 = row.try_get("max_sequence")?;
+        Ok(max_sequence.max(0) as u64)
+    }
+
+    /// Load only resources referenced by durable change records after `after_sequence`.
     pub async fn load_incremental_config(
         &self,
         namespace: &str,
-        since: DateTime<Utc>,
-        known_proxy_ids: &HashSet<String>,
-        known_consumer_ids: &HashSet<String>,
-        known_plugin_config_ids: &HashSet<String>,
-        known_upstream_ids: &HashSet<String>,
+        after_sequence: u64,
     ) -> Result<IncrementalResult, anyhow::Error> {
         let start = Instant::now();
         let poll_timestamp = Utc::now();
-
-        // Subtract 1 second safety margin to handle boundary writes
-        let since_safe = since - Duration::seconds(1);
-        let since_str = since_safe.to_rfc3339();
-
-        // Fetch changed rows (indexed scan via updated_at index)
-        let changed_proxies = self.load_proxies_since(namespace, &since_str).await?;
-        let changed_consumers = self.load_consumers_since(namespace, &since_str).await?;
-        let changed_plugin_configs = self
-            .load_plugin_configs_since(namespace, &since_str)
+        self.ensure_change_cursor_available(namespace, after_sequence)
             .await?;
-        let changed_upstreams = self.load_upstreams_since(namespace, &since_str).await?;
-
-        // Fetch current IDs (lightweight — one TEXT column per table)
-        let current_proxy_ids = self
-            .load_table_ids(namespace, ResourceTable::Proxies)
+        let changes = self
+            .load_config_changes_after(namespace, after_sequence)
             .await?;
-        let current_consumer_ids = self
-            .load_table_ids(namespace, ResourceTable::Consumers)
-            .await?;
-        let current_plugin_config_ids = self
-            .load_table_ids(namespace, ResourceTable::PluginConfigs)
-            .await?;
-        let current_upstream_ids = self
-            .load_table_ids(namespace, ResourceTable::Upstreams)
+        self.ensure_change_cursor_available(namespace, after_sequence)
             .await?;
 
-        // Detect deletions: IDs we knew about that no longer exist
-        let removed_proxy_ids = diff_removed(known_proxy_ids, &current_proxy_ids);
-        let removed_consumer_ids = diff_removed(known_consumer_ids, &current_consumer_ids);
-        let removed_plugin_config_ids =
-            diff_removed(known_plugin_config_ids, &current_plugin_config_ids);
-        let removed_upstream_ids = diff_removed(known_upstream_ids, &current_upstream_ids);
+        if changes.is_empty() {
+            self.check_slow_query("load_incremental_config", start);
+            return Ok(IncrementalResult {
+                added_or_modified_proxies: Vec::new(),
+                removed_proxy_ids: Vec::new(),
+                added_or_modified_consumers: Vec::new(),
+                removed_consumer_ids: Vec::new(),
+                added_or_modified_plugin_configs: Vec::new(),
+                removed_plugin_config_ids: Vec::new(),
+                added_or_modified_upstreams: Vec::new(),
+                removed_upstream_ids: Vec::new(),
+                sequence_cursor: after_sequence,
+                poll_timestamp,
+            });
+        }
 
-        let mut result = IncrementalResult {
-            added_or_modified_proxies: changed_proxies,
-            removed_proxy_ids,
-            added_or_modified_consumers: changed_consumers,
-            removed_consumer_ids,
-            added_or_modified_plugin_configs: changed_plugin_configs,
-            removed_plugin_config_ids,
-            added_or_modified_upstreams: changed_upstreams,
-            removed_upstream_ids,
-            poll_timestamp,
-        };
+        let sequence_cursor = changes
+            .iter()
+            .map(|change| change.sequence)
+            .max()
+            .unwrap_or(after_sequence);
+        let mut proxy_ops = HashMap::new();
+        let mut consumer_ops = HashMap::new();
+        let mut plugin_config_ops = HashMap::new();
+        let mut upstream_ops = HashMap::new();
 
-        // Hot-path isolation: strip api_spec_id from every loaded resource
-        // before the polling loop applies the delta. Mirrors the
-        // load_full_config strip and matches the Mongo incremental path.
-        for p in &mut result.added_or_modified_proxies {
+        for change in changes {
+            if change.operation != "upsert" && change.operation != "delete" {
+                warn!(
+                    "Ignoring config_changes row with unknown operation '{}' for {} {}",
+                    change.operation, change.resource_type, change.resource_id
+                );
+                continue;
+            }
+            match change.resource_type.as_str() {
+                "proxy" => {
+                    proxy_ops.insert(change.resource_id, change.operation);
+                }
+                "consumer" => {
+                    consumer_ops.insert(change.resource_id, change.operation);
+                }
+                "plugin_config" => {
+                    plugin_config_ops.insert(change.resource_id, change.operation);
+                }
+                "upstream" => {
+                    upstream_ops.insert(change.resource_id, change.operation);
+                }
+                other => {
+                    warn!(
+                        "Ignoring config_changes row with unknown resource_type '{}' for id {}",
+                        other, change.resource_id
+                    );
+                }
+            }
+        }
+
+        let (proxy_upserts, mut removed_proxy_ids) = Self::split_change_ops(proxy_ops);
+        let (consumer_upserts, mut removed_consumer_ids) = Self::split_change_ops(consumer_ops);
+        let (plugin_config_upserts, mut removed_plugin_config_ids) =
+            Self::split_change_ops(plugin_config_ops);
+        let (upstream_upserts, mut removed_upstream_ids) = Self::split_change_ops(upstream_ops);
+
+        let mut added_or_modified_proxies =
+            self.load_proxies_by_ids(namespace, &proxy_upserts).await?;
+        let loaded_proxy_ids: HashSet<String> = added_or_modified_proxies
+            .iter()
+            .map(|proxy| proxy.id.clone())
+            .collect();
+        removed_proxy_ids.extend(
+            proxy_upserts
+                .iter()
+                .filter(|id| !loaded_proxy_ids.contains(*id))
+                .cloned(),
+        );
+
+        let added_or_modified_consumers = self
+            .load_consumers_by_ids(namespace, &consumer_upserts)
+            .await?;
+        let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
+            .iter()
+            .map(|consumer| consumer.id.clone())
+            .collect();
+        removed_consumer_ids.extend(
+            consumer_upserts
+                .iter()
+                .filter(|id| !loaded_consumer_ids.contains(*id))
+                .cloned(),
+        );
+
+        let mut added_or_modified_plugin_configs = self
+            .load_plugin_configs_by_ids(namespace, &plugin_config_upserts)
+            .await?;
+        let loaded_plugin_config_ids: HashSet<String> = added_or_modified_plugin_configs
+            .iter()
+            .map(|config| config.id.clone())
+            .collect();
+        removed_plugin_config_ids.extend(
+            plugin_config_upserts
+                .iter()
+                .filter(|id| !loaded_plugin_config_ids.contains(*id))
+                .cloned(),
+        );
+
+        let mut added_or_modified_upstreams = self
+            .load_upstreams_by_ids(namespace, &upstream_upserts)
+            .await?;
+        let loaded_upstream_ids: HashSet<String> = added_or_modified_upstreams
+            .iter()
+            .map(|upstream| upstream.id.clone())
+            .collect();
+        removed_upstream_ids.extend(
+            upstream_upserts
+                .iter()
+                .filter(|id| !loaded_upstream_ids.contains(*id))
+                .cloned(),
+        );
+
+        for p in &mut added_or_modified_proxies {
             p.api_spec_id = None;
         }
-        for u in &mut result.added_or_modified_upstreams {
+        for u in &mut added_or_modified_upstreams {
             u.api_spec_id = None;
         }
-        for pc in &mut result.added_or_modified_plugin_configs {
+        for pc in &mut added_or_modified_plugin_configs {
             pc.api_spec_id = None;
         }
 
+        let result = IncrementalResult {
+            added_or_modified_proxies,
+            removed_proxy_ids,
+            added_or_modified_consumers,
+            removed_consumer_ids,
+            added_or_modified_plugin_configs,
+            removed_plugin_config_ids,
+            added_or_modified_upstreams,
+            removed_upstream_ids,
+            sequence_cursor,
+            poll_timestamp,
+        };
+
         if result.is_empty() {
-            debug!("Incremental poll: no changes detected");
+            debug!(
+                "Incremental poll: no resource changes after sequence {}",
+                after_sequence
+            );
         } else {
             info!(
-                "Incremental poll: {} proxies, {} consumers, {} plugins, {} upstreams changed; {} proxies, {} consumers, {} plugins, {} upstreams removed",
+                "Incremental poll through sequence {}: {} proxies, {} consumers, {} plugins, {} upstreams changed; {} proxies, {} consumers, {} plugins, {} upstreams removed",
+                result.sequence_cursor,
                 result.added_or_modified_proxies.len(),
                 result.added_or_modified_consumers.len(),
                 result.added_or_modified_plugin_configs.len(),
@@ -2994,36 +3580,122 @@ impl DatabaseStore {
         Ok(result)
     }
 
-    /// Load proxies modified since `since_str` (RFC 3339 timestamp).
-    async fn load_proxies_since(
+    async fn ensure_change_cursor_available(
         &self,
         namespace: &str,
-        since_str: &str,
-    ) -> Result<Vec<Proxy>, anyhow::Error> {
-        let start = Instant::now();
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at >= ?"))
-                .bind(namespace)
-                .bind(since_str)
-                .fetch_all(&self.rpool())
-                .await?;
+        after_sequence: u64,
+    ) -> Result<(), anyhow::Error> {
+        let row = sqlx::query(
+            &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
+        )
+        .bind(namespace)
+        .fetch_optional(&self.pool())
+        .await?;
+        if let Some(row) = row {
+            let retained_sequence: i64 = row.try_get("retained_sequence")?;
+            let retained_sequence = retained_sequence.max(0) as u64;
+            if after_sequence < retained_sequence {
+                anyhow::bail!(
+                    "config change cursor {} for namespace '{}' is behind retained sequence {}",
+                    after_sequence,
+                    namespace,
+                    retained_sequence
+                );
+            }
+        }
+        Ok(())
+    }
 
-        if rows.is_empty() {
-            return Ok(Vec::new());
+    async fn load_config_changes_after(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<ConfigChangeRecord>, anyhow::Error> {
+        if after_sequence > i64::MAX as u64 {
+            anyhow::bail!("config change cursor exceeds SQL BIGINT range");
+        }
+        let rows = sqlx::query(
+            &self.q("SELECT sequence, resource_type, resource_id, operation \
+             FROM config_changes \
+             WHERE namespace = ? AND sequence > ? \
+             ORDER BY sequence ASC \
+             LIMIT ?"),
+        )
+        .bind(namespace)
+        .bind(after_sequence as i64)
+        .bind(Self::CHANGE_LOG_BATCH_LIMIT)
+        .fetch_all(&self.pool())
+        .await?;
+
+        if rows.len() >= Self::CHANGE_LOG_BATCH_LIMIT as usize {
+            anyhow::bail!(
+                "config change batch for namespace '{}' reached limit {}; forcing full reload",
+                namespace,
+                Self::CHANGE_LOG_BATCH_LIMIT
+            );
         }
 
-        // Batch-load proxy_plugins only for the changed proxy IDs
-        let changed_ids: HashSet<String> = rows
+        let mut changes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sequence: i64 = row.try_get("sequence")?;
+            changes.push(ConfigChangeRecord {
+                sequence: sequence.max(0) as u64,
+                resource_type: row.try_get("resource_type")?,
+                resource_id: row.try_get("resource_id")?,
+                operation: row.try_get("operation")?,
+            });
+        }
+        Ok(changes)
+    }
+
+    fn split_change_ops(ops: HashMap<String, String>) -> (Vec<String>, Vec<String>) {
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        for (id, op) in ops {
+            if op == "delete" {
+                deletes.push(id);
+            } else {
+                upserts.push(id);
+            }
+        }
+        upserts.sort();
+        deletes.sort();
+        (upserts, deletes)
+    }
+
+    async fn load_proxies_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<Vec<Proxy>, anyhow::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::new();
+        for chunk in ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT * FROM proxies WHERE namespace = ? AND id IN ({})",
+                placeholders
+            ));
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            rows.extend(query.fetch_all(&self.pool()).await?);
+        }
+
+        let changed_ids: Vec<String> = rows
             .iter()
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
-
-        let changed_id_list: Vec<String> = changed_ids.iter().cloned().collect();
         let mut plugins_by_proxy = self
             .load_proxy_plugin_associations_for_proxy_ids(
-                &changed_id_list,
+                &changed_ids,
                 "load_incremental_config",
-                false,
+                true,
             )
             .await?;
 
@@ -3037,101 +3709,187 @@ impl DatabaseStore {
             "load_incremental_config",
             &plugins_by_proxy,
         )?;
-
-        self.check_slow_query("load_proxies_since", start);
         Ok(proxies)
     }
 
-    /// Load consumers modified since `since_str`.
-    async fn load_consumers_since(
+    async fn load_consumers_by_ids(
         &self,
         namespace: &str,
-        since_str: &str,
+        ids: &[String],
     ) -> Result<Vec<Consumer>, anyhow::Error> {
-        let start = Instant::now();
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at >= ?"))
-                .bind(namespace)
-                .bind(since_str)
-                .fetch_all(&self.rpool())
-                .await?;
-
-        let mut consumers = Vec::with_capacity(rows.len());
-        for row in rows {
-            consumers.push(row_to_consumer(&row)?);
-        }
-        self.check_slow_query("load_consumers_since", start);
-        Ok(consumers)
+        let rows = self
+            .load_rows_by_ids("consumers", namespace, ids, "load_consumers_by_ids")
+            .await?;
+        rows.iter().map(row_to_consumer).collect()
     }
 
-    /// Load plugin configs modified since `since_str`.
-    async fn load_plugin_configs_since(
+    async fn load_plugin_configs_by_ids(
         &self,
         namespace: &str,
-        since_str: &str,
+        ids: &[String],
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let rows = self
+            .load_rows_by_ids(
+                "plugin_configs",
+                namespace,
+                ids,
+                "load_plugin_configs_by_ids",
+            )
+            .await?;
+        rows.iter().map(row_to_plugin_config).collect()
+    }
+
+    async fn load_upstreams_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
+        let rows = self
+            .load_rows_by_ids("upstreams", namespace, ids, "load_upstreams_by_ids")
+            .await?;
+        rows.iter().map(row_to_upstream).collect()
+    }
+
+    async fn load_rows_by_ids(
+        &self,
+        table: &'static str,
+        namespace: &str,
+        ids: &[String],
+        operation: &'static str,
+    ) -> Result<Vec<AnyRow>, anyhow::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND updated_at >= ?"),
+        let mut rows = Vec::new();
+        for chunk in ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT * FROM {} WHERE namespace = ? AND id IN ({})",
+                table, placeholders
+            ));
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            rows.extend(query.fetch_all(&self.pool()).await?);
+        }
+        self.check_slow_query(operation, start);
+        Ok(rows)
+    }
+
+    async fn select_resource_ids_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        table: &'static str,
+        namespace: &str,
+        extra_predicate: Option<(&'static str, &str)>,
+        lock_rows: bool,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let lock_clause = if lock_rows && self.db_type != "sqlite" {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let sql = if let Some((column, _)) = extra_predicate {
+            self.q(&format!(
+                "SELECT id FROM {} WHERE namespace = ? AND {} = ?{}",
+                table, column, lock_clause
+            ))
+        } else {
+            self.q(&format!(
+                "SELECT id FROM {} WHERE namespace = ?{}",
+                table, lock_clause
+            ))
+        };
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some((_, value)) = extra_predicate {
+            query = query.bind(value);
+        }
+        let rows = query.fetch_all(&mut **tx).await?;
+        rows.iter()
+            .map(|row| row.try_get("id").map_err(anyhow::Error::from))
+            .collect()
+    }
+
+    async fn use_delete_capture_snapshot_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        // PostgreSQL defaults to READ COMMITTED, where a namespace-wide DELETE
+        // can see rows committed after the pre-scan used for change logging.
+        if self.db_type == "postgres" {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn record_config_change_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.lock_config_change_sequence_tx(tx).await?;
+        sqlx::query(&self.q("INSERT INTO config_changes \
+             (namespace, resource_type, resource_id, operation, created_at) \
+             VALUES (?, ?, ?, ?, ?)"))
+        .bind(namespace)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(operation)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn compact_config_changes_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        let row = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+             FROM config_changes WHERE namespace = ?"))
+        .bind(namespace)
+        .fetch_one(&mut **tx)
+        .await?;
+        let max_sequence: i64 = row.try_get("max_sequence")?;
+        let max_sequence = max_sequence.max(0) as u64;
+        if max_sequence <= Self::CHANGE_LOG_RETAIN_PER_NAMESPACE {
+            return Ok(());
+        }
+        let cutoff = max_sequence - Self::CHANGE_LOG_RETAIN_PER_NAMESPACE;
+        let retained_row = sqlx::query(
+            &self.q("SELECT COALESCE(MAX(sequence), 0) AS retained_sequence \
+                 FROM config_changes WHERE namespace = ? AND sequence <= ?"),
         )
         .bind(namespace)
-        .bind(since_str)
-        .fetch_all(&self.rpool())
+        .bind(cutoff as i64)
+        .fetch_one(&mut **tx)
         .await?;
-
-        let mut configs = Vec::with_capacity(rows.len());
-        for row in rows {
-            configs.push(row_to_plugin_config(&row)?);
-        }
-        self.check_slow_query("load_plugin_configs_since", start);
-        Ok(configs)
-    }
-
-    /// Load upstreams modified since `since_str`.
-    async fn load_upstreams_since(
-        &self,
-        namespace: &str,
-        since_str: &str,
-    ) -> Result<Vec<Upstream>, anyhow::Error> {
-        let start = Instant::now();
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at >= ?"))
-                .bind(namespace)
-                .bind(since_str)
-                .fetch_all(&self.rpool())
-                .await?;
-
-        let mut upstreams = Vec::with_capacity(rows.len());
-        for row in rows {
-            upstreams.push(row_to_upstream(&row)?);
-        }
-        self.check_slow_query("load_upstreams_since", start);
-        Ok(upstreams)
-    }
-
-    /// Load all IDs from a resource table (lightweight — one TEXT column, no
-    /// deserialization). The table is selected via [`ResourceTable`] to ensure
-    /// only known tables are queried — no dynamic string interpolation.
-    async fn load_table_ids(
-        &self,
-        namespace: &str,
-        table: ResourceTable,
-    ) -> Result<HashSet<String>, anyhow::Error> {
-        let start = Instant::now();
-        let sql = self.q(table.select_ids_sql());
-        let rows: Vec<AnyRow> = sqlx::query(&sql)
+        let retained_sequence: i64 = retained_row.try_get("retained_sequence")?;
+        sqlx::query(&self.q("DELETE FROM config_changes WHERE namespace = ? AND sequence <= ?"))
             .bind(namespace)
-            .fetch_all(&self.rpool())
+            .bind(cutoff as i64)
+            .execute(&mut **tx)
             .await?;
-
-        let mut ids = HashSet::with_capacity(rows.len());
-        for row in rows {
-            if let Ok(id) = row.try_get::<String, _>("id") {
-                ids.insert(id);
-            }
+        if retained_sequence > 0 {
+            let upsert_sql = self.config_change_retention_upsert_sql();
+            sqlx::query(&upsert_sql)
+                .bind(namespace)
+                .bind(retained_sequence)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&mut **tx)
+                .await?;
         }
-        self.check_slow_query(table.load_ids_label(), start);
-        Ok(ids)
+        Ok(())
     }
 
     /// Load `(id, scope, proxy_id)` for each plugin_config ID **within
@@ -3142,8 +3900,10 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
+        operation: &str,
     ) -> Result<PluginConfigRefs, anyhow::Error> {
-        self.load_plugin_config_refs_from_pool(ids, namespace, true)
+        let pool = self.pool();
+        self.load_plugin_config_refs_from_pool(ids, namespace, operation, &pool)
             .await
     }
 
@@ -3151,16 +3911,12 @@ impl DatabaseStore {
         &self,
         ids: &[String],
         namespace: &str,
-        use_primary: bool,
+        operation: &str,
+        pool: &AnyPool,
     ) -> Result<PluginConfigRefs, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let pool = if use_primary {
-            self.pool()
-        } else {
-            self.rpool()
-        };
 
         let mut plugin_refs = std::collections::HashMap::new();
         for chunk in ids.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
@@ -3178,16 +3934,36 @@ impl DatabaseStore {
                 query = query.bind(id);
             }
 
-            let rows = query.fetch_all(&pool).await?;
+            let rows = query.fetch_all(pool).await.map_err(|e| {
+                Self::proxy_plugin_reference_lookup_error(operation, namespace, None, e)
+            })?;
             for row in rows {
-                let id: String = row.try_get("id")?;
-                let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                let id: String = row.try_get("id").map_err(|e| {
+                    Self::proxy_plugin_reference_lookup_error(operation, namespace, Some("id"), e)
+                })?;
+                let scope_raw: String = row.try_get("scope").map_err(|e| {
+                    Self::proxy_plugin_reference_lookup_error(
+                        operation,
+                        namespace,
+                        Some("scope"),
+                        e,
+                    )
+                })?;
+                let scope = match scope_raw.as_str() {
                     "proxy" => PluginScope::Proxy,
                     "proxy_group" => PluginScope::ProxyGroup,
                     _ => PluginScope::Global,
                 };
                 let proxy_id = row
-                    .try_get::<Option<String>, _>("proxy_id")?
+                    .try_get::<Option<String>, _>("proxy_id")
+                    .map_err(|e| {
+                        Self::proxy_plugin_reference_lookup_error(
+                            operation,
+                            namespace,
+                            Some("proxy_id"),
+                            e,
+                        )
+                    })?
                     .filter(|id| !id.trim().is_empty());
                 plugin_refs.insert(
                     id.clone(),
@@ -3203,25 +3979,13 @@ impl DatabaseStore {
         Ok(plugin_refs)
     }
 
-    /// Extract known IDs from a full config (used to seed the incremental poller).
-    ///
-    /// Delegates to [`crate::config::db_backend::extract_known_ids`].
-    #[allow(dead_code)]
-    pub fn extract_known_ids(
-        config: &GatewayConfig,
-    ) -> (
-        HashSet<String>,
-        HashSet<String>,
-        HashSet<String>,
-        HashSet<String>,
-    ) {
-        crate::config::db_backend::extract_known_ids(config)
-    }
-
     /// Maximum records per database transaction for batch operations.
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
     const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
+    const CONFIG_CHANGE_LOCK_NAME: &str = "global";
+    const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
+    const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
     /// Fallback page size used only when no runtime override has been set
     /// via `set_full_load_page_size()`. Matches the default for
@@ -3268,6 +4032,7 @@ impl DatabaseStore {
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut touched_namespaces = HashSet::new();
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
@@ -3399,8 +4164,14 @@ impl DatabaseStore {
                         .await?;
                 }
             }
+            self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
+                .await?;
+            touched_namespaces.insert(proxy.namespace.clone());
         }
 
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
         let count = proxies.len();
         tx.commit().await?;
         Ok(count)
@@ -3422,6 +4193,7 @@ impl DatabaseStore {
             let mut tx = self.pool().begin().await?;
             let mut seen = HashSet::new();
             let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
+            let mut touched_namespaces = HashSet::new();
             for proxy in chunk {
                 for assoc in &proxy.plugins {
                     if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
@@ -3442,6 +4214,7 @@ impl DatabaseStore {
                         .execute(&mut *tx)
                         .await?;
                     touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
+                    touched_namespaces.insert(proxy.namespace.clone());
                 }
             }
             if !touched_proxies.is_empty() {
@@ -3453,7 +4226,12 @@ impl DatabaseStore {
                         .bind(namespace)
                         .execute(&mut *tx)
                         .await?;
+                    self.record_config_change_tx(&mut tx, namespace, "proxy", proxy_id, "upsert")
+                        .await?;
                 }
+            }
+            for namespace in &touched_namespaces {
+                self.compact_config_changes_tx(&mut tx, namespace).await?;
             }
             tx.commit().await?;
         }
@@ -3486,6 +4264,7 @@ impl DatabaseStore {
         consumers: &[Consumer],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut touched_namespaces = HashSet::new();
         let sql = self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
@@ -3504,8 +4283,20 @@ impl DatabaseStore {
                 .await?;
             self.insert_consumer_credential_index_tx(&mut tx, consumer)
                 .await?;
+            self.record_config_change_tx(
+                &mut tx,
+                &consumer.namespace,
+                "consumer",
+                &consumer.id,
+                "upsert",
+            )
+            .await?;
+            touched_namespaces.insert(consumer.namespace.clone());
         }
 
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
         let count = consumers.len();
         tx.commit().await?;
         Ok(count)
@@ -3535,6 +4326,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut touched_namespaces = HashSet::new();
         let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
@@ -3568,9 +4360,17 @@ impl DatabaseStore {
                     .bind(&pc.id)
                     .execute(&mut *tx)
                     .await?;
+                self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                    .await?;
             }
+            self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
+                .await?;
+            touched_namespaces.insert(pc.namespace.clone());
         }
 
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
         let count = configs.len();
         tx.commit().await?;
         Ok(count)
@@ -3600,6 +4400,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut touched_namespaces = HashSet::new();
         let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
@@ -3649,8 +4450,20 @@ impl DatabaseStore {
                 .bind(upstream.updated_at.to_rfc3339())
                 .execute(&mut *tx)
                 .await?;
+            self.record_config_change_tx(
+                &mut tx,
+                &upstream.namespace,
+                "upstream",
+                &upstream.id,
+                "upsert",
+            )
+            .await?;
+            touched_namespaces.insert(upstream.namespace.clone());
         }
 
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
         let count = upstreams.len();
         tx.commit().await?;
         Ok(count)
@@ -3668,6 +4481,19 @@ impl DatabaseStore {
     pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
+        let proxy_ids = self
+            .select_resource_ids_tx(&mut tx, "proxies", namespace, None, true)
+            .await?;
+        let plugin_config_ids = self
+            .select_resource_ids_tx(&mut tx, "plugin_configs", namespace, None, true)
+            .await?;
+        let consumer_ids = self
+            .select_resource_ids_tx(&mut tx, "consumers", namespace, None, true)
+            .await?;
+        let upstream_ids = self
+            .select_resource_ids_tx(&mut tx, "upstreams", namespace, None, true)
+            .await?;
 
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id IN (SELECT id FROM proxies WHERE namespace = ?)"))
             .bind(namespace)
@@ -3701,6 +4527,23 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
+        for id in proxy_ids {
+            self.record_config_change_tx(&mut tx, namespace, "proxy", &id, "delete")
+                .await?;
+        }
+        for id in plugin_config_ids {
+            self.record_config_change_tx(&mut tx, namespace, "plugin_config", &id, "delete")
+                .await?;
+        }
+        for id in consumer_ids {
+            self.record_config_change_tx(&mut tx, namespace, "consumer", &id, "delete")
+                .await?;
+        }
+        for id in upstream_ids {
+            self.record_config_change_tx(&mut tx, namespace, "upstream", &id, "delete")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
 
         tx.commit().await?;
         self.check_slow_query("delete_all_resources", start);
@@ -3824,12 +4667,13 @@ impl DatabaseStore {
         }
     }
 
-    /// Connect a read replica pool for config polling.
+    /// Connect a read replica pool for admin read offload.
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
+        self.read_replica_url = Some(replica_url.to_string());
 
         let final_url = Self::append_connect_timeout(
             replica_url,
@@ -3838,44 +4682,81 @@ impl DatabaseStore {
         );
 
         let pool = self.build_pool_options().connect(&final_url).await?;
+        sqlx::query("SELECT 1").fetch_one(&pool).await?;
 
-        self.read_replica_pool = Some(Arc::new(ArcSwap::from_pointee(pool)));
+        self.read_replica_pool.store(Some(Arc::new(pool)));
         info!(
-            "Read replica connected (db_type={}, url={})",
+            "Read replica connected for admin reads (db_type={}, url={})",
             self.db_type,
             Self::redact_url(replica_url)
         );
         Ok(())
     }
 
-    /// Get a snapshot of the read replica pool, falling back to the primary.
+    /// Get a snapshot of the read pool for admin-only list/read APIs.
     ///
-    /// Used by config polling (load_full_config, load_incremental_config) to
-    /// offload read traffic from the primary. If no read replica is configured
-    /// or the replica pool has been closed, returns the primary pool.
-    fn rpool(&self) -> AnyPool {
-        if let Some(ref rp) = self.read_replica_pool {
-            let replica = (**rp.load()).clone();
-            if replica.is_closed() {
-                self.pool()
-            } else {
-                replica
+    /// Runtime configuration polling is intentionally excluded from this path:
+    /// authoritative startup loads, incremental changed-row queries, deletion
+    /// scans, and association validation must read from the primary pool so
+    /// replica lag cannot hide changes or advance cursors incorrectly.
+    fn admin_read_pool(&self) -> AdminReadPool {
+        if self.read_replica_url.is_some()
+            && let Some(replica) = self.read_replica_pool.load_full()
+        {
+            let pool = replica.as_ref().clone();
+            if !pool.is_closed() {
+                return AdminReadPool {
+                    pool,
+                    source: AdminReadSource::ReadReplica,
+                };
             }
+            self.mark_read_replica_unavailable("admin_read_pool", "replica pool is closed");
+        }
+
+        AdminReadPool {
+            pool: self.pool(),
+            source: AdminReadSource::Primary,
+        }
+    }
+
+    /// Snapshot the admin read pool. This is intentionally admin-only; runtime
+    /// polling must call [`Self::pool`] directly.
+    fn rpool(&self) -> AnyPool {
+        self.admin_read_pool().pool
+    }
+
+    fn mark_read_replica_unavailable(
+        &self,
+        operation: &'static str,
+        error: impl std::fmt::Display,
+    ) {
+        let old_pool = self.read_replica_pool.swap(None);
+        if old_pool.is_some() {
+            warn!(
+                operation,
+                error = %error,
+                "Read replica marked unavailable; admin reads will use primary until reconnect succeeds"
+            );
         } else {
-            self.pool()
+            warn!(
+                operation,
+                error = %error,
+                "Read replica unavailable; admin reads are using primary"
+            );
+        }
+        if let Some(pool) = old_pool {
+            tokio::spawn(async move {
+                pool.close().await;
+            });
         }
     }
 
     /// Atomically replace the read replica pool with a freshly connected one.
     ///
-    /// Called by the DB polling loop when DnsCache detects that the read replica
-    /// FQDN now resolves to a different set of IPs.
+    /// Called by the DB polling loop when DnsCache detects that the read
+    /// replica FQDN now resolves to a different set of IPs, by the TLS reload
+    /// watcher, and after startup if the initial replica connection failed.
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
-        let rp = match &self.read_replica_pool {
-            Some(rp) => rp,
-            None => return Ok(()), // no replica configured
-        };
-
         sqlx::any::install_default_drivers();
 
         let final_url = Self::append_connect_timeout(
@@ -3884,17 +4765,25 @@ impl DatabaseStore {
             self.pool_config.connect_timeout_seconds,
         );
 
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
-
-        let old_pool = rp.swap(Arc::new(new_pool));
         info!(
-            "Read replica pool reconnected (db_type={}). Old pool closing in background.",
-            self.db_type
+            "Attempting read replica reconnect for admin reads (db_type={}, url={})",
+            self.db_type,
+            Self::redact_url(replica_url)
+        );
+        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
+
+        let old_pool = self.read_replica_pool.swap(Some(Arc::new(new_pool)));
+        info!(
+            "Read replica restored for admin reads (db_type={}). Old pool closing in background.",
+            self.db_type,
         );
 
-        tokio::spawn(async move {
-            old_pool.close().await;
-        });
+        if let Some(old_pool) = old_pool {
+            tokio::spawn(async move {
+                old_pool.close().await;
+            });
+        }
 
         Ok(())
     }
@@ -3940,21 +4829,56 @@ impl DatabaseStore {
         crate::config::db_backend::redact_url(url)
     }
 
-    /// Returns true if a read replica pool is configured.
+    /// Returns true if a read replica URL is configured.
     #[allow(dead_code)] // Public API for tests and future consumers
     pub fn has_read_replica_pool(&self) -> bool {
-        self.read_replica_pool.is_some()
+        self.read_replica_url.is_some()
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     pub async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self.list_namespaces_from_admin_read(&admin_read.pool).await {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_namespaces", &error);
+                warn!("Read replica admin query failed; retrying list_namespaces against primary");
+                let primary_pool = self.pool();
+                let retry = self.list_namespaces_from_admin_read(&primary_pool).await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_namespaces");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return all distinct namespaces from the authoritative primary pool.
+    pub async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        let pool = self.pool();
+        self.list_namespaces_from_pool(&pool).await
+    }
+
+    async fn list_namespaces_from_admin_read(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces_from_pool(pool).await
+    }
+
+    async fn list_namespaces_from_pool(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<Vec<String>, anyhow::Error> {
         let start = Instant::now();
         let sql = "SELECT DISTINCT namespace FROM proxies \
                    UNION SELECT DISTINCT namespace FROM consumers \
                    UNION SELECT DISTINCT namespace FROM plugin_configs \
                    UNION SELECT DISTINCT namespace FROM upstreams \
                    ORDER BY 1";
-        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.rpool()).await?;
+        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(pool).await?;
         let mut namespaces = Vec::with_capacity(rows.len());
         for row in rows {
             if let Ok(ns) = row.try_get::<String, _>("namespace") {
@@ -4217,6 +5141,24 @@ impl DatabaseStore {
 
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
+        if let Some(u) = &bundle.upstream {
+            self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
+                .await?;
+        }
+        self.record_config_change_tx(
+            &mut tx,
+            &bundle.proxy.namespace,
+            "proxy",
+            &bundle.proxy.id,
+            "upsert",
+        )
+        .await?;
+        for pc in &bundle.plugins {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, &spec.namespace)
+            .await?;
 
         tx.commit().await?;
         Ok(())
@@ -4322,6 +5264,24 @@ impl DatabaseStore {
             &spec.proxy_id,
         )
         .await?;
+        let deleted_plugin_config_ids = self
+            .select_resource_ids_tx(
+                &mut tx,
+                "plugin_configs",
+                &spec.namespace,
+                Some(("api_spec_id", &spec.id)),
+                false,
+            )
+            .await?;
+        let deleted_upstream_ids = self
+            .select_resource_ids_tx(
+                &mut tx,
+                "upstreams",
+                &spec.namespace,
+                Some(("api_spec_id", &spec.id)),
+                false,
+            )
+            .await?;
 
         // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
         // are intentionally preserved. The proxy itself is updated in place (not deleted)
@@ -4349,6 +5309,14 @@ impl DatabaseStore {
             .bind(&spec.namespace)
             .execute(&mut *tx)
             .await?;
+        for id in &deleted_plugin_config_ids {
+            self.record_config_change_tx(&mut tx, &spec.namespace, "plugin_config", id, "delete")
+                .await?;
+        }
+        for id in &deleted_upstream_ids {
+            self.record_config_change_tx(&mut tx, &spec.namespace, "upstream", id, "delete")
+                .await?;
+        }
 
         // Insert the new upstream (if present).
         if let Some(u) = &bundle.upstream {
@@ -4637,6 +5605,24 @@ impl DatabaseStore {
         .bind(&spec.id)
         .execute(&mut *tx)
         .await?;
+        self.record_config_change_tx(
+            &mut tx,
+            &bundle.proxy.namespace,
+            "proxy",
+            &bundle.proxy.id,
+            "upsert",
+        )
+        .await?;
+        if let Some(u) = &bundle.upstream {
+            self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
+                .await?;
+        }
+        for pc in &bundle.plugins {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, &spec.namespace)
+            .await?;
 
         tx.commit().await?;
         Ok(())
@@ -4918,6 +5904,38 @@ impl DatabaseStore {
         crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
         anyhow::Error,
     > {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_api_specs_from_admin_read(namespace, filter, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_api_specs", &error);
+                warn!("Read replica admin query failed; retrying list_api_specs against primary");
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_api_specs_from_admin_read(namespace, filter, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_api_specs");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_api_specs_from_admin_read(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+        pool: &AnyPool,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
         use crate::config::db_backend::{ApiSpecSortBy, PaginatedResult, SortOrder};
 
         // Build WHERE clause dynamically.
@@ -4998,7 +6016,7 @@ impl DatabaseStore {
         if let Some(ref v) = has_tag_val {
             count_query = count_query.bind(v);
         }
-        let count_row = count_query.fetch_one(&self.rpool()).await?;
+        let count_row = count_query.fetch_one(pool).await?;
         let total: i64 = count_row.try_get("cnt")?;
 
         // --- Data query (ORDER BY + LIMIT + OFFSET) --------------------------
@@ -5043,7 +6061,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.rpool())
+            .fetch_all(pool)
             .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -5063,6 +6081,7 @@ impl DatabaseStore {
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.
         let row: Option<AnyRow> =
@@ -5079,7 +6098,52 @@ impl DatabaseStore {
 
         let proxy_id: String = row.try_get("proxy_id")?;
 
+        let proxy_lock_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ? FOR UPDATE")
+        };
+        sqlx::query(&proxy_lock_sql)
+            .bind(&proxy_id)
+            .bind(namespace)
+            .fetch_optional(&mut *tx)
+            .await?;
+
         self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, id, &proxy_id)
+            .await?;
+        let mut deleted_plugin_config_ids = self
+            .select_resource_ids_tx(
+                &mut tx,
+                "plugin_configs",
+                namespace,
+                Some(("api_spec_id", id)),
+                true,
+            )
+            .await?;
+        let proxy_plugin_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM plugin_configs WHERE proxy_id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM plugin_configs WHERE proxy_id = ? AND namespace = ? FOR UPDATE")
+        };
+        let proxy_plugin_rows: Vec<AnyRow> = sqlx::query(&proxy_plugin_sql)
+            .bind(&proxy_id)
+            .bind(namespace)
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in proxy_plugin_rows {
+            let plugin_id: String = row.try_get("id")?;
+            if !deleted_plugin_config_ids.contains(&plugin_id) {
+                deleted_plugin_config_ids.push(plugin_id);
+            }
+        }
+        let deleted_upstream_ids = self
+            .select_resource_ids_tx(
+                &mut tx,
+                "upstreams",
+                namespace,
+                Some(("api_spec_id", id)),
+                true,
+            )
             .await?;
 
         // Delete spec-owned plugin_configs by api_spec_id (belt-and-suspenders;
@@ -5120,6 +6184,17 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
+        self.record_config_change_tx(&mut tx, namespace, "proxy", &proxy_id, "delete")
+            .await?;
+        for plugin_id in deleted_plugin_config_ids {
+            self.record_config_change_tx(&mut tx, namespace, "plugin_config", &plugin_id, "delete")
+                .await?;
+        }
+        for upstream_id in deleted_upstream_ids {
+            self.record_config_change_tx(&mut tx, namespace, "upstream", &upstream_id, "delete")
+                .await?;
+        }
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
 
         tx.commit().await?;
         Ok(true)
@@ -5213,6 +6288,37 @@ impl DatabaseStore {
         namespace: &str,
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_audit_events_from_admin_read(namespace, filter, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_audit_events", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_audit_events against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_audit_events_from_admin_read(namespace, filter, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_audit_events");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_audit_events_from_admin_read(
+        &self,
+        namespace: &str,
+        filter: &crate::admin::audit::AuditListFilter,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         let start = std::time::Instant::now();
         let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
 
@@ -5258,7 +6364,7 @@ impl DatabaseStore {
         if let Some(ref value) = filter.end {
             count_query = count_query.bind(audit_ts_string(value));
         }
-        let total: i64 = count_query.fetch_one(&self.rpool()).await?.try_get("cnt")?;
+        let total: i64 = count_query.fetch_one(pool).await?.try_get("cnt")?;
 
         let sql = self.q(&format!(
             "SELECT id, ts, actor, action, resource_type, resource_id, namespace, diff \
@@ -5287,7 +6393,7 @@ impl DatabaseStore {
         let rows = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.rpool())
+            .fetch_all(pool)
             .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -5317,13 +6423,18 @@ impl DatabaseBackend for DatabaseStore {
         self.has_read_replica_pool()
     }
 
+    fn read_replica_available(&self) -> bool {
+        self.read_replica_pool
+            .load_full()
+            .is_some_and(|pool| !pool.is_closed())
+    }
+
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
         let primary = self.pool.load();
         let size = primary.size();
         let idle = primary.num_idle() as u32;
 
-        let replica = self.read_replica_pool.as_ref().map(|rp| {
-            let rp = rp.load();
+        let replica = self.read_replica_pool.load_full().map(|rp| {
             Box::new(crate::config::db_backend::DbPoolStatsInner {
                 size: rp.size(),
                 idle: rp.num_idle() as u32,
@@ -5371,25 +6482,16 @@ impl DatabaseBackend for DatabaseStore {
         Ok(GatewayTrustBundlePoll::Unchanged)
     }
 
+    async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        DatabaseStore::latest_change_sequence(self, namespace).await
+    }
+
     async fn load_incremental_config(
         &self,
         namespace: &str,
-        since: DateTime<Utc>,
-        known_proxy_ids: &HashSet<String>,
-        known_consumer_ids: &HashSet<String>,
-        known_plugin_config_ids: &HashSet<String>,
-        known_upstream_ids: &HashSet<String>,
+        after_sequence: u64,
     ) -> Result<IncrementalResult, anyhow::Error> {
-        DatabaseStore::load_incremental_config(
-            self,
-            namespace,
-            since,
-            known_proxy_ids,
-            known_consumer_ids,
-            known_plugin_config_ids,
-            known_upstream_ids,
-        )
-        .await
+        DatabaseStore::load_incremental_config(self, namespace, after_sequence).await
     }
 
     async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
@@ -5690,6 +6792,10 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::list_namespaces(self).await
     }
 
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        DatabaseStore::list_namespaces_authoritative(self).await
+    }
+
     async fn submit_api_spec_bundle(
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
@@ -5767,11 +6873,6 @@ impl DatabaseBackend for DatabaseStore {
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         DatabaseStore::list_audit_events(self, namespace, filter).await
     }
-}
-
-/// IDs in `known` that are not in `current` (i.e., deleted resources).
-pub(crate) fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
-    known.difference(current).cloned().collect()
 }
 
 /// Parse a stored backend scheme string into the canonical 6-variant

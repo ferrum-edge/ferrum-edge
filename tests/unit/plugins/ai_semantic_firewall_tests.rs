@@ -135,15 +135,15 @@ async fn plugin_name_priority_protocols_and_registration() {
     );
     assert!(ferrum_edge::plugins::available_plugins().contains(&"ai_semantic_firewall"));
     assert!(!ferrum_edge::plugins::available_plugins().contains(&"semantic_ai_firewall"));
-    assert!(ferrum_edge::plugins::is_security_plugin(
-        "ai_semantic_firewall"
-    ));
-    assert!(!ferrum_edge::plugins::is_security_plugin(
-        "semantic_ai_firewall"
-    ));
-    assert!(ferrum_edge::plugins::is_removed_security_plugin(
-        "semantic_ai_firewall"
-    ));
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("ai_semantic_firewall"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::FailClosed)
+    );
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("semantic_ai_firewall"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::FailClosed)
+    );
+    assert!(ferrum_edge::plugins::removed_plugin_registration("semantic_ai_firewall").is_some());
 }
 
 #[test]

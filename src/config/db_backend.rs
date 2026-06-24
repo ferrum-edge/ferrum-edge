@@ -78,9 +78,10 @@ impl Default for ApiSpecListFilter {
 
 /// Result of an incremental config poll.
 ///
-/// Contains only the resources that changed since the last poll, plus IDs of
-/// resources that were deleted. The polling loop uses this to apply surgical
-/// updates without loading the entire database.
+/// Contains only resources referenced by durable change-log records newer than
+/// the caller's sequence cursor, plus IDs of resources that were deleted. The
+/// polling loop advances `sequence_cursor` only after the delta validates and
+/// applies, so rejected deltas are retried from the same durable point.
 ///
 /// Serializable for CP-to-DP gRPC delta broadcasts.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -93,7 +94,10 @@ pub struct IncrementalResult {
     pub removed_plugin_config_ids: Vec<String>,
     pub added_or_modified_upstreams: Vec<Upstream>,
     pub removed_upstream_ids: Vec<String>,
-    /// Timestamp to use as `since` for the next incremental poll.
+    /// Highest durable config change sequence included in this poll.
+    #[serde(default)]
+    pub sequence_cursor: u64,
+    /// Timestamp to use as the in-memory/gRPC config version for this delta.
     pub poll_timestamp: DateTime<Utc>,
 }
 
@@ -132,7 +136,7 @@ pub struct DbPoolStats {
     pub max_connections: u32,
     /// Minimum configured idle connections (`FERRUM_DB_POOL_MIN_CONNECTIONS`).
     pub min_connections: u32,
-    /// Read replica pool stats, if a replica is configured.
+    /// Read replica pool stats, if a configured admin-read replica is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_replica: Option<Box<DbPoolStatsInner>>,
 }
@@ -182,6 +186,11 @@ pub trait DatabaseBackend: Send + Sync {
     /// Returns true if a read replica is configured.
     fn has_read_replica(&self) -> bool;
 
+    /// Returns true if a configured read replica currently has an active pool.
+    fn read_replica_available(&self) -> bool {
+        self.has_read_replica()
+    }
+
     /// Return connection pool statistics for observability.
     ///
     /// Returns `None` when the backend does not expose pool internals
@@ -228,15 +237,16 @@ pub trait DatabaseBackend: Send + Sync {
     // Incremental polling
     // -----------------------------------------------------------------------
 
-    /// Load only resources changed since `since`, plus detect deletions.
+    /// Return the highest durable config-change sequence currently committed
+    /// for `namespace`. Callers seed this after a full reload so subsequent
+    /// incremental polls start from an authoritative snapshot boundary.
+    async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    /// Load only resources changed after `after_sequence`.
     async fn load_incremental_config(
         &self,
         namespace: &str,
-        since: DateTime<Utc>,
-        known_proxy_ids: &HashSet<String>,
-        known_consumer_ids: &HashSet<String>,
-        known_plugin_config_ids: &HashSet<String>,
-        known_upstream_ids: &HashSet<String>,
+        after_sequence: u64,
     ) -> Result<IncrementalResult, anyhow::Error>;
 
     // -----------------------------------------------------------------------
@@ -434,7 +444,7 @@ pub trait DatabaseBackend: Send + Sync {
     /// database TLS parameters derived from `FERRUM_DB_TLS_MODE`.
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error>;
 
-    /// Atomically replace the read replica pool with a freshly connected one.
+    /// Atomically replace the admin-read replica pool with a freshly connected one.
     async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error>;
 
     /// Try to reconnect to any available database URL (primary first, then failover).
@@ -491,8 +501,16 @@ pub trait DatabaseBackend: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Return all distinct namespaces across all resource tables.
+    /// Return all distinct namespaces across all resource tables for admin reads.
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
+
+    /// Return all distinct namespaces using the authoritative primary read path.
+    ///
+    /// Runtime config polling uses this when `FERRUM_CP_NAMESPACES=*` so namespace
+    /// discovery cannot lag behind primary resource reads.
+    async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
+        self.list_namespaces().await
+    }
 
     // -----------------------------------------------------------------------
     // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC
@@ -611,9 +629,11 @@ pub trait DatabaseBackend: Send + Sync {
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error>;
 }
 
-/// Extract known IDs from a full config (used to seed the incremental poller).
+/// Extract resource IDs from a full config.
 ///
 /// This is a pure function on `GatewayConfig`, independent of any backend.
+// Used by external test crates; the binary target otherwise flags it as dead code.
+#[allow(dead_code)]
 pub fn extract_known_ids(
     config: &GatewayConfig,
 ) -> (
@@ -689,6 +709,15 @@ pub fn redact_url(url: &str) -> String {
         }
         Err(_) => redact_mongodb_multi_host_url(url).unwrap_or_else(|| "<invalid-url>".to_string()),
     }
+}
+
+/// Redact configured database URLs if a driver error includes them verbatim.
+pub fn redact_error_text(error: impl std::fmt::Display, urls: &[&str]) -> String {
+    let mut text = error.to_string();
+    for url in urls {
+        text = text.replace(url, &redact_url(url));
+    }
+    text
 }
 
 fn extract_mongodb_multi_host_hostname(db_url: &str) -> Option<String> {

@@ -57,7 +57,32 @@ use crate::modes::mesh::config::{
     MeshConfig, MeshSidecar, MeshSidecarEgress, PeerAuthentication, PolicyScope,
     SidecarHostPattern, WorkloadSelector, service_entry_exported_to_namespace,
 };
-use crate::modes::mesh::slice::MeshSliceRequest;
+use crate::modes::mesh::slice::{MeshSliceRequest, node_waypoint_assertors_from_workloads};
+
+fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) {
+    if let Some(source) = config
+        .frontend_tls_namespace_sources
+        .iter()
+        .find(|source| source.namespace == namespace)
+        .cloned()
+    {
+        config.frontend_tls_cert_path = Some(source.cert_path);
+        config.frontend_tls_key_path = Some(source.key_path);
+        config.frontend_tls_source_namespace = Some(source.namespace);
+        config.frontend_tls_namespace_sources.clear();
+        return;
+    }
+    config.frontend_tls_namespace_sources.clear();
+    if config
+        .frontend_tls_source_namespace
+        .as_deref()
+        .is_some_and(|source_namespace| source_namespace != namespace)
+    {
+        config.frontend_tls_cert_path = None;
+        config.frontend_tls_key_path = None;
+        config.frontend_tls_source_namespace = None;
+    }
+}
 
 /// What set of namespaces a CP instance is authorised to serve.
 ///
@@ -695,6 +720,7 @@ impl CpGrpcServer {
         config.plugin_configs.retain(|pc| pc.namespace == namespace);
         config.upstreams.retain(|u| u.namespace == namespace);
         config.known_namespaces = vec![namespace.to_string()];
+        filter_frontend_tls_sources_to_namespace(config, namespace);
     }
 
     pub(crate) fn filter_config_to_mesh_request_for_scope(
@@ -733,6 +759,19 @@ impl CpGrpcServer {
         Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
         let istio_root_namespace = mesh.istio_root_namespace.clone();
 
+        // Raw authoritative configs never carry this runtime-only field. When
+        // a stream-local config is refiltered after an incremental delta,
+        // though, it may already contain source assertors that are no longer
+        // visible in `mesh.workloads`; preserve them rather than shrinking the
+        // allow-list to the destination-visible workload slice.
+        if mesh.node_waypoint_assertors.is_empty() {
+            mesh.node_waypoint_assertors = Self::node_waypoint_assertors_for_request(
+                mesh,
+                namespace,
+                allow_cross_namespace_mesh_visibility,
+                scope,
+            );
+        }
         mesh.workloads
             .retain(|workload| visible_namespaces.contains(&workload.namespace));
         let workload_ids: HashSet<_> = mesh
@@ -988,6 +1027,20 @@ impl CpGrpcServer {
             Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
             _ => true,
         }
+    }
+
+    fn node_waypoint_assertors_for_request(
+        mesh: &MeshConfig,
+        namespace: &str,
+        allow_cross_namespace_mesh_visibility: bool,
+        scope: Option<&CpScope>,
+    ) -> Vec<crate::identity::spiffe::SpiffeId> {
+        node_waypoint_assertors_from_workloads(mesh.workloads.iter().filter(|workload| {
+            if !allow_cross_namespace_mesh_visibility && workload.namespace != namespace {
+                return false;
+            }
+            Self::namespace_allowed_by_scope(&workload.namespace, scope)
+        }))
     }
 
     fn policy_scope_can_apply_to_namespace(
@@ -1600,6 +1653,7 @@ impl ConfigSync for CpGrpcServer {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
 
     fn test_trust_bundles() -> crate::modes::mesh::config::TrustBundleSet {
         crate::modes::mesh::config::TrustBundleSet {
@@ -2382,6 +2436,113 @@ mod tests {
     }
 
     #[test]
+    fn mesh_request_filter_preserves_source_node_waypoint_assertors_before_workload_narrowing() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{NodeWaypointEndpoint, Workload};
+        use crate::modes::mesh::slice::MeshSlice;
+
+        let waypoint_alpha = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-alpha";
+        let waypoint_beta = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-beta";
+        let workload =
+            |namespace: &str, service_name: &str, waypoint_spiffe: &str, address: &str| Workload {
+                spiffe_id: SpiffeId::new(format!(
+                    "spiffe://test.local/ns/{namespace}/sa/{service_name}"
+                ))
+                .expect("fixture SPIFFE ID should be valid"),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), service_name.to_string())]),
+                    namespace: Some(namespace.to_string()),
+                },
+                service_name: service_name.to_string(),
+                addresses: vec![address.to_string()],
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("test.local")
+                    .expect("fixture trust domain should be valid"),
+                namespace: namespace.to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: Some(service_name.to_string()),
+                pod_uid: None,
+                node_waypoint: Some(NodeWaypointEndpoint {
+                    address: address.to_string(),
+                    hbone_port: 15008,
+                    spiffe_id: SpiffeId::new(waypoint_spiffe)
+                        .expect("fixture waypoint SPIFFE ID should be valid"),
+                    node_name: None,
+                    node_uid: None,
+                    network: None,
+                    cluster: None,
+                }),
+                remote_provenance: false,
+            };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    workload("alpha", "client", waypoint_alpha, "10.2.0.11"),
+                    workload("beta", "reviews", waypoint_beta, "10.2.0.12"),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "beta".to_string(),
+            ..MeshSliceRequest::default()
+        };
+
+        let mut full_scope = HashSet::new();
+        full_scope.insert("alpha".to_string());
+        full_scope.insert("beta".to_string());
+        let filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Set(full_scope),
+        );
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(mesh.workloads.len(), 1);
+        assert_eq!(mesh.workloads[0].namespace, "beta");
+        assert_eq!(
+            mesh.node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_alpha, waypoint_beta],
+            "CP should derive assertors from scope-authorized workloads before request-visible workload narrowing"
+        );
+
+        let slice = MeshSlice::from_gateway_config(&filtered, request.clone());
+        assert_eq!(
+            slice
+                .node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_alpha, waypoint_beta],
+            "the narrowed slice must carry source-node assertors that are no longer visible as workloads"
+        );
+
+        let mut beta_only_scope = HashSet::new();
+        beta_only_scope.insert("beta".to_string());
+        let beta_only = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Set(beta_only_scope),
+        );
+        let beta_only_mesh = beta_only.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            beta_only_mesh
+                .node_waypoint_assertors
+                .iter()
+                .map(SpiffeId::as_str)
+                .collect::<Vec<_>>(),
+            vec![waypoint_beta],
+            "explicit CP namespace scopes must bound the assertor inventory"
+        );
+    }
+
+    #[test]
     fn mesh_request_filter_preserves_sidecar_admitted_cross_namespace_services() {
         use crate::modes::mesh::config::{
             AppProtocol, MeshDestinationRule, MeshService, MeshSidecar, MeshSidecarEgress,
@@ -2581,5 +2742,89 @@ mod tests {
         assert_eq!(multi_cluster.east_west_gateways.len(), 1);
         assert_eq!(multi_cluster.east_west_gateways[0].namespace, "ns-a");
         assert_eq!(multi_cluster.east_west_gateways[0].name, "ewa");
+    }
+
+    #[test]
+    fn namespace_filter_keeps_granted_cross_namespace_frontend_tls_secret_sources() {
+        use crate::config::types::*;
+
+        let config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("ns-a".to_string()),
+            ..Default::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(
+            filtered.frontend_tls_cert_path.as_deref(),
+            Some("k8s://ns-b/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            filtered.frontend_tls_key_path.as_deref(),
+            Some("k8s://ns-b/gateway-cert#tls.key")
+        );
+    }
+
+    #[test]
+    fn namespace_filter_projects_namespace_scoped_gateway_frontend_tls_sources() {
+        use crate::config::types::*;
+
+        let config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://ns-a/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-a/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("ns-a".to_string()),
+            frontend_tls_namespace_sources: vec![
+                FrontendTlsNamespaceSource {
+                    namespace: "ns-a".to_string(),
+                    cert_path: "k8s://ns-a/gateway-cert#tls.crt".to_string(),
+                    key_path: "k8s://ns-a/gateway-cert#tls.key".to_string(),
+                },
+                FrontendTlsNamespaceSource {
+                    namespace: "ns-b".to_string(),
+                    cert_path: "k8s://ns-b/gateway-cert#tls.crt".to_string(),
+                    key_path: "k8s://ns-b/gateway-cert#tls.key".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-b");
+        assert_eq!(
+            filtered.frontend_tls_cert_path.as_deref(),
+            Some("k8s://ns-b/gateway-cert#tls.crt")
+        );
+        assert_eq!(
+            filtered.frontend_tls_key_path.as_deref(),
+            Some("k8s://ns-b/gateway-cert#tls.key")
+        );
+        assert_eq!(
+            filtered.frontend_tls_source_namespace.as_deref(),
+            Some("ns-b")
+        );
+        assert!(filtered.frontend_tls_namespace_sources.is_empty());
+    }
+
+    #[test]
+    fn namespace_filter_strips_foreign_gateway_frontend_tls_sources() {
+        use crate::config::types::*;
+
+        let config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
+            frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
+            frontend_tls_source_namespace: Some("ns-b".to_string()),
+            ..Default::default()
+        };
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(filtered.frontend_tls_cert_path, None);
+        assert_eq!(filtered.frontend_tls_key_path, None);
+        assert_eq!(filtered.frontend_tls_source_namespace, None);
     }
 }

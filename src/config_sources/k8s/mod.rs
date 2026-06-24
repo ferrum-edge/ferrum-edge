@@ -9,6 +9,7 @@ mod gateway_api;
 mod istio;
 mod mesh_config;
 
+pub(crate) use core::secret_object_is_valid_tls_certificate;
 // Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
@@ -35,12 +36,14 @@ use serde_json::Value;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     MAX_TARGET_WEIGHT, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    RetryConfig, Upstream, UpstreamTarget, default_namespace,
+    RetryConfig, UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
 
 const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
+const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
@@ -93,6 +96,7 @@ pub struct K8sObject {
 #[derive(Debug, Clone)]
 pub struct K8sTranslationOptions {
     pub namespace: String,
+    pub node_waypoint_namespace: String,
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
@@ -112,12 +116,15 @@ pub struct K8sTranslationOptions {
     /// (`enforced || dry_run`) and is not affected by this.
     pub mesh_sidecar_ingress_enforced: bool,
     source_namespaces: Option<HashSet<String>>,
+    pod_source_namespaces: Option<HashSet<String>>,
 }
 
 impl K8sTranslationOptions {
     pub fn new(namespace: String, trust_domain: TrustDomain) -> Self {
         let source_namespaces = HashSet::from([namespace.clone()]);
+        let pod_source_namespaces = HashSet::from([namespace.clone()]);
         Self {
+            node_waypoint_namespace: namespace.clone(),
             namespace,
             trust_domain,
             prefer_istio_on_overlap: true,
@@ -126,6 +133,7 @@ impl K8sTranslationOptions {
             pod_discovery_enabled: false,
             mesh_sidecar_ingress_enforced: false,
             source_namespaces: Some(source_namespaces),
+            pod_source_namespaces: Some(pod_source_namespaces),
         }
     }
 
@@ -151,6 +159,13 @@ impl K8sTranslationOptions {
         self
     }
 
+    pub fn with_node_waypoint_namespace(mut self, namespace: String) -> Self {
+        if !namespace.trim().is_empty() {
+            self.node_waypoint_namespace = namespace;
+        }
+        self
+    }
+
     pub fn with_cluster_domain(mut self, domain: String) -> Self {
         // Empty/whitespace falls back to the existing default (`cluster.local`)
         // rather than producing a translator that can never match a FQDN host.
@@ -161,7 +176,18 @@ impl K8sTranslationOptions {
     }
 
     pub fn with_source_namespaces(mut self, namespaces: Vec<String>) -> Self {
-        self.source_namespaces = if namespaces.is_empty() {
+        let source_namespaces = if namespaces.is_empty() {
+            None
+        } else {
+            Some(namespaces.into_iter().collect())
+        };
+        self.pod_source_namespaces = source_namespaces.clone();
+        self.source_namespaces = source_namespaces;
+        self
+    }
+
+    pub fn with_pod_source_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.pod_source_namespaces = if namespaces.is_empty() {
             None
         } else {
             Some(namespaces.into_iter().collect())
@@ -171,6 +197,12 @@ impl K8sTranslationOptions {
 
     fn includes_namespace(&self, namespace: &str) -> bool {
         self.source_namespaces
+            .as_ref()
+            .is_none_or(|namespaces| namespaces.contains(namespace))
+    }
+
+    fn includes_pod_namespace(&self, namespace: &str) -> bool {
+        self.pod_source_namespaces
             .as_ref()
             .is_none_or(|namespaces| namespaces.contains(namespace))
     }
@@ -228,6 +260,11 @@ pub struct K8sTranslation {
     /// does not mark a valid (and materialized) route as `Conflicted=True`
     /// against an older sibling that the translator already dropped.
     pub route_conflicts: Vec<GatewayApiRouteConflict>,
+    /// Route parentRefs that actually produced live route configuration.
+    /// Status uses this per-parent set instead of route-wide proxy IDs so a
+    /// route attached to one programmed parent and one fail-closed parent does
+    /// not report both parents as Programmed.
+    pub materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +309,12 @@ pub struct GatewayApiRouteConflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GatewayApiMaterializedRouteParent {
+    pub route: K8sResourceKey,
+    pub parent_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct K8sServiceKey {
     pub namespace: String,
     pub name: String,
@@ -286,6 +329,53 @@ impl K8sServiceKey {
         }
         Some(Self { namespace, name })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GatewayApiListenerKey {
+    pub namespace: String,
+    pub gateway: String,
+    pub listener: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum GatewayApiAllowedRoutesNamespaces {
+    #[default]
+    Same,
+    All,
+    Selector(GatewayApiNamespaceSelector),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GatewayApiNamespaceSelector {
+    pub match_labels: HashMap<String, String>,
+    pub match_expressions: Vec<GatewayApiNamespaceSelectorExpression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayApiNamespaceSelectorExpression {
+    pub key: String,
+    pub operator: GatewayApiNamespaceSelectorOperator,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatewayApiNamespaceSelectorOperator {
+    In,
+    NotIn,
+    Exists,
+    DoesNotExist,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GatewayApiListenerPolicy {
+    pub namespaces: GatewayApiAllowedRoutesNamespaces,
+    pub hostname: Option<String>,
+    pub port: Option<u64>,
+    pub route_kinds: HashSet<String>,
+    pub materializable: bool,
+    pub routes_materializable: bool,
+    pub requires_frontend_tls: bool,
 }
 
 pub(crate) struct K8sAccumulator {
@@ -303,16 +393,22 @@ pub(crate) struct K8sAccumulator {
     /// The nested shape lets `lookup_service_port` borrow `&str` arguments
     /// directly — no per-lookup `.to_string()` allocations.
     service_port_names: HashMap<String, HashMap<String, HashMap<String, u16>>>,
+    service_ports: HashMap<String, HashMap<String, HashSet<u16>>>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
+    pub(crate) gateway_api_listener_policies:
+        HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    gateway_api_gateway_classes: HashMap<String, bool>,
+    pub(crate) namespace_labels: HashMap<String, HashMap<String, String>>,
     /// Flat copy of the Gateway API route conflicts computed over the
     /// translator's filtered object set. Reused by the status writer so
     /// invalid routes (which the translator skips) cannot push a valid
     /// sibling into `Conflicted=True`.
     gateway_api_route_conflicts: Vec<GatewayApiRouteConflict>,
+    gateway_api_materialized_route_parents: HashSet<GatewayApiMaterializedRouteParent>,
 }
 
 impl K8sAccumulator {
@@ -330,12 +426,17 @@ impl K8sAccumulator {
             proxy_sources: HashMap::new(),
             known_namespaces: HashSet::new(),
             service_port_names: HashMap::new(),
+            service_ports: HashMap::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
+            gateway_api_listener_policies: HashMap::new(),
+            gateway_api_gateway_classes: HashMap::new(),
+            namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
+            gateway_api_materialized_route_parents: HashSet::new(),
         }
     }
 
@@ -355,8 +456,68 @@ impl K8sAccumulator {
             .copied()
     }
 
+    pub(crate) fn service_exists(&self, namespace: &str, service: &str) -> bool {
+        self.service_port_names
+            .get(namespace)
+            .is_some_and(|services| services.contains_key(service))
+    }
+
+    pub(crate) fn service_port_exists(&self, namespace: &str, service: &str, port: u16) -> bool {
+        self.service_ports
+            .get(namespace)
+            .and_then(|services| services.get(service))
+            .is_some_and(|ports| ports.contains(&port))
+    }
+
+    pub(crate) fn has_observed_services(&self) -> bool {
+        !self.service_port_names.is_empty()
+    }
+
+    pub(crate) fn endpoint_route_backends_for_service(
+        &self,
+        namespace: &str,
+        service: &str,
+        service_port: u16,
+        weight: u32,
+    ) -> Vec<RouteBackend> {
+        core::endpoint_route_backends_for_service(self, namespace, service, service_port, weight)
+    }
+
+    pub(crate) fn secret_is_valid_tls_certificate(&self, namespace: &str, name: &str) -> bool {
+        core::secret_is_valid_tls_certificate(self, namespace, name)
+    }
+
+    pub(crate) fn secret_tls_material_digest(&self, namespace: &str, name: &str) -> Option<&str> {
+        core::secret_tls_material_digest(self, namespace, name)
+    }
+
     fn observe_namespace(&mut self, namespace: &str) {
         self.known_namespaces.insert(namespace.to_string());
+    }
+
+    pub(crate) fn record_namespace_labels(
+        &mut self,
+        namespace: String,
+        labels: HashMap<String, String>,
+    ) {
+        self.namespace_labels.insert(namespace, labels);
+    }
+
+    pub(crate) fn record_gateway_class(&mut self, object: &K8sObject) {
+        let managed = object.spec.get("controllerName").and_then(Value::as_str)
+            == Some(FERRUM_GATEWAY_CONTROLLER_NAME);
+        self.gateway_api_gateway_classes
+            .insert(object.metadata.name.clone(), managed);
+    }
+
+    pub(crate) fn gateway_is_managed_by_ferrum(&self, object: &K8sObject) -> bool {
+        let Some(class_name) = object.spec.get("gatewayClassName").and_then(Value::as_str) else {
+            return false;
+        };
+        self.gateway_api_gateway_classes
+            .get(class_name)
+            .copied()
+            .unwrap_or_else(|| class_name == "ferrum")
     }
 
     fn record_explicit_workload_service(&mut self, key: K8sServiceKey) {
@@ -367,6 +528,7 @@ impl K8sAccumulator {
         self.explicit_service_entries.insert(key);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_reference_grant(
         &mut self,
         from_namespace: String,
@@ -375,6 +537,7 @@ impl K8sAccumulator {
         to_namespace: String,
         to_group: String,
         to_kind: String,
+        to_name: Option<String>,
     ) {
         self.reference_grants.insert(ReferenceGrantPermission {
             from_namespace,
@@ -383,9 +546,11 @@ impl K8sAccumulator {
             to_namespace,
             to_group,
             to_kind,
+            to_name,
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reference_grant_allows(
         &self,
         from_namespace: &str,
@@ -394,14 +559,19 @@ impl K8sAccumulator {
         to_namespace: &str,
         to_group: &str,
         to_kind: &str,
+        to_name: Option<&str>,
     ) -> bool {
-        self.reference_grants.contains(&ReferenceGrantPermission {
-            from_namespace: from_namespace.to_string(),
-            from_group: from_group.to_string(),
-            from_kind: from_kind.to_string(),
-            to_namespace: to_namespace.to_string(),
-            to_group: to_group.to_string(),
-            to_kind: to_kind.to_string(),
+        self.reference_grants.iter().any(|grant| {
+            grant.from_namespace == from_namespace
+                && grant.from_group == from_group
+                && grant.from_kind == from_kind
+                && grant.to_namespace == to_namespace
+                && grant.to_group == to_group
+                && grant.to_kind == to_kind
+                && grant
+                    .to_name
+                    .as_deref()
+                    .is_none_or(|name| Some(name) == to_name)
         })
     }
 
@@ -448,6 +618,18 @@ impl K8sAccumulator {
         }
     }
 
+    pub(crate) fn record_gateway_api_materialized_route_parent(
+        &mut self,
+        route: &K8sObject,
+        parent_ref: String,
+    ) {
+        self.gateway_api_materialized_route_parents
+            .insert(GatewayApiMaterializedRouteParent {
+                route: K8sResourceKey::from_object(route),
+                parent_ref,
+            });
+    }
+
     fn finish(mut self) -> K8sTranslation {
         gateway_api::finalize_dispatch_plugin_precedence(&mut self.config.plugin_configs);
         debug_assert!(
@@ -488,6 +670,7 @@ impl K8sAccumulator {
             config: self.config,
             warnings: self.warnings,
             route_conflicts: self.gateway_api_route_conflicts,
+            materialized_route_parents: self.gateway_api_materialized_route_parents,
         }
     }
 }
@@ -500,6 +683,7 @@ struct ReferenceGrantPermission {
     to_namespace: String,
     to_group: String,
     to_kind: String,
+    to_name: Option<String>,
 }
 
 pub fn translate_k8s_objects(
@@ -513,11 +697,54 @@ pub fn gateway_api_route_conflicts(
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
 ) -> Vec<GatewayApiRouteConflict> {
-    gateway_api::route_conflicts(objects, options)
+    let mut acc = K8sAccumulator::new(options.clone());
+    collect_gateway_api_status_context(objects, &mut acc);
+    gateway_api::route_conflicts(objects, options, Some(&acc))
 }
 
 pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
     gateway_api::route_conflict_keys(object)
+}
+
+pub fn gateway_api_route_conflict_keys_with_context(
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Vec<GatewayApiRouteConflictKey> {
+    let mut acc = K8sAccumulator::new(options.clone());
+    collect_gateway_api_status_context(objects, &mut acc);
+    gateway_api::route_conflict_keys_for_acc(object, Some(&acc))
+}
+
+fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumulator) {
+    for object in objects {
+        if object.kind == "Namespace" {
+            acc.record_namespace_labels(
+                object.metadata.name.clone(),
+                object.metadata.labels.clone(),
+            );
+        } else if object.kind == "GatewayClass" {
+            acc.record_gateway_class(object);
+        }
+    }
+    for object in objects {
+        if !includes_object_namespace(&acc.options, object) {
+            continue;
+        }
+        if object.kind == "ReferenceGrant" {
+            let _ = gateway_api::collect_reference_grant(acc, object);
+        } else if object.kind == "Secret" {
+            let _ = core::collect(acc, object);
+        }
+    }
+    for object in objects {
+        if object.kind == "Gateway"
+            && includes_object_namespace(&acc.options, object)
+            && acc.gateway_is_managed_by_ferrum(object)
+        {
+            let _ = gateway_api::collect_gateway_listener_policy(acc, object);
+        }
+    }
 }
 
 pub(crate) fn translate_k8s_objects_with_filter<F>(
@@ -543,6 +770,20 @@ where
     let mut acc = K8sAccumulator::new(options);
 
     for object in &included_objects {
+        if object.kind == "Namespace" {
+            acc.record_namespace_labels(
+                object.metadata.name.clone(),
+                object.metadata.labels.clone(),
+            );
+        } else if object.kind == "GatewayClass" {
+            acc.record_gateway_class(object);
+        }
+    }
+
+    for object in &included_objects {
+        if object.kind == "Namespace" || object.kind == "GatewayClass" {
+            continue;
+        }
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
@@ -554,6 +795,8 @@ where
             if acc.options.pod_discovery_enabled {
                 core::collect(&mut acc, object)?;
             }
+        } else if object.kind == "Secret" {
+            core::collect(&mut acc, object)?;
         } else if mesh_config::is_istio_mesh_config_map(&acc.options, object) {
             mesh_config::collect(&mut acc, object)?;
         } else if acc.options.pod_discovery_enabled && object.kind == "WorkloadEntry" {
@@ -565,7 +808,17 @@ where
         }
     }
 
-    let gateway_api_route_conflicts = gateway_api::route_conflicts(&included_objects, &acc.options);
+    for object in &included_objects {
+        if object.kind == "Gateway"
+            && includes_object_namespace(&acc.options, object)
+            && acc.gateway_is_managed_by_ferrum(object)
+        {
+            gateway_api::collect_gateway_listener_policy(&mut acc, object)?;
+        }
+    }
+
+    let gateway_api_route_conflicts =
+        gateway_api::route_conflicts(&included_objects, &acc.options, Some(&acc));
     for conflict in &gateway_api_route_conflicts {
         let skipped_reason = if conflict.loser.kind == "GRPCRoute"
             && conflict.key.match_signature == "{}"
@@ -595,6 +848,9 @@ where
     acc.gateway_api_route_conflicts = gateway_api_route_conflicts;
 
     for object in &included_objects {
+        if object.kind == "Namespace" || object.kind == "GatewayClass" {
+            continue;
+        }
         if !includes_object_namespace(&acc.options, object) {
             continue;
         }
@@ -626,12 +882,6 @@ where
             continue;
         }
 
-        // GatewayClass is watched for ownership/status decisions by the
-        // controller, but it does not materialize proxy config directly.
-        if object.kind == "GatewayClass" {
-            continue;
-        }
-
         if istio::translate(&mut acc, object)? || gateway_api::translate(&mut acc, object)? {
             continue;
         }
@@ -650,15 +900,29 @@ where
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
-    options.includes_namespace(&object.metadata.namespace)
+    object_namespace_matches_source(options, object)
+        || object.kind == "GatewayClass"
         || mesh_config::is_root_namespace_config_map(options, object)
+        || (options.pod_discovery_enabled
+            && core::trusted_node_waypoint_pod_object(options, object))
         || (options.pod_discovery_enabled
             && core::is_cluster_scoped_core_resource_kind(&object.kind))
 }
 
 fn observe_object_namespace(acc: &mut K8sAccumulator, object: &K8sObject) {
-    if !core::is_cluster_scoped_core_resource_kind(&object.kind) {
+    if !core::is_cluster_scoped_core_resource_kind(&object.kind)
+        && (object_namespace_matches_source(&acc.options, object)
+            || mesh_config::is_root_namespace_config_map(&acc.options, object))
+    {
         acc.observe_namespace(&object.metadata.namespace);
+    }
+}
+
+fn object_namespace_matches_source(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
+    if options.pod_discovery_enabled && object.kind == "Pod" {
+        options.includes_pod_namespace(&object.metadata.namespace)
+    } else {
+        options.includes_namespace(&object.metadata.namespace)
     }
 }
 
@@ -677,20 +941,25 @@ pub(crate) fn collect_service(
         .map(|arr| arr.as_slice())
         .unwrap_or(&[]);
     let mut port_names: HashMap<String, u16> = HashMap::new();
+    let mut port_numbers: HashSet<u16> = HashSet::new();
     for port_entry in ports {
-        let Some(name) = string_field(port_entry, "name") else {
-            continue;
-        };
         let Some(raw) = port_entry.get("port").and_then(Value::as_u64) else {
             continue;
         };
         let port = port_from_u64(object, raw, "Service.spec.ports[].port")?;
-        port_names.insert(name.to_string(), port);
+        port_numbers.insert(port);
+        if let Some(name) = string_field(port_entry, "name") {
+            port_names.insert(name.to_string(), port);
+        }
     }
     acc.service_port_names
         .entry(object.metadata.namespace.clone())
         .or_default()
         .insert(object.metadata.name.clone(), port_names);
+    acc.service_ports
+        .entry(object.metadata.namespace.clone())
+        .or_default()
+        .insert(object.metadata.name.clone(), port_numbers);
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding
@@ -896,6 +1165,7 @@ pub(crate) struct RouteProxySpec {
     pub hosts: Vec<String>,
     pub listen_path: Option<String>,
     pub strip_listen_path: bool,
+    pub preserve_host_header: bool,
     pub backend_host: String,
     pub backend_port: u16,
     pub upstream_id: Option<String>,
@@ -919,7 +1189,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_port: spec.backend_port,
         backend_path: None,
         strip_listen_path: spec.strip_listen_path,
-        preserve_host_header: false,
+        preserve_host_header: spec.preserve_host_header,
         backend_connect_timeout_ms: 30_000,
         backend_read_timeout_ms: spec.backend_read_timeout_ms.unwrap_or(30_000),
         backend_write_timeout_ms: 30_000,
@@ -1128,10 +1398,12 @@ pub(crate) fn route_local_fault_value_for_rule(fault: &Value) -> Option<Value> {
     Some(Value::Object(config))
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct MeshRouteDispatchDestination<'a> {
     pub backend_host: &'a str,
     pub backend_port: u16,
     pub upstream_id: Option<&'a str>,
+    pub requires_node_waypoint_authz: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1667,6 +1939,12 @@ fn route_dispatch_destination_value(
     } else {
         return None;
     }
+    if route_destination.requires_node_waypoint_authz {
+        destination.insert(
+            "requires_node_waypoint_authz".to_string(),
+            Value::Bool(true),
+        );
+    }
     Some(destination)
 }
 
@@ -2107,6 +2385,17 @@ pub(crate) struct RouteBackend {
     pub host: String,
     pub port: u16,
     pub weight: u32,
+    pub service_namespace: Option<String>,
+    pub service_name: Option<String>,
+    pub service_port: Option<u16>,
+}
+
+pub(crate) fn route_backends_require_node_waypoint_authz(backends: &[RouteBackend]) -> bool {
+    backends.iter().any(|backend| {
+        backend.service_namespace.is_some()
+            && backend.service_name.is_some()
+            && backend.service_port.is_some()
+    })
 }
 
 pub(crate) fn upstream_for_route(
@@ -2125,14 +2414,32 @@ pub(crate) fn upstream_for_route(
         namespace,
         targets: backends
             .into_iter()
-            .map(|backend| UpstreamTarget {
-                host: backend.host,
-                port: backend.port,
-                service_port_policy_key: None,
-                weight: backend.weight,
-                tags: HashMap::new(),
-                locality: None,
-                path: None,
+            .map(|backend| {
+                let mut tags = HashMap::new();
+                if let (Some(namespace), Some(name), Some(port)) = (
+                    backend.service_namespace.as_ref(),
+                    backend.service_name.as_ref(),
+                    backend.service_port,
+                ) {
+                    tags.insert(
+                        UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                        namespace.clone(),
+                    );
+                    tags.insert(UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(), name.clone());
+                    tags.insert(
+                        UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                        port.to_string(),
+                    );
+                }
+                UpstreamTarget {
+                    host: backend.host,
+                    port: backend.port,
+                    service_port_policy_key: backend.service_port,
+                    weight: backend.weight,
+                    tags,
+                    locality: None,
+                    path: None,
+                }
             })
             .collect(),
         algorithm: if has_weighted_target {

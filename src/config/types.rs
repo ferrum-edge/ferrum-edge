@@ -390,14 +390,14 @@ pub struct UpstreamPortOverride {
     /// (HTTP-family dispatch is a follow-on PR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
-    /// Per-port HTTP `maxRequestsPerConnection` mapped from DestinationRule
-    /// `connectionPool.http.maxRequestsPerConnection`. Projected onto the
-    /// per-target effective proxy's existing `pool_max_requests_per_connection`
-    /// schema field. Hyper does not yet expose a "close-after-N-requests"
-    /// builder knob, so the field is wire-projected end-to-end but its
-    /// runtime effect remains pending — same status as the proxy-level field.
-    /// Tracked as a follow-on once hyper grows the knob or a request-count
-    /// wrapper is introduced.
+    /// Legacy carrier for DestinationRule
+    /// `connectionPool.http.maxRequestsPerConnection`.
+    ///
+    /// New translation does not populate this field, and
+    /// `resolve_effective_proxy_for_target` intentionally ignores any legacy
+    /// carried value because Ferrum has no backend close-after-N-requests
+    /// runtime behavior. K8s status reports the DR field as deferred instead of
+    /// presenting this as effective policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_max_requests_per_connection: Option<u32>,
     /// Per-port HTTP idle-timeout mapped from DestinationRule
@@ -573,7 +573,7 @@ impl ResolvedPortOverride {
     /// Field-by-field seed of the `connectionPool.http` fields from a
     /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
     ///
-    /// For each of the six `connectionPool.http` fields, the per-port value wins
+    /// For each supported `connectionPool.http` field, the per-port value wins
     /// when set; otherwise the fallback's value is inherited. This mirrors the
     /// NON-SD apply-time layering EXACTLY: there, the top-level
     /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
@@ -585,8 +585,8 @@ impl ResolvedPortOverride {
     /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
     /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
     ///
-    /// Only the six `connectionPool.http` fields are merged; the fallback only
-    /// ever carries those (it is built solely from the DR top-level
+    /// Only `connectionPool.http` fields are merged; the fallback only ever
+    /// carries those (it is built solely from the DR top-level
     /// `connectionPool.http` block), so non-`connectionPool.http` fields
     /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
     /// this per-port entry already has them.
@@ -708,6 +708,10 @@ impl ResolvedSubsetTrafficPolicy {
 }
 
 /// A single backend target within an upstream group.
+pub const UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG: &str = "_ferrum_service_namespace";
+pub const UPSTREAM_TARGET_SERVICE_NAME_TAG: &str = "_ferrum_service_name";
+pub const UPSTREAM_TARGET_SERVICE_PORT_TAG: &str = "_ferrum_service_port";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamTarget {
     pub host: String,
@@ -1768,7 +1772,7 @@ pub struct Proxy {
     pub namespace: String,
     /// Optional list of hostnames this proxy matches on.
     /// Empty means match all hosts (catch-all).
-    /// Supports exact hostnames and single-level wildcard prefixes (e.g., "*.example.com").
+    /// Supports exact hostnames and DNS suffix wildcard prefixes (e.g., "*.example.com").
     /// For HTTP-family proxies, either `hosts` or `listen_path` must be set
     /// (both may be set together).
     #[serde(default)]
@@ -1923,15 +1927,13 @@ pub struct Proxy {
     /// (always H2) or HBONE/mesh-mTLS transport selection.
     #[serde(skip)]
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
-    /// Istio DestinationRule `connectionPool.http.maxRequestsPerConnection`
-    /// (wire-projected). Populated at admit time directly, and at dispatch
-    /// time by `resolve_effective_proxy_for_target` from
-    /// `Upstream.port_overrides[port].http_max_requests_per_connection`.
-    /// Reqwest/hyper do not yet expose a stable close-after-N-requests
-    /// builder knob for the shared client pool, so the field is admitted,
-    /// persisted, and routed end-to-end but has no live runtime effect —
-    /// once hyper grows the knob (or a request-count wrapper is added) the
-    /// field will activate without further schema or projection work.
+    /// Deprecated proxy-level `maxRequestsPerConnection` carrier.
+    /// Reqwest/hyper do not expose a stable close-after-N-requests builder knob
+    /// for the shared backend client pool, so this direct proxy field is
+    /// admitted for backward compatibility but has no live runtime effect.
+    /// DestinationRule translation no longer projects into this field; K8s
+    /// status reports DR `connectionPool.http.maxRequestsPerConnection` as
+    /// deferred instead.
     /// `None` (default) = no configured cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
@@ -2205,6 +2207,29 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    /// Optional proxy frontend TLS certificate source delivered with the
+    /// namespace-scoped gateway config. Kubernetes Gateway listeners populate
+    /// this from `certificateRefs` as `k8s://<namespace>/<secret>#tls.crt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_cert_path: Option<String>,
+    /// Optional proxy frontend TLS private-key source paired with
+    /// `frontend_tls_cert_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_key_path: Option<String>,
+    /// Namespace of the Gateway that materialized `frontend_tls_*`.
+    ///
+    /// The Secret itself can be cross-namespace when authorized by
+    /// ReferenceGrant, so CP/DP namespace filtering must use this owner
+    /// namespace instead of inferring ownership from a `k8s://secret-ns/...`
+    /// source URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend_tls_source_namespace: Option<String>,
+    /// Gateway-managed frontend TLS material indexed by owning Gateway
+    /// namespace. Multi-namespace CPs keep all Gateway TLS entries here until
+    /// the per-DP namespace filter projects the matching entry into
+    /// `frontend_tls_*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frontend_tls_namespace_sources: Vec<FrontendTlsNamespaceSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the
@@ -2214,6 +2239,14 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendTlsNamespaceSource {
+    pub namespace: String,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -2658,18 +2691,24 @@ impl GatewayConfig {
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Split proxies into two buckets: those with an explicit listen_path and
-        // host-only proxies. Only proxies in the same bucket AND the same path
-        // (for the path bucket) can conflict.
-        let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
-        let mut host_only: Vec<&Proxy> = Vec::new();
+        // Split proxies into namespace-scoped buckets: those with an explicit
+        // listen_path and host-only proxies. Only proxies in the same namespace,
+        // the same bucket, AND the same path (for the path bucket) can conflict.
+        let mut by_path: HashMap<(&str, &str), Vec<&Proxy>> = HashMap::new();
+        let mut host_only: HashMap<&str, Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
                 continue;
             }
             match proxy.listen_path.as_deref() {
-                Some(path) => by_path.entry(path).or_default().push(proxy),
-                None => host_only.push(proxy),
+                Some(path) => by_path
+                    .entry((proxy.namespace.as_str(), path))
+                    .or_default()
+                    .push(proxy),
+                None => host_only
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .push(proxy),
             }
         }
 
@@ -2735,7 +2774,7 @@ impl GatewayConfig {
             })
             .unwrap_or_default();
 
-        for (path, group) in &by_path {
+        for ((_, path), group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
@@ -2748,7 +2787,7 @@ impl GatewayConfig {
                     {
                         continue;
                     }
-                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                    if ambiguous_path_host_overlap(&proxy_a.hosts, &proxy_b.hosts) {
                         if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
                             errors.push(format!(
                                 "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
@@ -2765,13 +2804,15 @@ impl GatewayConfig {
             }
         }
 
-        for (i, proxy_a) in host_only.iter().enumerate() {
-            for proxy_b in host_only.iter().skip(i + 1) {
-                if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
-                    errors.push(format!(
-                        "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
-                        proxy_b.id, proxy_a.id
-                    ));
+        for group in host_only.values() {
+            for (i, proxy_a) in group.iter().enumerate() {
+                for proxy_b in group.iter().skip(i + 1) {
+                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                        errors.push(format!(
+                            "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
+                            proxy_b.id, proxy_a.id
+                        ));
+                    }
                 }
             }
         }
@@ -2889,6 +2930,10 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
+        self.frontend_tls_namespace_sources
+            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        self.frontend_tls_namespace_sources
+            .dedup_by(|left, right| left.namespace == right.namespace);
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();
@@ -3756,7 +3801,7 @@ fn default_udp_idle_timeout() -> u64 {
 ///
 /// Valid formats:
 /// - Exact hostname: `api.example.com` (lowercase, no scheme/port/path)
-/// - Wildcard: `*.example.com` (single-level wildcard prefix)
+/// - Wildcard: `*.example.com` (DNS suffix wildcard prefix)
 pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host entry must not be empty".to_string());
@@ -3867,6 +3912,38 @@ pub fn hosts_overlap(a: &[String], b: &[String]) -> bool {
     // Check wildcard-to-exact and wildcard-to-wildcard overlaps
     for host_a in a {
         for host_b in b {
+            if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn ambiguous_path_host_overlap(a: &[String], b: &[String]) -> bool {
+    // Empty = catch-all. The catch-all tier sits behind exact and wildcard
+    // routes, but two same-path catch-all/specific routes are still ambiguous
+    // for configuration ownership and should fail closed.
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+
+    let a_set: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let b_set: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    if a_set.intersection(&b_set).next().is_some() {
+        return true;
+    }
+
+    for host_a in a {
+        for host_b in b {
+            let wildcard_a = host_a.starts_with("*.");
+            let wildcard_b = host_b.starts_with("*.");
+            if wildcard_a != wildcard_b {
+                // Exact-host routes are checked before wildcard-host routes in
+                // RouterCache, so this overlap is deterministic.
+                continue;
+            }
             if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
                 return true;
             }
@@ -6487,24 +6564,17 @@ pub(crate) fn json_depth(value: &serde_json::Value) -> usize {
 }
 
 /// Check if a wildcard pattern matches a hostname.
-/// `*.example.com` matches `foo.example.com` but not `example.com` or `a.b.example.com`.
+/// `*.example.com` matches any DNS name below `example.com`, including
+/// `foo.example.com` and `a.b.example.com`, but not `example.com` itself.
 pub fn wildcard_matches(pattern: &str, hostname: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // Don't match the base domain itself
         if hostname == suffix {
             return false;
         }
-        // Must end with .suffix and have exactly one label before it
-        if let Some(prefix) = hostname.strip_suffix(suffix) {
-            // prefix should be "something." with no additional dots
-            if prefix.ends_with('.')
-                && !prefix[..prefix.len() - 1].is_empty()
-                && !prefix[..prefix.len() - 1].contains('.')
-            {
-                return true;
-            }
-        }
-        false
+        hostname
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
     } else {
         pattern == hostname
     }

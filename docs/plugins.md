@@ -2143,7 +2143,7 @@ config:
 
 ### `request_deduplication`
 
-Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same key was seen within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
+Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same logical request was completed within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
 
 **Priority:** 2750
 
@@ -2152,7 +2152,9 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive) |
 | `ttl_seconds` | u64 | `300` | Time-to-live for cached responses (must be > 0) |
 | `inflight_ttl_seconds` | u64 | `ttl_seconds` | How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request (must be > 0). Set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to `ttl_seconds` |
-| `max_entries` | u64 | `10000` | Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory also scales with this count outside `max_total_size_bytes`. |
+| `max_entries` | u64 | `10000` | Maximum number of tracked local entries. Active in-flight markers count toward this limit but are not evicted while live |
+| `max_entry_size_bytes` | u64 | `1048576` | Maximum retained size of one completed response entry. Oversized retained responses are returned normally, clear the in-flight marker, and are not retained locally or serialized for Redis. Redis payloads are also skipped when their serialized value exceeds this cap |
+| `max_total_size_bytes` | u64 | `104857600` | Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode they clear the in-flight marker immediately; in Redis mode, Redis publish failures leave local and distributed locks to expire |
 | `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to |
 | `scope_by_consumer` | bool | `true` | Scope keys by authenticated consumer identity |
 | `enforce_required` | bool | `false` | Reject requests missing the idempotency header with 400 |
@@ -2167,14 +2169,20 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_password` | String (optional) | — | Redis password |
 
 **Behavior:**
-- On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
-- Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
+- Logical idempotency keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
+- Request fingerprints bind the logical key to the HTTP method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and a SHA-256 request-body digest. Raw request bodies, credentials, cookies, identities, and idempotency values are not stored in keys or fingerprints
+- On cache hit with the same fingerprint: returns the cached response with `X-Idempotent-Replayed: true` header
+- Reusing the same logical idempotency key for a different fingerprint returns `409 Conflict`
+- Concurrent duplicates with the same fingerprint return `409 Conflict` while the first request is still in-flight
+- Applicable methods with a declared body are buffered before `before_proxy`, even if the idempotency header is not present yet, so earlier header-transform plugins can add the key without making the body unavailable for fingerprinting
+- If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
+- Completed response storage is bounded by `max_entry_size_bytes` and `max_total_size_bytes`. Size-skipped responses still return to the original client, but no replayable response is retained. In local mode, skipped responses clear the in-flight marker so a later retry can execute normally; in Redis mode, a local-total-cap skip keeps local and distributed locks until `inflight_ttl_seconds` if Redis publication fails
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 
-**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Automatic local fallback when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Before a fresh request reaches the backend, the plugin acquires a Redis in-flight lock with `SET NX` and an ownership token; peers with the same fingerprint receive 409 while the first request is running, and peers reusing the same logical key for a different fingerprint receive the fingerprint-mismatch 409. Completed responses are published to Redis before the lock is token-released, so a peer cannot miss both the in-flight marker and the replayable response. Redis completed-response values include the request fingerprint and are not backward-compatible with pre-fingerprint serialized values. Redis publication requires both the retained response size and serialized payload size to fit `max_entry_size_bytes`; the total byte limit bounds local completed-response retention. If the local total cap skips retention, the response is still published to Redis when it fits the per-entry cap; if that Redis publish fails, the local and distributed in-flight locks are left to expire under `inflight_ttl_seconds` to avoid immediate duplicate execution without a replay value. Automatic local fallback is used when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: request_deduplication
@@ -2539,7 +2547,7 @@ config:
       value: "escaped"
 ```
 
-**Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API) or fail startup (file mode) / warn (DB mode):
+**Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API), fail startup in file mode, or reject the new DB/CP reload snapshot while the gateway keeps serving the prior good config:
 
 | Operation | Required fields | Notes |
 |-----------|-----------------|-------|
@@ -2638,7 +2646,6 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties). Accepts `"gzip"`, `"br"`, or `"brotli"` (alias for `"br"`). Unknown values, non-string entries, or non-array configs are rejected at plugin load — typos surface immediately rather than producing a partially-functional plugin. An empty array is also rejected |
 | `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
-| `disable_on_etag` | bool | `false` | Skip compression when the response has an ETag header |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
 | `gzip_level` | u64 | `6` | Gzip compression level (1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
@@ -2658,7 +2665,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 3. Response is a range response (`206`, `Content-Range`, or an internal range marker)
 4. Response has `Cache-Control: no-transform`
 5. Response already has `Content-Encoding` (no double-compression)
-6. `disable_on_etag` is true and response has an `ETag` header
+6. Response has a strong `ETag` validator. Weak validators (`W/"..."`) remain eligible for compression
 7. Response `Content-Type` is not in the whitelist
 8. Response `Content-Length` is below `min_content_length`
 9. Client did not send `Accept-Encoding` with a supported algorithm
@@ -2670,6 +2677,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Forces response body buffering on proxies where this plugin is enabled
 - When `decompress_request` is enabled, supported gzip/brotli request bodies are decoded before final request-body hooks and the forwarded request has `Content-Encoding` and `Content-Length` removed
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
+- Strong origin `ETag` validators are preserved by skipping compression; weak ETags can be forwarded with compressed variants
 
 ```yaml
 config:
@@ -2979,7 +2987,7 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ttl_seconds` | u64 | `300` | Default TTL when the backend response does not provide cache freshness headers |
+| `ttl_seconds` | u64 | `300` | Default freshness lifetime when the backend response does not provide `max-age` or `s-maxage`; upstream `Age` and `Date` still reduce remaining freshness |
 | `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction |
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body |
 | `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries |
@@ -2996,7 +3004,8 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 Behavior:
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
-- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists.
+- Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.
+- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists, including a current `Age` header.
 - Authenticated requests are always partitioned by hashed effective identity. Setting `cache_key_include_consumer: true` also permits caching authenticated responses that do not explicitly opt into shared caching and partitions unauthenticated requests under `_anon`.
 - When `cache_key_include_query` is enabled, the raw query string is hashed byte-for-byte without parsing, sorting, percent-decoding, or normalizing, so duplicate parameters, parameter order, percent-encoded names, bare flags, and empty values remain distinct.
 - Requests carrying `Authorization`, `Proxy-Authorization`, or `Cookie` are keyed by hashed header values for cacheable responses so distinct credentials or sessions cannot share one cached entry.

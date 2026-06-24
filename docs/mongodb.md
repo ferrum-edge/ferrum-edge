@@ -10,7 +10,7 @@ This guide covers deploying Ferrum Edge with MongoDB as the configuration databa
 | You want built-in replica set failover | You need multi-document ACID transactions without a replica set |
 | You prefer document-based config storage | You want mature schema migration tooling |
 | You're deploying on MongoDB Atlas | You're using managed RDS/Cloud SQL |
-| You need read/write splitting via read preference | You need a separate read replica URL |
+| You want driver-managed topology discovery | You need SQL read-replica admin-read offload |
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI
 | Pool checkout wait | `waitQueueTimeoutMS` URI option | Driver-side wait for an available connection. |
 | Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
 | TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
-| Read/write splitting | `readPreference` URI option | Use `secondaryPreferred` to offload config polling reads. |
+| Read preference | Ignored by Ferrum's config store | Runtime config reads are forced to primary for authoritative polling consistency. |
 | TLS | `FERRUM_DB_TLS_MODE` plus certificate path env vars, or URI options such as `tls=true`, `tlsCAFile`, `tlsCertificateKeyFile` | Env mode values supported for MongoDB are `disable`, `require`, and `verify-full`. |
 | App name | `FERRUM_MONGO_APP_NAME` or `appName` URI option | Helps identify Ferrum connections in MongoDB server diagnostics. The env var overrides the URI value when set. |
 
@@ -96,7 +96,7 @@ These settings have no effect when `FERRUM_DB_TYPE=mongodb`:
 
 | Variable | Why N/A for MongoDB |
 |---|---|
-| `FERRUM_DB_READ_REPLICA_URL` | MongoDB handles read routing via `readPreference` in the connection string (see [Read Preference](#read-preference)) |
+| `FERRUM_DB_READ_REPLICA_URL` | SQL-only. MongoDB uses one authoritative client and Ferrum forces primary reads. |
 | `FERRUM_DB_POOL_MAX_CONNECTIONS` | MongoDB driver manages its own connection pool internally |
 | `FERRUM_DB_POOL_MIN_CONNECTIONS` | MongoDB driver manages its own connection pool internally |
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | MongoDB uses `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` instead |
@@ -105,35 +105,27 @@ These settings have no effect when `FERRUM_DB_TYPE=mongodb`:
 | `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | Use `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` instead |
 | `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | MongoDB has no per-statement timeout (use `maxTimeMS` in queries if needed) |
 
-## Read Preference
+## Read Consistency
 
-MongoDB handles read/write splitting natively through **read preference** in the connection string — no separate replica URL needed. The driver routes reads and writes to the appropriate replica set members automatically.
+Ferrum's MongoDB config store uses primary reads for startup full loads,
+incremental change-log polling, relationship reads, and admin reads.
+If `FERRUM_DB_URL` includes a `readPreference` option, Ferrum logs a warning and
+overrides it to primary when building the MongoDB client. This prevents replica
+lag from hiding runtime config changes or advancing polling cursors against a
+stale secondary.
 
-```bash
-# All reads go to secondaries when available, primary as fallback
-FERRUM_DB_URL="mongodb://user:pass@mongo1:27017,mongo2:27017,mongo3:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred"
-```
+When `FERRUM_MONGO_REPLICA_SET` is configured, startup and fallback full loads
+run inside a snapshot transaction so proxies, consumers, plugin configs, and
+upstreams come from one multi-collection view. A full-load query, decode, or
+validation failure rejects the complete candidate and the gateway keeps serving
+the last known-good runtime configuration. Standalone MongoDB deployments cannot
+provide multi-collection snapshots; Ferrum uses sequential primary reads there
+and rejects candidates only for errors and validation checks enforced by the
+runtime load path, so concurrent writes can require a later poll to converge.
 
-This is why `FERRUM_DB_READ_REPLICA_URL` is SQL-only. MongoDB's `readPreference` replaces it with better behavior:
-
-| Read Preference | Behavior | Use Case |
-|---|---|---|
-| `primary` (default) | All reads go to primary | Strongest consistency |
-| `primaryPreferred` | Primary if available, else secondary | Consistency with HA fallback |
-| `secondary` | Reads only from secondaries | Offload primary completely |
-| `secondaryPreferred` | Secondary if available, else primary | **Recommended for Ferrum Edge** — offloads config polling reads from primary |
-| `nearest` | Lowest latency member regardless of role | Multi-region deployments |
-
-### Example: Production Config Polling on Secondary
-
-```bash
-FERRUM_DB_TYPE=mongodb
-FERRUM_DB_URL="mongodb://mongo-primary:27017,mongo-secondary1:27017,mongo-secondary2:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred"
-FERRUM_MONGO_DATABASE=ferrum
-FERRUM_MONGO_REPLICA_SET=rs0
-```
-
-The gateway writes new proxy/consumer/plugin configs to the primary via the Admin API, and the polling loop reads config changes from a secondary — same read/write split as `FERRUM_DB_READ_REPLICA_URL` for SQL, but built into the driver.
+`FERRUM_DB_READ_REPLICA_URL` is SQL-only. MongoDB replica sets are still useful
+for primary failover, transactions, and majority write concern; they are not a
+Ferrum config-polling read-offload mechanism.
 
 ## Failover
 
@@ -186,7 +178,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key      # mTLS
 
 `FERRUM_DB_TLS_MODE=require` enables encrypted MongoDB connections but allows invalid server certificates. `FERRUM_DB_TLS_MODE=verify-full` enables TLS and validates the server certificate chain, using `FERRUM_DB_TLS_CA_CERT_PATH` when provided.
 
-**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate cert/key files and the gateway automatically combines them into a PID-scoped temp file (`/tmp/ferrum-mongo-client-{pid}.pem`).
+**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate cert/key files and the gateway automatically combines them into an owner-scoped temporary PEM. Generated PEMs use restrictive permissions, remain available while the active MongoDB driver client may need them, and are removed automatically after the owning connection bundle is dropped.
 
 ### Approach 2: Connection String Options
 
@@ -241,7 +233,7 @@ FERRUM_MONGO_REPLICA_SET=rs0
 A production MongoDB replica set typically has 3+ members:
 
 ```bash
-FERRUM_DB_URL="mongodb://mongo1:27017,mongo2:27017,mongo3:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred&w=majority"
+FERRUM_DB_URL="mongodb://mongo1:27017,mongo2:27017,mongo3:27017/ferrum?replicaSet=rs0&w=majority"
 FERRUM_MONGO_REPLICA_SET=rs0
 FERRUM_MONGO_DATABASE=ferrum
 ```
@@ -254,7 +246,7 @@ The `w=majority` write concern ensures writes are acknowledged by a majority of 
 
 ```bash
 FERRUM_DB_TYPE=mongodb
-FERRUM_DB_URL="mongodb+srv://ferrum-user:password@cluster0.abc123.mongodb.net/ferrum?retryWrites=true&w=majority&readPreference=secondaryPreferred"
+FERRUM_DB_URL="mongodb+srv://ferrum-user:password@cluster0.abc123.mongodb.net/ferrum?retryWrites=true&w=majority"
 FERRUM_MONGO_DATABASE=ferrum
 # No FERRUM_MONGO_REPLICA_SET needed — Atlas handles this via SRV
 # No FERRUM_DB_TLS_* needed — Atlas enables TLS by default via mongodb+srv://
@@ -357,11 +349,14 @@ New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `Plu
 
 ## Incremental Polling
 
-MongoDB uses the same incremental polling strategy as SQL backends:
+MongoDB replica sets use the same durable incremental polling strategy as SQL backends:
 
-1. **Startup:** Full collection scan loads all documents
-2. **Subsequent polls:** `updated_at > last_poll_timestamp` queries fetch only changed documents (indexed)
-3. **Deletion detection:** Lightweight `_id` projection queries detect removed documents
-4. **Fallback:** If incremental poll fails, falls back to full collection scan
+1. **Startup:** A full load reads all runtime collections and seeds the latest accepted `config_changes.sequence`. Replica sets use a snapshot transaction; standalone deployments use sequential primary reads and only reject inconsistencies caught by the runtime load validation path.
+2. **Subsequent polls:** Pollers read ordered `config_changes` documents after the accepted sequence cursor, collapse each resource to its final operation in the batch, and point-load changed IDs only.
+3. **Deletion detection:** Deletes are delivered by durable `config_changes` delete records; normal incremental polling does not scan every runtime collection ID.
+4. **Retention:** Old change records are compacted after the retained per-namespace window. If a poller's cursor is older than retained history, it falls back to the same full-load path and reseeds the sequence cursor.
+5. **Fallback:** If incremental poll fails, Ferrum falls back to the same full-load path and rejects the candidate on any query, decode, or runtime load validation error.
 
-The `updated_at` indexes on all four collections ensure polling queries use index scans, not full collection scans.
+The `config_changes` collection has `{namespace, sequence}` and `{sequence}` indexes so polling cost is proportional to the number of retained changes read, not total runtime resource count.
+
+Standalone MongoDB does not provide multi-document transactions, so resource writes and their `config_changes` records cannot be made crash-atomic. Ferrum therefore forces standalone MongoDB pollers through the full-load fallback path instead of accepting an incremental cursor that could miss a resource mutation whose change record was not committed.

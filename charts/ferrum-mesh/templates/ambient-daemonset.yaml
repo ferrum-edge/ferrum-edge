@@ -1,4 +1,85 @@
 {{- if .Values.ambient.enabled }}
+{{- $ambientImageRepository := toString .Values.image.repository -}}
+{{- $ambientImageTag := toString .Values.image.tag -}}
+{{- $ambientEnv := default dict .Values.ambient.env -}}
+{{- $ambientSpire := default dict .Values.ambient.spire -}}
+{{- $ambientSpireEnabled := eq (lower (toString (default false $ambientSpire.enabled))) "true" -}}
+{{- $ambientSpireSocketHostPath := toString (default "/run/spire/sockets" $ambientSpire.socketHostPath) -}}
+{{- $ambientSpireSocketMountPath := toString (default "/run/spire/sockets" $ambientSpire.socketMountPath) -}}
+{{- $ambientSpireSocketFileName := toString (default "agent.sock" $ambientSpire.socketFileName) -}}
+{{- $ambientSpireSocketPath := printf "%s/%s" (trimSuffix "/" $ambientSpireSocketMountPath) $ambientSpireSocketFileName -}}
+{{- $ambientSpireWorkloadSpiffeId := toString (default "" $ambientSpire.workloadSpiffeId) -}}
+{{- $ambientSpireProductionMode := true -}}
+{{- if hasKey $ambientSpire "productionMode" -}}
+{{- $ambientSpireProductionMode = $ambientSpire.productionMode -}}
+{{- end -}}
+{{- $ambientSpireUsesNodeName := contains "$(FERRUM_K8S_NODE_NAME)" $ambientSpireWorkloadSpiffeId -}}
+{{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
+{{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
+{{- $nodeWaypointRegistryMountPath = toString (index $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR") -}}
+{{- end -}}
+{{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
+{{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
+{{- $ambientAdminPort := "9000" -}}
+{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
+{{- $ambientAdminPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTP_PORT") -}}
+{{- end -}}
+{{- $ambientAdminBindAddress := "0.0.0.0" -}}
+{{- if hasKey $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS" -}}
+{{- $ambientAdminBindAddress = toString (index $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS") -}}
+{{- end -}}
+{{- $ambientAdminProbeHost := $ambientAdminBindAddress -}}
+{{- if or (eq $ambientAdminProbeHost "") (eq $ambientAdminProbeHost "0.0.0.0") (eq $ambientAdminProbeHost "*") -}}
+{{- $ambientAdminProbeHost = "127.0.0.1" -}}
+{{- else if eq $ambientAdminProbeHost "::" -}}
+{{- $ambientAdminProbeHost = "::1" -}}
+{{- end -}}
+{{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
+{{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
+{{- end -}}
+{{- if $nodeWaypointRegistryEnabled -}}
+{{- if eq $ambientAdminPort "0" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires FERRUM_ADMIN_HTTP_PORT to stay enabled for the Kubernetes readiness probe" -}}
+{{- end -}}
+{{- if not .Values.nodeAgent.enabled -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.enabled=true" -}}
+{{- end -}}
+{{- if ne $nodeAgentProxyMode "node_waypoint" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.proxyMode=node_waypoint" -}}
+{{- end -}}
+{{- if ne $nodeAgentCaptureMode "ebpf" -}}
+{{- fail "ambient FERRUM_MESH_TOPOLOGY=node_waypoint requires nodeAgent.captureMode=ebpf" -}}
+{{- end -}}
+{{- end -}}
+{{- if $ambientSpireEnabled -}}
+{{- if eq (trim $ambientSpireWorkloadSpiffeId) "" -}}
+{{- fail "ambient.spire.enabled=true requires ambient.spire.workloadSpiffeId" -}}
+{{- end -}}
+{{- if eq (trim $ambientSpireSocketHostPath) "" -}}
+{{- fail "ambient.spire.enabled=true requires ambient.spire.socketHostPath" -}}
+{{- end -}}
+{{- if eq (trim $ambientSpireSocketMountPath) "" -}}
+{{- fail "ambient.spire.enabled=true requires ambient.spire.socketMountPath" -}}
+{{- end -}}
+{{- if and $nodeWaypointRegistryEnabled (not $ambientSpireUsesNodeName) -}}
+{{- fail "ambient.spire.enabled=true with NodeWaypoint requires ambient.spire.workloadSpiffeId to include $(FERRUM_K8S_NODE_NAME) for per-node SPIFFE IDs" -}}
+{{- end -}}
+{{- range $baseName := list "FERRUM_K8S_NODE_NAME" "FERRUM_MESH_CA_BACKEND" "FERRUM_MESH_SPIRE_AGENT_SOCKET" "FERRUM_MESH_WORKLOAD_SPIFFE_ID" "FERRUM_MESH_PRODUCTION_MODE" "FERRUM_MESH_ALLOW_NO_CA" "FERRUM_GATEWAY_SPIFFE_ID" "FERRUM_GATEWAY_SVID_CERT_PATH" "FERRUM_GATEWAY_SVID_KEY_PATH" "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH" "FERRUM_GATEWAY_SVID_CERT_SOURCE" "FERRUM_GATEWAY_SVID_KEY_SOURCE" "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_SOURCE" -}}
+{{- range $suffix := list "" "_FILE" "_VAULT" "_AWS" "_AZURE" "_GCP" -}}
+{{- $name := printf "%s%s" $baseName $suffix -}}
+{{- if hasKey $ambientEnv $name -}}
+{{- fail (printf "ambient.env.%s is chart-managed when ambient.spire.enabled=true; set ambient.spire values instead" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint")) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
+{{- end -}}
+{{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -20,16 +101,32 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
+      {{- if $nodeWaypointRegistryEnabled }}
+      hostPID: true
+      {{- end }}
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: ferrum-edge
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ $ambientImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           securityContext:
+            {{- if $nodeWaypointRegistryEnabled }}
+            runAsUser: 0
+            runAsGroup: 0
+            {{- end }}
             capabilities:
               add:
+                {{- if $nodeWaypointRegistryEnabled }}
+                - BPF
+                {{- end }}
                 - NET_ADMIN
                 - NET_RAW
+                {{- if $nodeWaypointRegistryEnabled }}
+                - PERFMON
+                - SYS_ADMIN
+                - SYS_PTRACE
+                {{- end }}
           ports:
             - name: outbound
               containerPort: {{ .Values.ambient.outboundPort }}
@@ -40,8 +137,84 @@ spec:
           env:
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
-            {{- range $name, $value := .Values.ambient.env }}
+            {{- if and $nodeWaypointRegistryEnabled (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
+            - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
+              value: {{ .Values.nodeAgent.podRegistryDir | quote }}
+            {{- end }}
+            {{- if $ambientSpireEnabled }}
+            {{- if $ambientSpireUsesNodeName }}
+            - name: FERRUM_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
+            - name: FERRUM_MESH_CA_BACKEND
+              value: "spire_agent"
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: {{ $ambientSpireSocketPath | quote }}
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: {{ $ambientSpireWorkloadSpiffeId | quote }}
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: {{ $ambientSpireProductionMode | quote }}
+            {{- end }}
+            {{- range $name, $value := $ambientEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
+          {{- if or $nodeWaypointRegistryEnabled $ambientSpireEnabled }}
+          volumeMounts:
+            {{- if $nodeWaypointRegistryEnabled }}
+            - name: bpf-fs
+              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+              readOnly: true
+            - name: cgroup
+              mountPath: {{ .Values.nodeAgent.cgroupRoot }}
+              readOnly: true
+            - name: node-waypoint-pod-registry
+              mountPath: {{ $nodeWaypointRegistryMountPath }}
+            {{- end }}
+            {{- if $ambientSpireEnabled }}
+            - name: spire-agent-socket
+              mountPath: {{ $ambientSpireSocketMountPath }}
+              readOnly: true
+            {{- end }}
+          {{- end }}
+          {{- if $nodeWaypointRegistryEnabled }}
+          readinessProbe:
+            exec:
+              command:
+                - /app/ferrum-edge
+                - health
+                - --host
+                - {{ $ambientAdminProbeHost | quote }}
+                - -p
+                - {{ $ambientAdminPort | quote }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          {{- end }}
+      {{- if or $nodeWaypointRegistryEnabled $ambientSpireEnabled }}
+      volumes:
+        {{- if $nodeWaypointRegistryEnabled }}
+        - name: bpf-fs
+          hostPath:
+            path: {{ .Values.nodeAgent.bpfFsPath }}
+            type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: {{ .Values.nodeAgent.cgroupRoot }}
+            type: Directory
+        - name: node-waypoint-pod-registry
+          hostPath:
+            path: {{ .Values.nodeAgent.podRegistryDir }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if $ambientSpireEnabled }}
+        - name: spire-agent-socket
+          hostPath:
+            path: {{ $ambientSpireSocketHostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+      {{- end }}
 {{- end }}

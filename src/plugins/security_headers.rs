@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::util::http_headers::cache_control_has_directive;
+use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
 use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
@@ -135,6 +135,16 @@ impl Plugin for SecurityHeaders {
         self.set.iter().any(|(name, value)| {
             name == "cache-control" && cache_control_has_directive(value, "no-transform")
         })
+    }
+
+    fn may_add_response_strong_etag(
+        &self,
+        _ctx: &RequestContext,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.set
+            .iter()
+            .any(|(name, value)| name == "etag" && etag_value_is_strong(value))
     }
 
     fn simulate_after_proxy_response_headers(

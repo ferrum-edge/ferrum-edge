@@ -1002,6 +1002,90 @@ fn strict_locality_subset_scope_falls_back_to_unhealthy_local_not_remote() {
     }
 }
 
+#[test]
+fn strict_locality_retry_excluding_only_local_fails_closed_not_remote() {
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let up = strict_upstream(
+        None,
+        vec![
+            local.clone(),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..8 {
+        let next = LoadBalancerCache::select_next_target_from(
+            &snapshot,
+            "u1",
+            &format!("strict-retry-{i}"),
+            &local,
+            no_health(),
+        )
+        .expect("strict retry should fail closed to local");
+        assert_eq!(next.host, "local-a.local");
+    }
+}
+
+#[test]
+fn strict_locality_port_retry_excluding_only_local_fails_closed_not_remote() {
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(8080, UpstreamPortOverride::default());
+    let mut up = strict_upstream(
+        None,
+        vec![
+            local.clone(),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+        ],
+    );
+    up.port_overrides = port_overrides;
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..8 {
+        let next = LoadBalancerCache::select_next_target_for_port_from(
+            &snapshot,
+            "u1",
+            &format!("strict-port-retry-{i}"),
+            8080,
+            &local,
+            no_health(),
+        )
+        .expect("strict port retry should fail closed to local");
+        assert_eq!(next.host, "local-a.local");
+    }
+}
+
+#[test]
+fn strict_locality_vec_retry_excluding_only_local_fails_closed_not_remote() {
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let mut targets = Vec::with_capacity(130);
+    targets.push(local.clone());
+    for i in 0..129 {
+        targets.push(remote_target(
+            &format!("remote-{i}.local"),
+            Some("remote-cluster-east"),
+        ));
+    }
+    let up = strict_upstream(None, targets);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..8 {
+        let next = LoadBalancerCache::select_next_target_from(
+            &snapshot,
+            "u1",
+            &format!("strict-vec-retry-{i}"),
+            &local,
+            no_health(),
+        )
+        .expect("strict Vec retry should fail closed to local");
+        assert_eq!(next.host, "local-a.local");
+    }
+}
+
 // ── localityLbSetting.distribute ──────────────────────────────────────────
 
 fn upstream_with_locality_lb(

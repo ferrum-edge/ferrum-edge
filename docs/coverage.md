@@ -46,17 +46,104 @@ its path through `FERRUM_EDGE_TEST_BIN` so subprocess-based functional tests
 contribute to the same coverage report. MongoDB functional tests are included
 in the filter list and skip gracefully when local MongoDB is not available.
 
-## CI Baseline
+## Database/File Mode Regression Notes
 
-The scheduled `Coverage` workflow runs on pushes to `main`, manual dispatch,
-and Sundays at 06:00 UTC. It publishes an HTML report and LCOV file as a
-30-day GitHub Actions artifact. It also writes the overall coverage percentage
-and lowest/highest-covered files to the workflow step summary.
+The DB/file-mode regression matrix is split by what can run deterministically in
+the in-process coverage suite versus what needs backend services or subprocess
+orchestration:
 
-Current overall coverage: **79.15% line coverage** (`143,848/181,736` lines),
-captured locally on 2026-05-24 with `scripts/coverage.sh`. Replace this local
-snapshot with the first successful `Coverage` workflow artifact value after the
-workflow is merged to `main` if it differs.
+- SQL runtime config loading is covered through SQLite-backed integration tests
+  for the shared `DatabaseStore` implementation. These tests pin full-load
+  keyset pagination, durable `config_changes` incremental create/update/delete
+  delivery, retained-history cursor expiry, saturated-batch full-reload
+  fallback, proxy/plugin association fail-closed behavior, and the invariant
+  that normal incremental polling does not discover raw runtime rows without
+  change-log records.
+- Database-mode poll-loop unit tests cover rejected-delta backoff, escalation to
+  authoritative full reload, bounded metrics, recovery clearing, and preserving
+  the accepted sequence cursor when a full-load or incremental candidate is
+  rejected. Unchanged valid database configs commit the sequence cursor and keep
+  the gateway available.
+- MongoDB standalone behavior is covered by functional CI against the default
+  `mongo:7` service and intentionally forces database-mode pollers to full
+  reloads instead of accepting non-transactional incremental cursors. MongoDB
+  replica-set transaction/incremental behavior requires a replica-set topology
+  and is tracked here as a backend-specific coverage boundary for remote CI
+  environments that provide one.
+- File-mode lifecycle parity is covered by in-process `file::serve` unit tests
+  for fallible listener draining, bounded background-task shutdown, reserved
+  port calculation with pre-bound listeners, and HTTP/3 bind-address parity.
+  Subprocess functional tests cover YAML startup and SIGHUP reload behavior.
+
+## CI Baseline And Gates
+
+The `Coverage` workflow runs on pull requests, pushes to `main`, manual
+dispatch, and Sundays at 06:00 UTC. It publishes an HTML report, LCOV file, JSON
+summary, and terminal summary as a 30-day GitHub Actions artifact named
+`coverage-report` whenever coverage is collected. It also writes the overall
+coverage percentage and lowest/highest-covered files to the workflow step
+summary.
+
+The full default-branch gate is based on the latest completed `main` coverage
+artifact available when the gate was introduced on 2026-06-20:
+
+| Scope | Remote baseline | Gate |
+| --- | ---: | ---: |
+| Overall line coverage | `210900/269397` lines, **78.29%** | **78.28%** |
+| `src/plugins/` line coverage | `54957/64665` lines, **84.99%** | **84.98%** |
+| Changed coverable `src/plugins/` lines on plugin PRs | same plugin baseline | **84.98%** |
+
+The thresholds are intentionally rounded down from the measured remote values
+so presentation precision does not fail a run, while any real coverage drop in
+overall or plugin coverage still fails the full default-branch gate.
+
+PR coverage is mode-aware:
+
+- Pull requests that touch plugin coverage-relevant files run a single
+  plugin-focused coverage job over `--lib` and `--test unit_tests`, then enforce
+  changed-line coverage for coverable `src/plugins/` lines.
+- Pull requests that do not touch plugin coverage-relevant files keep the
+  required `Merge Coverage` check as a fast no-op.
+- Pushes to `main`, manual dispatches, and scheduled runs still execute the full
+  coverage shard matrix and enforce the overall and `src/plugins/` thresholds.
+
+Plugin coverage-relevant paths are `src/plugins/**`, `src/plugin_cache.rs`,
+`tests/unit/plugins/**`,
+`tests/functional/functional_redis_rate_limiting_test.rs`,
+`.github/workflows/coverage.yml`, and
+`scripts/check_coverage_thresholds.py`. Generated, ignored, or otherwise
+non-coverable changed lines are ignored consistently with the LCOV report.
+
+To inspect the same remote results without running coverage locally:
+
+```bash
+gh run list --repo ferrum-edge/ferrum-edge --workflow Coverage --branch main
+gh run download <run-id> --repo ferrum-edge/ferrum-edge --name coverage-report --dir /tmp/ferrum-coverage
+python3 scripts/check_coverage_thresholds.py \
+  --coverage-json /tmp/ferrum-coverage/coverage.json \
+  --lcov /tmp/ferrum-coverage/lcov.info \
+  --min-overall-line 78.28 \
+  --min-plugins-line 84.98
+```
+
+For PR changed-line investigation, compare against the PR base SHA:
+
+```bash
+python3 scripts/check_coverage_thresholds.py \
+  --coverage-json /tmp/ferrum-coverage/coverage.json \
+  --lcov /tmp/ferrum-coverage/lcov.info \
+  --changed-base <base-sha> \
+  --min-changed-plugins-line 84.98
+```
+
+The normal PR `CI` workflow also includes required plugin hardening regression
+jobs:
+
+- `Plugin Hardening Unit Regressions`: cache byte accounting and
+  last-known-good plugin reload regressions.
+- `Plugin Hardening Redis Regression`: multi-instance Redis request
+  deduplication with `FERRUM_REDIS_REQUIRED=1`, so Redis startup failures cannot
+  silently skip the regression.
 
 Latest opt-in functional benchmark: **81.68% line coverage**
 (`148,432/181,717` lines), captured locally on 2026-05-25 with

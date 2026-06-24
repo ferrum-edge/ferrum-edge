@@ -252,6 +252,7 @@ mod tests {
             locality: None,
             service_account: Some(name.to_string()),
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }
     }

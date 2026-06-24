@@ -30,9 +30,9 @@ This guide covers deploying Ferrum Edge across multiple regions for high availab
 Each region runs:
 - A **Control Plane** instance polling the shared database
 - Multiple **Data Plane** instances receiving config from CPs via gRPC
-- An optional local **read replica** for reduced polling latency
+- An optional local SQL **read replica** for eligible admin-read offload
 
-Each CP is stateless — it simply polls the database and broadcasts config. The database cluster handles replication, conflict resolution, and consistency.
+Each CP is stateless — it polls the primary-consistent database view and broadcasts config. The database cluster handles replication, conflict resolution, and consistency.
 
 ## How It Works
 
@@ -73,7 +73,7 @@ PostgreSQL supports several multi-region strategies:
 - One primary accepts writes; standbys in other regions replicate via streaming
 - On primary failure, Patroni promotes a standby automatically
 - Use `FERRUM_DB_FAILOVER_URLS` to list standby connection URLs
-- Use `FERRUM_DB_READ_REPLICA_URL` per-region to offload polling reads to local standby
+- Use `FERRUM_DB_READ_REPLICA_URL` per-region only for eligible admin-read offload; runtime config polling still reads the primary-consistent writer endpoint
 
 ```bash
 # US East CP (primary DB in US East)
@@ -81,7 +81,7 @@ FERRUM_DB_URL=postgres://user:pass@pg-east:5432/ferrum
 FERRUM_DB_FAILOVER_URLS=postgres://user:pass@pg-west:5432/ferrum,postgres://user:pass@pg-central:5432/ferrum
 FERRUM_DB_READ_REPLICA_URL=postgres://user:pass@pg-east-replica:5432/ferrum
 
-# US West CP (primary in East, local read replica)
+# US West CP (primary in East, local admin-read replica)
 FERRUM_DB_URL=postgres://user:pass@pg-east:5432/ferrum
 FERRUM_DB_FAILOVER_URLS=postgres://user:pass@pg-west:5432/ferrum,postgres://user:pass@pg-central:5432/ferrum
 FERRUM_DB_READ_REPLICA_URL=postgres://user:pass@pg-west-replica:5432/ferrum
@@ -169,15 +169,10 @@ FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/fe
 ```
 
 - **Writes** go to the primary (elected automatically)
-- **Reads** can go to local secondaries via `readPreference=secondaryPreferred` in the connection string
+- **Reads** used for Ferrum config polling go to the primary-consistent client view; URI `readPreference` is ignored by Ferrum's config store
 - **Failover** is automatic — the driver routes to the new primary within seconds
 - `FERRUM_DB_FAILOVER_URLS` is not needed — list all members in `FERRUM_DB_URL`
-- `FERRUM_DB_READ_REPLICA_URL` is not needed — use `readPreference` in the connection string
-
-```bash
-# CP reads locally with secondaryPreferred, writes auto-route to primary
-FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred
-```
+- `FERRUM_DB_READ_REPLICA_URL` is SQL-only and is not used by MongoDB
 
 - **Pro**: Native multi-region with automatic primary election, no external tooling needed
 - **Con**: Single write primary (like PG streaming replication). Writes during network partition require majority quorum
@@ -286,7 +281,7 @@ MongoDB simplifies the deployment significantly — no failover URLs or read rep
 FERRUM_MODE=cp
 FERRUM_NAMESPACE=us-east   # or us-west, us-central per region
 FERRUM_DB_TYPE=mongodb
-FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred
+FERRUM_DB_URL=mongodb://mongo-east:27017,mongo-west:27017,mongo-central:27017/ferrum?replicaSet=rs0
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
 FERRUM_CP_DP_GRPC_JWT_SECRET=$GRPC_JWT_SECRET
 FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET

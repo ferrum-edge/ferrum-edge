@@ -170,11 +170,11 @@ docker compose --profile mongodb up -d
 curl http://localhost:9002/health
 ```
 
-Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, read preference, and managed service configuration.
+Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
 
 **Key differences from SQL**:
 - Indexes created automatically instead of SQL migrations
-- Read/write splitting via `readPreference` in connection string (not `FERRUM_DB_READ_REPLICA_URL`)
+- Runtime config reads are primary-consistent; MongoDB `readPreference` is ignored by Ferrum's config store
 - `FERRUM_DB_POOL_*` settings are ignored — MongoDB driver manages its own pool
 
 ### 4. CP/DP Distributed Mode (Horizontal Scaling)

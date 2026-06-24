@@ -1,6 +1,8 @@
 use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::waf::Waf;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
+use ferrum_edge::plugins::{
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -1241,7 +1243,10 @@ fn header_value_target_names_must_be_non_empty_when_provided() {
 
 #[test]
 fn waf_is_security_critical() {
-    assert!(is_security_plugin("waf"));
+    assert_eq!(
+        plugin_failure_policy("waf"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
 }
 
 #[tokio::test]

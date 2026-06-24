@@ -15,6 +15,10 @@
 //! ) -> Result<Option<std::sync::Arc<dyn crate::plugins::Plugin>>, String> {
 //!     Ok(Some(std::sync::Arc::new(MyPlugin::new(config)?)))
 //! }
+//!
+//! pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
+//!     crate::plugins::PluginFailurePolicy::KeepLastKnownGood
+//! }
 //! ```
 //!
 //! The `new()` constructor must return `Result<Self, String>` and validate the

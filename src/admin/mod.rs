@@ -174,7 +174,7 @@ pub async fn start_admin_listener(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls(addr, state, shutdown, None).await
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None).await
 }
 
 /// Start the Admin API listener with optional TLS support.
@@ -184,8 +184,23 @@ pub async fn start_admin_listener_with_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
+}
+
+/// Start the Admin API listener with optional TLS support and signal readiness
+/// after the TCP socket binds successfully.
+pub async fn start_admin_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
     serve_admin_on_listener(listener, state, shutdown, tls_config).await
 }
 
@@ -201,8 +216,23 @@ pub async fn start_admin_listener_with_dynamic_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
 ) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_dynamic_tls_and_signal(addr, state, shutdown, tls_slot, None).await
+}
+
+/// Start the Admin API HTTPS listener with a hot-swappable frontend TLS slot
+/// and signal readiness after the TCP socket binds successfully.
+pub async fn start_admin_listener_with_dynamic_tls_and_signal(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
     serve_admin_on_listener_with_dynamic_tls(listener, state, shutdown, tls_slot).await
 }
 
@@ -689,6 +719,32 @@ pub async fn handle_admin_request(
             health_status["cached_config"] = json!({
                 "available": false
             });
+        }
+
+        if state.mode == "database"
+            && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
+                .database_delta_poll_metrics_snapshot()
+        {
+            if let Some(degraded) = snapshot.degraded {
+                health_status["status"] = json!("degraded");
+                health_status["database_polling"] = json!({
+                    "status": "degraded",
+                    "reason": degraded.reason,
+                    "resource_category": degraded.resource_category,
+                    "validation_category": degraded.validation_category,
+                    "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
+                    "current_backoff_bucket": degraded.current_backoff_bucket,
+                    "current_backoff_seconds": degraded.current_backoff_seconds,
+                    "escalated": degraded.escalated,
+                });
+            } else {
+                health_status["database_polling"] = json!({
+                    "status": "ok",
+                    "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
+                    "current_backoff_bucket": snapshot.current_backoff_bucket,
+                    "current_backoff_seconds": snapshot.current_backoff_seconds,
+                });
+            }
         }
 
         if state
@@ -1731,6 +1787,11 @@ async fn handle_mesh_remote_clusters_get(
         .as_ref()
         .as_ref()
         .and_then(|slice| slice.multi_cluster.as_ref());
+    let trust_bundles = applied_slice
+        .as_ref()
+        .as_ref()
+        .and_then(|slice| slice.trust_bundles.as_ref());
+    let federation = mesh_runtime.federation_store().snapshot();
 
     // Discovery is enabled only when the poll interval is positive. Read from
     // the DP's own env config so the flag is populated even before the first
@@ -1741,12 +1802,29 @@ async fn handle_mesh_remote_clusters_get(
         .proxy_state
         .as_ref()
         .is_some_and(|ps| ps.env_config.mesh_remote_discovery_poll_interval_seconds > 0);
+    let federation_poll_enabled = state
+        .proxy_state
+        .as_ref()
+        .is_some_and(|ps| ps.env_config.mesh_federation_poll_interval_seconds > 0);
+    let federation_fail_open = state
+        .proxy_state
+        .as_ref()
+        .is_some_and(|ps| ps.env_config.mesh_federation_fail_open);
+    let inbound_spiffe_verifier_configured = state.proxy_state.as_ref().is_some_and(|ps| {
+        ps.mesh_inbound_spiffe_verifier_active
+            .load(Ordering::Acquire)
+    });
 
     let resp =
         mesh_remote_clusters::build_response(mesh_remote_clusters::MeshRemoteClustersInputs {
             snapshot: snapshot.as_ref(),
             multi_cluster,
+            federation: &federation,
+            trust_bundles,
             discovery_enabled,
+            federation_poll_enabled,
+            federation_fail_open,
+            inbound_spiffe_verifier_configured,
             // `timestamp()` is non-negative for any realistic wall clock; clamp the
             // theoretical pre-epoch case to 0 rather than casting a negative i64.
             now_unix_seconds: chrono::Utc::now().timestamp().max(0) as u64,
@@ -2960,7 +3038,7 @@ fn build_metrics(state: &AdminState) -> Value {
             );
         }
 
-        json!({
+        let mut metrics = json!({
             "gateway": {
                 "mode": state.mode,
                 "ferrum_version": crate::FERRUM_VERSION,
@@ -3026,7 +3104,15 @@ fn build_metrics(state: &AdminState) -> Value {
             "rate_limiting": {
                 "tracked_key_count": rate_limiter_keys,
             },
-        })
+        });
+        if state.mode == "database"
+            && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
+                .database_delta_poll_metrics_snapshot()
+        {
+            metrics["database_polling"] =
+                serde_json::to_value(snapshot).unwrap_or_else(|_| json!(null));
+        }
+        metrics
     } else {
         // CP mode or no proxy state
         json!({

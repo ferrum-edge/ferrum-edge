@@ -1,24 +1,29 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    AppProtocol, MeshService, ServicePort, ServiceTargetPort, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    AppProtocol, MeshService, NodeWaypointEndpoint, ServicePort, ServiceTargetPort, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector, default_node_waypoint_hbone_port,
 };
 
 use super::{
-    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, port_from_u64, string_field,
+    K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, K8sTranslationOptions,
+    RouteBackend, port_from_u64, string_field,
 };
 
 #[derive(Debug, Default)]
 pub(super) struct CoreState {
     services: HashMap<K8sServiceKey, CoreService>,
+    secrets: HashMap<K8sServiceKey, CoreSecret>,
     pods: HashMap<PodKey, CorePod>,
     pod_by_ip: HashMap<String, PodKey>,
     endpoint_slices: Vec<CoreEndpointSlice>,
     node_localities: HashMap<String, String>,
+    node_uids: HashMap<String, String>,
+    node_waypoints_by_node: HashMap<String, CoreNodeWaypointPod>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,10 +46,17 @@ impl PodKey {
 #[derive(Debug)]
 struct CoreService {
     ports: Vec<ServicePort>,
+    has_selector: bool,
     /// `spec.clusterIPs` (fallback `spec.clusterIP`), excluding the headless
     /// sentinel `"None"` and empty strings. Raw-TCP egress maps captured
     /// original destinations to services through these VIPs.
     cluster_ips: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CoreSecret {
+    valid_tls_certificate: bool,
+    tls_material_digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -61,12 +73,20 @@ struct CorePod {
     ports: Vec<WorkloadPort>,
     node_name: Option<String>,
     ready: bool,
+    node_waypoint_proxy: bool,
 }
 
 #[derive(Debug)]
 struct CoreEndpointSlice {
     service_key: K8sServiceKey,
+    ports: Vec<CoreEndpointSlicePort>,
     endpoints: Vec<CoreEndpoint>,
+}
+
+#[derive(Debug)]
+struct CoreEndpointSlicePort {
+    name: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -77,12 +97,28 @@ struct CoreEndpoint {
     node_name: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CoreNodeWaypointPod {
+    address: String,
+    hbone_port: u16,
+    spiffe_id: SpiffeId,
+}
+
+#[derive(Debug)]
+struct CoreAutoWorkload {
+    pod_key: PodKey,
+    workload: Workload,
+}
+
 pub(super) fn is_core_resource_kind(kind: &str) -> bool {
-    matches!(kind, "Pod" | "Service" | "EndpointSlice" | "Node")
+    matches!(
+        kind,
+        "Pod" | "Service" | "EndpointSlice" | "Node" | "Namespace" | "Secret"
+    )
 }
 
 pub(super) fn is_cluster_scoped_core_resource_kind(kind: &str) -> bool {
-    matches!(kind, "Node")
+    matches!(kind, "Node" | "Namespace")
 }
 
 pub(super) fn collect(
@@ -91,6 +127,10 @@ pub(super) fn collect(
 ) -> Result<(), K8sTranslateError> {
     match object.kind.as_str() {
         "Service" => collect_service(acc, object),
+        "Secret" => {
+            collect_secret(acc, object);
+            Ok(())
+        }
         "Pod" => {
             collect_pod(acc, object);
             Ok(())
@@ -133,6 +173,8 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
         }
     }
 
+    let mut service_backed_pod_keys = BTreeSet::new();
+
     for key in service_keys {
         if acc.explicit_service_entries.contains(&key) {
             continue;
@@ -152,9 +194,10 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
             )?;
-            for workload in auto_workloads {
-                workload_ref_strings.push(workload.spiffe_id.as_str().to_string());
-                acc.mesh.workloads.push(workload);
+            for auto in auto_workloads {
+                service_backed_pod_keys.insert(auto.pod_key);
+                workload_ref_strings.push(auto.workload.spiffe_id.as_str().to_string());
+                acc.mesh.workloads.push(auto.workload);
             }
         }
 
@@ -173,6 +216,8 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             cluster_ips: service.cluster_ips.clone(),
         });
     }
+
+    add_identity_only_workloads(acc, &service_backed_pod_keys)?;
 
     Ok(())
 }
@@ -241,6 +286,11 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
         key,
         CoreService {
             ports: service_ports,
+            has_selector: object
+                .spec
+                .get("selector")
+                .and_then(Value::as_object)
+                .is_some_and(|selector| !selector.is_empty()),
             cluster_ips,
         },
     );
@@ -269,7 +319,7 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
             );
         }
     }
-    let pod = CorePod {
+    let mut pod = CorePod {
         namespace: object.metadata.namespace.clone(),
         name: object.metadata.name.clone(),
         uid: object.metadata.uid.clone(),
@@ -282,7 +332,21 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         ports: pod_ports(object),
         node_name: string_field(&object.spec, "nodeName").map(ToOwned::to_owned),
         ready: pod_is_ready(object),
+        node_waypoint_proxy: false,
     };
+    if let Some((node_name, address)) = node_waypoint_pod_candidate(acc, object, &pod) {
+        pod.node_waypoint_proxy = true;
+        for address in &pod.addresses {
+            if acc.core.pod_by_ip.get(address) == Some(&key) {
+                acc.core.pod_by_ip.remove(address);
+            }
+        }
+        if let Some(node_waypoint) = node_waypoint_pod_endpoint(object, &pod, address) {
+            acc.core
+                .node_waypoints_by_node
+                .insert(node_name, node_waypoint);
+        }
+    }
     acc.core.pods.insert(key, pod);
 }
 
@@ -300,6 +364,29 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
     else {
         return;
     };
+
+    let ports = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|port| {
+            let name = string_field(port, "name")
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned);
+            let port = port
+                .get("port")
+                .and_then(Value::as_u64)
+                .filter(|port| *port != 0 && *port <= u16::MAX as u64)
+                .map(|port| port as u16);
+            if name.is_none() && port.is_none() {
+                None
+            } else {
+                Some(CoreEndpointSlicePort { name, port })
+            }
+        })
+        .collect();
 
     let endpoints = object
         .spec
@@ -327,11 +414,213 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
 
     acc.core.endpoint_slices.push(CoreEndpointSlice {
         service_key,
+        ports,
         endpoints,
     });
 }
 
+pub(super) fn secret_is_valid_tls_certificate(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .is_some_and(|secret| secret.valid_tls_certificate)
+}
+
+pub(super) fn secret_tls_material_digest<'a>(
+    acc: &'a K8sAccumulator,
+    namespace: &str,
+    name: &str,
+) -> Option<&'a str> {
+    K8sServiceKey::new(namespace.to_string(), name.to_string())
+        .and_then(|key| acc.core.secrets.get(&key))
+        .and_then(|secret| secret.tls_material_digest.as_deref())
+}
+
+fn collect_secret(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let Some(key) = K8sServiceKey::new(
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    ) else {
+        return;
+    };
+    let valid_tls_certificate = secret_object_is_valid_tls_certificate(object);
+    acc.core.secrets.insert(
+        key,
+        CoreSecret {
+            valid_tls_certificate,
+            tls_material_digest: valid_tls_certificate
+                .then(|| secret_tls_material_digest_for_object(object))
+                .flatten(),
+        },
+    );
+}
+
+fn secret_tls_material_digest_for_object(secret: &K8sObject) -> Option<String> {
+    let data = secret.spec.get("data").and_then(Value::as_object)?;
+    let cert = data.get("tls.crt").and_then(Value::as_str)?;
+    let key = data.get("tls.key").and_then(Value::as_str)?;
+    let mut digest = Sha256::new();
+    digest.update(cert.as_bytes());
+    digest.update([0]);
+    digest.update(key.as_bytes());
+    Some(hex::encode(digest.finalize()))
+}
+
+pub(crate) fn secret_object_is_valid_tls_certificate(secret: &K8sObject) -> bool {
+    if secret.spec.get("type").and_then(Value::as_str) != Some("kubernetes.io/tls") {
+        return false;
+    }
+    let Some(data) = secret.spec.get("data").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(cert) = data.get("tls.crt").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(key) = data.get("tls.key").and_then(Value::as_str) else {
+        return false;
+    };
+    secret_data_decodes_to_valid_tls_pair(cert, key)
+}
+
+fn secret_data_decodes_to_valid_tls_pair(cert_value: &str, key_value: &str) -> bool {
+    let Some(certs) = secret_data_decodes_to_certificate_chain(cert_value) else {
+        return false;
+    };
+    let Some(key) = secret_data_decodes_to_private_key(key_value) else {
+        return false;
+    };
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    rustls::sign::CertifiedKey::from_der(certs, key, &provider).is_ok()
+}
+
+fn secret_data_decodes_to_certificate_chain(
+    value: &str,
+) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        let Ok(certs) = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() else {
+            return None;
+        };
+        (!certs.is_empty()).then_some(certs)
+    })
+}
+
+fn secret_data_decodes_to_private_key(
+    value: &str,
+) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
+    secret_data_decodes_to_bytes(value, |bytes| {
+        let mut reader = std::io::Cursor::new(bytes);
+        rustls_pemfile::private_key(&mut reader).ok().flatten()
+    })
+}
+
+fn secret_data_decodes_to_bytes<T>(
+    value: &str,
+    predicate: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
+    use base64::Engine as _;
+
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        return None;
+    };
+    predicate(&bytes)
+}
+
+pub(super) fn endpoint_route_backends_for_service(
+    acc: &K8sAccumulator,
+    namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    weight: u32,
+) -> Vec<RouteBackend> {
+    if !acc.options.pod_discovery_enabled {
+        return Vec::new();
+    }
+    let Some(service_key) = K8sServiceKey::new(namespace.to_string(), service_name.to_string())
+    else {
+        return Vec::new();
+    };
+    let Some(service) = acc.core.services.get(&service_key) else {
+        return Vec::new();
+    };
+    if service.has_selector && !service.cluster_ips.is_empty() {
+        return Vec::new();
+    }
+
+    let service_port_spec = service
+        .ports
+        .iter()
+        .find(|candidate| candidate.port == service_port);
+    let mut seen = BTreeSet::new();
+    let mut backends = Vec::new();
+    for slice in acc
+        .core
+        .endpoint_slices
+        .iter()
+        .filter(|slice| slice.service_key == service_key)
+    {
+        let Some(target_port) = endpoint_backend_port(service_port_spec, service_port, slice)
+        else {
+            continue;
+        };
+        for endpoint in slice.endpoints.iter().filter(|endpoint| endpoint.ready) {
+            for address in &endpoint.addresses {
+                if address.is_empty() {
+                    continue;
+                }
+                if seen.insert((address.clone(), target_port)) {
+                    backends.push(RouteBackend {
+                        host: address.clone(),
+                        port: target_port,
+                        weight,
+                        service_namespace: Some(namespace.to_string()),
+                        service_name: Some(service_name.to_string()),
+                        service_port: Some(service_port),
+                    });
+                }
+            }
+        }
+    }
+    backends
+}
+
+fn endpoint_backend_port(
+    service_port_spec: Option<&ServicePort>,
+    service_port: u16,
+    slice: &CoreEndpointSlice,
+) -> Option<u16> {
+    match service_port_spec.and_then(|port| port.target_port.as_ref()) {
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => Some(*port),
+        Some(ServiceTargetPort::Name(name)) => slice
+            .ports
+            .iter()
+            .find(|port| port.name.as_deref() == Some(name.as_str()))
+            .and_then(|port| port.port),
+        Some(ServiceTargetPort::Number(_)) => None,
+        None => {
+            if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref())
+                && let Some(port) = slice
+                    .ports
+                    .iter()
+                    .find(|port| port.name.as_deref() == Some(name))
+                    .and_then(|port| port.port)
+            {
+                return Some(port);
+            }
+            Some(service_port)
+        }
+    }
+}
+
 fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {
+    if !object.metadata.uid.is_empty() {
+        acc.core
+            .node_uids
+            .insert(object.metadata.name.clone(), object.metadata.uid.clone());
+    }
     let Some(locality) = node_locality(&object.metadata.labels) else {
         return;
     };
@@ -344,7 +633,7 @@ fn auto_workloads_for_service(
     acc: &K8sAccumulator,
     service_key: &K8sServiceKey,
     endpoint_slice_indices: &[usize],
-) -> Result<Vec<Workload>, K8sTranslateError> {
+) -> Result<Vec<CoreAutoWorkload>, K8sTranslateError> {
     let mut endpoints_by_pod = BTreeMap::new();
     let mut seen_endpoint_addresses: BTreeMap<PodKey, HashSet<String>> = BTreeMap::new();
     for &slice_index in endpoint_slice_indices {
@@ -389,12 +678,38 @@ fn auto_workloads_for_service(
         };
         // EndpointSlice readiness controls service membership, while pod readiness
         // keeps stale cache entries from resurfacing terminating pods.
-        if !pod.ready {
+        if !pod.ready || pod.node_waypoint_proxy {
             continue;
         }
-        workloads.push(workload_from_pod(acc, service_key, pod, &endpoint)?);
+        workloads.push(CoreAutoWorkload {
+            pod_key,
+            workload: workload_from_pod(acc, service_key, pod, &endpoint)?,
+        });
     }
     Ok(workloads)
+}
+
+fn add_identity_only_workloads(
+    acc: &mut K8sAccumulator,
+    service_backed_pod_keys: &BTreeSet<PodKey>,
+) -> Result<(), K8sTranslateError> {
+    let mut pod_keys: Vec<PodKey> = acc.core.pods.keys().cloned().collect();
+    pod_keys.sort();
+    for pod_key in pod_keys {
+        if service_backed_pod_keys.contains(&pod_key) {
+            continue;
+        }
+        let Some(pod) = acc.core.pods.get(&pod_key) else {
+            continue;
+        };
+        if !pod.ready || pod.uid.is_empty() || pod.node_waypoint_proxy {
+            continue;
+        }
+        acc.mesh
+            .workloads
+            .push(identity_only_workload_from_pod(acc, pod)?);
+    }
+    Ok(())
 }
 
 fn workload_from_pod(
@@ -415,6 +730,7 @@ fn workload_from_pod(
     addresses.dedup();
     let node_name = endpoint.node_name.as_deref().or(pod.node_name.as_deref());
     let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
+    let node_waypoint = node_name.and_then(|node| node_waypoint_for_node(acc, node));
 
     Ok(Workload {
         spiffe_id,
@@ -435,7 +751,269 @@ fn workload_from_pod(
         // Per-pod UID for node-waypoint scope keying; `None` when the pod
         // object carried no UID so the resolver falls back to SPIFFE scope.
         pod_uid: (!pod.uid.is_empty()).then(|| pod.uid.clone()),
+        node_waypoint,
         remote_provenance: false,
+    })
+}
+
+fn identity_only_workload_from_pod(
+    acc: &K8sAccumulator,
+    pod: &CorePod,
+) -> Result<Workload, K8sTranslateError> {
+    let path = format!("ns/{}/sa/{}", pod.namespace, pod.service_account);
+    let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
+        .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
+    let locality = pod
+        .node_name
+        .as_deref()
+        .and_then(|node| acc.core.node_localities.get(node).cloned());
+
+    Ok(Workload {
+        spiffe_id,
+        selector: WorkloadSelector {
+            labels: pod.labels.clone(),
+            namespace: Some(pod.namespace.clone()),
+        },
+        service_name: pod.name.clone(),
+        // Identity-only pods feed node-waypoint source identity and scoped
+        // authz. They are not Service backends, so keep them out of direct
+        // Pod-IP routing and outbound registries.
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: acc.options.trust_domain.clone(),
+        namespace: pod.namespace.clone(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality,
+        service_account: Some(pod.service_account.clone()),
+        pod_uid: Some(pod.uid.clone()),
+        node_waypoint: None,
+        remote_provenance: false,
+    })
+}
+
+fn node_waypoint_pod_candidate(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    pod: &CorePod,
+) -> Option<(String, String)> {
+    if !pod.ready
+        || !trusted_node_waypoint_pod_object(&acc.options, object)
+        || !pod_host_network(object)
+    {
+        return None;
+    }
+    let topology = pod_env_value(object, "FERRUM_MESH_TOPOLOGY")?;
+    if !matches_node_waypoint_topology(topology) {
+        return None;
+    }
+    let node_name = pod.node_name.as_ref()?.trim();
+    if node_name.is_empty() {
+        return None;
+    }
+    let address = pod
+        .addresses
+        .iter()
+        .find(|address| !address.trim().is_empty())?
+        .clone();
+    Some((node_name.to_string(), address))
+}
+
+fn node_waypoint_pod_endpoint(
+    object: &K8sObject,
+    pod: &CorePod,
+    address: String,
+) -> Option<CoreNodeWaypointPod> {
+    let hbone_port = node_waypoint_hbone_port(object, pod);
+    let spiffe_id = node_waypoint_spiffe_id(object)?;
+    Some(CoreNodeWaypointPod {
+        address,
+        hbone_port,
+        spiffe_id,
+    })
+}
+
+pub(super) fn trusted_node_waypoint_pod_object(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> bool {
+    object.kind == "Pod"
+        && object.metadata.namespace == options.node_waypoint_namespace
+        && pod_host_network(object)
+        && object
+            .metadata
+            .labels
+            .get("app.kubernetes.io/name")
+            .is_some_and(|value| value == "ferrum-mesh-ambient")
+        && string_field(&object.spec, "serviceAccountName") == Some("ferrum-mesh")
+        && pod_env_value(object, "FERRUM_MESH_TOPOLOGY").is_some_and(matches_node_waypoint_topology)
+}
+
+fn node_waypoint_hbone_port(object: &K8sObject, pod: &CorePod) -> u16 {
+    pod_env_value(object, "FERRUM_MESH_HBONE_LISTEN_ADDR")
+        .and_then(port_from_socket_addr_env)
+        .or_else(|| {
+            pod.ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some("hbone") && port.port != 0)
+                .map(|port| port.port)
+        })
+        .unwrap_or_else(default_node_waypoint_hbone_port)
+}
+
+fn port_from_socket_addr_env(value: &str) -> Option<u16> {
+    value
+        .trim()
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+        .filter(|port| *port != 0)
+}
+
+fn node_waypoint_spiffe_id(object: &K8sObject) -> Option<SpiffeId> {
+    if pod_env_bool_true(object, "FERRUM_MESH_ALLOW_NO_CA") {
+        return None;
+    }
+    for name in ["FERRUM_MESH_WORKLOAD_SPIFFE_ID", "FERRUM_GATEWAY_SPIFFE_ID"] {
+        if let Some(spiffe_id) =
+            pod_env_value_resolved(object, name).and_then(|value| SpiffeId::new(value).ok())
+        {
+            return Some(spiffe_id);
+        }
+    }
+    None
+}
+
+fn node_waypoint_for_node(acc: &K8sAccumulator, node_name: &str) -> Option<NodeWaypointEndpoint> {
+    let waypoint = acc.core.node_waypoints_by_node.get(node_name)?;
+    Some(NodeWaypointEndpoint {
+        address: waypoint.address.clone(),
+        hbone_port: waypoint.hbone_port,
+        spiffe_id: waypoint.spiffe_id.clone(),
+        node_name: Some(node_name.to_string()),
+        node_uid: acc.core.node_uids.get(node_name).cloned(),
+        network: None,
+        cluster: None,
+    })
+}
+
+fn matches_node_waypoint_topology(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    normalized == "node_waypoint"
+}
+
+fn pod_host_network(object: &K8sObject) -> bool {
+    object
+        .spec
+        .get("hostNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn pod_env_value<'a>(object: &'a K8sObject, name: &str) -> Option<&'a str> {
+    object
+        .spec
+        .get("containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|container| {
+            container
+                .get("env")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find_map(|env| {
+            (string_field(env, "name") == Some(name))
+                .then(|| string_field(env, "value"))
+                .flatten()
+        })
+}
+
+fn pod_env_value_resolved(object: &K8sObject, name: &str) -> Option<String> {
+    for container in object
+        .spec
+        .get("containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let mut values = HashMap::new();
+        for env in container
+            .get("env")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(env_name) = string_field(env, "name") else {
+                continue;
+            };
+            if let Some(value) = string_field(env, "value") {
+                let resolved = expand_pod_env_refs(value, &values);
+                if env_name == name {
+                    return Some(resolved);
+                }
+                values.insert(env_name.to_string(), resolved);
+                continue;
+            }
+            if let Some(value) = pod_env_field_ref_value(object, env) {
+                if env_name == name {
+                    return Some(value);
+                }
+                values.insert(env_name.to_string(), value);
+            }
+        }
+    }
+    None
+}
+
+fn expand_pod_env_refs(value: &str, values: &HashMap<String, String>) -> String {
+    let mut resolved = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("$(") {
+        resolved.push_str(&rest[..start]);
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find(')') else {
+            resolved.push_str(&rest[start..]);
+            return resolved;
+        };
+        let name = &after_marker[..end];
+        if let Some(replacement) = values.get(name) {
+            resolved.push_str(replacement);
+        } else {
+            resolved.push_str("$(");
+            resolved.push_str(name);
+            resolved.push(')');
+        }
+        rest = &after_marker[end + 1..];
+    }
+    resolved.push_str(rest);
+    resolved
+}
+
+fn pod_env_field_ref_value(object: &K8sObject, env: &Value) -> Option<String> {
+    match env
+        .get("valueFrom")?
+        .get("fieldRef")?
+        .get("fieldPath")?
+        .as_str()?
+    {
+        "metadata.name" => Some(object.metadata.name.clone()),
+        "metadata.namespace" => Some(object.metadata.namespace.clone()),
+        "metadata.uid" => Some(object.metadata.uid.clone()),
+        "spec.nodeName" => string_field(&object.spec, "nodeName").map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn pod_env_bool_true(object: &K8sObject, name: &str) -> bool {
+    pod_env_value(object, name).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "y" | "on"
+        )
     })
 }
 
@@ -449,9 +1027,14 @@ fn invalid_resource_for_core_pod(pod: &CorePod, message: impl Into<String>) -> K
 }
 
 fn pod_key_for_endpoint_addresses(state: &CoreState, addresses: &[String]) -> Option<PodKey> {
-    addresses
-        .iter()
-        .find_map(|address| state.pod_by_ip.get(address).cloned())
+    addresses.iter().find_map(|address| {
+        let pod_key = state.pod_by_ip.get(address)?;
+        state
+            .pods
+            .get(pod_key)
+            .is_some_and(|pod| !pod.node_waypoint_proxy)
+            .then(|| pod_key.clone())
+    })
 }
 
 fn pod_addresses(object: &K8sObject) -> Vec<String> {
@@ -819,6 +1402,60 @@ mod tests {
         assert_eq!(
             mesh.workloads[0].spiffe_id.as_str(),
             "spiffe://cluster.local/ns/default/sa/reviews"
+        );
+    }
+
+    #[test]
+    fn source_only_ready_pod_materializes_identity_without_service_ref() {
+        let mut dst = ready_pod("reviews-v1", "10.1.0.10");
+        dst.metadata.uid = "11111111-1111-4111-8111-111111111111".to_string();
+
+        let mut src = ready_pod("src-a", "10.1.0.20");
+        src.metadata.uid = "22222222-2222-4222-8222-222222222222".to_string();
+        src.spec["serviceAccountName"] = json!("src-a");
+        src.metadata
+            .labels
+            .insert("app".to_string(), "src-a".to_string());
+
+        let translation = translate_k8s_objects(
+            &[
+                service(),
+                dst,
+                src,
+                endpoint_slice(vec![("reviews-v1", "10.1.0.10")]),
+            ],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        assert_eq!(mesh.services.len(), 1);
+        assert_eq!(mesh.services[0].workloads.len(), 1);
+        assert_eq!(mesh.workloads.len(), 2);
+
+        let source = mesh
+            .workloads
+            .iter()
+            .find(|workload| {
+                workload.pod_uid.as_deref() == Some("22222222-2222-4222-8222-222222222222")
+            })
+            .expect("source-only pod identity workload");
+        assert_eq!(
+            source.spiffe_id.as_str(),
+            "spiffe://cluster.local/ns/default/sa/src-a"
+        );
+        assert_eq!(
+            source.selector.labels.get("app").map(String::as_str),
+            Some("src-a")
+        );
+        assert!(source.addresses.is_empty());
+        assert!(source.ports.is_empty());
+        assert!(
+            mesh.services[0]
+                .workloads
+                .iter()
+                .all(|workload| workload.spiffe_id != source.spiffe_id),
+            "source-only identity workload must not be added to service workload refs"
         );
     }
 

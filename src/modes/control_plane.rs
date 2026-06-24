@@ -12,6 +12,7 @@
 
 use arc_swap::ArcSwap;
 use futures_util::TryStreamExt;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -228,7 +229,7 @@ async fn run_cp_grpc_tls_accept_loop(
 /// Resolve which namespaces the CP polling loop should load on each tick.
 ///
 /// `Single(ns)` / `Set({ns, ...})` return the explicit list directly; `All`
-/// dynamically discovers namespaces from `db.list_namespaces()` so the CP
+/// dynamically discovers namespaces from authoritative primary reads so the CP
 /// picks up new tenants without a restart. Returns at least one namespace
 /// — when `All` is configured but the database is empty, we still load the
 /// gateway's `FERRUM_NAMESPACE` so the admin API works on a fresh cluster.
@@ -243,14 +244,14 @@ async fn resolve_polled_namespaces(
         return explicit;
     }
     // CpScope::All — discover dynamically.
-    match db.list_namespaces().await {
+    match db.list_namespaces_authoritative().await {
         Ok(ns) => merge_discovered_namespaces(ns, retain_on_success, fallback),
         Err(e) => {
             let retained = previous_on_error.unwrap_or(retain_on_success);
             let ns = normalize_namespace_list(retained);
             if !ns.is_empty() {
                 warn!(
-                    "CP scope=All: list_namespaces() failed ({}); keeping previous {} namespace(s): [{}]",
+                    "CP scope=All: authoritative namespace discovery failed ({}); keeping previous {} namespace(s): [{}]",
                     e,
                     ns.len(),
                     ns.join(", ")
@@ -258,7 +259,7 @@ async fn resolve_polled_namespaces(
                 ns
             } else {
                 warn!(
-                    "CP scope=All: list_namespaces() failed ({}); falling back to FERRUM_NAMESPACE='{}'",
+                    "CP scope=All: authoritative namespace discovery failed ({}); falling back to FERRUM_NAMESPACE='{}'",
                     e, fallback
                 );
                 vec![fallback.to_string()]
@@ -313,65 +314,21 @@ fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
 /// per namespace, then concatenates the per-namespace results into a single
 /// `IncrementalResult` so the rest of the polling loop's validate / apply /
 /// partition pipeline stays the same.
-///
-/// The `since` and known-id sets are scoped per namespace inside this
-/// function: each namespace's deletion detection only compares its own
-/// known IDs against its own current IDs (otherwise a removal in namespace
-/// A would look like an unknown ID in namespace B's list and incorrectly
-/// surface). For the back-compat `Single` case, the call collapses to a
-/// single per-namespace fetch identical to the pre-T2-A path.
-#[allow(clippy::too_many_arguments)]
 async fn load_incremental_config_multi(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
-    since: chrono::DateTime<chrono::Utc>,
-    known_proxy_ids: &std::collections::HashSet<String>,
-    known_consumer_ids: &std::collections::HashSet<String>,
-    known_plugin_config_ids: &std::collections::HashSet<String>,
-    known_upstream_ids: &std::collections::HashSet<String>,
-    proxy_ns: &std::collections::HashMap<String, String>,
-    consumer_ns: &std::collections::HashMap<String, String>,
-    plugin_config_ns: &std::collections::HashMap<String, String>,
-    upstream_ns: &std::collections::HashMap<String, String>,
-) -> Result<IncrementalResult, anyhow::Error> {
+    after_sequences: &HashMap<String, u64>,
+) -> Result<(IncrementalResult, HashMap<String, u64>), anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        return db
-            .load_incremental_config(
-                ns,
-                since,
-                known_proxy_ids,
-                known_consumer_ids,
-                known_plugin_config_ids,
-                known_upstream_ids,
-            )
-            .await;
+        let after_sequence = after_sequences.get(ns).copied().unwrap_or(0);
+        let result = db.load_incremental_config(ns, after_sequence).await?;
+        let mut next_sequences = after_sequences.clone();
+        next_sequences.insert(ns.to_string(), result.sequence_cursor);
+        return Ok((result, next_sequences));
     }
 
-    // Build per-namespace known-id subsets so each call's deletion detection
-    // is scoped correctly. A known ID in namespace A must not be compared
-    // against namespace B's "current" list, or the incremental poll would
-    // see it as removed.
-    use std::collections::HashSet;
-    let split_ids = |ids: &HashSet<String>,
-                     lookup: &std::collections::HashMap<String, String>|
-     -> std::collections::HashMap<String, HashSet<String>> {
-        let mut out: std::collections::HashMap<String, HashSet<String>> =
-            std::collections::HashMap::new();
-        for id in ids {
-            if let Some(ns) = lookup.get(id) {
-                out.entry(ns.clone()).or_default().insert(id.clone());
-            }
-        }
-        out
-    };
-    let split_proxies = split_ids(known_proxy_ids, proxy_ns);
-    let split_consumers = split_ids(known_consumer_ids, consumer_ns);
-    let split_plugin_configs = split_ids(known_plugin_config_ids, plugin_config_ns);
-    let split_upstreams = split_ids(known_upstream_ids, upstream_ns);
-
-    let empty: HashSet<String> = HashSet::new();
-    let mut combined_poll_timestamp = None;
+    let mut next_sequences = after_sequences.clone();
     let mut combined = IncrementalResult {
         added_or_modified_proxies: Vec::new(),
         removed_proxy_ids: Vec::new(),
@@ -381,23 +338,17 @@ async fn load_incremental_config_multi(
         removed_plugin_config_ids: Vec::new(),
         added_or_modified_upstreams: Vec::new(),
         removed_upstream_ids: Vec::new(),
+        sequence_cursor: namespaces
+            .iter()
+            .filter_map(|ns| after_sequences.get(ns).copied())
+            .max()
+            .unwrap_or(0),
         poll_timestamp: chrono::Utc::now(),
     };
     for ns in namespaces {
-        let ns_proxies = split_proxies.get(ns).unwrap_or(&empty);
-        let ns_consumers = split_consumers.get(ns).unwrap_or(&empty);
-        let ns_plugin_configs = split_plugin_configs.get(ns).unwrap_or(&empty);
-        let ns_upstreams = split_upstreams.get(ns).unwrap_or(&empty);
-        let mut delta = db
-            .load_incremental_config(
-                ns,
-                since,
-                ns_proxies,
-                ns_consumers,
-                ns_plugin_configs,
-                ns_upstreams,
-            )
-            .await?;
+        let after_sequence = after_sequences.get(ns).copied().unwrap_or(0);
+        let mut delta = db.load_incremental_config(ns, after_sequence).await?;
+        next_sequences.insert(ns.clone(), delta.sequence_cursor);
         combined
             .added_or_modified_proxies
             .append(&mut delta.added_or_modified_proxies);
@@ -422,25 +373,10 @@ async fn load_incremental_config_multi(
         combined
             .removed_upstream_ids
             .append(&mut delta.removed_upstream_ids);
-        // Keep the earliest per-namespace poll start. Writes that land in an
-        // early-polled namespace while later namespaces are still being read
-        // must remain behind the next `since` watermark.
-        let poll_timestamp =
-            min_incremental_poll_timestamp(combined_poll_timestamp, delta.poll_timestamp);
-        combined_poll_timestamp = Some(poll_timestamp);
-        combined.poll_timestamp = poll_timestamp;
+        combined.sequence_cursor = combined.sequence_cursor.max(delta.sequence_cursor);
+        combined.poll_timestamp = combined.poll_timestamp.min(delta.poll_timestamp);
     }
-    Ok(combined)
-}
-
-fn min_incremental_poll_timestamp(
-    current: Option<chrono::DateTime<chrono::Utc>>,
-    next: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
-    match current {
-        Some(current) if current <= next => current,
-        _ => next,
-    }
+    Ok((combined, next_sequences))
 }
 
 /// Load and merge per-namespace `GatewayConfig`s into a single combined config.
@@ -478,12 +414,30 @@ async fn load_full_config_multi(
     Ok(combined)
 }
 
+async fn load_full_config_multi_with_sequence(
+    db: &dyn DatabaseBackend,
+    namespaces: &[String],
+) -> Result<(GatewayConfig, HashMap<String, u64>), anyhow::Error> {
+    let mut sequences = HashMap::new();
+    if namespaces.is_empty() {
+        sequences.insert(
+            "ferrum".to_string(),
+            db.latest_change_sequence("ferrum").await?,
+        );
+    }
+    for ns in namespaces {
+        sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
+    }
+    let config = load_full_config_multi(db, namespaces).await?;
+    Ok((config, sequences))
+}
+
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
 /// each namespace that has at least one changed or removed resource.
 ///
 /// Resources are matched by their `namespace` field; removed IDs are
 /// partitioned via a `(id → namespace)` lookup built from the CP's current
-/// known-IDs sets so deletions reach the right per-namespace channel.
+/// accepted config so deletions reach the right per-namespace channel.
 fn partition_incremental_by_namespace(
     result: IncrementalResult,
     proxy_ns: &std::collections::HashMap<String, String>,
@@ -495,6 +449,7 @@ fn partition_incremental_by_namespace(
 
     let mut buckets: HashMap<String, IncrementalResult> = HashMap::new();
     let poll_timestamp = result.poll_timestamp;
+    let sequence_cursor = result.sequence_cursor;
 
     let make_empty = |ts: chrono::DateTime<chrono::Utc>| IncrementalResult {
         added_or_modified_proxies: Vec::new(),
@@ -505,6 +460,7 @@ fn partition_incremental_by_namespace(
         removed_plugin_config_ids: Vec::new(),
         added_or_modified_upstreams: Vec::new(),
         removed_upstream_ids: Vec::new(),
+        sequence_cursor,
         poll_timestamp: ts,
     };
 
@@ -705,11 +661,15 @@ pub async fn run(
 
             if let Some(ref replica_url) = effective_replica_url {
                 match store.connect_read_replica(replica_url).await {
-                    Ok(()) => info!("Read replica connected for config polling"),
-                    Err(e) => warn!(
-                        "Read replica connection failed, polling will use primary: {}",
-                        e
-                    ),
+                    Ok(()) => info!("Read replica connected for admin reads"),
+                    Err(e) => {
+                        let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
+                        warn!(
+                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds: {}",
+                            db_backend::redact_url(replica_url),
+                            safe_error
+                        );
+                    }
                 }
             }
             Box::new(store)
@@ -755,7 +715,8 @@ pub async fn run(
         );
     }
 
-    let config = load_full_config_multi(db.as_ref(), &polled_namespaces).await?;
+    let (config, initial_change_sequences) =
+        load_full_config_multi_with_sequence(db.as_ref(), &polled_namespaces).await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers, {} plugins, {} upstreams across {} namespace(s)",
         config.proxies.len(),
@@ -1154,6 +1115,7 @@ pub async fn run(
         };
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
+            controller_namespace: env_config.k8s_controller_namespace.clone(),
             trust_domain: env_config.k8s_trust_domain.clone(),
             cluster_domain: env_config.k8s_cluster_domain.clone(),
             istio_root_namespace: env_config.k8s_istio_root_namespace.clone(),
@@ -1163,6 +1125,13 @@ pub async fn run(
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
             watch_node_locality: env_config.k8s_node_locality_enabled,
+            gateway_api_data_plane_service_namespace: env_config
+                .gateway_api_data_plane_service_namespace
+                .clone(),
+            gateway_api_data_plane_service_name: env_config
+                .gateway_api_data_plane_service_name
+                .clone(),
+            gateway_api_status_address: env_config.gateway_api_status_address.clone(),
             // Effective Sidecar ingress materialization gate (F6 §6.2): ingress
             // is materialized only when enforcement is on AND not dry-run,
             // mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run`
@@ -1218,8 +1187,8 @@ pub async fn run(
 
     // Database polling loop -> push incremental deltas to DPs and mesh nodes (with shutdown).
     //
-    // Uses the same incremental polling strategy as database mode: indexed
-    // `updated_at > ?` queries + lightweight ID queries for deletion detection.
+    // Uses the same incremental polling strategy as database mode: durable
+    // change-log reads after the last accepted sequence cursor.
     // Deltas are broadcast as DELTA updates; DPs apply them via apply_incremental.
     // Falls back to FULL_SNAPSHOT on incremental poll failure.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
@@ -1273,21 +1242,15 @@ pub async fn run(
 
         // Track the last known set of resolved IPs for the DB hostname.
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
-        let mut last_replica_ips: Option<Vec<IpAddr>> = None;
+        let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
+            Arc::new(tokio::sync::Mutex::new(None));
         let mut force_full_reload = false;
         let mut last_polled_namespaces = initial_polled_namespaces;
+        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
-        // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
         let mut last_gateway_trust_bundles = initial_config.trust_bundles.clone();
-        let (
-            mut known_proxy_ids,
-            mut known_consumer_ids,
-            mut known_plugin_config_ids,
-            mut known_upstream_ids,
-        ) = db_backend::extract_known_ids(&initial_config);
-        let mut last_poll_at: Option<chrono::DateTime<chrono::Utc>> =
-            Some(initial_config.loaded_at);
+        let mut last_change_sequences = initial_change_sequences;
 
         loop {
             tokio::select! {
@@ -1328,34 +1291,16 @@ pub async fn run(
                         }
                     }
 
-                    // Check if the read replica FQDN now resolves to different IPs
-                    if let Some(ref replica_hostname) = replica_hostname
-                        && let Some(ref replica_url) = replica_url_for_reconnect
-                        && let Ok(ips) = dns_cache_for_poll.resolve_all(replica_hostname, None, None).await
-                    {
-                        let needs_reconnect = match &last_replica_ips {
-                            Some(prev) => {
-                                let mut prev_sorted = prev.clone();
-                                prev_sorted.sort();
-                                let mut cur_sorted = ips.clone();
-                                cur_sorted.sort();
-                                prev_sorted != cur_sorted
-                            }
-                            None => false,
-                        };
-                        if needs_reconnect {
-                            info!(
-                                "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting replica pool",
-                                replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
-                            );
-                            if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
-                                error!(
-                                    "Failed to reconnect read replica pool after DNS change for '{}': {}",
-                                    replica_hostname, e
-                                );
-                            }
-                        }
-                        last_replica_ips = Some(ips);
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                            db_poll.clone(),
+                            Some(replica_url.as_str()),
+                            replica_hostname.as_deref(),
+                            &dns_cache_for_poll,
+                            last_replica_ips.clone(),
+                            replica_reconnect_in_flight.clone(),
+                        )
+                        .await;
                     }
 
                     if force_full_reload {
@@ -1373,23 +1318,13 @@ pub async fn run(
                             Some(&last_polled_namespaces),
                         )
                         .await;
-                        match load_full_config_multi(db_poll.as_ref(), &nslist).await {
-                            Ok(new_config) => {
+                        match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                            Ok((new_config, sequences)) => {
                                 // Treat pool swap as a new source snapshot.
-                                let (
-                                    next_known_proxy_ids,
-                                    next_known_consumer_ids,
-                                    next_known_plugin_config_ids,
-                                    next_known_upstream_ids,
-                                ) = db_backend::extract_known_ids(&new_config);
                                 last_gateway_trust_bundles = new_config.trust_bundles.clone();
-                                last_poll_at = Some(new_config.loaded_at);
+                                last_change_sequences = sequences;
                                 let new_config_arc = Arc::new(new_config.clone());
                                 config_poll.store(new_config_arc.clone());
-                                known_proxy_ids = next_known_proxy_ids;
-                                known_consumer_ids = next_known_consumer_ids;
-                                known_plugin_config_ids = next_known_plugin_config_ids;
-                                known_upstream_ids = next_known_upstream_ids;
                                 last_polled_namespaces = nslist.clone();
                                 force_full_reload = false;
                                 db_available_poll.store(true, Ordering::Relaxed);
@@ -1416,20 +1351,20 @@ pub async fn run(
                             }
                             Err(e) => {
                                 error!(
-                                    "Failed full config reload after DB DNS reconnect; keeping existing config and retrying: {}",
+                                    "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
                                     e
                                 );
                                 db_available_poll.store(false, Ordering::Relaxed);
                                 continue;
                             }
                         }
-                    } else if let Some(since) = last_poll_at {
+                    } else {
                         // Resolve the polled namespace list. For `Single`
                         // / `Set` this is the explicit list (no DB call).
-                        // For `All`, list_namespaces() runs once per tick
-                        // — bounded cost vs. the per-resource queries that
-                        // dominate poll time. Snapshot the current config
-                        // for per-namespace deletion routing.
+                        // For `All`, authoritative namespace discovery runs
+                        // once per tick — bounded cost vs. the per-resource
+                        // queries that dominate poll time. Snapshot the current
+                        // config for per-namespace deletion routing.
                         let current_snapshot = config_poll.load_full();
                         let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
@@ -1450,19 +1385,11 @@ pub async fn run(
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
                             &nslist,
-                            since,
-                            &known_proxy_ids,
-                            &known_consumer_ids,
-                            &known_plugin_config_ids,
-                            &known_upstream_ids,
-                            &current_proxy_ns,
-                            &current_consumer_ns,
-                            &current_plugin_config_ns,
-                            &current_upstream_ns,
+                            &last_change_sequences,
                         )
                         .await
                         {
-                            Ok(result) => {
+                            Ok((result, next_change_sequences)) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
@@ -1471,7 +1398,7 @@ pub async fn run(
                                         .await
                                     {
                                         Ok(GatewayTrustBundlePoll::Unchanged) => {
-                                            last_poll_at = Some(result.poll_timestamp);
+                                            last_change_sequences = next_change_sequences;
                                             continue;
                                         }
                                         Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
@@ -1483,7 +1410,7 @@ pub async fn run(
                                         Err(e) => {
                                             warn!(
                                                 "Failed to refresh gateway trust bundles after empty incremental poll; \
-                                                 leaving last_poll_at unchanged so the next poll retries: {}",
+                                                 leaving the sequence cursor unchanged so the next poll retries: {}",
                                                 e
                                             );
                                             continue;
@@ -1515,25 +1442,13 @@ pub async fn run(
                                         last_gateway_trust_bundles =
                                             source_trust_bundles;
                                     }
-                                    last_poll_at = Some(result.poll_timestamp);
+                                    last_change_sequences = next_change_sequences;
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
 
-                                // Collect ID changes before moving result into
-                                // apply_incremental — needed for known-ID advancement
-                                // after validation passes.
-                                let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
-                                let removed_proxy_ids = result.removed_proxy_ids.clone();
-                                let added_consumer_ids: Vec<String> = result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect();
-                                let removed_consumer_ids = result.removed_consumer_ids.clone();
-                                let added_plugin_config_ids: Vec<String> = result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect();
-                                let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
-                                let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
-                                let removed_upstream_ids = result.removed_upstream_ids.clone();
-
                                 // Apply delta to a cloned config, then validate
-                                // before broadcasting or advancing known IDs.
+                                // before broadcasting or advancing the sequence cursor.
                                 // Mirrors database mode's validate-before-swap
                                 // contract via ProxyState::apply_incremental.
                                 let mut new_config = (*config_poll.load_full()).clone();
@@ -1591,7 +1506,7 @@ pub async fn run(
                                     }
                                     warn!(
                                         "Incremental config update rejected by validation; \
-                                         leaving last_poll_at unchanged so the next poll \
+                                         leaving the sequence cursor unchanged so the next poll \
                                          retries the same rows"
                                     );
                                     continue;
@@ -1621,13 +1536,8 @@ pub async fn run(
                                     }
                                 }
 
-                                // Validation passed — advance known IDs, broadcast
-                                // the delta to DPs, and store the new config.
-                                update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
-                                update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
-                                update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
-                                update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
-
+                                // Validation passed — broadcast the delta to DPs
+                                // and store the new config before advancing the cursor.
                                 // Apply to CP's own in-memory config before broadcasting so
                                 // subscribers that connect during this poll either receive the
                                 // queued delta or load a snapshot that already contains it.
@@ -1684,24 +1594,19 @@ pub async fn run(
                                     partitions.len(),
                                     version
                                 );
-                                last_poll_at = Some(poll_ts);
+                                last_change_sequences = next_change_sequences;
                             }
                             Err(e) => {
                                 warn!(
-                                    "Incremental poll failed, falling back to full reload: {}",
+                                    "Authoritative primary incremental poll failed, falling back to full reload: {}",
                                     e
                                 );
                                 // Fallback to full config load + full snapshot broadcast
-                                match load_full_config_multi(db_poll.as_ref(), &nslist).await {
-                                    Ok(new_config) => {
+                                match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                                    Ok((new_config, sequences)) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
-                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                        known_proxy_ids = p;
-                                        known_consumer_ids = c;
-                                        known_plugin_config_ids = pc;
-                                        known_upstream_ids = u;
                                         last_polled_namespaces = nslist.clone();
-                                        last_poll_at = Some(new_config.loaded_at);
+                                        last_change_sequences = sequences;
                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
@@ -1722,16 +1627,11 @@ pub async fn run(
                                         // try failover URLs before giving up.
                                         match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
-                                                match load_full_config_multi(db_poll.as_ref(), &nslist).await {
-                                                    Ok(new_config) => {
+                                                match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                                                    Ok((new_config, sequences)) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
-                                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
-                                                        known_proxy_ids = p;
-                                                        known_consumer_ids = c;
-                                                        known_plugin_config_ids = pc;
-                                                        known_upstream_ids = u;
                                                         last_polled_namespaces = nslist.clone();
-                                                        last_poll_at = Some(new_config.loaded_at);
+                                                        last_change_sequences = sequences;
                                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
@@ -1750,7 +1650,7 @@ pub async fn run(
                                                     Err(e3) => {
                                                         db_available_poll.store(false, Ordering::Relaxed);
                                                         warn!(
-                                                            "Failover reload also failed (serving cached): {}",
+                                                            "Authoritative primary failover reload also failed (serving cached): {}",
                                                             e3
                                                         );
                                                     }
@@ -1759,7 +1659,7 @@ pub async fn run(
                                             Err(_) => {
                                                 db_available_poll.store(false, Ordering::Relaxed);
                                                 warn!(
-                                                    "Full config reload also failed (serving cached): {}",
+                                                    "Authoritative primary full config reload also failed (serving cached): {}",
                                                     e2
                                                 );
                                             }
@@ -1769,6 +1669,7 @@ pub async fn run(
                             }
                         }
                     }
+
                 }
                 _ = cp_poll_shutdown.changed() => {
                     info!("CP database polling shutting down");
@@ -1851,29 +1752,12 @@ pub async fn run(
         listener_handles.push(handle);
     }
 
-    if listener_handles.is_empty() {
-        let mut wait_shutdown = shutdown_tx.subscribe();
-        while !*wait_shutdown.borrow() {
-            if wait_shutdown.changed().await.is_err() {
-                break;
-            }
-        }
-        info!("Shutdown signal received with no active listeners");
-    } else {
-        let shutdown_on_panic = {
-            let shutdown_tx = shutdown_tx.clone();
-            move || {
-                let _ = shutdown_tx.send(true);
-            }
-        };
-        let listener_drain =
-            crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic);
-        match tokio::time::timeout(Duration::from_secs(5), listener_drain).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => error!("CP listener task failed: {}", err),
-            Err(_) => warn!("CP listeners did not drain within 5s, proceeding with shutdown"),
-        }
-    }
+    wait_for_cp_listeners_until_shutdown_or_exit(
+        listener_handles,
+        shutdown_tx.clone(),
+        Duration::from_secs(5),
+    )
+    .await;
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a DB query). Same 5 s
@@ -1893,17 +1777,103 @@ pub async fn run(
     Ok(())
 }
 
-/// Update a known ID set by adding new IDs and removing deleted ones.
-fn update_known_ids(
-    known: &mut std::collections::HashSet<String>,
-    added: &Vec<String>,
-    removed: &[String],
+async fn wait_for_cp_listeners_until_shutdown_or_exit(
+    listener_handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    drain_timeout: Duration,
 ) {
-    for id in removed {
-        known.remove(id);
+    if listener_handles.is_empty() {
+        wait_for_cp_shutdown(&shutdown_tx).await;
+        info!("Shutdown signal received with no active listeners");
+        return;
     }
-    for id in added {
-        known.insert(id.clone());
+
+    let listener_shutdown_tx = shutdown_tx.clone();
+    let mut listener_monitor = tokio::spawn(async move {
+        monitor_cp_listener_handles_until_exit(
+            listener_handles,
+            listener_shutdown_tx,
+            drain_timeout,
+        )
+        .await
+    });
+    tokio::select! {
+        result = &mut listener_monitor => {
+            log_cp_listener_monitor_result(result);
+        }
+        _ = wait_for_cp_shutdown(&shutdown_tx) => {
+            match tokio::time::timeout(drain_timeout, &mut listener_monitor).await {
+                Ok(result) => {
+                    log_cp_listener_monitor_result(result);
+                }
+                Err(_) => {
+                    warn!("Timed out waiting for CP listeners to drain after shutdown");
+                    listener_monitor.abort();
+                }
+            }
+        }
+    }
+}
+
+async fn monitor_cp_listener_handles_until_exit(
+    listener_handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    drain_timeout: Duration,
+) -> Result<(), tokio::task::JoinError> {
+    let (first_result, _idx, remaining) = futures_util::future::select_all(listener_handles).await;
+    info!("CP listener task exited; triggering control-plane shutdown");
+    let _ = shutdown_tx.send(true);
+
+    let remaining_result = if remaining.is_empty() {
+        Ok(())
+    } else {
+        let shutdown_on_panic = {
+            let shutdown_tx = shutdown_tx.clone();
+            move || {
+                let _ = shutdown_tx.send(true);
+            }
+        };
+        let mut remaining_monitor = tokio::spawn(async move {
+            crate::modes::file::await_listener_handles(remaining, shutdown_on_panic).await
+        });
+        match tokio::time::timeout(drain_timeout, &mut remaining_monitor).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => Err(err),
+            Err(_) => {
+                warn!("Timed out waiting for remaining CP listeners to drain after listener exit");
+                remaining_monitor.abort();
+                Ok(())
+            }
+        }
+    };
+
+    match (first_result, remaining_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn wait_for_cp_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
+    let mut wait_shutdown = shutdown_tx.subscribe();
+    while !*wait_shutdown.borrow() {
+        if wait_shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn log_cp_listener_monitor_result(
+    result: Result<Result<(), tokio::task::JoinError>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            error!("CP listener task failed: {}", err);
+        }
+        Err(err) => {
+            error!("CP listener monitor task failed: {}", err);
+        }
     }
 }
 
@@ -1913,7 +1883,6 @@ mod tests {
     use crate::config::db_backend::IncrementalResult;
     use crate::config::types::*;
     use chrono::Utc;
-    use std::collections::HashSet;
     use std::time::Instant;
 
     fn empty_incremental() -> IncrementalResult {
@@ -1926,6 +1895,7 @@ mod tests {
             removed_plugin_config_ids: vec![],
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
+            sequence_cursor: 0,
             poll_timestamp: Utc::now(),
         }
     }
@@ -2100,47 +2070,6 @@ mod tests {
         let mut items: Vec<(&str, i32)> = vec![];
         upsert_by_id(&mut items, vec![("a", 1)], |item| item.0);
         assert_eq!(items.len(), 1);
-    }
-
-    // update_known_ids
-
-    #[test]
-    fn update_known_ids_adds_and_removes() {
-        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
-        assert!(known.contains("a"));
-        assert!(!known.contains("b"));
-        assert!(known.contains("c"));
-        assert!(known.contains("d"));
-    }
-
-    #[test]
-    fn update_known_ids_remove_nonexistent_is_noop() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
-        assert_eq!(known.len(), 1);
-        assert!(known.contains("a"));
-    }
-
-    #[test]
-    fn update_known_ids_empty_operations() {
-        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
-        update_known_ids(&mut known, &vec![], &[]);
-        assert_eq!(known.len(), 1);
-    }
-
-    #[test]
-    fn multi_namespace_poll_timestamp_keeps_earliest_namespace_start() {
-        let base = Utc::now();
-        let first_namespace = base + chrono::Duration::seconds(2);
-        let later_namespace = base + chrono::Duration::seconds(5);
-        let earliest_namespace = base + chrono::Duration::seconds(1);
-
-        let first = min_incremental_poll_timestamp(None, first_namespace);
-        let second = min_incremental_poll_timestamp(Some(first), later_namespace);
-        let third = min_incremental_poll_timestamp(Some(second), earliest_namespace);
-
-        assert_eq!(third, earliest_namespace);
     }
 
     // apply_incremental_to_config
@@ -2329,6 +2258,100 @@ mod tests {
         assert!(
             !triggered.load(std::sync::atomic::Ordering::SeqCst),
             "panic trigger must NOT fire on a clean shutdown",
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_listener_wait_does_not_apply_drain_timeout_before_shutdown() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut listener_rx = shutdown_tx.subscribe();
+        let listener = tokio::spawn(async move {
+            while !*listener_rx.borrow() {
+                if listener_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let wait_shutdown_tx = shutdown_tx.clone();
+        let wait = tokio::spawn(wait_for_cp_listeners_until_shutdown_or_exit(
+            vec![listener],
+            wait_shutdown_tx,
+            Duration::from_millis(20),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !wait.is_finished(),
+            "CP listener wait must not return before shutdown just because the drain timeout elapsed",
+        );
+
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("CP listener wait should complete after shutdown")
+            .expect("CP listener wait task should not panic");
+    }
+
+    #[tokio::test]
+    async fn cp_listener_exit_triggers_shutdown_and_drains_siblings() {
+        let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
+
+        let grpc = tokio::spawn(async {});
+
+        let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http = tokio::spawn(async move {
+            while !*admin_http_rx.borrow() {
+                if admin_http_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        wait_for_cp_listeners_until_shutdown_or_exit(
+            vec![admin_http, grpc],
+            shutdown_tx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        observed_shutdown
+            .changed()
+            .await
+            .expect("listener exit should send shutdown");
+        assert!(
+            *observed_shutdown.borrow(),
+            "CP listener exit must flip the shared shutdown watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let exited = tokio::spawn(async {});
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![stuck, exited],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("listener-triggered shutdown must not wait forever on stuck siblings");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "listener-triggered drain should honor the configured timeout"
         );
     }
 }

@@ -94,6 +94,7 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         locality: None,
         service_account: None,
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     }
 }

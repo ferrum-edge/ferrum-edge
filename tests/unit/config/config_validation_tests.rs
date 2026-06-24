@@ -224,12 +224,12 @@ fn test_hosts_overlap_wildcard_does_not_match_base_domain() {
 }
 
 #[test]
-fn test_hosts_overlap_wildcard_does_not_match_multi_level() {
+fn test_hosts_overlap_wildcard_matches_multi_level() {
     let a = vec!["*.example.com".to_string()];
     let b = vec!["a.b.example.com".to_string()];
     assert!(
-        !hosts_overlap(&a, &b),
-        "*.example.com should NOT match multi-level subdomain"
+        hosts_overlap(&a, &b),
+        "*.example.com should match multi-level subdomains"
     );
 }
 

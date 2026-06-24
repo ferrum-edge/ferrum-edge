@@ -55,3 +55,26 @@ pub(crate) fn headers_have_cache_control_directive(
         name.eq_ignore_ascii_case("cache-control") && cache_control_has_directive(value, directive)
     })
 }
+
+pub(crate) fn etag_value_is_strong(value: &str) -> bool {
+    !etag_value_is_weak(value)
+}
+
+fn etag_value_is_weak(value: &str) -> bool {
+    let value = value.trim();
+    let Some(rest) = value.strip_prefix("W/") else {
+        return false;
+    };
+    let Some(opaque_tag) = rest.strip_prefix('"').and_then(|tag| tag.strip_suffix('"')) else {
+        return false;
+    };
+    opaque_tag
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x7e | 0x80..=0xff))
+}
+
+pub(crate) fn headers_have_strong_etag(headers: &HashMap<String, String>) -> bool {
+    headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("etag") && etag_value_is_strong(value))
+}
