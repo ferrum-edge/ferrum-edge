@@ -260,8 +260,7 @@ impl BpfMaps {
     pub fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
         let key = ipv4_to_nbo_key(ip);
         let map = &mut self.pod_ips;
-        map.remove(&key)
-            .map_err(|e| format!("Failed to remove pod IP {ip}: {e}"))
+        tolerate_missing_map_remove(map.remove(&key), || format!("pod IP {ip}"))
     }
 
     pub fn insert_pod_ip6(&mut self, ip: Ipv6Addr, info: &PodInfo) -> Result<(), String> {
@@ -278,8 +277,7 @@ impl BpfMaps {
     pub fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
         let key = CidrKey6::host(ipv6_to_nbo_words(ip));
         let map = &mut self.pod_ips6;
-        map.remove(&key)
-            .map_err(|e| format!("Failed to remove pod IPv6 {ip}: {e}"))
+        tolerate_missing_map_remove(map.remove(&key), || format!("pod IPv6 {ip}"))
     }
 
     pub fn insert_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {

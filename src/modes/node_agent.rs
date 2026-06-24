@@ -167,6 +167,7 @@ impl NodeSourceIps {
         }
     }
 
+    #[cfg(test)]
     fn extend(&mut self, other: NodeSourceIps) {
         for ip in other.ipv4 {
             self.insert(std::net::IpAddr::V4(ip));
@@ -325,12 +326,6 @@ fn node_agent_node_source_ips_from_env() -> Result<NodeSourceIps, String> {
     Ok(ips)
 }
 
-fn node_agent_node_source_ips() -> Result<NodeSourceIps, String> {
-    let mut ips = node_agent_node_source_ips_from_env()?;
-    ips.extend(discover_host_interface_node_source_ips());
-    Ok(ips)
-}
-
 fn insert_node_source_ip(ips: &mut NodeSourceIps, var_name: &str, raw: &str) -> Result<(), String> {
     if raw.is_empty() {
         return Ok(());
@@ -344,71 +339,6 @@ fn insert_node_source_ip(ips: &mut NodeSourceIps, var_name: &str, raw: &str) -> 
             "{var_name} contains invalid IP address '{raw}': {e}"
         )),
     }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn discover_host_interface_node_source_ips() -> NodeSourceIps {
-    struct IfAddrsGuard(*mut libc::ifaddrs);
-
-    impl Drop for IfAddrsGuard {
-        fn drop(&mut self) {
-            // Safety: the pointer is returned by getifaddrs and owned by this guard.
-            unsafe { libc::freeifaddrs(self.0) };
-        }
-    }
-
-    let mut first: *mut libc::ifaddrs = std::ptr::null_mut();
-    // Safety: getifaddrs initializes `first` on success. The list is released
-    // by `IfAddrsGuard` before returning.
-    if unsafe { libc::getifaddrs(&mut first) } != 0 || first.is_null() {
-        return NodeSourceIps::default();
-    }
-    let _guard = IfAddrsGuard(first);
-    let mut ips = NodeSourceIps::default();
-    let mut cursor = first;
-
-    while !cursor.is_null() {
-        // Safety: `cursor` walks the getifaddrs linked list until null.
-        let ifaddr = unsafe { &*cursor };
-        if ifaddr.ifa_addr.is_null()
-            || (ifaddr.ifa_flags & (libc::IFF_UP as u32)) == 0
-            || (ifaddr.ifa_flags & (libc::IFF_LOOPBACK as u32)) != 0
-        {
-            cursor = ifaddr.ifa_next;
-            continue;
-        }
-
-        // Safety: `ifa_addr` points to a sockaddr whose family selects the cast.
-        let family = unsafe { (*ifaddr.ifa_addr).sa_family as libc::c_int };
-        match family {
-            libc::AF_INET => {
-                // Safety: AF_INET guarantees sockaddr_in layout.
-                let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in) };
-                let ip = std::net::Ipv4Addr::from(sockaddr.sin_addr.s_addr.to_ne_bytes());
-                if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() {
-                    ips.insert(std::net::IpAddr::V4(ip));
-                }
-            }
-            libc::AF_INET6 => {
-                // Safety: AF_INET6 guarantees sockaddr_in6 layout.
-                let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in6) };
-                let ip = std::net::Ipv6Addr::from(sockaddr.sin6_addr.s6_addr);
-                if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() {
-                    ips.insert(std::net::IpAddr::V6(ip));
-                }
-            }
-            _ => {}
-        }
-
-        cursor = ifaddr.ifa_next;
-    }
-
-    ips
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn discover_host_interface_node_source_ips() -> NodeSourceIps {
-    NodeSourceIps::default()
 }
 
 fn pod_probe_ports_from_spec(spec: Option<&PodSpec>) -> Vec<u16> {
@@ -4252,7 +4182,7 @@ fn initialize_backend(
     }
 
     if require_sock_ops {
-        let node_source_ips = match node_agent_node_source_ips() {
+        let node_source_ips = match node_agent_node_source_ips_from_env() {
             Ok(ips) => ips,
             Err(e) => {
                 metrics.set_topology_degraded("capture_unavailable");
@@ -4277,8 +4207,8 @@ fn initialize_backend(
         if node_source_ips.is_empty() {
             warn!(
                 "NodeWaypoint inbound direct-pod guard has no FERRUM_NODE_AGENT_NODE_IP(S) \
-                 configured and no host interface IPs were discovered; Kubernetes host-network \
-                 probes will not be exempt until the node-agent receives a node source IP"
+                 configured; Kubernetes host-network probes will not be exempt until an \
+                 operator supplies trusted kubelet probe source IPs"
             );
         }
     }

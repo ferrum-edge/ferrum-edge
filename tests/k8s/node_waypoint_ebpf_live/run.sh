@@ -44,6 +44,7 @@ LIVE_ASSERTIONS_FILE="${FERRUM_LIVE_ASSERTIONS_FILE:-$RESULTS_DIR/live-assertion
 LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-dual-stack-node-waypoint-ebpf}"
 LIVE_ASSERTIONS_INITIALIZED=false
 RECORDED_LIVE_ASSERTIONS=" "
+TRUSTED_KUBELET_PROBE_IPS=""
 REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ebpf.chart_profile
   node_waypoint.ebpf.capture_ready
@@ -82,6 +83,11 @@ if [[ "${FERRUM_EBPF_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
   echo "Refusing to run against the current kube-context without FERRUM_EBPF_LIVE_ACK_DISPOSABLE=true" >&2
   exit 1
 fi
+
+helm_set_string_escape() {
+  local value="$1"
+  printf '%s' "${value//,/\\,}"
+}
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -451,10 +457,29 @@ render_chart_assertions() {
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
     ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
-    ! grep -A3 "name: FERRUM_NODE_AGENT_NODE_IP" <<<"$rendered" | grep -q "fieldPath: status.hostIP" ||
+    grep -q "name: FERRUM_NODE_AGENT_NODE_IP" <<<"$rendered" ||
+    grep -q "name: FERRUM_NODE_AGENT_NODE_IPS" <<<"$rendered" ||
     [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]]; then
-    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases" >&2
-    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|FERRUM_NODE_AGENT_NODE_IP|status.hostIP|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases or rendered implicit probe source trust" >&2
+    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|FERRUM_NODE_AGENT_NODE_IP|FERRUM_NODE_AGENT_NODE_IPS|status.hostIP|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  local trusted_probe_render_ips="10.244.1.1,10.244.2.1"
+  local trusted_probe_render_ips_helm
+  trusted_probe_render_ips_helm="$(helm_set_string_escape "$trusted_probe_render_ips")"
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_render_ips_helm")"
+  if ! grep -A1 "name: FERRUM_NODE_AGENT_NODE_IPS" <<<"$rendered" | grep -q "value: \"$trusted_probe_render_ips\""; then
+    echo "NodeWaypoint render did not emit explicit trusted kubelet probe source IPs" >&2
+    grep -nE 'FERRUM_NODE_AGENT_NODE_IPS|trustedKubeletProbeSourceIps' <<<"$rendered" >&2 || true
     exit 1
   fi
 
@@ -591,6 +616,21 @@ render_chart_assertions() {
 
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set-string nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS=10.244.1.1 >/tmp/ferrum-node-agent-managed-probe-env-render.out 2>&1; then
+    echo "Node-agent render accepted a chart-managed probe source env override" >&2
+    cat /tmp/ferrum-node-agent-managed-probe-env-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS is chart-managed" /tmp/ferrum-node-agent-managed-probe-env-render.out; then
+    echo "Node-agent render rejected managed probe env override without a clear error" >&2
+    cat /tmp/ferrum-node-agent-managed-probe-env-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
     --set nodeAgent.enabled=true \
@@ -658,6 +698,42 @@ label_nodes() {
   log "labeling test nodes"
   kubectl label node "$NODE_A" ferrum.io/live-node=a --overwrite
   kubectl label node "$NODE_B" ferrum.io/live-node=b --overwrite
+}
+
+discover_trusted_kubelet_probe_ips() {
+  log "deriving trusted kubelet probe source IPs from node PodCIDRs"
+  TRUSTED_KUBELET_PROBE_IPS="$(kubectl get node "$NODE_A" "$NODE_B" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+data = json.load(sys.stdin)
+items = data.get("items") or [data]
+seen = set()
+out = []
+for node in items:
+    spec = node.get("spec") or {}
+    cidrs = spec.get("podCIDRs") or []
+    if not cidrs and spec.get("podCIDR"):
+        cidrs = [spec["podCIDR"]]
+    for raw in cidrs:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+            ip = next(network.hosts())
+        except (StopIteration, ValueError):
+            continue
+        text = str(ip)
+        if text not in seen:
+            seen.add(text)
+            out.append(text)
+print(",".join(out))
+')"
+  if [[ -z "$TRUSTED_KUBELET_PROBE_IPS" ]]; then
+    echo "could not derive trusted kubelet probe source IPs from node PodCIDRs" >&2
+    kubectl get node "$NODE_A" "$NODE_B" -o json >&2 || true
+    exit 1
+  fi
+  log "trusted kubelet probe source IPs: $TRUSTED_KUBELET_PROBE_IPS"
 }
 
 node_waypoint_spiffe_template() {
@@ -742,6 +818,8 @@ install_spire_production_identity() {
 install_ferrum() {
   log "installing Ferrum chart"
   local -a identity_args=()
+  local trusted_probe_ips_helm
+  trusted_probe_ips_helm="$(helm_set_string_escape "$TRUSTED_KUBELET_PROBE_IPS")"
   if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
     local spire_id_template
     spire_id_template="$(node_waypoint_spiffe_template)"
@@ -802,6 +880,7 @@ install_ferrum() {
     --set nodeAgent.proxyMode=node_waypoint \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
     --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
+    --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_ips_helm" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR" \
     --set nodeAgent.fallbackMode=fail \
     --wait \
@@ -2332,6 +2411,7 @@ init_live_assertions
 render_chart_assertions
 validate_cluster
 label_nodes
+discover_trusted_kubelet_probe_ips
 install_spire_production_identity
 install_ferrum
 verify_ambient_spire_identity

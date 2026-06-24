@@ -6,9 +6,11 @@
 //! enrolled pod IPs are dropped unless they carry the NodeWaypoint relay's
 //! authorized socket mark; non-initial TCP packets are allowed so replies for
 //! intentionally bypassed outbound flows can return to the pod. Direct UDP is
-//! failed closed for NodeWaypoint because there is no authorized relay path yet.
-//! Local node source IPs can only bypass this guard for enrolled Kubernetes probe
-//! ports.
+//! failed closed for NodeWaypoint because there is no authorized relay path yet,
+//! except DNS responses from source port 53 to high pod-originated client ports
+//! (>=32768).
+//! Explicitly configured local node source IPs can only bypass this guard for
+//! enrolled Kubernetes probe ports.
 
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::macros::classifier;
@@ -29,6 +31,8 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
+const DNS_PORT: u16 = 53;
+const MIN_DNS_CLIENT_PORT: u16 = 32768;
 
 #[classifier]
 pub fn ferrum_tc_inbound(ctx: TcContext) -> i32 {
@@ -76,7 +80,10 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
             }
             guard_enrolled_destination(ctx)
         }
-        IPPROTO_UDP => drop_unsupported_enrolled_destination(),
+        IPPROTO_UDP => match udp_ports4(ctx) {
+            Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => Ok(TC_ACT_OK),
+            _ => drop_unsupported_enrolled_destination(),
+        },
         _ => Ok(TC_ACT_OK),
     }
 }
@@ -124,7 +131,10 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             }
             guard_enrolled_destination(ctx)
         }
-        IPPROTO_UDP => drop_unsupported_enrolled_destination(),
+        IPPROTO_UDP => match udp_ports6(ctx) {
+            Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => Ok(TC_ACT_OK),
+            _ => drop_unsupported_enrolled_destination(),
+        },
         header if ipv6_extension_header(header) => drop_unsupported_enrolled_destination(),
         _ => Ok(TC_ACT_OK),
     }
@@ -193,6 +203,30 @@ fn tcp_dst_port_and_flags6(ctx: &TcContext) -> Result<(u16, u8), i64> {
     let port: u16 = ctx.load(ETH_HDR_LEN + 40 + 2).map_err(|_| -1i64)?;
     let flags: u8 = ctx.load(ETH_HDR_LEN + 40 + 13).map_err(|_| -1i64)?;
     Ok((u16::from_be(port), flags))
+}
+
+#[inline(always)]
+fn udp_ports4(ctx: &TcContext) -> Result<(u16, u16), i64> {
+    let version_ihl: u8 = ctx.load(ETH_HDR_LEN).map_err(|_| -1i64)?;
+    let ihl = ((version_ihl & 0x0f) as usize) * 4;
+    if ihl < 20 {
+        return Err(-1i64);
+    }
+    let src_port: u16 = ctx.load(ETH_HDR_LEN + ihl).map_err(|_| -1i64)?;
+    let dst_port: u16 = ctx.load(ETH_HDR_LEN + ihl + 2).map_err(|_| -1i64)?;
+    Ok((u16::from_be(src_port), u16::from_be(dst_port)))
+}
+
+#[inline(always)]
+fn udp_ports6(ctx: &TcContext) -> Result<(u16, u16), i64> {
+    let src_port: u16 = ctx.load(ETH_HDR_LEN + 40).map_err(|_| -1i64)?;
+    let dst_port: u16 = ctx.load(ETH_HDR_LEN + 40 + 2).map_err(|_| -1i64)?;
+    Ok((u16::from_be(src_port), u16::from_be(dst_port)))
+}
+
+#[inline(always)]
+fn dns_response_allowed(src_port: u16, dst_port: u16) -> bool {
+    src_port == DNS_PORT && dst_port >= MIN_DNS_CLIENT_PORT
 }
 
 #[inline(always)]

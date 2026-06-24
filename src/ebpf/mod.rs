@@ -549,8 +549,12 @@ pub trait EbpfBackend: Send + Sync {
     ) -> Result<(), String>;
     fn detach_pod(&mut self, pod_uid: &str) -> Result<(), String>;
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String>;
+    /// Remove an enrolled pod IPv4 entry. Real BPF maps tolerate ENOENT because
+    /// rollback paths may run before the corresponding update was applied.
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
     fn update_pod_ip6(&mut self, ip: Ipv6Addr, info: &PodInfo) -> Result<(), String>;
+    /// Remove an enrolled pod IPv6 entry. Real BPF maps tolerate ENOENT because
+    /// rollback paths may run before the corresponding update was applied.
     fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
     fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
     fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;

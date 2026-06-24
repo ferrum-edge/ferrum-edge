@@ -225,6 +225,11 @@ nodeAgent:
   captureMode: ebpf
   proxyMode: local_pod
   proxyUid: 1337
+  # Comma-separated source IPs trusted to bypass the NodeWaypoint direct-inbound
+  # guard only when they target Kubernetes HTTP/TCP/gRPC probe ports discovered
+  # from the enrolled pod spec. Keep empty unless the deployment has identified
+  # kubelet probe source addresses (for example CNI bridge gateway IPs).
+  trustedKubeletProbeSourceIps: ""
   # Shared host-path directory used only when proxyMode=node_waypoint. The
   # node-agent publishes one file per enrolled pod here, and the ambient
   # NodeWaypoint proxy consumes it to open per-pod in-netns capture listeners.
