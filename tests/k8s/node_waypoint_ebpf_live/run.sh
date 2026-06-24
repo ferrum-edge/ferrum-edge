@@ -935,11 +935,15 @@ verify_ambient_spire_identity() {
   log "checking ambient NodeWaypoint Workload API SVIDs"
   local spec_file="$RESULTS_DIR/ambient-spire-pods.json"
   mkdir -p "$RESULTS_DIR/ambient-spire-metrics"
-  kubectl -n "$MESH_NS" get pod \
+  if ! kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-ambient \
-    -o json > "$spec_file"
+    -o json >"$spec_file"; then
+    echo "could not fetch ambient NodeWaypoint pod specs" >&2
+    collect_spire_diagnostics
+    return 1
+  fi
 
-  python3 - "$spec_file" "$TRUST_DOMAIN" "$MESH_NS" <<'PY'
+  if ! python3 - "$spec_file" "$TRUST_DOMAIN" "$MESH_NS" <<'PY'
 import json
 import sys
 
@@ -1001,11 +1005,20 @@ if errors:
     print("\n".join(errors), file=sys.stderr)
     raise SystemExit(1)
 PY
+  then
+    collect_spire_diagnostics
+    return 1
+  fi
 
   local -a pod_records
   mapfile -t pod_records < <(kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-ambient \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}')
+  if [[ "${#pod_records[@]}" -eq 0 ]]; then
+    echo "no ambient NodeWaypoint pod records found for SPIRE SVID metric check" >&2
+    collect_spire_diagnostics
+    return 1
+  fi
   local idx=0 pod node expected_spiffe metrics_file pf_log pf_pid fetched port
   for record in "${pod_records[@]}"; do
     IFS=$'\t' read -r pod node <<<"$record"
@@ -1033,7 +1046,7 @@ PY
       echo "ambient pod $pod on $node did not report SPIRE Agent SVID metric for $expected_spiffe" >&2
       cat "$metrics_file" >&2 || true
       collect_spire_diagnostics
-      exit 1
+      return 1
     fi
   done
 
@@ -2836,7 +2849,6 @@ run_spire_restart_recovery_check() {
       "spire-agent-and-nodewaypoint-restarted-svids-reloaded-traffic-and-hbone-authn-recovered" \
       "$(spiffe_for_sa src-a)" \
       "$(spiffe_for_sa dst-a)" \
-      "" \
       "spire-restart-recovery,hbone-negative"
     return
   fi
@@ -2849,7 +2861,6 @@ run_spire_restart_recovery_check() {
     "spire=$spire_ok ambient=$ambient_ok svid=$svid_ok admission=$admission_ok deny_admission=$deny_admission_ok allow=$allow_ok deny=$deny_ok hbone=$hbone_ok" \
     "$(spiffe_for_sa src-a)" \
     "$(spiffe_for_sa dst-a)" \
-    "" \
     "spire-restart-recovery,hbone-negative"
   collect_traffic_failure_diagnostics
   return 1
