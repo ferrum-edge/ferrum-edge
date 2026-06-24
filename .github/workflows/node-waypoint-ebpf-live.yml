@@ -68,7 +68,35 @@ jobs:
           shared-key: "ci-node-waypoint-ebpf-live"
 
       - name: Build normal runtime binary
-        run: cargo build --bin ferrum-edge
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package normal image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Build eBPF runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge --features cloud-secrets,ebpf
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install bpf-linker
+        run: cargo +stable install bpf-linker --locked
+
+      - name: Build eBPF program
+        run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+
+      - name: Package eBPF image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
+          bpf-elf-path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
 
       - name: Install Kubernetes tools
         run: |
@@ -78,20 +106,6 @@ jobs:
           sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           sudo chmod +x /usr/local/bin/kubectl
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-      - name: Package normal image
-        uses: ./.github/actions/package-ferrum-runtime-image
-        with:
-          binary-path: target/debug/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
-
-      - name: Build eBPF image
-        run: |
-          set -euo pipefail
-          docker build \
-            --build-arg FEATURES=cloud-secrets,ebpf \
-            -t "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}-ebpf" \
-            .
 
       - name: Create disposable dual-stack kind cluster
         run: |
