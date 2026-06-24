@@ -648,6 +648,8 @@ pub struct MockEbpfBackend {
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
     pub fail_update_pod_ip: bool,
+    pub fail_update_node_probe_port: bool,
+    pub fail_update_node_probe_port6: bool,
     pub fail_remove_pod_ip: bool,
     pub fail_remove_node_probe_port: bool,
     pub fail_attach_sock_ops: bool,
@@ -757,6 +759,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        if self.fail_update_node_probe_port {
+            return Err(format!(
+                "injected node probe port update failure for {ip}:{port}"
+            ));
+        }
         self.node_probe_ports.insert((ip, port));
         Ok(())
     }
@@ -772,6 +779,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        if self.fail_update_node_probe_port6 {
+            return Err(format!(
+                "injected node IPv6 probe port update failure for {ip}:{port}"
+            ));
+        }
         self.node_probe_ports6.insert((ip, port));
         Ok(())
     }
