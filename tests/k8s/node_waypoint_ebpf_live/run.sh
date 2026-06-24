@@ -76,6 +76,9 @@ if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
     node_waypoint.identity.spire_live_ready
     node_waypoint.identity.spire_workload_entries
     node_waypoint.identity.workload_api_svid
+    node_waypoint.identity.plaintext_hbone_rejected
+    node_waypoint.identity.unauthenticated_hbone_rejected
+    node_waypoint.identity.forged_assertion_rejected
   )
 fi
 
@@ -1330,7 +1333,8 @@ ambient_pod_on_node() {
   kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-ambient \
     --field-selector "spec.nodeName=$node" \
-    -o jsonpath='{.items[0].metadata.name}'
+    -o go-template='{{range .items}}{{- $name := .metadata.name -}}{{- if not .metadata.deletionTimestamp -}}{{- range .status.conditions -}}{{- if and (eq .type "Ready") (eq .status "True") -}}{{ $name }}{{"\n"}}{{- end -}}{{- end -}}{{- end -}}{{- end -}}' |
+    head -n 1
 }
 
 pick_loopback_port() {
@@ -1341,6 +1345,38 @@ with socket.socket() as sock:
     sock.bind(("127.0.0.1", 0))
     print(sock.getsockname()[1])
 PY
+}
+
+ambient_pods() {
+  kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o go-template='{{range .items}}{{- $name := .metadata.name -}}{{- if not .metadata.deletionTimestamp -}}{{- range .status.conditions -}}{{- if and (eq .type "Ready") (eq .status "True") -}}{{ $name }}{{"\n"}}{{- end -}}{{- end -}}{{- end -}}{{- end -}}'
+}
+
+wait_for_port_forward_ready() {
+  local pf_pid="$1"
+  local pf_log="$2"
+  local port="$3"
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$pf_pid" 2>/dev/null; then
+      echo "port-forward process exited before local port $port became ready" >&2
+      cat "$pf_log" >&2 || true
+      return 1
+    fi
+    if grep -q "Forwarding from .*:$port" "$pf_log" 2>/dev/null; then
+      return
+    fi
+    sleep 0.25
+  done
+  echo "port-forward did not become ready on local port $port" >&2
+  cat "$pf_log" >&2 || true
+  return 1
+}
+
+stop_port_forward() {
+  local pf_pid="$1"
+  kill "$pf_pid" 2>/dev/null || true
+  wait "$pf_pid" 2>/dev/null || true
 }
 
 fetch_node_waypoint_identities_for_node() {
@@ -1783,17 +1819,14 @@ wait_for_ambient_mesh_slice() {
   token="$(admin_bearer_token)"
   local drift_dir="$RESULTS_DIR/mesh-drift"
   mkdir -p "$drift_dir"
-  local -a ambient_pods
-  mapfile -t ambient_pods < <(kubectl -n "$MESH_NS" get pod \
-    -l app.kubernetes.io/name=ferrum-mesh-ambient \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-  if [[ "${#ambient_pods[@]}" -lt 2 ]]; then
-    echo "expected at least two ambient pods, found ${#ambient_pods[@]}" >&2
-    kubectl -n "$MESH_NS" get pods -o wide >&2
-    exit 1
-  fi
 
   for attempt in $(seq 1 60); do
+    local -a ambient_pods
+    mapfile -t ambient_pods < <(ambient_pods)
+    if [[ "${#ambient_pods[@]}" -lt 2 ]]; then
+      sleep 2
+      continue
+    fi
     local ready=0
     local idx=0
     for pod in "${ambient_pods[@]}"; do
@@ -1838,6 +1871,7 @@ wait_for_ambient_mesh_slice() {
   done
 
   echo "ambient proxies did not accept the expected live mesh slice" >&2
+  kubectl -n "$MESH_NS" get pods -o wide >&2 || true
   for file in "$drift_dir"/*; do
     echo "--- $file" >&2
     cat "$file" >&2 || true
@@ -2142,6 +2176,362 @@ expect_blocked_from_namespace() {
   rm -f "$err"
 }
 
+hbone_probe_error_is_transport_rejection() {
+  local err="$1"
+  grep -Eiq 'SSL|TLS|alert|handshake|certificate|connection reset|empty reply|unexpected eof|Recv failure|server returned nothing|HTTP/0\.9|HTTP/2 stream .*PROTOCOL_ERROR' "$err"
+}
+
+hbone_probe_body_is_unauthenticated_policy_rejection() {
+  local out="$1"
+  local body expected
+  [[ -f "$out" ]] || return 1
+  body="$(cat "$out")"
+  body="${body//$'\r'/}"
+  body="${body#"${body%%[![:space:]]*}"}"
+  body="${body%"${body##*[![:space:]]}"}"
+  expected='{"error":"Mesh authorization denied: missing per-pod policy scope"}'
+  [[ "$body" == "$expected" ]]
+}
+
+run_hbone_listener_negative_probe_for_pod() {
+  local mode="$1"
+  local ambient_pod="$2"
+  local port pf_log pf_pid out err status code url
+  port="$(pick_loopback_port)"
+  mkdir -p "$RESULTS_DIR/hbone-negative"
+  out="$RESULTS_DIR/hbone-negative/$mode-$ambient_pod.out"
+  err="$RESULTS_DIR/hbone-negative/$mode-$ambient_pod.err"
+  pf_log="$RESULTS_DIR/hbone-negative/$mode-$ambient_pod-port-forward.log"
+
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:15008" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  if ! wait_for_port_forward_ready "$pf_pid" "$pf_log" "$port"; then
+    stop_port_forward "$pf_pid"
+    return 1
+  fi
+
+  set +e
+  case "$mode" in
+    plaintext)
+      url="http://127.0.0.1:$port"
+      code="$(curl -sS -m 8 -o "$out" -w "%{http_code}" -X CONNECT \
+        --request-target "127.0.0.1:8080" \
+        "$url" 2>"$err")"
+      ;;
+    unauthenticated)
+      url="https://127.0.0.1:$port"
+      code="$(curl -k --http2 -sS -m 8 -o "$out" -w "%{http_code}" -X CONNECT \
+        --request-target "127.0.0.1:8080" \
+        -H "baggage: source.principal=$(spiffe_for_sa src-a)" \
+        "$url" 2>"$err")"
+      ;;
+    *)
+      echo "unsupported HBONE negative probe mode '$mode'" >&2
+      status=1
+      code=""
+      ;;
+  esac
+  status=$?
+  set -e
+  stop_port_forward "$pf_pid"
+
+  if [[ "$status" -ne 0 && "${code:-000}" == "000" ]] && hbone_probe_error_is_transport_rejection "$err"; then
+    return
+  fi
+
+  if [[ "$mode" == "unauthenticated" && "$status" -eq 0 && "$code" == "403" ]] && \
+    hbone_probe_body_is_unauthenticated_policy_rejection "$out"; then
+    return
+  fi
+
+  echo "expected $mode HBONE probe against $ambient_pod to fail at transport/client-auth/authz boundary, got curl status=$status HTTP ${code:-<none>}" >&2
+  cat "$err" >&2 || true
+  [[ -f "$out" ]] && cat "$out" >&2 || true
+  return 1
+}
+
+run_hbone_listener_negative_check() {
+  local assertion_id="$1"
+  local mode="$2"
+  local outcome="$3"
+  local -a pods
+  mapfile -t pods < <(ambient_pods)
+  if [[ "${#pods[@]}" -lt 2 ]]; then
+    echo "expected at least two ambient pods for HBONE listener negative check, found ${#pods[@]}" >&2
+    kubectl -n "$MESH_NS" get pods -o wide >&2 || true
+    record_live_assertion \
+      "$assertion_id" \
+      fail \
+      unmanaged-a \
+      dst-a \
+      "missing-ambient-pods" \
+      "none" \
+      "$(spiffe_for_sa dst-a)" \
+      "hbone-negative"
+    return 1
+  fi
+
+  local pod
+  for pod in "${pods[@]}"; do
+    if ! run_hbone_listener_negative_probe_for_pod "$mode" "$pod"; then
+      record_live_assertion \
+        "$assertion_id" \
+        fail \
+        unmanaged-a \
+        dst-a \
+        "unexpected-$mode-hbone-admission-on-$pod" \
+        "none" \
+        "$(spiffe_for_sa dst-a)" \
+        "hbone-negative"
+      return 1
+    fi
+  done
+
+  record_live_assertion \
+    "$assertion_id" \
+    pass \
+    unmanaged-a \
+    dst-a \
+    "$outcome-all-ambient-pods" \
+    "none" \
+    "$(spiffe_for_sa dst-a)" \
+    "hbone-negative"
+}
+
+run_plaintext_hbone_rejection_check() {
+  run_hbone_listener_negative_check \
+    node_waypoint.identity.plaintext_hbone_rejected \
+    plaintext \
+    plaintext-to-hbone-listener-rejected
+}
+
+run_unauthenticated_hbone_rejection_check() {
+  run_hbone_listener_negative_check \
+    node_waypoint.identity.unauthenticated_hbone_rejected \
+    unauthenticated \
+    no-client-svid-hbone-listener-rejected
+}
+
+fetch_policy_denies_for_node() {
+  local node="$1"
+  local out="$2"
+  local ambient_pod port token pf_log pf_pid fetched
+  ambient_pod="$(ambient_pod_on_node "$node")"
+  if [[ -z "$ambient_pod" ]]; then
+    echo "no ferrum-mesh-ambient pod found on node $node" >&2
+    return 1
+  fi
+  port="$(pick_loopback_port)"
+  token="$(admin_bearer_token)"
+  pf_log="$out.port-forward.log"
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  if ! wait_for_port_forward_ready "$pf_pid" "$pf_log" "$port"; then
+    stop_port_forward "$pf_pid"
+    return 1
+  fi
+  fetched=false
+  for _ in $(seq 1 20); do
+    if curl -fsS -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:$port/mesh/policy-denies/recent?window=30s&limit=100" >"$out" 2>"$out.curl"; then
+      fetched=true
+      break
+    fi
+    sleep 0.25
+  done
+  stop_port_forward "$pf_pid"
+  [[ "$fetched" == "true" ]]
+}
+
+policy_deny_count_for_source_and_reasons() {
+  local file="$1"
+  local expected_source="$2"
+  shift 2
+  python3 - "$file" "$expected_source" "$@" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expected_source = sys.argv[2]
+reasons = set(sys.argv[3:])
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+count = 0
+for group in data.get("grouped") or []:
+    if group.get("reason") not in reasons:
+        continue
+    if expected_source and group.get("source") != expected_source:
+        continue
+    count += int(group.get("count") or 0)
+print(count)
+PY
+}
+
+forged_assertion_response_is_policy_rejection() {
+  local code="$1"
+  local body="$2"
+  body="${body//$'\r'/}"
+  body="${body#"${body%%[![:space:]]*}"}"
+  body="${body%"${body##*[![:space:]]}"}"
+
+  if [[ "$code" == "403" ]]; then
+    return
+  fi
+
+  if [[ "$code" == "502" && "$body" == \{\"error\":\"HBONE\ backend\ unavailable:\ HBONE\ CONNECT\ rejected\ for\ *\ with\ status\ 403\"\} ]]; then
+    return
+  fi
+
+  return 1
+}
+
+expect_attributed_forged_assertion_blocked() {
+  local from="$1"
+  local destination="$2"
+  local url="$3"
+  local family="${4:-4}"
+  local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
+  local out_dir before_file after_file output code body err status before_count after_count
+  from_record="$(workload_pod_record_for_app "$from")"
+  IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
+  destination_record="$(workload_pod_record_for_app "$destination")"
+  IFS=$'\t' read -r dst_uid dst_node dst_pod <<<"$destination_record"
+  if [[ -z "${from_node:-}" || -z "${dst_node:-}" ]]; then
+    echo "could not resolve source/destination nodes for forged assertion check" >&2
+    kubectl -n "$WORKLOAD_NS" get pods -o wide >&2 || true
+    return 1
+  fi
+  expected_assertor="$(node_waypoint_spiffe_for_node "$from_node")"
+  out_dir="$RESULTS_DIR/hbone-negative/forged-assertion-deny"
+  mkdir -p "$out_dir"
+  before_file="$out_dir/before.json"
+  after_file="$out_dir/after.json"
+  err="$out_dir/curl.err"
+
+  if ! fetch_policy_denies_for_node "$dst_node" "$before_file"; then
+    echo "could not fetch baseline policy-deny counts from destination node $dst_node" >&2
+    return 1
+  fi
+  before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
+
+  set +e
+  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+  status=$?
+  set -e
+  code="${output##*$'\n'}"
+  body="${output%$'\n'*}"
+  printf '%s\n' "$output" >"$out_dir/curl.out"
+  printf '%s\n' "$status" >"$out_dir/curl.status"
+  if [[ "$status" -ne 0 ]] || ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
+    echo "expected forged assertion request to fail via destination HBONE policy rejection, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}'" >&2
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  for _ in $(seq 1 20); do
+    if fetch_policy_denies_for_node "$dst_node" "$after_file"; then
+      after_count="$(policy_deny_count_for_source_and_reasons "$after_file" "$expected_assertor" scope_missing untrusted_assertor)"
+      if [[ "$after_count" =~ ^[0-9]+$ && "$before_count" =~ ^[0-9]+$ && "$after_count" -gt "$before_count" ]]; then
+        return
+      fi
+    fi
+    sleep 0.5
+  done
+
+  echo "expected destination policy-deny recorder to add scope_missing/untrusted_assertor for $expected_assertor; before=$before_count after=${after_count:-<unread>}" >&2
+  cat "$after_file" >&2 || true
+  return 1
+}
+
+rollout_ambient_after_assertor_change() {
+  kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-ambient --timeout=5m || return 1
+  wait_for_node_waypoint_ready_markers || return 1
+  wait_for_ambient_mesh_slice || return 1
+}
+
+restore_default_hbone_assertors() {
+  kubectl -n "$MESH_NS" set env daemonset/ferrum-mesh-ambient FERRUM_MESH_TRUSTED_HBONE_ASSERTORS- >/dev/null || return 1
+  rollout_ambient_after_assertor_change
+}
+
+run_forged_assertion_rejection_check() {
+  local bad_assertor blocked_ok=0 restored_ok=0 recovery_ok=0
+  bad_assertor="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/not-a-node-waypoint"
+  mkdir -p "$RESULTS_DIR/hbone-negative"
+  log "checking authenticated HBONE baggage is rejected from an untrusted assertor"
+
+  if kubectl -n "$MESH_NS" set env daemonset/ferrum-mesh-ambient \
+    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS=$bad_assertor" >/dev/null; then
+    if rollout_ambient_after_assertor_change; then
+      if expect_attributed_forged_assertion_blocked \
+        src-a \
+        dst-a \
+        "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+        4; then
+        blocked_ok=0
+      else
+        blocked_ok=$?
+      fi
+    else
+      blocked_ok=$?
+    fi
+  else
+    blocked_ok=$?
+  fi
+
+  if restore_default_hbone_assertors; then
+    restored_ok=0
+  else
+    restored_ok=$?
+  fi
+  if [[ "$restored_ok" -eq 0 ]]; then
+    if expect_allowed src-a \
+      "restored trusted HBONE assertors" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      "ok-a" \
+      4; then
+      recovery_ok=0
+    else
+      recovery_ok=$?
+    fi
+  fi
+
+  if [[ "$blocked_ok" -eq 0 && "$restored_ok" -eq 0 && "$recovery_ok" -eq 0 ]]; then
+    record_live_assertion \
+      node_waypoint.identity.forged_assertion_rejected \
+      pass \
+      src-a \
+      dst-a \
+      "authenticated-hbone-baggage-from-untrusted-assertor-fail-closed-and-recovers" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return
+  fi
+
+  record_live_assertion \
+    node_waypoint.identity.forged_assertion_rejected \
+    fail \
+    src-a \
+    dst-a \
+    "bad-assertor-blocked=$blocked_ok restore=$restored_ok recovery=$recovery_ok" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)"
+  collect_traffic_failure_diagnostics
+  return 1
+}
+
+run_hbone_identity_negative_checks() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+
+  log "running HBONE identity negative checks"
+  run_plaintext_hbone_rejection_check
+  run_unauthenticated_hbone_rejection_check
+  run_forged_assertion_rejection_check
+}
+
 run_traffic_checks() {
   log "running IPv4 Service authorization and bypass checks"
   local dst_a_ip dst_b_ip
@@ -2218,6 +2608,8 @@ run_traffic_checks() {
     "cross-node unmanaged direct Pod IP inbound guard" \
     "http://$dst_a_ip:8080/" \
     4
+
+  run_hbone_identity_negative_checks
 
   log "checking stale identity cleanup across source workload recreation"
   local old_src_a_uid old_src_a_node

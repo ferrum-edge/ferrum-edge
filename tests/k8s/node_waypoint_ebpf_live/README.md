@@ -22,7 +22,19 @@ program/link/map evidence with `bpftool`, creates same-node and cross-node
 source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
 verifies `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the
 live `AuthorizationPolicy`, and checks stale source identities stay denied after
-pod recreation. On dual-stack clusters it also requires the IPv6 pod-netns ready
+pod recreation. In production SPIRE mode it also verifies that every ambient
+DaemonSet pod rejects plaintext and no-client-SVID connections to the HBONE
+listener. The no-client-SVID probe uses a valid authority-form CONNECT target
+and accepts only a transport/protocol failure or Ferrum's explicit
+`{"error":"Mesh authorization denied: missing per-pod policy scope"}` 403 denial,
+not a generic non-200 response. It then temporarily pins the trusted HBONE
+assertor inventory to a wrong SPIFFE ID to prove authenticated but untrusted
+asserted workload identity fails closed with an attributed policy deny and
+recovers after the default inventory is restored. That forged-assertion probe
+accepts a direct 403 or the source-side 502 wrapper that explicitly reports the
+destination HBONE CONNECT was rejected with 403; in both cases the destination
+policy-deny counter for the expected NodeWaypoint assertor must increase.
+On dual-stack clusters it also requires the IPv6 pod-netns ready
 markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
 guard.
 

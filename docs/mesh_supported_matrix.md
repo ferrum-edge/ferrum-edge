@@ -53,7 +53,7 @@ authoritative answer to "what regression fails CI today."
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, and inbound direct-pod enforcement are live-gated;
-  stale-IP reuse and forged-assertion coverage remain H2 residuals;
+  stale-IP reuse and remaining production identity-profile coverage remain H2 residuals;
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
@@ -88,7 +88,8 @@ need them, or because they are blocked upstream / architecturally:
   fallback and built-in assertor defaults. The pod-veth tc guard now drops
   unmanaged direct Pod-IP attempts to enrolled destination pods unless the
   destination HBONE relay set the authorized socket mark.
-  Broader promotion still waits on stale-IP reuse and forged-assertion coverage.
+  Broader promotion still waits on stale-IP reuse and remaining production
+  identity-profile coverage.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
   services or proxies force the NodeWaypoint UDP/DTLS path closed during config
