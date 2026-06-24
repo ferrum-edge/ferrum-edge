@@ -14,31 +14,40 @@ calls it must provide a disposable cluster with:
 
 The script renders the chart first and fails if an enabled eBPF node-agent or
 NodeWaypoint proxy would use a non-`-ebpf` image. It then installs the chart,
-checks `/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`,
-collects BPF program/link/map evidence with `bpftool`, creates same-node and
-cross-node source/destination pods, verifies `src-a` Service ClusterIP traffic
-is admitted, verifies `src-b` Service ClusterIP and direct Pod-IP attempts are
-rejected by the live `AuthorizationPolicy`, and checks stale source identities
-stay denied after pod recreation. On dual-stack clusters it also requires the
-IPv6 pod-netns ready markers, IPv6 Service allow/deny behavior, and an IPv6
-direct Pod-IP bypass guard.
+installs a minimal SPIRE Server/Agent fixture by default, registers per-node
+NodeWaypoint SVID entries, checks that every ambient NodeWaypoint pod reports a
+matching `ferrum_mesh_cert_expiry_seconds{source="workload_api"}` metric, checks
+`/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`, collects BPF
+program/link/map evidence with `bpftool`, creates same-node and cross-node
+source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
+verifies `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the
+live `AuthorizationPolicy`, and checks stale source identities stay denied after
+pod recreation. On dual-stack clusters it also requires the IPv6 pod-netns ready
+markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
+guard.
 
-The chart render preflight also verifies the production identity profile needed
-by the next H2 live fixture step: `ambient.spire.enabled=true` must mount the
-SPIRE Agent Workload API socket into the NodeWaypoint proxy and render
+The chart render preflight and live install both verify the production identity
+profile: `ambient.spire.enabled=true` must mount the SPIRE Agent Workload API
+socket into the NodeWaypoint proxy and render
 `FERRUM_MESH_CA_BACKEND=spire_agent`, `FERRUM_MESH_SPIRE_AGENT_SOCKET`,
 per-node `FERRUM_MESH_WORKLOAD_SPIFFE_ID` using `$(FERRUM_K8S_NODE_NAME)`, and
-`FERRUM_MESH_PRODUCTION_MODE=true`.
+`FERRUM_MESH_PRODUCTION_MODE=true`. The SPIRE fixture follows the upstream
+Kubernetes k8s_psat registration pattern: each NodeWaypoint workload entry is
+registered under the attested per-node SPIRE Agent parent ID, using the
+Kubernetes node UID in
+`spiffe://<trust-domain>/spire/agent/k8s_psat/<cluster>/<node-uid>`, plus
+`k8s:node-name:<node>` so each NodeWaypoint DaemonSet pod receives the SVID
+that discovery later pins for that node.
 
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current
 assertions are H2 evidence only; they do not promote NodeWaypoint or make it a
 release-blocking GA contract row.
 
-The ambient proxy is started with `FERRUM_MESH_ALLOW_NO_CA=true` because this
-disposable test targets eBPF capture, pod attribution, policy enforcement, and
-fail-closed bypass coverage, not mesh mTLS identity issuance.
-Production installs must provide gateway SVID material or a CA backend instead.
+Set `FERRUM_LIVE_SPIRE_PRODUCTION=false` only for local eBPF-only debugging. In
+that opt-out mode the ambient proxy is started with `FERRUM_MESH_ALLOW_NO_CA=true`;
+the required CI workflow keeps production SPIRE enabled so a missing SVID cannot
+fall back to plaintext.
 
 Run manually:
 
@@ -48,6 +57,12 @@ tests/k8s/node_waypoint_ebpf_live/run.sh
 ```
 
 Set `FERRUM_LIVE_REQUIRE_DUAL_STACK=true` for the dual-stack pass.
+Set `FERRUM_LIVE_KUBE_CONTEXT=<context>` to run against a disposable cluster
+that is not the current kube context; the harness switches to it before cluster
+operations.
+Set `FERRUM_LIVE_TRUST_DOMAIN=<domain>` to exercise a non-`cluster.local` trust
+domain across SPIRE registration, Ferrum Kubernetes identity derivation, and
+the workload `AuthorizationPolicy` principals.
 Set `FERRUM_LIVE_DOCKER_NODE_EVIDENCE=true` when running against kind from the
 Docker host; the harness will collect BPF evidence through the kind node
 containers instead of pulling a separate `kubectl debug` image.

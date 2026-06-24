@@ -12,6 +12,13 @@ if [[ ! -f "$LIVE_ASSERTIONS_HELPER" && -f "$PWD/tests/k8s/lib/live_assertions.s
 fi
 source "$LIVE_ASSERTIONS_HELPER"
 
+# shellcheck source=../lib/spire.sh
+SPIRE_HELPER="$ROOT_DIR/tests/k8s/lib/spire.sh"
+if [[ ! -f "$SPIRE_HELPER" && -f "$PWD/tests/k8s/lib/spire.sh" ]]; then
+  SPIRE_HELPER="$PWD/tests/k8s/lib/spire.sh"
+fi
+source "$SPIRE_HELPER"
+
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
@@ -27,6 +34,10 @@ AMBIENT_ADMIN_PORT="${FERRUM_LIVE_AMBIENT_ADMIN_PORT:-19010}"
 NODE_AGENT_ADMIN_PORT="${FERRUM_LIVE_NODE_AGENT_ADMIN_PORT:-19090}"
 ADMIN_JWT_SECRET="${FERRUM_LIVE_ADMIN_JWT_SECRET:-ferrum-edge-node-waypoint-live-admin-secret}"
 ADMIN_JWT_ISSUER="${FERRUM_LIVE_ADMIN_JWT_ISSUER:-ferrum-edge}"
+KUBE_CONTEXT="${FERRUM_LIVE_KUBE_CONTEXT:-}"
+SPIRE_PRODUCTION="${FERRUM_LIVE_SPIRE_PRODUCTION:-true}"
+SPIRE_NS="${FERRUM_LIVE_SPIRE_NAMESPACE:-$FERRUM_SPIRE_NAMESPACE}"
+TRUST_DOMAIN="${FERRUM_LIVE_TRUST_DOMAIN:-cluster.local}"
 RESULTS_DIR="$ROOT_DIR/target/node-waypoint-ebpf-live"
 LIVE_ASSERTIONS_FILE="${FERRUM_LIVE_ASSERTIONS_FILE:-$RESULTS_DIR/live-assertions.json}"
 LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-dual-stack-node-waypoint-ebpf}"
@@ -55,6 +66,13 @@ if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
     node_waypoint.ipv6.pod_ip_bypass_guard
   )
 fi
+if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+  REQUIRED_LIVE_ASSERTIONS+=(
+    node_waypoint.identity.spire_live_ready
+    node_waypoint.identity.spire_workload_entries
+    node_waypoint.identity.workload_api_svid
+  )
+fi
 
 if [[ "${FERRUM_EBPF_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
   echo "Refusing to run against the current kube-context without FERRUM_EBPF_LIVE_ACK_DISPOSABLE=true" >&2
@@ -72,12 +90,24 @@ require_cmd kubectl
 require_cmd helm
 require_cmd curl
 require_cmd python3
+if [[ -z "$KUBE_CONTEXT" ]]; then
+  KUBE_CONTEXT="$(kubectl config current-context)"
+fi
 if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
   require_cmd docker
 fi
 
 log() {
   printf '\n[node-waypoint-ebpf-live] %s\n' "$*"
+}
+
+select_kube_context() {
+  local current_context
+  current_context="$(kubectl config current-context 2>/dev/null || true)"
+  if [[ "$current_context" != "$KUBE_CONTEXT" ]]; then
+    log "switching kube context to $KUBE_CONTEXT"
+    kubectl config use-context "$KUBE_CONTEXT" >/dev/null
+  fi
 }
 
 init_live_assertions() {
@@ -129,7 +159,7 @@ record_live_assertion_once() {
 
 spiffe_for_sa() {
   local service_account="$1"
-  printf 'spiffe://cluster.local/ns/%s/sa/%s' "$WORKLOAD_NS" "$service_account"
+  printf 'spiffe://%s/ns/%s/sa/%s' "$TRUST_DOMAIN" "$WORKLOAD_NS" "$service_account"
 }
 
 render_chart_assertions() {
@@ -259,7 +289,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local spire_id="spiffe://cluster.local/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
+  local spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
@@ -323,7 +353,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local shared_spire_id="spiffe://cluster.local/ns/$MESH_NS/sa/ferrum-mesh"
+  local shared_spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh"
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -472,6 +502,28 @@ render_chart_assertions() {
 
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
+    --set controlPlane.enabled=true \
+    --set controlPlane.database.type=sqlite \
+    --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+    --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
+    --set-string "controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret" \
+    --set-string "controlPlane.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN")"
+  if [[ "$(grep -A1 -F "name: FERRUM_K8S_TRUST_DOMAIN" <<<"$rendered" | grep -c -F "value: \"$TRUST_DOMAIN\"" || true)" -lt 2 ]]; then
+    echo "NodeWaypoint render did not propagate the live trust domain to control-plane and node-agent K8s identity env" >&2
+    grep -nE 'name: FERRUM_K8S_TRUST_DOMAIN|value: "' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
     --set nodeAgent.admin.enabled=true \
     --set-string nodeAgent.admin.port=0)"
@@ -603,10 +655,108 @@ label_nodes() {
   kubectl label node "$NODE_B" ferrum.io/live-node=b --overwrite
 }
 
+all_ready_nodes() {
+  kubectl get nodes --no-headers | awk '$2 == "Ready" {print $1}'
+}
+
+node_waypoint_spiffe_template() {
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
+}
+
+node_waypoint_spiffe_for_node() {
+  local node="$1"
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/%s' "$TRUST_DOMAIN" "$MESH_NS" "$node"
+}
+
+collect_spire_diagnostics() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+  ferrum_spire_collect_diagnostics "$KUBE_CONTEXT" "$SPIRE_NS" "$RESULTS_DIR/spire" || true
+}
+
+install_spire_production_identity() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    log "SPIRE production identity disabled; using explicit no-CA test mode"
+    return
+  fi
+
+  log "installing minimal SPIRE and registering NodeWaypoint SVID entries"
+  ferrum_spire_apply_minimal "$KUBE_CONTEXT" "$TRUST_DOMAIN" "$SPIRE_NS"
+  ferrum_spire_wait_ready "$KUBE_CONTEXT" "$SPIRE_NS" 5m
+
+  local -a spire_nodes
+  mapfile -t spire_nodes < <(ready_worker_nodes)
+  if [[ "${#spire_nodes[@]}" -eq 0 ]]; then
+    echo "expected at least one Ready worker node for SPIRE NodeWaypoint registration" >&2
+    exit 1
+  fi
+
+  mkdir -p "$RESULTS_DIR/spire"
+  ferrum_spire_server_exec "$KUBE_CONTEXT" "$SPIRE_NS" agent list \
+    > "$RESULTS_DIR/spire/attested-agents.txt"
+
+  local node spiffe_id agent_parent_id
+  for node in "${spire_nodes[@]}"; do
+    agent_parent_id="$(ferrum_spire_k8s_psat_agent_parent_id_for_node \
+      "$KUBE_CONTEXT" \
+      "$SPIRE_NS" \
+      "$TRUST_DOMAIN" \
+      "$node")"
+    spiffe_id="$(node_waypoint_spiffe_for_node "$node")"
+    ferrum_spire_register_k8s_workload \
+      "$KUBE_CONTEXT" \
+      "$SPIRE_NS" \
+      "$spiffe_id" \
+      "$agent_parent_id" \
+      "$MESH_NS" \
+      ferrum-mesh \
+      "k8s:node-name:$node" \
+      "k8s:container-name:ferrum-edge"
+  done
+
+  ferrum_spire_server_exec "$KUBE_CONTEXT" "$SPIRE_NS" entry show \
+    > "$RESULTS_DIR/spire/registered-entries.txt"
+  record_live_assertion \
+    node_waypoint.identity.spire_live_ready \
+    pass \
+    "" \
+    "" \
+    "spire-server-and-agent-ready" \
+    "" \
+    "" \
+    "spire"
+  record_live_assertion \
+    node_waypoint.identity.spire_workload_entries \
+    pass \
+    "" \
+    "" \
+    "registered-nodewaypoint-per-node-svid-entries" \
+    "" \
+    "" \
+    "spire/attested-agents.txt,spire/registered-entries.txt"
+}
+
 install_ferrum() {
   log "installing Ferrum chart"
+  local -a identity_args=()
+  if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+    local spire_id_template
+    spire_id_template="$(node_waypoint_spiffe_template)"
+    identity_args=(
+      --set ambient.spire.enabled=true
+      --set-string "ambient.spire.workloadSpiffeId=$spire_id_template"
+      --set ambient.spire.productionMode=true
+    )
+  else
+    identity_args=(
+      --set ambient.env.FERRUM_MESH_ALLOW_NO_CA=true
+    )
+  fi
+
   kubectl create namespace "$MESH_NS" --dry-run=client -o yaml | kubectl apply -f -
   helm upgrade --install "$RELEASE" "$CHART_DIR" \
+    --kube-context "$KUBE_CONTEXT" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
     --set image.tag="$IMAGE_TAG" \
@@ -627,6 +777,7 @@ install_ferrum() {
     --set controlPlane.env.FERRUM_LOG_LEVEL=info \
     --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
+    --set-string "controlPlane.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=false \
     --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
@@ -641,13 +792,14 @@ install_ferrum() {
     --set-string "ambient.env.FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET" \
     --set-string "ambient.env.FERRUM_ADMIN_JWT_ISSUER=$ADMIN_JWT_ISSUER" \
     --set ambient.env.FERRUM_LOG_LEVEL=info \
-    --set ambient.env.FERRUM_MESH_ALLOW_NO_CA=true \
+    "${identity_args[@]}" \
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set nodeAgent.enabled=true \
     --set nodeAgent.captureMode=ebpf \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
+    --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR" \
     --set nodeAgent.fallbackMode=fail \
     --wait \
@@ -656,6 +808,127 @@ install_ferrum() {
   kubectl -n "$MESH_NS" rollout status deployment/ferrum-mesh-control-plane --timeout=5m
   kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-node-agent --timeout=5m
   kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-ambient --timeout=5m
+}
+
+verify_ambient_spire_identity() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+
+  log "checking ambient NodeWaypoint Workload API SVIDs"
+  local spec_file="$RESULTS_DIR/ambient-spire-pods.json"
+  mkdir -p "$RESULTS_DIR/ambient-spire-metrics"
+  kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o json > "$spec_file"
+
+  python3 - "$spec_file" "$TRUST_DOMAIN" "$MESH_NS" <<'PY'
+import json
+import sys
+
+path, trust_domain, mesh_ns = sys.argv[1:4]
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+items = data.get("items") or []
+if not items:
+    raise SystemExit("no ferrum-mesh-ambient pods found")
+
+errors = []
+for pod in items:
+    name = pod["metadata"]["name"]
+    node = pod["spec"].get("nodeName")
+    containers = pod["spec"].get("containers") or []
+    ferrum = next((c for c in containers if c.get("name") == "ferrum-edge"), None)
+    if ferrum is None:
+        errors.append(f"{name}: missing ferrum-edge container")
+        continue
+
+    env = {item["name"]: item for item in ferrum.get("env") or []}
+    expected_spiffe_template = f"spiffe://{trust_domain}/ns/{mesh_ns}/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)"
+    expected_values = {
+        "FERRUM_MESH_CA_BACKEND": "spire_agent",
+        "FERRUM_MESH_SPIRE_AGENT_SOCKET": "/run/spire/sockets/agent.sock",
+        "FERRUM_MESH_WORKLOAD_SPIFFE_ID": expected_spiffe_template,
+        "FERRUM_MESH_PRODUCTION_MODE": "true",
+    }
+    for key, expected in expected_values.items():
+        actual = env.get(key, {}).get("value")
+        if actual != expected:
+            errors.append(f"{name}: {key}={actual!r}, expected {expected!r}")
+    if "FERRUM_MESH_ALLOW_NO_CA" in env:
+        errors.append(f"{name}: FERRUM_MESH_ALLOW_NO_CA must not be present in SPIRE mode")
+    node_env = env.get("FERRUM_K8S_NODE_NAME", {})
+    field_path = ((node_env.get("valueFrom") or {}).get("fieldRef") or {}).get("fieldPath")
+    if field_path != "spec.nodeName":
+        errors.append(f"{name}: FERRUM_K8S_NODE_NAME fieldPath={field_path!r}, expected spec.nodeName")
+
+    mounts = ferrum.get("volumeMounts") or []
+    if not any(
+        mount.get("name") == "spire-agent-socket"
+        and mount.get("mountPath") == "/run/spire/sockets"
+        and mount.get("readOnly") is True
+        for mount in mounts
+    ):
+        errors.append(f"{name}: missing read-only spire-agent-socket mount")
+
+    volumes = pod["spec"].get("volumes") or []
+    if not any(
+        volume.get("name") == "spire-agent-socket"
+        and (volume.get("hostPath") or {}).get("path") == "/run/spire/sockets"
+        for volume in volumes
+    ):
+        errors.append(f"{name}: missing /run/spire/sockets hostPath volume")
+
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+  local -a pod_records
+  mapfile -t pod_records < <(kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}')
+  local idx=0 pod node expected_spiffe metrics_file pf_log pf_pid fetched port
+  for record in "${pod_records[@]}"; do
+    IFS=$'\t' read -r pod node <<<"$record"
+    [[ -n "$pod" && -n "$node" ]] || continue
+    expected_spiffe="$(node_waypoint_spiffe_for_node "$node")"
+    port=$((19400 + idx))
+    idx=$((idx + 1))
+    metrics_file="$RESULTS_DIR/ambient-spire-metrics/$pod.prom"
+    pf_log="$RESULTS_DIR/ambient-spire-metrics/$pod-port-forward.log"
+    kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+    pf_pid=$!
+    fetched=false
+    for _ in $(seq 1 40); do
+      if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
+        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"workload_api\"}" "$metrics_file"; then
+          fetched=true
+          break
+        fi
+      fi
+      sleep 0.5
+    done
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+    if [[ "$fetched" != "true" ]]; then
+      echo "ambient pod $pod on $node did not report Workload API SVID metric for $expected_spiffe" >&2
+      cat "$metrics_file" >&2 || true
+      collect_spire_diagnostics
+      exit 1
+    fi
+  done
+
+  record_live_assertion \
+    node_waypoint.identity.workload_api_svid \
+    pass \
+    "" \
+    "" \
+    "ambient-nodewaypoints-loaded-per-node-workload-api-svids" \
+    "" \
+    "" \
+    "ambient-spire-pods.json,ambient-spire-metrics"
 }
 
 collect_node_agent_metrics() {
@@ -716,6 +989,7 @@ collect_ambient_node_waypoint_identities() {
 }
 
 collect_traffic_failure_diagnostics() {
+  collect_spire_diagnostics
   collect_node_agent_metrics
   collect_ambient_node_waypoint_identities
   collect_bpf_evidence || true
@@ -851,9 +1125,10 @@ collect_bpf_evidence() {
 
 apply_workloads() {
   log "applying live traffic workloads"
-  awk -v ns="$WORKLOAD_NS" -v require_dual="$REQUIRE_DUAL_STACK" '
+  awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" '
     {
       gsub(/__NAMESPACE__/, ns)
+      gsub(/__TRUST_DOMAIN__/, td)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
         if (require_dual == "true") {
           print "  ipFamilyPolicy: RequireDualStack"
@@ -1899,18 +2174,24 @@ run_ipv6_checks() {
 
 cleanup() {
   if [[ "${FERRUM_LIVE_KEEP_RESOURCES:-false}" != "true" ]]; then
-    kubectl delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
-    helm uninstall "$RELEASE" -n "$MESH_NS" >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
+    helm uninstall "$RELEASE" -n "$MESH_NS" --kube-context "$KUBE_CONTEXT" >/dev/null 2>&1 || true
+    if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+      kubectl --context "$KUBE_CONTEXT" delete namespace "$SPIRE_NS" --ignore-not-found=true >/dev/null 2>&1 || true
+    fi
   fi
 }
 
 trap cleanup EXIT
 
+select_kube_context
 init_live_assertions
 render_chart_assertions
 validate_cluster
 label_nodes
+install_spire_production_identity
 install_ferrum
+verify_ambient_spire_identity
 assert_node_agent_ready_metric
 collect_bpf_evidence
 apply_workloads

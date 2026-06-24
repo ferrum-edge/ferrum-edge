@@ -154,6 +154,8 @@ jobs:
           FERRUM_LIVE_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
           FERRUM_LIVE_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
           FERRUM_LIVE_DOCKER_NODE_EVIDENCE: "true"
+          FERRUM_LIVE_SPIRE_PRODUCTION: "true"
+          FERRUM_LIVE_TRUST_DOMAIN: "cluster.local"
         run: tests/k8s/node_waypoint_ebpf_live/run.sh
 
       - name: Collect diagnostics
@@ -169,6 +171,9 @@ jobs:
           kubectl -n ferrum-ebpf-live get all -o wide > "$results/workloads-all.txt" 2>&1
           kubectl -n ferrum-ebpf-live describe pods > "$results/workloads-pods-describe.txt" 2>&1
           kubectl -n ferrum-ebpf-live describe svc > "$results/workloads-services-describe.txt" 2>&1
+          kubectl -n spire-system get all -o wide > "$results/spire-all.txt" 2>&1
+          kubectl -n spire-system logs statefulset/spire-server --all-containers --tail=500 > "$results/spire-server.log" 2>&1
+          kubectl -n spire-system logs daemonset/spire-agent --all-containers --tail=500 > "$results/spire-agent.log" 2>&1
           helm -n ferrum get values ferrum-live --all > "$results/helm-values.yaml" 2>&1
           helm -n ferrum get manifest ferrum-live > "$results/helm-manifest.yaml" 2>&1
           kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/control-plane-deployment-describe.txt" 2>&1

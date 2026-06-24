@@ -312,6 +312,109 @@ ferrum_spire_wait_ready() {
   kubectl --context "$context" -n "$namespace" rollout status daemonset/spire-agent --timeout="$timeout"
 }
 
+ferrum_spire_server_pod() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+
+  kubectl --context "$context" -n "$namespace" get pod \
+    -l app=spire-server \
+    -o jsonpath='{.items[0].metadata.name}'
+}
+
+ferrum_spire_server_exec() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+  shift 2
+
+  local pod
+  pod="$(ferrum_spire_server_pod "$context" "$namespace")"
+  if [[ -z "$pod" ]]; then
+    printf 'no spire-server pod found in namespace %s\n' "$namespace" >&2
+    return 1
+  fi
+
+  kubectl --context "$context" -n "$namespace" exec "$pod" -- \
+    /opt/spire/bin/spire-server "$@" -socketPath /run/spire/server.sock
+}
+
+ferrum_spire_entry_has_selectors() {
+  local output="$1"
+  shift
+
+  local selector
+  for selector in "$@"; do
+    if ! grep -q "Selector[[:space:]]*:[[:space:]]*$selector" <<<"$output"; then
+      return 1
+    fi
+  done
+}
+
+ferrum_spire_k8s_psat_agent_parent_id_for_node() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+  local trust_domain="${3:?trust domain is required}"
+  local node_name="${4:?node name is required}"
+  local cluster="${5:-$trust_domain}"
+  local node_uid
+  node_uid="$(kubectl --context "$context" get node "$node_name" -o jsonpath='{.metadata.uid}')"
+  if [[ -z "$node_uid" ]]; then
+    printf 'node %s has no Kubernetes UID\n' "$node_name" >&2
+    return 1
+  fi
+
+  local parent_id="spiffe://$trust_domain/spire/agent/k8s_psat/$cluster/$node_uid"
+  local attempts="${FERRUM_SPIRE_AGENT_PARENT_ID_ATTEMPTS:-30}"
+  local sleep_seconds="${FERRUM_SPIRE_AGENT_PARENT_ID_SLEEP_SECONDS:-2}"
+  local attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if ferrum_spire_server_exec "$context" "$namespace" agent show -spiffeID "$parent_id" >/dev/null 2>&1; then
+      printf '%s\n' "$parent_id"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  printf 'SPIRE k8s_psat agent for node %s is not attested; expected parent ID %s\n' \
+    "$node_name" "$parent_id" >&2
+  ferrum_spire_server_exec "$context" "$namespace" agent list >&2 || true
+  return 1
+}
+
+ferrum_spire_register_k8s_workload() {
+  local context="${1:?kube context is required}"
+  local spire_namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+  local spiffe_id="${3:?workload SPIFFE ID is required}"
+  local parent_id="${4:?parent SPIFFE ID is required}"
+  local workload_namespace="${5:?workload namespace is required}"
+  local service_account="${6:?service account is required}"
+  shift 6
+
+  local -a selectors=(
+    "k8s:ns:$workload_namespace"
+    "k8s:sa:$service_account"
+  )
+  local selector
+  for selector in "$@"; do
+    selectors+=("$selector")
+  done
+
+  local existing=""
+  if existing="$(ferrum_spire_server_exec "$context" "$spire_namespace" entry show -spiffeID "$spiffe_id" -parentID "$parent_id" 2>/dev/null)" &&
+    ferrum_spire_entry_has_selectors "$existing" "${selectors[@]}"; then
+    return 0
+  fi
+
+  local -a args=(
+    entry create
+    -spiffeID "$spiffe_id"
+    -parentID "$parent_id"
+  )
+  for selector in "${selectors[@]}"; do
+    args+=(-selector "$selector")
+  done
+  ferrum_spire_server_exec "$context" "$spire_namespace" "${args[@]}"
+}
+
 ferrum_spire_collect_diagnostics() {
   local context="${1:?kube context is required}"
   local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
@@ -321,4 +424,6 @@ ferrum_spire_collect_diagnostics() {
   kubectl --context "$context" -n "$namespace" get all -o wide > "$artifact_dir/spire-all.txt" 2>&1 || true
   kubectl --context "$context" -n "$namespace" logs statefulset/spire-server --all-containers --tail=1000 > "$artifact_dir/spire-server.log" 2>&1 || true
   kubectl --context "$context" -n "$namespace" logs daemonset/spire-agent --all-containers --tail=1000 > "$artifact_dir/spire-agent.log" 2>&1 || true
+  ferrum_spire_server_exec "$context" "$namespace" agent list > "$artifact_dir/spire-agents.txt" 2>&1 || true
+  ferrum_spire_server_exec "$context" "$namespace" entry show > "$artifact_dir/spire-entries.txt" 2>&1 || true
 }

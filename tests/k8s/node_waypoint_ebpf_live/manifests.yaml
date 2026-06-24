@@ -253,7 +253,7 @@ spec:
     - from:
         - source:
             principals:
-              - cluster.local/ns/__NAMESPACE__/sa/src-b
+              - __TRUST_DOMAIN__/ns/__NAMESPACE__/sa/src-b
 ---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
@@ -269,7 +269,7 @@ spec:
     - from:
         - source:
             principals:
-              - cluster.local/ns/__NAMESPACE__/sa/src-a
+              - __TRUST_DOMAIN__/ns/__NAMESPACE__/sa/src-a
 ---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
@@ -285,4 +285,4 @@ spec:
     - from:
         - source:
             principals:
-              - cluster.local/ns/__NAMESPACE__/sa/src-a
+              - __TRUST_DOMAIN__/ns/__NAMESPACE__/sa/src-a

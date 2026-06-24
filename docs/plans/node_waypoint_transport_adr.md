@@ -6,12 +6,12 @@ Status: Proposed for H2 implementation
 
 NodeWaypoint is the sidecarless topology where a per-node Ferrum proxy accepts
 traffic captured from many node-local pods. The current live gate proves the
-IPv4 eBPF capture path, source pod attribution, same-node and cross-node Service
-authorization, stale source identity cleanup, and direct Pod-IP fail-closed
-checks on a two-worker kind cluster. It still runs with
-`FERRUM_MESH_ALLOW_NO_CA=true`; production SPIRE, authenticated node-to-node
-transport, destination-side NodeWaypoint policy enforcement, end-to-end IPv6
-capture, and explicit direct-inbound enforcement remain H2 work.
+IPv4/IPv6 eBPF capture path, source pod attribution, same-node and cross-node
+Service authorization, stale source identity cleanup, production SPIRE Workload
+API issuance for per-node NodeWaypoint SVIDs, and direct Pod-IP fail-closed
+checks on a two-worker kind cluster. Authenticated node-to-node transport,
+destination-side NodeWaypoint policy enforcement, and explicit direct-inbound
+enforcement remain H2 work.
 
 This ADR defines the target transport so implementation can proceed without
 adding a plaintext shortcut or routing to a non-existent per-pod HBONE listener.
@@ -75,8 +75,8 @@ Identity-backed source NodeWaypoint runtimes (file SVID material or mesh CA
 backend; production mode requires one of those identity sources) skip
 metadata-absent service targets so the route fails closed instead of retaining a
 plaintext backend. Explicit no-CA/no-identity development runs keep the
-temporary plaintext compatibility fallback until the SPIRE production live
-fixture replaces it.
+temporary plaintext compatibility fallback; the required live gate now uses
+SPIRE-backed production mode instead.
 Helm now exposes `ambient.spire.enabled` to mount the SPIRE Agent Workload API
 socket and render the `spire_agent` CA backend, workload SPIFFE ID, and
 production-mode guardrail for NodeWaypoint proxy Pods. The NodeWaypoint chart
@@ -84,6 +84,10 @@ profile requires the workload SPIFFE ID to include the chart-managed
 `$(FERRUM_K8S_NODE_NAME)` downward-API token, and Kubernetes discovery resolves
 that token from `spec.nodeName` before publishing node waypoint assertors, so a
 DaemonSet cannot collapse all waypoints onto one shared production identity.
+The live harness installs a minimal SPIRE fixture and registers one workload
+entry per Ready node with `k8s:node-name:<node>` selectors, then requires each
+ambient NodeWaypoint pod to expose a `workload_api` SVID metric for its expected
+node-bound SPIFFE ID.
 
 Implementation status: the data plane now consumes `Workload.node_waypoint`
 when it is present on a selected captured-Service workload. It materializes a

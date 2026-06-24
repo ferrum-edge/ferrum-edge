@@ -1,6 +1,6 @@
 // SPIFFE Workload API protocol
 //
-// Vendored from https://github.com/spiffe/spiffe/blob/main/proto/spiffe/workload/workload.proto
+// Vendored from https://github.com/spiffe/spiffe/blob/main/standards/workloadapi.proto
 // Vendored locally so the build does not fetch over the network. Keep this file
 // in sync with the upstream .proto when bumping the SPIFFE Workload API version.
 //
@@ -15,8 +15,6 @@
 
 syntax = "proto3";
 
-package spiffe.workload;
-
 // DIVERGENCE FROM UPSTREAM SPIFFE WORKLOAD API
 //
 // The only divergence from the upstream proto is the
@@ -26,6 +24,10 @@ package spiffe.workload;
 // gateway never inspects the claims wire-format directly. When Phase B
 // re-introduces the JWT-SVID validate path, we can either decode JSON
 // ourselves or re-introduce the `Struct` import.
+//
+// Upstream intentionally declares no proto package. Keep this unqualified so
+// the gRPC service path is `/SpiffeWorkloadAPI/*`; real SPIRE agents reject a
+// packaged service such as `/spiffe.workload.SpiffeWorkloadAPI/*`.
 //
 // All field numbers, names, and types in the X.509 messages match upstream
 // byte-for-byte so this gateway is wire-compatible with real SPIRE agents
