@@ -50,7 +50,7 @@ impl ReqwestPoolManager {
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
         let crls = self.crls.load_full();
-        let mut client_builder = BackendTlsConfigBuilder {
+        let tls_builder = BackendTlsConfigBuilder {
             proxy,
             policy: self.tls_policy.as_deref(),
             global_ca: self
@@ -70,17 +70,22 @@ impl ReqwestPoolManager {
                 .as_deref()
                 .map(Path::new),
             crls: crls.as_ref().as_slice(),
-        }
-        .build_reqwest()
-        .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
-        .dns_resolver(dns_resolver)
-        .tcp_nodelay(true)
-        .pool_max_idle_per_host(config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
-        // Never auto-follow backend redirects from this shared client.
-        // Proxy dispatch must surface 3xx to callers as-is, and warmup probes
-        // must only touch configured backend targets (no redirected egress).
-        .redirect(reqwest::redirect::Policy::none());
+        };
+        let reqwest_builder = if config.enable_http2 {
+            tls_builder.build_reqwest()
+        } else {
+            tls_builder.build_reqwest_with_http2_enabled(false)
+        };
+        let mut client_builder = reqwest_builder
+            .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
+            .dns_resolver(dns_resolver)
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(config.max_idle_per_host)
+            .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
+            // Never auto-follow backend redirects from this shared client.
+            // Proxy dispatch must surface 3xx to callers as-is, and warmup probes
+            // must only touch configured backend targets (no redirected egress).
+            .redirect(reqwest::redirect::Policy::none());
 
         // NOTE: Neither `backend_connect_timeout_ms` nor `backend_read_timeout_ms`
         // is baked into the client here. The `reqwest::Client` is shared across
@@ -166,14 +171,21 @@ impl PoolManager for ReqwestPoolManager {
         );
         let scheme_disc = proxy.backend_scheme.map(|s| s as u8).unwrap_or(u8::MAX);
         let _ = write!(buf, "{}|", scheme_disc);
-        // Force-H1 (DestinationRule `h2UpgradePolicy = DO_NOT_UPGRADE`) builds a
-        // reqwest client with ALPN restricted to `http/1.1` (see
-        // `BackendTlsConfigBuilder::build_reqwest`). That is a DIFFERENT,
-        // protocol-incompatible client from the default (h2-capable) one, so it
-        // must NOT share a pool entry. This is a protocol/ALPN distinction
-        // (legitimate pool-key content per `.claude/rules/proxy-protocols.md`),
-        // NOT a policy field. `h1` marks the force-H1 client; absent otherwise.
-        if proxy.forces_backend_http1_only() {
+        // Force-H1 (`h2UpgradePolicy = DO_NOT_UPGRADE` or resolved
+        // `pool_enable_http2=false` on a TLS backend) builds a reqwest client
+        // with ALPN restricted to `http/1.1` (see
+        // `BackendTlsConfigBuilder::build_reqwest_with_http2_enabled`). That is
+        // a DIFFERENT, protocol-incompatible client from the default
+        // (h2-capable) one, so it must NOT share a pool entry. This is a
+        // protocol/ALPN distinction (legitimate pool-key content per
+        // `.claude/rules/proxy-protocols.md`), NOT a policy-only field. `h1`
+        // marks the force-H1 client; absent otherwise.
+        let force_reqwest_http1 = proxy.forces_backend_http1_only()
+            || (proxy
+                .backend_scheme
+                .is_some_and(|scheme| scheme.is_tls_backend())
+                && !self.global_config.for_proxy(proxy).enable_http2);
+        if force_reqwest_http1 {
             buf.push_str("h1");
         }
         buf.push('|');
