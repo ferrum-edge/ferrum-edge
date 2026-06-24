@@ -36,7 +36,10 @@ controlPlane:
     # turn them off with a one-line env override without editing the
     # chart values. Same applies to FERRUM_K8S_WATCH_NAMESPACES: when
     # unset, the controller follows the T2-A CP namespace scope
-    # (FERRUM_CP_NAMESPACES).
+    # (FERRUM_CP_NAMESPACES). The chart renders
+    # FERRUM_K8S_CONTROLLER_NAMESPACE to the Helm release namespace unless
+    # explicitly overridden here, so managed workload namespace settings do
+    # not affect trusted NodeWaypoint discovery.
   database:
     # One of: sqlite, postgres, mysql, mongodb. Required when controlPlane.enabled
     # or ca.enabled is true.
@@ -136,6 +139,17 @@ ambient:
   outboundPort: 15001
   hbonePort: 15008
   captureMode: iptables
+  spire:
+    # Mount a SPIRE Agent Workload API socket and configure mesh mode to fetch
+    # its runtime X.509-SVID from SPIRE. Requires workloadSpiffeId; NodeWaypoint
+    # profiles must include $(FERRUM_K8S_NODE_NAME) so each node has a distinct
+    # waypoint identity.
+    enabled: false
+    socketHostPath: /run/spire/sockets
+    socketMountPath: /run/spire/sockets
+    socketFileName: agent.sock
+    workloadSpiffeId: ""
+    productionMode: true
   env:
     FERRUM_MODE: mesh
     FERRUM_MESH_TOPOLOGY: ambient
@@ -200,13 +214,33 @@ observability:
 
 nodeAgent:
   enabled: false
+  env: {}
+  # Empty repository/tag inherit the top-level image repository/tag. When
+  # captureMode=ebpf, the template automatically appends "-ebpf" to the
+  # resolved tag unless it is already present, selecting the real capture image
+  # instead of the default mock/no-op image.
   image:
-    repository: ferrumedge/ferrum-edge
-    tag: latest
+    repository: ""
+    tag: ""
   captureMode: ebpf
+  proxyMode: local_pod
   proxyUid: 1337
+  # Shared host-path directory used only when proxyMode=node_waypoint. The
+  # node-agent publishes one file per enrolled pod here, and the ambient
+  # NodeWaypoint proxy consumes it to open per-pod in-netns capture listeners.
+  podRegistryDir: /run/ferrum/node-waypoint-pods
   cgroupRoot: /sys/fs/cgroup
   bpfFsPath: /sys/fs/bpf
+  admin:
+    # Enables the read-only node-agent admin listener for /health and /metrics.
+    # The default bind is loopback-only; the DaemonSet readiness probe execs the
+    # built-in health command inside the container, so it can still reach this
+    # listener without exposing unauthenticated metrics on the cluster network.
+    enabled: true
+    bindAddress: 127.0.0.1
+    # Non-conflicting with the ambient mesh admin listener's binary default
+    # (9000) when both DaemonSets run on the host network.
+    port: 19090
   # Default to fail because the published Ferrum image is distroless and does
   # not include /bin/sh, iptables, or ip6tables. Set to `iptables` only when
   # running a custom node-agent image that provides those binaries.
@@ -242,10 +276,9 @@ nodeAgent:
     # so admission controllers see the requested posture). Set to false
     # only if an admission webhook rejects PERFMON in your environment.
     addCapPerfmon: true
-    # Drop CAP_SYS_ADMIN. Modern kernels (5.8+) cover everything via
-    # CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN. Default true to minimize
-    # privilege on modern kernels; set to false only if you still run
-    # kernels where BPF operations require SYS_ADMIN.
+    # Drop CAP_SYS_ADMIN for local_pod capture. NodeWaypoint capture always
+    # adds SYS_ADMIN because the agent must setns() into pod network namespaces
+    # to resolve host-side veth peers before attaching inbound tc programs.
     dropCapSysAdmin: true
     # Pod-wide seccomp profile. RuntimeDefault is the containerd default
     # and permits every syscall the agent needs (bpf, setsockopt, sh -c

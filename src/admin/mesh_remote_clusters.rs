@@ -42,8 +42,15 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
+use crate::modes::mesh::config::{MultiClusterConfig, RemoteCluster, TrustBundleSet};
+use crate::modes::mesh::federation::FederationSnapshot;
 use crate::modes::mesh::multicluster::RemoteEndpointSnapshot;
+
+const TRUST_SOURCE_POLLED: &str = "polled";
+const TRUST_SOURCE_CONTROL_PLANE: &str = "control_plane";
+const TRUST_SOURCE_LOCAL: &str = "local";
+const TRUST_SOURCE_BLOCKED_PENDING_POLL: &str = "blocked_pending_poll";
+const TRUST_SOURCE_NONE: &str = "none";
 
 /// One remote cluster this DP has successfully fetched endpoints from. Counts
 /// (not the endpoints themselves) are surfaced so the payload describes the
@@ -105,6 +112,23 @@ pub struct ConfiguredRemoteCluster {
     /// map — a quick "is configured discovery actually returning anything?"
     /// flag so operators don't have to cross-reference the two lists by hand.
     pub discovered: bool,
+    /// Whether this data plane has an active outbound trust bundle for the
+    /// remote trust domain.
+    pub outbound_trust_active: bool,
+    /// Whether this data plane has an active inbound SPIFFE verifier that can
+    /// authenticate peers from the remote trust domain.
+    pub inbound_trust_active: bool,
+    /// Source of the remote trust state: `polled`, `control_plane`, `local`,
+    /// `blocked_pending_poll`, or `none`.
+    pub trust_source: String,
+    /// Unix timestamp (seconds) of the last successful polled bundle fetch when
+    /// `trust_source` is `polled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundle_fetched_at_unix_seconds: Option<u64>,
+    /// `now - trust_bundle_fetched_at_unix_seconds`, clamped to `0`, when a
+    /// polled bundle is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundle_age_seconds: Option<u64>,
 }
 
 /// Top-level response shape. The handler in `admin/mod.rs` is a thin wrapper
@@ -137,13 +161,118 @@ pub struct MeshRemoteClustersInputs<'a> {
     /// has been accepted or the slice carries no multicluster config — the
     /// `configured` list is then empty.
     pub multi_cluster: Option<&'a MultiClusterConfig>,
+    /// Live federation bundle snapshot from
+    /// [`crate::modes::mesh::federation::FederationStore::snapshot`].
+    pub federation: &'a FederationSnapshot,
+    /// Accepted slice's trust bundles, if present.
+    pub trust_bundles: Option<&'a TrustBundleSet>,
     /// Whether discovery is enabled (poll interval > 0). Passed in rather than
     /// derived from the snapshot because an enabled-but-not-yet-converged
     /// discovery has an empty snapshot, indistinguishable from disabled.
     pub discovery_enabled: bool,
+    /// Whether trust-bundle federation polling is enabled.
+    pub federation_poll_enabled: bool,
+    /// Effective `FERRUM_MESH_FEDERATION_FAIL_OPEN` value.
+    pub federation_fail_open: bool,
+    /// Whether inbound mesh SPIFFE peer verification has a live verifier slot.
+    pub inbound_spiffe_verifier_configured: bool,
     /// Wall-clock "now" as a Unix timestamp (seconds) used to compute
     /// `age_seconds`. Injected so unit tests are deterministic.
     pub now_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteTrustStatus {
+    outbound_trust_active: bool,
+    inbound_trust_active: bool,
+    trust_source: &'static str,
+    fetched_at_unix_seconds: Option<u64>,
+    age_seconds: Option<u64>,
+}
+
+fn endpoint_configured(remote: &RemoteCluster) -> bool {
+    remote
+        .federation_endpoint
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+}
+
+fn trust_bundle_set_contains_remote_domain(
+    bundles: &TrustBundleSet,
+    remote: &RemoteCluster,
+) -> bool {
+    bundles.local.trust_domain == remote.trust_domain
+        || bundles
+            .federated
+            .iter()
+            .any(|bundle| bundle.trust_domain == remote.trust_domain)
+}
+
+fn remote_trust_status(
+    remote: &RemoteCluster,
+    inputs: &MeshRemoteClustersInputs<'_>,
+    federation_endpoint_configured: bool,
+    effective_trust_bundles: Option<&TrustBundleSet>,
+) -> RemoteTrustStatus {
+    let effective_bundle_present = effective_trust_bundles
+        .is_some_and(|bundles| trust_bundle_set_contains_remote_domain(bundles, remote));
+
+    if let Some(bundle) = inputs.federation.bundles.get(&remote.trust_domain) {
+        if !effective_bundle_present {
+            return RemoteTrustStatus {
+                outbound_trust_active: false,
+                inbound_trust_active: false,
+                trust_source: TRUST_SOURCE_NONE,
+                fetched_at_unix_seconds: None,
+                age_seconds: None,
+            };
+        }
+        let fetched_at = bundle.fetched_at_unix_seconds;
+        return RemoteTrustStatus {
+            outbound_trust_active: true,
+            inbound_trust_active: inputs.inbound_spiffe_verifier_configured,
+            trust_source: TRUST_SOURCE_POLLED,
+            fetched_at_unix_seconds: Some(fetched_at),
+            age_seconds: Some(inputs.now_unix_seconds.saturating_sub(fetched_at)),
+        };
+    }
+
+    let cp_bundle_present = inputs
+        .trust_bundles
+        .is_some_and(|bundles| trust_bundle_set_contains_remote_domain(bundles, remote));
+
+    if !cp_bundle_present {
+        return RemoteTrustStatus {
+            outbound_trust_active: false,
+            inbound_trust_active: false,
+            trust_source: TRUST_SOURCE_NONE,
+            fetched_at_unix_seconds: None,
+            age_seconds: None,
+        };
+    }
+
+    let source = if inputs
+        .trust_bundles
+        .is_some_and(|bundles| bundles.local.trust_domain == remote.trust_domain)
+    {
+        TRUST_SOURCE_LOCAL
+    } else if inputs.federation_poll_enabled
+        && federation_endpoint_configured
+        && !inputs.federation_fail_open
+    {
+        TRUST_SOURCE_BLOCKED_PENDING_POLL
+    } else {
+        TRUST_SOURCE_CONTROL_PLANE
+    };
+    let active = source != TRUST_SOURCE_BLOCKED_PENDING_POLL && effective_bundle_present;
+
+    RemoteTrustStatus {
+        outbound_trust_active: active,
+        inbound_trust_active: active && inputs.inbound_spiffe_verifier_configured,
+        trust_source: source,
+        fetched_at_unix_seconds: None,
+        age_seconds: None,
+    }
 }
 
 /// Build the response from staged inputs. Pure function — no I/O, no clock
@@ -225,25 +354,44 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
     // Configured view: one entry per declared remote cluster. `discovered`
     // flag cross-references the scoped discovered set so operators see at a
     // glance which configured clusters are actually returning endpoints.
+    let effective_trust_bundles =
+        crate::modes::mesh::federation::merge_federation_into_trust_bundles(
+            inputs.trust_bundles.cloned(),
+            inputs.federation,
+            inputs.multi_cluster,
+            inputs.federation_fail_open,
+            inputs.federation_poll_enabled,
+        );
     let configured: Vec<ConfiguredRemoteCluster> = inputs
         .multi_cluster
         .map(|mc| {
             let mut entries: Vec<ConfiguredRemoteCluster> = mc
                 .remote_clusters
                 .iter()
-                .map(|remote| ConfiguredRemoteCluster {
-                    cluster_name: remote.name.clone(),
-                    trust_domain: remote.trust_domain.as_str().to_string(),
-                    network: remote.network.clone(),
-                    control_plane_configured: remote
-                        .control_plane_url
-                        .as_deref()
-                        .is_some_and(|url| !url.trim().is_empty()),
-                    federation_endpoint_configured: remote
-                        .federation_endpoint
-                        .as_deref()
-                        .is_some_and(|url| !url.trim().is_empty()),
-                    discovered: discovered_names.contains(remote.name.as_str()),
+                .map(|remote| {
+                    let federation_endpoint_configured = endpoint_configured(remote);
+                    let trust_status = remote_trust_status(
+                        remote,
+                        &inputs,
+                        federation_endpoint_configured,
+                        effective_trust_bundles.as_ref(),
+                    );
+                    ConfiguredRemoteCluster {
+                        cluster_name: remote.name.clone(),
+                        trust_domain: remote.trust_domain.as_str().to_string(),
+                        network: remote.network.clone(),
+                        control_plane_configured: remote
+                            .control_plane_url
+                            .as_deref()
+                            .is_some_and(|url| !url.trim().is_empty()),
+                        federation_endpoint_configured,
+                        discovered: discovered_names.contains(remote.name.as_str()),
+                        outbound_trust_active: trust_status.outbound_trust_active,
+                        inbound_trust_active: trust_status.inbound_trust_active,
+                        trust_source: trust_status.trust_source.to_string(),
+                        trust_bundle_fetched_at_unix_seconds: trust_status.fetched_at_unix_seconds,
+                        trust_bundle_age_seconds: trust_status.age_seconds,
+                    }
                 })
                 .collect();
             entries.sort_by(|a, b| a.cluster_name.cmp(&b.cluster_name));

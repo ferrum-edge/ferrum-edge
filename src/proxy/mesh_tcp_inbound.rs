@@ -124,26 +124,11 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // prefix it would see on the generic TCP proxy. The peek is non-destructive;
     // the relay re-reads the same bytes.
     //
-    // CLIENT-FIRST GATE: the blocking peek runs ONLY for opaque-TLS app ports
-    // (`entry.tls_inspect`), where the client speaks first (the ClientHello), so
-    // the peek resolves immediately. Server-first stream ports (Redis/MySQL/
-    // Postgres/Mongo/plain TCP, `tls_inspect == false`) send NO client bytes until
-    // they receive the backend greeting, so peeking there would PARK this task
-    // pre-dial for the full `peek_timeout` — and indefinitely when that timeout is
-    // `0` (the historical "no timeout" single-peek) — stalling every such inbound
-    // connection before the loopback app is ever dialed. This mirrors the SNI peek
-    // gate above (and the generic TCP proxy, which only peeks ClientHello-first
-    // listeners): a server-first port must not block on client bytes that arrive
-    // only after the relay starts.
-    //
-    // Skipping the peek for server-first ports is BEHAVIOR-PRESERVING for the WAF:
-    // it yields exactly the `first_bytes = None` / `first_bytes_kind =
-    // Some(PlaintextWire)` state the bounded peek produced on timeout (idle peer /
-    // server-first greeting wait), so the stream WAF's missing-bytes decision is
-    // identical — fail-open without an enforce-action signature, fail-closed in
-    // enforce mode with one (its documented contract) — only without the pre-dial
-    // wait. Plaintext stream bytes are genuinely L7-inspectable when present, so
-    // the kind stays `PlaintextWire` here, matching the plaintext-client branch.
+    // FIRST-BYTES GATE: only pre-dial peek when mesh has an explicit
+    // client-first signal (opaque TLS). Ambiguous raw TCP and known server-first
+    // protocols (Redis/Mongo/MySQL/Postgres) may not send client bytes until
+    // the backend greeting, and peeking would park the relay on the handshake
+    // clock before loopback is dialed.
     //
     // The byte-kind mirrors the generic TCP proxy's wire classification: this
     // handler NEVER terminates TLS (it relays the captured stream verbatim to
@@ -156,15 +141,18 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // ciphertext handshake bytes are L7-inspectable, producing false
     // matches/blocks.
     let (first_bytes, first_bytes_kind) = if scan_first_bytes {
-        if entry.tls_inspect {
-            // Opaque-TLS, client-first: peek the ClientHello (resolves at once).
+        if entry.first_bytes_inspect {
             let bytes =
                 tcp_proxy::peek_tcp_first_bytes(&client_stream, peek_timeout, first_bytes_min_len)
                     .await;
-            (bytes, Some(StreamBytesKind::EncryptedWire))
+            let kind = if entry.tls_inspect {
+                StreamBytesKind::EncryptedWire
+            } else {
+                StreamBytesKind::PlaintextWire
+            };
+            (bytes, Some(kind))
         } else {
-            // Server-first: do not block on client bytes pre-dial. The WAF sees
-            // the same `None` / `PlaintextWire` it would on a timed-out peek.
+            // Known server-first protocols: do not block on client bytes pre-dial.
             (None, Some(StreamBytesKind::PlaintextWire))
         }
     } else {

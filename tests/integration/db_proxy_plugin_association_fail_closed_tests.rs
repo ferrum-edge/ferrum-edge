@@ -4,9 +4,8 @@
 //! must fail closed when the junction-table query or row decoding fails, and
 //! admin reads must not serialize incomplete association graphs.
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use std::collections::HashSet;
 use tempfile::TempDir;
 
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
@@ -55,6 +54,17 @@ async fn seed_proxy_with_plugin(store: &DatabaseStore) {
         .execute(&pool)
         .await
         .expect("association insert must succeed");
+
+    sqlx::query(
+        "INSERT INTO config_changes (namespace, resource_type, resource_id, operation, created_at) \
+         VALUES ('ferrum', 'plugin_config', 'plugin-1', 'upsert', ?), \
+                ('ferrum', 'proxy', 'proxy-1', 'upsert', ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("change-log seed must succeed");
 }
 
 async fn drop_proxy_plugins_table(store: &DatabaseStore) {
@@ -62,6 +72,22 @@ async fn drop_proxy_plugins_table(store: &DatabaseStore) {
         .execute(&store.pool())
         .await
         .expect("drop proxy_plugins must succeed");
+}
+
+async fn drop_plugin_configs_table(store: &DatabaseStore) {
+    let pool = store.pool();
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("connection acquisition must succeed");
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .expect("foreign key disabling must succeed");
+    sqlx::query("DROP TABLE plugin_configs")
+        .execute(&mut *conn)
+        .await
+        .expect("drop plugin_configs must succeed");
 }
 
 fn error_text<T>(result: Result<T, anyhow::Error>) -> String {
@@ -99,16 +125,8 @@ async fn successful_association_loading_remains_unchanged() {
     assert_eq!(proxy.plugins.len(), 1);
     assert_eq!(proxy.plugins[0].plugin_config_id, "plugin-1");
 
-    let empty = HashSet::new();
     let incremental = store
-        .load_incremental_config(
-            "ferrum",
-            Utc::now() - Duration::days(1),
-            &empty,
-            &empty,
-            &empty,
-            &empty,
-        )
+        .load_incremental_config("ferrum", 0)
         .await
         .expect("incremental load must succeed");
     let incremental_proxy = incremental
@@ -159,31 +177,11 @@ async fn incremental_association_query_failure_rejects_delta() {
         .load_full_config("ferrum")
         .await
         .expect("baseline full load must succeed");
-    let known_proxy_ids: HashSet<String> = baseline.proxies.iter().map(|p| p.id.clone()).collect();
-    let known_consumer_ids: HashSet<String> =
-        baseline.consumers.iter().map(|c| c.id.clone()).collect();
-    let known_plugin_config_ids: HashSet<String> = baseline
-        .plugin_configs
-        .iter()
-        .map(|pc| pc.id.clone())
-        .collect();
-    let known_upstream_ids: HashSet<String> =
-        baseline.upstreams.iter().map(|u| u.id.clone()).collect();
+    assert_eq!(baseline.proxies.len(), 1);
 
     drop_proxy_plugins_table(&store).await;
 
-    let message = error_text(
-        store
-            .load_incremental_config(
-                "ferrum",
-                Utc::now() - Duration::days(1),
-                &known_proxy_ids,
-                &known_consumer_ids,
-                &known_plugin_config_ids,
-                &known_upstream_ids,
-            )
-            .await,
-    );
+    let message = error_text(store.load_incremental_config("ferrum", 0).await);
     assert_association_error_context(&message, "load_incremental_config");
 }
 
@@ -266,6 +264,27 @@ async fn admin_proxy_reads_fail_closed_on_association_query_failure() {
 
     let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
     assert_association_error_context(&list_message, "list_proxies_paginated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_proxy_reads_wrap_plugin_config_lookup_failures_as_association_errors() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+    drop_plugin_configs_table(&store).await;
+
+    let get_message = error_text(store.get_proxy("proxy-1").await);
+    assert_association_error_context(&get_message, "get_proxy");
+    assert!(
+        get_message.contains("failed to load plugin_config references"),
+        "plugin_config lookup failure should be wrapped as association context, got: {get_message}"
+    );
+
+    let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
+    assert_association_error_context(&list_message, "list_proxies_paginated");
+    assert!(
+        list_message.contains("failed to load plugin_config references"),
+        "paginated plugin_config lookup failure should be wrapped as association context, got: {list_message}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

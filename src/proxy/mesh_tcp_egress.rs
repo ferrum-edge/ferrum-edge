@@ -46,6 +46,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use super::{LoadBalancerConnectionGuard, ProxyState, hbone_pool, mesh_mtls_pool, tcp_proxy};
+use crate::identity::SpiffeId;
 use crate::load_balancer::LoadBalancerCache;
 use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpEgressEntry;
@@ -62,6 +63,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
     epoch: &RequestEpoch,
     entry: &Arc<MeshTcpEgressEntry>,
     orig_dst: std::net::SocketAddr,
+    asserted_source_identity: Option<&SpiffeId>,
 ) {
     let proxy = entry.relay_proxy.as_ref();
     let Some(selection) = LoadBalancerCache::select_target_from(
@@ -135,15 +137,29 @@ pub(crate) async fn handle_mesh_tcp_egress(
             }
         };
         let hbone_port = hbone_pool::target_hbone_port(&target);
+        let dial_host = match hbone_pool::target_hbone_dial_host(&target) {
+            Ok(host) => host,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    error = %err,
+                    "Raw-TCP mesh egress target carries a corrupt HBONE dial host; refusing dial"
+                );
+                return;
+            }
+        };
         match state
             .hbone_pool
-            .get_tunnel(
+            .get_tunnel_via(
                 proxy,
+                dial_host,
                 &target.host,
                 target.port,
                 target.dispatch_policy_port(),
                 hbone_port,
                 expected_peer.as_ref(),
+                asserted_source_identity,
             )
             .await
         {

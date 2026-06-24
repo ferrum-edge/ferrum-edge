@@ -3061,6 +3061,63 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
 }
 
 #[tokio::test]
+async fn test_proxy_get_namespace_miss_does_not_validate_other_namespace_associations() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("namespace_miss_invalid_assoc.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let ts = Utc::now().to_rfc3339();
+    let pool = db.pool();
+
+    sqlx::query(
+        "INSERT INTO proxies \
+         (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, created_at, updated_at) \
+         VALUES ('other-proxy', 'other', 'other proxy', '[]', '/api/v1', 'http', 'other.example.com', 8080, ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("other namespace proxy insert must succeed");
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES ('other-global-invalid', 'other', 'cors', '{}', 'global', NULL, 1, ?, ?)",
+    )
+    .bind(&ts)
+    .bind(&ts)
+    .execute(&pool)
+    .await
+    .expect("other namespace global plugin insert must succeed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES ('other-proxy', 'other-global-invalid')",
+    )
+    .execute(&pool)
+    .await
+    .expect("invalid other namespace association insert must succeed");
+
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, data_source) = admin_get(&base_url, "/proxies/other-proxy", &token).await;
+    assert_eq!(
+        status, 404,
+        "default namespace GET should not validate a proxy from another namespace: {body:?}"
+    );
+    assert_eq!(data_source, None);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not found")),
+        "namespace miss should be reported as not found, got: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_proxy_crud_create_update_delete() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

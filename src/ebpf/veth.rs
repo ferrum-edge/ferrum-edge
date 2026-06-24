@@ -8,6 +8,8 @@
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
+use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
@@ -48,9 +50,29 @@ pub fn discover_veth_for_pod(pod_pid: Option<u32>, cgroup_path: Option<&str>) ->
     }
 }
 
+/// Discover the host-side interface that routes to a local pod IP.
+///
+/// This is a fallback for runtimes that expose the pod cgroup and host route
+/// table but block reading peer indexes through `/proc/<pid>/root/sys` or
+/// `setns`. The caller should prefer PID/cgroup netns discovery first because
+/// it identifies the veth peer directly; the route fallback is still scoped by
+/// the tc program's destination-pod-IP map before any packet is classified.
+pub fn discover_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        resolve_iface_by_ipv4_route(Path::new("/proc/net/route"), pod_ip)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pod_ip;
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn discover_veth_linux(pid: u32) -> Option<String> {
-    let peer = read_pod_peer_indexes(pid)?;
+    let peer = read_pod_peer_indexes_from_proc_root(pid).or_else(|| read_pod_peer_indexes(pid))?;
     resolve_iface_by_peer(peer)
 }
 
@@ -77,7 +99,8 @@ fn discover_veth_from_cgroup(cgroup_path: &str) -> Option<String> {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+            if descend {
                 dirs.push(entry.path());
             }
         }
@@ -102,6 +125,18 @@ fn read_pod_peer_indexes(pid: u32) -> Option<PodPeerIndexes> {
     .join()
     .ok()
     .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn read_pod_peer_indexes_from_proc_root(pid: u32) -> Option<PodPeerIndexes> {
+    read_pod_peer_indexes_from_proc_root_at(Path::new("/proc"), pid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_pod_peer_indexes_from_proc_root_at(proc_root: &Path, pid: u32) -> Option<PodPeerIndexes> {
+    read_pod_peer_indexes_from_net_class(
+        &proc_root.join(pid.to_string()).join("root/sys/class/net"),
+    )
 }
 
 /// Read the host peer interface index from the pod's network namespace sysfs.
@@ -167,16 +202,69 @@ fn resolve_iface_by_peer(peer: PodPeerIndexes) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn resolve_iface_by_peer_in_sysfs(sysfs_net: &Path, peer: PodPeerIndexes) -> Option<String> {
     let entries = std::fs::read_dir(sysfs_net).ok()?;
+    let mut ifindex_match = None;
     for entry in entries.flatten() {
         let iface_name = entry.file_name().to_string_lossy().to_string();
         let iface_path = entry.path();
-        if read_u32_from_file(&iface_path.join("ifindex")) == Some(peer.host_ifindex)
-            && read_u32_from_file(&iface_path.join("iflink")) == Some(peer.pod_ifindex)
-        {
+        if read_u32_from_file(&iface_path.join("ifindex")) != Some(peer.host_ifindex) {
+            continue;
+        }
+        if read_u32_from_file(&iface_path.join("iflink")) == Some(peer.pod_ifindex) {
             return Some(iface_name);
         }
+        if ifindex_match.is_none() {
+            ifindex_match = Some(iface_name);
+        }
     }
-    None
+    ifindex_match
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<String> {
+    let routes = std::fs::read_to_string(route_path).ok()?;
+    let ip_raw = u32::from_le_bytes(pod_ip.octets());
+    let mut best: Option<(u32, String)> = None;
+
+    for line in routes.lines().skip(1) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 8 {
+            continue;
+        }
+
+        let iface = fields[0];
+        if iface == "lo" || iface == "eth0" {
+            continue;
+        }
+
+        let (Some(destination), Some(flags), Some(mask)) = (
+            parse_route_hex_u32(fields[1]),
+            parse_route_hex_u32(fields[3]),
+            parse_route_hex_u32(fields[7]),
+        ) else {
+            continue;
+        };
+        if flags & 0x1 == 0 || mask == 0 {
+            continue;
+        }
+        if ip_raw & mask != destination & mask {
+            continue;
+        }
+
+        let prefix_len = mask.count_ones();
+        if best
+            .as_ref()
+            .is_none_or(|(best_prefix, _)| prefix_len > *best_prefix)
+        {
+            best = Some((prefix_len, iface.to_string()));
+        }
+    }
+
+    best.map(|(_, iface)| iface)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_route_hex_u32(raw: &str) -> Option<u32> {
+    u32::from_str_radix(raw, 16).ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -229,6 +317,14 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     fn write(path: &Path, value: &str) {
         std::fs::write(path, value).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn route_hex(ip: &str) -> String {
+        format!(
+            "{:08X}",
+            u32::from_le_bytes(ip.parse::<Ipv4Addr>().unwrap().octets())
+        )
     }
 
     thread_local! {
@@ -349,6 +445,24 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn read_pod_peer_ifindex_uses_proc_root_sysfs_view() {
+        let dir = tempdir().unwrap();
+        let net = dir.path().join("123/root/sys/class/net");
+        std::fs::create_dir_all(net.join("eth0")).unwrap();
+        write(&net.join("eth0/ifindex"), "7\n");
+        write(&net.join("eth0/iflink"), "42\n");
+
+        assert_eq!(
+            read_pod_peer_indexes_from_proc_root_at(dir.path(), 123),
+            Some(PodPeerIndexes {
+                pod_ifindex: 7,
+                host_ifindex: 42
+            })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn resolve_iface_by_peer_uses_host_ifindex_and_reciprocal_iflink() {
         let dir = tempdir().unwrap();
         let net = dir.path();
@@ -374,12 +488,12 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_iface_by_peer_rejects_non_reciprocal_iflink() {
+    fn resolve_iface_by_peer_accepts_unique_host_ifindex_without_reciprocal_iflink() {
         let dir = tempdir().unwrap();
         let net = dir.path();
-        std::fs::create_dir(net.join("eth0")).unwrap();
-        write(&net.join("eth0/ifindex"), "42\n");
-        write(&net.join("eth0/iflink"), "42\n");
+        std::fs::create_dir(net.join("vethabc")).unwrap();
+        write(&net.join("vethabc/ifindex"), "42\n");
+        write(&net.join("vethabc/iflink"), "0\n");
 
         assert_eq!(
             resolve_iface_by_peer_in_sysfs(
@@ -388,8 +502,41 @@ pub(crate) mod tests {
                     pod_ifindex: 7,
                     host_ifindex: 42
                 }
+            )
+            .as_deref(),
+            Some("vethabc")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_iface_by_ipv4_route_uses_longest_matching_pod_route() {
+        let dir = tempdir().unwrap();
+        let route = dir.path().join("route");
+        write(
+            &route,
+            &format!(
+                "\
+Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+eth0 {default} 00000000 0001 0 0 0 {default} 0 0 0
+vethdown {pod} 00000000 0000 0 0 0 {host} 0 0 0
+cni0 {subnet} 00000000 0001 0 0 0 {mask24} 0 0 0
+vethpod {pod} 00000000 0001 0 0 0 {host} 0 0 0
+badline
+vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
+",
+                default = route_hex("0.0.0.0"),
+                pod = route_hex("10.244.1.5"),
+                subnet = route_hex("10.244.1.0"),
+                other = route_hex("10.244.1.6"),
+                mask24 = route_hex("255.255.255.0"),
+                host = route_hex("255.255.255.255"),
             ),
-            None
+        );
+
+        assert_eq!(
+            resolve_iface_by_ipv4_route(&route, "10.244.1.5".parse().unwrap()).as_deref(),
+            Some("vethpod")
         );
     }
 

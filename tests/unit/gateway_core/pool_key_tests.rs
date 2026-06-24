@@ -262,6 +262,34 @@ async fn connection_pool_key_force_http1_discriminator() {
         "default key must NOT carry the h1 discriminator: {default_key}"
     );
 
+    let mut default_https_proxy = minimal_proxy();
+    default_https_proxy.backend_scheme = Some(BackendScheme::Https);
+    default_https_proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    default_https_proxy.backend_port = 443;
+    let default_https_key = pool.pool_key_for_warmup(&default_https_proxy);
+
+    let mut disabled_h2_proxy = default_https_proxy.clone();
+    disabled_h2_proxy.pool_enable_http2 = Some(false);
+    let disabled_h2_key = pool.pool_key_for_warmup(&disabled_h2_proxy);
+    assert_ne!(
+        default_https_key, disabled_h2_key,
+        "pool_enable_http2=false on a TLS backend must not share the default \
+         h2-capable reqwest key: default={default_https_key} disabled_h2={disabled_h2_key}"
+    );
+    assert!(
+        disabled_h2_key.contains("|h1|"),
+        "backend-H2-disabled TLS key must carry the h1 ALPN discriminator: {disabled_h2_key}"
+    );
+
+    let mut http_disabled_h2_proxy = minimal_proxy();
+    http_disabled_h2_proxy.pool_enable_http2 = Some(false);
+    let http_disabled_h2_key = pool.pool_key_for_warmup(&http_disabled_h2_proxy);
+    assert_eq!(
+        default_key, http_disabled_h2_key,
+        "pool_enable_http2=false must not fragment plaintext HTTP reqwest pools; \
+         reqwest does not speak h2c on this path"
+    );
+
     // `Upgrade` and `Default` are probe-driven — they stay h2-capable and must
     // share the default client's key (no fragmentation, no force-H1).
     for probe_driven in [H2UpgradePolicy::Upgrade, H2UpgradePolicy::Default] {

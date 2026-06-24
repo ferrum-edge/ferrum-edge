@@ -226,6 +226,14 @@ pub(crate) struct HostRouteTable {
     /// backing workload addresses, canonicalized the SAME way as the VIP keys);
     /// empty outside mesh mode.
     mesh_tcp_egress_by_workload: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+    /// Direct-pod-IP HTTP-family mesh egress lookup: strict
+    /// `(backing workload IP, resolved target port)` → hidden outbound route,
+    /// selected inside the HTTP request path before Host routing. Duplicate
+    /// claims or missing materialized route/upstream entries become
+    /// `CloseNotRoutable`, so a captured direct Pod-IP request is never
+    /// attributed to an arbitrary service by its Host header.
+    mesh_http_egress_by_workload:
+        HashMap<(std::net::IpAddr, u16), MeshHttpEgressByWorkloadDecision>,
     /// Local Sidecar raw-TCP inbound lookup: captured original-destination app
     /// port → loopback relay entry. Consulted by the inbound accept loop before
     /// Hyper parses the connection, so Redis/MySQL/etc. bytes never enter the
@@ -274,11 +282,14 @@ pub(crate) struct MeshTcpInboundEntry {
     /// The local service FQDN for logging.
     pub(crate) service_fqdn: String,
     /// `true` only for opaque-TLS app ports: the inbound relay peeks the
-    /// ClientHello SNI before the stream plugin chain. `false` for server-first
-    /// raw-TCP ports, where peeking would block the relay on the handshake clock
-    /// (the client sends nothing until the backend greeting). Carried from
+    /// ClientHello SNI before the stream plugin chain. Carried from
     /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
     pub(crate) tls_inspect: bool,
+    /// `true` only when mesh has an explicit client-first signal. `false` for
+    /// ambiguous/server-first raw-TCP protocols (Tcp/Redis/Mongo/MySQL/
+    /// Postgres), where peeking would block the relay on the handshake clock
+    /// before the backend greeting can arrive.
+    pub(crate) first_bytes_inspect: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -296,6 +307,15 @@ pub(crate) enum MeshTcpEgressDecision {
     /// connection — the destination is mesh-owned, so letting it fall
     /// through to hyper would just fail confusingly later, and guessing a
     /// different port/service is forbidden.
+    CloseNotRoutable,
+}
+
+#[derive(Clone)]
+pub(crate) enum MeshHttpEgressByWorkloadDecision {
+    Route {
+        proxy: Arc<Proxy>,
+        service_port: u16,
+    },
     CloseNotRoutable,
 }
 
@@ -599,6 +619,22 @@ impl HostRouteTable {
             return None;
         }
         self.mesh_tcp_egress_by_workload
+            .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
+    }
+
+    /// Direct-pod-IP HTTP-family egress lookup for captured outbound requests,
+    /// consulted before Host routing. `None` means the original destination is
+    /// not a declared workload HTTP target and the regular Host route may
+    /// proceed. A declared-but-unroutable or ambiguous pair returns
+    /// `CloseNotRoutable` and the request path fails closed.
+    pub(crate) fn mesh_http_egress_by_workload_decision(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<&MeshHttpEgressByWorkloadDecision> {
+        if self.mesh_http_egress_by_workload.is_empty() {
+            return None;
+        }
+        self.mesh_http_egress_by_workload
             .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
     }
 
@@ -1785,6 +1821,71 @@ impl RouterCache {
             }
         }
 
+        // ── Direct-pod-IP HTTP-family egress ──────────────────────────────
+        // Strict `(backing workload IP, resolved target port)` → hidden
+        // outbound proxy. The HTTP request path checks this before Host routing
+        // so a direct Pod-IP request cannot be attributed to whichever service
+        // the client chose to put in the Host header. Missing materialized
+        // proxy/upstream entries and duplicate claims fail closed.
+        let mut mesh_http_egress_by_workload: HashMap<
+            (std::net::IpAddr, u16),
+            MeshHttpEgressByWorkloadDecision,
+        > = HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            let upstream_ids: std::collections::HashSet<&str> =
+                config.upstreams.iter().map(|u| u.id.as_str()).collect();
+            let proxy_by_id: HashMap<&str, &Proxy> = config
+                .proxies
+                .iter()
+                .filter(|p| crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&p.id))
+                .map(|p| (p.id.as_str(), p))
+                .collect();
+            for spec in crate::modes::mesh::mesh_outbound_http_bywl_upstreams(
+                &mesh.services,
+                &mesh.workloads,
+                mesh.multi_cluster.as_ref(),
+            ) {
+                let decision = match (
+                    upstream_ids.contains(spec.upstream_id.as_str()),
+                    proxy_by_id.get(spec.proxy_id.as_str()),
+                ) {
+                    (true, Some(proxy)) => MeshHttpEgressByWorkloadDecision::Route {
+                        proxy: Arc::new((**proxy).clone()),
+                        service_port: spec.service_port.port,
+                    },
+                    _ => MeshHttpEgressByWorkloadDecision::CloseNotRoutable,
+                };
+                let key = (spec.canonical_ip, spec.target_port);
+                match mesh_http_egress_by_workload.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(decision);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let collision = match (entry.get(), &decision) {
+                            (
+                                MeshHttpEgressByWorkloadDecision::Route {
+                                    proxy: existing_proxy,
+                                    service_port: existing_port,
+                                },
+                                MeshHttpEgressByWorkloadDecision::Route {
+                                    proxy: new_proxy,
+                                    service_port: new_port,
+                                },
+                            ) => existing_proxy.id != new_proxy.id || existing_port != new_port,
+                            (
+                                MeshHttpEgressByWorkloadDecision::CloseNotRoutable,
+                                MeshHttpEgressByWorkloadDecision::CloseNotRoutable,
+                            ) => false,
+                            _ => true,
+                        };
+                        if collision {
+                            entry.insert(MeshHttpEgressByWorkloadDecision::CloseNotRoutable);
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Local raw-TCP Sidecar inbound lookup ──────────────────────────
         // Forward-derived during mesh preparation from the same local
         // workload/service view that HTTP inbound materialization consumes.
@@ -1802,6 +1903,7 @@ impl RouterCache {
                         backend_addr: route.backend_addr,
                         service_fqdn: route.service_fqdn.clone(),
                         tls_inspect: route.tls_inspect,
+                        first_bytes_inspect: route.first_bytes_inspect,
                     })
                 });
             }
@@ -1873,6 +1975,12 @@ impl RouterCache {
                             .or_insert_with(|| decision.clone());
                     }
                 }
+            }
+        }
+
+        for proxy in &config.proxies {
+            if crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&proxy.id) {
+                mesh_sibling_skip_ids.insert(proxy.id.clone());
             }
         }
 
@@ -2111,6 +2219,7 @@ impl RouterCache {
             mesh_inbound_ports,
             mesh_tcp_egress,
             mesh_tcp_egress_by_workload,
+            mesh_http_egress_by_workload,
             mesh_tcp_inbound,
             mesh_udp_egress,
         }
@@ -4695,18 +4804,30 @@ mod tests {
         use crate::config::types::BackendScheme;
         use crate::modes::mesh::config::{MeshConfig, MeshInboundTcpRoute};
 
-        let route = MeshInboundTcpRoute {
+        let redis_route = MeshInboundTcpRoute {
             match_port: 6380,
             backend_addr: "127.0.0.1:6380".parse().unwrap(),
             namespace: "default".to_string(),
             service_name: "redis".to_string(),
             service_fqdn: "redis.default.svc.cluster.local".to_string(),
-            // Redis is server-first: the relay must NOT peek SNI for this port.
+            // Redis is not opaque TLS: the relay must NOT peek SNI for this port.
             tls_inspect: false,
+            // Redis is server-first: the relay must not block before dialing loopback.
+            first_bytes_inspect: false,
+        };
+        let tcp_route = MeshInboundTcpRoute {
+            match_port: 7000,
+            backend_addr: "127.0.0.1:7000".parse().unwrap(),
+            namespace: "default".to_string(),
+            service_name: "tcpapp".to_string(),
+            service_fqdn: "tcpapp.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            // Generic TCP is ambiguous and must not pre-dial peek by default.
+            first_bytes_inspect: false,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                local_inbound_tcp_routes: vec![route],
+                local_inbound_tcp_routes: vec![redis_route, tcp_route],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
@@ -4721,12 +4842,25 @@ mod tests {
         assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
         assert!(
             !entry.tls_inspect,
-            "server-first raw-TCP inbound entries must not SNI-peek (would stall on the handshake clock)"
+            "non-TLS raw-TCP inbound entries must not SNI-peek"
+        );
+        assert!(
+            !entry.first_bytes_inspect,
+            "Redis inbound entries are server-first and must not pre-dial peek first bytes"
         );
         assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert_eq!(
             entry.relay_proxy.id,
             "__mesh-in-tcp-relay-default-redis-6380"
+        );
+
+        let tcp_entry = table
+            .mesh_tcp_inbound_entry("10.0.0.7:7000".parse().unwrap())
+            .expect("captured generic TCP app port should route");
+        assert_eq!(tcp_entry.backend_addr, "127.0.0.1:7000".parse().unwrap());
+        assert!(
+            !tcp_entry.first_bytes_inspect,
+            "generic TCP inbound entries are ambiguous and must not pre-dial peek first bytes"
         );
 
         assert!(
@@ -4855,6 +4989,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         };
 
@@ -4933,6 +5068,212 @@ mod tests {
         assert!(matches!(
             table.mesh_tcp_egress_by_workload_decision("10.0.0.7:6380".parse().unwrap()),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
+    fn mesh_http_egress_by_workload_routes_direct_pod_ip_dials() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: Some(ServiceTargetPort::Number(18080)),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: std::collections::HashMap::new(),
+            cluster_ips: Vec::new(),
+        };
+        let workload = Workload {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "reviews".to_string(),
+            addresses: vec!["10.0.0.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: 18080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        };
+        let canonical_ip = "10.0.0.7".parse().unwrap();
+        let upstream_id = crate::modes::mesh::mesh_outbound_http_bywl_upstream_id(
+            "default",
+            "reviews",
+            8080,
+            canonical_ip,
+        );
+        let proxy_id = crate::modes::mesh::mesh_outbound_http_bywl_proxy_id(
+            "default",
+            "reviews",
+            8080,
+            canonical_ip,
+        );
+        let mut proxy = minimal_proxy_for_routing(&proxy_id, "/");
+        proxy.hosts = vec!["bywl-default-reviews-8080-10-0-0-7.mesh.internal".to_string()];
+        proxy.upstream_id = Some(upstream_id.clone());
+        proxy.preserve_host_header = false;
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": upstream_id,
+            "name": "reviews.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.7", "port": 18080}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                workloads: vec![workload],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+
+        match table.mesh_http_egress_by_workload_decision("10.0.0.7:18080".parse().unwrap()) {
+            Some(MeshHttpEgressByWorkloadDecision::Route {
+                proxy,
+                service_port,
+            }) => {
+                assert_eq!(proxy.id, proxy_id);
+                assert_eq!(*service_port, 8080);
+            }
+            _ => panic!("expected direct-pod HTTP route"),
+        }
+        assert!(matches!(
+            table.mesh_http_egress_by_workload_decision("[::ffff:10.0.0.7]:18080".parse().unwrap()),
+            Some(MeshHttpEgressByWorkloadDecision::Route { .. })
+        ));
+        assert!(
+            cache
+                .find_proxy(
+                    Some("bywl-default-reviews-8080-10-0-0-7.mesh.internal"),
+                    "/"
+                )
+                .is_none(),
+            "hidden direct-pod proxies must not enter normal Host routing"
+        );
+        assert!(
+            table
+                .mesh_http_egress_by_workload_decision("10.0.0.7:8080".parse().unwrap())
+                .is_none(),
+            "index is keyed by resolved targetPort, not service port"
+        );
+    }
+
+    #[test]
+    fn mesh_http_egress_by_workload_closes_ambiguous_direct_pod_ip_dials() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        let spiffe = "spiffe://cluster.local/ns/default/sa/shared";
+        let workload = Workload {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "shared".to_string(),
+            addresses: vec!["10.0.0.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: 18080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        };
+        let service = |name: &str, port: u16| MeshService {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: Some(ServiceTargetPort::Number(18080)),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: std::collections::HashMap::new(),
+            cluster_ips: Vec::new(),
+        };
+
+        let canonical_ip = "10.0.0.7".parse().unwrap();
+        let mut proxies = Vec::new();
+        let mut upstreams = Vec::new();
+        for (name, port) in [("reviews", 8080u16), ("ratings", 9090u16)] {
+            let upstream_id = crate::modes::mesh::mesh_outbound_http_bywl_upstream_id(
+                "default",
+                name,
+                port,
+                canonical_ip,
+            );
+            let proxy_id = crate::modes::mesh::mesh_outbound_http_bywl_proxy_id(
+                "default",
+                name,
+                port,
+                canonical_ip,
+            );
+            let mut proxy = minimal_proxy_for_routing(&proxy_id, "/");
+            proxy.hosts = vec![format!("bywl-default-{name}-{port}-10-0-0-7.mesh.internal")];
+            proxy.upstream_id = Some(upstream_id.clone());
+            proxies.push(proxy);
+            upstreams.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": upstream_id,
+                    "name": format!("{name}.default.svc.cluster.local"),
+                    "targets": [{"host": "10.0.0.7", "port": 18080}],
+                }))
+                .expect("upstream deserializes"),
+            );
+        }
+
+        let config = GatewayConfig {
+            proxies,
+            upstreams,
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service("reviews", 8080), service("ratings", 9090)],
+                workloads: vec![workload],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table_for_tests();
+        assert!(matches!(
+            table.mesh_http_egress_by_workload_decision("10.0.0.7:18080".parse().unwrap()),
+            Some(MeshHttpEgressByWorkloadDecision::CloseNotRoutable)
         ));
     }
 }

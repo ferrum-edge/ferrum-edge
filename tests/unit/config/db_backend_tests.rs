@@ -411,8 +411,28 @@ fn incremental_result_is_empty_when_default() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
+    assert!(result.is_empty());
+}
+
+#[test]
+fn incremental_result_deserializes_legacy_delta_without_sequence_cursor() {
+    let result: IncrementalResult = serde_json::from_value(serde_json::json!({
+        "added_or_modified_proxies": [],
+        "removed_proxy_ids": [],
+        "added_or_modified_consumers": [],
+        "removed_consumer_ids": [],
+        "added_or_modified_plugin_configs": [],
+        "removed_plugin_config_ids": [],
+        "added_or_modified_upstreams": [],
+        "removed_upstream_ids": [],
+        "poll_timestamp": "2026-06-21T00:00:00Z"
+    }))
+    .expect("legacy incremental deltas without sequence_cursor must deserialize");
+
+    assert_eq!(result.sequence_cursor, 0);
     assert!(result.is_empty());
 }
 
@@ -435,6 +455,7 @@ fn incremental_result_not_empty_with_added_proxy() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
@@ -451,6 +472,7 @@ fn incremental_result_not_empty_with_removed_proxy_id() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
@@ -467,6 +489,7 @@ fn incremental_result_not_empty_with_removed_consumer() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
@@ -483,6 +506,7 @@ fn incremental_result_not_empty_with_removed_plugin_config() {
         removed_plugin_config_ids: vec!["pc1".to_string()],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
@@ -499,6 +523,7 @@ fn incremental_result_not_empty_with_removed_upstream() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec!["u1".to_string()],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
@@ -522,6 +547,7 @@ fn incremental_result_not_empty_with_added_consumer() {
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
+        sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());

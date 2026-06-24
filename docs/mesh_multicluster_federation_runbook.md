@@ -1,0 +1,127 @@
+# Mesh Multicluster Federation Runbook
+
+This runbook covers the real-cluster validation surface for Ferrum mesh trust
+federation and cross-cluster endpoint discovery. It is the operator and CI
+companion to `docs/mesh.md` sections "Trust Federation" and
+"Cross-Cluster Endpoint Discovery".
+
+## Current Validation Report
+
+Date: 2026-06-21.
+
+Local workspace validation could not create real clusters because Docker was
+not running and neither `kind` nor `k3d` was installed:
+
+```text
+docker info: Cannot connect to the Docker daemon at unix:///Users/jeremyjustus/.docker/run/docker.sock
+kind: not found
+k3d: not found
+```
+
+Existing repository coverage before this run was not enough to stop remediation:
+it covered in-process federation/discovery behavior and a single-kind Helm
+chart install, but not a bidirectional two-control-plane deployment over two
+real clusters.
+
+Remediation in this change makes federation activation bidirectional and
+observable:
+
+- the effective trust-bundle set is used by outbound mTLS and inbound SPIFFE
+  peer verification;
+- `FERRUM_MESH_FEDERATION_FAIL_OPEN=false` blocks CP-supplied fallback bundles
+  for remotes with `federation_endpoint` until the poller installs a last-good
+  bundle;
+- `FERRUM_MESH_FEDERATION_FAIL_OPEN=true` allows the CP fallback during
+  bootstrap;
+- transient poll failures preserve last-good bundles in both modes;
+- `GET /mesh/remote-clusters` reports discovery state, outbound trust, inbound
+  trust, trust source, and polled-bundle freshness per configured remote.
+
+## Required Topology
+
+Use two independent clusters:
+
+| Cluster | Trust domain | Ferrum CP | Ferrum DP/east-west | Workload |
+|---|---|---|---|---|
+| A | `cluster-a.test` | `ferrum-a` | sidecar/waypoint + east-west gateway | `client-a`, `echo-a` |
+| B | `cluster-b.test` | `ferrum-b` | sidecar/waypoint + east-west gateway | `client-b`, `echo-b` |
+
+Each cluster must have its own root, control-plane database, CP/DP JWT secret,
+gateway SVID, `MultiClusterConfig.remote_clusters[]` entry for the peer, peer
+`federation_endpoint`, peer `control_plane_url`, and east-west gateway address.
+
+## Failure-Mode Matrix
+
+| Scenario | Expected result |
+|---|---|
+| Bootstrap, fail-closed | Before the first successful bundle poll, `trust_source=blocked_pending_poll`, `outbound_trust_active=false`, `inbound_trust_active=false`, and authenticated cross-cluster traffic fails. |
+| Bootstrap, fail-open | Before the first successful bundle poll, CP fallback is active, `trust_source=control_plane`, and traffic can pass if the CP bundle is valid. |
+| First successful bundle poll | `trust_source=polled`; both outbound and inbound trust become active when the gateway has a SPIFFE verifier slot. |
+| Root rotation with overlap | Traffic continues while old and new roots overlap; status `trust_bundle_age_seconds` refreshes after poll. |
+| Root removal after overlap | Traffic signed by the removed root fails after the new polled bundle is active. |
+| Invalid bundle delivery | Invalid remote bundle is rejected; last-good bundle remains active; age increases; poll-failure metrics/logs identify the endpoint. |
+| Prolonged federation disconnection | Last-good bundle is preserved until expiry policy is defined by operators; alert on stale bundle age. |
+| Endpoint addition | Remote endpoint appears under `discovered`, service/workload counts increase, and the local LB can fail over to it. |
+| Endpoint removal | Removed remote endpoint disappears after a successful discovery poll or cluster removal; stale endpoints are evicted on accepted config/trust withdrawal. |
+| Local-first routing | With source locality present, local endpoints are preferred while healthy. |
+| Remote failover | When local endpoints are unavailable, traffic fails over to remote endpoints. |
+| Network partition / DNS failure / latency | Pollers back off and keep last-good bundles/endpoints; status age increases; recovery refreshes age and data. |
+| Stale CP data | Received-but-rejected slices do not affect poller membership or discovered status; accepted last-good slice continues serving. |
+| CP restart | DPs retain last-good slice and reconnect; status shows stale slice age during outage. |
+| Gateway restart | Gateway restarts with no partial trust state; it bootstraps according to fail-open/fail-closed policy and then converges from CP/poller data. |
+| Asymmetric trust | `GET /mesh/remote-clusters` distinguishes outbound and inbound trust, so missing inbound SPIFFE verifier material is visible as `outbound_trust_active=true`, `inbound_trust_active=false`. |
+
+## Operator Checks
+
+For each cluster:
+
+```bash
+kubectl --context "$CTX" -n ferrum get pods -o wide
+kubectl --context "$CTX" -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+kubectl --context "$CTX" -n ferrum rollout status deployment/ferrum-mesh-east-west --timeout=180s
+kubectl --context "$CTX" -n ferrum logs deployment/ferrum-mesh-control-plane --tail=200
+```
+
+Query mesh status through the authenticated admin API:
+
+```bash
+curl -fsS -H "Authorization: Bearer $ADMIN_JWT_A" \
+  "https://$ADMIN_A/mesh/remote-clusters" | jq .
+curl -fsS -H "Authorization: Bearer $ADMIN_JWT_B" \
+  "https://$ADMIN_B/mesh/remote-clusters" | jq .
+```
+
+The configured peer row must show:
+
+- `discovered=true` after endpoint discovery converges;
+- `trust_source=polled` after bundle polling converges;
+- `outbound_trust_active=true`;
+- `inbound_trust_active=true`;
+- a fresh `trust_bundle_age_seconds`.
+
+## Harness
+
+The scheduled harness entry point is:
+
+```bash
+tests/k8s/multicluster-federation/run.sh
+```
+
+It creates or reuses two kind clusters, deploys Ferrum control planes and
+east-west gateways with independent SQLite databases and secrets, and records
+diagnostics under `${ARTIFACT_DIR:-.context/multicluster-federation}`. The PR
+`Mesh Multicluster Federation` job in `.github/workflows/ci.yml` runs it when
+mesh federation, discovery, identity, proxy, chart, image, proto, docs, config,
+or CI surfaces change. Manual `workflow_dispatch` runs force the same smoke
+regardless of changed paths. CI uses `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`,
+packages a Ferrum runtime image with the same
+`.github/actions/package-ferrum-runtime-image` path used by other kind-based
+jobs, then loads that image into both clusters.
+That proves two independent clusters and CP/east-west rollout only. Full mode
+intentionally exits non-zero until the workload traffic/failure fixture is
+completed, so no one can mistake deploy smoke for bidirectional mTLS, rotation,
+failover, and partition validation. The smoke sets
+`FERRUM_MESH_ALLOW_NO_CA=true` on the east-west gateways because it does not
+yet provision workload SVIDs. The script intentionally fails during preflight
+when Docker, kind, kubectl, or Helm are unavailable; do not treat a skipped
+local run as validation evidence.

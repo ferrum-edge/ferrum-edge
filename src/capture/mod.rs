@@ -1233,16 +1233,14 @@ fn udp_tproxy_commands_for_family(
         .map(|sel| format!("{sel} {outbound_dst_scope} {mark_jump}"))
         .collect();
 
-    // INBOUND UDP capture is DISABLED (codex r1, #1808). The capture listener +
-    // egress datapath relay ONLY outbound (pod→mesh) UDP: `handle_captured_datagram`
-    // resolves outbound `mesh_udp_egress` entries by service VIP and DROPS anything
-    // non-routable. The inbound catch-all (`--dst-type LOCAL`) would divert UDP
-    // destined for the pod's OWN app IP into that egress-only listener, black-holing
-    // inbound UDP for UDP-serving pods. So emit NO inbound chain/jump/rules until an
-    // inbound UDP relay exists; teardown still reaps any prior inbound chain. (The
-    // cross-family `suppress_catch_all` logic now governs only the OUTBOUND catch-all
-    // above; inbound is off regardless of family selection.)
-    let emit_inbound = false;
+    // INBOUND UDP must remain captured when sidecar UDP capture is enabled. The
+    // destination-side HBONE datagram relay requires an authenticated mesh peer
+    // before opening a local UDP socket; letting pod-destined UDP bypass TPROXY
+    // would bypass mesh identity and mesh_authz policy. Until a dedicated inbound
+    // UDP relay exists, the captured LOCAL-destination path intentionally
+    // fail-closes in the egress-only listener instead of passing unauthenticated
+    // traffic directly to the workload.
+    let emit_inbound = true;
 
     // If this family emits NO TPROXY rule at all (e.g. a pure-CIDR cross-family
     // skip with no port includes), produce NO UDP state for it — no chains, no
@@ -1399,8 +1397,7 @@ fn udp_tproxy_commands_for_family(
     }
 
     // Inbound UDP chain — created, flushed, populated, and (below) jumped from
-    // PREROUTING ONLY when `emit_inbound` is set, which is currently never (#1808
-    // relays outbound only; see `emit_inbound`). Co-located here so all inbound
+    // PREROUTING when `emit_inbound` is set. Co-located here so all inbound
     // wiring lives behind one gate. Teardown reaps the chain UNCONDITIONALLY so a
     // pod upgraded from a prior version that DID install it is cleaned up.
     if emit_inbound {
@@ -1431,23 +1428,6 @@ fn udp_tproxy_commands_for_family(
             "FERRUM_MESH_UDP_INBOUND",
             &format!("-p udp -m addrtype --dst-type LOCAL {tproxy_jump}"),
         ));
-    } else {
-        // REAP a stale inbound chain/jump from a PRIOR in-place install (codex r2):
-        // a setup rerun (sidecar restart/upgrade) whose previous version emitted the
-        // inbound catch-all must actively remove it HERE — the cleanup script runs
-        // only on teardown, so without this an `emit_inbound = false` reapply would
-        // leave the old `PREROUTING -> FERRUM_MESH_UDP_INBOUND` jump diverting
-        // inbound-to-pod UDP into the egress-only listener (black-hole). Delete the
-        // jump BEFORE the chain it targets; all idempotent (`|| true`), a no-op on a
-        // fresh pod.
-        commands.push(idempotent_delete(
-            binary,
-            "mangle",
-            "PREROUTING",
-            "-p udp -j FERRUM_MESH_UDP_INBOUND",
-        ));
-        commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
-        commands.push(delete_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
     }
 
     // Transparent-routing plumbing: raw `ip` commands (NOT iptables). The fwmark
@@ -1548,9 +1528,8 @@ fn udp_tproxy_commands_for_family(
         "PREROUTING",
         "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
     ));
-    // The INBOUND jump is emitted ONLY when `emit_inbound` is set (currently never
-    // — #1808 relays outbound only). Without it, inbound-to-pod UDP is never
-    // diverted into the egress-only listener and flows normally to the pod's app.
+    // The INBOUND jump is emitted when `emit_inbound` is set so pod-destined UDP
+    // cannot bypass mesh identity and authorization by flowing directly to the app.
     if emit_inbound {
         commands.push(idempotent_append(
             binary,
@@ -2831,20 +2810,17 @@ mod tests {
         let plan = IptablesPlan::for_config(&config);
         let cmds = &plan.v4_commands;
 
-        // New mangle-table chains are created. Inbound UDP capture is DISABLED
-        // (#1808, no inbound relay), so NO inbound chain/rule/jump is emitted at all
-        // (asserted directly below).
+        // New mangle-table chains are created. Inbound UDP capture stays enabled
+        // for LOCAL destinations so unauthenticated UDP cannot bypass the mesh.
         assert!(
             cmds.iter()
                 .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_OUTBOUND")),
             "missing UDP outbound mangle chain: {cmds:?}"
         );
         assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && !c.contains("-D ")
-                && !c.contains("-F ")
-                && !c.contains("-X ")),
-            "inbound UDP capture disabled (#1808): only idempotent reap deletes (-D/-F/-X) may reference the inbound chain: {cmds:?}"
+            cmds.iter()
+                .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_INBOUND")),
+            "missing UDP inbound mangle chain: {cmds:?}"
         );
 
         // Catch-all TPROXY jump on both directions, on the UDP port with the mark.
@@ -2945,11 +2921,11 @@ mod tests {
         let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
         let cmds = &plan.v4_commands;
 
-        // Inbound is disabled (#1808), so only the egress-side chains are emitted.
         for chain in [
             "FERRUM_MESH_UDP_OUTBOUND",
             "FERRUM_MESH_UDP_OUTPUT_MARK",
             "FERRUM_MESH_UDP_REINJECT",
+            "FERRUM_MESH_UDP_INBOUND",
         ] {
             let flush = cmds
                 .iter()
@@ -3023,11 +2999,10 @@ mod tests {
     );
 
     #[test]
-    fn udp_prerouting_emits_outbound_jump_and_no_inbound() {
-        // The OUTBOUND chain is jumped from `mangle PREROUTING` (TPROXY is
-        // PREROUTING-only). Inbound UDP capture is DISABLED (#1808, no inbound
-        // relay), so NO inbound PREROUTING jump is emitted — inbound-to-pod UDP is
-        // never diverted and flows normally to the pod's app.
+    fn udp_prerouting_emits_outbound_and_inbound_jumps() {
+        // The OUTBOUND and INBOUND chains are jumped from `mangle PREROUTING`
+        // (TPROXY is PREROUTING-only). The inbound jump keeps pod-destined UDP
+        // from bypassing mesh identity and authorization.
         let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
         let cmds = &plan.v4_commands;
 
@@ -3040,10 +3015,12 @@ mod tests {
             "missing PREROUTING -> UDP outbound jump: {cmds:?}"
         );
         assert!(
-            !cmds
-                .iter()
-                .any(|c| c.contains("-j FERRUM_MESH_UDP_INBOUND") && !c.contains("-D ")),
-            "inbound UDP capture disabled (#1808): no PREROUTING -> inbound jump (only the idempotent -D reap): {cmds:?}"
+            cmds.iter().any(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
+            }),
+            "missing PREROUTING -> UDP inbound jump: {cmds:?}"
         );
     }
 
@@ -3062,14 +3039,11 @@ mod tests {
                 && c.contains("-j TPROXY")),
             "outbound UDP TPROXY must be scoped to a non-local destination: {cmds:?}"
         );
-        // Inbound UDP capture is DISABLED (#1808, no inbound relay): no inbound
-        // chain/rule is emitted at all, so there is no inbound TPROXY to scope.
         assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && !c.contains("-D ")
-                && !c.contains("-F ")
-                && !c.contains("-X ")),
-            "inbound UDP capture disabled (#1808): only idempotent reap deletes (-D/-F/-X) may reference the inbound chain: {cmds:?}"
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && c.contains("-m addrtype --dst-type LOCAL")
+                && c.contains("-j TPROXY")),
+            "inbound UDP TPROXY must be scoped to a local destination: {cmds:?}"
         );
     }
 
@@ -3203,14 +3177,10 @@ mod tests {
             );
         }
 
-        // Inbound UDP capture is DISABLED (#1808, no inbound relay): even with
-        // `exclude_inbound_ports` set, NO inbound chain/rule is emitted at all.
         assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && !c.contains("-D ")
-                && !c.contains("-F ")
-                && !c.contains("-X ")),
-            "inbound UDP capture disabled (#1808): exclude_inbound_ports emits no inbound rule (reap deletes only): {cmds:?}"
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && c.contains("-p udp --dport 5353 -j RETURN")),
+            "UDP inbound exclude port RETURN missing: {cmds:?}"
         );
     }
 
@@ -3291,11 +3261,17 @@ mod tests {
                     && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
             })
             .expect("PREROUTING -> outbound jump");
-        // Inbound capture is disabled (#1808), so only the outbound dst-based chain
-        // is jumped; the reinject jump must still precede it.
+        let inbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
+            })
+            .expect("PREROUTING -> inbound jump");
         assert!(
-            reinject_jump < outbound_jump,
-            "reinject PREROUTING jump must precede the outbound chain jump: {cmds:?}"
+            reinject_jump < outbound_jump && outbound_jump < inbound_jump,
+            "PREROUTING jump order must be reinject, outbound, inbound: {cmds:?}"
         );
 
         // (d) Host-netns (node-agent) path emits NO UDP rules at all — including no
@@ -3731,23 +3707,35 @@ mod tests {
 
         let plan = IptablesPlan::for_config(&config);
 
-        // The IPv4 family must emit NO UDP state at all (no TPROXY rule — neither
-        // the unqualified outbound nor the `--dst-type LOCAL` inbound catch-all —
-        // and no UDP mangle chains / PREROUTING jumps / fwmark routing for v4).
-        // Both the outbound AND inbound catch-alls are unqualified `-j TPROXY`
-        // diversions that would black-hole all IPv4 UDP though only IPv6 was
-        // selected (codex r4).
-        for cmd in &plan.v4_commands {
-            let touches_udp_tproxy = cmd.contains("-p udp") && cmd.contains("-j TPROXY");
-            let touches_routing = cmd.starts_with("ip rule") || cmd.starts_with("ip route");
-            assert!(
-                !cmd.contains("FERRUM_MESH_UDP")
-                    && !touches_udp_tproxy
-                    && !cmd.contains("fwmark")
-                    && !touches_routing,
-                "IPv6-only explicit includes must emit no IPv4 UDP state: {cmd}"
-            );
-        }
+        // The IPv4 family must emit no OUTBOUND UDP catch-all or MARK rule when
+        // only IPv6 CIDRs are selected. Inbound LOCAL capture is still emitted for
+        // the active IPv4 family so pod-destined UDP fail-closes behind the mesh
+        // relay instead of bypassing mTLS/authz.
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND") && c.contains("-j TPROXY")),
+            "IPv6-only explicit includes must not emit IPv4 outbound UDP TPROXY state: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK") && c.contains("-j MARK")),
+            "IPv6-only explicit includes must not MARK IPv4 outbound UDP egress: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                    && c.contains("-m addrtype --dst-type LOCAL")
+                    && c.contains("-j TPROXY")),
+            "IPv4 inbound UDP LOCAL capture must stay installed for fail-closed inbound protection: {:?}",
+            plan.v4_commands
+        );
         // The TCP IPv4 chains are still present (CIDR scoping is outbound-UDP-only).
         assert!(
             plan.v4_commands
@@ -3814,9 +3802,10 @@ mod tests {
             "IPv4 routing must be installed when a port include emits a rule: {:?}",
             plan.v4_commands
         );
-        // But the IPv4 family must STILL NOT get either UNQUALIFIED catch-all — the
-        // implicit outbound catch-all OR the inbound `--dst-type LOCAL` catch-all
-        // (both would black-hole all IPv4 UDP though only IPv6 was CIDR-selected).
+        // But the IPv4 family must STILL NOT get an unqualified OUTBOUND
+        // catch-all. Inbound `--dst-type LOCAL` capture is deliberately present
+        // for fail-closed inbound protection even when the outbound CIDR selector
+        // is IPv6-only.
         assert!(
             !plan
                 .v4_commands
@@ -3829,17 +3818,18 @@ mod tests {
             plan.v4_commands
         );
         assert!(
-            !plan
-                .v4_commands
+            plan.v4_commands
                 .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-j TPROXY")),
-            "IPv4 inbound catch-all must stay suppressed for the unselected family: {:?}",
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                    && c.contains("-m addrtype --dst-type LOCAL")
+                    && c.contains("-j TPROXY")),
+            "IPv4 inbound LOCAL capture must stay installed for fail-closed inbound protection: {:?}",
             plan.v4_commands
         );
         // The IPv6 family keeps its CIDR-qualified OUTBOUND rule (it IS the selected
         // family). The port include also fans onto IPv6 (port includes are
-        // family-agnostic). Inbound UDP capture is DISABLED (#1808), so NO inbound
-        // catch-all is emitted for the selected family either.
+        // family-agnostic). Inbound UDP capture also emits the LOCAL catch-all for
+        // the selected family so pod-destined UDP remains fail-closed.
         assert!(
             plan.v6_commands
                 .iter()
@@ -3849,14 +3839,12 @@ mod tests {
             plan.v6_commands
         );
         assert!(
-            !plan
-                .v6_commands
+            plan.v6_commands
                 .iter()
                 .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                    && !c.contains("-D ")
-                    && !c.contains("-F ")
-                    && !c.contains("-X ")),
-            "inbound UDP capture disabled (#1808): no inbound chain even for the selected family (reap deletes only): {:?}",
+                    && c.contains("-m addrtype --dst-type LOCAL")
+                    && c.contains("-j TPROXY")),
+            "IPv6 inbound catch-all must protect the selected family: {:?}",
             plan.v6_commands
         );
     }
@@ -3942,8 +3930,7 @@ mod tests {
             })
             .expect("PREROUTING -> UDP outbound jump");
 
-        // Inbound capture is disabled (#1808), so only the outbound PREROUTING jump
-        // exists; the routing plumbing must precede it.
+        // Routing plumbing must precede the first dst-based PREROUTING jump.
         assert!(
             route_add < outbound_jump,
             "fwmark `ip rule add` must precede the PREROUTING jump: {cmds:?}"

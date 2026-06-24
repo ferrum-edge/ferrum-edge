@@ -339,6 +339,33 @@ volumeMounts:
     readOnly: true
 ```
 
+For the bundled ambient / NodeWaypoint Helm chart path, enable the managed
+Workload API mount instead of hand-writing the volume:
+
+```yaml
+ambient:
+  spire:
+    enabled: true
+    workloadSpiffeId: spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)
+    socketHostPath: /run/spire/sockets
+    socketMountPath: /run/spire/sockets
+    socketFileName: agent.sock
+    productionMode: true
+```
+
+When enabled, the chart renders the `spire-agent-socket` hostPath mount and
+sets `FERRUM_MESH_CA_BACKEND=spire_agent`,
+`FERRUM_MESH_SPIRE_AGENT_SOCKET`, `FERRUM_MESH_WORKLOAD_SPIFFE_ID`, and
+`FERRUM_MESH_PRODUCTION_MODE` for the ambient mesh proxy. Those env vars are
+chart-managed in this mode; set the `ambient.spire` values instead of also
+overriding them under `ambient.env`, including external-secret suffix forms
+such as `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP`.
+For NodeWaypoint, `workloadSpiffeId` must include the chart-managed
+`$(FERRUM_K8S_NODE_NAME)` downward-API token so every DaemonSet Pod receives a
+distinct SPIFFE ID and downstream policy can pin the exact node waypoint peer.
+The Kubernetes discovery path resolves that token from `spec.nodeName` when it
+publishes `Workload.node_waypoint.spiffe_id`.
+
 The startup contract is implemented in [`SpireAgentCa::new`](../src/identity/ca/spire.rs):
 Ferrum waits up to 30s for the first SVID to arrive from the agent. If it does
 not arrive in time, startup continues with the CA in a degraded state and
@@ -471,7 +498,7 @@ Set the poller env knobs (defaults are usually fine):
 ```bash
 FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=300   # 5 min; 0 disables the poller
 FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS=30
-# FERRUM_MESH_FEDERATION_FAIL_OPEN=false           # reserved; today the verifier is always fail-closed
+# FERRUM_MESH_FEDERATION_FAIL_OPEN=false           # false blocks CP fallback until a bundle is polled; true allows bootstrap fallback
 ```
 
 If your federation requires alias trust domains during a migration (for

@@ -197,31 +197,46 @@ fn dr_connection_pool_tcp_keepalive() {
     assert_eq!(keepalive.interval_seconds, Some(10));
 }
 
-/// `trafficPolicy.connectionPool.http.maxRequestsPerConnection` — T1-C (PR #908).
-/// Lands on `MeshConnectionPoolHttp.max_requests_per_connection`. Per
-/// CLAUDE.md the field is wire-projected end-to-end though hyper does not yet
-/// expose a close-after-N knob — keep Supported for the translation layer
-/// and document the runtime gap in the notes.
+/// `trafficPolicy.connectionPool.http.maxRequestsPerConnection` is parsed and
+/// validated, but deferred because Ferrum does not enforce close-after-N
+/// backend requests.
 #[test]
 fn dr_connection_pool_http_max_requests_per_connection() {
     register_feature!(
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.maxRequestsPerConnection",
-        status = Status::Supported,
-        notes = "T1-C (PR #908): translated; persists end-to-end though hyper lacks a close-after-N builder knob today.",
+        status = Status::Deferred,
+        notes = "Parsed and validated, but not projected: backend close-after-N-requests is unsupported. Status reports the field as deferred.",
     );
-    let dr = translated(json!({
-        "host": "echo.default.svc.cluster.local",
-        "trafficPolicy": {
-            "connectionPool": {"http": {"maxRequestsPerConnection": 500}}
-        }
-    }));
-    let http = dr
-        .traffic_policy
-        .expect("traffic policy")
-        .connection_pool_http
-        .expect("http overlay");
-    assert_eq!(http.max_requests_per_connection, Some(500));
+    let result = translate_k8s_objects(
+        &[destination_rule(json!({
+            "host": "echo.default.svc.cluster.local",
+            "trafficPolicy": {
+                "connectionPool": {"http": {"maxRequestsPerConnection": 500}}
+            }
+        }))],
+        options(),
+    )
+    .expect("translation succeeds");
+    assert!(
+        result.warnings.iter().any(|warning| {
+            warning.contains("maxRequestsPerConnection") && warning.contains("not applied")
+        }),
+        "deferred field must warn: {:?}",
+        result.warnings
+    );
+    let mesh = result.config.mesh.expect("mesh config");
+    let dr = mesh
+        .destination_rules
+        .into_iter()
+        .next()
+        .expect("one mesh destination rule emitted");
+    assert!(
+        dr.traffic_policy
+            .and_then(|policy| policy.connection_pool_http)
+            .is_none(),
+        "maxRequestsPerConnection-only block must not create an effective overlay"
+    );
 }
 
 /// `trafficPolicy.connectionPool.http.idleTimeout` — T1-C (PR #908).
