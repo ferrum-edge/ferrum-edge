@@ -312,6 +312,34 @@ ferrum_spire_wait_ready() {
   kubectl --context "$context" -n "$namespace" rollout status daemonset/spire-agent --timeout="$timeout"
 }
 
+ferrum_spire_cleanup_minimal() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+
+  ferrum_spire_require_tools
+  kubectl --context "$context" delete clusterrolebinding \
+    ferrum-spire-server-tokenreviewer \
+    ferrum-spire-agent-workload-reader \
+    --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl --context "$context" delete clusterrole \
+    ferrum-spire-server-tokenreviewer \
+    ferrum-spire-agent-workload-reader \
+    --ignore-not-found=true >/dev/null 2>&1 || true
+  kubectl --context "$context" delete namespace "$namespace" \
+    --ignore-not-found=true >/dev/null 2>&1 || true
+}
+
+ferrum_spire_agent_nodes() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+
+  kubectl --context "$context" -n "$namespace" get pod \
+    -l app=spire-agent \
+    -o jsonpath='{range .items[*]}{.status.phase}{"\t"}{.spec.nodeName}{"\n"}{end}' |
+    awk '$1 == "Running" && $2 != "" {print $2}' |
+    sort -u
+}
+
 ferrum_spire_server_pod() {
   local context="${1:?kube context is required}"
   local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"

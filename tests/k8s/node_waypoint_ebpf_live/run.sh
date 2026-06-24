@@ -655,10 +655,6 @@ label_nodes() {
   kubectl label node "$NODE_B" ferrum.io/live-node=b --overwrite
 }
 
-all_ready_nodes() {
-  kubectl get nodes --no-headers | awk '$2 == "Ready" {print $1}'
-}
-
 node_waypoint_spiffe_template() {
   printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
 }
@@ -686,9 +682,10 @@ install_spire_production_identity() {
   ferrum_spire_wait_ready "$KUBE_CONTEXT" "$SPIRE_NS" 5m
 
   local -a spire_nodes
-  mapfile -t spire_nodes < <(ready_worker_nodes)
+  mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$KUBE_CONTEXT" "$SPIRE_NS")
   if [[ "${#spire_nodes[@]}" -eq 0 ]]; then
-    echo "expected at least one Ready worker node for SPIRE NodeWaypoint registration" >&2
+    echo "expected at least one scheduled SPIRE Agent node for NodeWaypoint registration" >&2
+    kubectl --context "$KUBE_CONTEXT" -n "$SPIRE_NS" get pods -o wide >&2 || true
     exit 1
   fi
 
@@ -903,7 +900,7 @@ PY
     fetched=false
     for _ in $(seq 1 40); do
       if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
-        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"workload_api\"}" "$metrics_file"; then
+        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"spire_agent\"}" "$metrics_file"; then
           fetched=true
           break
         fi
@@ -913,7 +910,7 @@ PY
     kill "$pf_pid" 2>/dev/null || true
     wait "$pf_pid" 2>/dev/null || true
     if [[ "$fetched" != "true" ]]; then
-      echo "ambient pod $pod on $node did not report Workload API SVID metric for $expected_spiffe" >&2
+      echo "ambient pod $pod on $node did not report SPIRE Agent SVID metric for $expected_spiffe" >&2
       cat "$metrics_file" >&2 || true
       collect_spire_diagnostics
       exit 1
@@ -2177,7 +2174,7 @@ cleanup() {
     kubectl --context "$KUBE_CONTEXT" delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
     helm uninstall "$RELEASE" -n "$MESH_NS" --kube-context "$KUBE_CONTEXT" >/dev/null 2>&1 || true
     if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
-      kubectl --context "$KUBE_CONTEXT" delete namespace "$SPIRE_NS" --ignore-not-found=true >/dev/null 2>&1 || true
+      ferrum_spire_cleanup_minimal "$KUBE_CONTEXT" "$SPIRE_NS"
     fi
   fi
 }
