@@ -1948,7 +1948,7 @@ wait_for_node_waypoint_ipv6_ready_markers() {
   exit 1
 }
 
-wait_for_node_waypoint_marker_removed() {
+try_wait_for_node_waypoint_marker_removed() {
   local node="$1"
   local uid="$2"
   for _ in $(seq 1 60); do
@@ -1962,7 +1962,11 @@ wait_for_node_waypoint_marker_removed() {
   done
   echo "stale NodeWaypoint registry or readiness marker remained for deleted pod $uid on $node" >&2
   dump_node_waypoint_registry "$node"
-  exit 1
+  return 1
+}
+
+wait_for_node_waypoint_marker_removed() {
+  try_wait_for_node_waypoint_marker_removed "$@" || exit 1
 }
 
 mesh_drift_ready() {
@@ -2812,7 +2816,18 @@ run_traffic_checks() {
     old_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
     old_src_a_node="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].spec.nodeName}')"
     kubectl -n "$WORKLOAD_NS" delete pod -l app=src-a --wait=true
-    wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"
+    if ! try_wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"; then
+      record_live_assertion \
+        node_waypoint.identity.stale_cleanup \
+        fail \
+        src-a \
+        dst-a \
+        "deleted-source-registry-marker-remained" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
     kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
     wait_for_node_waypoint_ready_markers
     wait_for_ambient_mesh_slice
@@ -2905,7 +2920,27 @@ run_traffic_checks() {
       return 1
     fi
   fi
-  wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"
+  if ! try_wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-a \
+      dst-a \
+      "deleted-source-registry-marker-remained-before-ip-reuse" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "deleted-source-registry-marker-remained-before-ip-reuse" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if ! force_next_kind_ipv4_pod_ip_reuse "$old_src_a_node" "$old_src_a_cni_dir" "$old_src_a_ip"; then
     record_live_assertion \
       node_waypoint.identity.stale_ip_reuse \
