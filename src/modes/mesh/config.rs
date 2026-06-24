@@ -101,6 +101,13 @@ pub struct Workload {
     /// labels are scoped independently instead of collapsed to one merged scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<String>,
+    /// Destination NodeWaypoint endpoint for the node hosting this workload.
+    /// NodeWaypoint secured transport dials this endpoint over HBONE and pins
+    /// `spiffe_id`, while the CONNECT authority remains the selected workload
+    /// address/app port. Missing metadata must fail closed once the secured
+    /// NodeWaypoint transport is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_waypoint: Option<NodeWaypointEndpoint>,
     /// Runtime-only RESERVED remote-cluster provenance marker: `true` iff this
     /// workload was ingested from a REMOTE cluster's discovery slice. Set by
     /// [`crate::modes::mesh::multicluster::tag_remote_workloads`] at the DP-side
@@ -116,6 +123,43 @@ pub struct Workload {
     /// ever set locally, after `fetch()`, by the remote-poll loop.
     #[serde(skip)]
     pub remote_provenance: bool,
+}
+
+/// Destination NodeWaypoint transport endpoint for a workload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeWaypointEndpoint {
+    /// IP or DNS name of the destination NodeWaypoint instance that owns the
+    /// selected workload's node. This is the outer TCP/TLS dial target.
+    pub address: String,
+    /// HBONE listener port on `address`. Defaults to Istio's standard 15008
+    /// when omitted so older explicit endpoints can stay compact.
+    #[serde(
+        default = "default_node_waypoint_hbone_port",
+        skip_serializing_if = "is_default_node_waypoint_hbone_port"
+    )]
+    pub hbone_port: u16,
+    /// Exact SPIFFE ID expected in the destination NodeWaypoint's server SVID.
+    pub spiffe_id: SpiffeId,
+    /// Kubernetes node name that owns this NodeWaypoint endpoint, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    /// Kubernetes node UID that owns this NodeWaypoint endpoint, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_uid: Option<String>,
+    /// Network/locality identity for multi-network selection, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Cluster identity for multi-cluster routing, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+}
+
+pub fn default_node_waypoint_hbone_port() -> u16 {
+    crate::modes::mesh::hbone::ISTIO_HBONE_PORT
+}
+
+fn is_default_node_waypoint_hbone_port(port: &u16) -> bool {
+    *port == default_node_waypoint_hbone_port()
 }
 
 /// A port advertised by a workload.
@@ -2117,6 +2161,14 @@ pub struct MeshConfig {
     /// `envoy.config.core.v3.TypedExtensionConfig` payloads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<crate::modes::mesh::slice::MeshExtensionConfig>,
+    /// Runtime-only CP-derived NodeWaypoint assertor inventory. The CP fills
+    /// this before request-specific workload narrowing so destination slices can
+    /// still trust legitimate source node-waypoint identities. `serde(skip)`:
+    /// never operator-settable, never serialized on raw `GatewayConfig`; the
+    /// narrowed `MeshSlice.node_waypoint_assertors` field carries it over the
+    /// mesh subscription transports.
+    #[serde(skip)]
+    pub node_waypoint_assertors: Vec<SpiffeId>,
     /// Runtime-only back-projection of the slice's narrowed **local-inbound**
     /// service view (`MeshSlice.local_inbound_services`), set by mesh
     /// preparation. `Some` exactly when Sidecar narrowing resolved the local
@@ -2188,6 +2240,7 @@ impl Default for MeshConfig {
             multi_cluster: None,
             outbound_traffic_policy: None,
             extension_configs: Vec::new(),
+            node_waypoint_assertors: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             declared_ingress_http_ports: 0,
@@ -2251,12 +2304,13 @@ pub struct MeshInboundTcpRoute {
     /// `true` only for opaque-TLS app ports (`AppProtocol::Tls`), where the
     /// captured plaintext bytes are a real TLS ClientHello so the inbound relay
     /// peeks the SNI before the stream plugin chain (a `when: connection.sni`
-    /// `AuthorizationPolicy` needs it). `false` for server-first raw-TCP ports
-    /// (Redis/MySQL/Postgres/Mongo/plain TCP), whose clients send NOTHING until
-    /// the backend greeting — peeking those would block the relay on the
-    /// handshake clock (up to `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`,
-    /// indefinitely when `0`) before the loopback dial.
+    /// `AuthorizationPolicy` needs it).
     pub tls_inspect: bool,
+    /// `true` only when the mesh classifier has an explicit client-first signal
+    /// for safe pre-dial peeking. `false` for ambiguous/server-first raw-TCP
+    /// protocols (Tcp/Mongo/MySQL/Postgres/Redis), where clients may send
+    /// nothing until the backend greeting.
+    pub first_bytes_inspect: bool,
 }
 
 fn default_waypoint_for() -> String {
@@ -2436,6 +2490,58 @@ fn validate_mesh_config_internal(
                 "Workload '{}': cluster must not be empty when set",
                 wl.spiffe_id
             ));
+        }
+        if let Some(endpoint) = &wl.node_waypoint {
+            validate_non_empty_string(
+                format!("Workload '{}'.node_waypoint.address", wl.spiffe_id),
+                &endpoint.address,
+                &mut errors,
+            );
+            validate_non_zero_port(
+                format!("Workload '{}'.node_waypoint.hbone_port", wl.spiffe_id),
+                endpoint.hbone_port,
+                &mut errors,
+            );
+            if endpoint
+                .node_name
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.node_name: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
+            if endpoint
+                .node_uid
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.node_uid: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
+            if endpoint
+                .network
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.network: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
+            if endpoint
+                .cluster
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "Workload '{}'.node_waypoint.cluster: must not be empty when set",
+                    wl.spiffe_id
+                ));
+            }
         }
     }
 

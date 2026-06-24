@@ -1583,6 +1583,30 @@ impl MetricsRegistry {
                 &ns_label,
             );
 
+            // Capture-state gauge — one hot label from a closed set. This is
+            // the readiness/condition surface operators alert on; the
+            // topology-degraded gauge below explains the first degradation
+            // reason in more detail.
+            output.push_str(
+                "# HELP ferrum_node_agent_capture_state \
+                 Node-agent capture backend condition. Exactly one state label is 1.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_capture_state gauge\n");
+            for state in crate::ebpf::NODE_AGENT_CAPTURE_STATES {
+                let value = u64::from(snapshot.capture_state == *state);
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_capture_state{{state=\"{}\"}} {}\n",
+                        state, value,
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_capture_state{{state=\"{}\"{}}} {}\n",
+                        state, ns_label, value,
+                    ));
+                }
+            }
+
             // Topology-degraded gauge — emitted whenever the node-agent
             // metrics are registered so dashboards can pin "expected: 0"
             // even on healthy nodes. `reason` is a closed snake_case set

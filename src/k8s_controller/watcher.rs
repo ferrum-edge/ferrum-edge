@@ -339,6 +339,24 @@ fn crd_watch_namespaces(
     }
 }
 
+fn pod_discovery_core_watch_namespaces(
+    resource: &CoreResourceSpec,
+    namespaces: &[String],
+    node_waypoint_namespace: &str,
+) -> Vec<String> {
+    if resource.kind != "Pod" || namespaces.is_empty() || node_waypoint_namespace.is_empty() {
+        return namespaces.to_vec();
+    }
+    let mut merged = namespaces.to_vec();
+    if !merged
+        .iter()
+        .any(|namespace| namespace == node_waypoint_namespace)
+    {
+        merged.push(node_waypoint_namespace.to_string());
+    }
+    merged
+}
+
 fn gateway_api_data_plane_status_watch_namespaces(
     namespaces: &[String],
     data_plane_service_namespace: Option<&str>,
@@ -390,11 +408,13 @@ fn find_crd_resource(api_group: &discovery::ApiGroup, crd: &CrdSpec) -> Option<A
         .find(|ar| ar.kind == crd.kind && ar.plural == crd.plural)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_crd_watchers(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
     namespaces: Vec<String>,
+    node_waypoint_namespace: String,
     istio_root_namespace: String,
     gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -574,7 +594,16 @@ pub async fn start_crd_watchers(
         core_watch_plan.extend(
             selected_core_resources(selection.watch_node_locality)
                 .into_iter()
-                .map(|resource| (resource, namespaces.clone())),
+                .map(|resource| {
+                    (
+                        resource,
+                        pod_discovery_core_watch_namespaces(
+                            resource,
+                            &namespaces,
+                            &node_waypoint_namespace,
+                        ),
+                    )
+                }),
         );
     }
     if selection.watch_gateway_api {
@@ -753,6 +782,7 @@ pub fn spawn_crd_reprobe_task(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
     namespaces: Vec<String>,
+    node_waypoint_namespace: String,
     istio_root_namespace: String,
     gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -778,6 +808,7 @@ pub fn spawn_crd_reprobe_task(
                         store_set.clone(),
                         selection,
                         namespaces.clone(),
+                        node_waypoint_namespace.clone(),
                         istio_root_namespace.clone(),
                         gateway_api_data_plane_service_namespace.clone(),
                         shutdown.clone(),
@@ -825,6 +856,44 @@ mod tests {
             ),
             vec!["default".to_string(), "istio-system".to_string()]
         );
+    }
+
+    #[test]
+    fn pod_discovery_pod_watch_includes_mesh_namespace_when_scoped() {
+        let pod = K8S_CORE_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "Pod")
+            .expect("pod resource");
+        assert_eq!(
+            pod_discovery_core_watch_namespaces(
+                pod,
+                &["prod".to_string(), "staging".to_string()],
+                "ferrum-system",
+            ),
+            vec![
+                "prod".to_string(),
+                "staging".to_string(),
+                "ferrum-system".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pod_discovery_non_pod_and_all_namespace_watches_stay_unchanged() {
+        let service = K8S_CORE_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "Service")
+            .expect("service resource");
+        assert_eq!(
+            pod_discovery_core_watch_namespaces(service, &["prod".to_string()], "ferrum-system"),
+            vec!["prod".to_string()]
+        );
+
+        let pod = K8S_CORE_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "Pod")
+            .expect("pod resource");
+        assert!(pod_discovery_core_watch_namespaces(pod, &[], "ferrum-system").is_empty());
     }
 
     #[test]

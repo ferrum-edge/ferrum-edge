@@ -48,6 +48,7 @@ fn workload(spiffe_id: &str, service: &str, address: &str) -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     }
 }

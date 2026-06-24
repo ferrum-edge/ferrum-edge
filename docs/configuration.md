@@ -113,6 +113,64 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
 
+#### Runtime Config Lifecycle Invariants
+
+File, database, and DP modes apply runtime configuration through explicit
+`Applied`, `Unchanged`, or `Rejected` outcomes. `Applied` swaps the new config
+and rebuilds the derived caches. `Unchanged` confirms the source is still valid
+without churning caches. `Rejected` keeps the last known-good runtime config and
+does not commit database poll bookkeeping. CP mode validates database poll
+candidates before storing and broadcasting them, but it does not use those
+`ProxyState` apply outcomes on every broadcast path.
+
+Database-mode polling commits the accepted `config_changes.sequence` cursor only
+after an `Applied` or `Unchanged` candidate. Full reload candidates follow the
+same rule: a rejected full snapshot cannot poison the later incremental cursor.
+SQL runtime polling always uses the primary pool; `FERRUM_DB_READ_REPLICA_URL`
+is only for eligible admin reads. MongoDB config reads force primary read
+preference, and standalone MongoDB polling intentionally uses full reloads
+instead of accepting non-transactional incremental cursors.
+
+Full-load guarantees are backend-specific but fail closed. PostgreSQL uses a
+repeatable-read, read-only transaction; MySQL requires repeatable-read
+transaction isolation; SQLite reads through one transaction snapshot; MongoDB
+replica sets use snapshot transactions. If a query, decode, relationship, or
+runtime validation step fails, the whole candidate is rejected and the previous
+config keeps serving.
+
+Normal incremental polling is durable-change-log based. SQL and MongoDB
+replica-set pollers read ordered `config_changes` rows/documents after the
+accepted cursor, collapse each resource to the final operation in the batch, and
+point-load only those changed IDs. Delete records carry removals, so normal
+incremental polling does not scan every runtime collection or table ID.
+Retained-history gaps and saturated change batches force the same authoritative
+full-reload path.
+
+Repeated rejected database deltas use bounded backoff and low-cardinality
+metrics. After `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` identical
+rejections, database mode attempts an authoritative full reload and keeps the
+last known-good config if that reload fails or is also rejected. The public
+health and metrics surfaces report degraded database polling without exposing
+resource IDs or validation strings as unbounded labels.
+
+Listener readiness and supervision are part of the same fail-closed lifecycle.
+File and database modes report startup ready only after configured HTTP, HTTPS,
+HTTP/3, and stream listeners have bound or been adopted. Supervised HTTP-family
+and admin listener task failures trigger sibling shutdown instead of leaving a
+partially serving process. Stream listener bind/startup failures are fatal in
+file/database modes; after startup, stream listener exits are handled by stream
+listener reconciliation and retry rather than by shutting down sibling listeners
+or the process.
+In-process file-mode callers that pass pre-bound listeners reserve those actual
+ports for stream-listener conflict validation; env-config ports are used only
+when no listener is pre-bound.
+
+TLS source ownership is explicit. Database TLS live reload reconnects the active
+SQL primary pool or MongoDB client, plus SQL admin-read replicas when present.
+MongoDB driver paths that require filesystem PEMs receive owner-scoped temporary
+files with restrictive permissions; those files remain only while the connection
+bundle that may need them is alive.
+
 #### MySQL minimum version
 
 MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit
@@ -251,7 +309,7 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_PROXY_UID` | No | `1337` in injector patches | UID used to exempt Ferrum's own outbound traffic from iptables capture |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | No | `auto` | IPv6 iptables fan-out: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it when IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | No | — | Comma-separated SPIFFE trust domains accepted as equivalent to the peer cert's trust domain when validating HBONE baggage `source.principal`. Default empty: strict same-trust-domain match. Mirror of Istio `MeshConfig.trustDomainAliases` for federated multi-cluster setups |
-| `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` | No | — | Comma-separated allow-list of HBONE peer identities trusted to rewrite the `mesh_authz` principal via baggage `source.principal`. Each entry is either a bare Kubernetes service-account name (matched against the Istio convention `ns/<ns>/sa/<sa>`) or a full `spiffe://` SPIFFE id (exact-identity pinning). Default empty: `mesh_authz` uses the built-in defaults `[ztunnel, waypoint]`. Authenticated peers outside this list keep their own peer-cert identity and the dropped baggage surfaces as `mesh_authz.ignored_baggage.untrusted_assertor=true`. Configure a `mesh_authz` plugin override with `trusted_hbone_assertors: []` to disable baggage rewriting entirely |
+| `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` | No | — | Comma-separated allow-list of HBONE peer identities trusted to rewrite the `mesh_authz` principal via baggage `source.principal`. Each entry is either a bare Kubernetes service-account name (matched against the Istio convention `ns/<ns>/sa/<sa>`) or a full `spiffe://` SPIFFE id (exact-identity pinning). Default empty: `mesh_authz` uses the built-in defaults `[ztunnel, waypoint]`, except identity-backed `NodeWaypoint` derives exact assertor SPIFFE IDs from the scope-authorized CP-derived `node_waypoint_assertors` inventory and uses an empty list when none exists. Authenticated peers outside this list keep their own peer-cert identity and the dropped baggage surfaces as `mesh_authz.ignored_baggage.untrusted_assertor=true`. Configure a `mesh_authz` plugin override with `trusted_hbone_assertors: []` to disable baggage rewriting entirely |
 | `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS` | No | — | Comma-separated W3C `baggage` key prefixes stripped from outbound requests at dispatch. Default empty: forward unchanged for ordinary egress. Gateway-originated HBONE inner requests always strip identity-shaped baggage keys (`source.*`, `destination.*`, and aliases) while preserving non-identity baggage |
 | `FERRUM_MESH_SIDECAR_ENFORCED` | No | `false` | When `true`, the slice builder applies Istio `Sidecar` egress scope narrowing: services, service-entries, and destination-rules outside the applicable `Sidecar`'s egress scope are filtered out before being sent to data planes. `Sidecar` resources are parsed and persisted unconditionally; this flag only gates the slice-narrowing pass so operators can opt in after vetting their `Sidecar` definitions |
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | No | `false` | Computes the applicable `Sidecar` egress scope and reports would-deny counts while leaving the slice unchanged. Use with the JWT-authenticated `/mesh/egress-scope` admin endpoints before enabling `FERRUM_MESH_SIDECAR_ENFORCED` |
@@ -333,10 +391,14 @@ Service / namespace names embedded in destination hosts are matched case-sensiti
 
 **T2-B default-on in K8s pods**: `FERRUM_K8S_CONTROLLER_ENABLED` and `FERRUM_K8S_POD_DISCOVERY_ENABLED` default to `true` when the gateway process is running inside a Kubernetes pod (detected via the standard injected `KUBERNETES_SERVICE_HOST` env var, the same heuristic `kube-rs`'s `Config::incluster()` uses). Outside a pod — CLI invocations, Docker containers without `KUBERNETES_SERVICE_HOST`, dev environments — they keep the historic `false` default so tests and local runs are unaffected. Explicit `=false` from the operator (env var or `ferrum.conf`) always wins, so pod-side opt-out remains one setting away. **T2-B Istio status sub-resources**: when the K8s controller runs with `FERRUM_K8S_WATCH_ISTIO_CRDS=true`, it now patches `status.conditions[]` on `AuthorizationPolicy`, `PeerAuthentication`, and `DestinationRule` CRDs so `kubectl describe` surfaces Ferrum's translation outcome (accepted, rejected, deferred-field list). The controller's service account needs `get` plus `patch` on those CRDs' `status` subresources because Ferrum reads live conditions before merge-patching its own — see the chart in `charts/ferrum-mesh/templates/control-plane-rbac.yaml`. Other Istio CRDs (`VirtualService`, `ServiceEntry`, `RequestAuthentication`, `Sidecar`, `Telemetry`, `WorkloadEntry`) are deferred to a follow-on. **T2-B K8s watch scope**: when `FERRUM_K8S_WATCH_NAMESPACES` is unset, the controller derives its watch scope from the T2-A CP scope (`FERRUM_CP_NAMESPACES`). `CpScope::Single`/`Set` translate to namespaced watches; `CpScope::All` becomes a cluster-wide watch (requires `ClusterRole`-level permissions the chart already grants). Operators with an explicit `FERRUM_K8S_WATCH_NAMESPACES` value still win — the override is preserved for hand-tuned cases where the K8s watch scope intentionally differs from the CP scope.
 
+For NodeWaypoint discovery, `FERRUM_K8S_CONTROLLER_NAMESPACE` identifies the namespace where the Ferrum controller and ambient NodeWaypoint DaemonSet are installed. It defaults to `FERRUM_NAMESPACE` for non-Helm deployments. The Helm chart sets it to the release namespace so `FERRUM_NAMESPACE` can continue to represent the managed workload namespace without causing the CP to trust or watch the wrong NodeWaypoint pods.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_K8S_CONTROLLER_ENABLED` | No | `true` in K8s pods (detected via `KUBERNETES_SERVICE_HOST`), `false` otherwise | Master switch for the CP-side K8s CRD controller. T2-B flipped the default to on inside a pod; explicit `=false` still disables it. When on, also enables `FERRUM_K8S_POD_DISCOVERY_ENABLED` by the same in-cluster heuristic |
 | `FERRUM_K8S_POD_DISCOVERY_ENABLED` | No | `true` in K8s pods (detected via `KUBERNETES_SERVICE_HOST`), `false` otherwise | Enables native Kubernetes Pod/Service/EndpointSlice discovery in the CP K8s controller. T2-B flipped the default to on inside a pod; explicit `=false` still disables it |
+| `FERRUM_K8S_CONTROLLER_NAMESPACE` | No | `FERRUM_NAMESPACE` | Namespace where the Ferrum K8s controller and ambient NodeWaypoint DaemonSet are installed. Helm renders this as the release namespace so managed workload namespace overrides do not break trusted NodeWaypoint discovery |
+| `FERRUM_K8S_NODE_NAME` | NodeWaypoint SPIRE Helm profile | — | Kubernetes node name injected into ambient NodeWaypoint Pods with downward API `spec.nodeName`. The Helm SPIRE profile uses it in `FERRUM_MESH_WORKLOAD_SPIFFE_ID` as `$(FERRUM_K8S_NODE_NAME)` so each DaemonSet Pod receives a distinct per-node SPIFFE ID; Ferrum does not otherwise require operators to set it directly |
 | `FERRUM_K8S_NODE_LOCALITY_ENABLED` | No | `false` | Enables optional cluster-scoped Node watching so topology labels can enrich auto-discovered pod workload locality |
 | `FERRUM_K8S_CLUSTER_DOMAIN` | No | `cluster.local` | Kubernetes cluster DNS domain used by the source translator for FQDN host matching. VirtualService destinations of the form `<svc>.<ns>.svc.<cluster_domain>` (and bare/short forms) resolve port names against the matching `Service` |
 | `FERRUM_K8S_TRUST_DOMAIN` | No | `cluster.local` | SPIFFE trust domain for derived workload identities. In `node_agent` mode it derives each enrolled pod's workload SPIFFE ID (`spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`) when writing the `FERRUM_WORKLOAD_IDENTITY` eBPF map, so it must match the CP-side SPIFFE format the node-waypoint resolver enrolls |
@@ -376,7 +438,7 @@ Outbound capture can be narrowed per pod with `traffic.sidecar.istio.io/includeO
 
 Outbound capture exclusions can also be set per pod with `traffic.sidecar.istio.io/excludeOutboundPorts` or `ferrum.io/excludeOutboundPorts`, using comma-separated TCP ports. Global and pod-local lists are merged and deduplicated before the init container renders iptables `RETURN` rules.
 
-Inbound port exclusions use the parallel annotations `traffic.sidecar.istio.io/excludeInboundPorts` / `ferrum.io/excludeInboundPorts`; the RETURN rules are emitted BEFORE the inbound REDIRECT so the exclusion is honored. CIDR-range exclusions use `traffic.sidecar.istio.io/excludeOutboundIPRanges` (APPENDS to the env-derived `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS`) and `traffic.sidecar.istio.io/includeOutboundIPRanges` (REPLACES the env-derived `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` when present, matching Istio's include-overrides-include semantics). Invalid ports or CIDRs in any annotation are rejected by the admission webhook with an error naming the offending annotation. Any IPv6 CIDR in include or exclude ranges activates IPv6 capture planning; IPv6 rules are partitioned into an `ip6tables` rule block. `FERRUM_MESH_IP6TABLES_ENABLED=auto` skips that block when the binary is missing, `true` requires it and fails before applying IPv4 rules if unavailable, and `false` emits IPv4-only rules.
+Inbound port exclusions use the parallel annotations `traffic.sidecar.istio.io/excludeInboundPorts` / `ferrum.io/excludeInboundPorts`; the RETURN rules are emitted BEFORE the inbound REDIRECT/TPROXY catch-all so TCP and UDP exclusions are honored. CIDR-range exclusions use `traffic.sidecar.istio.io/excludeOutboundIPRanges` (APPENDS to the env-derived `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS`) and `traffic.sidecar.istio.io/includeOutboundIPRanges` (REPLACES the env-derived `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` when present, matching Istio's include-overrides-include semantics). Invalid ports or CIDRs in any annotation are rejected by the admission webhook with an error naming the offending annotation. Any IPv6 CIDR in include or exclude ranges activates IPv6 capture planning; IPv6 rules are partitioned into an `ip6tables` rule block. `FERRUM_MESH_IP6TABLES_ENABLED=auto` skips that block when the binary is missing, `true` requires it and fails before applying IPv4 rules if unavailable, and `false` emits IPv4-only rules.
 
 Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`, `allowPrivilegeEscalation=false`, `readOnlyRootFilesystem=true`, `seccompProfile=RuntimeDefault`, and all Linux capabilities dropped. `FERRUM_MESH_PROXY_UID=0` is rejected at injector startup because Kubernetes would reject a sidecar that combines UID 0 with `runAsNonRoot=true`. The iptables init container explicitly sets `runAsUser=0`, `runAsNonRoot=false`, and `seccompProfile=RuntimeDefault`; it runs as root only long enough to program capture rules, drops all capabilities before adding back `NET_ADMIN` and `NET_RAW`, disables privilege escalation, and receives bounded CPU/memory requests and limits. Injector startup validates those resource quantity env vars so malformed values fail before admission requests are served. Its root filesystem remains writable because iptables needs the xtables lock path while programming capture rules.
 
@@ -403,7 +465,7 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | `FERRUM_MESH_CAPTURE_INCLUDE_CIDRS` | No | `0.0.0.0/0` | CIDRs to capture for outbound traffic (comma-separated). Per-pod annotation `traffic.sidecar.istio.io/includeOutboundIPRanges` REPLACES this value when present |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS` | No | — | CIDRs to exclude from outbound capture (comma-separated, highest priority). Per-pod annotation `traffic.sidecar.istio.io/excludeOutboundIPRanges` APPENDS to this value |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | No | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture (comma-separated) |
-| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | No | — | Destination TCP ports excluded from inbound capture (comma-separated; mirrors Istio `excludeInboundPorts`). Per-pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive. RETURN rules are emitted before the inbound REDIRECT so the exclusion is honored |
+| `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | No | — | Destination TCP and UDP ports excluded from inbound capture (comma-separated; mirrors Istio `excludeInboundPorts`). Per-pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive. RETURN rules are emitted before the inbound REDIRECT/TPROXY catch-all so the exclusion is honored |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | No | `auto` | IPv6 iptables fan-out: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it when IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
 | `FERRUM_MESH_CAPTURE_UDP_ENABLED` | No | `false` | Emit UDP TPROXY capture rules (F3 §3.3 Stage 2). Accepts the repo-wide boolean forms: case-insensitive `true`/`false` plus `1`/`0`. UDP cannot use the TCP REDIRECT model, so captured UDP uses TPROXY in the `mangle` table plus a fwmark and an `ip rule`/`ip route local` for transparent delivery. **Default off:** the consuming UDP listener arrives in Stage 3, so enabling this before then would redirect UDP into a void. When off, no `mangle`/TPROXY/routing rules are emitted at all |
 | `FERRUM_MESH_CAPTURE_UDP_PORT` | No | `15011` | UDP TPROXY listener port (Stage 3 consumer). Distinct from the TCP outbound port (`15001`) because UDP and TCP cannot share one listener socket |
@@ -500,7 +562,7 @@ Gateway SVID material is validated at startup. When all three SVID sources resol
 
 Gateway DPs can also receive mesh SPIFFE trust bundles from the CP. `GatewayConfig.trust_bundles` uses the same serializable `TrustBundleSet` shape as mesh config on the CP side, but CP `ConfigUpdate` and `FullConfigResponse` messages carry that material only in the `trust_bundles_json` side channel so older DPs can keep deserializing full snapshot `GatewayConfig` JSON safely. Stream snapshots, stream deltas, and unary full snapshots all refresh gateway-to-mesh trust material; JSON `null` explicitly clears previously delivered CP trust, including when the CP rejects invalid trust-bundle material and must revoke stale anchors instead of leaving them unchanged. When a gateway SVID is loaded from files, received trust bundles temporarily override the SVID bundle's trust material in the lock-free slot; if a later authoritative CP update clears them, the DP restores the latest validated file trust. Without a local SVID, the DP still stores CP-delivered bundles for later gateway-mesh features.
 
-Gateway-to-mesh HBONE dispatch is opt-in per upstream target. A target tagged `mesh.hbone=true` is probed on the standard sidecar HBONE port `15008` (override with `mesh.hbone_port`) when the gateway has a loaded SVID. If the probe succeeds, plain HTTP requests to that target are sent through an HTTP/2 CONNECT tunnel with SPIFFE mTLS before the ordinary H3/H2/reqwest backend chain is considered. The HBONE pool uses the proxy's effective `pool_*` overrides for connection count, idle timeout, TCP keepalive, and HTTP/2 flow-control settings, and coalesces concurrent first connects for the same target/SVID key within the proxy's `backend_connect_timeout_ms` budget. Requests that require replayable retries or request-body buffering stay on the existing direct backend transports. Ferrum injects `source.principal` baggage from the gateway SVID on the CONNECT request; mesh sidecars still validate baggage against the authenticated peer identity before trusting it. Capability-level tunnel establishment failures such as TCP, TLS, DNS, or HTTP/2 handshake errors downgrade only the cached HBONE capability for that target, so later requests fall back to the normal direct backend transports until the next capability refresh succeeds. Per-request CONNECT rejections do not downgrade HBONE support.
+Gateway-to-mesh HBONE dispatch is opt-in per upstream target. A target tagged `mesh.hbone=true` is probed on the standard sidecar HBONE port `15008` (override with `mesh.hbone_port`) when the gateway has a loaded SVID. Plain HTTP requests to that target use an HTTP/2 CONNECT tunnel with SPIFFE mTLS before the ordinary H3/H2/reqwest backend chain is considered. A `Supported`, `Unknown`, or not-yet-cached HBONE capability can attempt the live tunnel so cold or timed-out probes do not block first traffic; an explicit `Unsupported` capability, missing gateway SVID, replayable retry requirement, or request-body-buffering requirement fails closed instead of direct-dialing the application endpoint. The HBONE pool uses the proxy's effective `pool_*` overrides for connection count, idle timeout, TCP keepalive, and HTTP/2 flow-control settings, and coalesces concurrent first connects for the same target/SVID key within the proxy's `backend_connect_timeout_ms` budget. Ferrum injects `source.principal` baggage from the gateway SVID on the CONNECT request; mesh sidecars still validate baggage against the authenticated peer identity before trusting it. Capability-level tunnel establishment failures such as TCP, TLS, DNS, or HTTP/2 handshake errors downgrade only the cached HBONE capability for that target, so later mesh-tagged requests continue to fail closed until the next capability refresh succeeds. Per-request CONNECT rejections do not downgrade HBONE support.
 
 When a gateway SVID is loaded, Ferrum also enables gateway-originated mesh metrics. If no global `workload_metrics` plugin exists, the runtime adds an internal global plugin with `workload_spiffe_id` set to the gateway SPIFFE ID. If an operator-managed global `workload_metrics` plugin already exists in the gateway namespace, Ferrum leaves the plugin in place and fills `workload_spiffe_id` only when it is missing. Requests actually dispatched through HBONE are labeled with `mesh.connection_security_policy=mutual_tls`, `mesh.gateway.transport=hbone`, and any mesh destination tags present on the selected upstream target.
 

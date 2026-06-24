@@ -30,6 +30,7 @@ const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
 
 pub struct ReconcilerConfig {
     pub namespace: String,
+    pub controller_namespace: String,
     pub trust_domain: String,
     pub cluster_domain: String,
     pub istio_root_namespace: String,
@@ -139,6 +140,7 @@ async fn run_reconcile_loop(
             mesh_update_tx: broadcasters.mesh_update_tx.clone(),
             mesh_registry: Arc::clone(&broadcasters.mesh_registry),
             namespace: reconciler_config.namespace.clone(),
+            controller_namespace: reconciler_config.controller_namespace.clone(),
             cluster_domain: reconciler_config.cluster_domain.clone(),
             istio_root_namespace: reconciler_config.istio_root_namespace.clone(),
             watch_namespaces: reconciler_config.watch_namespaces.clone(),
@@ -181,6 +183,7 @@ async fn run_reconcile_loop(
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
                         namespace: reconciler_config.namespace.clone(),
+                        controller_namespace: reconciler_config.controller_namespace.clone(),
                         cluster_domain: reconciler_config.cluster_domain.clone(),
                         istio_root_namespace: reconciler_config.istio_root_namespace.clone(),
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
@@ -220,6 +223,7 @@ async fn run_reconcile_loop(
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
                         namespace: reconciler_config.namespace.clone(),
+                        controller_namespace: reconciler_config.controller_namespace.clone(),
                         cluster_domain: reconciler_config.cluster_domain.clone(),
                         istio_root_namespace: reconciler_config.istio_root_namespace.clone(),
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
@@ -407,6 +411,7 @@ struct ReconcileContext {
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
     namespace: String,
+    controller_namespace: String,
     cluster_domain: String,
     istio_root_namespace: String,
     watch_namespaces: Vec<String>,
@@ -498,7 +503,9 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     let options = K8sTranslationOptions::new(ctx.namespace.clone(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.clone())
         .with_istio_root_namespace(ctx.istio_root_namespace.clone())
+        .with_node_waypoint_namespace(ctx.controller_namespace.clone())
         .with_source_namespaces(source_namespaces)
+        .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
         .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced);
     let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
@@ -1113,6 +1120,7 @@ mod tests {
             locality: None,
             service_account: Some(service_account.to_string()),
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }
     }

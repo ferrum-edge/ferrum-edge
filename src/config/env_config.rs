@@ -923,6 +923,11 @@ pub struct EnvConfig {
     /// false for one release; when true, CP also watches core resources and
     /// derives mesh services/workloads from ready pods.
     pub k8s_pod_discovery_enabled: bool,
+    /// Namespace where the Ferrum K8s controller and ambient NodeWaypoint
+    /// DaemonSet are installed. Defaults to `FERRUM_NAMESPACE`; Helm sets it
+    /// to `.Release.Namespace` so managed workload namespace overrides do not
+    /// break trusted NodeWaypoint discovery.
+    pub k8s_controller_namespace: String,
     /// Enable cluster-scoped Node watching to enrich auto-discovered pod
     /// workloads with topology.kubernetes.io/{region,zone}. Requires
     /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. Default: false.
@@ -1775,6 +1780,7 @@ impl Default for EnvConfig {
             node_agent_cni_socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
+            k8s_controller_namespace: "ferrum".to_string(),
             k8s_node_locality_enabled: false,
             k8s_watch_namespaces: Vec::new(),
             k8s_kubeconfig_path: None,
@@ -2146,6 +2152,7 @@ impl EnvConfig {
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
             node_agent_cni_enabled: bool = "FERRUM_NODE_AGENT_CNI_ENABLED" => false;
             node_agent_cni_socket_path: String = "FERRUM_NODE_AGENT_CNI_SOCKET_PATH" => "/var/run/ferrum/node-agent-cni.sock".to_string();
+            k8s_controller_namespace: String = "FERRUM_K8S_CONTROLLER_NAMESPACE" => namespace.clone();
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
@@ -2751,6 +2758,7 @@ impl EnvConfig {
             node_agent_cni_socket_path,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
+            k8s_controller_namespace,
             k8s_node_locality_enabled,
             k8s_watch_namespaces,
             k8s_kubeconfig_path,
@@ -3689,6 +3697,8 @@ impl EnvConfig {
             .map_err(|e| format!("Invalid FERRUM_NAMESPACE: {}", e))?;
         validate_k8s_namespace(&self.k8s_istio_root_namespace)
             .map_err(|e| format!("Invalid FERRUM_K8S_ISTIO_ROOT_NAMESPACE: {}", e))?;
+        validate_k8s_namespace(&self.k8s_controller_namespace)
+            .map_err(|e| format!("Invalid FERRUM_K8S_CONTROLLER_NAMESPACE: {}", e))?;
 
         // Validate FERRUM_CP_NAMESPACES entries. Special token `"*"` means
         // "all namespaces" — any other value must be a valid namespace label.

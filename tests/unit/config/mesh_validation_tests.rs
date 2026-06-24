@@ -8,10 +8,10 @@ use ferrum_edge::modes::mesh::config::{
     MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule,
     MeshService, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSubset,
     MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig, ParsedCidr, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig, NodeWaypointEndpoint, ParsedCidr,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -36,6 +36,7 @@ fn fresh_workload() -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     }
 }
@@ -77,6 +78,41 @@ fn workload_rejects_empty_service_name() {
     wl.service_name = String::new();
     let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], &[], None);
     assert!(errors.iter().any(|e| e.contains("service_name")));
+}
+
+#[test]
+fn workload_validates_node_waypoint_endpoint() {
+    let mut wl = fresh_workload();
+    wl.node_waypoint = Some(NodeWaypointEndpoint {
+        address: " ".into(),
+        hbone_port: 0,
+        spiffe_id: SpiffeId::new("spiffe://prod.example.com/ns/ferrum-system/sa/node-waypoint")
+            .unwrap(),
+        node_name: Some(" ".into()),
+        node_uid: Some(" ".into()),
+        network: Some(" ".into()),
+        cluster: Some(" ".into()),
+    });
+
+    let errors = validate_mesh_config(&[wl], &[], &[], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("node_waypoint.address") && e.contains("must not be empty")),
+        "expected address validation error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("node_waypoint.hbone_port") && e.contains("greater than 0")),
+        "expected hbone_port validation error, got: {errors:?}"
+    );
+    for field in ["node_name", "node_uid", "network", "cluster"] {
+        assert!(
+            errors.iter().any(|e| e.contains(field)),
+            "expected {field} validation error, got: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -955,6 +991,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                node_waypoint: None,
                 remote_provenance: false,
             }],
             ..Default::default()

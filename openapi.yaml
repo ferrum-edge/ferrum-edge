@@ -10768,14 +10768,17 @@ components:
             (raw TCP streams). A connection whose source pod has no resolved
             per-pod scope records `mesh_authz.scope_missing`; when any
             namespace/selector-scoped policy is configured it then **fails closed**
-            (`403`, `mesh_authz.deny_policy=scope_missing`) on both the HTTP/HBONE
-            request path and TCP/UDP/DTLS streams (at accept) — a missing scope
+            (`403`, `mesh_authz.deny_policy=scope_missing`) on the HTTP/HBONE
+            request path and raw TCP streams (at accept) — a missing scope
             means the source workload left the live slice generation, not an
             enrollment race, so a long-lived connection from a removed workload
-            stops being served under scoped authz. With only mesh-wide policies
-            configured, both paths stay fully evaluable and fall through to
-            mesh-wide-only evaluation. Auto-set by mesh injection on
-            `NodeWaypoint` topology where one listener serves many pods.
+            stops being served under scoped authz. NodeWaypoint UDP/DTLS has no
+            trustworthy per-datagram/session pod scope, so slice preparation
+            disables UDP/DTLS service/proxy paths when enforcing
+            namespace/selector-scoped policies are present; mesh-wide UDP/DTLS
+            policy remains evaluable, and audit-only scoped policy does not
+            force suppression. Auto-set by mesh injection on `NodeWaypoint`
+            topology where one listener serves many pods.
         trusted_hbone_assertors:
           type: array
           items:

@@ -5,6 +5,7 @@
 //! placing pod cgroups at different paths. The node agent must resolve
 //! the correct path before attaching BPF programs.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// Resolve the cgroup v2 path for a Kubernetes pod.
@@ -14,9 +15,16 @@ use std::path::{Path, PathBuf};
 pub fn resolve_pod_cgroup_path(cgroup_root: &str, pod_uid: &str) -> Option<PathBuf> {
     let sanitized_uid = pod_uid.replace('-', "_");
 
-    systemd_pod_cgroup_paths(cgroup_root, &sanitized_uid)
+    if let Some(path) = systemd_pod_cgroup_paths(cgroup_root, &sanitized_uid)
         .into_iter()
         .chain(cgroupfs_pod_cgroup_paths(cgroup_root, pod_uid))
+        .find(|path| path.exists())
+    {
+        return Some(path);
+    }
+
+    discover_pod_cgroup_paths(cgroup_root, pod_uid, &sanitized_uid)
+        .into_iter()
         .find(|path| path.exists())
 }
 
@@ -40,6 +48,54 @@ fn cgroupfs_pod_cgroup_paths(cgroup_root: &str, pod_uid: &str) -> [PathBuf; 3] {
         root.join(format!("burstable/pod{pod_uid}")),
         root.join(format!("besteffort/pod{pod_uid}")),
     ]
+}
+
+const POD_CGROUP_DISCOVERY_MAX_DEPTH: usize = 8;
+const POD_CGROUP_DISCOVERY_MAX_DIRS: usize = 4096;
+
+fn discover_pod_cgroup_paths(
+    cgroup_root: &str,
+    pod_uid: &str,
+    sanitized_uid: &str,
+) -> Vec<PathBuf> {
+    let root = Path::new(cgroup_root);
+    let raw_cgroupfs = format!("pod{pod_uid}");
+    let systemd_suffix = format!("pod{sanitized_uid}.slice");
+    let mut matches = Vec::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0usize));
+    let mut scanned = 0usize;
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if scanned >= POD_CGROUP_DISCOVERY_MAX_DIRS {
+            break;
+        }
+        scanned += 1;
+
+        let name_matches = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == raw_cgroupfs || name.ends_with(&systemd_suffix));
+        if name_matches {
+            matches.push(dir.clone());
+            continue;
+        }
+        if depth >= POD_CGROUP_DISCOVERY_MAX_DEPTH {
+            continue;
+        }
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+            if descend {
+                queue.push_back((entry.path(), depth + 1));
+            }
+        }
+    }
+
+    matches
 }
 
 /// Build the expected cgroup path for a given QoS class (for testing/validation).
@@ -183,6 +239,21 @@ mod tests {
         let path = dir
             .path()
             .join("kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc_def.slice");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert_eq!(
+            resolve_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def"),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn resolve_pod_cgroup_path_finds_kubelet_slice_systemd_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(
+            "kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/\
+             kubelet-kubepods-burstable-podabc_def.slice",
+        );
         std::fs::create_dir_all(&path).unwrap();
 
         assert_eq!(

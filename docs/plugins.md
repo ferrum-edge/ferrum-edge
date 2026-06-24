@@ -2659,9 +2659,9 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
-**Skip conditions** (checked in order):
+**Response compression skip conditions** (checked in order):
 1. Response status is 204 or 304
-2. Request has `Cache-Control: no-transform`
+2. Request has `Cache-Control: no-transform` (skips gateway response compression only)
 3. Response is a range response (`206`, `Content-Range`, or an internal range marker)
 4. Response has `Cache-Control: no-transform`
 5. Response already has `Content-Encoding` (no double-compression)
@@ -2675,8 +2675,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Adds `Vary: Accept-Encoding` to compressed responses for cache correctness
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - Forces response body buffering on proxies where this plugin is enabled
-- Request decompression removes `Content-Encoding` and `Content-Length` from the forwarded request headers
-- Requests with `Cache-Control: no-transform` bypass gateway compression/decompression and keep request representation headers intact
+- When `decompress_request` is enabled, supported gzip/brotli request bodies are decoded before final request-body hooks and the forwarded request has `Content-Encoding` and `Content-Length` removed
+- Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; weak ETags can be forwarded with compressed variants
 
 ```yaml

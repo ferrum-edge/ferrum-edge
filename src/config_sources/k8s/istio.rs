@@ -25,10 +25,10 @@ use super::{
     mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
     optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
     proxy_for_route, request_termination_plugin_for_proxy, resource_id,
-    route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
-    route_response_transformer_plugin_for_proxy, selector_from_istio, sidecar_selector_from_istio,
-    string_array, string_field, string_map, upstream_for_route,
-    workload_entry_service_key_from_host,
+    route_backends_require_node_waypoint_authz, route_local_fault_value_for_rule,
+    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
+    selector_from_istio, sidecar_selector_from_istio, string_array, string_field, string_map,
+    upstream_for_route, workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -2212,6 +2212,7 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         // WorkloadEntry is a VM/static workload with no Kubernetes pod UID;
         // node-waypoint scope falls back to SPIFFE keying for these.
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     })
 }
@@ -2659,29 +2660,44 @@ fn virtual_service_routes(
             }
         };
 
-        let (backend_host, backend_port, upstream_id) = if backends.is_empty() {
-            // Redirect-only route: no backend. The dispatch rule omits the
-            // destination and the redirect fires before backend dispatch.
-            (String::new(), 0, None)
-        } else if backends.len() == 1 {
-            let Some(backend) = backends.into_iter().next() else {
-                continue;
+        let (backend_host, backend_port, upstream_id, requires_node_waypoint_authz) =
+            if backends.is_empty() {
+                // Redirect-only route: no backend. The dispatch rule omits the
+                // destination and the redirect fires before backend dispatch.
+                (String::new(), 0, None, false)
+            } else if backends.len() == 1 {
+                let Some(backend) = backends.into_iter().next() else {
+                    continue;
+                };
+                let requires_node_waypoint_authz =
+                    route_backends_require_node_waypoint_authz(std::slice::from_ref(&backend));
+                (
+                    backend.host,
+                    backend.port,
+                    None,
+                    requires_node_waypoint_authz,
+                )
+            } else {
+                let requires_node_waypoint_authz =
+                    route_backends_require_node_waypoint_authz(&backends);
+                let upstream_id = resource_id(
+                    "istio-vs-upstream",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &index.to_string(),
+                );
+                upstreams.push(upstream_for_route(
+                    upstream_id.clone(),
+                    object.metadata.namespace.clone(),
+                    backends,
+                ));
+                (
+                    String::new(),
+                    0,
+                    Some(upstream_id),
+                    requires_node_waypoint_authz,
+                )
             };
-            (backend.host, backend.port, None)
-        } else {
-            let upstream_id = resource_id(
-                "istio-vs-upstream",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &index.to_string(),
-            );
-            upstreams.push(upstream_for_route(
-                upstream_id.clone(),
-                object.metadata.namespace.clone(),
-                backends,
-            ));
-            (String::new(), 0, Some(upstream_id))
-        };
 
         let retry = route_retry_config(http);
         let timeout_ms = route_timeout_ms(http);
@@ -2761,6 +2777,7 @@ fn virtual_service_routes(
                     backend_host: backend_host.as_str(),
                     backend_port,
                     upstream_id: upstream_id.as_deref(),
+                    requires_node_waypoint_authz,
                 },
                 MeshRouteDispatchPolicy {
                     timeout_ms,
@@ -3087,10 +3104,26 @@ fn route_backends(
             ));
         };
         let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
+        let service_identity = service_host_components(
+            host,
+            &object.metadata.namespace,
+            &acc.options.cluster_domain,
+        )
+        .and_then(|(svc, ns)| {
+            acc.service_port_exists(ns, svc, port)
+                .then(|| (ns.to_string(), svc.to_string(), port))
+        });
         backends.push(RouteBackend {
             host: host.to_string(),
             port,
             weight,
+            service_namespace: service_identity
+                .as_ref()
+                .map(|(namespace, _, _)| namespace.clone()),
+            service_name: service_identity
+                .as_ref()
+                .map(|(_, service, _)| service.clone()),
+            service_port: service_identity.map(|(_, _, port)| port),
         });
     }
     if skipped_zero > 0 {

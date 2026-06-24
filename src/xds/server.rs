@@ -1453,13 +1453,37 @@ fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     // lifetime, and a restart starts with an empty cache anyway. Do not reuse
     // this helper for persisted cross-process cache keys without canonicalizing
     // map order first.
-    match serde_json::to_vec(config) {
-        Ok(bytes) => fingerprint_bytes([b"full-config".as_slice(), bytes.as_slice()]),
+    let config_bytes = match serde_json::to_vec(config) {
+        Ok(bytes) => bytes,
         Err(error) => {
             let error = error.to_string();
-            fingerprint_bytes([b"full-config-error".as_slice(), error.as_bytes()])
+            return fingerprint_bytes([b"full-config-error".as_slice(), error.as_bytes()]);
         }
-    }
+    };
+    // `MeshConfig.node_waypoint_assertors` is deliberately `serde(skip)` so it
+    // never rides raw ConfigSync `GatewayConfig` JSON, but xDS CP filtering
+    // stores it in the in-process filtered config before snapshot translation.
+    // Include it here so off-visible source-waypoint inventory changes still
+    // invalidate the stream/snapshot cache.
+    let assertor_bytes = match config
+        .mesh
+        .as_ref()
+        .map(|mesh| serde_json::to_vec(&mesh.node_waypoint_assertors))
+        .transpose()
+    {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            let error = error.to_string();
+            return fingerprint_bytes([b"full-config-runtime-error".as_slice(), error.as_bytes()]);
+        }
+    };
+    fingerprint_bytes([
+        b"full-config".as_slice(),
+        config_bytes.as_slice(),
+        b"node-waypoint-assertors".as_slice(),
+        assertor_bytes.as_slice(),
+    ])
 }
 
 fn xds_state_key(namespace: &str, node_id: &str) -> String {
@@ -2235,6 +2259,7 @@ fn should_send_delta_response(
 mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
+    use crate::identity::spiffe::SpiffeId;
     use crate::modes::mesh::config::{
         AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, MeshWaypointBinding,
         MeshWaypointServiceRef, MtlsMode, PeerAuthentication, ServicePort,
@@ -2737,6 +2762,36 @@ mod tests {
         assert_eq!(
             snapshot_cluster_names(&snapshot),
             vec!["cluster/beta/checkout/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn xds_config_fingerprint_includes_runtime_node_waypoint_assertors() {
+        let mut left = gateway_config_with_service(true, 0);
+        let mut right = left.clone();
+        let waypoint_a =
+            SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a").unwrap();
+        let waypoint_b =
+            SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b").unwrap();
+        left.mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_assertors = vec![waypoint_a];
+        right
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_assertors = vec![waypoint_b];
+
+        assert_eq!(
+            serde_json::to_vec(&left).expect("serialized config"),
+            serde_json::to_vec(&right).expect("serialized config"),
+            "runtime-only assertors are intentionally skipped from raw GatewayConfig JSON"
+        );
+        assert_ne!(
+            config_fingerprint(&left),
+            config_fingerprint(&right),
+            "xDS fingerprints must still invalidate when only runtime assertors change"
         );
     }
 
