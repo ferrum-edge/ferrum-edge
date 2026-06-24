@@ -45,6 +45,7 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ipv4.pod_ip_bypass_guard_same_node
   node_waypoint.ipv4.pod_ip_bypass_guard_cross_node
   node_waypoint.identity.stale_cleanup
+  node_waypoint.identity.spire_chart_profile
 )
 if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
@@ -258,6 +259,149 @@ render_chart_assertions() {
     exit 1
   fi
 
+  local spire_id="spiffe://cluster.local/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.spire.enabled=true \
+    --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint)"
+  if ! grep -q "name: spire-agent-socket" <<<"$rendered" ||
+    ! grep -q "mountPath: /run/spire/sockets" <<<"$rendered" ||
+    ! grep -q "path: /run/spire/sockets" <<<"$rendered" ||
+    ! grep -A3 "name: FERRUM_K8S_NODE_NAME" <<<"$rendered" | grep -q "fieldPath: spec.nodeName" ||
+    ! grep -A1 "name: FERRUM_MESH_CA_BACKEND" <<<"$rendered" | grep -q 'value: "spire_agent"' ||
+    ! grep -A1 "name: FERRUM_MESH_SPIRE_AGENT_SOCKET" <<<"$rendered" | grep -q 'value: "/run/spire/sockets/agent.sock"' ||
+    ! grep -A1 "name: FERRUM_MESH_WORKLOAD_SPIFFE_ID" <<<"$rendered" | grep -q "value: \"$spire_id\"" ||
+    ! grep -A1 "name: FERRUM_MESH_PRODUCTION_MODE" <<<"$rendered" | grep -q 'value: "true"' ||
+    grep -q "name: FERRUM_MESH_ALLOW_NO_CA" <<<"$rendered"; then
+    echo "NodeWaypoint SPIRE render did not mount/configure the Workload API identity source" >&2
+    grep -nE 'spire-agent-socket|FERRUM_MESH_CA_BACKEND|FERRUM_MESH_SPIRE_AGENT_SOCKET|FERRUM_MESH_WORKLOAD_SPIFFE_ID|FERRUM_MESH_PRODUCTION_MODE|FERRUM_MESH_ALLOW_NO_CA|mountPath: /run/spire|path: /run/spire' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set image.repository="$IMAGE_REPOSITORY" \
+    --set image.tag="$IMAGE_TAG" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.spire.enabled=true \
+    --set ambient.spire.productionMode=false \
+    --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint)"
+  if ! grep -A1 "name: FERRUM_MESH_PRODUCTION_MODE" <<<"$rendered" | grep -q 'value: "false"'; then
+    echo "NodeWaypoint SPIRE render did not preserve ambient.spire.productionMode=false" >&2
+    grep -nA1 "FERRUM_MESH_PRODUCTION_MODE" <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.spire.enabled=true \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-missing-id-render.out 2>&1; then
+    echo "NodeWaypoint SPIRE render accepted ambient.spire.enabled without a workload SPIFFE ID" >&2
+    cat /tmp/ferrum-node-waypoint-spire-missing-id-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "ambient.spire.enabled=true requires ambient.spire.workloadSpiffeId" /tmp/ferrum-node-waypoint-spire-missing-id-render.out; then
+    echo "NodeWaypoint SPIRE render rejected missing workload SPIFFE ID without a clear error" >&2
+    cat /tmp/ferrum-node-waypoint-spire-missing-id-render.out >&2 || true
+    exit 1
+  fi
+
+  local shared_spire_id="spiffe://cluster.local/ns/$MESH_NS/sa/ferrum-mesh"
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.spire.enabled=true \
+    --set-string "ambient.spire.workloadSpiffeId=$shared_spire_id" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-shared-id-render.out 2>&1; then
+    echo "NodeWaypoint SPIRE render accepted a shared DaemonSet SPIFFE ID" >&2
+    cat /tmp/ferrum-node-waypoint-spire-shared-id-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "requires ambient.spire.workloadSpiffeId to include" /tmp/ferrum-node-waypoint-spire-shared-id-render.out; then
+    echo "NodeWaypoint SPIRE render rejected shared SPIFFE ID without a clear error" >&2
+    cat /tmp/ferrum-node-waypoint-spire-shared-id-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.env.FERRUM_MESH_CA_BACKEND=none \
+    --set ambient.spire.enabled=true \
+    --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-managed-env-render.out 2>&1; then
+    echo "NodeWaypoint SPIRE render accepted a chart-managed identity env override" >&2
+    cat /tmp/ferrum-node-waypoint-spire-managed-env-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "ambient.env.FERRUM_MESH_CA_BACKEND is chart-managed" /tmp/ferrum-node-waypoint-spire-managed-env-render.out; then
+    echo "NodeWaypoint SPIRE render rejected managed identity env override without a clear error" >&2
+    cat /tmp/ferrum-node-waypoint-spire-managed-env-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.env.FERRUM_GATEWAY_SVID_CERT_PATH=/etc/ferrum/svid/cert.pem \
+    --set ambient.spire.enabled=true \
+    --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-file-svid-render.out 2>&1; then
+    echo "NodeWaypoint SPIRE render accepted a file-SVID override" >&2
+    cat /tmp/ferrum-node-waypoint-spire-file-svid-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "ambient.env.FERRUM_GATEWAY_SVID_CERT_PATH is chart-managed" /tmp/ferrum-node-waypoint-spire-file-svid-render.out; then
+    echo "NodeWaypoint SPIRE render rejected file-SVID override without a clear error" >&2
+    cat /tmp/ferrum-node-waypoint-spire-file-svid-render.out >&2 || true
+    exit 1
+  fi
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set ambient.env.FERRUM_GATEWAY_SVID_CERT_PATH_FILE=/etc/ferrum/svid/cert-path-secret \
+    --set ambient.spire.enabled=true \
+    --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-file-svid-suffix-render.out 2>&1; then
+    echo "NodeWaypoint SPIRE render accepted a suffixed file-SVID override" >&2
+    cat /tmp/ferrum-node-waypoint-spire-file-svid-suffix-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "ambient.env.FERRUM_GATEWAY_SVID_CERT_PATH_FILE is chart-managed" /tmp/ferrum-node-waypoint-spire-file-svid-suffix-render.out; then
+    echo "NodeWaypoint SPIRE render rejected suffixed file-SVID override without a clear error" >&2
+    cat /tmp/ferrum-node-waypoint-spire-file-svid-suffix-render.out >&2 || true
+    exit 1
+  fi
+
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
@@ -404,6 +548,12 @@ render_chart_assertions() {
     "" \
     "" \
     "helm-rendered-ebpf-images-registry-hostpid-capabilities"
+  record_live_assertion \
+    node_waypoint.identity.spire_chart_profile \
+    pass \
+    "" \
+    "" \
+    "helm-rendered-spire-workload-api-production-identity-source"
 }
 
 ready_worker_nodes() {

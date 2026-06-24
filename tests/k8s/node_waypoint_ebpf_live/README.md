@@ -23,6 +23,13 @@ stay denied after pod recreation. On dual-stack clusters it also requires the
 IPv6 pod-netns ready markers, IPv6 Service allow/deny behavior, and an IPv6
 direct Pod-IP bypass guard.
 
+The chart render preflight also verifies the production identity profile needed
+by the next H2 live fixture step: `ambient.spire.enabled=true` must mount the
+SPIRE Agent Workload API socket into the NodeWaypoint proxy and render
+`FERRUM_MESH_CA_BACKEND=spire_agent`, `FERRUM_MESH_SPIRE_AGENT_SOCKET`,
+per-node `FERRUM_MESH_WORKLOAD_SPIFFE_ID` using `$(FERRUM_K8S_NODE_NAME)`, and
+`FERRUM_MESH_PRODUCTION_MODE=true`.
+
 Each run writes `target/node-waypoint-ebpf-live/live-assertions.json` using the
 shared live-assertion schema from `tests/k8s/lib/live_assertions.sh`. The current
 assertions are H2 evidence only; they do not promote NodeWaypoint or make it a

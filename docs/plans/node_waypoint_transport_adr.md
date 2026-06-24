@@ -77,6 +77,13 @@ metadata-absent service targets so the route fails closed instead of retaining a
 plaintext backend. Explicit no-CA/no-identity development runs keep the
 temporary plaintext compatibility fallback until the SPIRE production live
 fixture replaces it.
+Helm now exposes `ambient.spire.enabled` to mount the SPIRE Agent Workload API
+socket and render the `spire_agent` CA backend, workload SPIFFE ID, and
+production-mode guardrail for NodeWaypoint proxy Pods. The NodeWaypoint chart
+profile requires the workload SPIFFE ID to include the chart-managed
+`$(FERRUM_K8S_NODE_NAME)` downward-API token, and Kubernetes discovery resolves
+that token from `spec.nodeName` before publishing node waypoint assertors, so a
+DaemonSet cannot collapse all waypoints onto one shared production identity.
 
 Implementation status: the data plane now consumes `Workload.node_waypoint`
 when it is present on a selected captured-Service workload. It materializes a
@@ -223,6 +230,7 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv4.pod_ip_bypass_guard_same_node`
 - `node_waypoint.ipv4.pod_ip_bypass_guard_cross_node`
 - `node_waypoint.identity.stale_cleanup`
+- `node_waypoint.identity.spire_chart_profile`
 - `node_waypoint.ipv6.pod_ip_fail_closed` (historical pre-admission evidence;
   retained as a non-required artifact once IPv6 admission is enabled)
 - `node_waypoint.ipv6.service_fail_closed` (historical pre-admission evidence;

@@ -877,7 +877,7 @@ fn node_waypoint_spiffe_id(object: &K8sObject) -> Option<SpiffeId> {
     }
     for name in ["FERRUM_MESH_WORKLOAD_SPIFFE_ID", "FERRUM_GATEWAY_SPIFFE_ID"] {
         if let Some(spiffe_id) =
-            pod_env_value(object, name).and_then(|value| SpiffeId::new(value).ok())
+            pod_env_value_resolved(object, name).and_then(|value| SpiffeId::new(value).ok())
         {
             return Some(spiffe_id);
         }
@@ -930,6 +930,82 @@ fn pod_env_value<'a>(object: &'a K8sObject, name: &str) -> Option<&'a str> {
                 .then(|| string_field(env, "value"))
                 .flatten()
         })
+}
+
+fn pod_env_value_resolved(object: &K8sObject, name: &str) -> Option<String> {
+    for container in object
+        .spec
+        .get("containers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let mut values = HashMap::new();
+        for env in container
+            .get("env")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(env_name) = string_field(env, "name") else {
+                continue;
+            };
+            if let Some(value) = string_field(env, "value") {
+                let resolved = expand_pod_env_refs(value, &values);
+                if env_name == name {
+                    return Some(resolved);
+                }
+                values.insert(env_name.to_string(), resolved);
+                continue;
+            }
+            if let Some(value) = pod_env_field_ref_value(object, env) {
+                if env_name == name {
+                    return Some(value);
+                }
+                values.insert(env_name.to_string(), value);
+            }
+        }
+    }
+    None
+}
+
+fn expand_pod_env_refs(value: &str, values: &HashMap<String, String>) -> String {
+    let mut resolved = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("$(") {
+        resolved.push_str(&rest[..start]);
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find(')') else {
+            resolved.push_str(&rest[start..]);
+            return resolved;
+        };
+        let name = &after_marker[..end];
+        if let Some(replacement) = values.get(name) {
+            resolved.push_str(replacement);
+        } else {
+            resolved.push_str("$(");
+            resolved.push_str(name);
+            resolved.push(')');
+        }
+        rest = &after_marker[end + 1..];
+    }
+    resolved.push_str(rest);
+    resolved
+}
+
+fn pod_env_field_ref_value(object: &K8sObject, env: &Value) -> Option<String> {
+    match env
+        .get("valueFrom")?
+        .get("fieldRef")?
+        .get("fieldPath")?
+        .as_str()?
+    {
+        "metadata.name" => Some(object.metadata.name.clone()),
+        "metadata.namespace" => Some(object.metadata.namespace.clone()),
+        "metadata.uid" => Some(object.metadata.uid.clone()),
+        "spec.nodeName" => string_field(&object.spec, "nodeName").map(ToOwned::to_owned),
+        _ => None,
+    }
 }
 
 fn pod_env_bool_true(object: &K8sObject, name: &str) -> bool {

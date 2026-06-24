@@ -139,6 +139,17 @@ ambient:
   outboundPort: 15001
   hbonePort: 15008
   captureMode: iptables
+  spire:
+    # Mount a SPIRE Agent Workload API socket and configure mesh mode to fetch
+    # its runtime X.509-SVID from SPIRE. Requires workloadSpiffeId; NodeWaypoint
+    # profiles must include $(FERRUM_K8S_NODE_NAME) so each node has a distinct
+    # waypoint identity.
+    enabled: false
+    socketHostPath: /run/spire/sockets
+    socketMountPath: /run/spire/sockets
+    socketFileName: agent.sock
+    workloadSpiffeId: ""
+    productionMode: true
   env:
     FERRUM_MODE: mesh
     FERRUM_MESH_TOPOLOGY: ambient

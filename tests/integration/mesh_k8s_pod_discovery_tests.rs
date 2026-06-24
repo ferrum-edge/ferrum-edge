@@ -135,6 +135,20 @@ fn push_pod_env(pod: &mut K8sObject, name: &str, value: &str) {
         }));
 }
 
+fn push_pod_env_field_ref(pod: &mut K8sObject, name: &str, field_path: &str) {
+    pod.spec["containers"][0]["env"]
+        .as_array_mut()
+        .expect("env array")
+        .push(json!({
+            "name": name,
+            "valueFrom": {
+                "fieldRef": {
+                    "fieldPath": field_path
+                }
+            }
+        }));
+}
+
 fn node_waypoint_pod_with_spiffe(
     node_name: &str,
     ip: &str,
@@ -319,6 +333,86 @@ fn k8s_pod_discovery_attaches_ready_node_waypoint_metadata() {
     assert_eq!(
         slice_node_waypoint.spiffe_id.as_str(),
         "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
+    let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
+    push_pod_env_field_ref(&mut waypoint, "FERRUM_K8S_NODE_NAME", "spec.nodeName");
+    push_pod_env(
+        &mut waypoint,
+        "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            waypoint,
+        ],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    let workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+        .expect("reviews workload");
+    let node_waypoint = workload
+        .node_waypoint
+        .as_ref()
+        .expect("same-node NodeWaypoint endpoint");
+
+    assert_eq!(
+        node_waypoint.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a"
+    );
+    assert_eq!(node_waypoint.node_name.as_deref(), Some("node-a"));
+}
+
+#[test]
+fn k8s_pod_discovery_does_not_recursively_expand_node_waypoint_spiffe_env() {
+    let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
+    push_pod_env(
+        &mut waypoint,
+        "FERRUM_NODE_NAME_ALIAS",
+        "$(FERRUM_K8S_NODE_NAME)",
+    );
+    push_pod_env_field_ref(&mut waypoint, "FERRUM_K8S_NODE_NAME", "spec.nodeName");
+    push_pod_env(
+        &mut waypoint,
+        "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_NODE_NAME_ALIAS)",
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            waypoint,
+        ],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    let workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+        .expect("reviews workload");
+
+    assert!(
+        workload.node_waypoint.is_none(),
+        "discovery should not recursively resolve a token kubelet leaves literal"
     );
 }
 
