@@ -1072,9 +1072,6 @@ mod tests {
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
         let control_plane = format!("https://remote-{suffix}.example:9443");
-        // The store-site redaction normalizes through `url::Url`, which appends
-        // a canonical trailing-slash path for an authority-only URL.
-        let expected_label = format!("https://remote-{suffix}.example:9443/");
         let fetched_at = unix_now_seconds().saturating_sub(5);
 
         increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
@@ -1090,7 +1087,7 @@ mod tests {
         );
         assert!(
             output.contains(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"{expected_label}\"}} 2"
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"redacted\"}} 2"
             )),
             "remote discovery failure counter series missing: {output}"
         );
