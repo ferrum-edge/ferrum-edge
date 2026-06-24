@@ -3184,13 +3184,12 @@ fn materialize_sidecar_inbound_proxies(
                 };
                 // Effective protocol with `protocol_overrides` applied (same
                 // resolution `service_tcp_stream_ports` filtered on). Only an
-                // opaque-TLS port carries a real ClientHello, so only it is SNI-
-                // peeked by the inbound relay. First-byte plugin inspection is
-                // still valid for client-first stream ports (opaque TLS and
-                // generic TCP); known server-first ports (Redis/MySQL/Postgres/
-                // Mongo) must not peek or the relay stalls on the handshake
-                // clock waiting for bytes the client never sends before the
-                // backend greeting.
+                // opaque-TLS port carries a real ClientHello, so only it is
+                // safely pre-dial peeked by the inbound relay. Ambiguous raw
+                // TCP and known server-first ports (Redis/MySQL/Postgres/Mongo)
+                // must not peek or the relay stalls on the handshake clock
+                // waiting for bytes the client never sends before the backend
+                // greeting.
                 let effective_protocol = service
                     .protocol_overrides
                     .get(&service_port.port)
@@ -3211,10 +3210,7 @@ fn materialize_sidecar_inbound_proxies(
                         runtime.cluster_domain.trim_matches('.')
                     ),
                     tls_inspect: matches!(effective_protocol, AppProtocol::Tls),
-                    first_bytes_inspect: matches!(
-                        effective_protocol,
-                        AppProtocol::Tls | AppProtocol::Tcp
-                    ),
+                    first_bytes_inspect: matches!(effective_protocol, AppProtocol::Tls),
                 });
             }
         }
@@ -15327,9 +15323,11 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_inbound_plain_tcp_route_marks_first_bytes_inspect() {
-        // Generic raw TCP is the client-first plaintext stream case where
-        // first-bytes-aware plugins need the opening payload before relay.
+    fn sidecar_inbound_plain_tcp_route_skips_first_bytes_inspect() {
+        // Generic raw TCP is ambiguous: it can model client-first payloads, but
+        // it is also the escape hatch for custom server-first protocols. Without
+        // an explicit client-first signal, the inbound relay must not pre-dial
+        // peek and risk stalling before the backend greeting.
         let spiffe = "spiffe://cluster.local/ns/default/sa/tcpapp";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
@@ -15364,8 +15362,8 @@ mod tests {
             "a generic TCP inbound port must not be marked for SNI peeking"
         );
         assert!(
-            route.first_bytes_inspect,
-            "a generic TCP inbound port must expose first bytes to stream plugins"
+            !route.first_bytes_inspect,
+            "a generic TCP inbound port is ambiguous and must not pre-dial peek first bytes"
         );
     }
 

@@ -285,11 +285,10 @@ pub(crate) struct MeshTcpInboundEntry {
     /// ClientHello SNI before the stream plugin chain. Carried from
     /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
     pub(crate) tls_inspect: bool,
-    /// `true` for client-first stream protocols whose opening bytes should be
-    /// made available to first-bytes-aware plugins. `false` for known
-    /// server-first raw-TCP protocols (Redis/Mongo/MySQL/Postgres), where
-    /// peeking would block the relay on the handshake clock before the backend
-    /// greeting can arrive.
+    /// `true` only when mesh has an explicit client-first signal. `false` for
+    /// ambiguous/server-first raw-TCP protocols (Tcp/Redis/Mongo/MySQL/
+    /// Postgres), where peeking would block the relay on the handshake clock
+    /// before the backend greeting can arrive.
     pub(crate) first_bytes_inspect: bool,
 }
 
@@ -4823,8 +4822,8 @@ mod tests {
             service_name: "tcpapp".to_string(),
             service_fqdn: "tcpapp.default.svc.cluster.local".to_string(),
             tls_inspect: false,
-            // Generic TCP is client-first for first-byte stream plugin inspection.
-            first_bytes_inspect: true,
+            // Generic TCP is ambiguous and must not pre-dial peek by default.
+            first_bytes_inspect: false,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4860,8 +4859,8 @@ mod tests {
             .expect("captured generic TCP app port should route");
         assert_eq!(tcp_entry.backend_addr, "127.0.0.1:7000".parse().unwrap());
         assert!(
-            tcp_entry.first_bytes_inspect,
-            "generic TCP inbound entries must expose first bytes to stream plugins"
+            !tcp_entry.first_bytes_inspect,
+            "generic TCP inbound entries are ambiguous and must not pre-dial peek first bytes"
         );
 
         assert!(

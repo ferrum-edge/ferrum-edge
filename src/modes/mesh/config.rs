@@ -2306,10 +2306,10 @@ pub struct MeshInboundTcpRoute {
     /// peeks the SNI before the stream plugin chain (a `when: connection.sni`
     /// `AuthorizationPolicy` needs it).
     pub tls_inspect: bool,
-    /// `true` for client-first stream protocols whose opening bytes should be
-    /// made available to first-bytes-aware plugins (stream WAF, TCP TLS-shape
-    /// checks). `false` for known server-first raw-TCP protocols (Mongo/MySQL/
-    /// Postgres/Redis), whose clients send nothing until the backend greeting.
+    /// `true` only when the mesh classifier has an explicit client-first signal
+    /// for safe pre-dial peeking. `false` for ambiguous/server-first raw-TCP
+    /// protocols (Tcp/Mongo/MySQL/Postgres/Redis), where clients may send
+    /// nothing until the backend greeting.
     pub first_bytes_inspect: bool,
 }
 
