@@ -62,6 +62,11 @@ pub static FERRUM_ACCEPT_COOKIE_BY_TUPLE6: LruHashMap<ConnTuple6, u64> =
 #[map]
 pub static FERRUM_POD_IPS: HashMap<u32, PodInfo> = HashMap::with_max_entries(4096, 0);
 
+/// Enrolled pod IPv6 addresses. Keyed by exact IPv6 address in the same word
+/// layout used by the connect6/orig-dst maps.
+#[map]
+pub static FERRUM_POD_IPS6: HashMap<CidrKey6, PodInfo> = HashMap::with_max_entries(4096, 0);
+
 /// UIDs exempt from outbound capture (proxy UID 1337).
 /// Connect hooks skip rewrite when the calling process matches.
 #[map]

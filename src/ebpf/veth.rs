@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 //! Host-side veth interface discovery for pod network namespaces.
 //!
-//! When a pod is enrolled for eBPF capture, the node agent attaches a tc/ingress
-//! program to the host-side veth peer to redirect inbound packets. This module
-//! resolves the veth interface name from the pod's network namespace.
+//! When a pod is enrolled for eBPF capture, the node agent attaches a tc
+//! classifier to the host-side veth peer. This module resolves the veth
+//! interface name from the pod's network namespace.
 
 #[cfg(target_os = "linux")]
 use std::fs::File;

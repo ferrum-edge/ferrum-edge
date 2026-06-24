@@ -10,13 +10,13 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 
 | Surface | Name / default | Purpose |
 |---|---|---|
-| Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod dual-family in-netns capture listeners, the GAP-2M socket-cookie bridge, and the pod registry (see below). The remote `node-waypoint-ebpf-live` workflow gates the IPv4 datapath and the dual-stack IPv6 capture assertions; secured node-to-node transport and inbound enforcement remain Experimental H2 residuals. |
+| Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod dual-family in-netns capture listeners, the GAP-2M socket-cookie bridge, the pod registry, and the direct-inbound pod-veth guard (see below). The remote `node-waypoint-ebpf-live` workflow gates IPv4 and IPv6 capture, secured node-to-node transport, SPIRE-backed identity, and direct Pod-IP bypass checks; stale-IP reuse and forged assertion coverage remain Experimental H2 residuals. |
 | Admin listener | `FERRUM_NODE_AGENT_ADMIN_ENABLED=false` | Opts in to the read-only admin listener for node-agent metrics/health. When enabled, `FERRUM_ADMIN_HTTP_PORT` controls the port and the listener defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. |
 | Outbound capture port | `15001` | The port written into the BPF capture config map and used by cgroup connect hooks when rewriting outbound sockets. |
 | HBONE redirect port | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT=15008` | The HBONE listener/redirect port carried in the same BPF config map for sidecarless topologies. Must match the mesh proxy HBONE listener (`15008` today). Node-agent startup automatically adds this port to outbound capture exclusions. |
 | Unix socket | `/run/ferrum/node-agent.sock` | Reserved IPC path for future node-agent/proxy coordination. Phase 1 treats this as inert contract metadata; no socket is created yet. |
-| BPF config map | `FERRUM_CAPTURE_CONFIG` | Singleton map keyed by `0`, containing outbound capture and HBONE redirect ports. |
-| BPF pod map | `FERRUM_POD_IPS` | Pod IP to proxy-port metadata for enrolled workloads. |
+| BPF config map | `FERRUM_CAPTURE_CONFIG` | Singleton map keyed by `0`, containing outbound capture and HBONE redirect ports plus the NodeWaypoint inbound relay socket mark trusted by the pod-veth tc guard. |
+| BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set. |
 | BPF original destination maps | `FERRUM_ORIG_DST4`, `FERRUM_ORIG_DST6` | Socket-cookie keyed original destination records. The `connect4`/`connect6` hooks write them (stamped with the source pod's UID + SPIFFE hash from `FERRUM_WORKLOAD_IDENTITY`); the node-agent pins them at `/sys/fs/bpf/ferrum/orig_dst{4,6}`; the node-waypoint mesh-proxy's **orig-dst bridge** (`src/ebpf/orig_dst_bridge.rs`) mirrors each record into the `NodeWaypointIdentityResolver`. |
 | BPF workload identity map | `FERRUM_WORKLOAD_IDENTITY` | Per-cgroup source workload identity (`{pod_uid, workload_spiffe_hash}`), keyed by `bpf_get_current_cgroup_id`. The node-agent writes one entry per enrolled pod cgroup; the connect hooks read it to stamp orig-dst records. Absent entry → connect hooks store the all-zero sentinel, which node-waypoint resolution treats as fail-closed. |
 | BPF capture filters | `FERRUM_BYPASS_UIDS`, `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE` | UID, CIDR, and port exclusions applied before outbound rewrite. |
@@ -29,9 +29,9 @@ The node-agent watches pods on the local node via kube-rs (`spec.nodeName={node_
 
 | Event | Source trigger | Node-agent action |
 |---|---|---|
-| Initial `Apply` for a previously-unseen pod | Pod creation | Resolve cgroup path, attach `connect4`/`connect6`/`getpeername4`/`getpeername6` programs, write `FERRUM_POD_IPS`, write `FERRUM_INCLUDE_PORTS` if the pod carries `includeOutboundPorts`. Counts toward `ferrum_node_agent_pods_enrolled_total`. |
+| Initial `Apply` for a previously-unseen pod | Pod creation | Resolve cgroup path, attach `connect4`/`connect6`/`getpeername4`/`getpeername6` programs, attach the host-side pod-veth tc classifier on ingress, write `FERRUM_POD_IPS` / `FERRUM_POD_IPS6`, write `FERRUM_INCLUDE_PORTS` if the pod carries `includeOutboundPorts`. Counts toward `ferrum_node_agent_pods_enrolled_total`. |
 | Subsequent `Apply` for an already-tracked pod | Pod metadata, label, or annotation update; status/condition change; container restart | Re-evaluate enrollment criteria (opt-in/opt-out labels and annotations), reconcile pod IP, **diff the parsed `includeOutboundPorts` policy** against the stashed baseline. Identical policy is a structural no-op (no BPF syscalls). A changed policy re-programs `FERRUM_INCLUDE_PORTS` for that pod's cgroup id; removed annotation drops the entry. Opt-in→opt-out flip triggers un-enrollment, opt-out→opt-in triggers enrollment. |
-| `Delete` | Pod deletion | Detach BPF programs, remove `FERRUM_POD_IPS` and `FERRUM_INCLUDE_PORTS` entries. Counts toward `ferrum_node_agent_pods_unenrolled_total`. |
+| `Delete` | Pod deletion | Detach BPF programs, remove `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` and `FERRUM_INCLUDE_PORTS` entries. Counts toward `ferrum_node_agent_pods_unenrolled_total`. |
 
 Mid-life update guarantees:
 
@@ -89,7 +89,7 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   (+ `CAP_NET_ADMIN`), because `CAP_BPF`/`CAP_PERFMON` did not exist until 5.8.
 >   `node_waypoint` mode additionally requires `CAP_SYS_ADMIN` on all supported
 >   kernels because enrollment enters pod network namespaces with `setns()` to
->   resolve host-side veth peers before attaching inbound tc programs.
+>   resolve host-side veth peers before attaching pod-veth tc classifiers.
 >   On a node that fails the kernel/cgroup/bpffs probe the `-ebpf` pod does **not**
 >   silently degrade to the mock backend: `run()` hands off to `handle_fallback`,
 >   whose default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` returns an error and the
@@ -243,10 +243,19 @@ enrolled, so newly started workloads cannot open direct egress connections that
 bypass `mesh_authz`. Until the proxy opens the pod-loopback listener for an
 address family, captured connections for that family may be refused, but they
 fail closed instead of bypassing policy. The inbound `getpeername4`/
-`getpeername6` programs are also attached during enrollment. NodeWaypoint adds
-`::/0` to the capture include set so IPv6 destinations reach `connect6`; the
-legacy `ipv6_outbound_deny` flag remains clear in the normal dual-family path.
-Excluded v6 (CIDR/port excludes) still flows. The proxy writes
+`getpeername6` programs are also attached during enrollment.
+
+For destination-side bypass protection, the same enrollment writes the pod's
+IPv4 and IPv6 addresses into `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` and attaches
+`ferrum_tc_inbound` to the host-side veth on ingress. Packets whose
+destination is an enrolled pod IP are dropped unless `skb->mark` matches the
+NodeWaypoint inbound relay auth mark from `FERRUM_CAPTURE_CONFIG`; the
+destination HBONE relay sets that mark with `SO_MARK` before dialing the local
+backend pod.
+
+NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
+`connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal
+dual-family path. Excluded v6 (CIDR/port excludes) still flows. The proxy writes
 `<registry_dir>/.ready/<pod_uid>` for the historical IPv4 readiness marker,
 `<registry_dir>/.ready4/<pod_uid>` for IPv4, and
 `<registry_dir>/.ready6/<pod_uid>` for IPv6; these dotdirs are skipped by the

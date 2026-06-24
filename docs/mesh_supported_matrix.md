@@ -52,7 +52,8 @@ authoritative answer to "what regression fails CI today."
   trust-bundle federation.
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
-  production SPIRE, and inbound direct-pod enforcement remain H2 residuals;
+  production SPIRE, and inbound direct-pod enforcement are live-gated;
+  stale-IP reuse and forged-assertion coverage remain H2 residuals;
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
@@ -84,9 +85,10 @@ need them, or because they are blocked upstream / architecturally:
   the CP-derived `node_waypoint_assertors` inventory, which is built from
   scope-authorized workloads before namespace/service slice narrowing.
   Explicit no-CA/no-identity development runs retain the temporary plaintext
-  fallback and built-in assertor defaults.
-  Broader promotion still waits on production SPIRE live coverage and inbound
-  direct-pod enforcement.
+  fallback and built-in assertor defaults. The pod-veth tc guard now drops
+  unmanaged direct Pod-IP attempts to enrolled destination pods unless the
+  destination HBONE relay set the authorized socket mark.
+  Broader promotion still waits on stale-IP reuse and forged-assertion coverage.
 - **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
   capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
   services or proxies force the NodeWaypoint UDP/DTLS path closed during config

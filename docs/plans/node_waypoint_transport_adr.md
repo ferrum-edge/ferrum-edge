@@ -11,8 +11,9 @@ Service authorization, stale source identity cleanup, production SPIRE Workload
 API issuance for per-node NodeWaypoint SVIDs, and direct Pod-IP fail-closed
 checks on a two-worker kind cluster. Authenticated node-to-node transport and
 destination-side NodeWaypoint policy enforcement are wired through the
-SPIFFE-mTLS HBONE relay path; broader explicit direct-inbound enforcement
-remains H2 work.
+SPIFFE-mTLS HBONE relay path. The destination-side pod-veth tc guard now drops
+unmarked direct traffic to enrolled pod IPs and admits only backend dials made
+by the destination NodeWaypoint relay with the authorized socket mark.
 
 This ADR defines the target transport so implementation can proceed without
 adding a plaintext shortcut or routing to a non-existent per-pod HBONE listener.
@@ -180,14 +181,20 @@ allowed.
 ## Direct Pod Traffic
 
 The H2 production profile rejects direct inbound traffic to enrolled destination
-pods unless the flow originates from the authorized destination NodeWaypoint
-path. A future redirect design is possible, but TC/XDP/CNI classification alone
-does not satisfy this ADR; the enforcement action must prevent the packet from
-reaching the app outside destination policy.
+pods unless the flow originates from the authorized destination NodeWaypoint path.
+The current implementation enforces that with the pod-veth tc classifier
+attached on host-side veth ingress:
+`FERRUM_POD_IPS` / `FERRUM_POD_IPS6` mark enrolled destination addresses, and
+packets to those addresses are dropped unless `skb->mark` equals the
+NodeWaypoint inbound-auth mark set by the destination HBONE relay before it
+dials the local backend pod. This is intentionally a guard, not a redirect;
+unauthenticated direct pod-IP traffic never reaches the app outside destination
+policy.
 
-The current live gate already asserts denied-source direct Pod-IP attempts do
-not reach the destination over IPv4 or IPv6. H2 is not complete until same-node,
-cross-node, stale-IP reuse, unmanaged-source, forged-assertion, and production
+The live gate asserts both denied in-mesh sources and unmanaged non-mesh sources
+cannot reach enrolled destination pods directly over IPv4, plus the unmanaged
+IPv6 direct-inbound path when the cluster is dual-stack. H2 is not complete
+until stale-IP reuse, forged-assertion, and the remaining production
 identity-profile cases are covered.
 
 ## Failure Behavior
@@ -238,6 +245,8 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv4.service_deny_cross_node`
 - `node_waypoint.ipv4.pod_ip_bypass_guard_same_node`
 - `node_waypoint.ipv4.pod_ip_bypass_guard_cross_node`
+- `node_waypoint.ipv4.direct_inbound_guard_same_node`
+- `node_waypoint.ipv4.direct_inbound_guard_cross_node`
 - `node_waypoint.identity.stale_cleanup`
 - `node_waypoint.identity.spire_chart_profile`
 - `node_waypoint.ipv6.pod_ip_fail_closed` (historical pre-admission evidence;
@@ -248,6 +257,7 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv6.service_allow`
 - `node_waypoint.ipv6.service_deny`
 - `node_waypoint.ipv6.pod_ip_bypass_guard`
+- `node_waypoint.ipv6.direct_inbound_guard`
 
 Future H2 PRs should extend this list instead of renaming these IDs so artifacts
 remain comparable across commits.

@@ -41,7 +41,7 @@ use crate::ebpf::{
     IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
     NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE, NodeAgentMetrics,
-    NodeAgentProxyMode, PodAttachmentState, PodInfo,
+    NodeAgentProxyMode, PodAttachmentState, PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
@@ -60,6 +60,7 @@ static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(D
 const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
 const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
 const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
+const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1271,6 +1272,26 @@ fn cleanup_pre_enrollment_maps(
     pod_uid: &str,
     state: &PodAttachmentState,
 ) {
+    if let Some(ip) = state.pod_ip
+        && let Err(e) = backend.remove_pod_ip(ip)
+    {
+        warn!(
+            pod_uid,
+            %ip,
+            error = %e,
+            "Failed to remove pre-enrollment pod IPv4 entry from BPF map"
+        );
+    }
+    if let Some(ip) = state.pod_ip6
+        && let Err(e) = backend.remove_pod_ip6(ip)
+    {
+        warn!(
+            pod_uid,
+            %ip,
+            error = %e,
+            "Failed to remove pre-enrollment pod IPv6 entry from BPF map"
+        );
+    }
     for cgroup_id in &state.include_ports_cgroup_ids {
         if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
             warn!(
@@ -1564,7 +1585,7 @@ fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str
 
 fn forget_pending_pod_ip_remove_failures_for_ip(
     pod_states: &DashMap<String, PodAttachmentState>,
-    ip: std::net::Ipv4Addr,
+    ip: impl std::fmt::Display,
 ) -> usize {
     let key_prefix = pod_state_key_prefix(pod_states);
     let detail = ip.to_string();
@@ -1752,7 +1773,7 @@ fn retry_backed_off_pod_enrollments(
 
 fn pending_pod_ip_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, std::net::Ipv4Addr)> {
+) -> Vec<(String, std::net::IpAddr)> {
     if PENDING_CAPTURE_FAILURES.is_empty() {
         return Vec::new();
     }
@@ -1784,7 +1805,7 @@ fn retry_pending_pod_ip_removals(
     }
 
     for (failure_key, ip) in pending {
-        if let Some(owner_pod_uid) = pod_owning_ip(pod_states, ip) {
+        if let Some(owner_pod_uid) = pod_owning_ip_addr(pod_states, ip) {
             PENDING_CAPTURE_FAILURES.remove(&failure_key);
             debug!(
                 owner_pod_uid,
@@ -1794,7 +1815,11 @@ fn retry_pending_pod_ip_removals(
             continue;
         }
 
-        match backend.remove_pod_ip(ip) {
+        let result = match ip {
+            std::net::IpAddr::V4(ip) => backend.remove_pod_ip(ip),
+            std::net::IpAddr::V6(ip) => backend.remove_pod_ip6(ip),
+        };
+        match result {
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
                 debug!(%ip, "Recovered pending pod IP map removal failure");
@@ -1950,6 +1975,7 @@ fn handle_pod_added(
         .pod_ip_str
         .and_then(pod_watcher::parse_pod_ip)
         .or(event.pod_source_ips.ipv4);
+    let pod_ip6 = event.pod_source_ips.ipv6;
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
     // Production: the kube-rs caller sets `veth_iface_override = None`; the
@@ -1977,6 +2003,9 @@ fn handle_pod_added(
             let pod_ip_reconcile = reconcile_existing_pod_ip(
                 backend, config, metrics, &state_key, pod_uid, pod_ip, &mut state,
             );
+            let pod_ip6_reconcile = reconcile_existing_pod_ip6(
+                backend, config, metrics, &state_key, pod_uid, pod_ip6, &mut state,
+            );
             reconcile_existing_pod_include_ports(
                 backend,
                 metrics,
@@ -1993,6 +2022,7 @@ fn handle_pod_added(
                 &mut state,
             );
             if !pod_ip_reconcile.pod_ip_update_failed
+                && !pod_ip6_reconcile.pod_ip_update_failed
                 && let (Some(dir), Some(cgroup)) = (
                     &config.node_waypoint_pod_registry_dir,
                     state.cgroup_path.as_deref(),
@@ -2013,6 +2043,16 @@ fn handle_pod_added(
                     pod_uid,
                     ip,
                     "pod IP changed",
+                );
+            }
+            if let Some(ip) = pod_ip6_reconcile.stale_pod_ip {
+                remove_pod_ip6_if_unowned(
+                    backend,
+                    pod_states,
+                    metrics,
+                    pod_uid,
+                    ip,
+                    "pod IPv6 changed",
                 );
             }
             return;
@@ -2041,6 +2081,7 @@ fn handle_pod_added(
         pod_name: pod_name.to_string(),
         namespace: namespace.to_string(),
         pod_ip,
+        pod_ip6,
         cgroup_path: cgroup_path.clone(),
         veth_iface: veth_iface.clone(),
         attached: false,
@@ -2116,16 +2157,24 @@ fn handle_pod_added(
                 return;
             };
 
-            if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
-                warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
-                metrics.record_attach_error();
-                cleanup_partial_pod_enrollment(backend, pod_uid, &state);
-                remember_failed_pod_enrollment(
-                    &state_key,
-                    attempt_signature,
-                    enrollment_snapshot.clone(),
-                );
-                return;
+            for direction in [TcAttachDirection::Ingress, TcAttachDirection::Egress] {
+                if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound", direction) {
+                    warn!(
+                        pod_uid,
+                        iface,
+                        direction = direction.as_str(),
+                        error = %e,
+                        "Failed to attach tc program"
+                    );
+                    metrics.record_attach_error();
+                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    remember_failed_pod_enrollment(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                    );
+                    return;
+                }
             }
             if let Some(ip) = pod_ip {
                 let info = PodInfo {
@@ -2144,6 +2193,23 @@ fn handle_pod_added(
                     return;
                 }
             }
+            if let Some(ip) = pod_ip6 {
+                let info = PodInfo {
+                    proxy_port: config.capture_config.outbound_port,
+                    cgroup_id: 0,
+                };
+                if let Err(e) = backend.update_pod_ip6(ip, &info) {
+                    warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
+                    metrics.record_attach_error();
+                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    remember_failed_pod_enrollment(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                    );
+                    return;
+                }
+            }
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -2151,6 +2217,7 @@ fn handle_pod_added(
                 pod_name,
                 namespace,
                 ?pod_ip,
+                ?pod_ip6,
                 include_ports_cgroups = state.include_ports_cgroup_ids.len(),
                 workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
@@ -2174,6 +2241,9 @@ fn handle_pod_added(
         if let Some(ip) = pod_ip {
             forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         }
+        if let Some(ip) = pod_ip6 {
+            forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
+        }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
@@ -2191,11 +2261,21 @@ fn handle_pod_added(
     }
 }
 
-#[derive(Debug, Default)]
-struct PodIpReconcileResult {
-    stale_pod_ip: Option<std::net::Ipv4Addr>,
+#[derive(Debug)]
+struct PodIpReconcileResult<Ip> {
+    stale_pod_ip: Option<Ip>,
     recovered_pending_failure: bool,
     pod_ip_update_failed: bool,
+}
+
+impl<Ip> Default for PodIpReconcileResult<Ip> {
+    fn default() -> Self {
+        Self {
+            stale_pod_ip: None,
+            recovered_pending_failure: false,
+            pod_ip_update_failed: false,
+        }
+    }
 }
 
 fn reconcile_existing_pod_ip(
@@ -2206,7 +2286,7 @@ fn reconcile_existing_pod_ip(
     pod_uid: &str,
     pod_ip: Option<std::net::Ipv4Addr>,
     state: &mut PodAttachmentState,
-) -> PodIpReconcileResult {
+) -> PodIpReconcileResult<std::net::Ipv4Addr> {
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
@@ -2238,6 +2318,53 @@ fn reconcile_existing_pod_ip(
     );
     let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
+    PodIpReconcileResult {
+        stale_pod_ip: old_ip,
+        recovered_pending_failure: true,
+        pod_ip_update_failed: false,
+    }
+}
+
+fn reconcile_existing_pod_ip6(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    pod_ip: Option<std::net::Ipv6Addr>,
+    state: &mut PodAttachmentState,
+) -> PodIpReconcileResult<std::net::Ipv6Addr> {
+    let Some(new_ip) = pod_ip else {
+        return PodIpReconcileResult::default();
+    };
+    if state.pod_ip6 == Some(new_ip) {
+        return PodIpReconcileResult::default();
+    }
+
+    let info = PodInfo {
+        proxy_port: config.capture_config.outbound_port,
+        cgroup_id: 0,
+    };
+    if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
+        warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IPv6 map for existing pod");
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_POD_IP_UPDATE,
+            CAPTURE_FAILURE_DETAIL_POD_IP6,
+        );
+        return PodIpReconcileResult {
+            pod_ip_update_failed: true,
+            ..PodIpReconcileResult::default()
+        };
+    }
+    forget_pending_capture_failure(
+        state_key,
+        CAPTURE_FAILURE_POD_IP_UPDATE,
+        CAPTURE_FAILURE_DETAIL_POD_IP6,
+    );
+    let old_ip = state.pod_ip6;
+    state.pod_ip6 = Some(new_ip);
     PodIpReconcileResult {
         stale_pod_ip: old_ip,
         recovered_pending_failure: true,
@@ -2282,6 +2409,43 @@ fn remove_pod_ip_if_unowned(
     clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
+fn remove_pod_ip6_if_unowned(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    ip: std::net::Ipv6Addr,
+    removal_reason: &'static str,
+) {
+    if let Some(owner_pod_uid) = other_pod_owning_ip6(pod_states, pod_uid, ip) {
+        debug!(
+            pod_uid,
+            owner_pod_uid,
+            %ip,
+            removal_reason,
+            "Skipping pod IPv6 map removal; IP is owned by another tracked pod"
+        );
+        let state_key = pod_state_key(pod_states, pod_uid);
+        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
+        return;
+    }
+    let state_key = pod_state_key(pod_states, pod_uid);
+    if let Err(e) = backend.remove_pod_ip6(ip) {
+        warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IPv6 from map");
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+        return;
+    }
+    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
 fn other_pod_owning_ip(
     pod_states: &DashMap<String, PodAttachmentState>,
     pod_uid: &str,
@@ -2293,6 +2457,17 @@ fn other_pod_owning_ip(
     })
 }
 
+fn other_pod_owning_ip6(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+    ip: std::net::Ipv6Addr,
+) -> Option<String> {
+    pod_states.iter().find_map(|entry| {
+        (entry.key().as_str() != pod_uid && entry.value().pod_ip6 == Some(ip))
+            .then(|| entry.key().clone())
+    })
+}
+
 fn pod_owning_ip(
     pod_states: &DashMap<String, PodAttachmentState>,
     ip: std::net::Ipv4Addr,
@@ -2300,6 +2475,25 @@ fn pod_owning_ip(
     pod_states
         .iter()
         .find_map(|entry| (entry.value().pod_ip == Some(ip)).then(|| entry.key().clone()))
+}
+
+fn pod_owning_ip6(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::Ipv6Addr,
+) -> Option<String> {
+    pod_states
+        .iter()
+        .find_map(|entry| (entry.value().pod_ip6 == Some(ip)).then(|| entry.key().clone()))
+}
+
+fn pod_owning_ip_addr(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    ip: std::net::IpAddr,
+) -> Option<String> {
+    match ip {
+        std::net::IpAddr::V4(ip) => pod_owning_ip(pod_states, ip),
+        std::net::IpAddr::V6(ip) => pod_owning_ip6(pod_states, ip),
+    }
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -2617,6 +2811,11 @@ pub fn handle_pod_removed(
         CAPTURE_FAILURE_POD_IP_UPDATE,
         CAPTURE_FAILURE_DETAIL_POD_IP,
     );
+    forget_pending_capture_failure(
+        &state_key,
+        CAPTURE_FAILURE_POD_IP_UPDATE,
+        CAPTURE_FAILURE_DETAIL_POD_IP6,
+    );
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -2641,6 +2840,9 @@ pub fn handle_pod_removed(
         }
         if let Some(ip) = state.pod_ip {
             remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
+        }
+        if let Some(ip) = state.pod_ip6 {
+            remove_pod_ip6_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
         // Pair with `apply_include_outbound_ports` — only annotated pods ever
         // carried entries. Use the stashed cgroup ids (pod inode + descendant
@@ -3504,6 +3706,7 @@ mod tests {
                 pod_name: "test-pod".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -3519,6 +3722,7 @@ mod tests {
                 pod_name: "skipped-pod".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: None,
                 attached: false,
@@ -3571,6 +3775,7 @@ mod tests {
                 pod_name: "p".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: Some("/cg/x".to_string()),
                 veth_iface: None,
                 attached: true,
@@ -4141,13 +4346,22 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         let ipv4 = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let ipv6 = "fd00::5".parse().unwrap();
         assert_eq!(
             pod_states.get("pod-uid-v6-primary").unwrap().pod_ip,
             Some(ipv4)
         );
+        assert_eq!(
+            pod_states.get("pod-uid-v6-primary").unwrap().pod_ip6,
+            Some(ipv6)
+        );
         assert!(
             backend.pod_ips.contains_key(&ipv4),
             "IPv4 FERRUM_POD_IPS map entry should use status.podIPs when status.podIP is IPv6"
+        );
+        assert!(
+            backend.pod_ips6.contains_key(&ipv6),
+            "IPv6 FERRUM_POD_IPS6 map entry should be enrolled for dual-stack pods"
         );
     }
 
@@ -5253,6 +5467,7 @@ mod tests {
                 pod_name: "mesh-pod".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid2".to_string()),
                 veth_iface: None,
                 attached: true,
@@ -5334,6 +5549,7 @@ mod tests {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let ip6 = "fd00::5".parse().unwrap();
 
         pod_states.insert(
             "pod-uid-1".to_string(),
@@ -5342,6 +5558,7 @@ mod tests {
                 pod_name: "test-pod".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: Some(ip),
+                pod_ip6: Some(ip6),
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
@@ -5353,6 +5570,15 @@ mod tests {
         backend
             .update_pod_ip(
                 ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+        backend
+            .update_pod_ip6(
+                ip6,
                 &PodInfo {
                     proxy_port: 15001,
                     cgroup_id: 0,
@@ -5376,6 +5602,7 @@ mod tests {
         assert!(!pod_states.contains_key("pod-uid-1"));
         assert_eq!(backend.detached_pods, vec!["pod-uid-1"]);
         assert!(!backend.pod_ips.contains_key(&ip));
+        assert!(!backend.pod_ips6.contains_key(&ip6));
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
     }
 
@@ -5394,6 +5621,7 @@ mod tests {
                     pod_name: pod_uid.to_string(),
                     namespace: "default".to_string(),
                     pod_ip: Some(ip),
+                    pod_ip6: None,
                     cgroup_path: Some(format!("/sys/fs/cgroup/kubepods/{pod_uid}")),
                     veth_iface: Some(format!("veth-{pod_uid}")),
                     attached: true,
@@ -5623,6 +5851,7 @@ mod tests {
                 namespace: "default".to_string(),
                 attached: true,
                 pod_ip: Some(ip),
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: None,
                 include_ports_cgroup_ids: Vec::new(),
@@ -5653,6 +5882,7 @@ mod tests {
             pod_name: "alpha".to_string(),
             namespace: "default".to_string(),
             pod_ip: None,
+            pod_ip6: None,
             cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
             veth_iface: Some("veth123".to_string()),
             attached: true,
@@ -5838,6 +6068,7 @@ mod tests {
                 pod_name: "alpha".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
@@ -5928,6 +6159,7 @@ mod tests {
                 pod_name: "alpha".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: None,
                 attached: true,
@@ -5965,6 +6197,7 @@ mod tests {
                 pod_name: "existing".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -6020,6 +6253,7 @@ mod tests {
                 pod_name: "existing".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: Some(cgroup_path.to_string_lossy().to_string()),
                 veth_iface: Some("veth-old".to_string()),
                 attached: true,
@@ -6045,12 +6279,19 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         assert_eq!(backend.detached_pods, vec!["pod-uid-1".to_string()]);
-        assert!(
-            backend
-                .tc_attachments
-                .iter()
-                .any(|(iface, program)| iface == "veth-new" && program == "ferrum_tc_inbound")
-        );
+        for direction in [TcAttachDirection::Ingress, TcAttachDirection::Egress] {
+            assert!(
+                backend
+                    .tc_attachments
+                    .iter()
+                    .any(|(iface, program, actual_direction)| {
+                        iface == "veth-new"
+                            && program == "ferrum_tc_inbound"
+                            && *actual_direction == direction
+                    }),
+                "expected {direction:?} tc attach on recreated veth"
+            );
+        }
         let state = pod_states.get("pod-uid-1").unwrap();
         assert_eq!(state.pod_name, "sandbox-recreated");
         assert_eq!(state.veth_iface.as_deref(), Some("veth-new"));
@@ -6081,6 +6322,7 @@ mod tests {
                 pod_name: "existing".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -6138,6 +6380,7 @@ mod tests {
                 pod_name: "existing".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: None,
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -6221,6 +6464,7 @@ mod tests {
                 pod_name: "existing".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: Some(ip),
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -6297,6 +6541,7 @@ mod tests {
                 pod_name: "old".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: Some(ip),
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -6333,6 +6578,7 @@ mod tests {
                 pod_name: "new".to_string(),
                 namespace: "default".to_string(),
                 pod_ip: Some(ip),
+                pod_ip6: None,
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
@@ -6382,6 +6628,7 @@ mod tests {
                     pod_name: pod_uid.to_string(),
                     namespace: "default".to_string(),
                     pod_ip: Some(old_ip),
+                    pod_ip6: None,
                     cgroup_path: None,
                     veth_iface: Some(veth.to_string()),
                     attached: true,

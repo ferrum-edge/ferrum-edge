@@ -240,6 +240,10 @@ pub struct BpfCaptureConfig {
     /// Excluded v6 (bypass UID / port / CIDR excludes) is decided before the deny
     /// and still flows.
     pub ipv6_outbound_deny: u32,
+    /// `SO_MARK` value trusted by the pod-veth tc guard for destination
+    /// NodeWaypoint relay backend dials. Packets to enrolled pod IPs without
+    /// this mark are direct pod traffic and are dropped fail-closed.
+    pub node_waypoint_inbound_auth_mark: u32,
 }
 
 /// Maximum number of explicit `includeOutboundPorts` ports the per-cgroup
@@ -328,8 +332,13 @@ pub struct CidrKey6 {
 /// Outbound capture port. Connect hooks rewrite destinations here.
 pub const OUTBOUND_CAPTURE_PORT: u16 = 15001;
 
-/// Inbound HBONE port. TC ingress redirects inbound packets here.
+/// Inbound HBONE port carried in the capture config for sidecarless topologies.
 pub const INBOUND_HBONE_PORT: u16 = 15008;
+
+/// Socket mark used by the destination NodeWaypoint inbound HBONE relay when
+/// dialing the local backend pod. Chosen adjacent to Ferrum's TPROXY mark but
+/// distinct from it, and outside the common masked CNI mark classes.
+pub const NODE_WAYPOINT_INBOUND_AUTH_MARK: u32 = 0x734;
 
 /// Singleton key for `FERRUM_CAPTURE_CONFIG`.
 pub const FERRUM_CAPTURE_CONFIG_KEY: u32 = 0;
@@ -461,6 +470,7 @@ impl BpfCaptureConfig {
             outbound_capture_port: outbound_capture_port as u32,
             hbone_redirect_port: hbone_redirect_port as u32,
             ipv6_outbound_deny: 0,
+            node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
         }
     }
 
@@ -468,6 +478,11 @@ impl BpfCaptureConfig {
     /// see [`Self::ipv6_outbound_deny`].
     pub const fn with_ipv6_outbound_deny(mut self, deny: bool) -> Self {
         self.ipv6_outbound_deny = deny as u32;
+        self
+    }
+
+    pub const fn with_node_waypoint_inbound_auth_mark(mut self, mark: u32) -> Self {
+        self.node_waypoint_inbound_auth_mark = mark;
         self
     }
 
@@ -542,7 +557,7 @@ mod tests {
         // 8-byte aligned for the BPF verifier.
         assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
         assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
-        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 12);
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 16);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
         // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
@@ -737,6 +752,10 @@ mod tests {
         // IPv6 egress is redirected (not denied) by default; the deny remains an
         // explicit safety valve for deployments without an IPv6 capture listener.
         assert_eq!(config.ipv6_outbound_deny, 0);
+        assert_eq!(
+            config.node_waypoint_inbound_auth_mark,
+            NODE_WAYPOINT_INBOUND_AUTH_MARK
+        );
     }
 
     #[test]
@@ -758,6 +777,20 @@ mod tests {
                 .with_ipv6_outbound_deny(false)
                 .ipv6_outbound_deny,
             0
+        );
+    }
+
+    #[test]
+    fn node_waypoint_inbound_auth_mark_round_trips() {
+        assert_eq!(
+            BpfCaptureConfig::new(15001, 15008).node_waypoint_inbound_auth_mark,
+            NODE_WAYPOINT_INBOUND_AUTH_MARK
+        );
+        assert_eq!(
+            BpfCaptureConfig::new(15001, 15008)
+                .with_node_waypoint_inbound_auth_mark(0x735)
+                .node_waypoint_inbound_auth_mark,
+            0x735
         );
     }
 }

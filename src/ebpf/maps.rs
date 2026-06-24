@@ -6,9 +6,7 @@
 
 #![allow(dead_code)]
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
-use std::net::Ipv4Addr;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::Ebpf;
@@ -24,11 +22,12 @@ use ferrum_ebpf_common::{
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use super::{BPF_MAP_CAPTURE_CONFIG, BPF_MAP_WORKLOAD_IDENTITY, PodInfo};
+use super::{BPF_MAP_CAPTURE_CONFIG, BPF_MAP_POD_IPS6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct BpfMaps {
     pod_ips: BpfHashMap<MapData, u32, BpfPodInfo>,
+    pod_ips6: BpfHashMap<MapData, CidrKey6, BpfPodInfo>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
@@ -48,6 +47,12 @@ impl BpfMaps {
                 .ok_or("FERRUM_POD_IPS map not found")?,
         )
         .map_err(|e| format!("FERRUM_POD_IPS type mismatch: {e}"))?;
+
+        let pod_ips6 = BpfHashMap::try_from(
+            bpf.take_map(BPF_MAP_POD_IPS6)
+                .ok_or("FERRUM_POD_IPS6 map not found")?,
+        )
+        .map_err(|e| format!("FERRUM_POD_IPS6 type mismatch: {e}"))?;
 
         let bypass_uids = BpfHashMap::try_from(
             bpf.take_map("FERRUM_BYPASS_UIDS")
@@ -136,6 +141,7 @@ impl BpfMaps {
 
         Ok(Self {
             pod_ips,
+            pod_ips6,
             bypass_uids,
             cidr_exclude4,
             cidr_exclude6,
@@ -166,7 +172,7 @@ impl BpfMaps {
     }
 
     pub fn insert_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
-        let key = u32::from(ip);
+        let key = ipv4_to_nbo_key(ip);
         let value = BpfPodInfo {
             proxy_port: info.proxy_port as u32,
             _pad: 0,
@@ -177,10 +183,28 @@ impl BpfMaps {
     }
 
     pub fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-        let key = u32::from(ip);
+        let key = ipv4_to_nbo_key(ip);
         let map = &mut self.pod_ips;
         map.remove(&key)
             .map_err(|e| format!("Failed to remove pod IP {ip}: {e}"))
+    }
+
+    pub fn insert_pod_ip6(&mut self, ip: Ipv6Addr, info: &PodInfo) -> Result<(), String> {
+        let key = CidrKey6::host(ipv6_to_nbo_words(ip));
+        let value = BpfPodInfo {
+            proxy_port: info.proxy_port as u32,
+            _pad: 0,
+        };
+        let map = &mut self.pod_ips6;
+        map.insert(key, value, 0)
+            .map_err(|e| format!("Failed to insert pod IPv6 {ip}: {e}"))
+    }
+
+    pub fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        let key = CidrKey6::host(ipv6_to_nbo_words(ip));
+        let map = &mut self.pod_ips6;
+        map.remove(&key)
+            .map_err(|e| format!("Failed to remove pod IPv6 {ip}: {e}"))
     }
 
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
@@ -375,6 +399,10 @@ pub fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<ParsedCidrKey, String> {
     }
 }
 
+fn ipv4_to_nbo_key(addr: Ipv4Addr) -> u32 {
+    u32::from(addr).to_be()
+}
+
 fn ipv6_to_nbo_words(addr: Ipv6Addr) -> [u32; 4] {
     let octets = addr.octets();
     [
@@ -412,6 +440,12 @@ mod tests {
                 data: CidrKey4::new(u32::from(Ipv4Addr::new(192, 168, 1, 1)).to_be()),
             }
         );
+    }
+
+    #[test]
+    fn ipv4_pod_ip_key_uses_packet_byte_order() {
+        let key = ipv4_to_nbo_key(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(key.to_ne_bytes(), [10, 0, 0, 5]);
     }
 
     #[test]

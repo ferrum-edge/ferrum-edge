@@ -25,7 +25,9 @@ use super::{
 use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
 use crate::config::types::{Proxy, UpstreamTarget};
+use crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK;
 use crate::load_balancer::LoadBalancerCache;
+use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
 use crate::plugins::{Direction, DisconnectCause, Plugin, RequestContext, TransactionSummary};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
@@ -295,7 +297,16 @@ async fn connect_backend(
         })?;
     let addr = SocketAddr::new(resolved_ip, port);
 
-    let connect = crate::socket_opts::connect_with_socket_opts(addr);
+    let connect = if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
+        && node_waypoint_inbound_relay_mark_enabled()
+    {
+        crate::socket_opts::connect_with_socket_opts_and_mark(
+            addr,
+            Some(NODE_WAYPOINT_INBOUND_AUTH_MARK),
+        )
+    } else {
+        crate::socket_opts::connect_with_socket_opts_and_mark(addr, None)
+    };
     let stream = if effective_connect_timeout_ms > 0 {
         let timeout = Duration::from_millis(effective_connect_timeout_ms);
         match tokio::time::timeout(timeout, connect).await {
@@ -357,6 +368,15 @@ async fn connect_backend(
         stream,
         target_url,
         resolved_ip: Some(resolved_ip.to_string()),
+    })
+}
+
+fn node_waypoint_inbound_relay_mark_enabled() -> bool {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(|topology| {
+        matches!(
+            topology.trim().to_ascii_lowercase().as_str(),
+            "node_waypoint" | "node-waypoint"
+        )
     })
 }
 
