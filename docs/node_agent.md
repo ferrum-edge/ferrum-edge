@@ -17,7 +17,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | Unix socket | `/run/ferrum/node-agent.sock` | Reserved IPC path for future node-agent/proxy coordination. Phase 1 treats this as inert contract metadata; no socket is created yet. |
 | BPF config map | `FERRUM_CAPTURE_CONFIG` | Singleton map keyed by `0`, containing outbound capture and HBONE redirect ports plus the NodeWaypoint inbound relay socket mark trusted by the pod-veth tc guard. |
 | BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set. |
-| BPF node maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6` | IPv4/IPv6 node host IPs exempt from the NodeWaypoint direct-inbound guard so kubelet host-network probes can still reach enrolled pods. Helm seeds `FERRUM_NODE_AGENT_NODE_IP` from `status.hostIP`; use `FERRUM_NODE_AGENT_NODE_IPS` for extra dual-stack/custom node IPs. |
+| BPF node/probe maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6`, `FERRUM_NODE_PROBE_PORTS`, `FERRUM_NODE_PROBE_PORTS6` | IPv4/IPv6 node source IPs plus enrolled pod probe ports allowed through the NodeWaypoint direct-inbound guard. Helm seeds `FERRUM_NODE_AGENT_NODE_IP` from `status.hostIP`; use `FERRUM_NODE_AGENT_NODE_IPS` for extra dual-stack/custom node IPs. The node-agent also discovers host-interface IPs, including CNI bridge addresses used by kubelet probes, and derives probe ports from Kubernetes HTTP/TCP/gRPC liveness, readiness, and startup probes. |
 | BPF original destination maps | `FERRUM_ORIG_DST4`, `FERRUM_ORIG_DST6` | Socket-cookie keyed original destination records. The `connect4`/`connect6` hooks write them (stamped with the source pod's UID + SPIFFE hash from `FERRUM_WORKLOAD_IDENTITY`); the node-agent pins them at `/sys/fs/bpf/ferrum/orig_dst{4,6}`; the node-waypoint mesh-proxy's **orig-dst bridge** (`src/ebpf/orig_dst_bridge.rs`) mirrors each record into the `NodeWaypointIdentityResolver`. |
 | BPF workload identity map | `FERRUM_WORKLOAD_IDENTITY` | Per-cgroup source workload identity (`{pod_uid, workload_spiffe_hash}`), keyed by `bpf_get_current_cgroup_id`. The node-agent writes one entry per enrolled pod cgroup; the connect hooks read it to stamp orig-dst records. Absent entry → connect hooks store the all-zero sentinel, which node-waypoint resolution treats as fail-closed. |
 | BPF capture filters | `FERRUM_BYPASS_UIDS`, `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE` | UID, CIDR, and port exclusions applied before outbound rewrite. |
@@ -256,8 +256,12 @@ dropped unless `skb->mark` matches the inbound relay auth mark from
 `SO_MARK` before dialing the local backend pod. Direct UDP/DTLS to enrolled pod
 IPs fails closed because no authorized UDP relay path exists yet, while ARP/ICMP
 and other control traffic remains pass-through. Packets sourced from the local
-node IPs in `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` are exempt so kubelet
-host-network liveness/readiness probes continue to work.
+configured node IPs plus discovered host-interface IPs in `FERRUM_NODE_IPS` /
+`FERRUM_NODE_IPS6` are considered only as kubelet probe sources; they must also
+target an enrolled pod TCP probe port derived into `FERRUM_NODE_PROBE_PORTS` /
+`FERRUM_NODE_PROBE_PORTS6` from the pod's HTTP/TCP/gRPC liveness, readiness, or
+startup probe. Other host-network traffic from those source IPs still needs the
+trusted relay mark or follows the UDP/extension-header fail-closed behavior.
 
 NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
 `connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal

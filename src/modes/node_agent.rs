@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::{Pod, PodStatus};
+use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, PodStatus, Probe};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use kube::{Client, api::Api};
 use tracing::{debug, error, info, warn};
@@ -133,6 +134,42 @@ impl PodSourceIps {
                 }
             }
             Err(_) => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct NodeSourceIps {
+    ipv4: Vec<std::net::Ipv4Addr>,
+    ipv6: Vec<std::net::Ipv6Addr>,
+}
+
+impl NodeSourceIps {
+    fn is_empty(&self) -> bool {
+        self.ipv4.is_empty() && self.ipv6.is_empty()
+    }
+
+    fn insert(&mut self, ip: std::net::IpAddr) {
+        match ip {
+            std::net::IpAddr::V4(ip) => {
+                if !self.ipv4.contains(&ip) {
+                    self.ipv4.push(ip);
+                }
+            }
+            std::net::IpAddr::V6(ip) => {
+                if !self.ipv6.contains(&ip) {
+                    self.ipv6.push(ip);
+                }
+            }
+        }
+    }
+
+    fn extend(&mut self, other: NodeSourceIps) {
+        for ip in other.ipv4 {
+            self.insert(std::net::IpAddr::V4(ip));
+        }
+        for ip in other.ipv6 {
+            self.insert(std::net::IpAddr::V6(ip));
         }
     }
 }
@@ -272,8 +309,8 @@ fn cidr_is_ipv6(cidr: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn node_agent_node_source_ips_from_env() -> Result<PodSourceIps, String> {
-    let mut ips = PodSourceIps::default();
+fn node_agent_node_source_ips_from_env() -> Result<NodeSourceIps, String> {
+    let mut ips = NodeSourceIps::default();
     if let Some(raw) = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_IP") {
         insert_node_source_ip(&mut ips, "FERRUM_NODE_AGENT_NODE_IP", raw.trim())?;
     }
@@ -285,27 +322,153 @@ fn node_agent_node_source_ips_from_env() -> Result<PodSourceIps, String> {
     Ok(ips)
 }
 
-fn insert_node_source_ip(ips: &mut PodSourceIps, var_name: &str, raw: &str) -> Result<(), String> {
+fn node_agent_node_source_ips() -> Result<NodeSourceIps, String> {
+    let mut ips = node_agent_node_source_ips_from_env()?;
+    ips.extend(discover_host_interface_node_source_ips());
+    Ok(ips)
+}
+
+fn insert_node_source_ip(ips: &mut NodeSourceIps, var_name: &str, raw: &str) -> Result<(), String> {
     if raw.is_empty() {
         return Ok(());
     }
     match raw.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => {
-            if ips.ipv4.is_none() {
-                ips.ipv4 = Some(ip);
-            }
-            Ok(())
-        }
-        Ok(std::net::IpAddr::V6(ip)) => {
-            if ips.ipv6.is_none() {
-                ips.ipv6 = Some(ip);
-            }
+        Ok(ip) => {
+            ips.insert(ip);
             Ok(())
         }
         Err(e) => Err(format!(
             "{var_name} contains invalid IP address '{raw}': {e}"
         )),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn discover_host_interface_node_source_ips() -> NodeSourceIps {
+    struct IfAddrsGuard(*mut libc::ifaddrs);
+
+    impl Drop for IfAddrsGuard {
+        fn drop(&mut self) {
+            // Safety: the pointer is returned by getifaddrs and owned by this guard.
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+
+    let mut first: *mut libc::ifaddrs = std::ptr::null_mut();
+    // Safety: getifaddrs initializes `first` on success. The list is released
+    // by `IfAddrsGuard` before returning.
+    if unsafe { libc::getifaddrs(&mut first) } != 0 || first.is_null() {
+        return NodeSourceIps::default();
+    }
+    let _guard = IfAddrsGuard(first);
+    let mut ips = NodeSourceIps::default();
+    let mut cursor = first;
+
+    while !cursor.is_null() {
+        // Safety: `cursor` walks the getifaddrs linked list until null.
+        let ifaddr = unsafe { &*cursor };
+        if ifaddr.ifa_addr.is_null()
+            || (ifaddr.ifa_flags & (libc::IFF_UP as u32)) == 0
+            || (ifaddr.ifa_flags & (libc::IFF_LOOPBACK as u32)) != 0
+        {
+            cursor = ifaddr.ifa_next;
+            continue;
+        }
+
+        // Safety: `ifa_addr` points to a sockaddr whose family selects the cast.
+        let family = unsafe { (*ifaddr.ifa_addr).sa_family as libc::c_int };
+        match family {
+            libc::AF_INET => {
+                // Safety: AF_INET guarantees sockaddr_in layout.
+                let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in) };
+                let ip = std::net::Ipv4Addr::from(sockaddr.sin_addr.s_addr.to_ne_bytes());
+                if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() {
+                    ips.insert(std::net::IpAddr::V4(ip));
+                }
+            }
+            libc::AF_INET6 => {
+                // Safety: AF_INET6 guarantees sockaddr_in6 layout.
+                let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in6) };
+                let ip = std::net::Ipv6Addr::from(sockaddr.sin6_addr.s6_addr);
+                if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() {
+                    ips.insert(std::net::IpAddr::V6(ip));
+                }
+            }
+            _ => {}
+        }
+
+        cursor = ifaddr.ifa_next;
+    }
+
+    ips
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn discover_host_interface_node_source_ips() -> NodeSourceIps {
+    NodeSourceIps::default()
+}
+
+fn pod_probe_ports_from_spec(spec: Option<&PodSpec>) -> Vec<u16> {
+    let Some(spec) = spec else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for container in &spec.containers {
+        for probe in [
+            container.liveness_probe.as_ref(),
+            container.readiness_probe.as_ref(),
+            container.startup_probe.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            collect_probe_ports(&mut ports, probe, container);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn collect_probe_ports(ports: &mut Vec<u16>, probe: &Probe, container: &Container) {
+    if let Some(http_get) = &probe.http_get
+        && let Some(port) = resolve_probe_port(&http_get.port, container)
+    {
+        ports.push(port);
+    }
+    if let Some(tcp_socket) = &probe.tcp_socket
+        && let Some(port) = resolve_probe_port(&tcp_socket.port, container)
+    {
+        ports.push(port);
+    }
+    if let Some(grpc) = &probe.grpc
+        && let Some(port) = valid_probe_port(grpc.port)
+    {
+        ports.push(port);
+    }
+}
+
+fn resolve_probe_port(port: &IntOrString, container: &Container) -> Option<u16> {
+    match port {
+        IntOrString::Int(port) => valid_probe_port(*port),
+        IntOrString::String(name) => container.ports.as_ref()?.iter().find_map(|candidate| {
+            if candidate.name.as_deref() != Some(name.as_str()) {
+                return None;
+            }
+            if candidate
+                .protocol
+                .as_deref()
+                .is_some_and(|protocol| !protocol.eq_ignore_ascii_case("TCP"))
+            {
+                return None;
+            }
+            valid_probe_port(candidate.container_port)
+        }),
+    }
+}
+
+fn valid_probe_port(port: i32) -> Option<u16> {
+    u16::try_from(port).ok().filter(|port| *port != 0)
 }
 
 pub async fn run(
@@ -968,6 +1131,7 @@ fn apply_cni_add_from_pod(
     let status = pod.status.as_ref();
     let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
     let pod_source_ips = PodSourceIps::from_status(status);
+    let node_probe_ports = pod_probe_ports_from_spec(pod.spec.as_ref());
     let service_account = pod
         .spec
         .as_ref()
@@ -981,6 +1145,7 @@ fn apply_cni_add_from_pod(
         annotations: &annotations,
         pod_ip_str: pod_ip,
         pod_source_ips,
+        node_probe_ports,
         pod_pid: None,
         veth_iface_override: None,
     };
@@ -1305,28 +1470,44 @@ fn apply_workload_identity(
 
 fn cleanup_pre_enrollment_maps(
     backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
     pod_uid: &str,
     state: &PodAttachmentState,
 ) {
-    if let Some(ip) = state.pod_ip
-        && let Err(e) = backend.remove_pod_ip(ip)
-    {
-        warn!(
-            pod_uid,
-            %ip,
-            error = %e,
-            "Failed to remove pre-enrollment pod IPv4 entry from BPF map"
-        );
+    cleanup_node_probe_ports(backend, pod_states, pod_uid, state);
+    if let Some(ip) = state.pod_ip {
+        if let Some(owner_pod_uid) = other_pod_owning_ip(pod_states, pod_uid, ip) {
+            debug!(
+                pod_uid,
+                owner_pod_uid,
+                %ip,
+                "Skipping pre-enrollment pod IPv4 cleanup; IP is owned by another tracked pod"
+            );
+        } else if let Err(e) = backend.remove_pod_ip(ip) {
+            warn!(
+                pod_uid,
+                %ip,
+                error = %e,
+                "Failed to remove pre-enrollment pod IPv4 entry from BPF map"
+            );
+        }
     }
-    if let Some(ip) = state.pod_ip6
-        && let Err(e) = backend.remove_pod_ip6(ip)
-    {
-        warn!(
-            pod_uid,
-            %ip,
-            error = %e,
-            "Failed to remove pre-enrollment pod IPv6 entry from BPF map"
-        );
+    if let Some(ip) = state.pod_ip6 {
+        if let Some(owner_pod_uid) = other_pod_owning_ip6(pod_states, pod_uid, ip) {
+            debug!(
+                pod_uid,
+                owner_pod_uid,
+                %ip,
+                "Skipping pre-enrollment pod IPv6 cleanup; IP is owned by another tracked pod"
+            );
+        } else if let Err(e) = backend.remove_pod_ip6(ip) {
+            warn!(
+                pod_uid,
+                %ip,
+                error = %e,
+                "Failed to remove pre-enrollment pod IPv6 entry from BPF map"
+            );
+        }
     }
     for cgroup_id in &state.include_ports_cgroup_ids {
         if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
@@ -1350,15 +1531,84 @@ fn cleanup_pre_enrollment_maps(
     }
 }
 
+fn apply_node_probe_ports(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) -> Result<(), String> {
+    for port in &state.node_probe_ports {
+        if let Some(ip) = state.pod_ip {
+            backend
+                .update_node_probe_port(ip, *port)
+                .map_err(|e| format!("failed to write IPv4 node probe port {ip}:{port}: {e}"))?;
+        }
+        if let Some(ip) = state.pod_ip6 {
+            backend
+                .update_node_probe_port6(ip, *port)
+                .map_err(|e| format!("failed to write IPv6 node probe port {ip}:{port}: {e}"))?;
+        }
+    }
+    if !state.node_probe_ports.is_empty() {
+        debug!(
+            pod_uid,
+            ?state.node_probe_ports,
+            "Wrote node-source probe-port exemptions for enrolled pod"
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_node_probe_ports(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
+    if state.node_probe_ports.is_empty() {
+        return;
+    }
+    if let Some(ip) = state.pod_ip {
+        if other_pod_owning_ip(pod_states, pod_uid, ip).is_none() {
+            for port in &state.node_probe_ports {
+                if let Err(e) = backend.remove_node_probe_port(ip, *port) {
+                    warn!(pod_uid, %ip, port = *port, error = %e, "Failed to remove node probe port from BPF map");
+                }
+            }
+        } else {
+            debug!(
+                pod_uid,
+                %ip,
+                "Skipping node probe port cleanup; IPv4 is owned by another tracked pod"
+            );
+        }
+    }
+    if let Some(ip) = state.pod_ip6 {
+        if other_pod_owning_ip6(pod_states, pod_uid, ip).is_none() {
+            for port in &state.node_probe_ports {
+                if let Err(e) = backend.remove_node_probe_port6(ip, *port) {
+                    warn!(pod_uid, %ip, port = *port, error = %e, "Failed to remove node IPv6 probe port from BPF map");
+                }
+            }
+        } else {
+            debug!(
+                pod_uid,
+                %ip,
+                "Skipping node probe port cleanup; IPv6 is owned by another tracked pod"
+            );
+        }
+    }
+}
+
 fn cleanup_partial_pod_enrollment(
     backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
     pod_uid: &str,
     state: &PodAttachmentState,
 ) {
     if let Err(e) = backend.detach_pod(pod_uid) {
         warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
     }
-    cleanup_pre_enrollment_maps(backend, pod_uid, state);
+    cleanup_pre_enrollment_maps(backend, pod_states, pod_uid, state);
 }
 
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
@@ -1432,6 +1682,7 @@ fn handle_kube_pod_applied(
     let status = pod.status.as_ref();
     let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
     let pod_source_ips = PodSourceIps::from_status(status);
+    let node_probe_ports = pod_probe_ports_from_spec(pod.spec.as_ref());
     let service_account = pod
         .spec
         .as_ref()
@@ -1445,6 +1696,7 @@ fn handle_kube_pod_applied(
         annotations: &annotations,
         pod_ip_str: pod_ip,
         pod_source_ips,
+        node_probe_ports,
         pod_pid: None,
         veth_iface_override: None,
     };
@@ -1465,6 +1717,7 @@ pub struct PodEvent<'a> {
     pub annotations: &'a HashMap<String, String>,
     pub pod_ip_str: Option<&'a str>,
     pub pod_source_ips: PodSourceIps,
+    pub node_probe_ports: Vec<u16>,
     pub pod_pid: Option<u32>,
     /// Pre-resolved host-side veth interface name for this pod, bypassing
     /// the production resolver. Production always sets this to `None` and
@@ -1483,6 +1736,7 @@ struct PodEnrollmentAttemptSignature {
     service_account: Option<String>,
     pod_ip: Option<std::net::Ipv4Addr>,
     pod_source_ips: PodSourceIps,
+    node_probe_ports: Vec<u16>,
     cgroup_path: Option<String>,
     veth_iface: Option<String>,
     labels_fingerprint: u64,
@@ -1514,6 +1768,7 @@ struct RetryablePodEnrollment {
     annotations: HashMap<String, String>,
     pod_ip: Option<String>,
     pod_source_ips: PodSourceIps,
+    node_probe_ports: Vec<u16>,
     pod_pid: Option<u32>,
 }
 
@@ -1528,6 +1783,7 @@ impl RetryablePodEnrollment {
             annotations: event.annotations.clone(),
             pod_ip: event.pod_ip_str.map(ToOwned::to_owned),
             pod_source_ips: event.pod_source_ips,
+            node_probe_ports: event.node_probe_ports.clone(),
             pod_pid: event.pod_pid,
         }
     }
@@ -1545,6 +1801,7 @@ impl RetryablePodEnrollment {
             annotations: &self.annotations,
             pod_ip_str: self.pod_ip.as_deref(),
             pod_source_ips: self.pod_source_ips,
+            node_probe_ports: self.node_probe_ports.clone(),
             pod_pid: self.pod_pid,
             // Production always re-resolves the veth on retry (see struct docs).
             veth_iface_override: None,
@@ -1692,6 +1949,7 @@ fn pod_enrollment_attempt_signature(
         service_account: event.service_account.map(ToOwned::to_owned),
         pod_ip,
         pod_source_ips: event.pod_source_ips,
+        node_probe_ports: event.node_probe_ports.clone(),
         cgroup_path: cgroup_path.clone(),
         veth_iface: veth_iface.clone(),
         labels_fingerprint: map_fingerprint(event.labels),
@@ -2137,6 +2395,7 @@ fn handle_pod_added(
         include_ports_cgroup_ids: Vec::new(),
         include_ports_policy: None,
         workload_identity_cgroup_ids: Vec::new(),
+        node_probe_ports: event.node_probe_ports.clone(),
     };
 
     if let Some(ref cgroup) = cgroup_path {
@@ -2197,7 +2456,7 @@ fn handle_pod_added(
                     "Could not resolve pod veth interface, skipping attachment"
                 );
                 metrics.record_attach_error();
-                cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
                 remember_failed_pod_enrollment(
                     &state_key,
                     attempt_signature,
@@ -2216,7 +2475,7 @@ fn handle_pod_added(
                         "Failed to attach tc program"
                     );
                     metrics.record_attach_error();
-                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
                         attempt_signature,
@@ -2233,7 +2492,7 @@ fn handle_pod_added(
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.record_attach_error();
-                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
                         attempt_signature,
@@ -2250,7 +2509,7 @@ fn handle_pod_added(
                 if let Err(e) = backend.update_pod_ip6(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
-                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
                     remember_failed_pod_enrollment(
                         &state_key,
                         attempt_signature,
@@ -2258,6 +2517,17 @@ fn handle_pod_added(
                     );
                     return;
                 }
+            }
+            if let Err(e) = apply_node_probe_ports(backend, pod_uid, &state) {
+                warn!(pod_uid, error = %e, "Failed to update node probe-port maps");
+                metrics.record_attach_error();
+                cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
+                remember_failed_pod_enrollment(
+                    &state_key,
+                    attempt_signature,
+                    enrollment_snapshot.clone(),
+                );
+                return;
             }
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
@@ -2272,7 +2542,7 @@ fn handle_pod_added(
                 "Pod enrolled for eBPF capture"
             );
         } else {
-            cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+            cleanup_partial_pod_enrollment(backend, pod_states, pod_uid, &state);
             remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         }
     } else {
@@ -2887,6 +3157,7 @@ pub fn handle_pod_removed(
         if let Err(e) = backend.detach_pod(pod_uid) {
             warn!(pod_uid, error = %e, "Failed to detach BPF programs");
         }
+        cleanup_node_probe_ports(backend, pod_states, pod_uid, &state);
         if let Some(ip) = state.pod_ip {
             remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
@@ -3332,7 +3603,7 @@ fn initialize_backend(
     }
 
     if require_sock_ops {
-        let node_source_ips = match node_agent_node_source_ips_from_env() {
+        let node_source_ips = match node_agent_node_source_ips() {
             Ok(ips) => ips,
             Err(e) => {
                 metrics.set_topology_degraded("capture_unavailable");
@@ -3340,25 +3611,25 @@ fn initialize_backend(
                 return Err(anyhow::Error::msg(e));
             }
         };
-        if let Some(ip) = node_source_ips.ipv4
-            && let Err(e) = backend.update_node_ip(ip)
-        {
-            metrics.set_topology_degraded("capture_unavailable");
-            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-            return Err(anyhow::Error::msg(e));
+        for ip in &node_source_ips.ipv4 {
+            if let Err(e) = backend.update_node_ip(*ip) {
+                metrics.set_topology_degraded("capture_unavailable");
+                metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+                return Err(anyhow::Error::msg(e));
+            }
         }
-        if let Some(ip) = node_source_ips.ipv6
-            && let Err(e) = backend.update_node_ip6(ip)
-        {
-            metrics.set_topology_degraded("capture_unavailable");
-            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-            return Err(anyhow::Error::msg(e));
+        for ip in &node_source_ips.ipv6 {
+            if let Err(e) = backend.update_node_ip6(*ip) {
+                metrics.set_topology_degraded("capture_unavailable");
+                metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+                return Err(anyhow::Error::msg(e));
+            }
         }
-        if node_source_ips.ipv4.is_none() && node_source_ips.ipv6.is_none() {
+        if node_source_ips.is_empty() {
             warn!(
                 "NodeWaypoint inbound direct-pod guard has no FERRUM_NODE_AGENT_NODE_IP(S) \
-                 configured; Kubernetes host-network probes will not be exempt until the \
-                 node-agent receives the node source IP"
+                 configured and no host interface IPs were discovered; Kubernetes host-network \
+                 probes will not be exempt until the node-agent receives a node source IP"
             );
         }
     }
@@ -3628,14 +3899,110 @@ mod tests {
         with_env_vars(
             &[
                 ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
-                ("FERRUM_NODE_AGENT_NODE_IPS", "fd00::10"),
+                (
+                    "FERRUM_NODE_AGENT_NODE_IPS",
+                    "192.0.2.11,fd00::10,fd00::11,192.0.2.10",
+                ),
             ],
             || {
                 let ips =
                     node_agent_node_source_ips_from_env().expect("node source IPs should parse");
-                assert_eq!(ips.ipv4, Some(std::net::Ipv4Addr::new(192, 0, 2, 10)));
-                assert_eq!(ips.ipv6, Some("fd00::10".parse().unwrap()));
+                assert_eq!(
+                    ips.ipv4,
+                    vec![
+                        std::net::Ipv4Addr::new(192, 0, 2, 10),
+                        std::net::Ipv4Addr::new(192, 0, 2, 11)
+                    ]
+                );
+                assert_eq!(
+                    ips.ipv6,
+                    vec![
+                        "fd00::10".parse::<std::net::Ipv6Addr>().unwrap(),
+                        "fd00::11".parse::<std::net::Ipv6Addr>().unwrap()
+                    ]
+                );
             },
+        );
+    }
+
+    #[test]
+    fn node_source_ips_extend_preserves_all_unique_addresses() {
+        let mut ips = NodeSourceIps::default();
+        ips.insert(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)));
+        ips.insert(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)));
+
+        let mut discovered = NodeSourceIps::default();
+        discovered.insert(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 244, 1, 1)));
+        discovered.insert(std::net::IpAddr::V6(
+            "fd00::1".parse::<std::net::Ipv6Addr>().unwrap(),
+        ));
+        ips.extend(discovered);
+
+        assert_eq!(
+            ips.ipv4,
+            vec![
+                std::net::Ipv4Addr::new(192, 0, 2, 10),
+                std::net::Ipv4Addr::new(10, 244, 1, 1),
+            ]
+        );
+        assert_eq!(
+            ips.ipv6,
+            vec!["fd00::1".parse::<std::net::Ipv6Addr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn pod_probe_ports_from_spec_resolves_named_and_numeric_ports() {
+        use k8s_openapi::api::core::v1::{
+            ContainerPort, GRPCAction, HTTPGetAction, TCPSocketAction,
+        };
+
+        let spec = PodSpec {
+            containers: vec![Container {
+                name: "app".to_string(),
+                ports: Some(vec![
+                    ContainerPort {
+                        name: Some("http".to_string()),
+                        container_port: 8080,
+                        protocol: Some("TCP".to_string()),
+                        ..ContainerPort::default()
+                    },
+                    ContainerPort {
+                        name: Some("metrics-udp".to_string()),
+                        container_port: 9091,
+                        protocol: Some("UDP".to_string()),
+                        ..ContainerPort::default()
+                    },
+                ]),
+                readiness_probe: Some(Probe {
+                    http_get: Some(HTTPGetAction {
+                        port: IntOrString::String("http".to_string()),
+                        ..HTTPGetAction::default()
+                    }),
+                    ..Probe::default()
+                }),
+                liveness_probe: Some(Probe {
+                    tcp_socket: Some(TCPSocketAction {
+                        port: IntOrString::Int(9090),
+                        ..TCPSocketAction::default()
+                    }),
+                    ..Probe::default()
+                }),
+                startup_probe: Some(Probe {
+                    grpc: Some(GRPCAction {
+                        port: 7070,
+                        ..GRPCAction::default()
+                    }),
+                    ..Probe::default()
+                }),
+                ..Container::default()
+            }],
+            ..PodSpec::default()
+        };
+
+        assert_eq!(
+            pod_probe_ports_from_spec(Some(&spec)),
+            vec![7070, 8080, 9090]
         );
     }
 
@@ -3713,7 +4080,7 @@ mod tests {
         with_env_vars(
             &[
                 ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
-                ("FERRUM_NODE_AGENT_NODE_IPS", "fd00::10"),
+                ("FERRUM_NODE_AGENT_NODE_IPS", "192.0.2.11,fd00::10"),
             ],
             || initialize_backend(&mut backend, &config, &metrics).unwrap(),
         );
@@ -3726,6 +4093,11 @@ mod tests {
             backend
                 .node_ips
                 .contains(&std::net::Ipv4Addr::new(192, 0, 2, 10))
+        );
+        assert!(
+            backend
+                .node_ips
+                .contains(&std::net::Ipv4Addr::new(192, 0, 2, 11))
         );
         assert!(backend.node_ips6.contains(&"fd00::10".parse().unwrap()));
         assert_eq!(
@@ -3822,6 +4194,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
             },
         );
         pod_states.insert(
@@ -3838,6 +4211,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
             },
         );
 
@@ -3891,6 +4265,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
             },
         );
         let config = NodeAgentConfig {
@@ -3962,6 +4337,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4398,6 +4774,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4448,6 +4825,7 @@ mod tests {
                 ipv4: Some("10.0.0.5".parse().unwrap()),
                 ipv6: Some("fd00::5".parse().unwrap()),
             },
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4517,6 +4895,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips,
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4604,6 +4983,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: source_ips,
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4675,6 +5055,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some(veth),
         };
@@ -4811,6 +5192,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4883,6 +5265,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -4957,6 +5340,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5038,6 +5422,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.6"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.6")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5113,6 +5498,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.7"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.7")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5164,6 +5550,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5202,6 +5589,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5240,6 +5628,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: vec![8080],
             pod_pid: Some(4242),
             veth_iface_override: Some("veth-mock"),
         };
@@ -5254,6 +5643,7 @@ mod tests {
         assert_eq!(rebuilt.labels, &labels);
         assert_eq!(rebuilt.annotations, &annotations);
         assert_eq!(rebuilt.pod_ip_str, Some("10.0.0.5"));
+        assert_eq!(rebuilt.node_probe_ports, vec![8080]);
         assert_eq!(rebuilt.pod_pid, Some(4242));
         // Production re-resolves the veth on every retry, so the snapshot never
         // carries the override.
@@ -5307,6 +5697,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             // None mirrors production and the retry snapshot; veth resolves via
             // the override guard above.
@@ -5388,6 +5779,82 @@ mod tests {
     }
 
     #[test]
+    fn failed_enrollment_cleanup_keeps_ip_owned_by_tracked_pod() {
+        let mut backend = MockEbpfBackend {
+            fail_attach_tc: true,
+            ..MockEbpfBackend::default()
+        };
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-new")).unwrap();
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+
+        pod_states.insert(
+            "pod-uid-old".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-old".to_string(),
+                pod_name: "old-pod".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: Some("/sys/fs/cgroup/kubepods/pod-old".to_string()),
+                veth_iface: Some("veth-old".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
+            },
+        );
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-new",
+            pod_name: "new-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
+            pod_pid: None,
+            veth_iface_override: Some("veth-new"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(!pod_states.contains_key("pod-uid-new"));
+        assert!(
+            backend.pod_ips.contains_key(&ip),
+            "rollback for failed new enrollment must not remove the old pod's IP map entry"
+        );
+        forget_failed_pod_enrollment(&pod_state_key(&pod_states, "pod-uid-new"));
+    }
+
+    #[test]
     fn relist_prunes_failed_enrollment_for_vanished_pod_but_keeps_present_one() {
         // Codex finding: a pod that fails enrollment before it is inserted into
         // `pod_states` keeps an owned snapshot in FAILED_POD_ENROLLMENT_ATTEMPTS.
@@ -5428,6 +5895,7 @@ mod tests {
                 annotations: &HashMap::new(),
                 pod_ip_str: Some(ip),
                 pod_source_ips: PodSourceIps::from_primary_str(Some(ip)),
+                node_probe_ports: Vec::new(),
                 pod_pid: None,
                 veth_iface_override: None,
             };
@@ -5510,6 +5978,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: None,
         };
@@ -5554,6 +6023,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5583,6 +6053,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -5605,6 +6076,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5643,6 +6115,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -5674,6 +6147,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: vec![8080],
             },
         );
         backend
@@ -5694,6 +6168,8 @@ mod tests {
                 },
             )
             .unwrap();
+        backend.update_node_probe_port(ip, 8080).unwrap();
+        backend.update_node_probe_port6(ip6, 8080).unwrap();
 
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -5712,6 +6188,8 @@ mod tests {
         assert_eq!(backend.detached_pods, vec!["pod-uid-1"]);
         assert!(!backend.pod_ips.contains_key(&ip));
         assert!(!backend.pod_ips6.contains_key(&ip6));
+        assert!(!backend.node_probe_ports.contains(&(ip, 8080)));
+        assert!(!backend.node_probe_ports6.contains(&(ip6, 8080)));
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
     }
 
@@ -5737,6 +6215,7 @@ mod tests {
                     include_ports_cgroup_ids: Vec::new(),
                     include_ports_policy: None,
                     workload_identity_cgroup_ids: Vec::new(),
+                    node_probe_ports: Vec::new(),
                 },
             );
         }
@@ -5966,6 +6445,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -5998,6 +6478,7 @@ mod tests {
             include_ports_cgroup_ids: Vec::new(),
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
+            node_probe_ports: Vec::new(),
         }
     }
 
@@ -6184,6 +6665,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -6275,6 +6757,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -6313,6 +6796,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
 
@@ -6325,6 +6809,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6369,6 +6854,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
 
@@ -6381,6 +6867,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.9"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-new"),
         };
@@ -6438,6 +6925,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
 
@@ -6450,6 +6938,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6496,6 +6985,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         let event = PodEvent {
@@ -6507,6 +6997,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -6580,6 +7071,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         backend
@@ -6698,6 +7190,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
         backend
@@ -6735,6 +7228,7 @@ mod tests {
                 include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
             },
         );
 
@@ -6785,6 +7279,7 @@ mod tests {
                     include_ports_cgroup_ids: Vec::new(),
                     include_ports_policy: None,
                     workload_identity_cgroup_ids: Vec::new(),
+                    node_probe_ports: Vec::new(),
                 },
             );
         }
@@ -6807,6 +7302,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-a"),
         };
@@ -7226,6 +7722,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7292,6 +7789,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7360,6 +7858,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7426,6 +7925,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7479,6 +7979,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7531,6 +8032,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7578,6 +8080,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -7642,6 +8145,7 @@ mod tests {
             annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+            node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         }

@@ -320,6 +320,26 @@ impl EbpfBackend for AyaEbpfBackend {
         maps.insert_node_ip6(ip)
     }
 
+    fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_probe_port(ip, port)
+    }
+
+    fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.remove_node_probe_port(ip, port)
+    }
+
+    fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_probe_port6(ip, port)
+    }
+
+    fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.remove_node_probe_port6(ip, port)
+    }
+
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_bypass_uid(uid)

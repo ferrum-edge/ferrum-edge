@@ -55,6 +55,8 @@ pub const BPF_MAP_POD_IPS: &str = "FERRUM_POD_IPS";
 pub const BPF_MAP_POD_IPS6: &str = "FERRUM_POD_IPS6";
 pub const BPF_MAP_NODE_IPS: &str = "FERRUM_NODE_IPS";
 pub const BPF_MAP_NODE_IPS6: &str = "FERRUM_NODE_IPS6";
+pub const BPF_MAP_NODE_PROBE_PORTS: &str = "FERRUM_NODE_PROBE_PORTS";
+pub const BPF_MAP_NODE_PROBE_PORTS6: &str = "FERRUM_NODE_PROBE_PORTS6";
 pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
 pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
 pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
@@ -136,6 +138,8 @@ pub struct CaptureBpfMaps {
     pub pod_ips6: &'static str,
     pub node_ips: &'static str,
     pub node_ips6: &'static str,
+    pub node_probe_ports: &'static str,
+    pub node_probe_ports6: &'static str,
     pub bypass_uids: &'static str,
     pub cidr_exclude4: &'static str,
     pub cidr_exclude6: &'static str,
@@ -155,6 +159,8 @@ impl Default for CaptureBpfMaps {
             pod_ips6: BPF_MAP_POD_IPS6,
             node_ips: BPF_MAP_NODE_IPS,
             node_ips6: BPF_MAP_NODE_IPS6,
+            node_probe_ports: BPF_MAP_NODE_PROBE_PORTS,
+            node_probe_ports6: BPF_MAP_NODE_PROBE_PORTS6,
             bypass_uids: BPF_MAP_BYPASS_UIDS,
             cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
             cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
@@ -478,6 +484,11 @@ pub struct PodAttachmentState {
     /// re-statting a possibly-gone cgroup path. Empty when the identity could
     /// not be derived or no cgroup inode could be read.
     pub workload_identity_cgroup_ids: Vec<u64>,
+    /// Kubernetes liveness/readiness/startup probe TCP destination ports that
+    /// were written to `FERRUM_NODE_PROBE_PORTS*` for this pod. Used as the
+    /// removal baseline because Kubernetes delete events do not carry a stable
+    /// spec snapshot.
+    pub node_probe_ports: Vec<u16>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.
@@ -543,6 +554,10 @@ pub trait EbpfBackend: Send + Sync {
     fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
     fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
     fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
+    fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
+    fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
+    fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String>;
+    fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String>;
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String>;
     fn update_cidr_exclude(&mut self, cidr: &str) -> Result<(), String>;
     fn update_cidr_include(&mut self, cidr: &str) -> Result<(), String>;
@@ -610,6 +625,8 @@ pub struct MockEbpfBackend {
     pub pod_ips6: HashMap<Ipv6Addr, PodInfo>,
     pub node_ips: HashSet<Ipv4Addr>,
     pub node_ips6: HashSet<Ipv6Addr>,
+    pub node_probe_ports: HashSet<(Ipv4Addr, u16)>,
+    pub node_probe_ports6: HashSet<(Ipv6Addr, u16)>,
     pub bypass_uids: Vec<u32>,
     pub cidr_excludes: Vec<String>,
     pub cidr_includes: Vec<String>,
@@ -738,6 +755,26 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        self.node_probe_ports.insert((ip, port));
+        Ok(())
+    }
+
+    fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        self.node_probe_ports.remove(&(ip, port));
+        Ok(())
+    }
+
+    fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        self.node_probe_ports6.insert((ip, port));
+        Ok(())
+    }
+
+    fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        self.node_probe_ports6.remove(&(ip, port));
+        Ok(())
+    }
+
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
         self.bypass_uids.push(uid);
         Ok(())
@@ -803,6 +840,8 @@ impl EbpfBackend for MockEbpfBackend {
         self.pod_ips6.clear();
         self.node_ips.clear();
         self.node_ips6.clear();
+        self.node_probe_ports.clear();
+        self.node_probe_ports6.clear();
         self.include_ports.clear();
         self.workload_identities.clear();
         self.sock_ops_attached_cgroup_root = None;
@@ -884,6 +923,11 @@ mod tests {
         assert_eq!(contract.bpf_maps.capture_config, BPF_MAP_CAPTURE_CONFIG);
         assert_eq!(contract.bpf_maps.node_ips, BPF_MAP_NODE_IPS);
         assert_eq!(contract.bpf_maps.node_ips6, BPF_MAP_NODE_IPS6);
+        assert_eq!(contract.bpf_maps.node_probe_ports, BPF_MAP_NODE_PROBE_PORTS);
+        assert_eq!(
+            contract.bpf_maps.node_probe_ports6,
+            BPF_MAP_NODE_PROBE_PORTS6
+        );
         assert_eq!(
             contract.bpf_capture_config(),
             BpfCaptureConfig::new(16001, 16008)
@@ -983,11 +1027,19 @@ mod tests {
         assert!(backend.node_ips.contains(&ip));
         backend.update_node_ip6(ip6).unwrap();
         assert!(backend.node_ips6.contains(&ip6));
+        backend.update_node_probe_port(ip, 8080).unwrap();
+        assert!(backend.node_probe_ports.contains(&(ip, 8080)));
+        backend.update_node_probe_port6(ip6, 9090).unwrap();
+        assert!(backend.node_probe_ports6.contains(&(ip6, 9090)));
 
         backend.remove_pod_ip(ip).unwrap();
         assert!(!backend.pod_ips.contains_key(&ip));
         backend.remove_pod_ip6(ip6).unwrap();
         assert!(!backend.pod_ips6.contains_key(&ip6));
+        backend.remove_node_probe_port(ip, 8080).unwrap();
+        assert!(!backend.node_probe_ports.contains(&(ip, 8080)));
+        backend.remove_node_probe_port6(ip6, 9090).unwrap();
+        assert!(!backend.node_probe_ports6.contains(&(ip6, 9090)));
     }
 
     #[test]

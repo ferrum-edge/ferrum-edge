@@ -451,8 +451,8 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_NODE_AGENT_NODE_NAME` | Yes (node_agent) | — | Kubernetes node name, set via downward API (`spec.nodeName`) |
-| `FERRUM_NODE_AGENT_NODE_IP` | No | — | Kubernetes node host IP, set by the Helm chart via downward API (`status.hostIP`). NodeWaypoint seeds this into the eBPF direct-inbound guard so kubelet host-network probes to enrolled pod IPs remain reachable |
-| `FERRUM_NODE_AGENT_NODE_IPS` | No | — | Optional comma-separated extra node host IPs for dual-stack or custom deployments; merged with `FERRUM_NODE_AGENT_NODE_IP` for the same NodeWaypoint probe exemption |
+| `FERRUM_NODE_AGENT_NODE_IP` | No | — | Kubernetes node host IP, set by the Helm chart via downward API (`status.hostIP`). NodeWaypoint merges this with discovered host-interface IPs as kubelet probe sources; packets must also target a Kubernetes HTTP/TCP/gRPC probe port derived from the enrolled pod spec |
+| `FERRUM_NODE_AGENT_NODE_IPS` | No | — | Optional comma-separated extra node host IPs for dual-stack or custom deployments; merged with `FERRUM_NODE_AGENT_NODE_IP` and discovered host-interface IPs for the same source allowlist |
 | `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
 | `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
 | `FERRUM_NODE_AGENT_BPF_ELF_PATH` | Linux `ebpf` feature | build-tree eBPF target path | Compiled `ferrum-ebpf` ELF loaded by the aya backend |

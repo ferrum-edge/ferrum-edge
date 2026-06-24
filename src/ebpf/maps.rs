@@ -16,15 +16,15 @@ use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, IncludePortsPolicy, PodInfo as BpfPodInfo,
-    WorkloadIdentity,
+    BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, IncludePortsPolicy, NodeProbePortKey4,
+    NodeProbePortKey6, PodInfo as BpfPodInfo, WorkloadIdentity,
 };
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
-    BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_POD_IPS6,
-    BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
+    BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
+    BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_IPS6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -33,6 +33,8 @@ pub struct BpfMaps {
     pod_ips6: BpfHashMap<MapData, CidrKey6, BpfPodInfo>,
     node_ips: Option<BpfHashMap<MapData, u32, u8>>,
     node_ips6: Option<BpfHashMap<MapData, CidrKey6, u8>>,
+    node_probe_ports: Option<BpfHashMap<MapData, NodeProbePortKey4, u8>>,
+    node_probe_ports6: Option<BpfHashMap<MapData, NodeProbePortKey6, u8>>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
@@ -80,6 +82,32 @@ impl BpfMaps {
             None => {
                 tracing::warn!(
                     "FERRUM_NODE_IPS6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
+        let node_probe_ports = match bpf.take_map(BPF_MAP_NODE_PROBE_PORTS) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_NODE_PROBE_PORTS type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_NODE_PROBE_PORTS map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
+        let node_probe_ports6 = match bpf.take_map(BPF_MAP_NODE_PROBE_PORTS6) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_NODE_PROBE_PORTS6 type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_NODE_PROBE_PORTS6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
                 );
                 None
             }
@@ -175,6 +203,8 @@ impl BpfMaps {
             pod_ips6,
             node_ips,
             node_ips6,
+            node_probe_ports,
+            node_probe_ports6,
             bypass_uids,
             cidr_exclude4,
             cidr_exclude6,
@@ -200,6 +230,12 @@ impl BpfMaps {
         }
         if require_workload_identity && self.node_ips6.is_none() {
             missing.push(BPF_MAP_NODE_IPS6);
+        }
+        if require_workload_identity && self.node_probe_ports.is_none() {
+            missing.push(BPF_MAP_NODE_PROBE_PORTS);
+        }
+        if require_workload_identity && self.node_probe_ports6.is_none() {
+            missing.push(BPF_MAP_NODE_PROBE_PORTS6);
         }
         if missing.is_empty() {
             return Ok(());
@@ -264,6 +300,46 @@ impl BpfMaps {
         node_ips6
             .insert(key, 1u8, 0)
             .map_err(|e| format!("Failed to insert node IPv6 {ip}: {e}"))
+    }
+
+    pub fn insert_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        let Some(node_probe_ports) = self.node_probe_ports.as_mut() else {
+            return Ok(());
+        };
+        let key = NodeProbePortKey4::new(ipv4_to_nbo_key(ip), port);
+        node_probe_ports
+            .insert(key, 1u8, 0)
+            .map_err(|e| format!("Failed to insert node probe port {ip}:{port}: {e}"))
+    }
+
+    pub fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        let Some(node_probe_ports) = self.node_probe_ports.as_mut() else {
+            return Ok(());
+        };
+        let key = NodeProbePortKey4::new(ipv4_to_nbo_key(ip), port);
+        tolerate_missing_map_remove(node_probe_ports.remove(&key), || {
+            format!("node probe port {ip}:{port}")
+        })
+    }
+
+    pub fn insert_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        let Some(node_probe_ports6) = self.node_probe_ports6.as_mut() else {
+            return Ok(());
+        };
+        let key = NodeProbePortKey6::new(ipv6_to_nbo_words(ip), port);
+        node_probe_ports6
+            .insert(key, 1u8, 0)
+            .map_err(|e| format!("Failed to insert node IPv6 probe port {ip}:{port}: {e}"))
+    }
+
+    pub fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        let Some(node_probe_ports6) = self.node_probe_ports6.as_mut() else {
+            return Ok(());
+        };
+        let key = NodeProbePortKey6::new(ipv6_to_nbo_words(ip), port);
+        tolerate_missing_map_remove(node_probe_ports6.remove(&key), || {
+            format!("node IPv6 probe port {ip}:{port}")
+        })
     }
 
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
@@ -393,6 +469,26 @@ impl BpfMaps {
                 "Failed to remove workload identity for cgroup {cgroup_id}: {e}"
             )),
         }
+    }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn tolerate_missing_map_remove<F>(
+    result: Result<(), aya::maps::MapError>,
+    label: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> String,
+{
+    match result {
+        Ok(()) => Ok(()),
+        Err(aya::maps::MapError::SyscallError(err))
+            if err.io_error.raw_os_error() == Some(libc::ENOENT) =>
+        {
+            tracing::debug!(entry = %label(), "BPF map remove: entry already absent");
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to remove {} from BPF map: {e}", label())),
     }
 }
 

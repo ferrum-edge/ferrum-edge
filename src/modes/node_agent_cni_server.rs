@@ -529,6 +529,7 @@ pub fn pod_event_from_request<'a>(
         annotations,
         pod_ip_str: None,
         pod_source_ips: crate::modes::node_agent::PodSourceIps::default(),
+        node_probe_ports: Vec::new(),
         pod_pid: None,
         veth_iface_override: None,
     }

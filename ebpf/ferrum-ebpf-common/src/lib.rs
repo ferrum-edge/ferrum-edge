@@ -177,6 +177,48 @@ pub struct PodInfo {
     pub _pad: u32,
 }
 
+/// Node-source kubelet probe exemption for IPv4 direct-inbound traffic.
+///
+/// Keyed by enrolled pod IPv4 address (network byte order) and TCP
+/// destination port. Node source IPs alone are intentionally not sufficient to
+/// bypass the NodeWaypoint direct-inbound guard.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeProbePortKey4 {
+    pub addr: u32,
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl NodeProbePortKey4 {
+    pub const fn new(addr: u32, port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// IPv6 counterpart to [`NodeProbePortKey4`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeProbePortKey6 {
+    pub addr: [u32; 4],
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl NodeProbePortKey6 {
+    pub const fn new(addr: [u32; 4], port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
 /// Per-cgroup workload identity in the `FERRUM_WORKLOAD_IDENTITY` map, keyed by
 /// cgroup id (`bpf_get_current_cgroup_id`).
 ///

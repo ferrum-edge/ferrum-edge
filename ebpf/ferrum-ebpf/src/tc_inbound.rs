@@ -5,16 +5,19 @@
 //! `FERRUM_POD_IPS` / `FERRUM_POD_IPS6`. Direct TCP traffic to enrolled pod IPs
 //! is dropped unless it carries the NodeWaypoint relay's authorized socket mark;
 //! direct UDP is failed closed for NodeWaypoint because there is no authorized
-//! relay path yet. Local node source IPs are exempt so kubelet probes remain
-//! reachable.
+//! relay path yet. Local node source IPs can only bypass this guard for enrolled
+//! Kubernetes probe ports.
 
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
-use ferrum_ebpf_common::{CidrKey6, FERRUM_CAPTURE_CONFIG_KEY};
+use ferrum_ebpf_common::{
+    CidrKey6, NodeProbePortKey4, NodeProbePortKey6, FERRUM_CAPTURE_CONFIG_KEY,
+};
 
 use crate::maps::{
-    FERRUM_CAPTURE_CONFIG, FERRUM_NODE_IPS, FERRUM_NODE_IPS6, FERRUM_POD_IPS, FERRUM_POD_IPS6,
+    FERRUM_CAPTURE_CONFIG, FERRUM_NODE_IPS, FERRUM_NODE_IPS6, FERRUM_NODE_PROBE_PORTS,
+    FERRUM_NODE_PROBE_PORTS6, FERRUM_POD_IPS, FERRUM_POD_IPS6,
 };
 
 const ETH_HDR_LEN: usize = 14;
@@ -49,13 +52,16 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
     }
 
     let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
-    if unsafe { FERRUM_NODE_IPS.get(&src_ip) }.is_some() {
-        return Ok(TC_ACT_OK);
-    }
+    let source_is_node = unsafe { FERRUM_NODE_IPS.get(&src_ip) }.is_some();
 
     let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| -1i64)?;
     match protocol {
-        IPPROTO_TCP => guard_enrolled_destination(ctx),
+        IPPROTO_TCP => {
+            if source_is_node && node_probe_port4_allowed(ctx, dst_ip)? {
+                return Ok(TC_ACT_OK);
+            }
+            guard_enrolled_destination(ctx)
+        }
         IPPROTO_UDP => drop_unsupported_enrolled_destination(),
         _ => Ok(TC_ACT_OK),
     }
@@ -84,13 +90,16 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
             ctx.load(ETH_HDR_LEN + 20).map_err(|_| -1i64)?,
         ],
     };
-    if unsafe { FERRUM_NODE_IPS6.get(&src_ip) }.is_some() {
-        return Ok(TC_ACT_OK);
-    }
+    let source_is_node = unsafe { FERRUM_NODE_IPS6.get(&src_ip) }.is_some();
 
     let next_header: u8 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
     match next_header {
-        IPPROTO_TCP => guard_enrolled_destination(ctx),
+        IPPROTO_TCP => {
+            if source_is_node && node_probe_port6_allowed(ctx, dst_ip.addr)? {
+                return Ok(TC_ACT_OK);
+            }
+            guard_enrolled_destination(ctx)
+        }
         IPPROTO_UDP => drop_unsupported_enrolled_destination(),
         header if ipv6_extension_header(header) => drop_unsupported_enrolled_destination(),
         _ => Ok(TC_ACT_OK),
@@ -120,6 +129,37 @@ fn drop_unsupported_enrolled_destination() -> Result<i32, i64> {
         return Ok(TC_ACT_OK);
     }
     Ok(TC_ACT_SHOT)
+}
+
+#[inline(always)]
+fn node_probe_port4_allowed(ctx: &TcContext, dst_ip: u32) -> Result<bool, i64> {
+    let port = tcp_dst_port4(ctx)?;
+    let key = NodeProbePortKey4::new(dst_ip, port);
+    Ok(unsafe { FERRUM_NODE_PROBE_PORTS.get(&key) }.is_some())
+}
+
+#[inline(always)]
+fn node_probe_port6_allowed(ctx: &TcContext, dst_ip: [u32; 4]) -> Result<bool, i64> {
+    let port = tcp_dst_port6(ctx)?;
+    let key = NodeProbePortKey6::new(dst_ip, port);
+    Ok(unsafe { FERRUM_NODE_PROBE_PORTS6.get(&key) }.is_some())
+}
+
+#[inline(always)]
+fn tcp_dst_port4(ctx: &TcContext) -> Result<u16, i64> {
+    let version_ihl: u8 = ctx.load(ETH_HDR_LEN).map_err(|_| -1i64)?;
+    let ihl = ((version_ihl & 0x0f) as usize) * 4;
+    if ihl < 20 {
+        return Err(-1i64);
+    }
+    let port: u16 = ctx.load(ETH_HDR_LEN + ihl + 2).map_err(|_| -1i64)?;
+    Ok(u16::from_be(port))
+}
+
+#[inline(always)]
+fn tcp_dst_port6(ctx: &TcContext) -> Result<u16, i64> {
+    let port: u16 = ctx.load(ETH_HDR_LEN + 40 + 2).map_err(|_| -1i64)?;
+    Ok(u16::from_be(port))
 }
 
 #[inline(always)]
