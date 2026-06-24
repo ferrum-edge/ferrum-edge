@@ -46,6 +46,35 @@ its path through `FERRUM_EDGE_TEST_BIN` so subprocess-based functional tests
 contribute to the same coverage report. MongoDB functional tests are included
 in the filter list and skip gracefully when local MongoDB is not available.
 
+## Database/File Mode Regression Notes
+
+The DB/file-mode regression matrix is split by what can run deterministically in
+the in-process coverage suite versus what needs backend services or subprocess
+orchestration:
+
+- SQL runtime config loading is covered through SQLite-backed integration tests
+  for the shared `DatabaseStore` implementation. These tests pin full-load
+  keyset pagination, durable `config_changes` incremental create/update/delete
+  delivery, retained-history cursor expiry, saturated-batch full-reload
+  fallback, proxy/plugin association fail-closed behavior, and the invariant
+  that normal incremental polling does not discover raw runtime rows without
+  change-log records.
+- Database-mode poll-loop unit tests cover rejected-delta backoff, escalation to
+  authoritative full reload, bounded metrics, recovery clearing, and preserving
+  the accepted sequence cursor when a full-load or incremental candidate is
+  rejected. Unchanged valid database configs commit the sequence cursor and keep
+  the gateway available.
+- MongoDB standalone behavior is covered by functional CI against the default
+  `mongo:7` service and intentionally forces database-mode pollers to full
+  reloads instead of accepting non-transactional incremental cursors. MongoDB
+  replica-set transaction/incremental behavior requires a replica-set topology
+  and is tracked here as a backend-specific coverage boundary for remote CI
+  environments that provide one.
+- File-mode lifecycle parity is covered by in-process `file::serve` unit tests
+  for fallible listener draining, bounded background-task shutdown, reserved
+  port calculation with pre-bound listeners, and HTTP/3 bind-address parity.
+  Subprocess functional tests cover YAML startup and SIGHUP reload behavior.
+
 ## CI Baseline And Gates
 
 The `Coverage` workflow runs on pull requests, pushes to `main`, manual

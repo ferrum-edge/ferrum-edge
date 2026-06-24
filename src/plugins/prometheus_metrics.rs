@@ -410,6 +410,9 @@ pub struct MetricsRegistry {
     pub tls_cert_rotation_counter: DashMap<TlsCertRotationKey, TimestampedCounter>,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
+    /// Database-mode incremental polling rejection/backoff metrics.
+    database_delta_poll_metrics:
+        ArcSwap<Option<Arc<crate::modes::database::DatabaseDeltaPollMetrics>>>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -457,6 +460,7 @@ impl MetricsRegistry {
             tls_source_fetch_failure_counter: DashMap::new(),
             tls_cert_rotation_counter: DashMap::new(),
             node_agent_metrics: ArcSwap::from_pointee(None),
+            database_delta_poll_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -572,6 +576,26 @@ impl MetricsRegistry {
     pub fn set_node_agent_metrics(&self, metrics: Arc<NodeAgentMetrics>) {
         self.node_agent_metrics.store(Arc::new(Some(metrics)));
         self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn set_database_delta_poll_metrics(
+        &self,
+        metrics: Arc<crate::modes::database::DatabaseDeltaPollMetrics>,
+    ) {
+        self.database_delta_poll_metrics
+            .store(Arc::new(Some(metrics)));
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn invalidate_database_delta_poll_metrics_cache(&self) {
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn database_delta_poll_metrics_snapshot(
+        &self,
+    ) -> Option<crate::modes::database::DatabaseDeltaPollMetricsSnapshot> {
+        let metrics = self.database_delta_poll_metrics.load_full();
+        metrics.as_ref().as_ref().map(|metrics| metrics.snapshot())
     }
 
     pub fn refresh_tls_certificate_inventory(
@@ -1025,6 +1049,11 @@ impl MetricsRegistry {
             + self.tls_source_fetch_duration_buckets.len() * 700
             + self.tls_source_fetch_failure_counter.len() * 220
             + self.tls_cert_rotation_counter.len() * 220
+            + if self.database_delta_poll_metrics.load().is_some() {
+                1400
+            } else {
+                0
+            }
             + if self.node_agent_metrics.load().is_some() {
                 512
             } else {
@@ -1429,6 +1458,74 @@ impl MetricsRegistry {
 
         prometheus_helpers::render_mesh_observability_metrics(&mut output);
 
+        if let Some(snapshot) = self.database_delta_poll_metrics_snapshot() {
+            output.push_str(
+                "# HELP ferrum_database_delta_rejections_total Database incremental deltas rejected by validation, bucketed by bounded resource category.\n",
+            );
+            output.push_str("# TYPE ferrum_database_delta_rejections_total counter\n");
+            for category in crate::modes::database::DATABASE_DELTA_RESOURCE_CATEGORY_LABELS {
+                let count = snapshot
+                    .rejected_deltas_by_resource_category
+                    .get(category)
+                    .copied()
+                    .unwrap_or(0);
+                output.push_str(&format!(
+                    "ferrum_database_delta_rejections_total{{resource_category=\"{}\"{}}} {}\n",
+                    category, ns_label, count
+                ));
+            }
+
+            output.push_str(
+                "# HELP ferrum_database_delta_consecutive_identical_rejections Consecutive identical rejected database deltas currently being retried.\n",
+            );
+            output
+                .push_str("# TYPE ferrum_database_delta_consecutive_identical_rejections gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_database_delta_consecutive_identical_rejections",
+                snapshot.consecutive_identical_rejections,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_database_delta_backoff_bucket Current rejected-delta retry backoff bucket. Exactly one bucket is 1.\n",
+            );
+            output.push_str("# TYPE ferrum_database_delta_backoff_bucket gauge\n");
+            for bucket in crate::modes::database::DATABASE_DELTA_BACKOFF_BUCKET_LABELS {
+                let value = if bucket == snapshot.current_backoff_bucket {
+                    1
+                } else {
+                    0
+                };
+                output.push_str(&format!(
+                    "ferrum_database_delta_backoff_bucket{{bucket=\"{}\"{}}} {}\n",
+                    bucket, ns_label, value
+                ));
+            }
+
+            output.push_str(
+                "# HELP ferrum_database_delta_forced_full_reloads_total Authoritative full reload attempts triggered by repeated rejected database deltas.\n",
+            );
+            output.push_str("# TYPE ferrum_database_delta_forced_full_reloads_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_database_delta_forced_full_reloads_total",
+                snapshot.forced_full_reloads_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_database_delta_recoveries_total Rejected database delta recovery events after an accepted incremental apply or full reload.\n",
+            );
+            output.push_str("# TYPE ferrum_database_delta_recoveries_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_database_delta_recoveries_total",
+                snapshot.recoveries_total,
+                &ns_label,
+            );
+        }
+
         let node_agent_metrics = self.node_agent_metrics.load_full();
         if let Some(metrics) = node_agent_metrics.as_ref() {
             let snapshot = metrics.snapshot();
@@ -1485,6 +1582,30 @@ impl MetricsRegistry {
                 snapshot.pod_annotation_updates_failed,
                 &ns_label,
             );
+
+            // Capture-state gauge — one hot label from a closed set. This is
+            // the readiness/condition surface operators alert on; the
+            // topology-degraded gauge below explains the first degradation
+            // reason in more detail.
+            output.push_str(
+                "# HELP ferrum_node_agent_capture_state \
+                 Node-agent capture backend condition. Exactly one state label is 1.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_capture_state gauge\n");
+            for state in crate::ebpf::NODE_AGENT_CAPTURE_STATES {
+                let value = u64::from(snapshot.capture_state == *state);
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_capture_state{{state=\"{}\"}} {}\n",
+                        state, value,
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_capture_state{{state=\"{}\"{}}} {}\n",
+                        state, ns_label, value,
+                    ));
+                }
+            }
 
             // Topology-degraded gauge — emitted whenever the node-agent
             // metrics are registered so dashboards can pin "expected: 0"

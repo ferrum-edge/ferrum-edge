@@ -32,6 +32,14 @@ pub static FERRUM_ORIG_DST6: LruHashMap<OrigDstKey, OrigDst6> =
 pub static FERRUM_ORIG_DST_BY_TUPLE4: LruHashMap<ConnTuple4, OrigDst4> =
     LruHashMap::with_max_entries(65536, 0);
 
+/// GAP-2M callback-order bridge (IPv4): when `PASSIVE_ESTABLISHED` fires before
+/// `ACTIVE_ESTABLISHED` for an in-netns loopback connection, remember the
+/// accept-side cookie under the same tuple so the later active callback can stamp
+/// `FERRUM_ORIG_DST4`. Kernel-internal: not pinned, not read by userspace.
+#[map]
+pub static FERRUM_ACCEPT_COOKIE_BY_TUPLE4: LruHashMap<ConnTuple4, u64> =
+    LruHashMap::with_max_entries(65536, 0);
+
 /// GAP-2M accept-side cookie bridge (IPv6): the IPv6 analogue of
 /// `FERRUM_ORIG_DST_BY_TUPLE4`. The `sock_ops` program writes this at
 /// active-established (copying the connect-side record from `FERRUM_ORIG_DST6`)
@@ -42,6 +50,11 @@ pub static FERRUM_ORIG_DST_BY_TUPLE4: LruHashMap<ConnTuple4, OrigDst4> =
 /// footing as IPv4. Kernel-internal: not pinned, not read by userspace.
 #[map]
 pub static FERRUM_ORIG_DST_BY_TUPLE6: LruHashMap<ConnTuple6, OrigDst6> =
+    LruHashMap::with_max_entries(65536, 0);
+
+/// IPv6 counterpart to `FERRUM_ACCEPT_COOKIE_BY_TUPLE4`.
+#[map]
+pub static FERRUM_ACCEPT_COOKIE_BY_TUPLE6: LruHashMap<ConnTuple6, u64> =
     LruHashMap::with_max_entries(65536, 0);
 
 /// Enrolled pod IPs. Keyed by IPv4 address (network byte order `u32`).

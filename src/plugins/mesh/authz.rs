@@ -25,24 +25,30 @@
 //!
 //! Node-waypoint mode is different because one proxy instance handles many
 //! pods. When `per_pod_policy_scoping` is enabled, construction-time filtering
-//! is skipped and the request path evaluates the `PolicyScopeCache` attached to
-//! `RequestContext::node_waypoint_policy_scope`. A missing scope means the
-//! pod's workload is no longer in the live slice (the resolver derives a pod's
-//! scope from the same single generation that vouches its identity, so it is
-//! not an enrollment race): both the HTTP/HBONE and stream paths then **fail
-//! closed** (403) when any namespace/selector-scoped policy is configured, and
-//! fall through to mesh-wide-only when the mesh carries only mesh-wide policies.
+//! is skipped. The request path still uses the source pod's
+//! `RequestContext::node_waypoint_policy_scope` as the liveness/scope-missing
+//! fail-closed gate, but HTTP Service egress filters policy applicability by
+//! the selected destination Service's backing workload scopes, matching Istio's
+//! destination-scoped AuthorizationPolicy semantics. A missing source scope
+//! means the pod's workload is no longer in the live slice (the resolver derives
+//! a pod's scope from the same single generation that vouches its identity, so
+//! it is not an enrollment race): both the HTTP/HBONE and stream paths then
+//! **fail closed** (403) when any namespace/selector-scoped policy is
+//! configured, and fall through to mesh-wide-only when the mesh carries only
+//! mesh-wide policies.
 
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload, resolve_target_port,
     validate_mesh_condition_ip_block, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
@@ -60,6 +66,24 @@ use crate::plugins::{
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    destination_policy_scopes_by_upstream:
+        HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    destination_policy_scopes_by_backend:
+        HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    destination_policy_scopes_by_namespaced_backend: HashMap<
+        NamespacedDestinationBackendKey,
+        Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    >,
+    destination_backend_aliases_by_backend:
+        HashMap<DestinationBackendKey, Vec<DestinationBackendKey>>,
+    destination_backend_aliases_by_namespaced_backend:
+        HashMap<NamespacedDestinationBackendKey, Vec<DestinationBackendKey>>,
+    destination_same_namespace_backend_alias_by_backend:
+        HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
+    destination_service_backend_hosts: HashSet<String>,
+    destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
+    destination_route_upstreams_requiring_scope: HashSet<String>,
+    has_route_upstream_metadata: bool,
     has_header_rules: bool,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
@@ -144,6 +168,163 @@ const ATTR_DESTINATION_PORT: &str = "destination.port";
 const ATTR_CONNECTION_SNI: &str = "connection.sni";
 const ATTR_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
 const ATTR_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+pub(crate) const NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA: &str =
+    "mesh_authz.node_waypoint_authorized_upstream_id";
+pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA: &str =
+    "mesh_authz.node_waypoint_authorized_backend";
+pub(crate) const NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA: &str =
+    "mesh_authz.node_waypoint_authorized_backend_aliases";
+pub(crate) const NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA: &str =
+    "mesh_authz.node_waypoint_scoped_authz_active";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DestinationBackendKey {
+    host: String,
+    port: u16,
+}
+
+impl DestinationBackendKey {
+    fn new(host: &str, port: u16) -> Option<Self> {
+        if port == 0 {
+            return None;
+        }
+        let host = normalize_destination_backend_host(host)?;
+        Some(Self { host, port })
+    }
+
+    fn metadata_value(&self) -> String {
+        format!("{}|{}", self.host, self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NamespacedDestinationBackendKey {
+    namespace: String,
+    host: String,
+    port: u16,
+}
+
+impl NamespacedDestinationBackendKey {
+    fn new(namespace: &str, host: &str, port: u16) -> Option<Self> {
+        if port == 0 {
+            return None;
+        }
+        let namespace = normalize_destination_backend_host(namespace)?;
+        let host = normalize_destination_backend_host(host)?;
+        Some(Self {
+            namespace,
+            host,
+            port,
+        })
+    }
+
+    fn backend_key(&self) -> DestinationBackendKey {
+        DestinationBackendKey {
+            host: self.host.clone(),
+            port: self.port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NamespacedDestinationBackendHostKey {
+    namespace: String,
+    host: String,
+}
+
+impl NamespacedDestinationBackendHostKey {
+    fn new(namespace: &str, host: &str) -> Option<Self> {
+        let namespace = normalize_destination_backend_host(namespace)?;
+        let host = normalize_destination_backend_host(host)?;
+        Some(Self { namespace, host })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ServicePortKey {
+    namespace: String,
+    name: String,
+    port: u16,
+}
+
+impl ServicePortKey {
+    fn new(service: &crate::modes::mesh::config::MeshService, port: u16) -> Self {
+        Self {
+            namespace: service.namespace.clone(),
+            name: service.name.clone(),
+            port,
+        }
+    }
+
+    fn from_parts(namespace: &str, name: &str, port: u16) -> Option<Self> {
+        if port == 0 || namespace.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            namespace: namespace.trim().to_ascii_lowercase(),
+            name: name.trim().to_ascii_lowercase(),
+            port,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum NodeWaypointAuthorizedDestination {
+    Upstream(String),
+    Backend {
+        key: DestinationBackendKey,
+        aliases: Vec<DestinationBackendKey>,
+    },
+}
+
+struct DestinationScopeMatch<'a> {
+    authorized_destination: NodeWaypointAuthorizedDestination,
+    scopes: &'a [crate::modes::mesh::runtime::PolicyScopeCache],
+}
+
+#[derive(Default)]
+struct DestinationPolicyScopeIndex {
+    by_upstream: HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    by_backend: HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    by_namespaced_backend: HashMap<
+        NamespacedDestinationBackendKey,
+        Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    >,
+    backend_aliases_by_backend: HashMap<DestinationBackendKey, Vec<DestinationBackendKey>>,
+    backend_aliases_by_namespaced_backend:
+        HashMap<NamespacedDestinationBackendKey, Vec<DestinationBackendKey>>,
+    same_namespace_backend_alias_by_backend:
+        HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
+    service_backend_hosts: HashSet<String>,
+    namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
+    route_upstreams_requiring_scope: HashSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeWaypointRouteUpstreamConfig {
+    id: String,
+    namespace: String,
+    #[serde(default)]
+    targets: Vec<NodeWaypointRouteTargetConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeWaypointRouteTargetConfig {
+    host: String,
+    port: u16,
+    #[serde(default)]
+    service_namespace: Option<String>,
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    service_port: Option<u16>,
+}
+
+#[derive(Clone)]
+struct ServicePortDestinationScopes {
+    scopes: Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    endpoint_backends: HashSet<DestinationBackendKey>,
+}
 
 impl ConditionAttributeKeys {
     fn from_policies(policies: &[MeshPolicy]) -> Self {
@@ -189,6 +370,424 @@ impl ConditionAttributeKeys {
 /// `prefix...]` form.
 fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     key.strip_prefix(prefix)?.strip_suffix(']')
+}
+
+fn normalize_destination_backend_host(host: &str) -> Option<String> {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn node_waypoint_generated_route_upstream_id(upstream_id: &str) -> bool {
+    upstream_id.starts_with("istio-vs-upstream-")
+        || upstream_id.starts_with("gwapi-route-upstream-")
+}
+
+fn normalized_cluster_domains(config: &Value) -> Vec<String> {
+    fn push_domain(domains: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+        let domain = value.trim().trim_matches('.').to_ascii_lowercase();
+        if !domain.is_empty() && seen.insert(domain.clone()) {
+            domains.push(domain);
+        }
+    }
+
+    let mut domains = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(domain) = config.get("cluster_domain").and_then(Value::as_str) {
+        push_domain(&mut domains, &mut seen, domain);
+    }
+    if let Some(extra_domains) = config.get("cluster_domains").and_then(Value::as_array) {
+        for domain in extra_domains.iter().filter_map(Value::as_str) {
+            push_domain(&mut domains, &mut seen, domain);
+        }
+    }
+    if domains.is_empty() {
+        domains.push("cluster.local".to_string());
+    }
+    domains
+}
+
+fn service_qualified_host_aliases(
+    service: &crate::modes::mesh::config::MeshService,
+    cluster_domains: &[String],
+) -> Vec<String> {
+    let mut aliases = vec![
+        format!("{}.{}", service.name, service.namespace),
+        format!("{}.{}.svc", service.name, service.namespace),
+    ];
+    for cluster_domain in cluster_domains {
+        let cluster_domain = cluster_domain.trim().trim_matches('.');
+        if cluster_domain.is_empty() {
+            continue;
+        }
+        aliases.push(format!(
+            "{}.{}.svc.{}",
+            service.name, service.namespace, cluster_domain
+        ));
+    }
+    aliases
+}
+
+fn destination_policy_scopes_for_service_port(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) -> ServicePortDestinationScopes {
+    let mut scopes = Vec::new();
+    let mut endpoint_backends = HashSet::new();
+    for workload in
+        crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
+    {
+        if workload.addresses.is_empty() {
+            continue;
+        }
+        let app_port = match service_port.target_port.as_ref() {
+            Some(_) => {
+                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
+                    Some(port) if port != 0 => port,
+                    _ => continue,
+                }
+            }
+            None => service_port.port,
+        };
+        if app_port == 0 {
+            continue;
+        }
+        scopes.push(crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload));
+        for address in &workload.addresses {
+            if let Some(key) = DestinationBackendKey::new(address, app_port) {
+                endpoint_backends.insert(key);
+            }
+        }
+    }
+    ServicePortDestinationScopes {
+        scopes,
+        endpoint_backends,
+    }
+}
+
+fn parse_node_waypoint_route_upstreams(
+    config: &Value,
+) -> Result<(bool, Vec<NodeWaypointRouteUpstreamConfig>), String> {
+    match config.get("node_waypoint_route_upstreams") {
+        Some(value) => {
+            serde_json::from_value::<Vec<NodeWaypointRouteUpstreamConfig>>(value.clone())
+                .map(|upstreams| (true, upstreams))
+                .map_err(|error| {
+                    format!("mesh_authz: invalid node_waypoint_route_upstreams: {error}")
+                })
+        }
+        None => Ok((false, Vec::new())),
+    }
+}
+
+fn service_port_key_for_backend(
+    host: &str,
+    port: u16,
+    default_namespace: &str,
+    qualified_service_ports: &HashMap<DestinationBackendKey, ServicePortKey>,
+    namespaced_service_ports: &HashMap<NamespacedDestinationBackendKey, ServicePortKey>,
+) -> Option<ServicePortKey> {
+    if let Some(key) = DestinationBackendKey::new(host, port)
+        && let Some(service_key) = qualified_service_ports.get(&key)
+    {
+        return Some(service_key.clone());
+    }
+    let key = NamespacedDestinationBackendKey::new(default_namespace, host, port)?;
+    namespaced_service_ports.get(&key).cloned()
+}
+
+fn service_port_key_for_route_target(
+    target: &NodeWaypointRouteTargetConfig,
+    default_namespace: &str,
+    qualified_service_ports: &HashMap<DestinationBackendKey, ServicePortKey>,
+    namespaced_service_ports: &HashMap<NamespacedDestinationBackendKey, ServicePortKey>,
+) -> Option<ServicePortKey> {
+    if let (Some(service_name), Some(service_port)) =
+        (target.service_name.as_deref(), target.service_port)
+    {
+        let namespace = target
+            .service_namespace
+            .as_deref()
+            .unwrap_or(default_namespace);
+        return ServicePortKey::from_parts(namespace, service_name, service_port);
+    }
+    let service_port = target.service_port.unwrap_or(target.port);
+    service_port_key_for_backend(
+        &target.host,
+        service_port,
+        default_namespace,
+        qualified_service_ports,
+        namespaced_service_ports,
+    )
+}
+
+fn route_target_uses_service_alias(
+    target: &NodeWaypointRouteTargetConfig,
+    service_key: &ServicePortKey,
+    default_namespace: &str,
+    qualified_service_ports: &HashMap<DestinationBackendKey, ServicePortKey>,
+    namespaced_service_ports: &HashMap<NamespacedDestinationBackendKey, ServicePortKey>,
+) -> bool {
+    let service_port = target.service_port.unwrap_or(target.port);
+    service_port_key_for_backend(
+        &target.host,
+        service_port,
+        default_namespace,
+        qualified_service_ports,
+        namespaced_service_ports,
+    )
+    .is_some_and(|key| key == *service_key)
+}
+
+fn route_target_uses_modeled_endpoint(
+    target: &NodeWaypointRouteTargetConfig,
+    service_key: &ServicePortKey,
+    service_port_endpoints: &HashMap<ServicePortKey, HashSet<DestinationBackendKey>>,
+) -> bool {
+    DestinationBackendKey::new(&target.host, target.port).is_some_and(|backend| {
+        service_port_endpoints
+            .get(service_key)
+            .is_some_and(|endpoints| endpoints.contains(&backend))
+    })
+}
+
+fn destination_backend_aliases_for_service_port(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: u16,
+    qualified_aliases: &[String],
+    include_short_name: bool,
+) -> Vec<DestinationBackendKey> {
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+    for alias in qualified_aliases {
+        if let Some(key) = DestinationBackendKey::new(alias, service_port)
+            && seen.insert(key.clone())
+        {
+            aliases.push(key);
+        }
+    }
+    if include_short_name
+        && let Some(key) = DestinationBackendKey::new(&service.name, service_port)
+        && seen.insert(key.clone())
+    {
+        aliases.push(key);
+    }
+    aliases
+}
+
+fn destination_policy_scope_index(
+    slice: &MeshSlice,
+    cluster_domains: &[String],
+    route_upstreams: &[NodeWaypointRouteUpstreamConfig],
+) -> DestinationPolicyScopeIndex {
+    let mut index = DestinationPolicyScopeIndex::default();
+    let mut service_port_scopes = HashMap::new();
+    let mut service_port_endpoints = HashMap::new();
+    let mut qualified_service_ports = HashMap::new();
+    let mut namespaced_service_ports = HashMap::new();
+    let mut workload_backend_hosts = HashSet::new();
+    for workload in &slice.workloads {
+        for address in &workload.addresses {
+            if let Some(address) = normalize_destination_backend_host(address) {
+                workload_backend_hosts.insert(address);
+            }
+        }
+    }
+    for service in &slice.services {
+        let aliases = service_qualified_host_aliases(service, cluster_domains);
+        for alias in &aliases {
+            if let Some(host) = normalize_destination_backend_host(alias) {
+                index.service_backend_hosts.insert(host);
+            }
+        }
+        if let Some(host_key) =
+            NamespacedDestinationBackendHostKey::new(&service.namespace, &service.name)
+        {
+            index.namespaced_service_backend_hosts.insert(host_key);
+        }
+        for service_port in &service.ports {
+            let service_key = ServicePortKey::new(service, service_port.port);
+            let qualified_backend_aliases = destination_backend_aliases_for_service_port(
+                service,
+                service_port.port,
+                &aliases,
+                false,
+            );
+            let short_backend_alias = DestinationBackendKey::new(&service.name, service_port.port);
+            let namespaced_backend_aliases = destination_backend_aliases_for_service_port(
+                service,
+                service_port.port,
+                &aliases,
+                true,
+            );
+            for alias in &aliases {
+                if let Some(key) = DestinationBackendKey::new(alias, service_port.port) {
+                    qualified_service_ports.insert(key, service_key.clone());
+                }
+            }
+            if let Some(key) = NamespacedDestinationBackendKey::new(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            ) {
+                namespaced_service_ports.insert(key, service_key.clone());
+            }
+            let scopes = destination_policy_scopes_for_service_port(
+                service,
+                service_port,
+                &slice.workloads,
+                slice.multi_cluster.as_ref(),
+            );
+            if scopes.scopes.is_empty() {
+                continue;
+            }
+            service_port_scopes.insert(service_key.clone(), scopes.scopes.clone());
+            service_port_endpoints.insert(service_key.clone(), scopes.endpoint_backends.clone());
+            index.by_upstream.insert(
+                crate::modes::mesh::mesh_outbound_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
+                scopes.scopes.clone(),
+            );
+            for alias in &aliases {
+                if let Some(key) = DestinationBackendKey::new(alias, service_port.port) {
+                    index.by_backend.insert(key, scopes.scopes.clone());
+                }
+            }
+            for endpoint in &scopes.endpoint_backends {
+                index
+                    .by_backend
+                    .insert(endpoint.clone(), scopes.scopes.clone());
+                index
+                    .backend_aliases_by_backend
+                    .insert(endpoint.clone(), vec![endpoint.clone()]);
+            }
+            for alias_key in &qualified_backend_aliases {
+                index
+                    .backend_aliases_by_backend
+                    .insert(alias_key.clone(), qualified_backend_aliases.clone());
+                if let (Some(namespaced_alias_key), Some(short_backend_alias)) = (
+                    NamespacedDestinationBackendKey::new(
+                        &service.namespace,
+                        &alias_key.host,
+                        alias_key.port,
+                    ),
+                    short_backend_alias.clone(),
+                ) {
+                    index
+                        .same_namespace_backend_alias_by_backend
+                        .insert(namespaced_alias_key, short_backend_alias);
+                }
+            }
+            if let Some(key) = NamespacedDestinationBackendKey::new(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            ) {
+                index
+                    .by_namespaced_backend
+                    .insert(key.clone(), scopes.scopes.clone());
+                index
+                    .backend_aliases_by_namespaced_backend
+                    .insert(key, namespaced_backend_aliases);
+            }
+        }
+    }
+    for upstream in route_upstreams {
+        let mut route_scopes = Vec::new();
+        let mut requires_destination_scope = false;
+        let mut unscoped_target_seen = false;
+        let mut external_target_seen = false;
+        let mut seen_service_ports = HashSet::new();
+        for target in &upstream.targets {
+            let Some(service_key) = service_port_key_for_route_target(
+                target,
+                &upstream.namespace,
+                &qualified_service_ports,
+                &namespaced_service_ports,
+            ) else {
+                let host = normalize_destination_backend_host(&target.host);
+                if host.is_some_and(|host| workload_backend_hosts.contains(&host))
+                    || target.service_name.is_some()
+                    || target.service_port.is_some()
+                {
+                    requires_destination_scope = true;
+                    unscoped_target_seen = true;
+                } else {
+                    external_target_seen = true;
+                }
+                continue;
+            };
+            requires_destination_scope = true;
+            if !route_target_uses_service_alias(
+                target,
+                &service_key,
+                &upstream.namespace,
+                &qualified_service_ports,
+                &namespaced_service_ports,
+            ) && !route_target_uses_modeled_endpoint(
+                target,
+                &service_key,
+                &service_port_endpoints,
+            ) {
+                unscoped_target_seen = true;
+                continue;
+            }
+            if seen_service_ports.insert(service_key.clone()) {
+                if let Some(scopes) = service_port_scopes.get(&service_key) {
+                    route_scopes.extend(scopes.clone());
+                } else {
+                    unscoped_target_seen = true;
+                }
+            }
+        }
+        if requires_destination_scope {
+            index
+                .route_upstreams_requiring_scope
+                .insert(upstream.id.clone());
+        }
+        if requires_destination_scope
+            && !unscoped_target_seen
+            && !external_target_seen
+            && !route_scopes.is_empty()
+        {
+            index.by_upstream.insert(upstream.id.clone(), route_scopes);
+        }
+    }
+    index
+}
+
+fn evaluate_destination_policy_scopes(
+    policies: &[MeshPolicy],
+    scopes: &[crate::modes::mesh::runtime::PolicyScopeCache],
+    request: &MeshAuthzRequest,
+) -> MeshAuthzDecision {
+    let mut audit_policy = None;
+    for scope in scopes {
+        let decision = evaluate_mesh_authorization_policies(
+            policies
+                .iter()
+                .filter(|policy| scope.policy_applies(policy)),
+            request,
+        );
+        match decision {
+            MeshAuthzDecision::Deny { policy } => {
+                return MeshAuthzDecision::Deny { policy };
+            }
+            MeshAuthzDecision::Audit { policy } => {
+                audit_policy.get_or_insert(policy);
+            }
+            MeshAuthzDecision::Allow => {}
+        }
+    }
+    if let Some(policy) = audit_policy {
+        MeshAuthzDecision::Audit { policy }
+    } else {
+        MeshAuthzDecision::Allow
+    }
 }
 
 /// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
@@ -472,8 +1071,34 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
+        let mut has_route_upstream_metadata = false;
+        let destination_policy_scope_index = if per_pod_policy_scoping {
+            let cluster_domains = normalized_cluster_domains(config);
+            let (route_metadata_present, route_upstreams) =
+                parse_node_waypoint_route_upstreams(config)?;
+            has_route_upstream_metadata = route_metadata_present;
+            destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
+        } else {
+            DestinationPolicyScopeIndex::default()
+        };
         Ok(Self {
             slice,
+            destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
+            destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
+            destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
+                .by_namespaced_backend,
+            destination_backend_aliases_by_backend: destination_policy_scope_index
+                .backend_aliases_by_backend,
+            destination_backend_aliases_by_namespaced_backend: destination_policy_scope_index
+                .backend_aliases_by_namespaced_backend,
+            destination_same_namespace_backend_alias_by_backend: destination_policy_scope_index
+                .same_namespace_backend_alias_by_backend,
+            destination_service_backend_hosts: destination_policy_scope_index.service_backend_hosts,
+            destination_namespaced_service_backend_hosts: destination_policy_scope_index
+                .namespaced_service_backend_hosts,
+            destination_route_upstreams_requiring_scope: destination_policy_scope_index
+                .route_upstreams_requiring_scope,
+            has_route_upstream_metadata,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
@@ -660,6 +1285,93 @@ impl MeshAuthz {
             Some(scope) => scope.policy_applies(policy),
             None => matches!(policy.scope, PolicyScope::MeshWide),
         }
+    }
+
+    fn destination_scope_match_for_proxy(
+        &self,
+        proxy: &Proxy,
+    ) -> Option<DestinationScopeMatch<'_>> {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            if let Some(scopes) = self.destination_policy_scopes_by_upstream.get(upstream_id) {
+                return Some(DestinationScopeMatch {
+                    authorized_destination: NodeWaypointAuthorizedDestination::Upstream(
+                        upstream_id.to_string(),
+                    ),
+                    scopes,
+                });
+            }
+            return None;
+        }
+        let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+        if let Some(scopes) = self.destination_policy_scopes_by_backend.get(&backend_key) {
+            let mut aliases = self
+                .destination_backend_aliases_by_backend
+                .get(&backend_key)
+                .cloned()
+                .unwrap_or_else(|| vec![backend_key.clone()]);
+            if let Some(namespaced_backend_key) = NamespacedDestinationBackendKey::new(
+                &proxy.namespace,
+                &backend_key.host,
+                backend_key.port,
+            ) && let Some(short_alias) = self
+                .destination_same_namespace_backend_alias_by_backend
+                .get(&namespaced_backend_key)
+                && !aliases.contains(short_alias)
+            {
+                aliases.push(short_alias.clone());
+            }
+            return Some(DestinationScopeMatch {
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                    key: backend_key,
+                    aliases,
+                },
+                scopes,
+            });
+        }
+        let namespaced_backend_key = NamespacedDestinationBackendKey::new(
+            &proxy.namespace,
+            &proxy.backend_host,
+            proxy.backend_port,
+        )?;
+        self.destination_policy_scopes_by_namespaced_backend
+            .get(&namespaced_backend_key)
+            .map(|scopes| DestinationScopeMatch {
+                authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                    key: namespaced_backend_key.backend_key(),
+                    aliases: self
+                        .destination_backend_aliases_by_namespaced_backend
+                        .get(&namespaced_backend_key)
+                        .cloned()
+                        .unwrap_or_else(|| vec![namespaced_backend_key.backend_key()]),
+                },
+                scopes,
+            })
+    }
+
+    fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            if upstream_id.starts_with("__mesh-out-upstream-") {
+                return true;
+            }
+            if node_waypoint_generated_route_upstream_id(upstream_id) {
+                return !self.has_route_upstream_metadata
+                    || self
+                        .destination_route_upstreams_requiring_scope
+                        .contains(upstream_id);
+            }
+            return false;
+        }
+        if DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)
+            .is_some_and(|key| self.destination_service_backend_hosts.contains(&key.host))
+        {
+            return true;
+        }
+        NamespacedDestinationBackendHostKey::new(&proxy.namespace, &proxy.backend_host).is_some_and(
+            |key| {
+                self.destination_namespaced_service_backend_hosts
+                    .contains(&key)
+            },
+        )
     }
 
     fn decision_to_result(
@@ -1016,51 +1728,111 @@ impl Plugin for MeshAuthz {
         //
         // When `per_pod_policy_scoping` is enabled, the construction-time
         // filter was skipped (`self.slice.mesh_policies` carries the full
-        // unfiltered set) and we filter per-request using the source pod's
-        // PolicyScopeCache. If the scope is absent, retain mesh-wide policies
-        // only so scoped policies do not leak across pods. Other topologies
-        // keep the pre-filtered slice.
+        // unfiltered set). The source pod scope remains the fail-closed
+        // liveness gate. For materialized NodeWaypoint HTTP Service egress, the
+        // policy applicability filter must use the destination Service's backing
+        // workload scopes (AuthorizationPolicy scopes select destination
+        // workloads). Other per-pod paths keep source-pod filtering.
         //
         // Filtering is expressed as an iterator predicate so the hot path
         // never clones the full `MeshSlice` (which carries workloads,
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
+        let mut node_waypoint_authorized_destination = None;
         let decision = if self.per_pod_policy_scoping {
-            scope_missing = ctx.node_waypoint_policy_scope.is_none();
-            // Fail closed when scoped policies exist and this request's pod has
-            // no current scope — matching the stream path (`on_stream_connect`).
-            // The resolver derives a pod's scope from the SAME slice generation
-            // that vouches its identity, and the accepting connection holds the
-            // identity `Arc` (which the idle sweep's strong_count guard keeps
-            // enrolled), so a missing scope here is NOT an enrollment race: it
-            // means the workload's hash has left the live slice gate (the pod was
-            // removed or re-keyed). A long-lived HTTP/2/HBONE connection from a
-            // removed workload must therefore stop being served under scoped
-            // authz rather than silently dropping to mesh-wide-only — the same
-            // per-request gate the stream path enforces at accept. A mesh with
-            // only mesh-wide policies stays fully evaluable and falls through.
-            if scope_missing && self.has_scoped_policies {
-                ctx.metadata
-                    .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+            if self.has_scoped_policies {
                 ctx.metadata.insert(
-                    "mesh_authz.deny_policy".to_string(),
-                    "scope_missing".to_string(),
+                    NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA.to_string(),
+                    "true".to_string(),
                 );
-                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                return PluginResult::Reject {
-                    status_code: 403,
-                    body: r#"{"error":"Mesh authorization denied: missing per-pod policy scope"}"#
-                        .into(),
-                    headers: HashMap::new(),
-                };
             }
-            let scope = ctx.node_waypoint_policy_scope.as_deref();
-            let policies = self
-                .slice
-                .mesh_policies
-                .iter()
-                .filter(|policy| Self::policy_applies_to_pod(policy, scope));
-            evaluate_mesh_authorization_policies(policies, &request)
+            let destination_scope_match = ctx
+                .matched_proxy
+                .as_ref()
+                .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+            let can_use_destination_scope = ctx.node_waypoint_policy_scope.is_some()
+                || can_use_inbound_relay_destination_scope_without_source_scope(
+                    ctx,
+                    baggage_outcome,
+                );
+            if can_use_destination_scope
+                && let Some(destination_scope_match) = destination_scope_match
+            {
+                node_waypoint_authorized_destination =
+                    Some(destination_scope_match.authorized_destination);
+                evaluate_destination_policy_scopes(
+                    &self.slice.mesh_policies,
+                    destination_scope_match.scopes,
+                    &request,
+                )
+            } else {
+                scope_missing = ctx.node_waypoint_policy_scope.is_none();
+                // Fail closed when scoped policies exist and this request's pod has
+                // no current scope — matching the stream path (`on_stream_connect`).
+                // The resolver derives a pod's scope from the SAME slice generation
+                // that vouches its identity, and the accepting connection holds the
+                // identity `Arc` (which the idle sweep's strong_count guard keeps
+                // enrolled), so a missing scope here is NOT an enrollment race: it
+                // means the workload's hash has left the live slice gate (the pod was
+                // removed or re-keyed). A long-lived HTTP/2/HBONE connection from a
+                // removed workload must therefore stop being served under scoped
+                // authz rather than silently dropping to mesh-wide-only — the same
+                // per-request gate the stream path enforces at accept. A mesh with
+                // only mesh-wide policies stays fully evaluable and falls through.
+                //
+                // The exception above is the synthesized inbound HBONE relay with an
+                // honored trusted source assertion: that destination-side request has
+                // no captured source-pod scope, but authz can evaluate destination
+                // policies against the asserted source workload. Source-side
+                // HBONE-shaped traffic, untrusted relay baggage, and missing baggage
+                // keep the existing removed-workload fail-closed behavior.
+                if scope_missing && self.has_scoped_policies {
+                    ctx.metadata
+                        .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body:
+                            r#"{"error":"Mesh authorization denied: missing per-pod policy scope"}"#
+                                .into(),
+                        headers: HashMap::new(),
+                    };
+                }
+                if self.has_scoped_policies
+                    && ctx
+                        .matched_proxy
+                        .as_ref()
+                        .is_some_and(|proxy| self.proxy_requires_destination_scope(proxy))
+                {
+                    ctx.metadata.insert(
+                        "mesh_authz.destination_scope_missing".to_string(),
+                        "true".to_string(),
+                    );
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "destination_scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body:
+                            r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+                                .into(),
+                        headers: HashMap::new(),
+                    };
+                }
+                let scope = ctx.node_waypoint_policy_scope.as_deref();
+                let policies = self
+                    .slice
+                    .mesh_policies
+                    .iter()
+                    .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+                evaluate_mesh_authorization_policies(policies, &request)
+            }
         } else {
             evaluate_mesh_authorization(&self.slice, &request)
         };
@@ -1073,6 +1845,35 @@ impl Plugin for MeshAuthz {
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
         }
         let result = self.decision_to_result(decision, &mut ctx.metadata);
+        if self.has_scoped_policies
+            && matches!(result, PluginResult::Continue)
+            && let Some(destination) = node_waypoint_authorized_destination
+        {
+            match destination {
+                NodeWaypointAuthorizedDestination::Upstream(upstream_id) => {
+                    ctx.metadata.insert(
+                        NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA.to_string(),
+                        upstream_id,
+                    );
+                }
+                NodeWaypointAuthorizedDestination::Backend { key, aliases } => {
+                    ctx.metadata.insert(
+                        NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA.to_string(),
+                        key.metadata_value(),
+                    );
+                    if !aliases.is_empty() {
+                        ctx.metadata.insert(
+                            NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA.to_string(),
+                            aliases
+                                .iter()
+                                .map(DestinationBackendKey::metadata_value)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                    }
+                }
+            }
+        }
         if matches!(
             result,
             PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
@@ -1353,6 +2154,19 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
 
 fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
     ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+}
+
+fn can_use_inbound_relay_destination_scope_without_source_scope(
+    ctx: &RequestContext,
+    baggage_outcome: BaggageOutcome,
+) -> bool {
+    ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && matches!(baggage_outcome, BaggageOutcome::Honored)
+        && is_authenticated_hbone_request(ctx)
+        && ctx
+            .matched_proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID)
 }
 
 fn is_hbone_request(ctx: &RequestContext) -> bool {

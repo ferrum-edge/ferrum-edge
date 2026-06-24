@@ -1,0 +1,55 @@
+schema_version: 1
+capabilities:
+  - id: mesh.destination_rule.tcp_connect_timeout
+    display_name: DestinationRule TCP connect timeout
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_destination_rule
+        feature: trafficPolicy.connectionPool.tcp.connectTimeout
+    live_suite: mesh-e2e-sidecar
+    live_assertions:
+      - sidecar.destination_rule.tcp_connect_timeout
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#destinationrule
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.destination_rule.tcp_max_connections
+    display_name: DestinationRule TCP max connections
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_destination_rule
+        feature: trafficPolicy.connectionPool.tcp.maxConnections
+    live_suite: mesh-e2e-sidecar
+    live_assertions:
+      - sidecar.destination_rule.tcp_max_connections
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#destinationrule
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.virtual_service.cors_policy
+    display_name: VirtualService HTTP CORS policy
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_virtual_service
+        feature: http[].corsPolicy
+    live_suite: mesh-e2e-sidecar
+    live_assertions:
+      - sidecar.virtual_service.cors_policy
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#virtualservice-translation
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.

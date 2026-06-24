@@ -21,6 +21,13 @@ inputs:
     description: Strip debug symbols from the copied binary before packaging.
     required: false
     default: "true"
+  bpf-elf-path:
+    description: >-
+      Optional compiled ferrum-ebpf ELF to copy into /app/bpf/ferrum-ebpf and
+      expose through FERRUM_NODE_AGENT_BPF_ELF_PATH. Use for eBPF CI runtime
+      images that package host-built artifacts instead of compiling in Docker.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -32,15 +39,21 @@ runs:
         IMAGE: ${{ inputs.image }}
         BASE_IMAGE: ${{ inputs.base-image }}
         STRIP_BINARY: ${{ inputs.strip-binary }}
+        BPF_ELF_PATH: ${{ inputs.bpf-elf-path }}
       run: |
         set -euo pipefail
 
         binary_path="$BINARY_PATH"
         image="$IMAGE"
         base_image="$BASE_IMAGE"
+        bpf_elf_path="$BPF_ELF_PATH"
 
         if [ ! -f "$binary_path" ]; then
           echo "::error title=Missing ferrum-edge binary::$binary_path does not exist"
+          exit 1
+        fi
+        if [ -n "$bpf_elf_path" ] && [ ! -f "$bpf_elf_path" ]; then
+          echo "::error title=Missing ferrum-ebpf ELF::$bpf_elf_path does not exist"
           exit 1
         fi
 
@@ -50,6 +63,10 @@ runs:
         install -m 0755 "$binary_path" "$image_context/ferrum-edge"
         if [ "$STRIP_BINARY" = "true" ] && command -v strip >/dev/null 2>&1; then
           strip "$image_context/ferrum-edge" || true
+        fi
+        if [ -n "$bpf_elf_path" ]; then
+          mkdir -p "$image_context/bpf"
+          install -m 0644 "$bpf_elf_path" "$image_context/bpf/ferrum-ebpf"
         fi
 
         {
@@ -62,6 +79,13 @@ runs:
         WORKDIR /app
 
         COPY --chown=nonroot:nonroot ferrum-edge /app/ferrum-edge
+        DOCKERFILE
+          if [ -n "$bpf_elf_path" ]; then
+            cat <<'DOCKERFILE'
+        COPY --chown=nonroot:nonroot bpf /app/bpf
+        DOCKERFILE
+          fi
+          cat <<'DOCKERFILE'
 
         ENV PATH="/app:${PATH}" \
             FERRUM_MODE=database \
@@ -70,6 +94,13 @@ runs:
             FERRUM_PROXY_HTTPS_PORT=8443 \
             FERRUM_ADMIN_HTTP_PORT=9000 \
             FERRUM_ADMIN_HTTPS_PORT=9443
+        DOCKERFILE
+          if [ -n "$bpf_elf_path" ]; then
+            cat <<'DOCKERFILE'
+        ENV FERRUM_NODE_AGENT_BPF_ELF_PATH=/app/bpf/ferrum-ebpf
+        DOCKERFILE
+          fi
+          cat <<'DOCKERFILE'
 
         EXPOSE 8000 8443 9000 9443 50051
 

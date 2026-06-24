@@ -10,8 +10,9 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -100,18 +101,61 @@ fn start_gateway(
     Ok(cmd)
 }
 
-/// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+/// Wait for the gateway to become ready by sending a complete HTTP probe.
 async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addr = format!("127.0.0.1:{}", gateway_port);
+    let mut last_err = String::new();
 
     loop {
-        if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 15 seconds".into());
+        if Instant::now() >= deadline {
+            return Err(format!("Gateway did not start within 30 seconds: {last_err}").into());
         }
-        match tokio::net::TcpStream::connect(&addr).await {
+        match probe_gateway_http(&addr).await {
             Ok(_) => return Ok(()),
-            Err(_) => sleep(Duration::from_millis(300)).await,
+            Err(error) => {
+                last_err = error.to_string();
+                sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+}
+
+async fn probe_gateway_http(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(750),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await??;
+    let _ = stream.set_nodelay(true);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.write_all(
+            b"GET /__ferrum_startup_probe HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        ),
+    )
+    .await??;
+    let mut buf = [0u8; 12];
+    let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await??;
+    if n == 0 {
+        return Err("gateway closed startup probe without a response".into());
+    }
+    if !buf[..n].starts_with(b"HTTP/") {
+        return Err(format!(
+            "gateway startup probe returned non-HTTP bytes: {:?}",
+            &buf[..n]
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn child_exit_status(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("could not inspect gateway child status: {error}");
+            None
         }
     }
 }
@@ -129,7 +173,18 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let gateway_port = free_port().await;
         match start_gateway(config_path, gateway_port) {
             Ok(mut child) => match wait_for_gateway(gateway_port).await {
-                Ok(()) => return (child, gateway_port),
+                Ok(()) => {
+                    if let Some(status) = child_exit_status(&mut child) {
+                        last_err = format!("gateway exited immediately after readiness: {status}");
+                        eprintln!(
+                            "Gateway startup attempt {}/{} failed (port {}): {}",
+                            attempt, MAX_ATTEMPTS, gateway_port, last_err
+                        );
+                        let _ = child.wait();
+                    } else {
+                        return (child, gateway_port);
+                    }
+                }
                 Err(e) => {
                     last_err = e.to_string();
                     eprintln!(

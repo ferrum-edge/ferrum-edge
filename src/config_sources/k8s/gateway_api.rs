@@ -18,8 +18,9 @@ use super::{
     MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, optional_port_field, optional_target_weight_field,
-    port_from_u64, proxy_for_route, resource_id, route_request_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
+    port_from_u64, proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
+    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route,
 };
 use crate::config::types::{PluginConfig, Proxy};
 
@@ -2125,42 +2126,64 @@ fn http_route_resources(
                 || redirect.is_some()
                 || invalid_backend_fault.is_some();
 
-            let (backend_host, backend_port, upstream_id, mut pending_upstream) =
-                if backend_resolution.backends.is_empty() {
-                    if !has_only_zero_weight_backend_refs(rule) && !has_route_actions {
-                        continue;
-                    }
-                    (
-                        ZERO_WEIGHT_BACKEND_HOST.to_string(),
-                        ZERO_WEIGHT_BACKEND_PORT,
-                        None,
-                        None,
-                    )
-                } else if backend_resolution.backends.len() == 1 {
-                    let Some(backend) = backend_resolution.backends.into_iter().next() else {
-                        continue;
-                    };
-                    (backend.host, backend.port, None, None)
-                } else {
-                    let route_suffix = route_scoped_suffix(
-                        &route_kind,
-                        rule_index,
-                        None,
-                        route_namespace_suffix.as_deref(),
-                    );
-                    let upstream_id = resource_id(
-                        "gwapi-route-upstream",
-                        &object.metadata.namespace,
-                        &object.metadata.name,
-                        &route_suffix,
-                    );
-                    let upstream = upstream_for_route(
-                        upstream_id.clone(),
-                        config_namespace.clone(),
-                        backend_resolution.backends,
-                    );
-                    (String::new(), 0, Some(upstream_id), Some(upstream))
+            let (
+                backend_host,
+                backend_port,
+                upstream_id,
+                mut pending_upstream,
+                requires_node_waypoint_authz,
+            ) = if backend_resolution.backends.is_empty() {
+                if !has_only_zero_weight_backend_refs(rule) && !has_route_actions {
+                    continue;
+                }
+                (
+                    ZERO_WEIGHT_BACKEND_HOST.to_string(),
+                    ZERO_WEIGHT_BACKEND_PORT,
+                    None,
+                    None,
+                    false,
+                )
+            } else if backend_resolution.backends.len() == 1 {
+                let Some(backend) = backend_resolution.backends.into_iter().next() else {
+                    continue;
                 };
+                let requires_node_waypoint_authz =
+                    route_backends_require_node_waypoint_authz(std::slice::from_ref(&backend));
+                (
+                    backend.host,
+                    backend.port,
+                    None,
+                    None,
+                    requires_node_waypoint_authz,
+                )
+            } else {
+                let requires_node_waypoint_authz =
+                    route_backends_require_node_waypoint_authz(&backend_resolution.backends);
+                let route_suffix = route_scoped_suffix(
+                    &route_kind,
+                    rule_index,
+                    None,
+                    route_namespace_suffix.as_deref(),
+                );
+                let upstream_id = resource_id(
+                    "gwapi-route-upstream",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &route_suffix,
+                );
+                let upstream = upstream_for_route(
+                    upstream_id.clone(),
+                    config_namespace.clone(),
+                    backend_resolution.backends,
+                );
+                (
+                    String::new(),
+                    0,
+                    Some(upstream_id),
+                    Some(upstream),
+                    requires_node_waypoint_authz,
+                )
+            };
 
             let match_count = match_paths.len();
             for (match_index, listen_path) in match_paths.into_iter().enumerate() {
@@ -2241,6 +2264,7 @@ fn http_route_resources(
                                 backend_host: backend_host.as_str(),
                                 backend_port,
                                 upstream_id: upstream_id.as_deref(),
+                                requires_node_waypoint_authz,
                             },
                             &skipped_descriptors,
                             &entry_descriptors_for_path,
@@ -2597,6 +2621,12 @@ fn gateway_api_dispatch_route_rule(
         destination.insert(
             "backend_port".to_string(),
             serde_json::json!(route_destination.backend_port),
+        );
+    }
+    if route_destination.requires_node_waypoint_authz {
+        destination.insert(
+            "requires_node_waypoint_authz".to_string(),
+            Value::Bool(true),
         );
     }
 
@@ -3077,6 +3107,9 @@ fn route_backends(
                 ),
                 port: backend_port,
                 weight,
+                service_namespace: Some(backend_namespace.clone()),
+                service_name: Some(backend_name.to_string()),
+                service_port: Some(backend_port),
             }],
         });
     }

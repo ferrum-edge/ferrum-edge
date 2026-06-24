@@ -30,6 +30,22 @@ use arc_swap::ArcSwap;
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
 pub use ferrum_ebpf_common::{INCLUDE_PORTS_MAX, IncludePortsPolicy, WorkloadIdentity};
 
+pub const NODE_AGENT_CAPTURE_STATE_STARTING: &str = "starting";
+pub const NODE_AGENT_CAPTURE_STATE_READY: &str = "ready";
+pub const NODE_AGENT_CAPTURE_STATE_UNAVAILABLE: &str = "unavailable";
+pub const NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED: &str = "partially_attached";
+pub const NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE: &str =
+    "identity_bridge_unavailable";
+pub const NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK: &str = "node_global_fallback";
+pub const NODE_AGENT_CAPTURE_STATES: &[&str] = &[
+    NODE_AGENT_CAPTURE_STATE_STARTING,
+    NODE_AGENT_CAPTURE_STATE_READY,
+    NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
+    NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+    NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
+    NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
+];
+
 pub const DEFAULT_NODE_AGENT_SOCKET_PATH: &str = "/run/ferrum/node-agent.sock";
 pub const BPF_MAP_ORIG_DST4: &str = "FERRUM_ORIG_DST4";
 pub const BPF_MAP_ORIG_DST6: &str = "FERRUM_ORIG_DST6";
@@ -149,9 +165,10 @@ pub struct CaptureContract {
     pub unix_socket_path: String,
     pub bpf_maps: CaptureBpfMaps,
     /// Fail closed on captured IPv6 outbound (the `connect6` hook returns
-    /// `EPERM`) instead of redirecting it. Set in NodeWaypoint in-netns capture
-    /// mode, whose datapath is IPv4-only, so IPv6 egress cannot bypass
-    /// `mesh_authz`. See [`BpfCaptureConfig::ipv6_outbound_deny`].
+    /// `EPERM`) instead of redirecting it. This remains available as a safety
+    /// valve, but NodeWaypoint now keeps it disabled because the in-netns capture
+    /// manager opens an IPv6 pod-loopback listener and missing listeners fail
+    /// closed by connection refusal.
     pub ipv6_outbound_deny: bool,
 }
 
@@ -235,6 +252,12 @@ pub struct NodeAgentMetrics {
     /// restart the node agent after a kernel/cgroup/bpffs change, which
     /// matches the rest of the node-agent contract.
     pub topology_degraded_reason: ArcSwap<Option<&'static str>>,
+    /// Bounded operational state for the capture backend. This is separate from
+    /// `topology_degraded_reason`: the reason explains the first fault, while
+    /// this state is an alerting-friendly condition that distinguishes startup,
+    /// ready, unavailable, partially attached, identity-bridge unavailable, and
+    /// explicit node-global fallback.
+    pub capture_state: ArcSwap<&'static str>,
     /// CNI plugin RPC counts split by `(verb, outcome)` where verb is one
     /// of `add`/`del`/`check` and outcome is `success`/`rejected`/`error`.
     /// Bounded cardinality (3 × 3 = 9 series at most). Lets operators see
@@ -252,6 +275,7 @@ pub struct NodeAgentMetricsSnapshot {
     pub pod_annotation_updates_applied: u64,
     pub pod_annotation_updates_failed: u64,
     pub topology_degraded_reason: Option<&'static str>,
+    pub capture_state: &'static str,
     /// Snapshot of [`NodeAgentMetrics::cni_calls`]. Same `[verb][outcome]`
     /// layout as the source atomics. The outer axis is verb
     /// (`add`/`del`/`check`); the inner axis is outcome
@@ -326,6 +350,7 @@ impl NodeAgentMetrics {
                 .pod_annotation_updates_failed
                 .load(Ordering::Relaxed),
             topology_degraded_reason: *self.topology_degraded_reason.load_full().as_ref(),
+            capture_state: self.capture_state.load_full().as_ref(),
             cni_calls,
         }
     }
@@ -345,6 +370,17 @@ impl NodeAgentMetrics {
         self.topology_degraded_reason.store(Arc::new(None));
     }
 
+    /// Update the operator-visible capture state. Labels must come from
+    /// [`NODE_AGENT_CAPTURE_STATES`] to keep Prometheus cardinality bounded.
+    pub fn set_capture_state(&self, state: &'static str) {
+        self.capture_state.store(Arc::new(state));
+    }
+
+    pub fn record_attach_error(&self) {
+        self.attach_errors.fetch_add(1, Ordering::Relaxed);
+        self.set_capture_state(NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED);
+    }
+
     /// Increment the CNI call counter for one `(verb, outcome)` cell. The
     /// node-agent CNI server calls this exactly once per RPC.
     pub fn record_cni_call(&self, verb: CniCallVerb, outcome: CniCallOutcome) {
@@ -361,6 +397,7 @@ impl Default for NodeAgentMetrics {
             pod_annotation_updates_applied: AtomicU64::new(0),
             pod_annotation_updates_failed: AtomicU64::new(0),
             topology_degraded_reason: ArcSwap::from_pointee(None),
+            capture_state: ArcSwap::from_pointee(NODE_AGENT_CAPTURE_STATE_STARTING),
             cni_calls: [
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
@@ -504,9 +541,17 @@ pub trait EbpfBackend: Send + Sync {
     /// (`BPF_SOCK_OPS_EVENTS_PIN_PATH`, `BPF_SOCK_OPS_STATS_PIN_PATH`) so
     /// the mesh-proxy can open them by path.
     ///
-    /// Failure is non-fatal for the node-agent — observability is best-
-    /// effort; capture (the cgroup_sockaddr / tc programs) still runs.
+    /// The caller decides whether failure is fatal. In NodeWaypoint mode this
+    /// link is part of source-identity recovery, so startup refuses readiness
+    /// when it cannot be attached.
     fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String>;
+
+    /// Validate startup-level capture prerequisites after loading maps and
+    /// attaching any global links. Per-pod cgroup/tc attachments are validated
+    /// during pod enrollment and surface through `record_attach_error`; this
+    /// hook covers the backend-wide state required before readiness can report
+    /// healthy.
+    fn validate_startup_ready(&self, require_sock_ops: bool) -> Result<(), String>;
 }
 
 /// In-memory mock backend for Phase 1 and integration tests.
@@ -536,6 +581,8 @@ pub struct MockEbpfBackend {
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
+    pub fail_update_pod_ip: bool,
+    pub fail_remove_pod_ip: bool,
     pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
     /// When non-zero, the next N `update_workload_identity` calls return an
@@ -592,11 +639,17 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
+        if self.fail_update_pod_ip {
+            return Err(format!("injected pod IP update failure for {ip}"));
+        }
         self.pod_ips.insert(ip, info.clone());
         Ok(())
     }
 
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        if self.fail_remove_pod_ip {
+            return Err(format!("injected pod IP remove failure for {ip}"));
+        }
         self.pod_ips.remove(&ip);
         Ok(())
     }
@@ -675,6 +728,19 @@ impl EbpfBackend for MockEbpfBackend {
             return Err("sock_ops attach failed".to_string());
         }
         self.sock_ops_attached_cgroup_root = Some(cgroup_root.to_string());
+        Ok(())
+    }
+
+    fn validate_startup_ready(&self, require_sock_ops: bool) -> Result<(), String> {
+        if !self.programs_loaded {
+            return Err("BPF programs not loaded".to_string());
+        }
+        if self.capture_config.is_none() {
+            return Err("BPF capture config map not initialized".to_string());
+        }
+        if require_sock_ops && self.sock_ops_attached_cgroup_root.is_none() {
+            return Err("SOCK_OPS identity bridge is not attached".to_string());
+        }
         Ok(())
     }
 }

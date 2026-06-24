@@ -528,6 +528,7 @@ pub fn pod_event_from_request<'a>(
         labels,
         annotations,
         pod_ip_str: None,
+        pod_source_ips: crate::modes::node_agent::PodSourceIps::default(),
         pod_pid: None,
         veth_iface_override: None,
     }
@@ -557,6 +558,10 @@ mod tests {
         assert_eq!(event.pod_name, "alpha");
         assert_eq!(event.namespace, "demo");
         assert!(event.pod_ip_str.is_none());
+        assert_eq!(
+            event.pod_source_ips,
+            crate::modes::node_agent::PodSourceIps::default()
+        );
         assert!(event.pod_pid.is_none());
     }
 

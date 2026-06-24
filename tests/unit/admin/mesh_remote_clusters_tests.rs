@@ -14,9 +14,10 @@
 use ferrum_edge::admin::mesh_remote_clusters::{MeshRemoteClustersInputs, build_response};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    MeshService, MultiClusterConfig, RemoteCluster, ServicePort, Workload, WorkloadRef,
-    WorkloadSelector,
+    MeshService, MultiClusterConfig, RemoteCluster, ServicePort, TrustBundle, TrustBundleSet,
+    Workload, WorkloadRef, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::federation::{FederatedBundle, FederationSnapshot};
 use ferrum_edge::modes::mesh::multicluster::{
     RemoteClusterEndpoints, RemoteClusterEntry, RemoteEndpointSnapshot,
 };
@@ -47,6 +48,7 @@ fn workload(spiffe_id: &str, service: &str, address: &str) -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     }
 }
@@ -129,13 +131,62 @@ fn multi_cluster_with(remotes: Vec<RemoteCluster>) -> MultiClusterConfig {
     }
 }
 
+fn trust_bundles_with_federated(domains: Vec<&str>) -> TrustBundleSet {
+    TrustBundleSet {
+        local: TrustBundle {
+            trust_domain: td("local.test"),
+            x509_authorities: vec!["AQID".to_string()],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: domains
+            .into_iter()
+            .map(|domain| TrustBundle {
+                trust_domain: td(domain),
+                x509_authorities: vec!["BAUG".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            })
+            .collect(),
+    }
+}
+
+fn federation_snapshot_for(
+    cluster: &str,
+    trust_domain: &str,
+    fetched_at: u64,
+) -> FederationSnapshot {
+    let remote_td = td(trust_domain);
+    let mut snapshot = FederationSnapshot::default();
+    snapshot.bundles.insert(
+        remote_td.clone(),
+        FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: remote_td,
+                x509_authorities: vec!["BAUG".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: fetched_at,
+            endpoint: "https://remote.test/.well-known/spiffe".to_string(),
+            cluster_name: cluster.to_string(),
+        },
+    );
+    snapshot
+}
+
 #[test]
 fn empty_when_no_discovery_and_no_config() {
     let snapshot = RemoteEndpointSnapshot::default();
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: None,
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: false,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
     assert!(!resp.discovery_enabled);
@@ -177,7 +228,12 @@ fn discovered_surfaces_counts_and_age() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -221,7 +277,12 @@ fn discovered_payload_carries_no_raw_addresses_or_identities() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
     let serialized = serde_json::to_string(&resp).expect("serialize");
@@ -275,7 +336,12 @@ fn discovered_is_sorted_by_cluster_name() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 10,
     });
     let names: Vec<&str> = resp
@@ -308,7 +374,12 @@ fn future_fetch_timestamp_clamps_age_to_zero() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
     assert_eq!(resp.discovered[0].age_seconds, 0);
@@ -351,7 +422,12 @@ fn configured_reflects_declared_remotes_with_url_booleans() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -391,7 +467,12 @@ fn configured_treats_blank_urls_as_unset() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 0,
     });
     assert_eq!(resp.configured.len(), 1);
@@ -423,7 +504,12 @@ fn response_round_trips_and_omits_absent_network() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 500,
     });
     let value = serde_json::to_value(&resp).expect("serialize");
@@ -485,7 +571,12 @@ fn discovered_is_scoped_to_accepted_slice_clusters() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -537,7 +628,12 @@ fn discovered_scoping_matches_trust_domain_not_just_name() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -590,7 +686,12 @@ fn discovered_filter_omits_entry_with_diverged_network() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -642,7 +743,12 @@ fn discovered_filter_omits_entry_with_url_only_divergence() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -686,7 +792,12 @@ fn discovered_filter_matches_grpcs_declaration_against_normalized_entry() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: Some(&mc),
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
 
@@ -717,7 +828,12 @@ fn no_accepted_slice_means_no_discovered_clusters() {
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
         multi_cluster: None,
+        federation: &FederationSnapshot::default(),
+        trust_bundles: None,
         discovery_enabled: true,
+        federation_poll_enabled: false,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: false,
         now_unix_seconds: 1_000,
     });
     assert!(
@@ -725,4 +841,162 @@ fn no_accepted_slice_means_no_discovered_clusters() {
         "no accepted multicluster config → no discovered clusters"
     );
     assert!(resp.configured.is_empty());
+}
+
+#[test]
+fn configured_trust_fail_closed_blocks_control_plane_fallback_before_poll() {
+    let snapshot = RemoteEndpointSnapshot::default();
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        None,
+        None,
+        Some("https://remote.test/.well-known/spiffe"),
+    )]);
+    let trust_bundles = trust_bundles_with_federated(vec!["remote.local"]);
+    let federation = FederationSnapshot::default();
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        federation: &federation,
+        trust_bundles: Some(&trust_bundles),
+        discovery_enabled: false,
+        federation_poll_enabled: true,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: true,
+        now_unix_seconds: 1_000,
+    });
+
+    let configured = &resp.configured[0];
+    assert!(!configured.outbound_trust_active);
+    assert!(!configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "blocked_pending_poll");
+}
+
+#[test]
+fn configured_trust_fail_open_uses_control_plane_fallback_before_poll() {
+    let snapshot = RemoteEndpointSnapshot::default();
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        None,
+        None,
+        Some("https://remote.test/.well-known/spiffe"),
+    )]);
+    let trust_bundles = trust_bundles_with_federated(vec!["remote.local"]);
+    let federation = FederationSnapshot::default();
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        federation: &federation,
+        trust_bundles: Some(&trust_bundles),
+        discovery_enabled: false,
+        federation_poll_enabled: true,
+        federation_fail_open: true,
+        inbound_spiffe_verifier_configured: true,
+        now_unix_seconds: 1_000,
+    });
+
+    let configured = &resp.configured[0];
+    assert!(configured.outbound_trust_active);
+    assert!(configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "control_plane");
+}
+
+#[test]
+fn configured_trust_reports_polled_bundle_freshness() {
+    let snapshot = RemoteEndpointSnapshot::default();
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        None,
+        None,
+        Some("https://remote.test/.well-known/spiffe"),
+    )]);
+    let trust_bundles = trust_bundles_with_federated(vec![]);
+    let federation = federation_snapshot_for("remote-east", "remote.local", 900);
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        federation: &federation,
+        trust_bundles: Some(&trust_bundles),
+        discovery_enabled: false,
+        federation_poll_enabled: true,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: true,
+        now_unix_seconds: 1_000,
+    });
+
+    let configured = &resp.configured[0];
+    assert!(configured.outbound_trust_active);
+    assert!(configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "polled");
+    assert_eq!(configured.trust_bundle_fetched_at_unix_seconds, Some(900));
+    assert_eq!(configured.trust_bundle_age_seconds, Some(100));
+}
+
+#[test]
+fn configured_trust_does_not_report_unpublished_polled_bundle_active() {
+    let snapshot = RemoteEndpointSnapshot::default();
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        None,
+        None,
+        Some("https://remote.test/.well-known/spiffe"),
+    )]);
+    let federation = federation_snapshot_for("remote-east", "remote.local", 900);
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        federation: &federation,
+        trust_bundles: None,
+        discovery_enabled: false,
+        federation_poll_enabled: true,
+        federation_fail_open: false,
+        inbound_spiffe_verifier_configured: true,
+        now_unix_seconds: 1_000,
+    });
+
+    let configured = &resp.configured[0];
+    assert!(!configured.outbound_trust_active);
+    assert!(!configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "none");
+    assert_eq!(configured.trust_bundle_fetched_at_unix_seconds, None);
+    assert_eq!(configured.trust_bundle_age_seconds, None);
+}
+
+#[test]
+fn configured_trust_exposes_outbound_inbound_asymmetry() {
+    let snapshot = RemoteEndpointSnapshot::default();
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        None,
+        None,
+        Some("https://remote.test/.well-known/spiffe"),
+    )]);
+    let trust_bundles = trust_bundles_with_federated(vec!["remote.local"]);
+    let federation = FederationSnapshot::default();
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        federation: &federation,
+        trust_bundles: Some(&trust_bundles),
+        discovery_enabled: false,
+        federation_poll_enabled: true,
+        federation_fail_open: true,
+        inbound_spiffe_verifier_configured: false,
+        now_unix_seconds: 1_000,
+    });
+
+    let configured = &resp.configured[0];
+    assert!(configured.outbound_trust_active);
+    assert!(!configured.inbound_trust_active);
+    assert_eq!(configured.trust_source, "control_plane");
 }
