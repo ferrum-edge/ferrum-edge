@@ -1750,8 +1750,11 @@ impl Plugin for MeshAuthz {
                 .matched_proxy
                 .as_ref()
                 .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
-            let can_use_destination_scope =
-                ctx.node_waypoint_policy_scope.is_some() || is_authenticated_hbone_request(ctx);
+            let can_use_destination_scope = ctx.node_waypoint_policy_scope.is_some()
+                || can_use_inbound_relay_destination_scope_without_source_scope(
+                    ctx,
+                    baggage_outcome,
+                );
             if can_use_destination_scope
                 && let Some(destination_scope_match) = destination_scope_match
             {
@@ -1777,11 +1780,12 @@ impl Plugin for MeshAuthz {
                 // per-request gate the stream path enforces at accept. A mesh with
                 // only mesh-wide policies stays fully evaluable and falls through.
                 //
-                // The exception above is authenticated HBONE on a destination-scoped
-                // proxy (the transparent NodeWaypoint relay): that request has no
-                // captured source-pod scope on the destination side, but it still has
-                // a destination scope and either a trusted baggage source principal
-                // or the authenticated relay peer identity to evaluate.
+                // The exception above is the synthesized inbound HBONE relay with an
+                // honored trusted source assertion: that destination-side request has
+                // no captured source-pod scope, but authz can evaluate destination
+                // policies against the asserted source workload. Source-side
+                // HBONE-shaped traffic, untrusted relay baggage, and missing baggage
+                // keep the existing removed-workload fail-closed behavior.
                 if scope_missing && self.has_scoped_policies {
                     ctx.metadata
                         .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
@@ -2150,6 +2154,19 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
 
 fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
     ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+}
+
+fn can_use_inbound_relay_destination_scope_without_source_scope(
+    ctx: &RequestContext,
+    baggage_outcome: BaggageOutcome,
+) -> bool {
+    ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && matches!(baggage_outcome, BaggageOutcome::Honored)
+        && is_authenticated_hbone_request(ctx)
+        && ctx
+            .matched_proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID)
 }
 
 fn is_hbone_request(ctx: &RequestContext) -> bool {

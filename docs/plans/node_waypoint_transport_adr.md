@@ -153,6 +153,10 @@ The destination NodeWaypoint:
 - requires an authenticated HBONE peer with a SPIFFE identity;
 - accepts asserted workload identity only from an exact NodeWaypoint assertor
   authorized by the current slice;
+- uses destination-scoped AuthorizationPolicy for the transparent inbound HBONE
+  relay only when that trusted source assertion is honored; missing or
+  untrusted relay baggage fails closed instead of evaluating under the relay
+  identity;
 - verifies the asserted source workload still exists in the accepted slice and,
   when available, belongs to the asserting cluster, network, and node;
 - rejects unknown, deleted, stale, malformed, or node-mismatched assertions;

@@ -46,6 +46,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use super::{LoadBalancerConnectionGuard, ProxyState, hbone_pool, mesh_mtls_pool, tcp_proxy};
+use crate::identity::SpiffeId;
 use crate::load_balancer::LoadBalancerCache;
 use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpEgressEntry;
@@ -62,6 +63,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
     epoch: &RequestEpoch,
     entry: &Arc<MeshTcpEgressEntry>,
     orig_dst: std::net::SocketAddr,
+    asserted_source_identity: Option<&SpiffeId>,
 ) {
     let proxy = entry.relay_proxy.as_ref();
     let Some(selection) = LoadBalancerCache::select_target_from(
@@ -157,7 +159,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
                 target.dispatch_policy_port(),
                 hbone_port,
                 expected_peer.as_ref(),
-                None,
+                asserted_source_identity,
             )
             .await
         {
