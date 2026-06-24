@@ -42,6 +42,11 @@ recovers after the default inventory is restored. That forged-assertion probe
 accepts a direct 403 or the source-side 502 wrapper that explicitly reports the
 destination HBONE CONNECT was rejected with 403; in both cases the destination
 policy-deny counter for the expected NodeWaypoint assertor must increase.
+The production SPIRE pass also restarts the SPIRE Agent DaemonSet and the
+NodeWaypoint ambient DaemonSet, then waits for new Workload API SVID metrics,
+registry/mesh-slice readiness, fresh source admission, allow/deny traffic, and
+plaintext/no-client-SVID HBONE rejection before recording
+`node_waypoint.identity.spire_restart_recovery`.
 On dual-stack clusters it also requires the IPv6 pod-netns ready
 markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
 guard.

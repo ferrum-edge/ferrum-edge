@@ -89,6 +89,7 @@ if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
     node_waypoint.identity.plaintext_hbone_rejected
     node_waypoint.identity.unauthenticated_hbone_rejected
     node_waypoint.identity.forged_assertion_rejected
+    node_waypoint.identity.spire_restart_recovery
   )
 fi
 
@@ -2731,6 +2732,129 @@ run_hbone_identity_negative_checks() {
   run_forged_assertion_rejection_check
 }
 
+run_spire_restart_recovery_check() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+
+  log "checking SPIRE Agent and NodeWaypoint restart recovery"
+  local out_dir="$RESULTS_DIR/spire-restart-recovery"
+  mkdir -p "$out_dir"
+
+  local spire_ok=0 ambient_ok=0 svid_ok=0 admission_ok=0 deny_admission_ok=0 allow_ok=0 deny_ok=0 hbone_ok=0
+
+  if kubectl --context "$KUBE_CONTEXT" -n "$SPIRE_NS" rollout restart daemonset/spire-agent >"$out_dir/spire-agent-restart.log" 2>&1 &&
+    ferrum_spire_wait_ready "$KUBE_CONTEXT" "$SPIRE_NS" 5m >"$out_dir/spire-ready.log" 2>&1; then
+    spire_ok=0
+  else
+    spire_ok=$?
+  fi
+
+  if [[ "$spire_ok" -eq 0 ]]; then
+    if kubectl -n "$MESH_NS" rollout restart daemonset/ferrum-mesh-ambient >"$out_dir/ambient-restart.log" 2>&1 &&
+      kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-ambient --timeout=5m >"$out_dir/ambient-ready.log" 2>&1 &&
+      (wait_for_node_waypoint_ready_markers) >"$out_dir/node-waypoint-ready.log" 2>&1 &&
+      (wait_for_ambient_mesh_slice) >"$out_dir/mesh-slice-ready.log" 2>&1; then
+      ambient_ok=0
+    else
+      ambient_ok=$?
+    fi
+  fi
+
+  if [[ "$spire_ok" -eq 0 && "$ambient_ok" -eq 0 ]]; then
+    if (verify_ambient_spire_identity) >"$out_dir/workload-api-svid.log" 2>&1; then
+      svid_ok=0
+    else
+      svid_ok=$?
+    fi
+
+    if try_wait_for_node_waypoint_admission src-a \
+      "post-restart src-a Service path" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      4 >"$out_dir/admission-src-a.log" 2>&1; then
+      admission_ok=0
+    else
+      admission_ok=$?
+    fi
+
+    if try_wait_for_node_waypoint_admission src-b \
+      "post-restart src-b Service path" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      4 >"$out_dir/admission-src-b.log" 2>&1; then
+      deny_admission_ok=0
+    else
+      deny_admission_ok=$?
+    fi
+
+    if expect_allowed src-a \
+      "post-restart allowed Service path" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      "ok-a" \
+      4 >"$out_dir/allow-src-a.log" 2>&1; then
+      allow_ok=0
+    else
+      allow_ok=$?
+    fi
+
+    if expect_blocked src-b \
+      "post-restart AuthorizationPolicy DENY" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      4 >"$out_dir/deny-src-b.log" 2>&1; then
+      deny_ok=0
+    else
+      deny_ok=$?
+    fi
+
+    local pod hbone_pod_count=0
+    hbone_ok=0
+    while IFS= read -r pod; do
+      [[ -n "$pod" ]] || continue
+      hbone_pod_count=$((hbone_pod_count + 1))
+      if ! run_hbone_listener_negative_probe_for_pod plaintext "$pod" >"$out_dir/hbone-plaintext-$pod.log" 2>&1; then
+        hbone_ok=1
+        break
+      fi
+      if ! run_hbone_listener_negative_probe_for_pod unauthenticated "$pod" >"$out_dir/hbone-unauthenticated-$pod.log" 2>&1; then
+        hbone_ok=1
+        break
+      fi
+    done < <(ambient_pods)
+    if [[ "$hbone_pod_count" -lt 2 ]]; then
+      echo "expected at least two recovered ambient pods for post-restart HBONE probes, found $hbone_pod_count" >"$out_dir/hbone-pods.log"
+      hbone_ok=1
+    fi
+  fi
+
+  if [[ "$spire_ok" -eq 0 && "$ambient_ok" -eq 0 && "$svid_ok" -eq 0 &&
+    "$admission_ok" -eq 0 && "$deny_admission_ok" -eq 0 && "$allow_ok" -eq 0 &&
+    "$deny_ok" -eq 0 && "$hbone_ok" -eq 0 ]]; then
+    record_live_assertion \
+      node_waypoint.identity.spire_restart_recovery \
+      pass \
+      src-a \
+      dst-a \
+      "spire-agent-and-nodewaypoint-restarted-svids-reloaded-traffic-and-hbone-authn-recovered" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "" \
+      "spire-restart-recovery,hbone-negative"
+    return
+  fi
+
+  record_live_assertion \
+    node_waypoint.identity.spire_restart_recovery \
+    fail \
+    src-a \
+    dst-a \
+    "spire=$spire_ok ambient=$ambient_ok svid=$svid_ok admission=$admission_ok deny_admission=$deny_admission_ok allow=$allow_ok deny=$deny_ok hbone=$hbone_ok" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)" \
+    "" \
+    "spire-restart-recovery,hbone-negative"
+  collect_traffic_failure_diagnostics
+  return 1
+}
+
 run_traffic_checks() {
   log "running IPv4 Service authorization and bypass checks"
   local dst_a_ip dst_b_ip
@@ -2809,6 +2933,7 @@ run_traffic_checks() {
     4
 
   run_hbone_identity_negative_checks
+  run_spire_restart_recovery_check
 
   if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" != "true" ]]; then
     log "checking stale identity cleanup across source workload recreation"
