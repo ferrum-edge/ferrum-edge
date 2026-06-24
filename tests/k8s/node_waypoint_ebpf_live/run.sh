@@ -2973,16 +2973,26 @@ run_traffic_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  record_live_assertion \
-    node_waypoint.identity.stale_ip_reuse \
-    pass \
-    src-a \
-    dst-a \
-    "source-workload-recreated-with-new-uid-reused-ip-$old_src_a_ip-and-old-uid-absent" \
-    "$(spiffe_for_sa src-a)" \
-    "$(spiffe_for_sa dst-a)" \
-    "cni-ip-reuse"
-  wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  if ! try_wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-source-not-admitted" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-source-not-admitted-after-reused-ip" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    return 1
+  fi
   if ! expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4; then
     record_live_assertion \
       node_waypoint.identity.stale_cleanup \
@@ -2992,6 +3002,15 @@ run_traffic_checks() {
       "recreated-source-not-admitted" \
       "$(spiffe_for_sa src-a)" \
       "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "reused-ip-replacement-traffic-not-allowed" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
     return 1
   fi
   if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
@@ -3003,8 +3022,26 @@ run_traffic_checks() {
       "post-recreation-deny-regressed" \
       "$(spiffe_for_sa src-b)" \
       "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-deny-regressed-after-reused-ip" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
     return 1
   fi
+  record_live_assertion \
+    node_waypoint.identity.stale_ip_reuse \
+    pass \
+    src-a \
+    dst-a \
+    "source-workload-recreated-with-new-uid-reused-ip-$old_src_a_ip-old-uid-absent-and-traffic-verified" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)" \
+    "cni-ip-reuse"
   record_live_assertion \
     node_waypoint.identity.stale_cleanup \
     pass \
