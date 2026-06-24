@@ -104,16 +104,27 @@ capability traces to a specific kernel API used by the code.
 | `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_*_ELEM)` | `EbpfLoader::load()` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
 | `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers; managing host veth qdiscs; iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
 | `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
-| `CAP_SYS_ADMIN` | **Kernel-backcompat only.** On kernel **< 5.8**, `CAP_BPF` and `CAP_PERFMON` do not exist and `CAP_SYS_ADMIN` covers both. The probe in [`src/ebpf/kernel_probe.rs`](../src/ebpf/kernel_probe.rs) accepts kernel ≥ 5.7, so the chart keeps `CAP_SYS_ADMIN` for that one-minor window of 5.7.x. Operators running modern kernels (5.8+) can drop `SYS_ADMIN` via `nodeAgent.security.dropCapSysAdmin=true`. | All of the above | Same as `CAP_BPF` / `CAP_PERFMON` |
+| `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8**. Also required in `node_waypoint` mode on every supported kernel because the agent enters pod network namespaces with `setns()` to resolve host-side veth peers before tc attachment. The chart drops `SYS_ADMIN` for `local_pod` mode on modern kernels but always adds it for `nodeAgent.proxyMode=node_waypoint`. | Older-kernel BPF operations; `setns(CLONE_NEWNET)` for pod-netns veth discovery. | Same as `CAP_BPF` / `CAP_PERFMON`; `discover_host_veth_for_pod` in [`src/ebpf/veth.rs`](../src/ebpf/veth.rs) |
+| `CAP_SYS_PTRACE` | NodeWaypoint ambient proxy only. With `hostPID: true`, Linux still applies `ptrace_may_access` checks to `/proc/{pid}/ns/net`; workloads running with different UIDs or dumpability can otherwise return `EACCES` before the proxy can enter the pod netns. This is not used for `PTRACE_ATTACH`. | `stat`/`open` of `/proc/{pid}/ns/net` for enrolled pod PIDs. | `netns_inode_for_cgroup` and `NetnsGuard::enter` in [`src/proxy/netns_capture.rs`](../src/proxy/netns_capture.rs) |
+
+When `nodeAgent.proxyMode=node_waypoint`, the ambient mesh proxy is part of the
+same capture data path. The chart also grants that proxy `CAP_BPF`,
+`CAP_PERFMON`, `CAP_SYS_ADMIN`, and `CAP_SYS_PTRACE`: it opens the
+node-agent-pinned BPF maps by path, reads SOCK_OPS/orig-dst records, resolves
+registered pod PIDs through host `/proc`, and enters each enrolled pod's
+network namespace with `setns(CLONE_NEWNET)` to bind the pod-loopback capture
+listener.
+Those extra proxy permissions are not rendered for regular ambient iptables
+mode.
+
+`CAP_SYS_PTRACE` is intentionally scoped to the NodeWaypoint ambient proxy, not
+the node-agent DaemonSet. It is broader than the Ferrum code path that uses it:
+Ferrum does not call `ptrace(2)`, but a compromised proxy process with that
+capability should be treated as capable of same-node process inspection unless
+an LSM profile blocks those syscalls.
 
 ### Capabilities deliberately NOT requested
 
-- **`CAP_SYS_PTRACE`** — earlier chart versions added this, but it is not
-  used by any node-agent code path. The veth discovery code
-  ([`src/ebpf/veth.rs`](../src/ebpf/veth.rs)) reads
-  `/proc/{pid}/net/if_inet6` and walks `/sys/class/net/*/ifindex` — both
-  succeed under `hostPID: true` alone, without `ptrace`/`PTRACE_ATTACH`.
-  Removed from the chart in this commit.
 - **`CAP_SYS_RESOURCE`** — `raise_fd_limit()` in [`src/main.rs`](../src/main.rs)
   raises only the soft FD cap (via `setrlimit(RLIMIT_NOFILE)`); the hard cap
   is set by the operator via `LimitNOFILE=` (systemd) or `--ulimit nofile=`
@@ -136,6 +147,12 @@ capability traces to a specific kernel API used by the code.
 | `cgroup` (hostPath) | `/sys/fs/cgroup` (default; override via `FERRUM_NODE_AGENT_CGROUP_ROOT`) | ro | Opening a cgroup directory FD is required to call `BPF_PROG_ATTACH` against it (`attach_cgroup` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs)). The directory is mounted read-only; BPF attach uses the FD via the BPF subsystem, not direct cgroup writes. |
 | ServiceAccount token | `/var/run/secrets/kubernetes.io/serviceaccount/` | ro | Automatically projected by the kubelet. Consumed by `kube::Config::incluster()` ([`build_node_agent_kube_client` in `src/modes/node_agent.rs`](../src/modes/node_agent.rs)) to authenticate the `pods`/`nodes` watcher to the API server. Operators should prefer a **projected** token with a short `expirationSeconds` (the kubelet handles rotation) over the legacy long-lived Secret token. |
 | `/proc` | implicit via `hostPID: true` | ro | Veth discovery reads `/proc/{pid}/net/if_inet6` ([`src/ebpf/veth.rs`](../src/ebpf/veth.rs)) to find the host-side veth ifindex for each enrolled pod. Without `hostPID`, the container's `/proc` only shows its own PIDs and cannot resolve pod-PID-to-veth. |
+
+In NodeWaypoint topology, the ambient proxy mounts the same host bpffs and
+cgroup roots read-only and also runs with `hostPID: true`. It does not attach
+BPF programs or write cgroups; it needs those views to open pinned maps, find a
+live PID in each registry cgroup, and `setns()` into the matching pod network
+namespace before publishing `<podRegistryDir>/.ready/<pod_uid>`.
 
 ### Mounts deliberately NOT requested
 
@@ -208,7 +225,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ferrum-edge
-          image: ferrumedge/ferrum-edge:0.9.0
+          image: ferrumedge/ferrum-edge:0.9.0-ebpf
           args: ["run"]
           securityContext:
             # Root is required inside the container for BPF cgroup attach;
@@ -224,7 +241,7 @@ spec:
                 - BPF              # kernel >= 5.8; covered by SYS_ADMIN on older
                 - NET_ADMIN        # cgroup/tc attach, iptables fallback
                 - PERFMON          # kernel >= 5.8 BPF info/BTF
-                - SYS_ADMIN        # kernel < 5.8 backcompat; drop on 5.8+
+                - SYS_ADMIN        # required by node_waypoint setns/veth discovery
           volumeMounts:
             - name: bpf-fs
               mountPath: /sys/fs/bpf
@@ -238,6 +255,10 @@ spec:
           env:
             - name: FERRUM_MODE
               value: "node_agent"
+            - name: FERRUM_MESH_CAPTURE_MODE
+              value: "ebpf"
+            - name: FERRUM_NODE_AGENT_PROXY_MODE
+              value: "node_waypoint"
             - name: FERRUM_NODE_AGENT_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -379,6 +400,8 @@ profile ferrum-node-agent /usr/local/bin/ferrum-edge {
   capability net_admin,
   capability perfmon,
   capability sys_admin,
+  # Needed only if this profile is reused for the NodeWaypoint ambient proxy.
+  capability sys_ptrace,
 }
 ```
 
@@ -420,7 +443,7 @@ namespace:
 
 | Port | Protocol | Endpoint | Auth | Notes |
 |---|---|---|---|---|
-| `$FERRUM_ADMIN_HTTP_PORT` (default `9000`) | TCP / HTTP | `/metrics`, `/health`, `/overload` | Unauthenticated | Disabled unless `FERRUM_NODE_AGENT_ADMIN_ENABLED=true`. When enabled, defaults to `127.0.0.1` unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set — see [`docs/node_agent.md`](node_agent.md). |
+| `$FERRUM_ADMIN_HTTP_PORT` (binary default `9000`; Helm `nodeAgent.admin.port` default `19090`) | TCP / HTTP | `/metrics`, `/health`, `/overload` | Unauthenticated | Disabled unless `FERRUM_NODE_AGENT_ADMIN_ENABLED=true`. When enabled, defaults to `127.0.0.1` unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set — see [`docs/node_agent.md`](node_agent.md). |
 | n/a | n/a | No gRPC, no DP↔CP listener, no proxy listener | — | The node agent is not a proxy and does not accept business traffic. |
 
 Because the agent runs in the host network namespace, "binding to

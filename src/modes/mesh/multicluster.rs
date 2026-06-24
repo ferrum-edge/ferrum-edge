@@ -1813,6 +1813,7 @@ mod tests {
             locality: locality.map(str::to_string),
             service_account: None,
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }
     }

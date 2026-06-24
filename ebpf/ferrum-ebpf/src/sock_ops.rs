@@ -27,15 +27,24 @@
 //! connect-side record is re-keyed by `(netns cookie, connection tuple)` into
 //! `FERRUM_ORIG_DST_BY_TUPLE4`/`FERRUM_ORIG_DST_BY_TUPLE6`; at passive-established
 //! the mirror tuple is looked up and the record re-stamped under the accept-side
-//! cookie. The netns cookie is essential: captured connections all target
-//! `127.0.0.1:15001` / `[::1]:15001`, so the tuple alone collapses to loopback +
-//! an ephemeral port that can collide across pods in this one global map; the
-//! per-netns cookie keeps each pod's key distinct (no pod overwrites another's
-//! record → no identity misattribution) while staying identical across the two
-//! ends of a same-netns connection. See [`bridge_active_established`] /
-//! [`bridge_passive_established`]. A byte-order / tuple / netns mismatch only
-//! leaves resolution fail-closed (unchanged from pre-GAP-2M), never
-//! misattributed.
+//! cookie. The netns cookie is the preferred discriminator: captured connections
+//! all target `127.0.0.1:15001` / `[::1]:15001`, so the tuple alone collapses to
+//! loopback + an ephemeral port that can collide across pods in this one global
+//! map. Live NodeWaypoint CI exposed one more kernel/runtime wrinkle: because
+//! the proxy accepts on a socket originally bound in the workload netns but the
+//! accept syscall runs on the proxy task, some passive sock-ops callbacks report
+//! the accepting task's netns cookie rather than the workload socket's netns
+//! cookie. For that case the bridge publishes and probes a secondary
+//! `netns_cookie = 0` key. Userspace validates the resolved pod UID against the
+//! pod-specific in-netns listener before admitting traffic, so an any-netns hit
+//! can only repair the active/passive join; it cannot silently authorize a
+//! different pod.
+//!
+//! The two callbacks can arrive in either order for local loopback:
+//! active-first stores the original destination until passive consumes it, while
+//! passive-first stores the accept-side cookie until active stamps it. See
+//! [`bridge_active_established`] / [`bridge_passive_established`]. A byte-order
+//! or tuple mismatch leaves resolution fail-closed (unchanged from pre-GAP-2M).
 //!
 //! The IPv6 address fields are read element-by-element via a **volatile**
 //! per-`u32` ctx load ([`read_ctx_u32`]) at the four explicit `local_ip6` /
@@ -59,14 +68,16 @@ use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    sock_ops_peer_port_host_order, ConnTuple4, ConnTuple6, OrigDstKey, SockOpsRecord,
-    SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
-    SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
-    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SOCK_OPS_STATS_EVENTS_DROPPED,
+    sock_ops_peer_port_host_order, ConnTuple4, ConnTuple6, OrigDst4, OrigDst6, OrigDstKey,
+    SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
+    SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
+    SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
+    SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
 use crate::maps::{
-    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
+    FERRUM_ACCEPT_COOKIE_BY_TUPLE4, FERRUM_ACCEPT_COOKIE_BY_TUPLE6, FERRUM_ORIG_DST4,
+    FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
     FERRUM_SOCK_OPS_CONNECT_TS, FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
 };
 
@@ -342,14 +353,15 @@ fn bridge_active_established_v4(ctx: &SockOpsContext) {
     // remote addr/port is the loopback capture endpoint (the server). The netns
     // cookie disambiguates pods that share the loopback 4-tuple.
     if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&OrigDstKey { cookie }) }.copied() {
-        let tuple = ConnTuple4::new(
-            socket_netns_cookie(ctx),
-            read_ctx_u32(ctx, SK_OPS_LOCAL_IP4_OFF),
-            read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
-            read_ctx_u32(ctx, SK_OPS_REMOTE_IP4_OFF),
-            sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
-        );
+        let tuple = active_tuple4(ctx);
+        let any_tuple = tuple.any_netns();
         let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&tuple, &orig, 0);
+        let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&any_tuple, &orig, 0);
+        if let Some(accept_cookie) = accept_cookie_for_tuple4(&tuple, &any_tuple) {
+            stamp_accept_orig_dst4(accept_cookie, &orig);
+            cleanup_tuple4(&tuple);
+            cleanup_tuple4(&any_tuple);
+        }
     }
 }
 
@@ -362,14 +374,15 @@ fn bridge_active_established_v4(ctx: &SockOpsContext) {
 fn bridge_active_established_v6(ctx: &SockOpsContext) {
     let cookie = socket_cookie(ctx);
     if let Some(orig) = unsafe { FERRUM_ORIG_DST6.get(&OrigDstKey { cookie }) }.copied() {
-        let tuple = ConnTuple6::new(
-            socket_netns_cookie(ctx),
-            read_ctx_ip6(ctx, SK_OPS_LOCAL_IP6_OFF),
-            read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
-            read_ctx_ip6(ctx, SK_OPS_REMOTE_IP6_OFF),
-            sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
-        );
+        let tuple = active_tuple6(ctx);
+        let any_tuple = tuple.any_netns();
         let _ = FERRUM_ORIG_DST_BY_TUPLE6.insert(&tuple, &orig, 0);
+        let _ = FERRUM_ORIG_DST_BY_TUPLE6.insert(&any_tuple, &orig, 0);
+        if let Some(accept_cookie) = accept_cookie_for_tuple6(&tuple, &any_tuple) {
+            stamp_accept_orig_dst6(accept_cookie, &orig);
+            cleanup_tuple6(&tuple);
+            cleanup_tuple6(&any_tuple);
+        }
     }
 }
 
@@ -394,17 +407,17 @@ fn bridge_passive_established_v4(ctx: &SockOpsContext) {
     let cookie = socket_cookie(ctx);
     // Passive side mirrors the active tuple: the remote socket addr/port is the
     // client, the local addr/port is the loopback server. The netns cookie is
-    // the same as the active side for a same-netns connection.
-    let tuple = ConnTuple4::new(
-        socket_netns_cookie(ctx),
-        read_ctx_u32(ctx, SK_OPS_REMOTE_IP4_OFF),
-        sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
-        read_ctx_u32(ctx, SK_OPS_LOCAL_IP4_OFF),
-        read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
-    );
-    if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
-        let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
-        let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(&tuple);
+    // the same as the active side for a same-netns connection; the any-netns
+    // fallback covers kernels that report the accepting task's netns here.
+    let tuple = passive_tuple4(ctx);
+    let any_tuple = tuple.any_netns();
+    if let Some(orig) = orig_dst_for_tuple4(&tuple, &any_tuple) {
+        stamp_accept_orig_dst4(cookie, &orig);
+        cleanup_tuple4(&tuple);
+        cleanup_tuple4(&any_tuple);
+    } else {
+        let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE4.insert(&tuple, &cookie, 0);
+        let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE4.insert(&any_tuple, &cookie, 0);
     }
 }
 
@@ -415,17 +428,126 @@ fn bridge_passive_established_v4(ctx: &SockOpsContext) {
 #[inline(always)]
 fn bridge_passive_established_v6(ctx: &SockOpsContext) {
     let cookie = socket_cookie(ctx);
-    let tuple = ConnTuple6::new(
+    let tuple = passive_tuple6(ctx);
+    let any_tuple = tuple.any_netns();
+    if let Some(orig) = orig_dst_for_tuple6(&tuple, &any_tuple) {
+        stamp_accept_orig_dst6(cookie, &orig);
+        cleanup_tuple6(&tuple);
+        cleanup_tuple6(&any_tuple);
+    } else {
+        let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE6.insert(&tuple, &cookie, 0);
+        let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE6.insert(&any_tuple, &cookie, 0);
+    }
+}
+
+#[inline(always)]
+fn accept_cookie_for_tuple4(tuple: &ConnTuple4, any_tuple: &ConnTuple4) -> Option<u64> {
+    if let Some(cookie) = unsafe { FERRUM_ACCEPT_COOKIE_BY_TUPLE4.get(tuple) }.copied() {
+        return Some(cookie);
+    }
+    unsafe { FERRUM_ACCEPT_COOKIE_BY_TUPLE4.get(any_tuple) }.copied()
+}
+
+#[inline(always)]
+fn accept_cookie_for_tuple6(tuple: &ConnTuple6, any_tuple: &ConnTuple6) -> Option<u64> {
+    if let Some(cookie) = unsafe { FERRUM_ACCEPT_COOKIE_BY_TUPLE6.get(tuple) }.copied() {
+        return Some(cookie);
+    }
+    unsafe { FERRUM_ACCEPT_COOKIE_BY_TUPLE6.get(any_tuple) }.copied()
+}
+
+#[inline(always)]
+fn orig_dst_for_tuple4(tuple: &ConnTuple4, any_tuple: &ConnTuple4) -> Option<OrigDst4> {
+    if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(tuple) }.copied() {
+        return Some(orig);
+    }
+    unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(any_tuple) }.copied()
+}
+
+#[inline(always)]
+fn orig_dst_for_tuple6(tuple: &ConnTuple6, any_tuple: &ConnTuple6) -> Option<OrigDst6> {
+    if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE6.get(tuple) }.copied() {
+        return Some(orig);
+    }
+    unsafe { FERRUM_ORIG_DST_BY_TUPLE6.get(any_tuple) }.copied()
+}
+
+#[inline(always)]
+fn cleanup_tuple4(tuple: &ConnTuple4) {
+    let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(tuple);
+    let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE4.remove(tuple);
+}
+
+#[inline(always)]
+fn cleanup_tuple6(tuple: &ConnTuple6) {
+    let _ = FERRUM_ORIG_DST_BY_TUPLE6.remove(tuple);
+    let _ = FERRUM_ACCEPT_COOKIE_BY_TUPLE6.remove(tuple);
+}
+
+#[inline(always)]
+fn active_tuple4(ctx: &SockOpsContext) -> ConnTuple4 {
+    ConnTuple4::new(
+        socket_netns_cookie(ctx),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_IP4_OFF),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+        read_ctx_u32(ctx, SK_OPS_REMOTE_IP4_OFF),
+        sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
+    )
+}
+
+#[inline(always)]
+fn passive_tuple4(ctx: &SockOpsContext) -> ConnTuple4 {
+    ConnTuple4::new(
+        socket_netns_cookie(ctx),
+        read_ctx_u32(ctx, SK_OPS_REMOTE_IP4_OFF),
+        sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_IP4_OFF),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+    )
+}
+
+#[inline(always)]
+fn active_tuple6(ctx: &SockOpsContext) -> ConnTuple6 {
+    ConnTuple6::new(
+        socket_netns_cookie(ctx),
+        read_ctx_ip6(ctx, SK_OPS_LOCAL_IP6_OFF),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+        read_ctx_ip6(ctx, SK_OPS_REMOTE_IP6_OFF),
+        sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
+    )
+}
+
+#[inline(always)]
+fn passive_tuple6(ctx: &SockOpsContext) -> ConnTuple6 {
+    ConnTuple6::new(
         socket_netns_cookie(ctx),
         read_ctx_ip6(ctx, SK_OPS_REMOTE_IP6_OFF),
         sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
         read_ctx_ip6(ctx, SK_OPS_LOCAL_IP6_OFF),
         read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+    )
+}
+
+#[inline(always)]
+fn stamp_accept_orig_dst4(accept_cookie: u64, orig: &OrigDst4) {
+    let _ = FERRUM_ORIG_DST4.insert(
+        &OrigDstKey {
+            cookie: accept_cookie,
+        },
+        orig,
+        0,
     );
-    if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE6.get(&tuple) }.copied() {
-        let _ = FERRUM_ORIG_DST6.insert(&OrigDstKey { cookie }, &orig, 0);
-        let _ = FERRUM_ORIG_DST_BY_TUPLE6.remove(&tuple);
-    }
+}
+
+#[inline(always)]
+fn stamp_accept_orig_dst6(accept_cookie: u64, orig: &OrigDst6) {
+    let _ = FERRUM_ORIG_DST6.insert(
+        &OrigDstKey {
+            cookie: accept_cookie,
+        },
+        orig,
+        0,
+    );
 }
 
 /// Remove this socket's original-destination record from
@@ -445,8 +567,24 @@ fn cleanup_orig_dst_on_close(ctx: &SockOpsContext) {
     };
     if ctx.family() == AF_INET {
         let _ = FERRUM_ORIG_DST4.remove(&key);
-    } else {
+        let active = active_tuple4(ctx);
+        let passive = passive_tuple4(ctx);
+        let any_active = active.any_netns();
+        let any_passive = passive.any_netns();
+        cleanup_tuple4(&active);
+        cleanup_tuple4(&passive);
+        cleanup_tuple4(&any_active);
+        cleanup_tuple4(&any_passive);
+    } else if ctx.family() == AF_INET6 {
         let _ = FERRUM_ORIG_DST6.remove(&key);
+        let active = active_tuple6(ctx);
+        let passive = passive_tuple6(ctx);
+        let any_active = active.any_netns();
+        let any_passive = passive.any_netns();
+        cleanup_tuple6(&active);
+        cleanup_tuple6(&passive);
+        cleanup_tuple6(&any_active);
+        cleanup_tuple6(&any_passive);
     }
 }
 

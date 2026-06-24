@@ -118,6 +118,20 @@ cargo test --test integration_tests
 cargo test --test functional_tests -- --ignored --nocapture
 ```
 
+### Mesh Conformance and Live Evidence
+
+`tests/conformance/ga_contract.yaml` is the machine-readable GA product
+contract for mesh semantic coverage. `cargo test --test conformance_tests`
+validates the manifest and emits `target/conformance/coverage.json` plus
+`target/conformance/coverage.md`.
+
+Kubernetes live suites should source helpers from `tests/k8s/lib/`:
+
+- `kind.sh` for disposable kind clusters and shared diagnostics.
+- `spire.sh` for the common SPIRE install/readiness/diagnostics flow.
+- `live_assertions.sh` for `live-assertions.json` files keyed by stable
+  assertion IDs from the GA contract.
+
 ### By Test Name Pattern
 ```bash
 cargo test plugin           # All plugin-related tests

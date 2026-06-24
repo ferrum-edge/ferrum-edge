@@ -116,7 +116,9 @@ paths:
         startup (the body's `status` field is set to `"starting"` and
         `ready` is `false`). Once startup is complete the endpoint returns
         `200 OK` with `status` set to `"ok"` or `"degraded"` (DB
-        disconnected / admin writes blocked).
+        disconnected / admin writes blocked / database incremental polling
+        repeatedly rejecting the same delta while serving last known-good
+        config).
       tags: [Health]
       security: []
       responses:
@@ -1251,6 +1253,9 @@ paths:
         certificate rotation counters, source refresh outcomes, source fetch
         duration histograms, and bounded source fetch failure counters when
         those source watchers are active.
+        Database mode adds bounded rejected-delta polling counters and gauges
+        for validation rejections, retry backoff buckets, forced full reloads,
+        and recoveries. These labels never include raw resource IDs.
         Mesh mode adds identity and control-plane telemetry families for
         certificate expiry, rotation failures, CA health, trust-bundle
         versions, config freshness, and mTLS handshake failures.
@@ -1382,7 +1387,8 @@ paths:
         Returns a comprehensive snapshot of the gateway's runtime state including
         request throughput, connection pool sizes, circuit breaker states, health
         check results, load balancer active connections, cache statistics, consumer
-        index breakdowns, and rate limiter tracked keys.
+        index breakdowns, rate limiter tracked keys, and database rejected-delta
+        polling state in database mode.
 
         The response is cached for 5 seconds to avoid performance impact from
         frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
@@ -2242,6 +2248,9 @@ paths:
                         - control_plane_configured
                         - federation_endpoint_configured
                         - discovered
+                        - outbound_trust_active
+                        - inbound_trust_active
+                        - trust_source
                       properties:
                         cluster_name:
                           type: string
@@ -2268,6 +2277,30 @@ paths:
                           description: |
                             Whether this cluster is present in the scoped
                             `discovered` view (matched by name + trust domain).
+                        outbound_trust_active:
+                          type: boolean
+                          description: Whether this DP has an active outbound trust bundle for the remote trust domain.
+                        inbound_trust_active:
+                          type: boolean
+                          description: Whether this DP has an active inbound SPIFFE verifier that can authenticate peers from the remote trust domain.
+                        trust_source:
+                          type: string
+                          enum: [polled, control_plane, local, blocked_pending_poll, none]
+                          description: |
+                            Source of the currently effective remote trust
+                            state. `blocked_pending_poll` means fail-closed
+                            bootstrap is blocking a CP-supplied fallback until
+                            the first successful federation poll.
+                        trust_bundle_fetched_at_unix_seconds:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: Unix timestamp (seconds) of the last successful polled bundle fetch, present when `trust_source` is `polled`.
+                        trust_bundle_age_seconds:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          description: Seconds since the last successful polled bundle fetch, present when `trust_source` is `polled`.
               examples:
                 discovery-active:
                   value:
@@ -2287,11 +2320,19 @@ paths:
                         control_plane_configured: true
                         federation_endpoint_configured: true
                         discovered: true
+                        outbound_trust_active: true
+                        inbound_trust_active: true
+                        trust_source: polled
+                        trust_bundle_fetched_at_unix_seconds: 1747595530
+                        trust_bundle_age_seconds: 9
                       - cluster_name: remote-west
                         trust_domain: west.example.com
                         control_plane_configured: false
                         federation_endpoint_configured: true
                         discovered: false
+                        outbound_trust_active: false
+                        inbound_trust_active: false
+                        trust_source: blocked_pending_poll
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -7968,6 +8009,8 @@ components:
             consumer_count:
               type: integer
               description: Present only when `available` is true
+        database_polling:
+          $ref: "#/components/schemas/DatabaseDeltaPollingHealth"
 
     # ── Overload ──────────────────────────────────────────────────
     OverloadNoProxyState:
@@ -8247,6 +8290,124 @@ components:
               type: integer
               format: uint64
 
+    DatabaseDeltaPollingDegraded:
+      type: object
+      description: |
+        Active database incremental-delta rejection state. Labels are bounded
+        enums and never include raw resource IDs.
+      required:
+        - reason
+        - resource_category
+        - validation_category
+        - consecutive_identical_rejections
+        - current_backoff_bucket
+        - current_backoff_seconds
+        - escalated
+      properties:
+        reason:
+          type: string
+          enum: [rejected_incremental_delta, rejected_incremental_delta_escalated]
+        resource_category:
+          type: string
+          enum: [none, proxy, consumer, plugin_config, upstream, mixed]
+        validation_category:
+          type: string
+          enum: [security_plugin, duplicate_route, listener, upstream_reference, plugin_reference, tls, other]
+        consecutive_identical_rejections:
+          type: integer
+          format: int64
+        current_backoff_bucket:
+          type: string
+          enum: [none, lt_5s, lt_30s, lt_5m, gte_5m, max]
+        current_backoff_seconds:
+          type: integer
+          format: int64
+        escalated:
+          type: boolean
+
+    DatabaseDeltaPollingHealth:
+      type: object
+      description: |
+        Database-mode polling health for rejected incremental deltas. Present
+        only in database mode. When `status` is `degraded`, the gateway keeps
+        serving the last known-good runtime config and leaves the accepted poll
+        cursor unchanged.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        reason:
+          type: string
+          enum: [rejected_incremental_delta, rejected_incremental_delta_escalated]
+        resource_category:
+          type: string
+          enum: [none, proxy, consumer, plugin_config, upstream, mixed]
+        validation_category:
+          type: string
+          enum: [security_plugin, duplicate_route, listener, upstream_reference, plugin_reference, tls, other]
+        consecutive_identical_rejections:
+          type: integer
+          format: int64
+        current_backoff_bucket:
+          type: string
+          enum: [none, lt_5s, lt_30s, lt_5m, gte_5m, max]
+        current_backoff_seconds:
+          type: integer
+          format: int64
+        escalated:
+          type: boolean
+
+    DatabaseDeltaPollingMetrics:
+      type: object
+      description: |
+        Bounded metrics for database incremental-delta validation rejections.
+        Resource-category and backoff dimensions are fixed enum labels; raw
+        resource IDs are never exposed as metric labels.
+      required:
+        - rejected_deltas_total
+        - rejected_deltas_by_resource_category
+        - consecutive_identical_rejections
+        - current_backoff_bucket
+        - current_backoff_seconds
+        - forced_full_reloads_total
+        - recoveries_total
+        - last_resource_category
+      properties:
+        rejected_deltas_total:
+          type: integer
+          format: int64
+        rejected_deltas_by_resource_category:
+          type: object
+          description: |
+            Counts keyed by fixed resource-category labels:
+            `none`, `proxy`, `consumer`, `plugin_config`, `upstream`, `mixed`.
+          additionalProperties:
+            type: integer
+            format: int64
+        consecutive_identical_rejections:
+          type: integer
+          format: int64
+        current_backoff_bucket:
+          type: string
+          enum: [none, lt_5s, lt_30s, lt_5m, gte_5m, max]
+        current_backoff_seconds:
+          type: integer
+          format: int64
+        forced_full_reloads_total:
+          type: integer
+          format: int64
+        recoveries_total:
+          type: integer
+          format: int64
+        last_resource_category:
+          type: string
+          enum: [none, proxy, consumer, plugin_config, upstream, mixed]
+        degraded:
+          anyOf:
+            - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
+            - type: "null"
+
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
       type: object
@@ -8284,6 +8445,8 @@ components:
           $ref: "#/components/schemas/AdminMetricsConsumerIndex"
         rate_limiting:
           $ref: "#/components/schemas/AdminMetricsRateLimiting"
+        database_polling:
+          $ref: "#/components/schemas/DatabaseDeltaPollingMetrics"
 
     AdminMetricsGateway:
       type: object
@@ -10605,14 +10768,17 @@ components:
             (raw TCP streams). A connection whose source pod has no resolved
             per-pod scope records `mesh_authz.scope_missing`; when any
             namespace/selector-scoped policy is configured it then **fails closed**
-            (`403`, `mesh_authz.deny_policy=scope_missing`) on both the HTTP/HBONE
-            request path and TCP/UDP/DTLS streams (at accept) — a missing scope
+            (`403`, `mesh_authz.deny_policy=scope_missing`) on the HTTP/HBONE
+            request path and raw TCP streams (at accept) — a missing scope
             means the source workload left the live slice generation, not an
             enrollment race, so a long-lived connection from a removed workload
-            stops being served under scoped authz. With only mesh-wide policies
-            configured, both paths stay fully evaluable and fall through to
-            mesh-wide-only evaluation. Auto-set by mesh injection on
-            `NodeWaypoint` topology where one listener serves many pods.
+            stops being served under scoped authz. NodeWaypoint UDP/DTLS has no
+            trustworthy per-datagram/session pod scope, so slice preparation
+            disables UDP/DTLS service/proxy paths when enforcing
+            namespace/selector-scoped policies are present; mesh-wide UDP/DTLS
+            policy remains evaluable, and audit-only scoped policy does not
+            force suppression. Auto-set by mesh injection on `NodeWaypoint`
+            topology where one listener serves many pods.
         trusted_hbone_assertors:
           type: array
           items:

@@ -9,6 +9,7 @@ pub(crate) mod registry;
 
 pub(crate) mod report;
 
+mod contract;
 mod ga_scope;
 mod istio_authorization_policy;
 mod istio_destination_rule;

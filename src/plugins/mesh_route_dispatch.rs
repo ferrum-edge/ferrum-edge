@@ -27,9 +27,13 @@
 //! The plugin intentionally runs after authentication, authorization, and
 //! rate limiting. Those admission decisions use the public listener proxy
 //! identity; only downstream `before_proxy` plugins and backend dispatch see
-//! the effective override destination. WebSocket support applies to the
-//! HTTP upgrade handshake destination only — once upgraded, a WebSocket
-//! connection stays pinned to that backend and is not re-routed per frame.
+//! the effective override destination. Node-waypoint Service egress with
+//! scoped mesh policies is the exception: `mesh_authz` stamps the authorized
+//! Service upstream, and this plugin rejects any matching rule that would
+//! rewrite that request to a different upstream or direct backend. WebSocket
+//! support applies to the HTTP upgrade handshake destination only — once
+//! upgraded, a WebSocket connection stays pinned to that backend and is not
+//! re-routed per frame.
 //! HBONE CONNECT traffic now flows through the standard `before_proxy` chain
 //! before the HBONE relay branch in `proxy/mod.rs`, so this plugin can
 //! match on the outer CONNECT request (method, headers, query params) and
@@ -61,6 +65,10 @@ use crate::config::types::{
     BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
+};
+use crate::plugins::mesh::authz::{
+    NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
+    NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
 use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
@@ -990,6 +998,11 @@ pub struct RouteDestination {
     /// routes to a direct backend that uses different mTLS settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_tls: Option<BackendTlsConfig>,
+    /// Trusted translator marker for destinations that enter NodeWaypoint
+    /// Service authz. When scoped NodeWaypoint authz ran but did not stamp an
+    /// authorized destination, matching this rule must fail closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_node_waypoint_authz: bool,
 }
 
 impl RouteDestination {
@@ -999,6 +1012,85 @@ impl RouteDestination {
             && self.backend_port.is_none()
             && self.backend_tls.is_none()
     }
+}
+
+fn reject_node_waypoint_authz_destination_override(
+    ctx: &RequestContext,
+    destination: &RouteDestination,
+) -> Option<PluginResult> {
+    let authorized_upstream_id = ctx
+        .metadata
+        .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA);
+    let authorized_backend = ctx.metadata.get(NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA);
+    let authorized_backend_aliases = ctx
+        .metadata
+        .get(NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA);
+    if authorized_upstream_id.is_none() && authorized_backend.is_none() {
+        if destination.requires_node_waypoint_authz
+            && !destination.is_empty()
+            && ctx
+                .metadata
+                .get(NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA)
+                .is_some_and(|value| value == "true")
+        {
+            return Some(PluginResult::Reject {
+                status_code: 403,
+                body:
+                    "node-waypoint mesh authorization requires an authorized destination before route override"
+                        .to_string(),
+                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            });
+        }
+        return None;
+    }
+    if destination.is_empty() {
+        return None;
+    }
+    if let Some(authorized_upstream_id) = authorized_upstream_id
+        && destination.upstream_id.as_deref() == Some(authorized_upstream_id.as_str())
+        && destination.backend_host.is_none()
+        && destination.backend_port.is_none()
+        && destination.backend_tls.is_none()
+    {
+        return None;
+    }
+    if let Some(authorized_backend) = authorized_backend
+        && destination.upstream_id.is_none()
+        && let Some(destination_backend) = destination.backend_host.as_deref().and_then(|host| {
+            destination
+                .backend_port
+                .and_then(|port| node_waypoint_backend_metadata_value(host, port))
+        })
+        && (destination_backend == *authorized_backend
+            || node_waypoint_backend_metadata_contains(
+                authorized_backend_aliases.map(String::as_str),
+                &destination_backend,
+            ))
+    {
+        return None;
+    }
+    Some(PluginResult::Reject {
+        status_code: 403,
+        body:
+            "node-waypoint mesh authorization forbids route override to an unauthorized destination"
+                .to_string(),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+    })
+}
+
+fn node_waypoint_backend_metadata_value(host: &str, port: u16) -> Option<String> {
+    if port == 0 {
+        return None;
+    }
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then(|| format!("{host}|{port}"))
+}
+
+fn node_waypoint_backend_metadata_contains(values: Option<&str>, backend: &str) -> bool {
+    values
+        .into_iter()
+        .flat_map(|values| values.split(','))
+        .any(|value| value.trim() == backend)
 }
 
 /// Per-rule fault action carried by a single [`RouteRule`]. Projects Istio
@@ -1511,6 +1603,11 @@ impl Plugin for MeshRouteDispatch {
                 // stage).
                 if let Some(fault) = rule.fault.as_ref()
                     && let Some(result) = apply_fault_action(ctx, headers, rule, fault).await
+                {
+                    return result;
+                }
+                if let Some(result) =
+                    reject_node_waypoint_authz_destination_override(ctx, &rule.destination)
                 {
                     return result;
                 }

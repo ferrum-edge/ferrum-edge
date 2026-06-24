@@ -36,7 +36,8 @@ use serde_json::Value;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     MAX_TARGET_WEIGHT, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    RetryConfig, Upstream, UpstreamTarget, default_namespace,
+    RetryConfig, UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::MeshConfig;
@@ -95,6 +96,7 @@ pub struct K8sObject {
 #[derive(Debug, Clone)]
 pub struct K8sTranslationOptions {
     pub namespace: String,
+    pub node_waypoint_namespace: String,
     pub trust_domain: TrustDomain,
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
@@ -114,12 +116,15 @@ pub struct K8sTranslationOptions {
     /// (`enforced || dry_run`) and is not affected by this.
     pub mesh_sidecar_ingress_enforced: bool,
     source_namespaces: Option<HashSet<String>>,
+    pod_source_namespaces: Option<HashSet<String>>,
 }
 
 impl K8sTranslationOptions {
     pub fn new(namespace: String, trust_domain: TrustDomain) -> Self {
         let source_namespaces = HashSet::from([namespace.clone()]);
+        let pod_source_namespaces = HashSet::from([namespace.clone()]);
         Self {
+            node_waypoint_namespace: namespace.clone(),
             namespace,
             trust_domain,
             prefer_istio_on_overlap: true,
@@ -128,6 +133,7 @@ impl K8sTranslationOptions {
             pod_discovery_enabled: false,
             mesh_sidecar_ingress_enforced: false,
             source_namespaces: Some(source_namespaces),
+            pod_source_namespaces: Some(pod_source_namespaces),
         }
     }
 
@@ -153,6 +159,13 @@ impl K8sTranslationOptions {
         self
     }
 
+    pub fn with_node_waypoint_namespace(mut self, namespace: String) -> Self {
+        if !namespace.trim().is_empty() {
+            self.node_waypoint_namespace = namespace;
+        }
+        self
+    }
+
     pub fn with_cluster_domain(mut self, domain: String) -> Self {
         // Empty/whitespace falls back to the existing default (`cluster.local`)
         // rather than producing a translator that can never match a FQDN host.
@@ -163,7 +176,18 @@ impl K8sTranslationOptions {
     }
 
     pub fn with_source_namespaces(mut self, namespaces: Vec<String>) -> Self {
-        self.source_namespaces = if namespaces.is_empty() {
+        let source_namespaces = if namespaces.is_empty() {
+            None
+        } else {
+            Some(namespaces.into_iter().collect())
+        };
+        self.pod_source_namespaces = source_namespaces.clone();
+        self.source_namespaces = source_namespaces;
+        self
+    }
+
+    pub fn with_pod_source_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.pod_source_namespaces = if namespaces.is_empty() {
             None
         } else {
             Some(namespaces.into_iter().collect())
@@ -173,6 +197,12 @@ impl K8sTranslationOptions {
 
     fn includes_namespace(&self, namespace: &str) -> bool {
         self.source_namespaces
+            .as_ref()
+            .is_none_or(|namespaces| namespaces.contains(namespace))
+    }
+
+    fn includes_pod_namespace(&self, namespace: &str) -> bool {
+        self.pod_source_namespaces
             .as_ref()
             .is_none_or(|namespaces| namespaces.contains(namespace))
     }
@@ -870,16 +900,29 @@ where
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
-    options.includes_namespace(&object.metadata.namespace)
+    object_namespace_matches_source(options, object)
         || object.kind == "GatewayClass"
         || mesh_config::is_root_namespace_config_map(options, object)
+        || (options.pod_discovery_enabled
+            && core::trusted_node_waypoint_pod_object(options, object))
         || (options.pod_discovery_enabled
             && core::is_cluster_scoped_core_resource_kind(&object.kind))
 }
 
 fn observe_object_namespace(acc: &mut K8sAccumulator, object: &K8sObject) {
-    if !core::is_cluster_scoped_core_resource_kind(&object.kind) {
+    if !core::is_cluster_scoped_core_resource_kind(&object.kind)
+        && (object_namespace_matches_source(&acc.options, object)
+            || mesh_config::is_root_namespace_config_map(&acc.options, object))
+    {
         acc.observe_namespace(&object.metadata.namespace);
+    }
+}
+
+fn object_namespace_matches_source(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
+    if options.pod_discovery_enabled && object.kind == "Pod" {
+        options.includes_pod_namespace(&object.metadata.namespace)
+    } else {
+        options.includes_namespace(&object.metadata.namespace)
     }
 }
 
@@ -1360,6 +1403,7 @@ pub(crate) struct MeshRouteDispatchDestination<'a> {
     pub backend_host: &'a str,
     pub backend_port: u16,
     pub upstream_id: Option<&'a str>,
+    pub requires_node_waypoint_authz: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1895,6 +1939,12 @@ fn route_dispatch_destination_value(
     } else {
         return None;
     }
+    if route_destination.requires_node_waypoint_authz {
+        destination.insert(
+            "requires_node_waypoint_authz".to_string(),
+            Value::Bool(true),
+        );
+    }
     Some(destination)
 }
 
@@ -2335,6 +2385,17 @@ pub(crate) struct RouteBackend {
     pub host: String,
     pub port: u16,
     pub weight: u32,
+    pub service_namespace: Option<String>,
+    pub service_name: Option<String>,
+    pub service_port: Option<u16>,
+}
+
+pub(crate) fn route_backends_require_node_waypoint_authz(backends: &[RouteBackend]) -> bool {
+    backends.iter().any(|backend| {
+        backend.service_namespace.is_some()
+            && backend.service_name.is_some()
+            && backend.service_port.is_some()
+    })
 }
 
 pub(crate) fn upstream_for_route(
@@ -2353,14 +2414,32 @@ pub(crate) fn upstream_for_route(
         namespace,
         targets: backends
             .into_iter()
-            .map(|backend| UpstreamTarget {
-                host: backend.host,
-                port: backend.port,
-                service_port_policy_key: None,
-                weight: backend.weight,
-                tags: HashMap::new(),
-                locality: None,
-                path: None,
+            .map(|backend| {
+                let mut tags = HashMap::new();
+                if let (Some(namespace), Some(name), Some(port)) = (
+                    backend.service_namespace.as_ref(),
+                    backend.service_name.as_ref(),
+                    backend.service_port,
+                ) {
+                    tags.insert(
+                        UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                        namespace.clone(),
+                    );
+                    tags.insert(UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(), name.clone());
+                    tags.insert(
+                        UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                        port.to_string(),
+                    );
+                }
+                UpstreamTarget {
+                    host: backend.host,
+                    port: backend.port,
+                    service_port_policy_key: backend.service_port,
+                    weight: backend.weight,
+                    tags,
+                    locality: None,
+                    path: None,
+                }
             })
             .collect(),
         algorithm: if has_weighted_target {

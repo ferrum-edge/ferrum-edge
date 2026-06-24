@@ -266,6 +266,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
             locality: None,
             service_account: Some("reviews".to_string()),
             pod_uid: Some("functional-reviews-pod".to_string()),
+            node_waypoint: None,
             remote_provenance: false,
         }],
         services: vec![MeshService {
@@ -2254,6 +2255,7 @@ fn inbound_authz_slice(
         locality: None,
         service_account: Some("echo".to_string()),
         pod_uid: None,
+        node_waypoint: None,
         remote_provenance: false,
     };
     let echo_service = MeshService {
@@ -2747,6 +2749,7 @@ fn egress_service_slice(node_id: &str, b_spiffe: &str, backend_port: u16) -> Mes
             locality: None,
             service_account: Some("svc-b".to_string()),
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         services: vec![MeshService {
@@ -3847,6 +3850,7 @@ fn udp_dest_slice(node_id: &str, b_spiffe: &str, udp_port: u16) -> MeshSlice {
             locality: None,
             service_account: Some("svc-b".to_string()),
             pod_uid: None,
+            node_waypoint: None,
             remote_provenance: false,
         }],
         services: vec![MeshService {

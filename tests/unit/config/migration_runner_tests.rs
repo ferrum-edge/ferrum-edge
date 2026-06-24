@@ -36,12 +36,14 @@ const EXPECTED_INDEX_NAMES: &[&str] = &[
     "idx_consumers_ns_updated",
     "idx_plugin_configs_ns_updated",
     "idx_upstreams_ns_updated",
-    "idx_audit_events_namespace_ts_id",
-    // Covering indexes for the incremental-poll deletion diff.
     "idx_proxies_ns_id",
     "idx_consumers_ns_id",
     "idx_plugin_configs_ns_id",
     "idx_upstreams_ns_id",
+    "idx_audit_events_namespace_ts_id",
+    // Sequence indexes for durable incremental-poll change tracking.
+    "idx_config_changes_ns_sequence",
+    "idx_config_changes_sequence",
     "idx_plugin_configs_scope_id",
 ];
 
@@ -136,43 +138,130 @@ async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
     .expect("restored proxy_route_locks must be writable");
 }
 
-/// The incremental-poll deletion diff runs `SELECT id ... WHERE namespace = ?`
-/// on all four resource tables every poll cycle (see
-/// `db_loader::load_table_ids`). The `(namespace, id)` covering indexes must
-/// let SQLite answer that query without touching the table b-tree — an
-/// index-only scan — otherwise each poll re-walks every row to read `id`,
-/// which is the dominant cause of SQLite's per-poll cost at scale. SQLite
-/// reports a covering index as "USING COVERING INDEX" in EXPLAIN QUERY PLAN,
-/// and only `(namespace, id)` (not `(namespace, updated_at)`) can cover a
-/// projection of `id`, so a "COVERING INDEX" plan pins the new indexes.
 #[tokio::test]
-async fn test_v001_deletion_diff_uses_covering_index() {
+async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    sqlx::query("DROP INDEX idx_config_changes_ns_sequence")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX idx_config_changes_sequence")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let index_names = get_index_names(&pool).await;
+    assert!(
+        !index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_ns_sequence")
+    );
+    assert!(
+        !index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_sequence")
+    );
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "V001 is already tracked, so no migration should be newly applied"
+    );
+    let index_names = get_index_names(&pool).await;
+    assert!(
+        index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_ns_sequence"),
+        "compatibility pass must restore idx_config_changes_ns_sequence"
+    );
+    assert!(
+        index_names
+            .iter()
+            .any(|n| n == "idx_config_changes_sequence"),
+        "compatibility pass must restore idx_config_changes_sequence"
+    );
+}
+
+#[tokio::test]
+async fn test_run_pending_restores_full_load_indexes_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    for index_name in [
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+    ] {
+        let drop_sql = format!("DROP INDEX {index_name}");
+        sqlx::query(&drop_sql).execute(&pool).await.unwrap();
+    }
+    let index_names = get_index_names(&pool).await;
+    for index_name in [
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+    ] {
+        assert!(
+            !index_names.iter().any(|n| n == index_name),
+            "{index_name} should be absent after DROP INDEX"
+        );
+    }
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "V001 is already tracked, so no migration should be newly applied"
+    );
+    let index_names = get_index_names(&pool).await;
+    for index_name in [
+        "idx_proxies_ns_id",
+        "idx_consumers_ns_id",
+        "idx_plugin_configs_ns_id",
+        "idx_upstreams_ns_id",
+    ] {
+        assert!(
+            index_names.iter().any(|n| n == index_name),
+            "compatibility pass must restore {index_name}"
+        );
+    }
+}
+
+/// Incremental polling reads durable change records after the last accepted
+/// sequence cursor. The `(namespace, sequence)` index must support the range
+/// scan and ordering so polling cost follows retained changes, not total
+/// runtime resource count.
+#[tokio::test]
+async fn test_v001_config_changes_poll_uses_sequence_index() {
     let pool = test_pool().await;
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     runner.run_pending().await.unwrap();
 
-    for (table, index) in [
-        ("proxies", "idx_proxies_ns_id"),
-        ("consumers", "idx_consumers_ns_id"),
-        ("plugin_configs", "idx_plugin_configs_ns_id"),
-        ("upstreams", "idx_upstreams_ns_id"),
-    ] {
-        let sql = format!("EXPLAIN QUERY PLAN SELECT id FROM {table} WHERE namespace = ?");
-        let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
-            .bind("ferrum")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        let plan: String = rows
-            .iter()
-            .filter_map(|r| r.try_get::<String, _>("detail").ok())
-            .collect::<Vec<_>>()
-            .join("; ");
-        assert!(
-            plan.contains("COVERING INDEX") && plan.contains(index),
-            "deletion-diff query on `{table}` should use covering index `{index}`, got plan: {plan}"
-        );
-    }
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "EXPLAIN QUERY PLAN \
+         SELECT sequence, resource_type, resource_id, operation, created_at \
+         FROM config_changes \
+         WHERE namespace = ? AND sequence > ? \
+         ORDER BY sequence ASC",
+    )
+    .bind("ferrum")
+    .bind(42_i64)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let plan: String = rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("detail").ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        plan.contains("idx_config_changes_ns_sequence"),
+        "incremental change poll should use idx_config_changes_ns_sequence, got plan: {plan}"
+    );
 }
 
 #[tokio::test]
