@@ -144,10 +144,13 @@ The job runs on every PR, but eBPF validation steps only run when files under `e
 `node-waypoint-ebpf-live` runs on PRs that touch eBPF, node-agent, NodeWaypoint
 identity, netns capture, socket option, TCP scope, chart, or live harness files.
 It builds the normal runtime Docker image from the host-built binary, builds the
-`:<tag>-ebpf` image with `FEATURES=cloud-secrets,ebpf`, creates a disposable
-dual-stack kind cluster with two workers, mounts bpffs in each kind node, loads
-both images into the cluster, and installs the Istio policy CRDs. The runner
-must provide Docker and a Linux kernel with cgroup v2 and kernel >= 5.7.
+eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
+`ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime
+image from those cached host-built artifacts instead of recompiling inside
+Docker. It then creates a disposable dual-stack kind cluster with two workers,
+mounts bpffs in each kind node, loads both images into the cluster, and installs
+the Istio policy CRDs. The runner must provide Docker and a Linux kernel with
+cgroup v2 and kernel >= 5.7.
 
 The harness renders the Helm chart to assert enabled eBPF topologies select the
 `-ebpf` image, installs NodeWaypoint eBPF mode, checks

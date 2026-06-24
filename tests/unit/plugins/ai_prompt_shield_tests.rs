@@ -936,6 +936,37 @@ async fn test_scan_all_mode_redact_contextual_match_not_absorbed_by_unrelated_va
 }
 
 #[tokio::test]
+async fn test_scan_all_mode_redact_fails_closed_on_raw_escape_only_value_pattern() {
+    // A custom pattern may intentionally match the raw JSON escape spelling of
+    // a sensitive value. Even though that raw byte match is inside a string
+    // VALUE span, `redact_json_strings` only sees serde's decoded string, so it
+    // cannot remove the raw-only pattern. The request must fail closed rather
+    // than report redaction and forward the decoded email.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {
+                "name": "escaped_email",
+                "regex": "\\\\u0061\\\\u0040\\\\u0062\\\\u002e\\\\u0063\\\\u006f\\\\u006d"
+            }
+        ],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx_with_raw_body(
+        r#"{"model":"gpt-4","note":"contact \u0061\u0040\u0062\u002e\u0063\u006f\u006d"}"#,
+    );
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert!(
+        !ctx.metadata.contains_key("ai_shield_redacted"),
+        "raw-only JSON escape patterns inside values are not removable by the decoded-value redactor"
+    );
+}
+
+#[tokio::test]
 async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],

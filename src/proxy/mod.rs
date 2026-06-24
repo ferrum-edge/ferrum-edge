@@ -16901,7 +16901,7 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
 /// MIGHT negotiate h2 is left uncapped (an `http1*` knob must not 503 an h2
 /// backend — that is `http2MaxRequests`'s job).
 ///
-/// HTTP/1.1 is *known* in exactly three cases:
+/// HTTP/1.1 is *known* in these cases:
 ///
 /// * `proxy.forces_backend_http1_only()` — DestinationRule
 ///   `h2UpgradePolicy: DO_NOT_UPGRADE` restricts the reqwest client's ALPN to
@@ -16911,6 +16911,10 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
 ///   i.e. `!is_tls_backend()` on the HTTP-family reqwest path) — reqwest never
 ///   speaks h2c / HTTP/2-prior-knowledge over cleartext, so every cleartext
 ///   dial is HTTP/1.1; or
+/// * backend HTTP/2 is disabled for this proxy (`pool_enable_http2: false`) —
+///   the request has already been routed away from the direct-H2 pool and onto
+///   reqwest, and Ferrum's preconfigured-rustls reqwest path does not install
+///   h2 ALPN in this mode, so the operator's H1 cap must remain in force; or
 /// * the backend is **HTTPS but the capability registry has already classified
 ///   this target H2/TLS-unsupported (H1-only)** — the direct-H2 pool fork
 ///   (`direct_h2_known_unsupported` in `proxy_to_backend`) then bypasses the H2
@@ -16919,17 +16923,10 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
 ///   `Http2PoolError::BackendSelectedHttp1` fallback or a startup probe), so the
 ///   dispatch is known HTTP/1.1 at acquire time and must be capped.
 ///
-/// A **HTTPS** backend with no H1-only registry verdict MAY still negotiate h2
-/// via ALPN — unknown until the TLS handshake completes — so it is deliberately
-/// NOT capped (an `http1*` knob must not 503 a reqwest dispatch that becomes h2).
-/// This holds **even when `pool_enable_http2 == false`** (codex r6): that flag
-/// only steers `should_dispatch_direct_h2` away from the direct-H2 pool onto
-/// reqwest — it does NOT set reqwest `http1_only()` nor restrict the rustls ALPN
-/// (only `forces_backend_http1_only()` does, see `build_rustls_for_reqwest`), so
-/// the reqwest client still advertises h2 ALPN and the dial can become h2.
-/// (That `pool_enable_http2=false` doesn't enforce H1 on the reqwest client is a
-/// separate pre-existing gap, tracked in the F5.1 follow-up.) The
-/// buffered/retained-body bypass
+/// A **HTTPS** backend with backend HTTP/2 enabled and no H1-only registry
+/// verdict MAY still negotiate h2 via ALPN — unknown until the TLS handshake
+/// completes — so it is deliberately NOT capped (an `http1*` knob must not 503 a
+/// reqwest dispatch that becomes h2). The buffered/retained-body bypass
 /// (`enable_http2 && (retain_request_body || requires_request_body_buffering)`)
 /// likewise stays uncapped absent a registry verdict.
 ///
@@ -16951,14 +16948,16 @@ pub(crate) fn reqwest_dispatch_is_http1_only(
     if !proxy.dispatch_kind.is_tls_backend() {
         return true;
     }
+    let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
+    if !pool_config.enable_http2 {
+        return true;
+    }
     // HTTPS backend: HTTP/1.1 is *known* only when the capability registry has
     // already classified this target H2/TLS-unsupported — then, even though the
     // reqwest client still advertises h2 ALPN, the backend negotiates h1, and
     // `proxy_to_backend`'s direct-H2 fork keys this exact verdict
     // (`record.plain_http.h2_tls == Unsupported`) to bypass the H2 pool and fall
-    // to reqwest-H1. `pool_enable_http2 == false` is deliberately NOT treated as
-    // known-H1 (codex r6): it does not set reqwest `http1_only()` / restrict the
-    // ALPN, so that dispatch can still become h2 (see the doc comment above).
+    // to reqwest-H1.
     // Lookup is the same alloc-free thread-local-keyed `get` the H2 fork uses.
     state
         .backend_capabilities
@@ -27036,6 +27035,18 @@ mod tests {
         // Operator set `pool_enable_http2: false` → direct H2 pool is
         // never entered, every request goes via reqwest.
         assert!(proxy_config_forces_reqwest_dispatch(&proxy, false, false));
+    }
+
+    #[tokio::test]
+    async fn reqwest_dispatch_is_http1_only_when_backend_http2_disabled() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        proxy.pool_enable_http2 = Some(false);
+
+        assert!(
+            reqwest_dispatch_is_http1_only(&state, &proxy, None),
+            "pool_enable_http2=false routes HTTPS dispatch through reqwest without h2 ALPN, so the HTTP/1 pending cap must apply"
+        );
     }
 
     #[test]

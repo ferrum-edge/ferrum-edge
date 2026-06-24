@@ -487,16 +487,21 @@ impl AiPromptShield {
         // NOT keys, NOT structural punctuation). Computed once over the raw body.
         let value_spans = collect_json_value_spans(raw);
         // A raw match is removable iff its byte span lies entirely within one
-        // value span. Any match that touches structural bytes (keys/punctuation/
-        // whitespace) or straddles a token boundary is contextual-only and cannot
-        // be rewritten in place, so the request must fail closed.
+        // value span AND the same pattern can actually match the decoded value
+        // representation that `redact_json_strings` rewrites. Span containment
+        // keeps structural matches from being absorbed by unrelated values, but
+        // it is not sufficient by itself: a raw-body regex can match JSON escape
+        // syntax such as `\u0061` inside a string value, while the redactor only
+        // sees serde's decoded `a`.
         for pattern in &self.patterns {
             for m in pattern.regex.find_iter(raw) {
-                let (start, end) = (m.start(), m.end());
-                let removable = value_spans
-                    .iter()
-                    .any(|span| span.start <= start && end <= span.end);
-                if !removable {
+                if !raw_match_is_removable_by_value_redactor(
+                    raw,
+                    pattern,
+                    m.start(),
+                    m.end(),
+                    &value_spans,
+                ) {
                     return true;
                 }
             }
@@ -1158,6 +1163,31 @@ fn collect_json_value_spans(raw: &str) -> Vec<std::ops::Range<usize>> {
         }
     }
     spans
+}
+
+fn raw_match_is_removable_by_value_redactor(
+    raw: &str,
+    pattern: &PiiPattern,
+    start: usize,
+    end: usize,
+    value_spans: &[std::ops::Range<usize>],
+) -> bool {
+    let Some(span) = value_spans
+        .iter()
+        .find(|span| span.start <= start && end <= span.end)
+    else {
+        return false;
+    };
+
+    let Some(raw_value) = raw.get(span.clone()) else {
+        return false;
+    };
+
+    match serde_json::from_str::<Value>(raw_value) {
+        Ok(Value::String(decoded)) => pattern.regex.is_match(&decoded),
+        Ok(Value::Number(number)) => pattern.regex.is_match(&number.to_string()),
+        _ => false,
+    }
 }
 
 /// Collect scannable prompt text from a top-level LLM field that may be a
