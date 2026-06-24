@@ -567,6 +567,8 @@ mod userspace_pod {
         ConnTuple4,
         ConnTuple6,
         PodInfo,
+        NodeProbePortKey4,
+        NodeProbePortKey6,
         WorkloadIdentity,
         BpfCaptureConfig,
         IncludePortsPolicy,
