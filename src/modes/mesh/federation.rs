@@ -79,6 +79,17 @@ const FEDERATION_MAX_JWT_AUTHORITIES: usize = 256;
 #[derive(Debug, Default, Clone)]
 pub struct FederationSnapshot {
     pub bundles: HashMap<TrustDomain, FederatedBundle>,
+    /// Trust domains that have committed at least one successful poll in this
+    /// process. Once a domain is recorded here, `FERRUM_MESH_FEDERATION_FAIL_OPEN`
+    /// no longer grants it CP-supplied bootstrap-fallback trust: fail-open is a
+    /// *bootstrap* policy (before the first poll), not unlimited post-expiry
+    /// retention. So a domain that polled successfully and then aged out of its
+    /// bounded staleness window fails closed instead of silently reverting to the
+    /// stale CP fallback. The tombstone persists for the process lifetime (a
+    /// recovered poll re-overlays its live bundle); it is intentionally not
+    /// cleared on cluster removal so a removed-then-readded peer cannot resurrect
+    /// fallback trust for a domain already proven pollable.
+    pub ever_polled: HashSet<TrustDomain>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +211,9 @@ impl FederationStore {
             }
             let mut next = (**current).clone();
             next.bundles.insert(trust_domain.clone(), bundle.clone());
+            // Record the bootstrap tombstone so fail-open can no longer grant
+            // this domain CP-fallback trust once it has been polled.
+            next.ever_polled.insert(trust_domain.clone());
             installed = true;
             Arc::new(next)
         });
@@ -294,6 +308,11 @@ impl FederationStore {
         }
         let mut expired = false;
         self.inner.rcu(|current| {
+            // Recompute the outcome on every CAS attempt: a lost CAS retries the
+            // closure against a newer snapshot, so a stale `true` from an earlier
+            // attempt must not survive a retry that removes nothing (mirrors
+            // `install`'s per-attempt reset of `installed`).
+            expired = false;
             let Some(bundle) = current.bundles.get(trust_domain) else {
                 return Arc::clone(current);
             };
@@ -304,6 +323,8 @@ impl FederationStore {
             if age_seconds <= max_stale_seconds {
                 return Arc::clone(current);
             }
+            // The bundle map drops the entry; `ever_polled` deliberately retains
+            // the domain so fail-open stays suppressed after expiry.
             let mut next = (**current).clone();
             next.bundles.remove(trust_domain);
             expired = true;
@@ -1205,14 +1226,24 @@ pub fn merge_federation_into_trust_bundles(
 ) -> Option<TrustBundleSet> {
     let mut set = trust_bundles?;
 
-    if !fail_open {
-        let dynamic_domains = dynamic_federation_trust_domains(multi_cluster, poll_enabled);
-        if !dynamic_domains.is_empty() {
-            set.federated.retain(|fed| {
-                !dynamic_domains.contains(&fed.trust_domain)
-                    || snapshot.bundles.contains_key(&fed.trust_domain)
-            });
-        }
+    let dynamic_domains = dynamic_federation_trust_domains(multi_cluster, poll_enabled);
+    if !dynamic_domains.is_empty() {
+        set.federated.retain(|fed| {
+            // Non-dynamic (purely CP-supplied) domains are never pruned here.
+            if !dynamic_domains.contains(&fed.trust_domain) {
+                return true;
+            }
+            // A live polled bundle keeps the domain trusted (and is overlaid
+            // below, winning on conflict).
+            if snapshot.bundles.contains_key(&fed.trust_domain) {
+                return true;
+            }
+            // No live polled bundle. Fail-open keeps the CP bootstrap fallback
+            // ONLY until the domain's first successful poll; once it has ever
+            // been polled, fail-open is consumed (bootstrap is over) and an
+            // expired/withdrawn domain fails closed. Fail-closed prunes always.
+            fail_open && !snapshot.ever_polled.contains(&fed.trust_domain)
+        });
     }
 
     overlay_polled_federation_bundles(&mut set, snapshot);
@@ -1666,6 +1697,64 @@ mod tests {
     }
 
     #[test]
+    fn merge_fail_open_drops_cp_fallback_after_polled_bundle_expires() {
+        // Fail-open is a BOOTSTRAP policy: it may serve the CP-supplied fallback
+        // bundle only until a domain's first successful poll. Once a domain has
+        // ever polled and then aged out of its bounded staleness window (its
+        // bundle removed from the snapshot but its `ever_polled` tombstone
+        // retained), fail-open must NOT silently revert to the stale CP fallback —
+        // the expired domain fails closed (roadmap M5: fail-open must not become
+        // unlimited post-bootstrap retention).
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let remote_td = td("remote.example.com");
+        let cp_bundle = TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: td("local"),
+                x509_authorities: vec![sample_cert_base64()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: vec![TrustBundle {
+                trust_domain: remote_td.clone(),
+                x509_authorities: vec!["cp_value".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }],
+        };
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "remote".to_string(),
+                trust_domain: remote_td.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        // Domain polled successfully once, then its bundle aged out: no live
+        // bundle remains, but the bootstrap tombstone is retained.
+        let mut expired_snapshot = FederationSnapshot::default();
+        expired_snapshot.ever_polled.insert(remote_td.clone());
+
+        let merged = merge_federation_into_trust_bundles(
+            Some(cp_bundle),
+            &expired_snapshot,
+            Some(&mc),
+            true, // fail_open
+            true, // poll_enabled
+        )
+        .expect("merge result");
+
+        assert!(
+            merged.federated.is_empty(),
+            "fail-open must not resurrect the CP fallback for an ever-polled, expired domain: {:?}",
+            merged.federated
+        );
+    }
+
+    #[test]
     fn merge_polled_bundle_wins_in_fail_closed_mode() {
         use crate::modes::mesh::config::RemoteCluster;
 
@@ -2030,6 +2119,10 @@ mod tests {
             federated(100),
             task_generation,
         ));
+        assert!(
+            store.snapshot().ever_polled.contains(&domain),
+            "a successful install records the bootstrap tombstone"
+        );
         crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
             domain.as_str(),
             100,
@@ -2045,6 +2138,10 @@ mod tests {
         assert!(
             !store.snapshot().bundles.contains_key(&domain),
             "expired bundle is withdrawn from the active snapshot"
+        );
+        assert!(
+            store.snapshot().ever_polled.contains(&domain),
+            "the ever-polled tombstone is retained across expiry so fail-open stays suppressed"
         );
         assert!(
             rx.has_changed().unwrap(),

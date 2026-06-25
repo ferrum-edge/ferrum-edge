@@ -529,6 +529,13 @@ impl RemoteEndpointStore {
         }
         let mut expired = false;
         self.inner.rcu(|current| {
+            // Recompute the outcome on every CAS attempt: a lost CAS (e.g. an old
+            // poller failure racing a re-registered cluster installing fresh
+            // endpoints) retries the closure against a newer snapshot, so a stale
+            // `true` must not survive a retry that removes nothing and then
+            // withdraw a fresh cluster's freshness gauges (mirrors `install`'s
+            // per-attempt reset of `installed`).
+            expired = false;
             let Some(entry) = current.clusters.get(cluster_name) else {
                 return Arc::clone(current);
             };
@@ -543,7 +550,12 @@ impl RemoteEndpointStore {
         });
         if expired {
             self.revision_tx.send_modify(|revision| *revision += 1);
-            crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+            // Withdraw only the freshness gauges. Staleness expiry is transient —
+            // the poller stays live and can reinstall endpoints — so the
+            // monotonic `ferrum_mesh_remote_discovery_poll_successes_total`
+            // counter must be preserved to avoid a counter reset; only the
+            // cluster-removal path (`remove_and_clear_metrics`) clears it.
+            crate::plugins::mesh::prometheus_helpers::withdraw_mesh_remote_discovery_freshness(
                 cluster_name,
                 trust_domain,
             );
@@ -3741,9 +3753,24 @@ mod tests {
         );
         let mut rendered = String::new();
         crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        let cluster_label = format!("cluster=\"{cluster}\"");
         assert!(
-            !rendered.contains(&format!("cluster=\"{cluster}\"")),
-            "expiration clears last-success/age metrics for stale endpoints: {rendered}"
+            !rendered.lines().any(|line| line
+                .starts_with("ferrum_mesh_remote_discovery_last_success_timestamp_seconds")
+                && line.contains(&cluster_label)),
+            "expiration withdraws the last-success freshness gauge for stale endpoints: {rendered}"
+        );
+        assert!(
+            !rendered.lines().any(|line| line
+                .starts_with("ferrum_mesh_remote_discovery_endpoint_age_seconds")
+                && line.contains(&cluster_label)),
+            "expiration withdraws the derived endpoint-age gauge for stale endpoints: {rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line
+                .starts_with("ferrum_mesh_remote_discovery_poll_successes_total")
+                && line.contains(&cluster_label)),
+            "staleness expiry preserves the monotonic poll-success counter (no counter reset): {rendered}"
         );
 
         assert!(
