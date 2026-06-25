@@ -2897,6 +2897,35 @@ fn handle_pod_added(
                     return;
                 }
             }
+            // NodeWaypoint inbound relay dials this pod from a node-local source
+            // address, so an enrolled pod whose address family has no trusted
+            // node source IP would have its relay dial silently dropped by the
+            // source-bound guard. Surface that per family so a dual-stack install
+            // that configured only one family's source IP reports degraded rather
+            // than black-holing the other family. (The all-empty case already
+            // fails closed at startup in `initialize_backend`.)
+            if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
+                if pod_ip.is_some() && !backend.has_node_source_ipv4() {
+                    warn!(
+                        pod_uid,
+                        "NodeWaypoint enrolled an IPv4 pod but no trusted IPv4 node source IP is \
+                         configured (FERRUM_NODE_AGENT_NODE_IP / FERRUM_NODE_AGENT_NODE_IPS); the \
+                         inbound relay dial to this pod will be dropped until an IPv4 node source \
+                         IP is added"
+                    );
+                    metrics.set_topology_degraded("node_waypoint_node_source_ipv4_missing");
+                }
+                if pod_ip6.is_some() && !backend.has_node_source_ipv6() {
+                    warn!(
+                        pod_uid,
+                        "NodeWaypoint enrolled an IPv6 pod but no trusted IPv6 node source IP is \
+                         configured (FERRUM_NODE_AGENT_NODE_IP / FERRUM_NODE_AGENT_NODE_IPS); the \
+                         inbound relay dial to this pod will be dropped until an IPv6 node source \
+                         IP is added"
+                    );
+                    metrics.set_topology_degraded("node_waypoint_node_source_ipv6_missing");
+                }
+            }
             if let Some(ip) = pod_ip {
                 let info = PodInfo {
                     proxy_port: config.capture_config.outbound_port,
@@ -4724,8 +4753,19 @@ mod tests {
         };
         let metrics = NodeAgentMetrics::default();
 
-        let err = initialize_backend(&mut backend, &config, &metrics)
-            .expect_err("missing identity bridge must fail startup");
+        // Seed node source IPs so initialization reaches the sock-ops attach
+        // branch under test rather than failing closed on the (separately
+        // tested) empty trusted-node-source guard.
+        let err = with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10"),
+                ("FERRUM_NODE_AGENT_NODE_IPS", "192.0.2.11,fd00::10"),
+            ],
+            || {
+                initialize_backend(&mut backend, &config, &metrics)
+                    .expect_err("missing identity bridge must fail startup")
+            },
+        );
 
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
         assert!(err.to_string().contains("SOCK_OPS identity bridge"));
@@ -4736,6 +4776,49 @@ mod tests {
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn initialize_backend_node_waypoint_without_node_source_ip_fails_closed() {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        let mut config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+
+        let mut backend = MockEbpfBackend::default();
+        let metrics = NodeAgentMetrics::default();
+
+        // No trusted node source IP configured: NodeWaypoint must fail closed
+        // (the source-bound guard would otherwise drop the relay's own dial and
+        // all inbound to enrolled pods) instead of warning and continuing.
+        let err = with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_IP", ""),
+                ("FERRUM_NODE_AGENT_NODE_IPS", ""),
+            ],
+            || {
+                initialize_backend(&mut backend, &config, &metrics)
+                    .expect_err("empty trusted node source must fail closed")
+            },
+        );
+
+        assert!(err.to_string().contains("trusted node"));
+        assert!(backend.node_ips.is_empty());
+        assert!(backend.node_ips6.is_empty());
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
         );
     }
 
@@ -5445,6 +5528,71 @@ mod tests {
         assert!(
             backend.pod_ips6.contains_key(&ipv6),
             "IPv6 FERRUM_POD_IPS6 map entry should be enrolled for dual-stack pods"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_pod_added_node_waypoint_missing_family_source_reports_degraded() {
+        // Dual-stack regression: with only an IPv4 node source IP configured,
+        // enrolling a pod that also has an IPv6 address must surface the missing
+        // IPv6 node source (whose inbound relay dial the source-bound guard would
+        // drop) as degraded instead of reporting healthy.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        // Trust an IPv4 node source IP only; leave IPv6 unconfigured.
+        backend
+            .update_node_ip("192.0.2.10".parse().unwrap())
+            .unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-dualstack";
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let mut config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "8080")]);
+        let pod_source_ips = PodSourceIps {
+            ipv4: Some("10.0.0.5".parse().unwrap()),
+            ipv6: Some("fd00::5".parse().unwrap()),
+        };
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_source_ips,
+            node_probe_ports: Vec::new(),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        // The pod still enrolls (the guard stays active for the configured
+        // family), but the missing IPv6 source is surfaced as degraded.
+        assert!(pod_states.contains_key(pod_uid), "pod still enrolls");
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("node_waypoint_node_source_ipv6_missing"),
+            "a dual-stack pod with no IPv6 node source must report the IPv6 gap as degraded"
         );
     }
 

@@ -558,6 +558,13 @@ pub trait EbpfBackend: Send + Sync {
     fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
     fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String>;
     fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
+    /// Whether the NodeWaypoint inbound direct-pod guard has at least one
+    /// trusted node source IP for the given address family. Enrollment consults
+    /// this so a dual-stack deployment that configured only one family's source
+    /// IP surfaces the gap (the relay dial to the unconfigured family's pods is
+    /// dropped by the source-bound guard) instead of silently black-holing it.
+    fn has_node_source_ipv4(&self) -> bool;
+    fn has_node_source_ipv6(&self) -> bool;
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
     fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
     fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String>;
@@ -760,6 +767,14 @@ impl EbpfBackend for MockEbpfBackend {
     fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
         self.node_ips6.insert(ip);
         Ok(())
+    }
+
+    fn has_node_source_ipv4(&self) -> bool {
+        !self.node_ips.is_empty()
+    }
+
+    fn has_node_source_ipv6(&self) -> bool {
+        !self.node_ips6.is_empty()
     }
 
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {

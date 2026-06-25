@@ -76,6 +76,12 @@ pub struct AyaEbpfBackend {
     /// callers detach explicitly if needed).
     sock_ops_link_id: Option<SockOpsLinkId>,
     orig_dst_maps_pinned: bool,
+    /// Tracks whether at least one trusted node source IP has been installed
+    /// for each family, so enrollment can surface a per-family gap (the
+    /// source-bound inbound guard drops the relay dial to pods of a family with
+    /// no configured node source IP). Set when `update_node_ip*` succeeds.
+    node_source_ipv4_present: bool,
+    node_source_ipv6_present: bool,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -87,6 +93,8 @@ impl AyaEbpfBackend {
             pod_links: HashMap::new(),
             sock_ops_link_id: None,
             orig_dst_maps_pinned: false,
+            node_source_ipv4_present: false,
+            node_source_ipv6_present: false,
         }
     }
 
@@ -312,12 +320,24 @@ impl EbpfBackend for AyaEbpfBackend {
 
     fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
-        maps.insert_node_ip(ip)
+        maps.insert_node_ip(ip)?;
+        self.node_source_ipv4_present = true;
+        Ok(())
     }
 
     fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
-        maps.insert_node_ip6(ip)
+        maps.insert_node_ip6(ip)?;
+        self.node_source_ipv6_present = true;
+        Ok(())
+    }
+
+    fn has_node_source_ipv4(&self) -> bool {
+        self.node_source_ipv4_present
+    }
+
+    fn has_node_source_ipv6(&self) -> bool {
+        self.node_source_ipv6_present
     }
 
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
