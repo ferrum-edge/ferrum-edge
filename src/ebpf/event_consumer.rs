@@ -247,15 +247,18 @@ impl SockOpsConsumer {
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod production {
     use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use aya::maps::{Map, MapData, PerCpuArray, RingBuf};
     use ferrum_ebpf_common::{SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord};
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
-    use tracing::{info, warn};
+    use tracing::{debug, info, warn};
 
     use super::{PollOutcome, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent};
     use crate::ebpf::{BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH};
+
+    static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
 
     /// Run the consumer until the shutdown signal fires or an unrecoverable
     /// error is observed. Spawn via `tokio::spawn(run_pinned_consumer(...))`.
@@ -572,10 +575,10 @@ pub mod production {
         while let Some(item) = ring_buf.next() {
             let bytes: &[u8] = &item;
             if bytes.len() < std::mem::size_of::<SockOpsRecord>() {
-                warn!(
-                    expected = std::mem::size_of::<SockOpsRecord>(),
-                    actual = bytes.len(),
-                    "SOCK_OPS record short read; skipping"
+                log_malformed_sock_ops_record(
+                    "short_read",
+                    std::mem::size_of::<SockOpsRecord>(),
+                    bytes.len(),
                 );
                 continue;
             }
@@ -585,14 +588,30 @@ pub mod production {
                     events_handled = events_handled.saturating_add(1);
                 }
                 None => {
-                    // Unknown discriminant. Log once at low volume; the
-                    // ringbuf overrun warn covers the operator-visible
-                    // case where this matters.
-                    warn!("SOCK_OPS record carried an unknown discriminant; dropping");
+                    // Unknown discriminant. Log once at warn level and
+                    // suppress repeats; high-volume malformed records are
+                    // otherwise able to starve the admin health path.
+                    log_malformed_sock_ops_record("unknown_discriminant", bytes.len(), bytes.len());
                 }
             }
         }
         events_handled
+    }
+
+    fn log_malformed_sock_ops_record(reason: &'static str, expected: usize, actual: usize) {
+        if !MALFORMED_SOCK_OPS_RECORD_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                reason,
+                expected,
+                actual,
+                "SOCK_OPS malformed record observed; suppressing repeated warnings"
+            );
+        } else {
+            debug!(
+                reason,
+                expected, actual, "SOCK_OPS malformed record observed"
+            );
+        }
     }
 
     fn read_dropped_total(stats: &PerCpuArray<MapData, u64>) -> u64 {

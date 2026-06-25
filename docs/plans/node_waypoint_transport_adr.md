@@ -1,6 +1,6 @@
 # NodeWaypoint Secured Transport ADR
 
-Status: H2 implementation in progress
+Status: H2 live-gate baseline complete; NodeWaypoint remains Experimental
 
 ## Context
 
@@ -9,8 +9,11 @@ traffic captured from many node-local pods. The current live gate proves the
 IPv4/IPv6 eBPF capture path, source pod attribution, same-node and cross-node
 Service authorization, stale source identity cleanup, production SPIRE Workload
 API issuance for per-node NodeWaypoint SVIDs, and direct Pod-IP fail-closed
-checks on a two-worker kind cluster. Authenticated node-to-node transport and
-destination-side NodeWaypoint policy enforcement are wired through the
+checks on a two-worker kind cluster. It also proves plaintext/no-client-SVID
+HBONE listener probes are rejected and that authenticated HBONE baggage from an
+untrusted assertor fails closed under destination policy. Authenticated
+node-to-node transport and destination-side NodeWaypoint policy enforcement are
+wired through the
 SPIFFE-mTLS HBONE relay path. The destination-side pod-veth tc guard now drops
 unmarked direct traffic to enrolled pod IPs and admits only backend dials made
 by the destination NodeWaypoint relay with the authorized socket mark.
@@ -193,9 +196,13 @@ policy.
 
 The live gate asserts both denied in-mesh sources and unmanaged non-mesh sources
 cannot reach enrolled destination pods directly over IPv4, plus the unmanaged
-IPv6 direct-inbound path when the cluster is dual-stack. H2 is not complete
-until stale-IP reuse, forged-assertion, and the remaining production
-identity-profile cases are covered.
+IPv6 direct-inbound path when the cluster is dual-stack. It also forces source
+workload IPv4 reuse in the disposable kind CNI and proves the replacement
+UID/identity is admitted while stale registry state is gone. In production
+SPIRE mode it additionally proves NodeWaypoint pods receive Workload API SVIDs,
+reject plaintext and no-client-SVID HBONE probes, fail closed on authenticated
+but untrusted asserted identity, and recover SVID-backed traffic/policy after a
+SPIRE Agent plus NodeWaypoint DaemonSet restart.
 
 ## Failure Behavior
 
@@ -248,7 +255,15 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv4.direct_inbound_guard_same_node`
 - `node_waypoint.ipv4.direct_inbound_guard_cross_node`
 - `node_waypoint.identity.stale_cleanup`
+- `node_waypoint.identity.stale_ip_reuse`
 - `node_waypoint.identity.spire_chart_profile`
+- `node_waypoint.identity.spire_live_ready`
+- `node_waypoint.identity.spire_workload_entries`
+- `node_waypoint.identity.workload_api_svid`
+- `node_waypoint.identity.plaintext_hbone_rejected`
+- `node_waypoint.identity.unauthenticated_hbone_rejected`
+- `node_waypoint.identity.forged_assertion_rejected`
+- `node_waypoint.identity.spire_restart_recovery`
 - `node_waypoint.ipv6.pod_ip_fail_closed` (historical pre-admission evidence;
   retained as a non-required artifact once IPv6 admission is enabled)
 - `node_waypoint.ipv6.service_fail_closed` (historical pre-admission evidence;

@@ -495,14 +495,29 @@ impl AiPromptShield {
         // syntax such as `\u0061` inside a string value, while the redactor only
         // sees serde's decoded `a`.
         for pattern in &self.patterns {
+            let mut removable_by_value_span = vec![None; value_spans.len()];
             for m in pattern.regex.find_iter(raw) {
-                if !raw_match_is_removable_by_value_redactor(
-                    raw,
-                    pattern,
-                    m.start(),
-                    m.end(),
-                    &value_spans,
-                ) {
+                let Some(span_index) = value_spans
+                    .iter()
+                    .position(|span| span.start <= m.start() && m.end() <= span.end)
+                else {
+                    return true;
+                };
+
+                let removable = match removable_by_value_span[span_index] {
+                    Some(removable) => removable,
+                    None => {
+                        let removable = raw_value_is_removable_by_value_redactor(
+                            raw,
+                            pattern,
+                            &value_spans[span_index],
+                        );
+                        removable_by_value_span[span_index] = Some(removable);
+                        removable
+                    }
+                };
+
+                if !removable {
                     return true;
                 }
             }
@@ -1171,20 +1186,11 @@ fn should_preserve_top_level_scalar(key: &str, value: &Value) -> bool {
     NUMERIC_LLM_PARAMETER_KEYS.contains(&key) && value.is_number()
 }
 
-fn raw_match_is_removable_by_value_redactor(
+fn raw_value_is_removable_by_value_redactor(
     raw: &str,
     pattern: &PiiPattern,
-    start: usize,
-    end: usize,
-    value_spans: &[std::ops::Range<usize>],
+    span: &std::ops::Range<usize>,
 ) -> bool {
-    let Some(span) = value_spans
-        .iter()
-        .find(|span| span.start <= start && end <= span.end)
-    else {
-        return false;
-    };
-
     let Some(raw_value) = raw.get(span.clone()) else {
         return false;
     };

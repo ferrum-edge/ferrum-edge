@@ -308,8 +308,8 @@ ferrum_spire_wait_ready() {
   local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
   local timeout="${3:-180s}"
 
-  kubectl --context "$context" -n "$namespace" rollout status statefulset/spire-server --timeout="$timeout"
-  kubectl --context "$context" -n "$namespace" rollout status daemonset/spire-agent --timeout="$timeout"
+  kubectl --context "$context" -n "$namespace" rollout status statefulset/spire-server --timeout="$timeout" || return 1
+  kubectl --context "$context" -n "$namespace" rollout status daemonset/spire-agent --timeout="$timeout" || return 1
 }
 
 ferrum_spire_cleanup_minimal() {
