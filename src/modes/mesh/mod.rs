@@ -8251,11 +8251,26 @@ async fn serve_mesh_runtime(
                 );
             }
         }
+        let remote_discovery_credentials = match multicluster::parse_remote_discovery_credentials(
+            env_config.mesh_remote_discovery_credentials.as_deref(),
+            &env_config.cp_dp_grpc_jwt_issuer,
+        ) {
+            Ok(map) => std::sync::Arc::new(map),
+            Err(err) => {
+                // Fail closed: a malformed per-remote credential map must not
+                // start discovery with an unknown auth posture. An empty map
+                // here still fails closed per-cluster in `start_cluster` for any
+                // RemoteCluster that references a (now-absent) credential.
+                error!("{err}");
+                std::sync::Arc::new(std::collections::HashMap::new())
+            }
+        };
         let remote_discovery_manager = multicluster::RemoteDiscoveryManager::new(
             Some(remote_discovery_config),
             mesh_state.remote_endpoint_store().clone(),
             multicluster::native_source_factory,
-        );
+        )
+        .with_credentials(remote_discovery_credentials);
         mesh_background_handles.push(start_remote_cluster_discovery_reconcile_task(
             mesh_state.clone(),
             remote_discovery_manager,
@@ -20820,6 +20835,7 @@ mod tests {
                 network: Some("net2".to_string()),
                 control_plane_url: Some("https://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -22020,6 +22036,7 @@ mod tests {
                     network: None,
                     control_plane_url: None,
                     federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                    discovery_credential_ref: None,
                 }],
                 ..MultiClusterConfig::default()
             }),
@@ -22087,6 +22104,7 @@ mod tests {
                     network: None,
                     control_plane_url: None,
                     federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                    discovery_credential_ref: None,
                 }],
                 ..MultiClusterConfig::default()
             }),

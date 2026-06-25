@@ -61,10 +61,22 @@ private PKI or remote-control-plane mTLS is required.
 
 ## Follow-Up
 
-Per-remote credential references and remote-cluster audience binding remain the
-next auth hardening step. The current implementation keeps the existing shared
-CP/DP JWT secret and issuer model, with namespace scoping enforced by the
-remote CP. The follow-up should add a reference-based per-`RemoteCluster`
-credential shape that names a resolved secret source rather than embedding raw
-secrets in mesh slices, and should bind minted tokens to a remote-cluster
-audience without logging or serializing credential material.
+Per-remote credential references are now **implemented**: `RemoteCluster.discovery_credential_ref`
+names a credential resolved data-plane-side against
+`FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` (a ref -> secret map, itself
+resolvable through the external-secret backends), so each remote cluster
+authenticates to its own control plane with a distinct JWT secret rather than a
+single shared one — and the raw secret is never embedded in or serialized from a
+mesh slice. A reference that does not resolve fails that cluster's discovery
+closed (it is not polled); an unset reference falls back to the shared CP/DP
+secret, a posture now warned-as-deprecated in production multi-cluster. Because
+the remote CP validates the HS256 signature with its own secret, a token issued
+for one cluster cannot authenticate to another.
+
+The remaining auth hardening step is **explicit JWT audience-claim binding**:
+minting the discovery token with an `aud` scoped to the target cluster plus
+remote-CP-side audience validation, as defense-in-depth layered on top of the
+per-remote secret isolation (the per-remote secret already provides the cluster
+binding). The minted-token issuer continues to follow the shared
+`FERRUM_CP_DP_GRPC_JWT_ISSUER` because the remote CP pins the issuer, not a
+per-remote one.

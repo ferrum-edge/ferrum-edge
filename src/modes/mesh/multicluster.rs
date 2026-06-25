@@ -1002,6 +1002,11 @@ struct RemoteClusterPollTarget {
     trust_domain: TrustDomain,
     network: Option<String>,
     control_plane_url: String,
+    /// Reference naming the per-remote discovery credential (resolved against
+    /// the installed credential map). `None` falls back to the shared CP-DP
+    /// JWT secret. Kept in `PartialEq` so a changed reference re-rolls the
+    /// poller in `reconcile`.
+    credential_ref: Option<String>,
 }
 
 struct RunningRemoteDiscovery {
@@ -1020,6 +1025,10 @@ pub struct RemoteDiscoveryManager {
     store: RemoteEndpointStore,
     source_factory: RemoteSourceFactory,
     running: HashMap<String, RunningRemoteDiscovery>,
+    /// Resolved per-RemoteCluster discovery credentials (reference -> secret).
+    /// Matched against `RemoteCluster.discovery_credential_ref` in
+    /// `start_cluster`; an empty map keeps shared-secret behavior.
+    credentials: std::sync::Arc<std::collections::HashMap<String, GrpcJwtSecret>>,
 }
 
 impl RemoteDiscoveryManager {
@@ -1036,7 +1045,20 @@ impl RemoteDiscoveryManager {
             store,
             source_factory: Arc::new(source_factory),
             running: HashMap::new(),
+            credentials: std::sync::Arc::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Install the resolved per-RemoteCluster discovery credential map
+    /// (reference -> secret). References are matched against
+    /// `RemoteCluster.discovery_credential_ref`; an unmatched reference fails
+    /// closed (the cluster is not polled). Empty map = shared-secret behavior.
+    pub fn with_credentials(
+        mut self,
+        credentials: std::sync::Arc<std::collections::HashMap<String, GrpcJwtSecret>>,
+    ) -> Self {
+        self.credentials = credentials;
+        self
     }
 
     /// Start/stop per-cluster pollers to match the latest slice and trust state.
@@ -1104,7 +1126,44 @@ impl RemoteDiscoveryManager {
         names
     }
 
-    fn start_cluster(&mut self, target: RemoteClusterPollTarget, config: RemoteDiscoveryConfig) {
+    fn start_cluster(
+        &mut self,
+        target: RemoteClusterPollTarget,
+        mut config: RemoteDiscoveryConfig,
+    ) {
+        // Resolve the per-RemoteCluster discovery credential. A configured
+        // reference that does not resolve fails closed (do NOT silently fall
+        // back to the shared secret — that could authenticate with the wrong
+        // credential): skip the cluster with a warning.
+        match &target.credential_ref {
+            Some(reference) => match self.credentials.get(reference) {
+                Some(secret) => {
+                    config.jwt_secret = Some(secret.clone());
+                }
+                None => {
+                    warn!(
+                        cluster = %target.cluster_name,
+                        "RemoteCluster references an unknown discovery credential; \
+                         skipping discovery (configure FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)"
+                    );
+                    return;
+                }
+            },
+            None => {
+                // No per-remote reference: shared CP-DP secret fallback. In
+                // production multi-cluster this shared-secret posture is
+                // deprecated — warn loudly but keep working (migration path).
+                if config.production_mode && config.jwt_secret.is_some() {
+                    warn!(
+                        cluster = %target.cluster_name,
+                        "Remote-cluster discovery is using the shared CP-DP JWT secret in \
+                         production mode; configure a per-RemoteCluster discovery_credential_ref \
+                         + FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS so a credential for one cluster \
+                         cannot authenticate to another (deprecated shared-secret posture)"
+                    );
+                }
+            }
+        }
         let ctx = RemoteClusterPollContext {
             cluster_name: target.cluster_name.clone(),
             trust_domain: target.trust_domain.clone(),
@@ -1271,6 +1330,47 @@ impl RemoteDiscoveryConfig {
     }
 }
 
+/// Parse the `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` JSON object (a map of
+/// credential-reference -> raw JWT secret) into resolved `GrpcJwtSecret`s. The
+/// secret values are minted with the local CP-DP issuer (the remote CP pins
+/// issuer, not a per-remote one), passed in as `issuer` so it matches the
+/// shared-secret remote-discovery path (`FERRUM_CP_DP_GRPC_JWT_ISSUER`).
+/// Returns an empty map for `None`/empty input; returns an error string on
+/// malformed JSON or an empty secret value.
+pub(crate) fn parse_remote_discovery_credentials(
+    raw: Option<&str>,
+    issuer: &str,
+) -> Result<std::collections::HashMap<String, GrpcJwtSecret>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let parsed: std::collections::HashMap<String, String> = serde_json::from_str(raw)
+        .map_err(|e| {
+            format!(
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS is not a valid JSON object of ref->secret: {e}"
+            )
+        })?;
+    let mut out = std::collections::HashMap::with_capacity(parsed.len());
+    for (reference, secret) in parsed {
+        if reference.trim().is_empty() {
+            return Err(
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS has an empty credential reference"
+                    .to_string(),
+            );
+        }
+        if secret.is_empty() {
+            return Err(format!(
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference '{reference}' has an empty secret"
+            ));
+        }
+        out.insert(
+            reference,
+            GrpcJwtSecret::with_issuer(secret, issuer.to_string()),
+        );
+    }
+    Ok(out)
+}
+
 /// Resolve the poll-target list from a [`MultiClusterConfig`].
 ///
 /// A remote cluster is polled only when it BOTH declares a `control_plane_url`
@@ -1338,6 +1438,7 @@ fn poll_targets_for_multi_cluster_with_posture(
             // Normalize grpc:// → http:// and grpcs:// → https:// so the
             // dialer and TLS-selection logic always see canonical schemes.
             control_plane_url: normalize_control_plane_url(url),
+            credential_ref: remote.discovery_credential_ref.clone(),
         });
     }
     targets
@@ -1979,6 +2080,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         }
@@ -2035,6 +2137,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2113,6 +2216,7 @@ mod tests {
                 network: Some("net2".to_string()),
                 control_plane_url: Some("https://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         }
@@ -2378,6 +2482,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2513,6 +2618,7 @@ mod tests {
                     network: Some("net-a".to_string()),
                     control_plane_url: Some("https://cp-east.remote.example:15010".to_string()),
                     federation_endpoint: None,
+                    discovery_credential_ref: None,
                 },
                 RemoteCluster {
                     name: "west".to_string(),
@@ -2520,6 +2626,7 @@ mod tests {
                     network: Some("net-b".to_string()),
                     control_plane_url: Some("https://cp-west.remote.example:15010".to_string()),
                     federation_endpoint: None,
+                    discovery_credential_ref: None,
                 },
             ],
             ..MultiClusterConfig::default()
@@ -2635,6 +2742,7 @@ mod tests {
                 network: Some("net2".to_string()),
                 control_plane_url: Some("https://cp.east.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2678,6 +2786,7 @@ mod tests {
                 network: Some("net-other".to_string()),
                 control_plane_url: Some("https://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2693,6 +2802,7 @@ mod tests {
                 network: Some("net2".to_string()),
                 control_plane_url: Some("https://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2748,6 +2858,7 @@ mod tests {
                 network: Some("net2".to_string()),
                 control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2768,6 +2879,7 @@ mod tests {
                 network: Some("net2".to_string()),
                 control_plane_url: Some("grpcs://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2798,6 +2910,7 @@ mod tests {
             network: Some("net2".to_string()),
             control_plane_url: Some("https://cp.remote.example:15010".to_string()),
             federation_endpoint: None,
+            discovery_credential_ref: None,
         };
         assert!(entry.matches_declared(&base), "exact identity matches");
         // grpcs:// normalizes to the stored https:// → matches.
@@ -2893,6 +3006,7 @@ mod tests {
                     network: None,
                     control_plane_url: Some("https://cp.trusted.example:15010".to_string()),
                     federation_endpoint: None,
+                    discovery_credential_ref: None,
                 },
                 RemoteCluster {
                     name: "untrusted".to_string(),
@@ -2900,6 +3014,7 @@ mod tests {
                     network: None,
                     control_plane_url: Some("https://cp.untrusted.example:15010".to_string()),
                     federation_endpoint: None,
+                    discovery_credential_ref: None,
                 },
             ],
             ..MultiClusterConfig::default()
@@ -2921,6 +3036,7 @@ mod tests {
                 network: None,
                 control_plane_url: Some(format!("https://cp-{index}.remote.example:15010")),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             })
             .collect();
         let trusted: std::collections::HashSet<TrustDomain> = remote_clusters
@@ -2967,6 +3083,7 @@ mod tests {
                 network: None,
                 control_plane_url: Some("https://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -2998,6 +3115,152 @@ mod tests {
         assert!(
             store.snapshot().is_empty(),
             "trust withdrawal removes stale remote endpoints"
+        );
+        manager.shutdown();
+    }
+
+    #[test]
+    fn parse_remote_discovery_credentials_parses_map() {
+        let issuer = crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
+        let parsed =
+            parse_remote_discovery_credentials(Some(r#"{"b":"secretB","c":"secretC"}"#), issuer)
+                .expect("valid credential map parses");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get("b").map(|s| s.as_str()), Some("secretB"));
+        assert_eq!(parsed.get("c").map(|s| s.as_str()), Some("secretC"));
+        // Each resolved secret carries the supplied (shared CP-DP) issuer so the
+        // remote CP accepts a token minted with it.
+        assert_eq!(parsed.get("b").map(|s| s.issuer()), Some(issuer));
+    }
+
+    #[test]
+    fn parse_remote_discovery_credentials_none_and_empty_are_empty() {
+        let issuer = crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
+        assert!(
+            parse_remote_discovery_credentials(None, issuer)
+                .expect("None is ok")
+                .is_empty()
+        );
+        assert!(
+            parse_remote_discovery_credentials(Some(""), issuer)
+                .expect("empty is ok")
+                .is_empty()
+        );
+        assert!(
+            parse_remote_discovery_credentials(Some("  "), issuer)
+                .expect("whitespace is ok")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_remote_discovery_credentials_rejects_malformed_and_empty_secret() {
+        let issuer = crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
+        assert!(
+            parse_remote_discovery_credentials(Some("not json"), issuer).is_err(),
+            "malformed JSON is rejected"
+        );
+        assert!(
+            parse_remote_discovery_credentials(Some(r#"{"b":""}"#), issuer).is_err(),
+            "empty secret value is rejected"
+        );
+        assert!(
+            parse_remote_discovery_credentials(Some(r#"{"":"secret"}"#), issuer).is_err(),
+            "empty credential reference is rejected"
+        );
+    }
+
+    /// A RemoteCluster that references an installed credential starts a poller
+    /// (the per-remote secret resolves and is threaded into discovery config).
+    #[tokio::test]
+    async fn manager_starts_poller_for_resolved_credential_ref() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
+            production_mode: false,
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert(
+            "credB".to_string(),
+            GrpcJwtSecret::new("per-remote-secret-padding-32-chars".to_string()),
+        );
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        })
+        .with_credentials(std::sync::Arc::new(credentials));
+
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: None,
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+                discovery_credential_ref: Some("credB".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(td("remote.local"));
+
+        manager.reconcile(Some(&mc), trusted);
+        assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        manager.shutdown();
+    }
+
+    /// A RemoteCluster that references an UNKNOWN credential fails closed: no
+    /// poller is started (and discovery never falls back to the shared secret).
+    #[tokio::test]
+    async fn manager_fails_closed_for_unresolved_credential_ref() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
+            production_mode: false,
+            // A shared secret IS present; the unresolved ref must still fail
+            // closed rather than silently borrow it.
+            jwt_secret: Some(GrpcJwtSecret::new(
+                "shared-secret-padding-32-chars!!".to_string(),
+            )),
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        // Empty credential map: the referenced "missing" ref cannot resolve.
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        })
+        .with_credentials(std::sync::Arc::new(std::collections::HashMap::new()));
+
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: None,
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+                discovery_credential_ref: Some("missing".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(td("remote.local"));
+
+        manager.reconcile(Some(&mc), trusted);
+        assert!(
+            manager.running_cluster_names().is_empty(),
+            "an unresolved discovery credential reference must not start a poller"
         );
         manager.shutdown();
     }
@@ -3038,6 +3301,7 @@ mod tests {
                 network: None,
                 control_plane_url: Some("https://cp.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -3112,6 +3376,7 @@ mod tests {
                 network: Some("net-a".to_string()),
                 control_plane_url: Some("https://cp-v1.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -3149,6 +3414,7 @@ mod tests {
                 network: Some("net-b".to_string()),
                 control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };

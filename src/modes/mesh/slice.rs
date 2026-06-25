@@ -2982,6 +2982,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             east_west_gateways: Vec::new(),
         }

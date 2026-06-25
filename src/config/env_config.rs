@@ -858,6 +858,14 @@ pub struct EnvConfig {
     /// in seconds. `0` keeps endpoints indefinitely in non-production only;
     /// production validation rejects that posture.
     pub mesh_remote_discovery_max_stale_seconds: u64,
+    /// Per-RemoteCluster discovery credentials as a JSON object mapping a
+    /// credential reference (matched against `RemoteCluster.discovery_credential_ref`)
+    /// to the JWT secret the remote cluster's control plane accepts. Resolvable
+    /// through the external-secret suffixes (`_VAULT/_AWS/_AZURE/_GCP/_FILE`).
+    /// A token minted with one cluster's secret will not verify at another, so a
+    /// per-remote credential cannot authenticate to the wrong cluster. Never
+    /// logged. Unset falls back to the shared CP-DP JWT secret.
+    pub mesh_remote_discovery_credentials: Option<String>,
     /// Strict local-first locality load balancing. Default `false` (fail-open):
     /// when a mesh upstream's source locality is absent/unresolved the
     /// locality-aware LB returns local **and** remote endpoints together so
@@ -1777,6 +1785,7 @@ impl Default for EnvConfig {
             mesh_remote_discovery_poll_interval_seconds: 0,
             mesh_remote_discovery_poll_timeout_seconds: 30,
             mesh_remote_discovery_max_stale_seconds: 300,
+            mesh_remote_discovery_credentials: None,
             mesh_locality_lb_strict: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
@@ -2153,6 +2162,7 @@ impl EnvConfig {
             mesh_remote_discovery_poll_interval_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS" => 0u64;
             mesh_remote_discovery_poll_timeout_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS" => 30u64;
             mesh_remote_discovery_max_stale_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS" => 300u64;
+            mesh_remote_discovery_credentials: Option<String> = "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS";
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
@@ -2634,6 +2644,10 @@ impl EnvConfig {
         // file path so the `file` protocol's required-path validation can use
         // a plain presence check.
         let mesh_file_config_path = mesh_file_config_path.filter(|s| !s.trim().is_empty());
+        // Blank-means-unset so the per-remote credential map is `None` (shared
+        // secret fallback) rather than an empty-string JSON parse attempt.
+        let mesh_remote_discovery_credentials =
+            mesh_remote_discovery_credentials.filter(|s| !s.trim().is_empty());
         let dtls_cert_path = resolve_tls_source_override(
             conf,
             "FERRUM_DTLS_CERT_SOURCE",
@@ -2759,6 +2773,7 @@ impl EnvConfig {
             mesh_remote_discovery_poll_interval_seconds,
             mesh_remote_discovery_poll_timeout_seconds,
             mesh_remote_discovery_max_stale_seconds,
+            mesh_remote_discovery_credentials,
             mesh_locality_lb_strict,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,

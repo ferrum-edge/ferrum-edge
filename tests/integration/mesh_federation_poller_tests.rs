@@ -192,6 +192,7 @@ fn remote_cluster(name: &str, endpoint: &str) -> RemoteCluster {
         network: None,
         control_plane_url: None,
         federation_endpoint: Some(endpoint.to_string()),
+        discovery_credential_ref: None,
     }
 }
 

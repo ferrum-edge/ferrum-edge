@@ -318,6 +318,7 @@ fn multi_cluster_config_round_trips_through_serde() {
             network: Some("network-b".to_string()),
             control_plane_url: Some("https://cp-b.example:50051".to_string()),
             federation_endpoint: Some("https://eastwest-b.example/.well-known/spiffe".to_string()),
+            discovery_credential_ref: None,
         }],
         east_west_gateways: vec![EastWestGateway {
             name: "cluster-b".to_string(),

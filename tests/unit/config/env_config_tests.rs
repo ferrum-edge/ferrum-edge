@@ -5215,6 +5215,45 @@ fn test_mesh_svid_rotation_drain_seconds_parsed_from_env() {
 }
 
 #[test]
+fn test_mesh_remote_discovery_credentials_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            (
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS",
+                r#"{"credB":"secretB"}"#,
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.mesh_remote_discovery_credentials.as_deref(),
+                Some(r#"{"credB":"secretB"}"#)
+            );
+        },
+    );
+}
+
+#[test]
+fn test_mesh_remote_discovery_credentials_blank_is_none() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS", "   "),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.mesh_remote_discovery_credentials.is_none(),
+                "blank credential map normalizes to None (shared-secret fallback)"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_k8s_pod_discovery_parsed_from_env() {
     with_env_vars(
         &[

@@ -1631,6 +1631,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -1676,6 +1677,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -1727,6 +1729,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -1778,6 +1781,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -1829,6 +1833,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         };
@@ -1873,6 +1878,7 @@ mod tests {
                     network: None,
                     control_plane_url: None,
                     federation_endpoint: Some("https://a/.well-known/spiffe".to_string()),
+                    discovery_credential_ref: None,
                 },
                 RemoteCluster {
                     name: "no-endpoint".to_string(),
@@ -1880,6 +1886,7 @@ mod tests {
                     network: None,
                     control_plane_url: None,
                     federation_endpoint: None,
+                    discovery_credential_ref: None,
                 },
                 RemoteCluster {
                     name: "blank-endpoint".to_string(),
@@ -1887,6 +1894,7 @@ mod tests {
                     network: None,
                     control_plane_url: None,
                     federation_endpoint: Some("   ".to_string()),
+                    discovery_credential_ref: None,
                 },
             ],
             east_west_gateways: Vec::new(),
@@ -1909,6 +1917,7 @@ mod tests {
                     federation_endpoint: Some(format!(
                         "https://remote-{index}.example/.well-known/spiffe"
                     )),
+                    discovery_credential_ref: None,
                 })
                 .collect(),
             ..MultiClusterConfig::default()
@@ -2328,6 +2337,7 @@ mod tests {
             network: None,
             control_plane_url: None,
             federation_endpoint: Some("https://remote-a/.well-known/spiffe".to_string()),
+            discovery_credential_ref: None,
         };
         let slice_with_a = MultiClusterConfig {
             local_cluster: None,
@@ -2381,6 +2391,7 @@ mod tests {
             network: None,
             control_plane_url: None,
             federation_endpoint: Some(endpoint.to_string()),
+            discovery_credential_ref: None,
         };
         let slice_with_both = MultiClusterConfig {
             local_cluster: None,
@@ -2465,6 +2476,7 @@ mod tests {
             network: None,
             control_plane_url: None,
             federation_endpoint: Some(endpoint.to_string()),
+            discovery_credential_ref: None,
         };
         let slice_with_both = MultiClusterConfig {
             local_cluster: None,
@@ -2534,6 +2546,7 @@ mod tests {
                 network: None,
                 control_plane_url: None,
                 federation_endpoint: Some(endpoint.to_string()),
+                discovery_credential_ref: None,
             }],
             east_west_gateways: Vec::new(),
         };

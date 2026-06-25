@@ -882,6 +882,7 @@ fn multi_cluster_remote_cluster_requires_federated_trust_bundle_when_bundles_are
                 network: Some("network-b".to_string()),
                 control_plane_url: None,
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         }),
@@ -918,6 +919,7 @@ fn multi_cluster_rejects_too_many_remote_clusters() {
             network: None,
             control_plane_url: None,
             federation_endpoint: None,
+            discovery_credential_ref: None,
         })
         .collect();
     let mesh = MeshConfig {

@@ -119,6 +119,7 @@ fn remote_cluster(
         network: network.map(str::to_string),
         control_plane_url: control_plane_url.map(str::to_string),
         federation_endpoint: federation_endpoint.map(str::to_string),
+        discovery_credential_ref: None,
     }
 }
 

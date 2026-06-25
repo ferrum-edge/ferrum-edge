@@ -2691,6 +2691,7 @@ mod tests {
                         network: Some("remote-net".to_string()),
                         control_plane_url: Some("https://remote-cp.example.test".to_string()),
                         federation_endpoint: Some("https://remote-fed.example.test".to_string()),
+                        discovery_credential_ref: None,
                     }],
                     east_west_gateways: vec![
                         EastWestGateway {

@@ -165,6 +165,7 @@ fn install_accepted_slice_with_config(runtime: &MeshRuntimeState) {
                     network: Some("net2".to_string()),
                     control_plane_url: Some("grpcs://cp.east.example.com:50051".to_string()),
                     federation_endpoint: Some("https://spire.east.example.com/bundle".to_string()),
+                    discovery_credential_ref: None,
                 },
                 RemoteCluster {
                     name: "remote-west".to_string(),
@@ -173,6 +174,7 @@ fn install_accepted_slice_with_config(runtime: &MeshRuntimeState) {
                     // Federation-only: no control plane, never discoverable.
                     control_plane_url: None,
                     federation_endpoint: Some("https://spire.west.example.com/bundle".to_string()),
+                    discovery_credential_ref: None,
                 },
             ],
             east_west_gateways: Vec::new(),
