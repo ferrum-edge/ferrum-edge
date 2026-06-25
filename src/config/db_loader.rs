@@ -8,6 +8,9 @@
 //!    only changed resource IDs.
 //! 3. Deletes are delivered from durable delete records; normal incremental
 //!    polling does not scan every resource ID or rely on wall-clock timestamps.
+//! 4. Empty change-log windows force an authoritative full reload so direct
+//!    resource-table edits that missed `config_changes` cannot remain stale
+//!    indefinitely.
 //!
 //! On startup, a transaction-scoped full load seeds the initial config and
 //! accepted sequence cursor. Full loads use deterministic keyset pagination
@@ -3418,18 +3421,11 @@ impl DatabaseStore {
 
         if changes.is_empty() {
             self.check_slow_query("load_incremental_config", start);
-            return Ok(IncrementalResult {
-                added_or_modified_proxies: Vec::new(),
-                removed_proxy_ids: Vec::new(),
-                added_or_modified_consumers: Vec::new(),
-                removed_consumer_ids: Vec::new(),
-                added_or_modified_plugin_configs: Vec::new(),
-                removed_plugin_config_ids: Vec::new(),
-                added_or_modified_upstreams: Vec::new(),
-                removed_upstream_ids: Vec::new(),
-                sequence_cursor: after_sequence,
-                poll_timestamp,
-            });
+            anyhow::bail!(
+                "no config_changes rows after sequence {} for namespace {}; forcing full reload to reconcile authoritative resource tables",
+                after_sequence,
+                namespace
+            );
         }
 
         let sequence_cursor = changes

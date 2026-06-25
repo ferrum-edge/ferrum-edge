@@ -205,7 +205,7 @@ async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn incremental_poll_does_not_scan_runtime_rows_without_change_records() {
+async fn empty_change_log_window_forces_full_reload_for_reconciliation() {
     let (store, _temp_dir) = sqlite_store().await;
     let ts = Utc::now().to_rfc3339();
 
@@ -252,15 +252,15 @@ async fn incremental_poll_does_not_scan_runtime_rows_without_change_records() {
     .await
     .expect("raw upstream insert must succeed");
 
-    let result = store
-        .load_incremental_config("ferrum", 0)
-        .await
-        .expect("incremental poll must succeed");
+    let err = match store.load_incremental_config("ferrum", 0).await {
+        Ok(_) => panic!("empty change-log windows must force caller to full reload"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
     assert!(
-        result.is_empty(),
-        "raw runtime rows without config_changes records must not be discovered by incremental polling"
+        message.contains("no config_changes rows") && message.contains("forcing full reload"),
+        "empty change-log error should force reconciliation, got: {message}"
     );
-    assert_eq!(result.sequence_cursor, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

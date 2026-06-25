@@ -21,8 +21,10 @@
 //! they use sequential primary reads and only reject inconsistencies caught by
 //! the runtime load validation path. Replica-set incremental polling reads
 //! durable `config_changes` documents after the accepted sequence cursor and
-//! point-loads changed resource IDs; standalone deployments force full reloads
-//! because resource writes and change records are not transactionally coupled.
+//! point-loads changed resource IDs. Empty change-log windows force full
+//! reloads to reconcile direct collection edits that missed `config_changes`;
+//! standalone deployments force full reloads because resource writes and change
+//! records are not transactionally coupled.
 //!
 //! **Index creation**: The `run_migrations()` method creates indexes instead of
 //! running SQL migrations. `createIndex` is idempotent **only when the full
@@ -2262,6 +2264,14 @@ mod inner {
             }
             self.ensure_change_cursor_available(namespace, after_sequence)
                 .await?;
+            if change_count == 0 {
+                self.check_slow_query("load_incremental_config", start);
+                anyhow::bail!(
+                    "no config_changes rows after sequence {} for namespace {}; forcing full reload to reconcile authoritative resource collections",
+                    after_sequence,
+                    namespace
+                );
+            }
             if change_count >= CHANGE_LOG_BATCH_LIMIT as usize {
                 anyhow::bail!(
                     "MongoDB config change batch for namespace '{}' reached limit {}; forcing full reload",
