@@ -268,6 +268,18 @@ HTTP/TCP/gRPC liveness, readiness, or startup probe. Keep
 the host-network relay and kubelet probes; other host traffic still needs the
 trusted relay mark or follows the UDP/extension-header fail-closed behavior.
 
+Because the relay dials backend pods from a node-local source address, at least
+one trusted node source IP (`FERRUM_NODE_AGENT_NODE_IP` /
+`FERRUM_NODE_AGENT_NODE_IPS`, surfaced as `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6`)
+is **required** in NodeWaypoint mode: with the source-bound guard, an empty
+node-source set would drop the relay's own SYNs and break all inbound to enrolled
+pods. The node-agent therefore **fails closed** (capture reported unavailable)
+rather than silently black-holing the data path when no node source IP is
+configured. The address is CNI-specific and is not auto-detected — it is the host
+source the kernel uses to reach local pods (for example the node's pod-CIDR
+gateway, which may differ from the node's `status.hostIP`), so set it explicitly
+via `nodeAgent.trustedKubeletProbeSourceIps`.
+
 NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
 `connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal
 dual-family path. Excluded v6 (CIDR/port excludes) still flows. The proxy writes

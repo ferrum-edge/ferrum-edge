@@ -225,10 +225,17 @@ nodeAgent:
   captureMode: ebpf
   proxyMode: local_pod
   proxyUid: 1337
-  # Comma-separated source IPs trusted to bypass the NodeWaypoint direct-inbound
-  # guard only when they target Kubernetes HTTP/TCP/gRPC probe ports discovered
-  # from the enrolled pod spec. Keep empty unless the deployment has identified
-  # kubelet probe source addresses (for example CNI bridge gateway IPs).
+  # Comma-separated host source IPs trusted by the NodeWaypoint direct-inbound
+  # guard. These addresses serve two roles: (1) the inbound HBONE relay dials
+  # backend pods from a node-local source, so the source-bound guard admits the
+  # relay's marked traffic only from a trusted node source IP; and (2) they may
+  # reach Kubernetes HTTP/TCP/gRPC probe ports (discovered from the enrolled pod
+  # spec) without the relay mark. REQUIRED when proxyMode=node_waypoint: the
+  # relay source IP is CNI-specific and cannot be auto-detected (for example the
+  # node's pod-CIDR / CNI bridge gateway IP, which may differ from status.hostIP),
+  # so the node-agent fails closed (capture unavailable) when this is empty rather
+  # than silently dropping all inbound to enrolled pods. Leave empty only for
+  # non-NodeWaypoint proxy modes.
   trustedKubeletProbeSourceIps: ""
   # Shared host-path directory used only when proxyMode=node_waypoint. The
   # node-agent publishes one file per enrolled pod here, and the ambient

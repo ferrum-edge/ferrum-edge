@@ -4205,11 +4205,28 @@ fn initialize_backend(
             }
         }
         if node_source_ips.is_empty() {
-            warn!(
-                "NodeWaypoint inbound direct-pod guard has no FERRUM_NODE_AGENT_NODE_IP(S) \
-                 configured; Kubernetes host-network probes will not be exempt until an \
-                 operator supplies trusted kubelet probe source IPs"
-            );
+            // The NodeWaypoint inbound direct-pod guard now admits the relay's
+            // marked SYN only when it ALSO comes from a trusted node source IP
+            // (so a forgeable socket mark alone cannot bypass HBONE/mTLS). The
+            // inbound HBONE relay dials backend pods from a node-local source
+            // address, so with an empty node-source set the guard would drop the
+            // relay's own traffic — and all direct inbound to enrolled pods —
+            // silently. Fail closed instead of black-holing the data path: the
+            // relay source IP is CNI-specific (e.g. the node's pod-CIDR gateway
+            // or its kubelet probe source) and cannot be auto-detected, so the
+            // operator must supply it explicitly.
+            metrics.set_topology_degraded("capture_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            return Err(anyhow::Error::msg(
+                "NodeWaypoint inbound direct-pod guard requires at least one trusted node \
+                 source IP, but neither FERRUM_NODE_AGENT_NODE_IP nor FERRUM_NODE_AGENT_NODE_IPS \
+                 is set. The inbound HBONE relay dials backend pods from a node-local source \
+                 address, so the source-bound guard would drop the relay's own SYNs (and all \
+                 direct inbound to enrolled pods). Set the host source address(es) used to reach \
+                 local pods — CNI-specific, e.g. the node's pod-CIDR gateway or kubelet probe \
+                 source — via nodeAgent.trustedKubeletProbeSourceIps (FERRUM_NODE_AGENT_NODE_IP / \
+                 FERRUM_NODE_AGENT_NODE_IPS).",
+            ));
         }
     }
 
