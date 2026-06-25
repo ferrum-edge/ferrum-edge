@@ -304,6 +304,13 @@ pub fn record_mesh_federation_poll_success(
         .store(fetched_at_unix_seconds, Ordering::Relaxed);
 }
 
+/// Drop the federation last-success / bundle-age series once a polled bundle
+/// is withdrawn. Failure counters are preserved, but the gauges must not keep
+/// advertising a cached bundle after bounded staleness expires.
+pub fn clear_mesh_federation_poll_success(trust_domain: impl AsRef<str>) {
+    MESH_FEDERATION_LAST_SUCCESS.remove(trust_domain.as_ref());
+}
+
 pub fn increment_mesh_remote_discovery_poll_failure(
     cluster: impl AsRef<str>,
     trust_domain: impl AsRef<str>,

@@ -712,6 +712,90 @@ fn test_env_config_mesh_mode_rejects_malformed_production_mode() {
 }
 
 #[test]
+fn test_env_config_mesh_production_refuses_unbounded_federation_staleness() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "https://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
+            ("FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS", "30"),
+            ("FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS", "0"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_production_refuses_unbounded_remote_discovery_staleness() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "https://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
+            ("FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS", "30"),
+            ("FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS", "0"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_production_refuses_remote_discovery_tls_no_verify() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "https://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
+            ("FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS", "30"),
+            ("FERRUM_DP_GRPC_TLS_NO_VERIFY", "true"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("FERRUM_DP_GRPC_TLS_NO_VERIFY"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_mesh_mode_blank_gateway_svid_paths_are_not_identity() {
     // Empty / whitespace SVID paths (`Some("")`) provide no usable cert/key, so
     // they must NOT satisfy the identity check — production mode must still

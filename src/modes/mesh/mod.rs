@@ -8141,10 +8141,11 @@ async fn serve_mesh_runtime(
     // cached bundles still used by the live proxy config. No pollers run when
     // `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or no remote cluster
     // carries a federation endpoint.
-    let federation_poller_config = federation::FederationPollerConfig::from_env(
+    let federation_poller_config = federation::FederationPollerConfig::from_env_with_max_stale(
         env_config.mesh_federation_poll_interval_seconds,
         env_config.mesh_federation_poll_timeout_seconds,
         env_config.mesh_federation_fail_open,
+        env_config.mesh_federation_max_stale_seconds,
     );
     let federation_manager = federation::FederationPollerManager::new(
         federation_poller_config,
@@ -8192,9 +8193,10 @@ async fn serve_mesh_runtime(
             // uses `tls_urls` above.
             plain_urls: None,
         };
-        multicluster::RemoteDiscoveryConfig::new(
+        multicluster::RemoteDiscoveryConfig::new_with_max_stale(
             env_config.mesh_remote_discovery_poll_interval_seconds,
             env_config.mesh_remote_discovery_poll_timeout_seconds,
+            env_config.mesh_remote_discovery_max_stale_seconds,
             remote_grpc_secret,
             runtime.node_id.clone(),
             runtime.namespace.clone(),

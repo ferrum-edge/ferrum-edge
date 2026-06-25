@@ -75,6 +75,8 @@ use crate::modes::mesh::config_consumer::common::{
 /// `src/grpc/dp_client.rs`. One cross-cluster backoff curve for operators to
 /// reason about.
 pub(crate) const REMOTE_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
+#[allow(dead_code)]
+pub(crate) const DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS: u64 = 300;
 
 /// Defense-in-depth cap on the number of workloads / services a single remote
 /// cluster may contribute. A misbehaving (or compromised) remote CP cannot
@@ -132,6 +134,7 @@ pub struct RemoteClusterEntry {
 
 impl RemoteClusterEntry {
     /// Construct an entry, wrapping the poll timestamp in a fresh shared atomic.
+    #[allow(dead_code)]
     pub fn new(
         cluster_name: String,
         trust_domain: TrustDomain,
@@ -501,6 +504,51 @@ impl RemoteEndpointStore {
         if changed {
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
+    }
+
+    /// Expire last-good endpoints after a bounded staleness window without
+    /// retiring the cluster's generation. The poller remains live and can
+    /// reinstall endpoints on a later successful poll.
+    pub(crate) fn expire_stale_endpoints_and_clear_metrics(
+        &self,
+        cluster_name: &str,
+        trust_domain: &str,
+        now_unix_seconds: u64,
+        max_stale_age: Duration,
+    ) -> bool {
+        let max_stale_seconds = max_stale_age.as_secs();
+        if max_stale_seconds == 0 {
+            return false;
+        }
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.cluster_generation.load().contains_key(cluster_name) {
+            return false;
+        }
+        let mut expired = false;
+        self.inner.rcu(|current| {
+            let Some(entry) = current.clusters.get(cluster_name) else {
+                return Arc::clone(current);
+            };
+            let age_seconds = now_unix_seconds.saturating_sub(entry.fetched_at_unix_seconds());
+            if age_seconds <= max_stale_seconds {
+                return Arc::clone(current);
+            }
+            let mut next = (**current).clone();
+            next.clusters.remove(cluster_name);
+            expired = true;
+            Arc::new(next)
+        });
+        if expired {
+            self.revision_tx.send_modify(|revision| *revision += 1);
+            crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+                cluster_name,
+                trust_domain,
+            );
+        }
+        expired
     }
 
     /// Record a successful, still-live remote-discovery poll's success /
@@ -992,7 +1040,11 @@ impl RemoteDiscoveryManager {
             self.stop_all(true);
             return;
         };
-        let targets = poll_targets_for_multi_cluster(multi_cluster, &trust_bundle_domains);
+        let targets = poll_targets_for_multi_cluster_with_posture(
+            multi_cluster,
+            &trust_bundle_domains,
+            config.production_mode,
+        );
         if targets.is_empty() {
             self.stop_all(true);
             debug!("No remote clusters eligible for endpoint discovery; pollers stopped");
@@ -1062,6 +1114,8 @@ impl RemoteDiscoveryManager {
             trust_domain = %target.trust_domain,
             control_plane = %url_for_logs,
             poll_interval_seconds = ctx.config.poll_interval.as_secs(),
+            max_stale_seconds = ctx.config.max_stale_age.map(|age| age.as_secs()),
+            production_mode = ctx.config.production_mode,
             "Spawning remote-cluster endpoint discovery"
         );
         let handle = tokio::spawn(async move {
@@ -1139,6 +1193,12 @@ impl RemoteDiscoveryTlsConfig {
 pub struct RemoteDiscoveryConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
+    /// Maximum age for last-good endpoints after poll failures. `None` keeps
+    /// last-good endpoints indefinitely (dev/test only in production
+    /// validation).
+    pub max_stale_age: Option<Duration>,
+    /// Production posture rejects plaintext remote-control-plane URLs.
+    pub production_mode: bool,
     /// JWT secret + issuer for the remote CP gRPC handshake (reuses the
     /// CP→DP secret). `None` disables discovery (no secret → cannot dial).
     pub jwt_secret: Option<GrpcJwtSecret>,
@@ -1154,9 +1214,30 @@ pub struct RemoteDiscoveryConfig {
 impl RemoteDiscoveryConfig {
     /// Returns `None` when discovery should be disabled (interval 0 or no JWT
     /// secret available to authenticate to the remote CP).
+    #[allow(dead_code)]
     pub fn new(
         interval_seconds: u64,
         timeout_seconds: u64,
+        jwt_secret: Option<GrpcJwtSecret>,
+        node_id: String,
+        namespace: String,
+        tls_config: RemoteDiscoveryTlsConfig,
+    ) -> Option<Self> {
+        Self::new_with_max_stale(
+            interval_seconds,
+            timeout_seconds,
+            DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS,
+            jwt_secret,
+            node_id,
+            namespace,
+            tls_config,
+        )
+    }
+
+    pub fn new_with_max_stale(
+        interval_seconds: u64,
+        timeout_seconds: u64,
+        max_stale_seconds: u64,
         jwt_secret: Option<GrpcJwtSecret>,
         node_id: String,
         namespace: String,
@@ -1168,6 +1249,8 @@ impl RemoteDiscoveryConfig {
         Some(Self {
             poll_interval: Duration::from_secs(interval_seconds),
             request_timeout: Duration::from_secs(timeout_seconds.max(1)),
+            max_stale_age: (max_stale_seconds > 0).then(|| Duration::from_secs(max_stale_seconds)),
+            production_mode: crate::identity::production_mode(),
             jwt_secret,
             node_id,
             namespace,
@@ -1184,9 +1267,18 @@ impl RemoteDiscoveryConfig {
 /// cross-cluster discovery fail-closed: Ferrum will not dial (and merge
 /// endpoints from) a cluster it cannot mutually authenticate, mirroring the
 /// federation poller's posture.
+#[cfg(test)]
 fn poll_targets_for_multi_cluster(
     multi_cluster: &MultiClusterConfig,
     trust_bundle_domains: &std::collections::HashSet<TrustDomain>,
+) -> Vec<RemoteClusterPollTarget> {
+    poll_targets_for_multi_cluster_with_posture(multi_cluster, trust_bundle_domains, false)
+}
+
+fn poll_targets_for_multi_cluster_with_posture(
+    multi_cluster: &MultiClusterConfig,
+    trust_bundle_domains: &std::collections::HashSet<TrustDomain>,
+    production_mode: bool,
 ) -> Vec<RemoteClusterPollTarget> {
     let mut targets = Vec::with_capacity(
         multi_cluster
@@ -1211,7 +1303,7 @@ fn poll_targets_for_multi_cluster(
             );
             continue;
         }
-        if let Err(err) = validate_control_plane_url(url) {
+        if let Err(err) = validate_control_plane_url_with_posture(url, production_mode) {
             warn!(
                 cluster = %remote.name,
                 error = %err,
@@ -1266,7 +1358,15 @@ pub(crate) fn normalize_control_plane_url(url: &str) -> String {
 /// `grpc://` and `grpcs://` are accepted and normalized to `http://` /
 /// `https://` by [`normalize_control_plane_url`] before dialing so that
 /// `tonic::Channel::from_shared` receives a scheme it understands.
+#[cfg(test)]
 pub(crate) fn validate_control_plane_url(url: &str) -> Result<(), String> {
+    validate_control_plane_url_with_posture(url, false)
+}
+
+pub(crate) fn validate_control_plane_url_with_posture(
+    url: &str,
+    production_mode: bool,
+) -> Result<(), String> {
     // Normalise before parsing so the scheme check is on the canonical form.
     let normalized = normalize_control_plane_url(url);
     let parsed =
@@ -1274,6 +1374,13 @@ pub(crate) fn validate_control_plane_url(url: &str) -> Result<(), String> {
     match parsed.scheme() {
         "http" | "https" => {}
         other => return Err(format!("unsupported control_plane_url scheme '{other}'")),
+    }
+    if production_mode && parsed.scheme() != "https" {
+        return Err(
+            "production remote-cluster discovery requires an authenticated TLS control_plane_url \
+             (use https:// or grpcs://; plaintext http:// and grpc:// are dev/test only)"
+                .to_string(),
+        );
     }
     let Some(host) = parsed.host() else {
         return Err("control_plane_url has no host".to_string());
@@ -1450,6 +1557,7 @@ async fn remote_discovery_loop(
                     ctx.trust_domain.as_str(),
                     &url_for_logs,
                 );
+                expire_stale_endpoints_after_failure(&store, &ctx, task_generation, &url_for_logs);
                 (false, jittered_backoff(backoff_secs))
             }
         };
@@ -1462,6 +1570,35 @@ async fn remote_discovery_loop(
             _ = tokio::time::sleep(sleep_duration) => {}
             _ = wait_for_shutdown(&mut shutdown_rx) => return,
         }
+    }
+}
+
+fn expire_stale_endpoints_after_failure(
+    store: &RemoteEndpointStore,
+    ctx: &RemoteClusterPollContext,
+    task_generation: u64,
+    url_for_logs: &str,
+) {
+    let Some(max_stale_age) = ctx.config.max_stale_age else {
+        return;
+    };
+    if !store.cluster_generation_matches(&ctx.cluster_name, task_generation) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if store.expire_stale_endpoints_and_clear_metrics(
+        &ctx.cluster_name,
+        ctx.trust_domain.as_str(),
+        now,
+        max_stale_age,
+    ) {
+        warn!(
+            cluster = %ctx.cluster_name,
+            trust_domain = %ctx.trust_domain,
+            control_plane = %url_for_logs,
+            max_stale_seconds = max_stale_age.as_secs(),
+            "Expired last-good remote-cluster endpoints after bounded staleness window"
+        );
     }
 }
 
@@ -2799,6 +2936,8 @@ mod tests {
         let config = RemoteDiscoveryConfig {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
+            production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
@@ -2868,6 +3007,8 @@ mod tests {
         let config = RemoteDiscoveryConfig {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
+            production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
@@ -2938,6 +3079,8 @@ mod tests {
         let config = RemoteDiscoveryConfig {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
+            production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
@@ -3022,6 +3165,18 @@ mod tests {
     }
 
     #[test]
+    fn production_control_plane_url_rejects_plaintext() {
+        assert!(validate_control_plane_url_with_posture("https://cp.example:15010", true).is_ok());
+        assert!(validate_control_plane_url_with_posture("grpcs://cp.example:15010", true).is_ok());
+        let err = validate_control_plane_url_with_posture("http://cp.example:15010", true)
+            .expect_err("production remote discovery must reject plaintext HTTP");
+        assert!(err.contains("production"), "{err}");
+        let err = validate_control_plane_url_with_posture("grpc://cp.example:15010", true)
+            .expect_err("production remote discovery must reject plaintext gRPC");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    #[test]
     fn normalize_control_plane_url_translates_grpc_schemes() {
         assert_eq!(
             normalize_control_plane_url("grpc://cp.example:15010"),
@@ -3070,6 +3225,8 @@ mod tests {
         let config = RemoteDiscoveryConfig {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
+            production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
@@ -3151,6 +3308,8 @@ mod tests {
                 // quickly; the test shuts it down right after.
                 poll_interval: Duration::from_millis(20),
                 request_timeout: Duration::from_secs(1),
+                max_stale_age: None,
+                production_mode: false,
                 jwt_secret: None,
                 node_id: "dp-1".to_string(),
                 namespace: "default".to_string(),
@@ -3513,6 +3672,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expire_stale_endpoints_clears_cache_and_metrics_without_retiring_generation() {
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("stale-endpoints-{suffix}");
+        let trust_domain = format!("stale-{suffix}.example");
+        let trust = td(&trust_domain);
+
+        let store = RemoteEndpointStore::new();
+        let mut rx = store.subscribe();
+        let task_generation = store.register_cluster(&cluster);
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                &format!("spiffe://{trust_domain}/ns/default/sa/a"),
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        let entry_at = |fetched_at: u64| {
+            RemoteClusterEntry::new(
+                cluster.clone(),
+                trust.clone(),
+                None,
+                Some("https://cp.remote.example:15010".to_string()),
+                endpoints.clone(),
+                fetched_at,
+            )
+        };
+
+        assert!(
+            store.install(entry_at(100), task_generation).installed(),
+            "precondition: first poll installs endpoints"
+        );
+        store.record_remote_discovery_success_if_live(
+            &cluster,
+            &trust_domain,
+            100,
+            task_generation,
+        );
+        rx.mark_unchanged();
+
+        assert!(
+            !store.expire_stale_endpoints_and_clear_metrics(
+                &cluster,
+                &trust_domain,
+                120,
+                Duration::from_secs(20),
+            ),
+            "age equal to max stale remains usable"
+        );
+        assert!(store.snapshot().clusters.contains_key(&cluster));
+
+        assert!(store.expire_stale_endpoints_and_clear_metrics(
+            &cluster,
+            &trust_domain,
+            121,
+            Duration::from_secs(20),
+        ));
+        assert!(
+            !store.snapshot().clusters.contains_key(&cluster),
+            "expired endpoints are withdrawn from the active snapshot"
+        );
+        assert!(
+            rx.has_changed().unwrap(),
+            "expiration wakes the apply loop so upstream targets are recomputed"
+        );
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            !rendered.contains(&format!("cluster=\"{cluster}\"")),
+            "expiration clears last-success/age metrics for stale endpoints: {rendered}"
+        );
+
+        assert!(
+            store.install(entry_at(130), task_generation).installed(),
+            "staleness expiration must not retire the poll generation; a later successful poll can reinstall"
+        );
+        assert!(store.snapshot().clusters.contains_key(&cluster));
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+            &cluster,
+            &trust_domain,
+        );
+    }
+
     // ── Real two-CP gRPC round trip ────────────────────────────────────────
     //
     // The tests above stub `RemoteServiceSource::fetch` with `MockSource`. The
@@ -3685,6 +3929,8 @@ mod tests {
             config: RemoteDiscoveryConfig {
                 poll_interval: Duration::from_millis(20),
                 request_timeout,
+                max_stale_age: None,
+                production_mode: false,
                 jwt_secret,
                 node_id: "dp-1".to_string(),
                 namespace: "default".to_string(),

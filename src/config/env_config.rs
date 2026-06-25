@@ -833,6 +833,10 @@ pub struct EnvConfig {
     pub mesh_federation_poll_interval_seconds: u64,
     /// Per-request HTTP timeout for SPIFFE federation bundle fetches, in seconds.
     pub mesh_federation_poll_timeout_seconds: u64,
+    /// Maximum age for a last-good polled federation bundle after poll
+    /// failures, in seconds. `0` keeps last-good bundles indefinitely in
+    /// non-production only; production validation rejects that posture.
+    pub mesh_federation_max_stale_seconds: u64,
     /// When `true`, a poll failure that leaves a remote-cluster trust domain
     /// with no cached bundle still allows the mesh to start / continue (the
     /// remote trust domain is effectively unverifiable until the next
@@ -850,6 +854,10 @@ pub struct EnvConfig {
     pub mesh_remote_discovery_poll_interval_seconds: u64,
     /// Per-poll timeout for the remote-cluster MeshSubscribe fetch, in seconds.
     pub mesh_remote_discovery_poll_timeout_seconds: u64,
+    /// Maximum age for last-good remote-cluster endpoints after poll failures,
+    /// in seconds. `0` keeps endpoints indefinitely in non-production only;
+    /// production validation rejects that posture.
+    pub mesh_remote_discovery_max_stale_seconds: u64,
     /// Strict local-first locality load balancing. Default `false` (fail-open):
     /// when a mesh upstream's source locality is absent/unresolved the
     /// locality-aware LB returns local **and** remote endpoints together so
@@ -1764,9 +1772,11 @@ impl Default for EnvConfig {
             mesh_request_auth_require_exp: true,
             mesh_federation_poll_interval_seconds: 300,
             mesh_federation_poll_timeout_seconds: 30,
+            mesh_federation_max_stale_seconds: 3600,
             mesh_federation_fail_open: false,
             mesh_remote_discovery_poll_interval_seconds: 0,
             mesh_remote_discovery_poll_timeout_seconds: 30,
+            mesh_remote_discovery_max_stale_seconds: 300,
             mesh_locality_lb_strict: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
@@ -2138,9 +2148,11 @@ impl EnvConfig {
             mesh_request_auth_require_exp: bool = "FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP" => true;
             mesh_federation_poll_interval_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS" => 300u64;
             mesh_federation_poll_timeout_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS" => 30u64;
+            mesh_federation_max_stale_seconds: u64 = "FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS" => 3600u64;
             mesh_federation_fail_open: bool = "FERRUM_MESH_FEDERATION_FAIL_OPEN" => false;
             mesh_remote_discovery_poll_interval_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS" => 0u64;
             mesh_remote_discovery_poll_timeout_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS" => 30u64;
+            mesh_remote_discovery_max_stale_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS" => 300u64;
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
@@ -2742,9 +2754,11 @@ impl EnvConfig {
             mesh_request_auth_require_exp,
             mesh_federation_poll_interval_seconds,
             mesh_federation_poll_timeout_seconds,
+            mesh_federation_max_stale_seconds,
             mesh_federation_fail_open,
             mesh_remote_discovery_poll_interval_seconds,
             mesh_remote_discovery_poll_timeout_seconds,
+            mesh_remote_discovery_max_stale_seconds,
             mesh_locality_lb_strict,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
@@ -3561,6 +3575,36 @@ impl EnvConfig {
                             "Invalid FERRUM_MESH_PRODUCTION_MODE value '{raw}'. \
                              Expected true, false, 1, or 0"
                         ));
+                    }
+                }
+                if crate::identity::production_mode() {
+                    if self.mesh_federation_poll_interval_seconds > 0
+                        && self.mesh_federation_max_stale_seconds == 0
+                    {
+                        return Err(
+                            "FERRUM_MESH_PRODUCTION_MODE=true requires \
+                             FERRUM_MESH_FEDERATION_MAX_STALE_SECONDS > 0 when federation \
+                             polling is enabled; unbounded last-good trust bundles are dev/test only"
+                                .into(),
+                        );
+                    }
+                    if self.mesh_remote_discovery_poll_interval_seconds > 0 {
+                        if self.mesh_remote_discovery_max_stale_seconds == 0 {
+                            return Err(
+                                "FERRUM_MESH_PRODUCTION_MODE=true requires \
+                                 FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
+                                 discovery is enabled; unbounded last-good endpoints are dev/test only"
+                                    .into(),
+                            );
+                        }
+                        if self.dp_grpc_tls_no_verify {
+                            return Err(
+                                "FERRUM_MESH_PRODUCTION_MODE=true forbids \
+                                 FERRUM_DP_GRPC_TLS_NO_VERIFY=true when remote-cluster discovery is \
+                                 enabled; remote control-plane TLS must verify server identity"
+                                    .into(),
+                            );
+                        }
                     }
                 }
                 // The running mesh's workload identity comes either from

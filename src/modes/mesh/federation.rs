@@ -55,6 +55,8 @@ use crate::util::backoff::{
 pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
 #[cfg(test)]
 const FEDERATION_BACKOFF_MAX_SECS: u64 = BACKOFF_MAX_SECS;
+#[allow(dead_code)]
+pub(crate) const DEFAULT_FEDERATION_MAX_STALE_SECONDS: u64 = 3600;
 
 /// Hard cap on federation response body size. A real SPIFFE bundle is
 /// kilobytes — even a generous JWKS with several authorities fits well
@@ -275,6 +277,46 @@ impl FederationStore {
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
     }
+
+    /// Remove a last-good bundle after its bounded staleness window expires
+    /// without retiring the cluster's poll generation. The poller keeps running
+    /// and can reinstall a fresh bundle if the remote endpoint recovers.
+    pub(crate) fn expire_stale_bundle(
+        &self,
+        cluster_name: &str,
+        trust_domain: &TrustDomain,
+        now_unix_seconds: u64,
+        max_stale_age: Duration,
+    ) -> bool {
+        let max_stale_seconds = max_stale_age.as_secs();
+        if max_stale_seconds == 0 {
+            return false;
+        }
+        let mut expired = false;
+        self.inner.rcu(|current| {
+            let Some(bundle) = current.bundles.get(trust_domain) else {
+                return Arc::clone(current);
+            };
+            if bundle.cluster_name != cluster_name {
+                return Arc::clone(current);
+            }
+            let age_seconds = now_unix_seconds.saturating_sub(bundle.fetched_at_unix_seconds);
+            if age_seconds <= max_stale_seconds {
+                return Arc::clone(current);
+            }
+            let mut next = (**current).clone();
+            next.bundles.remove(trust_domain);
+            expired = true;
+            Arc::new(next)
+        });
+        if expired {
+            self.revision_tx.send_modify(|revision| *revision += 1);
+            crate::plugins::mesh::prometheus_helpers::clear_mesh_federation_poll_success(
+                trust_domain.as_str(),
+            );
+        }
+        expired
+    }
 }
 
 /// Wire-format the federation endpoint serves.
@@ -467,6 +509,10 @@ struct RemoteClusterPollTarget {
 pub struct FederationPollerConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
+    /// Maximum age for a last-good polled bundle after poll failures. `None`
+    /// keeps the pre-existing indefinite retention behavior (dev/test only in
+    /// production validation).
+    pub max_stale_age: Option<Duration>,
     /// Federation bootstrap policy. When true, a remote trust domain with a
     /// configured federation endpoint may use a CP-supplied fallback bundle
     /// before the first successful poll. When false, that remote trust domain
@@ -477,13 +523,29 @@ pub struct FederationPollerConfig {
 impl FederationPollerConfig {
     /// Returns `None` when the poller should be disabled (interval 0 or no
     /// federated remote clusters configured).
+    #[allow(dead_code)]
     pub fn from_env(interval_seconds: u64, timeout_seconds: u64, fail_open: bool) -> Option<Self> {
+        Self::from_env_with_max_stale(
+            interval_seconds,
+            timeout_seconds,
+            fail_open,
+            DEFAULT_FEDERATION_MAX_STALE_SECONDS,
+        )
+    }
+
+    pub fn from_env_with_max_stale(
+        interval_seconds: u64,
+        timeout_seconds: u64,
+        fail_open: bool,
+        max_stale_seconds: u64,
+    ) -> Option<Self> {
         if interval_seconds == 0 {
             return None;
         }
         Some(Self {
             poll_interval: Duration::from_secs(interval_seconds),
             request_timeout: Duration::from_secs(timeout_seconds.max(1)),
+            max_stale_age: (max_stale_seconds > 0).then(|| Duration::from_secs(max_stale_seconds)),
             fail_open,
         })
     }
@@ -581,6 +643,7 @@ pub fn spawn_federation_poller(
             trust_domain = %trust_domain,
             endpoint = %endpoint_for_logs,
             poll_interval_seconds = task_config.poll_interval.as_secs(),
+            max_stale_seconds = task_config.max_stale_age.map(|age| age.as_secs()),
             fail_open = task_config.fail_open,
             "Spawning SPIFFE federation poller"
         );
@@ -711,6 +774,7 @@ impl FederationPollerManager {
             trust_domain = %target.trust_domain,
             endpoint = %endpoint_for_logs,
             poll_interval_seconds = config.poll_interval.as_secs(),
+            max_stale_seconds = config.max_stale_age.map(|age| age.as_secs()),
             fail_open = config.fail_open,
             "Spawning SPIFFE federation poller"
         );
@@ -837,6 +901,13 @@ async fn poll_federation_loop(
                     trust_domain.as_str(),
                     &endpoint_for_logs,
                 );
+                expire_stale_bundle_after_failure(
+                    &store,
+                    &cluster_name,
+                    &trust_domain,
+                    config.max_stale_age,
+                    &endpoint_for_logs,
+                );
                 (false, jittered_backoff(backoff_secs))
             }
         };
@@ -849,6 +920,28 @@ async fn poll_federation_loop(
             _ = tokio::time::sleep(sleep_duration) => {}
             _ = wait_for_federation_shutdown(&mut shutdown_rx) => return,
         }
+    }
+}
+
+fn expire_stale_bundle_after_failure(
+    store: &FederationStore,
+    cluster_name: &str,
+    trust_domain: &TrustDomain,
+    max_stale_age: Option<Duration>,
+    endpoint_for_logs: &str,
+) {
+    let Some(max_stale_age) = max_stale_age else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if store.expire_stale_bundle(cluster_name, trust_domain, now, max_stale_age) {
+        warn!(
+            cluster = %cluster_name,
+            trust_domain = %trust_domain,
+            endpoint = %endpoint_for_logs,
+            max_stale_seconds = max_stale_age.as_secs(),
+            "Expired last-good SPIFFE federation bundle after bounded staleness window"
+        );
     }
 }
 
@@ -1699,7 +1792,15 @@ mod tests {
         let cfg = FederationPollerConfig::from_env(60, 10, true).expect("enabled");
         assert_eq!(cfg.poll_interval, Duration::from_secs(60));
         assert_eq!(cfg.request_timeout, Duration::from_secs(10));
+        assert_eq!(
+            cfg.max_stale_age,
+            Some(Duration::from_secs(DEFAULT_FEDERATION_MAX_STALE_SECONDS))
+        );
         assert!(cfg.fail_open);
+
+        let cfg =
+            FederationPollerConfig::from_env_with_max_stale(60, 10, false, 0).expect("enabled");
+        assert_eq!(cfg.max_stale_age, None);
     }
 
     #[test]
@@ -1904,6 +2005,70 @@ mod tests {
         assert!(!store.snapshot().bundles.contains_key(&domain));
     }
 
+    #[test]
+    fn expire_stale_bundle_drops_cache_without_retiring_generation() {
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("stale-{suffix}.example.com"));
+        let mut rx = store.subscribe();
+        let task_generation = store.register("stale-cluster");
+        let federated = |ts: u64| FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: domain.clone(),
+                x509_authorities: vec!["a".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: ts,
+            endpoint: "https://stale/.well-known/spiffe".to_string(),
+            cluster_name: "stale-cluster".to_string(),
+        };
+
+        assert!(store.install(
+            "stale-cluster",
+            domain.clone(),
+            federated(100),
+            task_generation,
+        ));
+        crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
+            domain.as_str(),
+            100,
+        );
+        rx.mark_unchanged();
+        assert!(
+            !store.expire_stale_bundle("stale-cluster", &domain, 120, Duration::from_secs(20),),
+            "age equal to max stale is still usable"
+        );
+        assert!(store.snapshot().bundles.contains_key(&domain));
+
+        assert!(store.expire_stale_bundle("stale-cluster", &domain, 121, Duration::from_secs(20),));
+        assert!(
+            !store.snapshot().bundles.contains_key(&domain),
+            "expired bundle is withdrawn from the active snapshot"
+        );
+        assert!(
+            rx.has_changed().unwrap(),
+            "expiration wakes the apply loop so effective trust is recomputed"
+        );
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            !rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "expiration clears federation last-success/age metrics for stale trust: {rendered}"
+        );
+
+        assert!(
+            store.install(
+                "stale-cluster",
+                domain.clone(),
+                federated(130),
+                task_generation,
+            ),
+            "staleness expiration must not retire the poll generation; a later successful poll can reinstall"
+        );
+        assert!(store.snapshot().bundles.contains_key(&domain));
+    }
+
     #[tokio::test]
     async fn manager_reconcile_starts_poller_and_removes_bundle_on_withdrawal() {
         use crate::modes::mesh::config::RemoteCluster;
@@ -1930,6 +2095,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
@@ -1982,6 +2148,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
@@ -2065,6 +2232,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
@@ -2130,6 +2298,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
