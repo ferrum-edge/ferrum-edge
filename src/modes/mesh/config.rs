@@ -3303,6 +3303,16 @@ fn validate_multi_cluster(
                 remote.name
             ));
         }
+        if remote
+            .discovery_credential_ref
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "RemoteCluster '{}': discovery_credential_ref must not be empty when set",
+                remote.name
+            ));
+        }
 
         if let Some(tb_set) = trust_bundles
             && remote.trust_domain != tb_set.local.trust_domain

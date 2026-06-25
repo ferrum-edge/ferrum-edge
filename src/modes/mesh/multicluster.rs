@@ -1376,9 +1376,16 @@ pub(crate) fn parse_remote_discovery_credentials(
                     .to_string(),
             );
         }
-        if secret.is_empty() {
+        // Enforce the same minimum HS256 key strength the shared
+        // FERRUM_CP_DP_GRPC_JWT_SECRET path applies (env_config `min_len`), so a
+        // per-remote entry cannot mint tokens with a trivially weak key — and the
+        // failure surfaces here at parse time, not later at the remote CP.
+        if secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
             return Err(format!(
-                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference '{reference}' has an empty secret"
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference '{reference}' secret must be at \
+                 least {} characters (matching FERRUM_CP_DP_GRPC_JWT_SECRET); got {}",
+                crate::config::types::MIN_JWT_SECRET_LENGTH,
+                secret.len()
             ));
         }
         out.insert(
@@ -3215,12 +3222,16 @@ mod tests {
     #[test]
     fn parse_remote_discovery_credentials_parses_map() {
         let issuer = crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
-        let parsed =
-            parse_remote_discovery_credentials(Some(r#"{"b":"secretB","c":"secretC"}"#), issuer)
-                .expect("valid credential map parses");
+        // Secrets must meet MIN_JWT_SECRET_LENGTH (32), like the shared
+        // FERRUM_CP_DP_GRPC_JWT_SECRET path enforces.
+        let secret_b = "b".repeat(40);
+        let secret_c = "c".repeat(40);
+        let raw = format!(r#"{{"b":"{secret_b}","c":"{secret_c}"}}"#);
+        let parsed = parse_remote_discovery_credentials(Some(&raw), issuer)
+            .expect("valid credential map parses");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed.get("b").map(|s| s.as_str()), Some("secretB"));
-        assert_eq!(parsed.get("c").map(|s| s.as_str()), Some("secretC"));
+        assert_eq!(parsed.get("b").map(|s| s.as_str()), Some(secret_b.as_str()));
+        assert_eq!(parsed.get("c").map(|s| s.as_str()), Some(secret_c.as_str()));
         // Each resolved secret carries the supplied (shared CP-DP) issuer so the
         // remote CP accepts a token minted with it.
         assert_eq!(parsed.get("b").map(|s| s.issuer()), Some(issuer));
@@ -3258,7 +3269,15 @@ mod tests {
             "empty secret value is rejected"
         );
         assert!(
-            parse_remote_discovery_credentials(Some(r#"{"":"secret"}"#), issuer).is_err(),
+            parse_remote_discovery_credentials(Some(r#"{"b":"short"}"#), issuer).is_err(),
+            "a secret below MIN_JWT_SECRET_LENGTH is rejected"
+        );
+        assert!(
+            parse_remote_discovery_credentials(
+                Some(r#"{"":"a-32-char-secret-aaaaaaaaaaaaaaaaa"}"#),
+                issuer
+            )
+            .is_err(),
             "empty credential reference is rejected"
         );
     }
