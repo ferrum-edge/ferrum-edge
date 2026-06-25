@@ -226,6 +226,28 @@ fn redact_url_redacts_credential_substring_aliases() {
 }
 
 #[test]
+fn redact_url_hides_percent_encoded_sensitive_query_keys() {
+    let redacted = redact_url(concat!(
+        "postgres://db.example.com/ferrum?",
+        "pass%77ord=supersecret&client%5Fsecret=client-secret&sslmode=require"
+    ));
+    assert!(
+        !redacted.contains("supersecret"),
+        "password leaked: {redacted}"
+    );
+    assert!(
+        !redacted.contains("client-secret"),
+        "client secret leaked: {redacted}"
+    );
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("password").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("client_secret").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+}
+
+#[test]
 fn redact_url_redacts_mongodb_semicolon_separated_options() {
     // MongoDB accepts `;` as an option separator; the `url` crate's query parser
     // only splits on `&`, so a `;`-joined credential must still be redacted.
@@ -251,6 +273,19 @@ fn redact_url_redacts_mongodb_semicolon_separated_options() {
     );
     assert!(redacted_ports.contains("password=***"));
     assert!(redacted_ports.contains("replicaSet=rs0"));
+}
+
+#[test]
+fn redact_url_hides_percent_encoded_mongodb_option_keys_in_fallback() {
+    let redacted = redact_url(
+        "mongodb://u:p@db0:27017,db1:27017/ferrum?replicaSet=rs0;pass%77ord=query-secret",
+    );
+    assert!(
+        !redacted.contains("query-secret"),
+        "encoded fallback password leaked: {redacted}"
+    );
+    assert!(redacted.contains("pass%77ord=***"));
+    assert!(redacted.contains("replicaSet=rs0"));
 }
 
 #[test]

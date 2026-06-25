@@ -976,14 +976,12 @@ fn sanitize_endpoint_for_logging(endpoint: &str) -> String {
 /// SSRF defense for federation endpoints. Cloud metadata services
 /// (`169.254.169.254`, AWS IMDS) and link-local addresses are rejected to
 /// keep a compromised control plane from pivoting through the poller into
-/// node-local infrastructure. Loopback is allowed because legitimate
-/// local-development and integration-test setups use it; loopback offers
-/// no new attack surface that the local process doesn't already have.
+/// node-local infrastructure. Loopback hosts are not blocked by the SSRF
+/// checks, but the endpoint must still use authenticated HTTPS.
 ///
-/// HTTPS is recommended (a `warn!` fires on plain `http://`) but not
-/// enforced, so existing CP-supplied configurations that pre-date this
-/// validator keep working. Operators should treat the warn as a strong
-/// hint to migrate.
+/// HTTPS is enforced for trust-bundle transport because polled bundles can
+/// become active for inbound SPIFFE verification. Accepting unauthenticated
+/// HTTP would let an on-path attacker replace a remote trust root.
 pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(endpoint).map_err(|e| {
         format!(
@@ -992,16 +990,10 @@ pub(crate) fn validate_federation_endpoint(endpoint: &str) -> Result<(), String>
         )
     })?;
     let scheme = url.scheme();
-    if scheme != "https" && scheme != "http" {
+    if scheme != "https" {
         return Err(format!(
-            "federation_endpoint must use 'http' or 'https' scheme (got '{scheme}')"
+            "federation_endpoint must use authenticated https scheme (got '{scheme}')"
         ));
-    }
-    if scheme == "http" {
-        warn!(
-            endpoint = %sanitize_endpoint_for_logging(endpoint),
-            "federation_endpoint uses plain http; trust-bundle traffic should use https"
-        );
     }
     let Some(host) = url.host() else {
         return Err(format!(
@@ -1725,10 +1717,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_federation_endpoint_allows_loopback_for_tests() {
-        validate_federation_endpoint("http://127.0.0.1:9090/x")
-            .expect("loopback http is allowed for test scaffolding");
-        validate_federation_endpoint("http://[::1]:9090/x").expect("loopback IPv6 is allowed");
+    fn validate_federation_endpoint_rejects_plain_http_loopback() {
+        let err = validate_federation_endpoint("http://127.0.0.1:9090/x")
+            .expect_err("plain http federation endpoints must be rejected");
+        assert!(err.contains("https"));
+        let err = validate_federation_endpoint("http://[::1]:9090/x")
+            .expect_err("plain http federation endpoints must be rejected");
+        assert!(err.contains("https"));
     }
 
     #[test]
@@ -1740,8 +1735,8 @@ mod tests {
     #[test]
     fn validate_federation_endpoint_rejects_ftp_scheme() {
         let err = validate_federation_endpoint("ftp://example.com/")
-            .expect_err("non-http(s) schemes must be rejected");
-        assert!(err.contains("http"));
+            .expect_err("non-https schemes must be rejected");
+        assert!(err.contains("https"));
     }
 
     #[test]

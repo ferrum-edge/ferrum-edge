@@ -6,9 +6,9 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6, IncludePortsPolicy, OrigDst4,
-    OrigDst6, OrigDstKey, PodInfo, WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES,
-    SOCK_OPS_STATS_LEN,
+    BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6, IncludePortsPolicy,
+    NodeProbePortKey4, NodeProbePortKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo,
+    WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -61,6 +61,32 @@ pub static FERRUM_ACCEPT_COOKIE_BY_TUPLE6: LruHashMap<ConnTuple6, u64> =
 /// TC ingress checks this to decide whether to redirect inbound packets.
 #[map]
 pub static FERRUM_POD_IPS: HashMap<u32, PodInfo> = HashMap::with_max_entries(4096, 0);
+
+/// Enrolled pod IPv6 addresses. Keyed by exact IPv6 address in the same word
+/// layout used by the connect6/orig-dst maps.
+#[map]
+pub static FERRUM_POD_IPS6: HashMap<CidrKey6, PodInfo> = HashMap::with_max_entries(4096, 0);
+
+/// Local node IPv4 addresses that may be considered for the kubelet probe
+/// exemption. The tc guard also requires an exact pod-IP/probe-port entry.
+#[map]
+pub static FERRUM_NODE_IPS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
+
+/// Local node IPv6 addresses that may be considered for the kubelet probe
+/// exemption. The tc guard also requires an exact pod-IP/probe-port entry.
+#[map]
+pub static FERRUM_NODE_IPS6: HashMap<CidrKey6, u8> = HashMap::with_max_entries(256, 0);
+
+/// Enrolled pod IPv4 TCP ports that may be reached directly from configured
+/// local node IPs for Kubernetes HTTP/TCP/gRPC probes.
+#[map]
+pub static FERRUM_NODE_PROBE_PORTS: HashMap<NodeProbePortKey4, u8> =
+    HashMap::with_max_entries(16384, 0);
+
+/// IPv6 counterpart to `FERRUM_NODE_PROBE_PORTS`.
+#[map]
+pub static FERRUM_NODE_PROBE_PORTS6: HashMap<NodeProbePortKey6, u8> =
+    HashMap::with_max_entries(16384, 0);
 
 /// UIDs exempt from outbound capture (proxy UID 1337).
 /// Connect hooks skip rewrite when the calling process matches.

@@ -320,6 +320,17 @@ async fn connect_with_socket_opts_connects_to_listener() {
 }
 
 #[tokio::test]
+async fn connect_with_socket_opts_and_zero_mark_connects_to_listener() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let stream = connect_with_socket_opts_and_mark(addr, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(stream.peer_addr().unwrap(), addr);
+}
+
+#[tokio::test]
 async fn connect_with_socket_opts_ipv6_loopback() {
     // Bind on IPv6 loopback — skip if OS doesn't support it.
     let listener = match tokio::net::TcpListener::bind("[::1]:0").await {

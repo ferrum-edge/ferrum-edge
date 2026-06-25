@@ -72,6 +72,36 @@ pub fn set_ip_bind_address_no_port(_fd: i32, _enable: bool) -> std::io::Result<(
     Ok(()) // No-op on non-Linux
 }
 
+/// Set `SO_MARK` on an outbound socket (Linux only).
+///
+/// NodeWaypoint uses this to distinguish authorized local backend dials made
+/// by the inbound HBONE relay from direct pod-IP traffic. Failures are surfaced
+/// to the caller so the datapath fails closed rather than sending unmarked
+/// traffic that the tc direct-pod guard will drop.
+#[cfg(target_os = "linux")]
+pub fn set_socket_mark(fd: std::os::unix::io::RawFd, mark: u32) -> std::io::Result<()> {
+    let val: libc::c_int = mark as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_socket_mark(_fd: i32, _mark: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 // ── SO_COOKIE ───────────────────────────────────────────────────────────────
 
 /// Read the kernel socket cookie for a TCP stream.
@@ -2528,6 +2558,14 @@ pub fn is_udp_gso_available() -> bool {
 pub async fn connect_with_socket_opts(
     sock_addr: std::net::SocketAddr,
 ) -> std::io::Result<tokio::net::TcpStream> {
+    connect_with_socket_opts_and_mark(sock_addr, None).await
+}
+
+/// Connect with the normal socket options plus an optional `SO_MARK`.
+pub async fn connect_with_socket_opts_and_mark(
+    sock_addr: std::net::SocketAddr,
+    socket_mark: Option<u32>,
+) -> std::io::Result<tokio::net::TcpStream> {
     let socket = if sock_addr.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
@@ -2538,7 +2576,12 @@ pub async fn connect_with_socket_opts(
     {
         use std::os::unix::io::AsRawFd;
         let _ = set_ip_bind_address_no_port(socket.as_raw_fd(), true);
+        if let Some(mark) = socket_mark.filter(|mark| *mark != 0) {
+            set_socket_mark(socket.as_raw_fd(), mark)?;
+        }
     }
+    #[cfg(not(unix))]
+    let _ = socket_mark;
 
     socket.connect(sock_addr).await
 }

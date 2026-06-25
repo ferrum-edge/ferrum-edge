@@ -1746,39 +1746,18 @@ impl Plugin for MeshAuthz {
                     "true".to_string(),
                 );
             }
-            scope_missing = ctx.node_waypoint_policy_scope.is_none();
-            // Fail closed when scoped policies exist and this request's pod has
-            // no current scope — matching the stream path (`on_stream_connect`).
-            // The resolver derives a pod's scope from the SAME slice generation
-            // that vouches its identity, and the accepting connection holds the
-            // identity `Arc` (which the idle sweep's strong_count guard keeps
-            // enrolled), so a missing scope here is NOT an enrollment race: it
-            // means the workload's hash has left the live slice gate (the pod was
-            // removed or re-keyed). A long-lived HTTP/2/HBONE connection from a
-            // removed workload must therefore stop being served under scoped
-            // authz rather than silently dropping to mesh-wide-only — the same
-            // per-request gate the stream path enforces at accept. A mesh with
-            // only mesh-wide policies stays fully evaluable and falls through.
-            if scope_missing && self.has_scoped_policies {
-                ctx.metadata
-                    .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
-                ctx.metadata.insert(
-                    "mesh_authz.deny_policy".to_string(),
-                    "scope_missing".to_string(),
-                );
-                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                return PluginResult::Reject {
-                    status_code: 403,
-                    body: r#"{"error":"Mesh authorization denied: missing per-pod policy scope"}"#
-                        .into(),
-                    headers: HashMap::new(),
-                };
-            }
             let destination_scope_match = ctx
                 .matched_proxy
                 .as_ref()
                 .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
-            if let Some(destination_scope_match) = destination_scope_match {
+            let can_use_destination_scope = ctx.node_waypoint_policy_scope.is_some()
+                || can_use_inbound_relay_destination_scope_without_source_scope(
+                    ctx,
+                    baggage_outcome,
+                );
+            if can_use_destination_scope
+                && let Some(destination_scope_match) = destination_scope_match
+            {
                 node_waypoint_authorized_destination =
                     Some(destination_scope_match.authorized_destination);
                 evaluate_destination_policy_scopes(
@@ -1786,29 +1765,66 @@ impl Plugin for MeshAuthz {
                     destination_scope_match.scopes,
                     &request,
                 )
-            } else if self.has_scoped_policies
-                && ctx
-                    .matched_proxy
-                    .as_ref()
-                    .is_some_and(|proxy| self.proxy_requires_destination_scope(proxy))
-            {
-                ctx.metadata.insert(
-                    "mesh_authz.destination_scope_missing".to_string(),
-                    "true".to_string(),
-                );
-                ctx.metadata.insert(
-                    "mesh_authz.deny_policy".to_string(),
-                    "destination_scope_missing".to_string(),
-                );
-                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                return PluginResult::Reject {
-                    status_code: 403,
-                    body:
-                        r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
-                            .into(),
-                    headers: HashMap::new(),
-                };
             } else {
+                scope_missing = ctx.node_waypoint_policy_scope.is_none();
+                // Fail closed when scoped policies exist and this request's pod has
+                // no current scope — matching the stream path (`on_stream_connect`).
+                // The resolver derives a pod's scope from the SAME slice generation
+                // that vouches its identity, and the accepting connection holds the
+                // identity `Arc` (which the idle sweep's strong_count guard keeps
+                // enrolled), so a missing scope here is NOT an enrollment race: it
+                // means the workload's hash has left the live slice gate (the pod was
+                // removed or re-keyed). A long-lived HTTP/2/HBONE connection from a
+                // removed workload must therefore stop being served under scoped
+                // authz rather than silently dropping to mesh-wide-only — the same
+                // per-request gate the stream path enforces at accept. A mesh with
+                // only mesh-wide policies stays fully evaluable and falls through.
+                //
+                // The exception above is the synthesized inbound HBONE relay with an
+                // honored trusted source assertion: that destination-side request has
+                // no captured source-pod scope, but authz can evaluate destination
+                // policies against the asserted source workload. Source-side
+                // HBONE-shaped traffic, untrusted relay baggage, and missing baggage
+                // keep the existing removed-workload fail-closed behavior.
+                if scope_missing && self.has_scoped_policies {
+                    ctx.metadata
+                        .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body:
+                            r#"{"error":"Mesh authorization denied: missing per-pod policy scope"}"#
+                                .into(),
+                        headers: HashMap::new(),
+                    };
+                }
+                if self.has_scoped_policies
+                    && ctx
+                        .matched_proxy
+                        .as_ref()
+                        .is_some_and(|proxy| self.proxy_requires_destination_scope(proxy))
+                {
+                    ctx.metadata.insert(
+                        "mesh_authz.destination_scope_missing".to_string(),
+                        "true".to_string(),
+                    );
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "destination_scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body:
+                            r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+                                .into(),
+                        headers: HashMap::new(),
+                    };
+                }
                 let scope = ctx.node_waypoint_policy_scope.as_deref();
                 let policies = self
                     .slice
@@ -2138,6 +2154,19 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
 
 fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
     ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+}
+
+fn can_use_inbound_relay_destination_scope_without_source_scope(
+    ctx: &RequestContext,
+    baggage_outcome: BaggageOutcome,
+) -> bool {
+    ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && matches!(baggage_outcome, BaggageOutcome::Honored)
+        && is_authenticated_hbone_request(ctx)
+        && ctx
+            .matched_proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID)
 }
 
 fn is_hbone_request(ctx: &RequestContext) -> bool {

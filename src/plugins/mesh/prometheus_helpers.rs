@@ -312,7 +312,7 @@ pub fn increment_mesh_remote_discovery_poll_failure(
     let key = MeshRemoteDiscoveryPollFailureKey {
         cluster: Arc::from(cluster.as_ref()),
         trust_domain: Arc::from(trust_domain.as_ref()),
-        control_plane: Arc::from(redact_control_plane_label(control_plane.as_ref()).as_str()),
+        control_plane: Arc::from(redact_control_plane_label(control_plane.as_ref())),
     };
     MESH_REMOTE_DISCOVERY_POLL_FAILURES
         .entry(key)
@@ -320,39 +320,16 @@ pub fn increment_mesh_remote_discovery_poll_failure(
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Strip the query and fragment from a control-plane URL before it becomes the
-/// `control_plane` metric label.
+/// Redact a control-plane URL before it becomes the `control_plane` metric
+/// label.
 ///
-/// `/metrics` is unauthenticated, and operators frequently copy-paste a
-/// control-plane URL with credential-like query parameters (`?token=...`).
-/// `sanitize_url_for_logging` (the caller's pre-pass) removes userinfo but keeps
-/// the path/query, so the secret must be dropped here, at the metric store site,
-/// before it is ever rendered. Scheme / host / port / path are preserved so the
-/// label still identifies the endpoint. Parsing keeps any leading userinfo
-/// stripped as a defense-in-depth backstop even if an un-sanitized URL reaches
-/// this path. Unparseable input falls back to truncating at the first `?`/`#`
-/// after the authority so no query/fragment text can leak.
-fn redact_control_plane_label(control_plane: &str) -> String {
-    match url::Url::parse(control_plane) {
-        Ok(mut parsed) => {
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            // Defense-in-depth: drop any userinfo that slipped past the caller's
-            // sanitizer. `set_username`/`set_password` only error for URLs that
-            // cannot bear userinfo (e.g. cannot-be-a-base), which is harmless.
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.to_string()
-        }
-        Err(_) => {
-            // Cut at the first query/fragment delimiter so credential-bearing
-            // segments never survive even when the URL does not parse.
-            let cut = control_plane
-                .find(['?', '#'])
-                .unwrap_or(control_plane.len());
-            control_plane[..cut].to_string()
-        }
-    }
+/// `/metrics` is unauthenticated. Even a URL with userinfo/query/fragment
+/// stripped can reveal remote control-plane topology through its host/port, and
+/// deployments sometimes place bearer material in path segments. Keep the
+/// legacy label key for metric compatibility, but store a fixed, non-sensitive
+/// value so no URL component is rendered.
+fn redact_control_plane_label(_control_plane: &str) -> &'static str {
+    "redacted"
 }
 
 pub fn record_mesh_remote_discovery_poll_success(
@@ -1095,9 +1072,6 @@ mod tests {
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
         let control_plane = format!("https://remote-{suffix}.example:9443");
-        // The store-site redaction normalizes through `url::Url`, which appends
-        // a canonical trailing-slash path for an authority-only URL.
-        let expected_label = format!("https://remote-{suffix}.example:9443/");
         let fetched_at = unix_now_seconds().saturating_sub(5);
 
         increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
@@ -1113,7 +1087,7 @@ mod tests {
         );
         assert!(
             output.contains(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"{expected_label}\"}} 2"
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"redacted\"}} 2"
             )),
             "remote discovery failure counter series missing: {output}"
         );
@@ -1147,24 +1121,24 @@ mod tests {
         );
     }
 
-    /// SECURITY (codex finding): a `control_plane_url` carrying credential-like
-    /// query parameters must not surface on the unauthenticated `/metrics`
-    /// failure-counter label. The store-site redaction drops the query/fragment
-    /// while keeping scheme/host/port/path so the endpoint is still identifiable.
+    /// SECURITY: a `control_plane_url` must not surface on the unauthenticated
+    /// `/metrics` failure-counter label. URLs can expose topology through the
+    /// host/port and credential-like material through path/query/fragment data.
     #[test]
-    fn remote_discovery_failure_label_redacts_query_and_fragment() {
+    fn remote_discovery_failure_label_redacts_control_plane_url() {
         let suffix = format!("{}-{}", std::process::id(), line!());
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
         let host = format!("cp-{suffix}.example");
-        let leaky_url = format!("https://{host}:9443/subscribe?token=secret&api_key=abc#frag");
+        let leaky_url = format!(
+            "https://user:pw@{host}:9443/tenant/path-token-secret/subscribe?token=secret&api_key=abc#frag"
+        );
 
         increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &leaky_url);
 
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
 
-        // Pull out just this cluster's failure line so the assertions are scoped.
         let line = output
             .lines()
             .find(|l| {
@@ -1173,42 +1147,39 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("failure series for {cluster} missing: {output}"));
 
+        for sensitive in [
+            host.as_str(),
+            "user",
+            "pw",
+            "9443",
+            "tenant",
+            "path-token-secret",
+            "token",
+            "secret",
+            "api_key",
+            "abc",
+            "frag",
+        ] {
+            assert!(
+                !line.contains(sensitive),
+                "sensitive control-plane URL component leaked into metric label: {line}"
+            );
+        }
         assert!(
-            !line.contains("token") && !line.contains("secret"),
-            "query token leaked into metric label: {line}"
-        );
-        assert!(
-            !line.contains("api_key") && !line.contains("abc"),
-            "query api_key leaked into metric label: {line}"
-        );
-        assert!(
-            !line.contains("frag") && !line.contains('?') && !line.contains('#'),
-            "fragment/query delimiters leaked into metric label: {line}"
-        );
-        // The scheme/host/port/path that identify the endpoint are retained.
-        assert!(
-            line.contains(&format!("control_plane=\"https://{host}:9443/subscribe\"")),
-            "redacted label dropped the identifying endpoint: {line}"
+            line.contains("control_plane=\"redacted\""),
+            "control-plane label should retain only a fixed redacted value: {line}"
         );
     }
 
-    /// The redaction also strips userinfo as a defense-in-depth backstop even if
-    /// an un-sanitized URL reaches the store site, and degrades safely (cut at
-    /// the first delimiter) for input that does not parse as a URL.
     #[test]
-    fn redact_control_plane_label_handles_userinfo_and_unparseable() {
+    fn redact_control_plane_label_uses_fixed_non_sensitive_value() {
         assert_eq!(
             redact_control_plane_label("https://user:pw@cp.example:9443/p?token=x"),
-            "https://cp.example:9443/p"
+            "redacted"
         );
-        // Not a URL: must still drop everything from the first `?`/`#`.
         assert_eq!(
             redact_control_plane_label("not a url?token=secret"),
-            "not a url"
-        );
-        assert_eq!(
-            redact_control_plane_label("garbage#token=secret"),
-            "garbage"
+            "redacted"
         );
     }
 

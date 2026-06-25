@@ -877,6 +877,36 @@ async fn test_scan_all_mode_redact_preserves_numeric_llm_parameters() {
 }
 
 #[tokio::test]
+async fn test_scan_all_mode_redacts_string_llm_parameter_values() {
+    // Numeric LLM parameters are preserved only when they are encoded as JSON
+    // numbers. A string value under the same top-level key is user-controlled
+    // content and must not bypass redaction/residual verification.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "seed": "123-45-6789",
+        "n": "987-65-4321"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+    let redacted = ctx.metadata.get("request_body").unwrap();
+    assert!(
+        !redacted.contains("123-45-6789") && !redacted.contains("987-65-4321"),
+        "string LLM parameter values must be removed from forwarded body: {redacted}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(redacted).unwrap();
+    assert_eq!(parsed["seed"], json!("[REDACTED:ssn]"));
+    assert_eq!(parsed["n"], json!("[REDACTED:ssn]"));
+}
+
+#[tokio::test]
 async fn test_scan_all_mode_redact_fails_closed_on_whitespace_sensitive_pattern() {
     // A contextual custom pattern that *requires* whitespace around the colon
     // matches the incoming raw body, but no token is rewritten. The residual

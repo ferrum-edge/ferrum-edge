@@ -12,8 +12,16 @@ if [[ ! -f "$LIVE_ASSERTIONS_HELPER" && -f "$PWD/tests/k8s/lib/live_assertions.s
 fi
 source "$LIVE_ASSERTIONS_HELPER"
 
+# shellcheck source=../lib/spire.sh
+SPIRE_HELPER="$ROOT_DIR/tests/k8s/lib/spire.sh"
+if [[ ! -f "$SPIRE_HELPER" && -f "$PWD/tests/k8s/lib/spire.sh" ]]; then
+  SPIRE_HELPER="$PWD/tests/k8s/lib/spire.sh"
+fi
+source "$SPIRE_HELPER"
+
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
+UNMANAGED_NS="${FERRUM_LIVE_UNMANAGED_NAMESPACE:-$WORKLOAD_NS-unmanaged}"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-0.9.0}"
@@ -25,13 +33,23 @@ DOCKER_NODE_EVIDENCE="${FERRUM_LIVE_DOCKER_NODE_EVIDENCE:-false}"
 NODE_WAYPOINT_REGISTRY_DIR="${FERRUM_LIVE_NODE_WAYPOINT_REGISTRY_DIR:-/run/ferrum/node-waypoint-pods}"
 AMBIENT_ADMIN_PORT="${FERRUM_LIVE_AMBIENT_ADMIN_PORT:-19010}"
 NODE_AGENT_ADMIN_PORT="${FERRUM_LIVE_NODE_AGENT_ADMIN_PORT:-19090}"
+DIAGNOSTIC_TIMEOUT_SECONDS="${FERRUM_LIVE_DIAGNOSTIC_TIMEOUT_SECONDS:-30}"
 ADMIN_JWT_SECRET="${FERRUM_LIVE_ADMIN_JWT_SECRET:-ferrum-edge-node-waypoint-live-admin-secret}"
 ADMIN_JWT_ISSUER="${FERRUM_LIVE_ADMIN_JWT_ISSUER:-ferrum-edge}"
+KUBE_CONTEXT="${FERRUM_LIVE_KUBE_CONTEXT:-}"
+SPIRE_PRODUCTION="${FERRUM_LIVE_SPIRE_PRODUCTION:-true}"
+SPIRE_NS="${FERRUM_LIVE_SPIRE_NAMESPACE:-$FERRUM_SPIRE_NAMESPACE}"
+TRUST_DOMAIN="${FERRUM_LIVE_TRUST_DOMAIN:-cluster.local}"
 RESULTS_DIR="$ROOT_DIR/target/node-waypoint-ebpf-live"
 LIVE_ASSERTIONS_FILE="${FERRUM_LIVE_ASSERTIONS_FILE:-$RESULTS_DIR/live-assertions.json}"
 LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-dual-stack-node-waypoint-ebpf}"
+STALE_IP_REUSE_HOST_LOCAL_PROFILE=false
+if [[ "$LIVE_PLATFORM_PROFILE" == "kind-dual-stack-node-waypoint-ebpf" ]]; then
+  STALE_IP_REUSE_HOST_LOCAL_PROFILE=true
+fi
 LIVE_ASSERTIONS_INITIALIZED=false
 RECORDED_LIVE_ASSERTIONS=" "
+TRUSTED_KUBELET_PROBE_IPS=""
 REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ebpf.chart_profile
   node_waypoint.ebpf.capture_ready
@@ -44,15 +62,34 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ipv4.service_deny_cross_node
   node_waypoint.ipv4.pod_ip_bypass_guard_same_node
   node_waypoint.ipv4.pod_ip_bypass_guard_cross_node
+  node_waypoint.ipv4.direct_inbound_guard_same_node
+  node_waypoint.ipv4.direct_inbound_guard_cross_node
   node_waypoint.identity.stale_cleanup
   node_waypoint.identity.spire_chart_profile
 )
+if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" == "true" ]]; then
+  REQUIRED_LIVE_ASSERTIONS+=(
+    node_waypoint.identity.stale_ip_reuse
+  )
+fi
 if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
     node_waypoint.ebpf.registry_ready_ipv6
     node_waypoint.ipv6.service_allow
     node_waypoint.ipv6.service_deny
     node_waypoint.ipv6.pod_ip_bypass_guard
+    node_waypoint.ipv6.direct_inbound_guard
+  )
+fi
+if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+  REQUIRED_LIVE_ASSERTIONS+=(
+    node_waypoint.identity.spire_live_ready
+    node_waypoint.identity.spire_workload_entries
+    node_waypoint.identity.workload_api_svid
+    node_waypoint.identity.plaintext_hbone_rejected
+    node_waypoint.identity.unauthenticated_hbone_rejected
+    node_waypoint.identity.forged_assertion_rejected
+    node_waypoint.identity.spire_restart_recovery
   )
 fi
 
@@ -60,6 +97,11 @@ if [[ "${FERRUM_EBPF_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
   echo "Refusing to run against the current kube-context without FERRUM_EBPF_LIVE_ACK_DISPOSABLE=true" >&2
   exit 1
 fi
+
+helm_set_string_escape() {
+  local value="$1"
+  printf '%s' "${value//,/\\,}"
+}
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -72,12 +114,46 @@ require_cmd kubectl
 require_cmd helm
 require_cmd curl
 require_cmd python3
+if [[ -z "$KUBE_CONTEXT" ]]; then
+  KUBE_CONTEXT="$(kubectl config current-context)"
+fi
 if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
   require_cmd docker
 fi
 
 log() {
   printf '\n[node-waypoint-ebpf-live] %s\n' "$*"
+}
+
+diagnostic_timeout() {
+  local label="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    local -a timeout_args
+    if timeout --foreground 1s true >/dev/null 2>&1; then
+      timeout_args=(--foreground "${DIAGNOSTIC_TIMEOUT_SECONDS}s")
+    else
+      timeout_args=("${DIAGNOSTIC_TIMEOUT_SECONDS}s")
+    fi
+    timeout "${timeout_args[@]}" "$@" || {
+      local status=$?
+      if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+        echo "$label timed out after ${DIAGNOSTIC_TIMEOUT_SECONDS}s" >&2
+      fi
+      return "$status"
+    }
+  else
+    "$@"
+  fi
+}
+
+select_kube_context() {
+  local current_context
+  current_context="$(kubectl config current-context 2>/dev/null || true)"
+  if [[ "$current_context" != "$KUBE_CONTEXT" ]]; then
+    log "switching kube context to $KUBE_CONTEXT"
+    kubectl config use-context "$KUBE_CONTEXT" >/dev/null
+  fi
 }
 
 init_live_assertions() {
@@ -129,7 +205,7 @@ record_live_assertion_once() {
 
 spiffe_for_sa() {
   local service_account="$1"
-  printf 'spiffe://cluster.local/ns/%s/sa/%s' "$WORKLOAD_NS" "$service_account"
+  printf 'spiffe://%s/ns/%s/sa/%s' "$TRUST_DOMAIN" "$WORKLOAD_NS" "$service_account"
 }
 
 render_chart_assertions() {
@@ -259,7 +335,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local spire_id="spiffe://cluster.local/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
+  local spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
@@ -323,7 +399,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local shared_spire_id="spiffe://cluster.local/ns/$MESH_NS/sa/ferrum-mesh"
+  local shared_spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh"
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -417,9 +493,29 @@ render_chart_assertions() {
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
     ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
+    grep -q "name: FERRUM_NODE_AGENT_NODE_IP" <<<"$rendered" ||
+    grep -q "name: FERRUM_NODE_AGENT_NODE_IPS" <<<"$rendered" ||
     [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]]; then
-    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases" >&2
-    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases or rendered implicit probe source trust" >&2
+    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|FERRUM_NODE_AGENT_NODE_IP|FERRUM_NODE_AGENT_NODE_IPS|status.hostIP|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  local trusted_probe_render_ips="10.244.1.1,10.244.2.1"
+  local trusted_probe_render_ips_helm
+  trusted_probe_render_ips_helm="$(helm_set_string_escape "$trusted_probe_render_ips")"
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_render_ips_helm")"
+  if ! grep -A1 "name: FERRUM_NODE_AGENT_NODE_IPS" <<<"$rendered" | grep -q "value: \"$trusted_probe_render_ips\""; then
+    echo "NodeWaypoint render did not emit explicit trusted kubelet probe source IPs" >&2
+    grep -nE 'FERRUM_NODE_AGENT_NODE_IPS|trustedKubeletProbeSourceIps' <<<"$rendered" >&2 || true
     exit 1
   fi
 
@@ -467,6 +563,28 @@ render_chart_assertions() {
     ! grep -A1 "name: FERRUM_NAMESPACE" <<<"$rendered" | grep -q "value: \"$WORKLOAD_NS\""; then
     echo "Control-plane render did not keep install and managed namespaces separate" >&2
     grep -nE 'FERRUM_K8S_CONTROLLER_NAMESPACE|FERRUM_NAMESPACE' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set controlPlane.enabled=true \
+    --set controlPlane.database.type=sqlite \
+    --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+    --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
+    --set-string "controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret" \
+    --set-string "controlPlane.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN")"
+  if [[ "$(grep -A1 -F "name: FERRUM_K8S_TRUST_DOMAIN" <<<"$rendered" | grep -c -F "value: \"$TRUST_DOMAIN\"" || true)" -lt 2 ]]; then
+    echo "NodeWaypoint render did not propagate the live trust domain to control-plane and node-agent K8s identity env" >&2
+    grep -nE 'name: FERRUM_K8S_TRUST_DOMAIN|value: "' <<<"$rendered" >&2 || true
     exit 1
   fi
 
@@ -529,6 +647,21 @@ render_chart_assertions() {
   if ! grep -q "nodeAgent.env.FERRUM_ADMIN_HTTP_PORT is chart-managed" /tmp/ferrum-node-agent-managed-env-render.out; then
     echo "Node-agent render rejected managed env override without a clear error" >&2
     cat /tmp/ferrum-node-agent-managed-env-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set-string nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS=10.244.1.1 >/tmp/ferrum-node-agent-managed-probe-env-render.out 2>&1; then
+    echo "Node-agent render accepted a chart-managed probe source env override" >&2
+    cat /tmp/ferrum-node-agent-managed-probe-env-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS is chart-managed" /tmp/ferrum-node-agent-managed-probe-env-render.out; then
+    echo "Node-agent render rejected managed probe env override without a clear error" >&2
+    cat /tmp/ferrum-node-agent-managed-probe-env-render.out >&2 || true
     exit 1
   fi
 
@@ -603,10 +736,143 @@ label_nodes() {
   kubectl label node "$NODE_B" ferrum.io/live-node=b --overwrite
 }
 
+discover_trusted_kubelet_probe_ips() {
+  log "deriving trusted kubelet probe source IPs from node PodCIDRs"
+  TRUSTED_KUBELET_PROBE_IPS="$(kubectl get node "$NODE_A" "$NODE_B" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+data = json.load(sys.stdin)
+items = data.get("items") or [data]
+seen = set()
+out = []
+for node in items:
+    spec = node.get("spec") or {}
+    cidrs = spec.get("podCIDRs") or []
+    if not cidrs and spec.get("podCIDR"):
+        cidrs = [spec["podCIDR"]]
+    for raw in cidrs:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+            ip = next(network.hosts())
+        except (StopIteration, ValueError):
+            continue
+        text = str(ip)
+        if text not in seen:
+            seen.add(text)
+            out.append(text)
+print(",".join(out))
+')"
+  if [[ -z "$TRUSTED_KUBELET_PROBE_IPS" ]]; then
+    echo "could not derive trusted kubelet probe source IPs from node PodCIDRs" >&2
+    kubectl get node "$NODE_A" "$NODE_B" -o json >&2 || true
+    exit 1
+  fi
+  log "trusted kubelet probe source IPs: $TRUSTED_KUBELET_PROBE_IPS"
+}
+
+node_waypoint_spiffe_template() {
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
+}
+
+node_waypoint_spiffe_for_node() {
+  local node="$1"
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/%s' "$TRUST_DOMAIN" "$MESH_NS" "$node"
+}
+
+collect_spire_diagnostics() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+  ferrum_spire_collect_diagnostics "$KUBE_CONTEXT" "$SPIRE_NS" "$RESULTS_DIR/spire" || true
+}
+
+install_spire_production_identity() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    log "SPIRE production identity disabled; using explicit no-CA test mode"
+    return
+  fi
+
+  log "installing minimal SPIRE and registering NodeWaypoint SVID entries"
+  ferrum_spire_apply_minimal "$KUBE_CONTEXT" "$TRUST_DOMAIN" "$SPIRE_NS"
+  ferrum_spire_wait_ready "$KUBE_CONTEXT" "$SPIRE_NS" 5m
+
+  local -a spire_nodes
+  mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$KUBE_CONTEXT" "$SPIRE_NS")
+  if [[ "${#spire_nodes[@]}" -eq 0 ]]; then
+    echo "expected at least one scheduled SPIRE Agent node for NodeWaypoint registration" >&2
+    kubectl --context "$KUBE_CONTEXT" -n "$SPIRE_NS" get pods -o wide >&2 || true
+    exit 1
+  fi
+
+  mkdir -p "$RESULTS_DIR/spire"
+  ferrum_spire_server_exec "$KUBE_CONTEXT" "$SPIRE_NS" agent list \
+    > "$RESULTS_DIR/spire/attested-agents.txt"
+
+  local node spiffe_id agent_parent_id
+  for node in "${spire_nodes[@]}"; do
+    agent_parent_id="$(ferrum_spire_k8s_psat_agent_parent_id_for_node \
+      "$KUBE_CONTEXT" \
+      "$SPIRE_NS" \
+      "$TRUST_DOMAIN" \
+      "$node")"
+    spiffe_id="$(node_waypoint_spiffe_for_node "$node")"
+    ferrum_spire_register_k8s_workload \
+      "$KUBE_CONTEXT" \
+      "$SPIRE_NS" \
+      "$spiffe_id" \
+      "$agent_parent_id" \
+      "$MESH_NS" \
+      ferrum-mesh \
+      "k8s:node-name:$node" \
+      "k8s:container-name:ferrum-edge"
+  done
+
+  ferrum_spire_server_exec "$KUBE_CONTEXT" "$SPIRE_NS" entry show \
+    > "$RESULTS_DIR/spire/registered-entries.txt"
+  record_live_assertion \
+    node_waypoint.identity.spire_live_ready \
+    pass \
+    "" \
+    "" \
+    "spire-server-and-agent-ready" \
+    "" \
+    "" \
+    "spire"
+  record_live_assertion \
+    node_waypoint.identity.spire_workload_entries \
+    pass \
+    "" \
+    "" \
+    "registered-nodewaypoint-per-node-svid-entries" \
+    "" \
+    "" \
+    "spire/attested-agents.txt,spire/registered-entries.txt"
+}
+
 install_ferrum() {
   log "installing Ferrum chart"
+  local -a identity_args=()
+  local trusted_probe_ips_helm
+  trusted_probe_ips_helm="$(helm_set_string_escape "$TRUSTED_KUBELET_PROBE_IPS")"
+  if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+    local spire_id_template
+    spire_id_template="$(node_waypoint_spiffe_template)"
+    identity_args=(
+      --set ambient.spire.enabled=true
+      --set-string "ambient.spire.workloadSpiffeId=$spire_id_template"
+      --set ambient.spire.productionMode=true
+    )
+  else
+    identity_args=(
+      --set ambient.env.FERRUM_MESH_ALLOW_NO_CA=true
+    )
+  fi
+
   kubectl create namespace "$MESH_NS" --dry-run=client -o yaml | kubectl apply -f -
   helm upgrade --install "$RELEASE" "$CHART_DIR" \
+    --kube-context "$KUBE_CONTEXT" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
     --set image.tag="$IMAGE_TAG" \
@@ -627,6 +893,7 @@ install_ferrum() {
     --set controlPlane.env.FERRUM_LOG_LEVEL=info \
     --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
+    --set-string "controlPlane.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=false \
     --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
@@ -641,13 +908,15 @@ install_ferrum() {
     --set-string "ambient.env.FERRUM_ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET" \
     --set-string "ambient.env.FERRUM_ADMIN_JWT_ISSUER=$ADMIN_JWT_ISSUER" \
     --set ambient.env.FERRUM_LOG_LEVEL=info \
-    --set ambient.env.FERRUM_MESH_ALLOW_NO_CA=true \
+    "${identity_args[@]}" \
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set nodeAgent.enabled=true \
     --set nodeAgent.captureMode=ebpf \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
+    --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
+    --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_ips_helm" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR" \
     --set nodeAgent.fallbackMode=fail \
     --wait \
@@ -656,6 +925,140 @@ install_ferrum() {
   kubectl -n "$MESH_NS" rollout status deployment/ferrum-mesh-control-plane --timeout=5m
   kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-node-agent --timeout=5m
   kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-ambient --timeout=5m
+}
+
+verify_ambient_spire_identity() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+
+  log "checking ambient NodeWaypoint Workload API SVIDs"
+  local spec_file="$RESULTS_DIR/ambient-spire-pods.json"
+  mkdir -p "$RESULTS_DIR/ambient-spire-metrics"
+  if ! kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o json >"$spec_file"; then
+    echo "could not fetch ambient NodeWaypoint pod specs" >&2
+    collect_spire_diagnostics
+    return 1
+  fi
+
+  if ! python3 - "$spec_file" "$TRUST_DOMAIN" "$MESH_NS" <<'PY'
+import json
+import sys
+
+path, trust_domain, mesh_ns = sys.argv[1:4]
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+items = data.get("items") or []
+if not items:
+    raise SystemExit("no ferrum-mesh-ambient pods found")
+
+errors = []
+for pod in items:
+    name = pod["metadata"]["name"]
+    node = pod["spec"].get("nodeName")
+    containers = pod["spec"].get("containers") or []
+    ferrum = next((c for c in containers if c.get("name") == "ferrum-edge"), None)
+    if ferrum is None:
+        errors.append(f"{name}: missing ferrum-edge container")
+        continue
+
+    env = {item["name"]: item for item in ferrum.get("env") or []}
+    expected_spiffe_template = f"spiffe://{trust_domain}/ns/{mesh_ns}/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)"
+    expected_values = {
+        "FERRUM_MESH_CA_BACKEND": "spire_agent",
+        "FERRUM_MESH_SPIRE_AGENT_SOCKET": "/run/spire/sockets/agent.sock",
+        "FERRUM_MESH_WORKLOAD_SPIFFE_ID": expected_spiffe_template,
+        "FERRUM_MESH_PRODUCTION_MODE": "true",
+    }
+    for key, expected in expected_values.items():
+        actual = env.get(key, {}).get("value")
+        if actual != expected:
+            errors.append(f"{name}: {key}={actual!r}, expected {expected!r}")
+    if "FERRUM_MESH_ALLOW_NO_CA" in env:
+        errors.append(f"{name}: FERRUM_MESH_ALLOW_NO_CA must not be present in SPIRE mode")
+    node_env = env.get("FERRUM_K8S_NODE_NAME", {})
+    field_path = ((node_env.get("valueFrom") or {}).get("fieldRef") or {}).get("fieldPath")
+    if field_path != "spec.nodeName":
+        errors.append(f"{name}: FERRUM_K8S_NODE_NAME fieldPath={field_path!r}, expected spec.nodeName")
+
+    mounts = ferrum.get("volumeMounts") or []
+    if not any(
+        mount.get("name") == "spire-agent-socket"
+        and mount.get("mountPath") == "/run/spire/sockets"
+        and mount.get("readOnly") is True
+        for mount in mounts
+    ):
+        errors.append(f"{name}: missing read-only spire-agent-socket mount")
+
+    volumes = pod["spec"].get("volumes") or []
+    if not any(
+        volume.get("name") == "spire-agent-socket"
+        and (volume.get("hostPath") or {}).get("path") == "/run/spire/sockets"
+        for volume in volumes
+    ):
+        errors.append(f"{name}: missing /run/spire/sockets hostPath volume")
+
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    collect_spire_diagnostics
+    return 1
+  fi
+
+  local -a pod_records
+  mapfile -t pod_records < <(kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}')
+  if [[ "${#pod_records[@]}" -eq 0 ]]; then
+    echo "no ambient NodeWaypoint pod records found for SPIRE SVID metric check" >&2
+    collect_spire_diagnostics
+    return 1
+  fi
+  local idx=0 pod node expected_spiffe metrics_file pf_log pf_pid fetched port
+  for record in "${pod_records[@]}"; do
+    IFS=$'\t' read -r pod node <<<"$record"
+    [[ -n "$pod" && -n "$node" ]] || continue
+    expected_spiffe="$(node_waypoint_spiffe_for_node "$node")"
+    port=$((19400 + idx))
+    idx=$((idx + 1))
+    metrics_file="$RESULTS_DIR/ambient-spire-metrics/$pod.prom"
+    pf_log="$RESULTS_DIR/ambient-spire-metrics/$pod-port-forward.log"
+    kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+    pf_pid=$!
+    fetched=false
+    for _ in $(seq 1 40); do
+      if curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
+        if grep -Fq "ferrum_mesh_cert_expiry_seconds{spiffe_id=\"$expected_spiffe\",source=\"workload_api\"}" "$metrics_file"; then
+          fetched=true
+          break
+        fi
+      fi
+      sleep 0.5
+    done
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+    if [[ "$fetched" != "true" ]]; then
+      echo "ambient pod $pod on $node did not report SPIRE Agent SVID metric for $expected_spiffe" >&2
+      cat "$metrics_file" >&2 || true
+      collect_spire_diagnostics
+      return 1
+    fi
+  done
+
+  record_live_assertion \
+    node_waypoint.identity.workload_api_svid \
+    pass \
+    "" \
+    "" \
+    "ambient-nodewaypoints-loaded-per-node-workload-api-svids" \
+    "" \
+    "" \
+    "ambient-spire-pods.json,ambient-spire-metrics"
 }
 
 collect_node_agent_metrics() {
@@ -716,6 +1119,7 @@ collect_ambient_node_waypoint_identities() {
 }
 
 collect_traffic_failure_diagnostics() {
+  collect_spire_diagnostics
   collect_node_agent_metrics
   collect_ambient_node_waypoint_identities
   collect_bpf_evidence || true
@@ -851,9 +1255,10 @@ collect_bpf_evidence() {
 
 apply_workloads() {
   log "applying live traffic workloads"
-  awk -v ns="$WORKLOAD_NS" -v require_dual="$REQUIRE_DUAL_STACK" '
+  awk -v ns="$WORKLOAD_NS" -v td="$TRUST_DOMAIN" -v require_dual="$REQUIRE_DUAL_STACK" '
     {
       gsub(/__NAMESPACE__/, ns)
+      gsub(/__TRUST_DOMAIN__/, td)
       if ($0 ~ /__SERVICE_IP_FAMILY_BLOCK__/) {
         if (require_dual == "true") {
           print "  ipFamilyPolicy: RequireDualStack"
@@ -872,6 +1277,56 @@ apply_workloads() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-b --timeout=3m
+
+  log "applying unmanaged direct-inbound probe workloads"
+  kubectl create namespace "$UNMANAGED_NS" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unmanaged-a
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unmanaged-a
+  template:
+    metadata:
+      labels:
+        app: unmanaged-a
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unmanaged-b
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unmanaged-b
+  template:
+    metadata:
+      labels:
+        app: unmanaged-b
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: b
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+EOF
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
 }
 
 admin_bearer_token() {
@@ -924,7 +1379,8 @@ ambient_pod_on_node() {
   kubectl -n "$MESH_NS" get pod \
     -l app.kubernetes.io/name=ferrum-mesh-ambient \
     --field-selector "spec.nodeName=$node" \
-    -o jsonpath='{.items[0].metadata.name}'
+    -o go-template='{{range .items}}{{- $name := .metadata.name -}}{{- if not .metadata.deletionTimestamp -}}{{- range .status.conditions -}}{{- if and (eq .type "Ready") (eq .status "True") -}}{{ $name }}{{"\n"}}{{- end -}}{{- end -}}{{- end -}}{{- end -}}' |
+    head -n 1
 }
 
 pick_loopback_port() {
@@ -935,6 +1391,38 @@ with socket.socket() as sock:
     sock.bind(("127.0.0.1", 0))
     print(sock.getsockname()[1])
 PY
+}
+
+ambient_pods() {
+  kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient \
+    -o go-template='{{range .items}}{{- $name := .metadata.name -}}{{- if not .metadata.deletionTimestamp -}}{{- range .status.conditions -}}{{- if and (eq .type "Ready") (eq .status "True") -}}{{ $name }}{{"\n"}}{{- end -}}{{- end -}}{{- end -}}{{- end -}}'
+}
+
+wait_for_port_forward_ready() {
+  local pf_pid="$1"
+  local pf_log="$2"
+  local port="$3"
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$pf_pid" 2>/dev/null; then
+      echo "port-forward process exited before local port $port became ready" >&2
+      cat "$pf_log" >&2 || true
+      return 1
+    fi
+    if grep -q "Forwarding from .*:$port" "$pf_log" 2>/dev/null; then
+      return
+    fi
+    sleep 0.25
+  done
+  echo "port-forward did not become ready on local port $port" >&2
+  cat "$pf_log" >&2 || true
+  return 1
+}
+
+stop_port_forward() {
+  local pf_pid="$1"
+  kill "$pf_pid" 2>/dev/null || true
+  wait "$pf_pid" 2>/dev/null || true
 }
 
 fetch_node_waypoint_identities_for_node() {
@@ -1078,6 +1566,163 @@ node_host_file_exists() {
   fi
 }
 
+ipv4_predecessor() {
+  local ip="$1"
+  python3 - "$ip" <<'PY'
+import ipaddress
+import sys
+
+ip = ipaddress.IPv4Address(sys.argv[1])
+if int(ip) == 0:
+    raise SystemExit("0.0.0.0 has no predecessor")
+print(ipaddress.IPv4Address(int(ip) - 1))
+PY
+}
+
+kind_cni_network_dir_for_ip() {
+  local node="$1"
+  local ip="$2"
+  if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    docker exec "$node" sh -eu -c '
+      ip="$1"
+      cni_roots() {
+        printf "%s\n" /run/cni-ipam-state /var/lib/cni/networks
+        [ -d /etc/cni/net.d ] || return 0
+        find /etc/cni/net.d -maxdepth 1 -type f \( -name "*.conf" -o -name "*.conflist" -o -name "*.json" \) -print 2>/dev/null |
+          while IFS= read -r config; do
+            sed -n "s/.*\"dataDir\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$config" 2>/dev/null || true
+          done
+      }
+      path=""
+      roots="$(cni_roots)"
+      while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        [ -d "$root" ] || continue
+        candidate="$(find "$root" -mindepth 2 -maxdepth 2 -type f -name "$ip" -print -quit 2>/dev/null || true)"
+        if [ -n "$candidate" ]; then
+          path="$candidate"
+          break
+        fi
+      done <<EOF
+$roots
+EOF
+      [ -n "$path" ] || exit 1
+      dirname "$path"
+    ' sh "$ip"
+  else
+    kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
+      chroot /host sh -eu -c '
+        ip="$1"
+        cni_roots() {
+          printf "%s\n" /run/cni-ipam-state /var/lib/cni/networks
+          [ -d /etc/cni/net.d ] || return 0
+          find /etc/cni/net.d -maxdepth 1 -type f \( -name "*.conf" -o -name "*.conflist" -o -name "*.json" \) -print 2>/dev/null |
+            while IFS= read -r config; do
+              sed -n "s/.*\"dataDir\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$config" 2>/dev/null || true
+            done
+        }
+        path=""
+        roots="$(cni_roots)"
+        while IFS= read -r root; do
+          [ -n "$root" ] || continue
+          [ -d "$root" ] || continue
+          candidate="$(find "$root" -mindepth 2 -maxdepth 2 -type f -name "$ip" -print -quit 2>/dev/null || true)"
+          if [ -n "$candidate" ]; then
+            path="$candidate"
+            break
+          fi
+        done <<EOF
+$roots
+EOF
+        [ -n "$path" ] || exit 1
+        dirname "$path"
+      ' sh "$ip"
+  fi
+}
+
+force_next_kind_ipv4_pod_ip_reuse() {
+  local node="$1"
+  local cni_network_dir="$2"
+  local ip="$3"
+  local predecessor
+  predecessor="$(ipv4_predecessor "$ip")"
+  mkdir -p "$RESULTS_DIR/cni-ip-reuse"
+  local out="$RESULTS_DIR/cni-ip-reuse/$node.txt"
+  # The CI profile is disposable kind with host-local CNI. Resetting
+  # last_reserved_ip to the predecessor makes the next pod allocation reuse
+  # this IPv4 address while preserving the real CNI allocation path.
+  if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    docker exec "$node" sh -eu -c '
+      dir="$1"
+      ip="$2"
+      predecessor="$3"
+      [ -d "$dir" ] || {
+        echo "missing CNI host-local network directory $dir" >&2
+        exit 1
+      }
+      [ ! -e "$dir/$ip" ] || {
+        echo "CNI lease $dir/$ip still exists; refusing to force reuse" >&2
+        exit 1
+      }
+      cursor_files="$(
+        find "$dir" -maxdepth 1 -type f \( -name last_reserved_ip -o -name "last_reserved_ip.*" \) -print |
+          while IFS= read -r candidate; do
+            current="$(cat "$candidate" 2>/dev/null || true)"
+            printf "%s\n" "$current" | grep -q ":" && continue
+            printf "%s\n" "$candidate"
+          done
+      )"
+      [ -n "$cursor_files" ] || cursor_files="$dir/last_reserved_ip.0"
+      printf "%s\n" "$cursor_files" |
+        while IFS= read -r cursor; do
+          [ -n "$cursor" ] || continue
+          printf "%s\n" "$predecessor" >"$cursor"
+        done
+      printf "network_dir=%s\nforced_next_ip=%s\n" "$dir" "$ip"
+      printf "%s\n" "$cursor_files" |
+        while IFS= read -r cursor; do
+          [ -n "$cursor" ] || continue
+          printf "cursor_file=%s\ncursor_value=%s\n" "$cursor" "$(cat "$cursor")"
+        done
+    ' sh "$cni_network_dir" "$ip" "$predecessor" >"$out"
+  else
+    kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
+      chroot /host sh -eu -c '
+        dir="$1"
+        ip="$2"
+        predecessor="$3"
+        [ -d "$dir" ] || {
+          echo "missing CNI host-local network directory $dir" >&2
+          exit 1
+        }
+        [ ! -e "$dir/$ip" ] || {
+          echo "CNI lease $dir/$ip still exists; refusing to force reuse" >&2
+          exit 1
+        }
+        cursor_files="$(
+          find "$dir" -maxdepth 1 -type f \( -name last_reserved_ip -o -name "last_reserved_ip.*" \) -print |
+            while IFS= read -r candidate; do
+              current="$(cat "$candidate" 2>/dev/null || true)"
+              printf "%s\n" "$current" | grep -q ":" && continue
+              printf "%s\n" "$candidate"
+            done
+        )"
+        [ -n "$cursor_files" ] || cursor_files="$dir/last_reserved_ip.0"
+        printf "%s\n" "$cursor_files" |
+          while IFS= read -r cursor; do
+            [ -n "$cursor" ] || continue
+            printf "%s\n" "$predecessor" >"$cursor"
+          done
+        printf "network_dir=%s\nforced_next_ip=%s\n" "$dir" "$ip"
+        printf "%s\n" "$cursor_files" |
+          while IFS= read -r cursor; do
+            [ -n "$cursor" ] || continue
+            printf "cursor_file=%s\ncursor_value=%s\n" "$cursor" "$(cat "$cursor")"
+          done
+      ' sh "$cni_network_dir" "$ip" "$predecessor" >"$out"
+  fi
+}
+
 dump_node_waypoint_registry() {
   local node="$1"
   local out="$RESULTS_DIR/node-waypoint-registry-$node.txt"
@@ -1116,6 +1761,7 @@ dump_node_waypoint_runtime_state() {
   local out="$RESULTS_DIR/node-waypoint-runtime-$node.txt"
   mkdir -p "$RESULTS_DIR"
   if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
+    diagnostic_timeout "node waypoint runtime state for $node" \
     docker exec "$node" sh -eu -c '
       echo "## host interfaces"
       ip -o link show 2>/dev/null || true
@@ -1166,6 +1812,7 @@ dump_node_waypoint_runtime_state() {
         done
     ' >"$out" 2>&1 || true
   else
+    diagnostic_timeout "node waypoint runtime state for $node" \
     kubectl debug "node/$node" -n default --image=busybox:1.36 --quiet -- \
       chroot /host sh -eu -c '
         echo "## host interfaces"
@@ -1315,7 +1962,7 @@ wait_for_node_waypoint_ipv6_ready_markers() {
   exit 1
 }
 
-wait_for_node_waypoint_marker_removed() {
+try_wait_for_node_waypoint_marker_removed() {
   local node="$1"
   local uid="$2"
   for _ in $(seq 1 60); do
@@ -1329,7 +1976,11 @@ wait_for_node_waypoint_marker_removed() {
   done
   echo "stale NodeWaypoint registry or readiness marker remained for deleted pod $uid on $node" >&2
   dump_node_waypoint_registry "$node"
-  exit 1
+  return 1
+}
+
+wait_for_node_waypoint_marker_removed() {
+  try_wait_for_node_waypoint_marker_removed "$@" || exit 1
 }
 
 mesh_drift_ready() {
@@ -1377,17 +2028,14 @@ wait_for_ambient_mesh_slice() {
   token="$(admin_bearer_token)"
   local drift_dir="$RESULTS_DIR/mesh-drift"
   mkdir -p "$drift_dir"
-  local -a ambient_pods
-  mapfile -t ambient_pods < <(kubectl -n "$MESH_NS" get pod \
-    -l app.kubernetes.io/name=ferrum-mesh-ambient \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-  if [[ "${#ambient_pods[@]}" -lt 2 ]]; then
-    echo "expected at least two ambient pods, found ${#ambient_pods[@]}" >&2
-    kubectl -n "$MESH_NS" get pods -o wide >&2
-    exit 1
-  fi
 
   for attempt in $(seq 1 60); do
+    local -a ambient_pods
+    mapfile -t ambient_pods < <(ambient_pods)
+    if [[ "${#ambient_pods[@]}" -lt 2 ]]; then
+      sleep 2
+      continue
+    fi
     local ready=0
     local idx=0
     for pod in "${ambient_pods[@]}"; do
@@ -1432,6 +2080,7 @@ wait_for_ambient_mesh_slice() {
   done
 
   echo "ambient proxies did not accept the expected live mesh slice" >&2
+  kubectl -n "$MESH_NS" get pods -o wide >&2 || true
   for file in "$drift_dir"/*; do
     echo "--- $file" >&2
     cat "$file" >&2 || true
@@ -1451,17 +2100,25 @@ svc_ipv6() {
   kubectl -n "$WORKLOAD_NS" get svc "$1" -o go-template='{{range .spec.clusterIPs}}{{.}}{{"\n"}}{{end}}' | grep ':' | head -n1 || true
 }
 
+curl_family_from_namespace() {
+  local namespace="$1"
+  local family="$2"
+  local deploy="$3"
+  local url="$4"
+  if [[ -n "$family" ]]; then
+    kubectl -n "$namespace" exec "deploy/$deploy" -- \
+      sh -c 'curl "$1" -g -sS -m 8 -w "\n%{http_code}" "$2"' -- "$family" "$url"
+  else
+    kubectl -n "$namespace" exec "deploy/$deploy" -- \
+      sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
+  fi
+}
+
 curl_family_from() {
   local family="$1"
   local deploy="$2"
   local url="$3"
-  if [[ -n "$family" ]]; then
-    kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
-      sh -c 'curl "$1" -g -sS -m 8 -w "\n%{http_code}" "$2"' -- "$family" "$url"
-  else
-    kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
-      sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
-  fi
+  curl_family_from_namespace "$WORKLOAD_NS" "$family" "$deploy" "$url"
 }
 
 curl_from() {
@@ -1486,10 +2143,18 @@ curl_for_family_from() {
   local family="$1"
   local deploy="$2"
   local url="$3"
+  curl_for_family_from_namespace "$WORKLOAD_NS" "$family" "$deploy" "$url"
+}
+
+curl_for_family_from_namespace() {
+  local namespace="$1"
+  local family="$2"
+  local deploy="$3"
+  local url="$4"
   case "$family" in
-    4) curl4_from "$deploy" "$url" ;;
-    6) curl6_from "$deploy" "$url" ;;
-    "") curl_from "$deploy" "$url" ;;
+    4) curl_family_from_namespace "$namespace" "-4" "$deploy" "$url" ;;
+    6) curl_family_from_namespace "$namespace" "-6" "$deploy" "$url" ;;
+    "") curl_family_from_namespace "$namespace" "" "$deploy" "$url" ;;
     *)
       echo "unsupported curl address family '$family'" >&2
       exit 1
@@ -1497,7 +2162,7 @@ curl_for_family_from() {
   esac
 }
 
-wait_for_node_waypoint_admission() {
+try_wait_for_node_waypoint_admission() {
   local from="$1"
   local label="$2"
   local url="$3"
@@ -1508,7 +2173,7 @@ wait_for_node_waypoint_admission() {
   if [[ -z "${uid:-}" || -z "${node:-}" || -z "${pod:-}" ]]; then
     echo "could not resolve workload pod record for app=$from" >&2
     kubectl -n "$WORKLOAD_NS" get pods -o wide >&2 || true
-    exit 1
+    return 1
   fi
 
   log "waiting for NodeWaypoint admission for $label ($pod on $node)"
@@ -1550,7 +2215,11 @@ wait_for_node_waypoint_admission() {
   fi
   collect_traffic_failure_diagnostics
   summarize_orig_dst4_records_for_uid "$node" "$uid" 8080 >&2 || true
-  exit 1
+  return 1
+}
+
+wait_for_node_waypoint_admission() {
+  try_wait_for_node_waypoint_admission "$@" || exit 1
 }
 
 expect_allowed() {
@@ -1658,15 +2327,55 @@ recorded_expect_blocked() {
   fi
 }
 
+recorded_expect_blocked_unmanaged() {
+  local assertion_id="$1"
+  local namespace="$2"
+  local from="$3"
+  local destination="$4"
+  local label="$5"
+  local url="$6"
+  local family="${7:-}"
+  local outcome="${8:-unmanaged-direct-pod-ip-fail-closed}"
+  if expect_blocked_from_namespace "$namespace" "$from" "$label" "$url" "$family"; then
+    record_live_assertion \
+      "$assertion_id" \
+      pass \
+      "$from" \
+      "$destination" \
+      "$outcome" \
+      "none" \
+      "$(spiffe_for_sa "$destination")"
+  else
+    record_live_assertion \
+      "$assertion_id" \
+      fail \
+      "$from" \
+      "$destination" \
+      "unexpected-http-200" \
+      "none" \
+      "$(spiffe_for_sa "$destination")"
+    return 1
+  fi
+}
+
 expect_blocked() {
   local from="$1"
   local label="$2"
   local url="$3"
   local family="${4:-}"
+  expect_blocked_from_namespace "$WORKLOAD_NS" "$from" "$label" "$url" "$family"
+}
+
+expect_blocked_from_namespace() {
+  local namespace="$1"
+  local from="$2"
+  local label="$3"
+  local url="$4"
+  local family="${5:-}"
   local output code err
   err="$(mktemp)"
   set +e
-  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+  output="$(curl_for_family_from_namespace "$namespace" "$family" "$from" "$url" 2>"$err")"
   local status=$?
   set -e
   code="${output##*$'\n'}"
@@ -1678,6 +2387,483 @@ expect_blocked() {
     return 1
   fi
   rm -f "$err"
+}
+
+hbone_probe_error_is_transport_rejection() {
+  local err="$1"
+  grep -Eiq 'SSL|TLS|alert|handshake|certificate|connection reset|empty reply|unexpected eof|Recv failure|server returned nothing|HTTP/0\.9|HTTP/2 stream .*PROTOCOL_ERROR' "$err"
+}
+
+hbone_probe_body_is_unauthenticated_policy_rejection() {
+  local out="$1"
+  local body expected
+  [[ -f "$out" ]] || return 1
+  body="$(cat "$out")"
+  body="${body//$'\r'/}"
+  body="${body#"${body%%[![:space:]]*}"}"
+  body="${body%"${body##*[![:space:]]}"}"
+  expected='{"error":"Mesh authorization denied: missing per-pod policy scope"}'
+  [[ "$body" == "$expected" ]]
+}
+
+run_hbone_listener_negative_probe_for_pod() {
+  local mode="$1"
+  local ambient_pod="$2"
+  local port pf_log pf_pid out err status code url
+  port="$(pick_loopback_port)"
+  mkdir -p "$RESULTS_DIR/hbone-negative"
+  out="$RESULTS_DIR/hbone-negative/$mode-$ambient_pod.out"
+  err="$RESULTS_DIR/hbone-negative/$mode-$ambient_pod.err"
+  pf_log="$RESULTS_DIR/hbone-negative/$mode-$ambient_pod-port-forward.log"
+
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:15008" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  if ! wait_for_port_forward_ready "$pf_pid" "$pf_log" "$port"; then
+    stop_port_forward "$pf_pid"
+    return 1
+  fi
+
+  set +e
+  case "$mode" in
+    plaintext)
+      url="http://127.0.0.1:$port"
+      code="$(curl -sS -m 8 -o "$out" -w "%{http_code}" -X CONNECT \
+        --request-target "127.0.0.1:8080" \
+        "$url" 2>"$err")"
+      ;;
+    unauthenticated)
+      url="https://127.0.0.1:$port"
+      code="$(curl -k --http2 -sS -m 8 -o "$out" -w "%{http_code}" -X CONNECT \
+        --request-target "127.0.0.1:8080" \
+        -H "baggage: source.principal=$(spiffe_for_sa src-a)" \
+        "$url" 2>"$err")"
+      ;;
+    *)
+      echo "unsupported HBONE negative probe mode '$mode'" >&2
+      status=1
+      code=""
+      ;;
+  esac
+  status=$?
+  set -e
+  stop_port_forward "$pf_pid"
+
+  if [[ "$status" -ne 0 && "${code:-000}" == "000" ]] && hbone_probe_error_is_transport_rejection "$err"; then
+    return
+  fi
+
+  if [[ "$mode" == "unauthenticated" && "$status" -eq 0 && "$code" == "403" ]] && \
+    hbone_probe_body_is_unauthenticated_policy_rejection "$out"; then
+    return
+  fi
+
+  echo "expected $mode HBONE probe against $ambient_pod to fail at transport/client-auth/authz boundary, got curl status=$status HTTP ${code:-<none>}" >&2
+  cat "$err" >&2 || true
+  [[ -f "$out" ]] && cat "$out" >&2 || true
+  return 1
+}
+
+run_hbone_listener_negative_check() {
+  local assertion_id="$1"
+  local mode="$2"
+  local outcome="$3"
+  local -a pods
+  mapfile -t pods < <(ambient_pods)
+  if [[ "${#pods[@]}" -lt 2 ]]; then
+    echo "expected at least two ambient pods for HBONE listener negative check, found ${#pods[@]}" >&2
+    kubectl -n "$MESH_NS" get pods -o wide >&2 || true
+    record_live_assertion \
+      "$assertion_id" \
+      fail \
+      unmanaged-a \
+      dst-a \
+      "missing-ambient-pods" \
+      "none" \
+      "$(spiffe_for_sa dst-a)" \
+      "hbone-negative"
+    return 1
+  fi
+
+  local pod
+  for pod in "${pods[@]}"; do
+    if ! run_hbone_listener_negative_probe_for_pod "$mode" "$pod"; then
+      record_live_assertion \
+        "$assertion_id" \
+        fail \
+        unmanaged-a \
+        dst-a \
+        "unexpected-$mode-hbone-admission-on-$pod" \
+        "none" \
+        "$(spiffe_for_sa dst-a)" \
+        "hbone-negative"
+      return 1
+    fi
+  done
+
+  record_live_assertion \
+    "$assertion_id" \
+    pass \
+    unmanaged-a \
+    dst-a \
+    "$outcome-all-ambient-pods" \
+    "none" \
+    "$(spiffe_for_sa dst-a)" \
+    "hbone-negative"
+}
+
+run_plaintext_hbone_rejection_check() {
+  run_hbone_listener_negative_check \
+    node_waypoint.identity.plaintext_hbone_rejected \
+    plaintext \
+    plaintext-to-hbone-listener-rejected
+}
+
+run_unauthenticated_hbone_rejection_check() {
+  run_hbone_listener_negative_check \
+    node_waypoint.identity.unauthenticated_hbone_rejected \
+    unauthenticated \
+    no-client-svid-hbone-listener-rejected
+}
+
+fetch_policy_denies_for_node() {
+  local node="$1"
+  local out="$2"
+  local ambient_pod port token pf_log pf_pid fetched
+  ambient_pod="$(ambient_pod_on_node "$node")"
+  if [[ -z "$ambient_pod" ]]; then
+    echo "no ferrum-mesh-ambient pod found on node $node" >&2
+    return 1
+  fi
+  port="$(pick_loopback_port)"
+  token="$(admin_bearer_token)"
+  pf_log="$out.port-forward.log"
+  kubectl -n "$MESH_NS" port-forward "pod/$ambient_pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  if ! wait_for_port_forward_ready "$pf_pid" "$pf_log" "$port"; then
+    stop_port_forward "$pf_pid"
+    return 1
+  fi
+  fetched=false
+  for _ in $(seq 1 20); do
+    if curl -fsS -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:$port/mesh/policy-denies/recent?window=30s&limit=100" >"$out" 2>"$out.curl"; then
+      fetched=true
+      break
+    fi
+    sleep 0.25
+  done
+  stop_port_forward "$pf_pid"
+  [[ "$fetched" == "true" ]]
+}
+
+policy_deny_count_for_source_and_reasons() {
+  local file="$1"
+  local expected_source="$2"
+  shift 2
+  python3 - "$file" "$expected_source" "$@" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expected_source = sys.argv[2]
+reasons = set(sys.argv[3:])
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+count = 0
+for group in data.get("grouped") or []:
+    if group.get("reason") not in reasons:
+        continue
+    if expected_source and group.get("source") != expected_source:
+        continue
+    count += int(group.get("count") or 0)
+print(count)
+PY
+}
+
+forged_assertion_response_is_policy_rejection() {
+  local code="$1"
+  local body="$2"
+  body="${body//$'\r'/}"
+  body="${body#"${body%%[![:space:]]*}"}"
+  body="${body%"${body##*[![:space:]]}"}"
+
+  if [[ "$code" == "403" ]]; then
+    return
+  fi
+
+  if [[ "$code" == "502" && "$body" == \{\"error\":\"HBONE\ backend\ unavailable:\ HBONE\ CONNECT\ rejected\ for\ *\ with\ status\ 403\"\} ]]; then
+    return
+  fi
+
+  return 1
+}
+
+expect_attributed_forged_assertion_blocked() {
+  local from="$1"
+  local destination="$2"
+  local url="$3"
+  local family="${4:-4}"
+  local from_record from_uid from_node from_pod destination_record dst_uid dst_node dst_pod expected_assertor
+  local out_dir before_file after_file output code body err status before_count after_count
+  from_record="$(workload_pod_record_for_app "$from")"
+  IFS=$'\t' read -r from_uid from_node from_pod <<<"$from_record"
+  destination_record="$(workload_pod_record_for_app "$destination")"
+  IFS=$'\t' read -r dst_uid dst_node dst_pod <<<"$destination_record"
+  if [[ -z "${from_node:-}" || -z "${dst_node:-}" ]]; then
+    echo "could not resolve source/destination nodes for forged assertion check" >&2
+    kubectl -n "$WORKLOAD_NS" get pods -o wide >&2 || true
+    return 1
+  fi
+  expected_assertor="$(node_waypoint_spiffe_for_node "$from_node")"
+  out_dir="$RESULTS_DIR/hbone-negative/forged-assertion-deny"
+  mkdir -p "$out_dir"
+  before_file="$out_dir/before.json"
+  after_file="$out_dir/after.json"
+  err="$out_dir/curl.err"
+
+  if ! fetch_policy_denies_for_node "$dst_node" "$before_file"; then
+    echo "could not fetch baseline policy-deny counts from destination node $dst_node" >&2
+    return 1
+  fi
+  before_count="$(policy_deny_count_for_source_and_reasons "$before_file" "$expected_assertor" scope_missing untrusted_assertor)"
+
+  set +e
+  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+  status=$?
+  set -e
+  code="${output##*$'\n'}"
+  body="${output%$'\n'*}"
+  printf '%s\n' "$output" >"$out_dir/curl.out"
+  printf '%s\n' "$status" >"$out_dir/curl.status"
+  if [[ "$status" -ne 0 ]] || ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
+    echo "expected forged assertion request to fail via destination HBONE policy rejection, got curl status=$status HTTP ${code:-<none>} body '${body:-<empty>}'" >&2
+    cat "$err" >&2 || true
+    return 1
+  fi
+
+  for _ in $(seq 1 20); do
+    if fetch_policy_denies_for_node "$dst_node" "$after_file"; then
+      after_count="$(policy_deny_count_for_source_and_reasons "$after_file" "$expected_assertor" scope_missing untrusted_assertor)"
+      if [[ "$after_count" =~ ^[0-9]+$ && "$before_count" =~ ^[0-9]+$ && "$after_count" -gt "$before_count" ]]; then
+        return
+      fi
+    fi
+    sleep 0.5
+  done
+
+  echo "expected destination policy-deny recorder to add scope_missing/untrusted_assertor for $expected_assertor; before=$before_count after=${after_count:-<unread>}" >&2
+  cat "$after_file" >&2 || true
+  return 1
+}
+
+rollout_ambient_after_assertor_change() {
+  kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-ambient --timeout=5m || return 1
+  wait_for_node_waypoint_ready_markers || return 1
+  wait_for_ambient_mesh_slice || return 1
+}
+
+restore_default_hbone_assertors() {
+  kubectl -n "$MESH_NS" set env daemonset/ferrum-mesh-ambient FERRUM_MESH_TRUSTED_HBONE_ASSERTORS- >/dev/null || return 1
+  rollout_ambient_after_assertor_change
+}
+
+run_forged_assertion_rejection_check() {
+  local bad_assertor blocked_ok=0 restored_ok=0 recovery_ok=0
+  bad_assertor="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/not-a-node-waypoint"
+  mkdir -p "$RESULTS_DIR/hbone-negative"
+  log "checking authenticated HBONE baggage is rejected from an untrusted assertor"
+
+  if kubectl -n "$MESH_NS" set env daemonset/ferrum-mesh-ambient \
+    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS=$bad_assertor" >/dev/null; then
+    if rollout_ambient_after_assertor_change; then
+      if expect_attributed_forged_assertion_blocked \
+        src-a \
+        dst-a \
+        "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+        4; then
+        blocked_ok=0
+      else
+        blocked_ok=$?
+      fi
+    else
+      blocked_ok=$?
+    fi
+  else
+    blocked_ok=$?
+  fi
+
+  if restore_default_hbone_assertors; then
+    restored_ok=0
+  else
+    restored_ok=$?
+  fi
+  if [[ "$restored_ok" -eq 0 ]]; then
+    if expect_allowed src-a \
+      "restored trusted HBONE assertors" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      "ok-a" \
+      4; then
+      recovery_ok=0
+    else
+      recovery_ok=$?
+    fi
+  fi
+
+  if [[ "$blocked_ok" -eq 0 && "$restored_ok" -eq 0 && "$recovery_ok" -eq 0 ]]; then
+    record_live_assertion \
+      node_waypoint.identity.forged_assertion_rejected \
+      pass \
+      src-a \
+      dst-a \
+      "authenticated-hbone-baggage-from-untrusted-assertor-fail-closed-and-recovers" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return
+  fi
+
+  record_live_assertion \
+    node_waypoint.identity.forged_assertion_rejected \
+    fail \
+    src-a \
+    dst-a \
+    "bad-assertor-blocked=$blocked_ok restore=$restored_ok recovery=$recovery_ok" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)"
+  collect_traffic_failure_diagnostics
+  return 1
+}
+
+run_hbone_identity_negative_checks() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+
+  log "running HBONE identity negative checks"
+  run_plaintext_hbone_rejection_check
+  run_unauthenticated_hbone_rejection_check
+  run_forged_assertion_rejection_check
+}
+
+run_spire_restart_recovery_check() {
+  if [[ "$SPIRE_PRODUCTION" != "true" ]]; then
+    return
+  fi
+
+  log "checking SPIRE Agent and NodeWaypoint restart recovery"
+  local out_dir="$RESULTS_DIR/spire-restart-recovery"
+  mkdir -p "$out_dir"
+
+  local spire_ok=0 ambient_ok=0 svid_ok=0 admission_ok=0 deny_admission_ok=0 allow_ok=0 deny_ok=0 hbone_ok=0
+
+  if kubectl --context "$KUBE_CONTEXT" -n "$SPIRE_NS" rollout restart daemonset/spire-agent >"$out_dir/spire-agent-restart.log" 2>&1 &&
+    ferrum_spire_wait_ready "$KUBE_CONTEXT" "$SPIRE_NS" 5m >"$out_dir/spire-ready.log" 2>&1; then
+    spire_ok=0
+  else
+    spire_ok=$?
+  fi
+
+  if [[ "$spire_ok" -eq 0 ]]; then
+    if kubectl -n "$MESH_NS" rollout restart daemonset/ferrum-mesh-ambient >"$out_dir/ambient-restart.log" 2>&1 &&
+      kubectl -n "$MESH_NS" rollout status daemonset/ferrum-mesh-ambient --timeout=5m >"$out_dir/ambient-ready.log" 2>&1 &&
+      (wait_for_node_waypoint_ready_markers) >"$out_dir/node-waypoint-ready.log" 2>&1 &&
+      (wait_for_ambient_mesh_slice) >"$out_dir/mesh-slice-ready.log" 2>&1; then
+      ambient_ok=0
+    else
+      ambient_ok=$?
+    fi
+  fi
+
+  if [[ "$spire_ok" -eq 0 && "$ambient_ok" -eq 0 ]]; then
+    if (verify_ambient_spire_identity) >"$out_dir/workload-api-svid.log" 2>&1; then
+      svid_ok=0
+    else
+      svid_ok=$?
+    fi
+
+    if try_wait_for_node_waypoint_admission src-a \
+      "post-restart src-a Service path" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      4 >"$out_dir/admission-src-a.log" 2>&1; then
+      admission_ok=0
+    else
+      admission_ok=$?
+    fi
+
+    if try_wait_for_node_waypoint_admission src-b \
+      "post-restart src-b Service path" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      4 >"$out_dir/admission-src-b.log" 2>&1; then
+      deny_admission_ok=0
+    else
+      deny_admission_ok=$?
+    fi
+
+    if expect_allowed src-a \
+      "post-restart allowed Service path" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      "ok-a" \
+      4 >"$out_dir/allow-src-a.log" 2>&1; then
+      allow_ok=0
+    else
+      allow_ok=$?
+    fi
+
+    if expect_blocked src-b \
+      "post-restart AuthorizationPolicy DENY" \
+      "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
+      4 >"$out_dir/deny-src-b.log" 2>&1; then
+      deny_ok=0
+    else
+      deny_ok=$?
+    fi
+
+    local pod hbone_pod_count=0
+    hbone_ok=0
+    while IFS= read -r pod; do
+      [[ -n "$pod" ]] || continue
+      hbone_pod_count=$((hbone_pod_count + 1))
+      if ! run_hbone_listener_negative_probe_for_pod plaintext "$pod" >"$out_dir/hbone-plaintext-$pod.log" 2>&1; then
+        hbone_ok=1
+        break
+      fi
+      if ! run_hbone_listener_negative_probe_for_pod unauthenticated "$pod" >"$out_dir/hbone-unauthenticated-$pod.log" 2>&1; then
+        hbone_ok=1
+        break
+      fi
+    done < <(ambient_pods)
+    if [[ "$hbone_pod_count" -lt 2 ]]; then
+      echo "expected at least two recovered ambient pods for post-restart HBONE probes, found $hbone_pod_count" >"$out_dir/hbone-pods.log"
+      hbone_ok=1
+    fi
+  fi
+
+  if [[ "$spire_ok" -eq 0 && "$ambient_ok" -eq 0 && "$svid_ok" -eq 0 &&
+    "$admission_ok" -eq 0 && "$deny_admission_ok" -eq 0 && "$allow_ok" -eq 0 &&
+    "$deny_ok" -eq 0 && "$hbone_ok" -eq 0 ]]; then
+    record_live_assertion \
+      node_waypoint.identity.spire_restart_recovery \
+      pass \
+      src-a \
+      dst-a \
+      "spire-agent-and-nodewaypoint-restarted-svids-reloaded-traffic-and-hbone-authn-recovered" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "spire-restart-recovery,hbone-negative"
+    return
+  fi
+
+  record_live_assertion \
+    node_waypoint.identity.spire_restart_recovery \
+    fail \
+    src-a \
+    dst-a \
+    "spire=$spire_ok ambient=$ambient_ok svid=$svid_ok admission=$admission_ok deny_admission=$deny_admission_ok allow=$allow_ok deny=$deny_ok hbone=$hbone_ok" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)" \
+    "spire-restart-recovery,hbone-negative"
+  collect_traffic_failure_diagnostics
+  return 1
 }
 
 run_traffic_checks() {
@@ -1740,17 +2926,246 @@ run_traffic_checks() {
     4 \
     "direct-pod-ip-fail-closed"
 
-  log "checking stale identity cleanup across source workload recreation"
-  local old_src_a_uid old_src_a_node
+  recorded_expect_blocked_unmanaged \
+    node_waypoint.ipv4.direct_inbound_guard_same_node \
+    "$UNMANAGED_NS" \
+    unmanaged-a \
+    dst-a \
+    "same-node unmanaged direct Pod IP inbound guard" \
+    "http://$dst_a_ip:8080/" \
+    4
+  recorded_expect_blocked_unmanaged \
+    node_waypoint.ipv4.direct_inbound_guard_cross_node \
+    "$UNMANAGED_NS" \
+    unmanaged-b \
+    dst-a \
+    "cross-node unmanaged direct Pod IP inbound guard" \
+    "http://$dst_a_ip:8080/" \
+    4
+
+  run_hbone_identity_negative_checks
+  run_spire_restart_recovery_check
+
+  if [[ "$STALE_IP_REUSE_HOST_LOCAL_PROFILE" != "true" ]]; then
+    log "checking stale identity cleanup across source workload recreation"
+    local old_src_a_uid old_src_a_node
+    old_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
+    old_src_a_node="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].spec.nodeName}')"
+    kubectl -n "$WORKLOAD_NS" delete pod -l app=src-a --wait=true
+    if ! try_wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"; then
+      record_live_assertion \
+        node_waypoint.identity.stale_cleanup \
+        fail \
+        src-a \
+        dst-a \
+        "deleted-source-registry-marker-remained" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+    kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
+    wait_for_node_waypoint_ready_markers
+    wait_for_ambient_mesh_slice
+    wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+    wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+    if ! expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4; then
+      record_live_assertion \
+        node_waypoint.identity.stale_cleanup \
+        fail \
+        src-a \
+        dst-a \
+        "recreated-source-not-admitted" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)"
+      return 1
+    fi
+    if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+      record_live_assertion \
+        node_waypoint.identity.stale_cleanup \
+        fail \
+        src-b \
+        dst-a \
+        "post-recreation-deny-regressed" \
+        "$(spiffe_for_sa src-b)" \
+        "$(spiffe_for_sa dst-a)"
+      return 1
+    fi
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      pass \
+      src-a \
+      dst-a \
+      "deleted-source-registry-marker-removed-and-recreated-source-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return
+  fi
+
+  log "checking stale identity cleanup across forced source workload IPv4 reuse"
+  local old_src_a_uid old_src_a_node old_src_a_pod old_src_a_ip old_src_a_cni_dir
+  local new_src_a_uid new_src_a_ip src_a_reuse_identities_file
   old_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
   old_src_a_node="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].spec.nodeName}')"
-  kubectl -n "$WORKLOAD_NS" delete pod -l app=src-a --wait=true
-  wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"
+  old_src_a_pod="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.name}')"
+  old_src_a_ip="$(pod_ip src-a)"
+  if [[ -z "$old_src_a_uid" || -z "$old_src_a_node" || -z "$old_src_a_pod" || -z "$old_src_a_ip" ]]; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "could-not-resolve-original-source-pod-for-ip-reuse" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return 1
+  fi
+  if [[ "$old_src_a_ip" == *:* ]]; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "source-pod-primary-ip-is-not-ipv4-$old_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    return 1
+  fi
+  if ! old_src_a_cni_dir="$(kind_cni_network_dir_for_ip "$old_src_a_node" "$old_src_a_ip")"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "could-not-find-kind-cni-lease-for-$old_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  kubectl -n "$WORKLOAD_NS" scale deploy/src-a --replicas=0
+  if kubectl -n "$WORKLOAD_NS" get "pod/$old_src_a_pod" >/dev/null 2>&1; then
+    if ! kubectl -n "$WORKLOAD_NS" wait --for=delete "pod/$old_src_a_pod" --timeout=3m; then
+      record_live_assertion \
+        node_waypoint.identity.stale_ip_reuse \
+        fail \
+        src-a \
+        dst-a \
+        "source-pod-delete-timeout-before-ip-reuse" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+  fi
+  if ! try_wait_for_node_waypoint_marker_removed "$old_src_a_node" "$old_src_a_uid"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-a \
+      dst-a \
+      "deleted-source-registry-marker-remained-before-ip-reuse" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "deleted-source-registry-marker-remained-before-ip-reuse" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! force_next_kind_ipv4_pod_ip_reuse "$old_src_a_node" "$old_src_a_cni_dir" "$old_src_a_ip"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "could-not-force-kind-cni-reuse-for-$old_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  kubectl -n "$WORKLOAD_NS" scale deploy/src-a --replicas=1
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-a --timeout=3m
   wait_for_node_waypoint_ready_markers
   wait_for_ambient_mesh_slice
-  wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
-  wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4
+  new_src_a_uid="$(kubectl -n "$WORKLOAD_NS" get pod -l app=src-a -o jsonpath='{.items[0].metadata.uid}')"
+  new_src_a_ip="$(pod_ip src-a)"
+  if [[ "$new_src_a_uid" == "$old_src_a_uid" || "$new_src_a_ip" != "$old_src_a_ip" ]]; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "expected-new-uid-with-reused-ip-$old_src_a_ip-got-uid-$new_src_a_uid-ip-$new_src_a_ip" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! try_wait_for_node_waypoint_admission src-a "recreated src-a Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-a \
+      dst-a \
+      "recreated-source-not-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "reused-ip-replacement-source-not-admitted" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    return 1
+  fi
+  src_a_reuse_identities_file="$RESULTS_DIR/ambient-node-waypoint-admission/src-a-$new_src_a_uid.json"
+  if [[ ! -f "$src_a_reuse_identities_file" ]] ||
+    node_waypoint_identities_include_uid "$src_a_reuse_identities_file" "$old_src_a_uid"; then
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "reused-ip-identity-snapshot-still-contained-old-uid-$old_src_a_uid" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  if ! try_wait_for_node_waypoint_admission src-b "post-recreation src-b Service path" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+    record_live_assertion \
+      node_waypoint.identity.stale_cleanup \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-source-not-admitted" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-source-not-admitted-after-reused-ip" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
+    return 1
+  fi
   if ! expect_allowed src-a "recreated source identity" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" "ok-a" 4; then
     record_live_assertion \
       node_waypoint.identity.stale_cleanup \
@@ -1760,6 +3175,15 @@ run_traffic_checks() {
       "recreated-source-not-admitted" \
       "$(spiffe_for_sa src-a)" \
       "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-a \
+      dst-a \
+      "reused-ip-replacement-traffic-not-allowed" \
+      "$(spiffe_for_sa src-a)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
     return 1
   fi
   if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
@@ -1771,8 +3195,26 @@ run_traffic_checks() {
       "post-recreation-deny-regressed" \
       "$(spiffe_for_sa src-b)" \
       "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.identity.stale_ip_reuse \
+      fail \
+      src-b \
+      dst-a \
+      "post-recreation-deny-regressed-after-reused-ip" \
+      "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)" \
+      "cni-ip-reuse"
     return 1
   fi
+  record_live_assertion \
+    node_waypoint.identity.stale_ip_reuse \
+    pass \
+    src-a \
+    dst-a \
+    "source-workload-recreated-with-new-uid-reused-ip-$old_src_a_ip-old-uid-absent-and-traffic-verified" \
+    "$(spiffe_for_sa src-a)" \
+    "$(spiffe_for_sa dst-a)" \
+    "cni-ip-reuse"
   record_live_assertion \
     node_waypoint.identity.stale_cleanup \
     pass \
@@ -1827,6 +3269,14 @@ run_ipv6_checks() {
       dst-a \
       "cluster-not-dual-stack" \
       "$(spiffe_for_sa src-b)" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
+      node_waypoint.ipv6.direct_inbound_guard \
+      skip \
+      unmanaged-b \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "none" \
       "$(spiffe_for_sa dst-a)"
     record_live_assertion \
       node_waypoint.ipv6.pod_ip_fail_closed \
@@ -1895,22 +3345,39 @@ run_ipv6_checks() {
     "http://[$dst_a_v6]:8080/" \
     6 \
     "direct-ipv6-pod-ip-fail-closed"
+  recorded_expect_blocked_unmanaged \
+    node_waypoint.ipv6.direct_inbound_guard \
+    "$UNMANAGED_NS" \
+    unmanaged-b \
+    dst-a \
+    "IPv6 unmanaged direct Pod IP inbound guard" \
+    "http://[$dst_a_v6]:8080/" \
+    6 \
+    "unmanaged-direct-ipv6-pod-ip-fail-closed"
 }
 
 cleanup() {
   if [[ "${FERRUM_LIVE_KEEP_RESOURCES:-false}" != "true" ]]; then
-    kubectl delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
-    helm uninstall "$RELEASE" -n "$MESH_NS" >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete namespace "$UNMANAGED_NS" --ignore-not-found=true >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
+    helm uninstall "$RELEASE" -n "$MESH_NS" --kube-context "$KUBE_CONTEXT" >/dev/null 2>&1 || true
+    if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+      ferrum_spire_cleanup_minimal "$KUBE_CONTEXT" "$SPIRE_NS"
+    fi
   fi
 }
 
 trap cleanup EXIT
 
+select_kube_context
 init_live_assertions
 render_chart_assertions
 validate_cluster
 label_nodes
+discover_trusted_kubelet_probe_ips
+install_spire_production_identity
 install_ferrum
+verify_ambient_spire_identity
 assert_node_agent_ready_metric
 collect_bpf_evidence
 apply_workloads

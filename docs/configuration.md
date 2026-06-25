@@ -451,6 +451,8 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_NODE_AGENT_NODE_NAME` | Yes (node_agent) | — | Kubernetes node name, set via downward API (`spec.nodeName`) |
+| `FERRUM_NODE_AGENT_NODE_IP` | No | — | Optional single trusted kubelet probe source IP for raw-manifest deployments. NodeWaypoint only exempts packets from this source when they target a Kubernetes HTTP/TCP/gRPC probe port derived from the enrolled pod spec. The Helm chart does not auto-populate this value |
+| `FERRUM_NODE_AGENT_NODE_IPS` | No | — | Optional comma-separated trusted kubelet probe source IPs for Helm, dual-stack, or custom deployments; merged with `FERRUM_NODE_AGENT_NODE_IP` for the same source allowlist. Do not include broad host-network sources |
 | `FERRUM_NODE_AGENT_CGROUP_ROOT` | No | `/sys/fs/cgroup` | cgroup v2 mount point for pod cgroup resolution |
 | `FERRUM_NODE_AGENT_BPF_FS_PATH` | No | `/sys/fs/bpf` | BPF filesystem mount point for pinned maps |
 | `FERRUM_NODE_AGENT_BPF_ELF_PATH` | Linux `ebpf` feature | build-tree eBPF target path | Compiled `ferrum-ebpf` ELF loaded by the aya backend |

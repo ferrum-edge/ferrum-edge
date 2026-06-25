@@ -326,11 +326,12 @@ async fn start_hbone_reject_server(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_source_baggage() {
+async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_asserted_source_baggage() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let td = TrustDomain::new("cluster.local").unwrap();
     let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
     let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let workload_id = SpiffeId::from_parts(&td, "ns/default/sa/workload").unwrap();
     let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
     let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
     let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
@@ -361,6 +362,7 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_source_baggage() {
             8080,
             server_addr.port(),
             None,
+            Some(&workload_id),
         ),
     )
     .await
@@ -379,7 +381,7 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_source_baggage() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), tunnel.shutdown()).await;
 
     assert_eq!(&echoed, b"mesh-hello");
-    assert_eq!(baggage_rx.await.expect("baggage"), gateway_id.as_str());
+    assert_eq!(baggage_rx.await.expect("baggage"), workload_id.as_str());
 }
 
 /// Regression for PR #1400: a connection that is only ever served by the
@@ -443,6 +445,7 @@ async fn hbone_fast_path_hit_refreshes_recency_and_keeps_busy_connection_alive()
                 8080,
                 8080,
                 server_port,
+                None,
                 None,
             ),
         )

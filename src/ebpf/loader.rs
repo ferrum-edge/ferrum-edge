@@ -11,7 +11,7 @@ use std::collections::HashMap;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::fs::{self, File};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::os::fd::AsFd;
 
@@ -35,7 +35,7 @@ use super::{
     BPF_MAP_ORIG_DST4, BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS,
     BPF_ORIG_DST4_PIN_PATH, BPF_ORIG_DST6_PIN_PATH, BPF_PROGRAM_SOCK_OPS,
     BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, IncludePortsPolicy,
-    PodInfo,
+    PodInfo, TcAttachDirection,
 };
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{BpfCaptureConfig, SOCK_OPS_RINGBUF_DEFAULT_BYTES};
@@ -241,17 +241,30 @@ impl EbpfBackend for AyaEbpfBackend {
         Ok(())
     }
 
-    fn attach_tc(&mut self, pod_uid: &str, iface: &str, program: &str) -> Result<(), String> {
+    fn attach_tc(
+        &mut self,
+        pod_uid: &str,
+        iface: &str,
+        program: &str,
+        direction: TcAttachDirection,
+    ) -> Result<(), String> {
         let bpf = self.bpf_mut()?;
         let prog: &mut SchedClassifier = bpf
             .program_mut(program)
             .ok_or_else(|| format!("BPF program '{program}' not found"))?
             .try_into()
             .map_err(|e| format!("'{program}' type mismatch: {e}"))?;
+        let attach_type = match direction {
+            TcAttachDirection::Ingress => TcAttachType::Ingress,
+            TcAttachDirection::Egress => TcAttachType::Egress,
+        };
 
-        let link_id = prog
-            .attach(iface, TcAttachType::Ingress)
-            .map_err(|e| format!("Failed to attach '{program}' to '{iface}': {e}"))?;
+        let link_id = prog.attach(iface, attach_type).map_err(|e| {
+            format!(
+                "Failed to attach '{program}' to '{iface}' {}: {e}",
+                direction.as_str()
+            )
+        })?;
 
         let links = self
             .pod_links
@@ -262,7 +275,12 @@ impl EbpfBackend for AyaEbpfBackend {
             });
         links.tc_link_ids.push(link_id);
 
-        debug!(program, iface, "BPF tc program attached");
+        debug!(
+            program,
+            iface,
+            direction = direction.as_str(),
+            "BPF tc program attached"
+        );
         Ok(())
     }
 
@@ -280,6 +298,46 @@ impl EbpfBackend for AyaEbpfBackend {
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_pod_ip(ip)
+    }
+
+    fn update_pod_ip6(&mut self, ip: Ipv6Addr, info: &PodInfo) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_pod_ip6(ip, info)
+    }
+
+    fn remove_pod_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.remove_pod_ip6(ip)
+    }
+
+    fn update_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_ip(ip)
+    }
+
+    fn update_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_ip6(ip)
+    }
+
+    fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_probe_port(ip, port)
+    }
+
+    fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.remove_node_probe_port(ip, port)
+    }
+
+    fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.insert_node_probe_port6(ip, port)
+    }
+
+    fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.remove_node_probe_port6(ip, port)
     }
 
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {

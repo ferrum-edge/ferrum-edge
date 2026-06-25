@@ -3184,11 +3184,12 @@ fn materialize_sidecar_inbound_proxies(
                 };
                 // Effective protocol with `protocol_overrides` applied (same
                 // resolution `service_tcp_stream_ports` filtered on). Only an
-                // opaque-TLS port carries a real ClientHello, so only it is SNI-
-                // peeked by the inbound relay; server-first ports (Redis/MySQL/
-                // Postgres/Mongo/plain TCP) must not peek or the relay stalls on
-                // the handshake clock waiting for bytes the client never sends
-                // before the backend greeting.
+                // opaque-TLS port carries a real ClientHello, so only it is
+                // safely pre-dial peeked by the inbound relay. Ambiguous raw
+                // TCP and known server-first ports (Redis/MySQL/Postgres/Mongo)
+                // must not peek or the relay stalls on the handshake clock
+                // waiting for bytes the client never sends before the backend
+                // greeting.
                 let effective_protocol = service
                     .protocol_overrides
                     .get(&service_port.port)
@@ -3209,6 +3210,7 @@ fn materialize_sidecar_inbound_proxies(
                         runtime.cluster_domain.trim_matches('.')
                     ),
                     tls_inspect: matches!(effective_protocol, AppProtocol::Tls),
+                    first_bytes_inspect: matches!(effective_protocol, AppProtocol::Tls),
                 });
             }
         }
@@ -15312,7 +15314,56 @@ mod tests {
         assert_eq!(route.service_fqdn, "redis.default.svc.cluster.local");
         assert!(
             !route.tls_inspect,
-            "a server-first Redis inbound port must not be marked for SNI peeking"
+            "a Redis inbound port must not be marked for SNI peeking"
+        );
+        assert!(
+            !route.first_bytes_inspect,
+            "a Redis inbound port is server-first, so the relay must not wait for client bytes before dialing loopback"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_plain_tcp_route_skips_first_bytes_inspect() {
+        // Generic raw TCP is ambiguous: it can model client-first payloads, but
+        // it is also the escape hatch for custom server-first protocols. Without
+        // an explicit client-first signal, the inbound relay must not pre-dial
+        // peek and risk stalling before the backend greeting.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/tcpapp";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("tcpapp", "tcpapp");
+        local.ports = vec![WorkloadPort {
+            port: 7000,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+        }];
+        let mut service = http_mesh_service("tcpapp", 7000, spiffe);
+        service.ports[0].protocol = AppProtocol::Tcp;
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("tcp".to_string()));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mesh = config.mesh.as_deref().expect("prepared mesh config");
+        assert_eq!(mesh.local_inbound_tcp_routes.len(), 1);
+        let route = &mesh.local_inbound_tcp_routes[0];
+        assert_eq!(route.match_port, 7000);
+        assert!(
+            !route.tls_inspect,
+            "a generic TCP inbound port must not be marked for SNI peeking"
+        );
+        assert!(
+            !route.first_bytes_inspect,
+            "a generic TCP inbound port is ambiguous and must not pre-dial peek first bytes"
         );
     }
 
@@ -15356,6 +15407,10 @@ mod tests {
         assert!(
             route.tls_inspect,
             "an opaque-TLS inbound port must be marked for ClientHello SNI peeking"
+        );
+        assert!(
+            route.first_bytes_inspect,
+            "an opaque-TLS inbound port must expose ClientHello bytes to stream plugins"
         );
     }
 

@@ -1246,6 +1246,7 @@ fn inbound_hbone_relay_destination_allowed(
     let Some(mesh) = mesh else {
         return false;
     };
+    let host = hbone_relay_authority_host_for_mesh(host);
 
     if host.eq_ignore_ascii_case("localhost")
         || host
@@ -1268,6 +1269,20 @@ fn inbound_hbone_relay_destination_allowed(
     })
 }
 
+fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
+    let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    else {
+        return host;
+    };
+    if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+        inner
+    } else {
+        host
+    }
+}
+
 /// Build a transparent inbound HBONE relay proxy that dials the CONNECT
 /// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
 /// terminator where no inbound route is materialized. Returns `None` (caller
@@ -1278,7 +1293,7 @@ fn build_inbound_hbone_relay_proxy(
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> Option<Arc<Proxy>> {
     let authority = authority?;
-    let host = authority.host();
+    let host = hbone_relay_authority_host_for_mesh(authority.host());
     let port = authority.port_u16()?;
     if host.is_empty() || port == 0 {
         return None;
@@ -10732,6 +10747,9 @@ async fn run_accept_loop(
                                             &epoch,
                                             &entry,
                                             dst,
+                                            node_waypoint_identity
+                                                .as_ref()
+                                                .map(|identity| &identity.spiffe_id),
                                         )
                                         .await;
                                         return;
@@ -17673,6 +17691,7 @@ async fn proxy_to_backend(
             client_request_body,
             upstream_target,
             plugins,
+            Some(request_ctx),
             response_decision_ctx,
             stream_response,
             client_ip,
@@ -19550,6 +19569,7 @@ async fn proxy_to_backend_hbone(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
+    source_identity_ctx: Option<&RequestContext>,
     ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
@@ -19676,6 +19696,7 @@ async fn proxy_to_backend_hbone(
             target.dispatch_policy_port(),
             hbone_port,
             expected_peer.as_ref(),
+            source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref()),
         )
         .await
     {
@@ -27610,7 +27631,7 @@ mod tests {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
             service_name: "app".to_string(),
-            addresses: vec!["10.1.2.3".to_string()],
+            addresses: vec!["10.1.2.3".to_string(), "fd00:10:244:1::4".to_string()],
             ports: vec![WorkloadPort {
                 port: 8080,
                 protocol: crate::modes::mesh::config::AppProtocol::Http,
@@ -27661,9 +27682,24 @@ mod tests {
             8080,
             Some(&mesh)
         ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "fd00:10:244:1::4",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "[fd00:10:244:1::4]",
+            8080,
+            Some(&mesh)
+        ));
         // ...but a port the workload does not expose is refused...
         assert!(!inbound_hbone_relay_destination_allowed(
             "10.1.2.3",
+            9999,
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "[fd00:10:244:1::4]",
             9999,
             Some(&mesh)
         ));
@@ -27673,6 +27709,52 @@ mod tests {
             8080,
             Some(&mesh)
         ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "[fd00:10:244:1::99]",
+            8080,
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "[10.1.2.3]",
+            8080,
+            Some(&mesh)
+        ));
+    }
+
+    #[test]
+    fn inbound_hbone_relay_proxy_normalizes_bracketed_ipv6_authority() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
+
+        let mut mesh = MeshConfig::default();
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "app".to_string(),
+            addresses: vec!["fd00:10:244:1::4".to_string()],
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: crate::modes::mesh::config::AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        });
+        let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
+
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh))
+            .expect("bracketed IPv6 authority should build relay");
+
+        assert_eq!(relay.backend_host, "fd00:10:244:1::4");
+        assert_eq!(relay.backend_port, 8080);
     }
 
     #[test]

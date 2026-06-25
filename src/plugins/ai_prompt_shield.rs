@@ -27,13 +27,15 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "type",
     "created",
     "stream",
-    // Numeric/scalar LLM request parameters an operator legitimately sends.
-    // Their values are tuning knobs, not user content, so a top-level scalar
-    // here that incidentally matches a PII regex (e.g. a 9-digit `seed` that
-    // looks like an SSN) must be preserved rather than rewritten — otherwise
-    // redaction silently changes the upstream request schema/semantics. These
-    // are carved out at the TOP LEVEL only; the same names nested under
-    // attacker-controlled structure are still scanned/redacted.
+    "tool_call_id",
+];
+
+/// Top-level numeric/scalar LLM request parameters an operator legitimately
+/// sends. Numeric values for these keys are tuning knobs, not user content, so
+/// a number that incidentally matches a PII regex (for example a 9-digit
+/// `seed`) is preserved. String values under these keys remain
+/// attacker-controlled content and must still be redacted.
+const NUMERIC_LLM_PARAMETER_KEYS: &[&str] = &[
     "temperature",
     "top_p",
     "top_k",
@@ -49,7 +51,6 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "presence_penalty",
     "repetition_penalty",
     "logit_bias",
-    "tool_call_id",
 ];
 
 /// Top-level request fields that carry prompt text in non-`messages` LLM
@@ -630,9 +631,7 @@ impl AiPromptShield {
         let mut check = json.clone();
         if let Value::Object(map) = &mut check {
             for (key, value) in map.iter_mut() {
-                if STRUCTURAL_KEYS.contains(&key.as_str())
-                    && (value.is_string() || value.is_number())
-                {
+                if should_preserve_top_level_scalar(key, value) {
                     *value = Value::String(String::new());
                 }
             }
@@ -1180,6 +1179,13 @@ fn collect_json_value_spans(raw: &str) -> Vec<std::ops::Range<usize>> {
     spans
 }
 
+fn should_preserve_top_level_scalar(key: &str, value: &Value) -> bool {
+    if STRUCTURAL_KEYS.contains(&key) {
+        return value.is_string() || value.is_number();
+    }
+    NUMERIC_LLM_PARAMETER_KEYS.contains(&key) && value.is_number()
+}
+
 fn raw_value_is_removable_by_value_redactor(
     raw: &str,
     pattern: &PiiPattern,
@@ -1387,17 +1393,14 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
         }
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
-                // Preserve only top-level structural scalar values (the model
-                // name, IDs, roles, and request parameters an operator
-                // legitimately sends) — both strings and numbers, since a
-                // numeric `id`/`created`/token limit must not be rewritten.
-                // Always recurse into nested objects/arrays, and never skip
-                // nested occurrences of these key names, so PII cannot hide
-                // under a structural key.
-                if top_level
-                    && STRUCTURAL_KEYS.contains(&k.as_str())
-                    && (val.is_string() || val.is_number())
-                {
+                // Preserve only top-level structural scalar values. LLM
+                // request parameters are preserved only when they are numeric;
+                // string values in fields such as `seed` or `n` are
+                // attacker-controlled content and must be redacted. Always
+                // recurse into nested objects/arrays, and never skip nested
+                // occurrences of these key names, so PII cannot hide under a
+                // structural key.
+                if top_level && should_preserve_top_level_scalar(k, val) {
                     continue;
                 }
                 redact_json_strings(val, patterns, false);

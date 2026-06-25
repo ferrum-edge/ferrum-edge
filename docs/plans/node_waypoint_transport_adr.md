@@ -1,17 +1,22 @@
 # NodeWaypoint Secured Transport ADR
 
-Status: Proposed for H2 implementation
+Status: H2 live-gate baseline complete; NodeWaypoint remains Experimental
 
 ## Context
 
 NodeWaypoint is the sidecarless topology where a per-node Ferrum proxy accepts
 traffic captured from many node-local pods. The current live gate proves the
-IPv4 eBPF capture path, source pod attribution, same-node and cross-node Service
-authorization, stale source identity cleanup, and direct Pod-IP fail-closed
-checks on a two-worker kind cluster. It still runs with
-`FERRUM_MESH_ALLOW_NO_CA=true`; production SPIRE, authenticated node-to-node
-transport, destination-side NodeWaypoint policy enforcement, end-to-end IPv6
-capture, and explicit direct-inbound enforcement remain H2 work.
+IPv4/IPv6 eBPF capture path, source pod attribution, same-node and cross-node
+Service authorization, stale source identity cleanup, production SPIRE Workload
+API issuance for per-node NodeWaypoint SVIDs, and direct Pod-IP fail-closed
+checks on a two-worker kind cluster. It also proves plaintext/no-client-SVID
+HBONE listener probes are rejected and that authenticated HBONE baggage from an
+untrusted assertor fails closed under destination policy. Authenticated
+node-to-node transport and destination-side NodeWaypoint policy enforcement are
+wired through the
+SPIFFE-mTLS HBONE relay path. The destination-side pod-veth tc guard now drops
+unmarked direct traffic to enrolled pod IPs and admits only backend dials made
+by the destination NodeWaypoint relay with the authorized socket mark.
 
 This ADR defines the target transport so implementation can proceed without
 adding a plaintext shortcut or routing to a non-existent per-pod HBONE listener.
@@ -75,8 +80,8 @@ Identity-backed source NodeWaypoint runtimes (file SVID material or mesh CA
 backend; production mode requires one of those identity sources) skip
 metadata-absent service targets so the route fails closed instead of retaining a
 plaintext backend. Explicit no-CA/no-identity development runs keep the
-temporary plaintext compatibility fallback until the SPIRE production live
-fixture replaces it.
+temporary plaintext compatibility fallback; the required live gate now uses
+SPIRE-backed production mode instead.
 Helm now exposes `ambient.spire.enabled` to mount the SPIRE Agent Workload API
 socket and render the `spire_agent` CA backend, workload SPIFFE ID, and
 production-mode guardrail for NodeWaypoint proxy Pods. The NodeWaypoint chart
@@ -84,6 +89,10 @@ profile requires the workload SPIFFE ID to include the chart-managed
 `$(FERRUM_K8S_NODE_NAME)` downward-API token, and Kubernetes discovery resolves
 that token from `spec.nodeName` before publishing node waypoint assertors, so a
 DaemonSet cannot collapse all waypoints onto one shared production identity.
+The live harness installs a minimal SPIRE fixture and registers one workload
+entry per Ready node with `k8s:node-name:<node>` selectors, then requires each
+ambient NodeWaypoint pod to expose a `workload_api` SVID metric for its expected
+node-bound SPIFFE ID.
 
 Implementation status: the data plane now consumes `Workload.node_waypoint`
 when it is present on a selected captured-Service workload. It materializes a
@@ -148,6 +157,10 @@ The destination NodeWaypoint:
 - requires an authenticated HBONE peer with a SPIFFE identity;
 - accepts asserted workload identity only from an exact NodeWaypoint assertor
   authorized by the current slice;
+- uses destination-scoped AuthorizationPolicy for the transparent inbound HBONE
+  relay only when that trusted source assertion is honored; missing or
+  untrusted relay baggage fails closed instead of evaluating under the relay
+  identity;
 - verifies the asserted source workload still exists in the accepted slice and,
   when available, belongs to the asserting cluster, network, and node;
 - rejects unknown, deleted, stale, malformed, or node-mismatched assertions;
@@ -171,15 +184,25 @@ allowed.
 ## Direct Pod Traffic
 
 The H2 production profile rejects direct inbound traffic to enrolled destination
-pods unless the flow originates from the authorized destination NodeWaypoint
-path. A future redirect design is possible, but TC/XDP/CNI classification alone
-does not satisfy this ADR; the enforcement action must prevent the packet from
-reaching the app outside destination policy.
+pods unless the flow originates from the authorized destination NodeWaypoint path.
+The current implementation enforces that with the pod-veth tc classifier
+attached on host-side veth ingress:
+`FERRUM_POD_IPS` / `FERRUM_POD_IPS6` mark enrolled destination addresses, and
+packets to those addresses are dropped unless `skb->mark` equals the
+NodeWaypoint inbound-auth mark set by the destination HBONE relay before it
+dials the local backend pod. This is intentionally a guard, not a redirect;
+unauthenticated direct pod-IP traffic never reaches the app outside destination
+policy.
 
-The current live gate already asserts denied-source direct Pod-IP attempts do
-not reach the destination over IPv4 or IPv6. H2 is not complete until same-node,
-cross-node, stale-IP reuse, unmanaged-source, forged-assertion, and production
-identity-profile cases are covered.
+The live gate asserts both denied in-mesh sources and unmanaged non-mesh sources
+cannot reach enrolled destination pods directly over IPv4, plus the unmanaged
+IPv6 direct-inbound path when the cluster is dual-stack. It also forces source
+workload IPv4 reuse in the disposable kind CNI and proves the replacement
+UID/identity is admitted while stale registry state is gone. In production
+SPIRE mode it additionally proves NodeWaypoint pods receive Workload API SVIDs,
+reject plaintext and no-client-SVID HBONE probes, fail closed on authenticated
+but untrusted asserted identity, and recover SVID-backed traffic/policy after a
+SPIRE Agent plus NodeWaypoint DaemonSet restart.
 
 ## Failure Behavior
 
@@ -229,8 +252,18 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv4.service_deny_cross_node`
 - `node_waypoint.ipv4.pod_ip_bypass_guard_same_node`
 - `node_waypoint.ipv4.pod_ip_bypass_guard_cross_node`
+- `node_waypoint.ipv4.direct_inbound_guard_same_node`
+- `node_waypoint.ipv4.direct_inbound_guard_cross_node`
 - `node_waypoint.identity.stale_cleanup`
+- `node_waypoint.identity.stale_ip_reuse`
 - `node_waypoint.identity.spire_chart_profile`
+- `node_waypoint.identity.spire_live_ready`
+- `node_waypoint.identity.spire_workload_entries`
+- `node_waypoint.identity.workload_api_svid`
+- `node_waypoint.identity.plaintext_hbone_rejected`
+- `node_waypoint.identity.unauthenticated_hbone_rejected`
+- `node_waypoint.identity.forged_assertion_rejected`
+- `node_waypoint.identity.spire_restart_recovery`
 - `node_waypoint.ipv6.pod_ip_fail_closed` (historical pre-admission evidence;
   retained as a non-required artifact once IPv6 admission is enabled)
 - `node_waypoint.ipv6.service_fail_closed` (historical pre-admission evidence;
@@ -239,6 +272,7 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv6.service_allow`
 - `node_waypoint.ipv6.service_deny`
 - `node_waypoint.ipv6.pod_ip_bypass_guard`
+- `node_waypoint.ipv6.direct_inbound_guard`
 
 Future H2 PRs should extend this list instead of renaming these IDs so artifacts
 remain comparable across commits.

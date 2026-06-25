@@ -36,8 +36,8 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
   the programs to:
   - The **per-pod cgroup v2** for every enrolled pod on the node
     (`connect4`, `connect6`, `getpeername4`, `getpeername6` — `cgroup_sock_addr`).
-  - The **host-side veth ingress** of every enrolled pod (`ferrum_tc_inbound`
-    — `sched_cls` classifier on tc ingress).
+  - The **host-side veth ingress/egress** of every enrolled pod
+    (`ferrum_tc_inbound` — `sched_cls` classifier on tc ingress/egress).
   - The **cgroup root** for global socket-ops telemetry
     (`ferrum_sock_ops` — `sock_ops`, attached once at startup).
 - Pins SOCK_OPS event and stats maps into `/sys/fs/bpf/ferrum/` so the
@@ -57,7 +57,7 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
   every cgroup path under `/sys/fs/cgroup`; every host network interface
   name under `/sys/class/net/`; every PID's net namespace info under
   `/proc/{pid}/net/if_inet6` (because of `hostPID: true`).
-- **Modify**: BPF maps (`FERRUM_POD_IPS`, `FERRUM_BYPASS_UIDS`,
+- **Modify**: BPF maps (`FERRUM_POD_IPS`, `FERRUM_POD_IPS6`, `FERRUM_BYPASS_UIDS`,
   `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE`, `FERRUM_INCLUDE_PORTS`,
   `FERRUM_CAPTURE_CONFIG`, `FERRUM_ORIG_DST4/6`, `FERRUM_SOCK_OPS_*`);
   cgroup-attached BPF program list; tc qdisc/filter list on host veth
@@ -71,7 +71,8 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
 A compromised node agent can:
 
 - Redirect outbound traffic from any pod on the node to a chosen
-  destination by rewriting `FERRUM_POD_IPS` / `FERRUM_CAPTURE_CONFIG` or
+  destination by rewriting `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` /
+  `FERRUM_CAPTURE_CONFIG` or
   by attaching attacker-controlled cgroup programs (subject to having loaded
   programs first — see capability discussion).
 - Attach arbitrary tc programs to host veth interfaces (within the

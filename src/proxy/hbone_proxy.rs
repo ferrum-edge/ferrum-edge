@@ -25,7 +25,9 @@ use super::{
 use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
 use crate::config::types::{Proxy, UpstreamTarget};
+use crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK;
 use crate::load_balancer::LoadBalancerCache;
+use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
 use crate::plugins::{Direction, DisconnectCause, Plugin, RequestContext, TransactionSummary};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
@@ -262,9 +264,7 @@ async fn connect_backend(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> Result<HboneBackendConnection, HboneConnectError> {
-    let (host, port) = upstream_target
-        .map(|target| (target.host.as_str(), target.port))
-        .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
+    let (host, port) = effective_hbone_backend_target(proxy, upstream_target);
     let target_url = format!("tcp://{host}:{port}");
 
     // Honor DestinationRule per-port `connect_timeout_ms` overrides on the
@@ -295,7 +295,16 @@ async fn connect_backend(
         })?;
     let addr = SocketAddr::new(resolved_ip, port);
 
-    let connect = crate::socket_opts::connect_with_socket_opts(addr);
+    let connect = if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
+        && node_waypoint_inbound_relay_mark_enabled()
+    {
+        crate::socket_opts::connect_with_socket_opts_and_mark(
+            addr,
+            Some(NODE_WAYPOINT_INBOUND_AUTH_MARK),
+        )
+    } else {
+        crate::socket_opts::connect_with_socket_opts_and_mark(addr, None)
+    };
     let stream = if effective_connect_timeout_ms > 0 {
         let timeout = Duration::from_millis(effective_connect_timeout_ms);
         match tokio::time::timeout(timeout, connect).await {
@@ -357,6 +366,33 @@ async fn connect_backend(
         stream,
         target_url,
         resolved_ip: Some(resolved_ip.to_string()),
+    })
+}
+
+fn effective_hbone_backend_target<'a>(
+    proxy: &'a Proxy,
+    upstream_target: Option<&'a UpstreamTarget>,
+) -> (&'a str, u16) {
+    upstream_target
+        .map(|target| (target.host.as_str(), target.port))
+        .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port))
+}
+
+fn inbound_hbone_relay_effective_destination_allowed(
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
+    inbound_hbone_relay_destination_allowed(app_host, app_port, mesh)
+}
+
+fn node_waypoint_inbound_relay_mark_enabled() -> bool {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(|topology| {
+        matches!(
+            topology.trim().to_ascii_lowercase().as_str(),
+            "node_waypoint" | "node-waypoint"
+        )
     })
 }
 
@@ -439,6 +475,47 @@ pub(super) async fn handle_hbone_request(
     );
     let upstream_target = selection.target;
     let upstream_balancer = selection.balancer;
+
+    if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
+        && !inbound_hbone_relay_effective_destination_allowed(
+            proxy,
+            upstream_target.as_deref(),
+            epoch.config.mesh.as_deref(),
+        )
+    {
+        let (app_host, app_port) =
+            effective_hbone_backend_target(proxy, upstream_target.as_deref());
+        warn!(
+            proxy_id = %proxy.id,
+            app_host,
+            app_port,
+            "Rejected HBONE CONNECT whose effective destination is outside the open-relay guard"
+        );
+        ctx.metadata.insert(
+            "mesh_authz.deny_policy".to_string(),
+            "hbone_relay_destination_denied".to_string(),
+        );
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::FORBIDDEN,
+            br#"{"error":"HBONE relay destination not allowed"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            plugins,
+            ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_relay_destination_denied",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(state, reject.http_status.as_u16());
+        return build_response_from_normalized_reject(reject);
+    }
 
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
     // responses are excluded from the deferred-dispatch path, #1649), so the
@@ -1338,11 +1415,20 @@ async fn hbone_udp_internal_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_hbone_relay_summary, hbone_relay_body_outcome};
-    use crate::config::types::Proxy;
+    use super::{
+        build_hbone_relay_summary, hbone_relay_body_outcome,
+        inbound_hbone_relay_effective_destination_allowed,
+    };
+    use crate::config::types::{Proxy, UpstreamTarget};
+    use crate::identity::spiffe::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
+    use crate::modes::mesh::config::{
+        AppProtocol, MeshConfig, Workload, WorkloadPort, WorkloadSelector,
+    };
     use crate::plugins::{Direction, RequestContext};
     use crate::proxy::tcp_proxy::{StreamFirstFailure, StreamIoSide};
     use crate::retry::ErrorClass;
+    use std::collections::HashMap;
     use std::time::Instant;
 
     fn minimal_proxy() -> Proxy {
@@ -1353,6 +1439,74 @@ mod tests {
             "backend_port": 15008
         }))
         .expect("minimal proxy should deserialize")
+    }
+
+    fn target(host: &str, port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            host: host.to_string(),
+            port,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        }
+    }
+
+    fn mesh_with_workload_port(port: u16) -> MeshConfig {
+        let mut mesh = MeshConfig::default();
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "app".to_string(),
+            addresses: vec!["10.1.2.3".to_string()],
+            ports: vec![WorkloadPort {
+                port,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        });
+        mesh
+    }
+
+    #[test]
+    fn inbound_relay_effective_destination_guard_checks_route_override_target() {
+        let mesh = mesh_with_workload_port(8080);
+        let mut proxy = minimal_proxy();
+        proxy.id = MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string();
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 8080;
+
+        assert!(inbound_hbone_relay_effective_destination_allowed(
+            &proxy,
+            None,
+            Some(&mesh)
+        ));
+        assert!(inbound_hbone_relay_effective_destination_allowed(
+            &proxy,
+            Some(&target("127.0.0.1", 8080)),
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_effective_destination_allowed(
+            &proxy,
+            Some(&target("203.0.113.10", 8080)),
+            Some(&mesh)
+        ));
+        assert!(!inbound_hbone_relay_effective_destination_allowed(
+            &proxy,
+            Some(&target("127.0.0.1", 9999)),
+            Some(&mesh)
+        ));
     }
 
     #[test]

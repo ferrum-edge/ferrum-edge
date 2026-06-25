@@ -7,6 +7,7 @@
 use crate::config::types::{ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use percent_encoding::percent_decode_str;
 use std::collections::HashSet;
 
 /// User-facing proxy route conflict message shared by preflight and persistence checks.
@@ -831,7 +832,10 @@ fn redact_query_option(option: &str) -> String {
         return key.to_string();
     };
 
-    if is_sensitive_url_query_key(key) {
+    let decoded_key = percent_decode_str(key).decode_utf8_lossy();
+    let decoded_key = decoded_key.as_ref();
+
+    if is_sensitive_url_query_key(decoded_key) {
         return format!("{key}=***");
     }
 
@@ -839,8 +843,10 @@ fn redact_query_option(option: &str) -> String {
     // `NAME:VALUE` properties; with MONGODB-AWS the AWS session token rides in
     // `AWS_SESSION_TOKEN:<secret>`. The key itself is not sensitive, so redact
     // any credential-bearing property value within it while keeping benign
-    // properties (e.g. `CANONICALIZE_HOST_NAME:true`) for observability.
-    if normalize_query_key(key) == "authmechanismproperties" {
+    // properties (e.g. `CANONICALIZE_HOST_NAME:true`) for observability. Query
+    // parameter names must be matched after percent-decoding so encoded aliases
+    // such as `authMechanismPropert%69es` cannot bypass nested redaction.
+    if normalize_query_key(decoded_key) == "authmechanismproperties" {
         return format!("{key}={}", redact_mechanism_properties(value));
     }
 
@@ -861,6 +867,8 @@ fn redact_mechanism_properties(value: &str) -> String {
 }
 
 fn is_sensitive_url_query_key(key: &str) -> bool {
+    // Callers pass percent-decoded key names so encoded sensitive aliases such
+    // as `pass%77ord` are matched using their semantic query-parameter name.
     // Exact (separator-insensitive) matches for credential-bearing keys that do
     // not contain one of the `SENSITIVE_SUBSTRINGS` below. Compared against the
     // normalized key, so `api_key`, `api-key`, and `apiKey` all match `apikey`.

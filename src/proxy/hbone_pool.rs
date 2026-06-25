@@ -502,8 +502,10 @@ impl HboneConnectionPool {
         app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
+        let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
 
         let fast_sender = with_hbone_pool_key(
@@ -545,7 +547,7 @@ impl HboneConnectionPool {
         };
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            self.open_connect_stream(sender, app_host, app_port, &source_identity),
+            self.open_connect_stream(sender, app_host, app_port, hbone_source_identity),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {

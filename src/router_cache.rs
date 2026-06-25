@@ -282,11 +282,14 @@ pub(crate) struct MeshTcpInboundEntry {
     /// The local service FQDN for logging.
     pub(crate) service_fqdn: String,
     /// `true` only for opaque-TLS app ports: the inbound relay peeks the
-    /// ClientHello SNI before the stream plugin chain. `false` for server-first
-    /// raw-TCP ports, where peeking would block the relay on the handshake clock
-    /// (the client sends nothing until the backend greeting). Carried from
+    /// ClientHello SNI before the stream plugin chain. Carried from
     /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
     pub(crate) tls_inspect: bool,
+    /// `true` only when mesh has an explicit client-first signal. `false` for
+    /// ambiguous/server-first raw-TCP protocols (Tcp/Redis/Mongo/MySQL/
+    /// Postgres), where peeking would block the relay on the handshake clock
+    /// before the backend greeting can arrive.
+    pub(crate) first_bytes_inspect: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -1900,6 +1903,7 @@ impl RouterCache {
                         backend_addr: route.backend_addr,
                         service_fqdn: route.service_fqdn.clone(),
                         tls_inspect: route.tls_inspect,
+                        first_bytes_inspect: route.first_bytes_inspect,
                     })
                 });
             }
@@ -4800,18 +4804,30 @@ mod tests {
         use crate::config::types::BackendScheme;
         use crate::modes::mesh::config::{MeshConfig, MeshInboundTcpRoute};
 
-        let route = MeshInboundTcpRoute {
+        let redis_route = MeshInboundTcpRoute {
             match_port: 6380,
             backend_addr: "127.0.0.1:6380".parse().unwrap(),
             namespace: "default".to_string(),
             service_name: "redis".to_string(),
             service_fqdn: "redis.default.svc.cluster.local".to_string(),
-            // Redis is server-first: the relay must NOT peek SNI for this port.
+            // Redis is not opaque TLS: the relay must NOT peek SNI for this port.
             tls_inspect: false,
+            // Redis is server-first: the relay must not block before dialing loopback.
+            first_bytes_inspect: false,
+        };
+        let tcp_route = MeshInboundTcpRoute {
+            match_port: 7000,
+            backend_addr: "127.0.0.1:7000".parse().unwrap(),
+            namespace: "default".to_string(),
+            service_name: "tcpapp".to_string(),
+            service_fqdn: "tcpapp.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            // Generic TCP is ambiguous and must not pre-dial peek by default.
+            first_bytes_inspect: false,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                local_inbound_tcp_routes: vec![route],
+                local_inbound_tcp_routes: vec![redis_route, tcp_route],
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
@@ -4826,12 +4842,25 @@ mod tests {
         assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
         assert!(
             !entry.tls_inspect,
-            "server-first raw-TCP inbound entries must not SNI-peek (would stall on the handshake clock)"
+            "non-TLS raw-TCP inbound entries must not SNI-peek"
+        );
+        assert!(
+            !entry.first_bytes_inspect,
+            "Redis inbound entries are server-first and must not pre-dial peek first bytes"
         );
         assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert_eq!(
             entry.relay_proxy.id,
             "__mesh-in-tcp-relay-default-redis-6380"
+        );
+
+        let tcp_entry = table
+            .mesh_tcp_inbound_entry("10.0.0.7:7000".parse().unwrap())
+            .expect("captured generic TCP app port should route");
+        assert_eq!(tcp_entry.backend_addr, "127.0.0.1:7000".parse().unwrap());
+        assert!(
+            !tcp_entry.first_bytes_inspect,
+            "generic TCP inbound entries are ambiguous and must not pre-dial peek first bytes"
         );
 
         assert!(
