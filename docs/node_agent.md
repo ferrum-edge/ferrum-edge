@@ -251,20 +251,22 @@ IPv4 and IPv6 addresses into `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` and attaches
 `ferrum_tc_inbound` to the host-side veth on ingress/egress. In local-pod mode
 the BPF config carries a zero inbound mark and this guard passes traffic through.
 In NodeWaypoint mode, TCP packets whose destination is an enrolled pod IP are
-dropped unless `skb->mark` matches the inbound relay auth mark from
+dropped unless they both come from an explicitly configured local-node source in
+`FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` and carry the inbound relay auth mark from
 `FERRUM_CAPTURE_CONFIG`; the destination HBONE relay sets that mark with
-`SO_MARK` before dialing the local backend pod. Direct UDP/DTLS to enrolled pod
-IPs fails closed because no authorized UDP relay path exists yet, except DNS
-responses from source port 53 back to high pod-originated client ports
-(`>=32768`); ARP/ICMP
-and other control traffic remains pass-through. Packets sourced from explicitly
-configured trusted kubelet probe source IPs in `FERRUM_NODE_IPS` /
-`FERRUM_NODE_IPS6` are considered only as kubelet probe sources; they must also
-target an enrolled pod TCP probe port derived into `FERRUM_NODE_PROBE_PORTS` /
-`FERRUM_NODE_PROBE_PORTS6` from the pod's HTTP/TCP/gRPC liveness, readiness, or
-startup probe. Do not include broad host-network source addresses in
-`FERRUM_NODE_AGENT_NODE_IPS`; other host traffic still needs the trusted relay
-mark or follows the UDP/extension-header fail-closed behavior.
+`SO_MARK` before dialing the local backend pod. The source-IP check prevents a
+workload that can forge ordinary Linux socket marks from using the mark alone as
+a direct-pod bypass. Direct UDP/DTLS to enrolled pod IPs fails closed because no
+authorized UDP relay path exists yet, except DNS responses from source port 53
+back to high pod-originated client ports (`>=32768`); ARP/ICMP and other control
+traffic remains pass-through. Packets sourced from explicitly configured trusted
+kubelet probe source IPs in `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6` can also reach
+enrolled pod TCP probe ports without the relay mark when those ports are derived
+into `FERRUM_NODE_PROBE_PORTS` / `FERRUM_NODE_PROBE_PORTS6` from the pod's
+HTTP/TCP/gRPC liveness, readiness, or startup probe. Keep
+`FERRUM_NODE_AGENT_NODE_IPS` limited to source addresses that are required for
+the host-network relay and kubelet probes; other host traffic still needs the
+trusted relay mark or follows the UDP/extension-header fail-closed behavior.
 
 NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
 `connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal

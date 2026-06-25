@@ -3,14 +3,15 @@
 //! Attached to the host-side veth interface of enrolled pods. Parses each
 //! IPv4/IPv6 packet and checks whether the destination IP is enrolled in
 //! `FERRUM_POD_IPS` / `FERRUM_POD_IPS6`. Direct TCP connection attempts to
-//! enrolled pod IPs are dropped unless they carry the NodeWaypoint relay's
-//! authorized socket mark; non-initial TCP packets are allowed so replies for
+//! enrolled pod IPs are dropped unless they come from an explicitly trusted
+//! local-node source and carry the NodeWaypoint relay's authorized socket
+//! mark; non-initial TCP packets are allowed so replies for
 //! intentionally bypassed outbound flows can return to the pod. Direct UDP is
 //! failed closed for NodeWaypoint because there is no authorized relay path yet,
 //! except DNS responses from source port 53 to high pod-originated client ports
 //! (>=32768).
-//! Explicitly configured local node source IPs can only bypass this guard for
-//! enrolled Kubernetes probe ports.
+//! Explicitly configured local node source IPs can only bypass this guard with
+//! the relay mark, or for enrolled Kubernetes probe ports without the mark.
 
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::macros::classifier;
@@ -67,18 +68,18 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
         IPPROTO_TCP => {
             let (dst_port, flags) = match tcp_dst_port_and_flags4(ctx) {
                 Ok(parsed) => parsed,
-                Err(_) => return guard_enrolled_destination(ctx),
+                Err(_) => return guard_enrolled_destination(ctx, source_is_node),
             };
             if source_is_node && node_probe_port4_allowed(dst_ip, dst_port) {
                 return Ok(TC_ACT_OK);
             }
-            if enrolled_destination_authorized(ctx) {
+            if enrolled_destination_authorized(ctx, source_is_node) {
                 return Ok(TC_ACT_PIPE);
             }
             if !tcp_initial_syn(flags) {
                 return Ok(TC_ACT_OK);
             }
-            guard_enrolled_destination(ctx)
+            guard_enrolled_destination(ctx, source_is_node)
         }
         IPPROTO_UDP => match udp_ports4(ctx) {
             Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => Ok(TC_ACT_OK),
@@ -118,18 +119,18 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
         IPPROTO_TCP => {
             let (dst_port, flags) = match tcp_dst_port_and_flags6(ctx) {
                 Ok(parsed) => parsed,
-                Err(_) => return guard_enrolled_destination(ctx),
+                Err(_) => return guard_enrolled_destination(ctx, source_is_node),
             };
             if source_is_node && node_probe_port6_allowed(dst_ip.addr, dst_port) {
                 return Ok(TC_ACT_OK);
             }
-            if enrolled_destination_authorized(ctx) {
+            if enrolled_destination_authorized(ctx, source_is_node) {
                 return Ok(TC_ACT_PIPE);
             }
             if !tcp_initial_syn(flags) {
                 return Ok(TC_ACT_OK);
             }
-            guard_enrolled_destination(ctx)
+            guard_enrolled_destination(ctx, source_is_node)
         }
         IPPROTO_UDP => match udp_ports6(ctx) {
             Ok((src_port, dst_port)) if dns_response_allowed(src_port, dst_port) => Ok(TC_ACT_OK),
@@ -141,21 +142,24 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
 }
 
 #[inline(always)]
-fn guard_enrolled_destination(ctx: &TcContext) -> Result<i32, i64> {
+fn guard_enrolled_destination(ctx: &TcContext, source_is_node: bool) -> Result<i32, i64> {
     let Some(config) = (unsafe { FERRUM_CAPTURE_CONFIG.get(&FERRUM_CAPTURE_CONFIG_KEY) }) else {
         return Ok(TC_ACT_SHOT);
     };
     if config.node_waypoint_inbound_auth_mark == 0 {
         return Ok(TC_ACT_OK);
     }
-    if skb_mark(ctx) == config.node_waypoint_inbound_auth_mark {
+    if source_is_node && skb_mark(ctx) == config.node_waypoint_inbound_auth_mark {
         return Ok(TC_ACT_PIPE);
     }
     Ok(TC_ACT_SHOT)
 }
 
 #[inline(always)]
-fn enrolled_destination_authorized(ctx: &TcContext) -> bool {
+fn enrolled_destination_authorized(ctx: &TcContext, source_is_node: bool) -> bool {
+    if !source_is_node {
+        return false;
+    }
     let Some(config) = (unsafe { FERRUM_CAPTURE_CONFIG.get(&FERRUM_CAPTURE_CONFIG_KEY) }) else {
         return false;
     };
