@@ -90,6 +90,7 @@ fn entry(
         td(trust_domain),
         network.map(str::to_string),
         control_plane_url.map(str::to_string),
+        None,
         RemoteClusterEndpoints {
             workloads,
             services,

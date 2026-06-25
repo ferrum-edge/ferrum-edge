@@ -125,6 +125,15 @@ pub struct RemoteClusterEntry {
     /// newly-declared identity. `None` only for entries staged without a poll
     /// URL (test seeders); production entries always carry the polled URL.
     pub control_plane_url: Option<String>,
+    /// Credential reference (`RemoteCluster.discovery_credential_ref`) the
+    /// endpoints were polled UNDER. Part of the poll identity: `matches_declared`
+    /// compares it so a slice that rotates or withdraws a cluster's discovery
+    /// credential — even with name/trust_domain/network/url unchanged — does NOT
+    /// admit endpoints fetched with the old credential. Without it, a credential
+    /// change (including to an unresolvable ref that must fail closed) would let
+    /// the slice-apply merge keep serving the stale endpoints for a generation,
+    /// until the discovery reconciler stops the old poller.
+    pub credential_ref: Option<String>,
     pub endpoints: RemoteClusterEndpoints,
     /// Unix-seconds timestamp of the last successful poll for this cluster.
     /// Shared (`Arc<AtomicU64>`) so a no-op poll refreshes it without a clone;
@@ -140,6 +149,7 @@ impl RemoteClusterEntry {
         trust_domain: TrustDomain,
         network: Option<String>,
         control_plane_url: Option<String>,
+        credential_ref: Option<String>,
         endpoints: RemoteClusterEndpoints,
         fetched_at_unix_seconds: u64,
     ) -> Self {
@@ -148,6 +158,7 @@ impl RemoteClusterEntry {
             trust_domain,
             network,
             control_plane_url,
+            credential_ref,
             endpoints,
             fetched_at: Arc::new(AtomicU64::new(fetched_at_unix_seconds)),
         }
@@ -162,9 +173,14 @@ impl RemoteClusterEntry {
 
     /// Whether this stored entry's FULL poll identity matches a `RemoteCluster`
     /// declared in a candidate / accepted slice. The poll identity is
-    /// (name, trust_domain, network, **normalized control_plane_url**): two
-    /// clusters that share a name but differ on any of those resolve / dial
-    /// differently and must not be conflated.
+    /// (name, trust_domain, network, **normalized control_plane_url**,
+    /// **discovery_credential_ref**): two clusters that share a name but differ
+    /// on any of those resolve / dial / **authenticate** differently and must
+    /// not be conflated. The credential ref is included so rotating or
+    /// withdrawing a cluster's discovery credential (even to an unresolvable ref
+    /// that must fail closed) immediately stops admitting endpoints fetched with
+    /// the old credential, rather than serving them until the reconciler stops
+    /// the old poller.
     ///
     /// The declared URL is normalized + trimmed the SAME way the poll target is
     /// ([`poll_targets_for_multi_cluster`] → [`normalize_control_plane_url`])
@@ -182,6 +198,7 @@ impl RemoteClusterEntry {
         if declared.name != self.cluster_name
             || declared.trust_domain != self.trust_domain
             || declared.network != self.network
+            || declared.discovery_credential_ref != self.credential_ref
         {
             return false;
         }
@@ -1169,6 +1186,7 @@ impl RemoteDiscoveryManager {
             trust_domain: target.trust_domain.clone(),
             network: target.network.clone(),
             control_plane_url: target.control_plane_url.clone(),
+            credential_ref: target.credential_ref.clone(),
             config,
         };
         let source = (self.source_factory)(&ctx);
@@ -1564,6 +1582,9 @@ pub struct RemoteClusterPollContext {
     pub trust_domain: TrustDomain,
     pub network: Option<String>,
     pub control_plane_url: String,
+    /// Credential reference this poll authenticates with, stamped onto stored
+    /// entries so `matches_declared` treats it as part of the poll identity.
+    pub credential_ref: Option<String>,
     pub config: RemoteDiscoveryConfig,
 }
 
@@ -1602,6 +1623,9 @@ async fn remote_discovery_loop(
                     // `poll_targets_for_multi_cluster`; store it so a later
                     // URL-only slice change fails the membership filter closed.
                     Some(ctx.control_plane_url.clone()),
+                    // Stamp the credential ref so a credential rotation /
+                    // withdrawal also fails the membership filter closed.
+                    ctx.credential_ref.clone(),
                     endpoints,
                     now,
                 );
@@ -2197,6 +2221,7 @@ mod tests {
                 // Matches the URL `candidate_admitting` declares (already
                 // normalized form), so the full-poll-identity filter admits it.
                 Some("https://cp.remote.example:15010".to_string()),
+                None,
                 endpoints,
                 1,
             ),
@@ -2588,6 +2613,7 @@ mod tests {
                 td("remote.local"),
                 Some("net-a".to_string()),
                 Some("https://cp-east.remote.example:15010".to_string()),
+                None,
                 RemoteClusterEndpoints {
                     workloads: vec![remote_workload("east", "net-a")],
                     services: vec![],
@@ -2602,6 +2628,7 @@ mod tests {
                 td("remote.local"),
                 Some("net-b".to_string()),
                 Some("https://cp-west.remote.example:15010".to_string()),
+                None,
                 RemoteClusterEndpoints {
                     workloads: vec![remote_workload("west", "net-b")],
                     services: vec![],
@@ -2901,6 +2928,7 @@ mod tests {
             td("remote.local"),
             Some("net2".to_string()),
             Some("https://cp.remote.example:15010".to_string()),
+            None,
             RemoteClusterEndpoints::default(),
             1,
         );
@@ -2957,10 +2985,73 @@ mod tests {
             td("remote.local"),
             Some("net2".to_string()),
             None,
+            None,
             RemoteClusterEndpoints::default(),
             1,
         );
         assert!(!urlless.matches_declared(&base));
+    }
+
+    /// The discovery credential ref is part of the poll identity:
+    /// `matches_declared` must reject a declaration whose
+    /// `discovery_credential_ref` differs from the credential the stored
+    /// endpoints were polled UNDER, so a credential rotation / withdrawal stops
+    /// admitting stale endpoints fetched with the old credential.
+    #[test]
+    fn matches_declared_includes_credential_ref() {
+        let entry = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            Some("https://cp.remote.example:15010".to_string()),
+            Some("credA".to_string()),
+            RemoteClusterEndpoints::default(),
+            1,
+        );
+        // Identical poll identity INCLUDING the credential ref → matches.
+        let base = RemoteCluster {
+            name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: Some("net2".to_string()),
+            control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+            federation_endpoint: None,
+            discovery_credential_ref: Some("credA".to_string()),
+        };
+        assert!(
+            entry.matches_declared(&base),
+            "an entry polled under credA matches a credA declaration"
+        );
+        // A rotated credential (different ref) → no match.
+        assert!(
+            !entry.matches_declared(&RemoteCluster {
+                discovery_credential_ref: Some("credB".to_string()),
+                ..base.clone()
+            }),
+            "rotating the discovery credential must stop admitting the old endpoints"
+        );
+        // A withdrawn credential (now None) → no match.
+        assert!(
+            !entry.matches_declared(&RemoteCluster {
+                discovery_credential_ref: None,
+                ..base.clone()
+            }),
+            "withdrawing the discovery credential must stop admitting the old endpoints"
+        );
+        // Symmetric case: an entry polled WITHOUT a credential must not match a
+        // declaration that has since ADDED one.
+        let uncredentialed = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            Some("https://cp.remote.example:15010".to_string()),
+            None,
+            RemoteClusterEndpoints::default(),
+            1,
+        );
+        assert!(
+            !uncredentialed.matches_declared(&base),
+            "adding a discovery credential must stop admitting endpoints polled without one"
+        );
     }
 
     #[test]
@@ -2974,6 +3065,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: None,
+            credential_ref: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -3097,6 +3189,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: None,
+            credential_ref: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -3390,6 +3483,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: Some("net-a".to_string()),
             control_plane_url: Some("https://cp-v1.remote.example:15010".to_string()),
+            credential_ref: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -3521,6 +3615,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: "https://cp.remote.example:15010".to_string(),
+            credential_ref: None,
             config: config.clone(),
         };
         let http_ctx = RemoteClusterPollContext {
@@ -3581,6 +3676,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: Some("net2".to_string()),
             control_plane_url: "https://cp.remote.example:15010".to_string(),
+            credential_ref: None,
             config: RemoteDiscoveryConfig {
                 // Tiny interval so the loop reaches the second (failing) poll
                 // quickly; the test shuts it down right after.
@@ -3659,6 +3755,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: None,
+            credential_ref: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/stale",
@@ -3702,6 +3799,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: None,
+            credential_ref: None,
             endpoints: endpoints.clone(),
             fetched_at: Arc::new(AtomicU64::new(1)),
         };
@@ -3745,6 +3843,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: None,
+            credential_ref: None,
             endpoints: endpoints.clone(),
             fetched_at: Arc::new(AtomicU64::new(fetched_at)),
         };
@@ -3818,6 +3917,7 @@ mod tests {
                 td("remote.local"),
                 None,
                 None,
+                None,
                 endpoints.clone(),
                 fetched_at,
             )
@@ -3873,6 +3973,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: None,
+            credential_ref: None,
             endpoints: endpoints.clone(),
             fetched_at: Arc::new(AtomicU64::new(fetched_at)),
         };
@@ -3975,6 +4076,7 @@ mod tests {
                 trust.clone(),
                 None,
                 Some("https://cp.remote.example:15010".to_string()),
+                None,
                 endpoints.clone(),
                 fetched_at,
             )
@@ -4219,6 +4321,7 @@ mod tests {
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: url.to_string(),
+            credential_ref: None,
             config: RemoteDiscoveryConfig {
                 poll_interval: Duration::from_millis(20),
                 request_timeout,

@@ -20892,6 +20892,7 @@ mod tests {
                 // control_plane_url so the full-poll-identity merge filter
                 // admits these endpoints.
                 Some("https://cp.remote.example:15010".to_string()),
+                None,
                 multicluster::RemoteClusterEndpoints {
                     workloads,
                     services: Vec::new(),
