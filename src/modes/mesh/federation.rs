@@ -123,6 +123,16 @@ pub struct FederationStore {
     /// Generation at which each cluster was last registered, in an
     /// `ArcSwap` so `install` can re-check it atomically inside its rcu.
     cluster_generation: Arc<ArcSwap<HashMap<String, u64>>>,
+    /// Serializes federation last-success / bundle-age gauge writes against the
+    /// staleness-expiry clear. The gauge map is keyed by trust domain ONLY, so
+    /// when two `RemoteCluster`s federate the same domain, a stale cluster's
+    /// expiry-clear could otherwise wipe the gauge a *different* cluster just
+    /// recorded for a freshly installed live bundle. Taking this lock in both
+    /// `record_poll_success_if_live` and `expire_stale_bundle` makes the
+    /// record-vs-clear ordering deterministic (the record always re-establishes
+    /// the gauge after a racing clear), mirroring the remote-discovery
+    /// `metrics_ordering` lock.
+    metrics_ordering: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for FederationStore {
@@ -134,6 +144,7 @@ impl Default for FederationStore {
             revision_tx: Arc::new(revision_tx),
             generation: Arc::new(AtomicU64::new(0)),
             cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            metrics_ordering: Arc::new(std::sync::Mutex::new(())),
         }
     }
 }
@@ -292,6 +303,38 @@ impl FederationStore {
         }
     }
 
+    /// Record a successful poll's last-success / bundle-age gauge — but only
+    /// while holding the metrics-ordering lock and re-confirming the cluster's
+    /// generation under it.
+    ///
+    /// The federation gauge map is keyed by trust domain only, so a stale
+    /// cluster's [`Self::expire_stale_bundle`] clear and another cluster's
+    /// success record for the same domain race on one key. Taking the same lock
+    /// (and skipping when the generation was retired) serializes them: a clear
+    /// that runs first is immediately followed by this record re-establishing
+    /// the gauge for the live bundle; a record that runs first cannot be wiped
+    /// because the expiry only removes a bundle this same cluster still owns.
+    pub(crate) fn record_poll_success_if_live(
+        &self,
+        cluster_name: &str,
+        trust_domain: &TrustDomain,
+        fetched_at_unix_seconds: u64,
+        task_generation: u64,
+    ) {
+        // Poison is impossible (panic-free critical sections); recover the guard
+        // rather than wedging the poller on a poisoned ordering lock.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cluster_generation_matches(cluster_name, task_generation) {
+            crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
+                trust_domain.as_str(),
+                fetched_at_unix_seconds,
+            );
+        }
+    }
+
     /// Remove a last-good bundle after its bounded staleness window expires
     /// without retiring the cluster's poll generation. The poller keeps running
     /// and can reinstall a fresh bundle if the remote endpoint recovers.
@@ -306,6 +349,15 @@ impl FederationStore {
         if max_stale_seconds == 0 {
             return false;
         }
+        // Serialize the gauge clear against concurrent success-metric writes
+        // (`record_poll_success_if_live`). The federation gauge key is
+        // trust-domain-only, so without this a cluster sharing the trust domain
+        // could have its freshly recorded last-success/age gauge wiped by this
+        // expiry. Held across the rcu and the clear below.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut expired = false;
         self.inner.rcu(|current| {
             // Recompute the outcome on every CAS attempt: a lost CAS retries the
@@ -1034,10 +1086,7 @@ async fn fetch_and_install_bundle(
     if !installed {
         return Ok(false);
     }
-    crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
-        trust_domain.as_str(),
-        now,
-    );
+    store.record_poll_success_if_live(cluster_name, trust_domain, now, task_generation);
     info!(
         cluster = %cluster_name,
         trust_domain = %trust_domain,
@@ -2164,6 +2213,81 @@ mod tests {
             "staleness expiration must not retire the poll generation; a later successful poll can reinstall"
         );
         assert!(store.snapshot().bundles.contains_key(&domain));
+    }
+
+    #[test]
+    fn federation_record_success_skips_after_generation_retired() {
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("retired-{suffix}.example.com"));
+        let generation = store.register("retiring-cluster");
+        // Retire the cluster generation (e.g. its RemoteCluster was removed)
+        // before the in-flight poll task records its success metric.
+        store.remove_cluster("retiring-cluster", &domain, true);
+        store.record_poll_success_if_live("retiring-cluster", &domain, 1000, generation);
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            !rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "a record from a retired generation must not resurrect the federation gauge: {rendered}"
+        );
+    }
+
+    #[test]
+    fn expire_stale_bundle_ignores_domain_owned_by_another_cluster() {
+        // Two RemoteClusters federate the same trust domain. Cluster A installs
+        // first; cluster B then reinstalls a fresh bundle for the same domain and
+        // records its gauge. Cluster A's long-stale poller must NOT remove B's
+        // live bundle or wipe B's freshly recorded gauge — the bundle is owned by
+        // B now, so A's expiry is a no-op (the ownership guard + the
+        // metrics-ordering lock keep the trust-domain-keyed gauge consistent).
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("shared-{suffix}.example.com"));
+        let federated = |cluster: &str, ts: u64| FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: domain.clone(),
+                x509_authorities: vec!["a".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: ts,
+            endpoint: "https://shared/.well-known/spiffe".to_string(),
+            cluster_name: cluster.to_string(),
+        };
+        let gen_a = store.register("cluster-a");
+        assert!(store.install(
+            "cluster-a",
+            domain.clone(),
+            federated("cluster-a", 100),
+            gen_a
+        ));
+        let gen_b = store.register("cluster-b");
+        assert!(store.install(
+            "cluster-b",
+            domain.clone(),
+            federated("cluster-b", 200),
+            gen_b
+        ));
+        store.record_poll_success_if_live("cluster-b", &domain, 200, gen_b);
+
+        assert!(
+            !store.expire_stale_bundle("cluster-a", &domain, 1_000_000, Duration::from_secs(20)),
+            "A's expiry must not remove a bundle now owned by cluster B"
+        );
+        assert!(
+            store.snapshot().bundles.contains_key(&domain),
+            "B's live bundle survives A's stale expiry"
+        );
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "B's freshly recorded federation gauge is not wiped by A's stale expiry: {rendered}"
+        );
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_federation_poll_success(
+            domain.as_str(),
+        );
     }
 
     #[tokio::test]
