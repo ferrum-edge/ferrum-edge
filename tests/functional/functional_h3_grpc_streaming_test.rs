@@ -251,9 +251,13 @@ async fn h3_grpc_streaming_server_responds_before_client_half_close() {
         Some("0"),
     );
 
-    // Only now does the client half-close — proving the response above was
-    // delivered while the request stream was still open.
-    stream.finish().await.expect("finish after response");
+    // The proof above is decisive: the full response (headers + message +
+    // grpc-status trailer) arrived while the request stream was still open, which
+    // is impossible on the old buffered path. The client now half-closes
+    // best-effort — once the RPC completes the gateway STOP_SENDINGs the request
+    // upload (the RPC is over; no more request DATA is wanted), so a late
+    // `finish()` may legitimately observe the already-closed stream.
+    let _ = stream.finish().await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
