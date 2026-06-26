@@ -17800,6 +17800,7 @@ async fn proxy_to_backend(
             client_request_body,
             plugins,
             ctx,
+            response_decision_ctx,
             upstream_target,
             client_ip,
             xff_append_ip,
@@ -20995,6 +20996,14 @@ async fn proxy_to_backend_http3(
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     mut ctx: Option<&mut RequestContext>,
+    // Real, read-only request context for the response-side buffer->stream
+    // downgrade (`refine_stream_response_for_content_type`). Distinct from
+    // `ctx` above, which is the request-body-hook clone and is `None` for
+    // response-only buffering plugins such as `compression` — so the refine
+    // MUST read this, mirroring the reqwest / direct-H2 / HBONE paths. `None`
+    // when retries are configured (a retry may replay the response body, so
+    // every attempt stays buffered).
+    response_decision_ctx: Option<&RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     xff_append_ip: &str,
@@ -21120,7 +21129,7 @@ async fn proxy_to_backend_http3(
                             stream_response,
                             proxy,
                             plugins,
-                            ctx.as_deref(),
+                            response_decision_ctx,
                             response.status,
                             &response.headers,
                         );
@@ -21335,9 +21344,7 @@ async fn proxy_to_backend_http3(
     let request_body =
         apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
             .await;
-    // Keep `ctx` alive (reborrow instead of move) — the buffered-response branch
-    // below needs it to run `refine_stream_response_for_content_type`.
-    match run_final_request_body_hooks(plugins, ctx.as_deref_mut(), headers, &request_body).await {
+    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
         PluginResult::Continue => {}
         reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
             return (
@@ -21515,7 +21522,7 @@ async fn proxy_to_backend_http3(
                     stream_response,
                     proxy,
                     plugins,
-                    ctx.as_deref(),
+                    response_decision_ctx,
                     response.status,
                     &response.headers,
                 );
@@ -21603,6 +21610,17 @@ async fn proxy_to_backend_http3(
 /// trailer names stripped — by [`crate::proxy::body::H3FrameSource`], so both
 /// H1 (chunked trailers) and H2 (trailers frame) downstream clients receive
 /// them.
+///
+/// KNOWN LIMITATION (pre-existing, shared with every native-H3 streaming
+/// response): unlike the `StreamingH2` arm, the downstream `StreamingH3` body
+/// builders do NOT yet apply the per-frame `backend_read_timeout_ms` idle
+/// regime, and the dispatch site does NOT defer the CB / passive-health
+/// outcome to body completion. So a 2xx/206 H3 response that stalls or resets
+/// AFTER headers banks a header-time success and relies on the QUIC idle
+/// timeout rather than a 504. This downgrade widens the set of responses on
+/// that streaming path (a `compression`-released `206`/SSE used to take the
+/// buffered drain's 504 + failure accounting); bringing the H3 streaming path
+/// to `StreamingH2` parity is tracked in issue #1901.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,

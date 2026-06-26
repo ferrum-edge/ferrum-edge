@@ -1835,11 +1835,10 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
     let resp = raw_h2c_request(
         &harness.proxy_url("/api/range"),
         "GET",
-        &[
-            ("host", "edge.example"),
-            ("accept-encoding", "gzip"),
-            ("range", "bytes=0-511"),
-        ],
+        // No explicit Host: the H2 `:authority` is set from the request URI
+        // (127.0.0.1:<port>); an extra mismatched Host would trip
+        // `check_host_authority_consistency` (400) before routing.
+        &[("accept-encoding", "gzip"), ("range", "bytes=0-511")],
     )
     .await
     .unwrap_or_else(|e| {
@@ -1932,11 +1931,8 @@ async fn h2c_frontend_h3_backend_large_206_streams_not_buffered_502() {
     let resp = raw_h2c_request(
         &harness.proxy_url("/api/big-range"),
         "GET",
-        &[
-            ("host", "edge.example"),
-            ("accept-encoding", "gzip"),
-            ("range", "bytes=0-"),
-        ],
+        // No explicit Host (see the trailers test): the URI sets `:authority`.
+        &[("accept-encoding", "gzip"), ("range", "bytes=0-")],
     )
     .await
     .unwrap_or_else(|e| {
