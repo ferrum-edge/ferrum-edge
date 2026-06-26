@@ -5573,17 +5573,24 @@ async fn dispatch_grpc_native_h3(
             // upload is client-caused and stays NEUTRAL — 413 + `ClientDisconnect`,
             // matching the plain native-H3 streaming 413 path — so it never
             // poisons the breaker / passive health / adaptive concurrency.
-            let (health_status, outcome_connection_error, outcome_error_class) = if is_oversize {
-                (413, false, Some(crate::retry::ErrorClass::ClientDisconnect))
+            let (health_status, outcome_error_class) = if is_oversize {
+                (413, Some(crate::retry::ErrorClass::ClientDisconnect))
             } else {
                 let status = if is_read_timeout { 504 } else { 502 };
-                let (connection_error, error_class) = h3_streaming_body_failure_outcome(
+                let (_, error_class) = h3_streaming_body_failure_outcome(
                     is_client_request_body_disconnect,
                     is_read_timeout,
                     h3_error_class,
                 );
-                (status, connection_error, error_class)
+                (status, error_class)
             };
+            // `H3PoolError::request_on_wire()` is authoritative for H3
+            // `connection_error` (proxy-protocols rules: do not AND it with generic
+            // error-class labels). Only a pre-wire failure (connect / TLS / DNS /
+            // pre-`send_request`) is a connection error; a post-wire reset, read
+            // timeout, or oversized / aborted upload already reached the backend
+            // wire and must NOT be recorded as a connect-class failure.
+            let outcome_connection_error = !e.request_on_wire();
             crate::proxy::backend_dispatch::record_backend_outcome(
                 state,
                 proxy,
@@ -5692,6 +5699,30 @@ async fn dispatch_grpc_native_h3(
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Backend response exceeds maximum size",
         );
+        // Emit a TransactionSummary so log/mirror plugins see this oversized
+        // response, like the dispatch-failure, after_proxy-reject, and success
+        // branches. Request bytes were forwarded; no response body was relayed.
+        log_h3_grpc_transaction(
+            proxy,
+            ctx,
+            plugins,
+            method,
+            original_request_path,
+            backend_url,
+            backend_resolved_ip,
+            proxy_headers,
+            StatusCode::OK.as_u16(),
+            request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            false,
+            false,
+            Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+            None,
+            start_time,
+            backend_start,
+            *plugin_execution_ns,
+        )
+        .await;
         record_request(state, StatusCode::OK.as_u16());
         return Ok(());
     }
@@ -5765,7 +5796,11 @@ async fn dispatch_grpc_native_h3(
             backend_resolved_ip,
             proxy_headers,
             log_status,
-            0,
+            // Request body was already streamed to the backend before the
+            // response returned and was rejected, so report the forwarded bytes
+            // (chargeback/audit parity with the success/failure branches). The
+            // gRPC reject is trailers-only, so no response DATA bytes are sent.
+            request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
             0,
             reject_sent,
             !reject_sent,
@@ -5799,6 +5834,21 @@ async fn dispatch_grpc_native_h3(
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC response: {}", e))?;
     if stream.send_response(resp).await.is_err() {
+        // A client disconnect at the header-write boundary must not mask a real
+        // backend failure: when the backend returned a failure status (a raw HTTP
+        // 5xx, or a configured breaker-failure status), clear the neutral
+        // `ClientDisconnect` class for CB/passive-health/admission so the failure
+        // is recorded — same guard the body/trailer path applies.
+        let backend_failure_status = response_status >= 500
+            || proxy
+                .circuit_breaker
+                .as_ref()
+                .is_some_and(|cb| cb.failure_status_codes.contains(&response_status));
+        let health_error_class = if backend_failure_status {
+            None
+        } else {
+            Some(crate::retry::ErrorClass::ClientDisconnect)
+        };
         crate::proxy::backend_dispatch::record_backend_outcome(
             state,
             proxy,
@@ -5808,7 +5858,7 @@ async fn dispatch_grpc_native_h3(
             cb_target_key,
             response_status,
             false,
-            Some(crate::retry::ErrorClass::ClientDisconnect),
+            health_error_class,
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
@@ -5817,7 +5867,7 @@ async fn dispatch_grpc_native_h3(
             &mut backend_admission_permits,
             response_status,
             false,
-            Some(crate::retry::ErrorClass::ClientDisconnect),
+            health_error_class,
             backend_admission_response_elapsed,
         );
         log_h3_grpc_transaction(
@@ -6018,7 +6068,13 @@ async fn dispatch_grpc_native_h3(
                         .and_then(|s| s.trim().parse::<u32>().ok());
                     strip_response_hop_by_hop_trailers(&mut trailers);
                     let finish_ok = if !trailers.is_empty() {
+                        // `send_trailers` only writes the trailer HEADERS frame;
+                        // `finish()` is required to FIN the QUIC send side so the
+                        // client sees end-of-response (the shared
+                        // `finish_h3_response_with_backend_trailers` helper does the
+                        // same). Skipping it leaves the stream open until timeout.
                         stream.send_trailers(trailers).await.is_ok()
+                            && stream.finish().await.is_ok()
                     } else {
                         stream.finish().await.is_ok()
                     };
