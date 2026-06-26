@@ -266,6 +266,10 @@ impl HboneConnectionPool {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
 
+        // The capability-warmup probe runs only for in-cluster HBONE targets
+        // (cross-cluster targets BYPASS the capability registry — they dial the
+        // operator-declared gateway `:15443`, never a probeable `:15008`
+        // workload), so trust-domain scope + SNI override are always `None` here.
         let fast_sender = with_hbone_pool_key(
             dial_host,
             app_port,
@@ -273,6 +277,8 @@ impl HboneConnectionPool {
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
             expected_peer,
+            None,
+            None,
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
@@ -287,6 +293,8 @@ impl HboneConnectionPool {
                 proxy.dns_override.as_deref(),
                 fingerprint.as_ref(),
                 expected_peer,
+                None,
+                None,
                 &pool_config,
                 |key| key.to_string(),
             );
@@ -298,6 +306,8 @@ impl HboneConnectionPool {
                 app_policy_port,
                 hbone_port,
                 expected_peer,
+                None,
+                None,
                 &key,
                 &pool_config,
             )
@@ -493,6 +503,7 @@ impl HboneConnectionPool {
     /// both. NodeWaypoint secured egress passes the destination NodeWaypoint as
     /// `dial_host` while preserving the selected workload IP/DNS as `app_host`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_tunnel_via(
         &self,
         proxy: &Proxy,
@@ -502,6 +513,16 @@ impl HboneConnectionPool {
         app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        // CROSS-CLUSTER east-west scope: `expected_trust_domain` scopes the
+        // server-cert verifier to a single remote trust domain and `sni_override`
+        // sets the outer-TLS SNI to the destination service FQDN so the remote
+        // east-west gateway's SNI passthrough routes the dial. Both `None` for
+        // the in-cluster Ambient/Waypoint/NodeWaypoint egress callers (the pinned
+        // peer constrains the domain; SNI = dial host). They are part of the pool
+        // KEY so a cross-cluster session (verified against TD-B for service-X) is
+        // never reused for a different TD / SNI.
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
         asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
@@ -515,6 +536,8 @@ impl HboneConnectionPool {
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
             expected_peer,
+            sni_override,
+            expected_trust_domain,
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
@@ -529,6 +552,8 @@ impl HboneConnectionPool {
                 proxy.dns_override.as_deref(),
                 fingerprint.as_ref(),
                 expected_peer,
+                sni_override,
+                expected_trust_domain,
                 &pool_config,
                 |key| key.to_string(),
             );
@@ -540,6 +565,8 @@ impl HboneConnectionPool {
                 app_policy_port,
                 hbone_port,
                 expected_peer,
+                expected_trust_domain,
+                sni_override,
                 &key,
                 &pool_config,
             )
@@ -616,6 +643,10 @@ impl HboneConnectionPool {
             dial_host,
             hbone_port,
             expected_peer,
+            // WS-over-HBONE is in-cluster only (cross-cluster WS is a documented
+            // follow-up); no trust-domain scope / SNI override.
+            None,
+            None,
             &pool_config,
             keepalive_override,
             None,
@@ -699,6 +730,10 @@ impl HboneConnectionPool {
             dial_host,
             hbone_port,
             expected_peer,
+            // Datagram-over-HBONE is in-cluster only here; no trust-domain scope
+            // / SNI override (cross-cluster UDP is not in scope).
+            None,
+            None,
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
@@ -772,6 +807,9 @@ impl HboneConnectionPool {
         app_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        // CROSS-CLUSTER scope, threaded into the dial. `None`/`None` in-cluster.
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
         key: &str,
         pool_config: &PoolConfig,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
@@ -908,6 +946,8 @@ impl HboneConnectionPool {
                 dial_host,
                 hbone_port,
                 expected_peer,
+                expected_trust_domain,
+                sni_override,
                 pool_config,
                 keepalive_override,
             ),
@@ -1091,12 +1131,21 @@ impl HboneConnectionPool {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_sender(
         &self,
         proxy: &Proxy,
         target_host: &str,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        // CROSS-CLUSTER scope: `expected_trust_domain` scopes the verifier and
+        // `sni_override` sets the outer-TLS SNI. `None`/`None` for every
+        // in-cluster pooled dial (the pinned peer constrains the domain; SNI =
+        // dial host). These are part of the pool key (the byte-stream path is
+        // pooled), so a cross-cluster session is never shared with an in-cluster
+        // one to the same `(host, port)`.
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
@@ -1112,6 +1161,8 @@ impl HboneConnectionPool {
             target_host,
             hbone_port,
             expected_peer,
+            expected_trust_domain,
+            sni_override,
             pool_config,
             keepalive_override,
             None,
@@ -1294,6 +1345,19 @@ pub(crate) async fn dial_h2_connect_sender(
     target_host: &str,
     dial_port: u16,
     expected_peer: Option<&crate::identity::SpiffeId>,
+    // Scopes the server-cert verifier to a single remote trust domain for the
+    // CROSS-CLUSTER east-west path (`expected_peer = None`, the SNI-passthrough
+    // gateway LB-picks the destination so no pod SPIFFE can be pinned, but the
+    // server SVID MUST be in exactly this trust domain). `None` for every
+    // in-cluster dial (the pinned peer already constrains the domain), matching
+    // the prior hardcoded `None`.
+    expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+    // Overrides the ClientHello SNI when `Some` (CROSS-CLUSTER: the destination
+    // service FQDN, so the remote east-west gateway's SNI passthrough routes to
+    // a destination terminator). `None` keeps the current behavior — SNI = the
+    // dial host `target_host` — so the in-cluster HBONE / raw-TCP / UDP /
+    // WebSocket-over-HBONE callers are byte-identical.
+    sni_override: Option<&str>,
     pool_config: &PoolConfig,
     keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
     // Per-port DestinationRule `connectTimeout` override (resolved by the caller
@@ -1344,23 +1408,29 @@ pub(crate) async fn dial_h2_connect_sender(
         pool_config.tcp_keepalive_seconds,
     );
 
-    // `dial_h2_connect_sender` backs HBONE egress (any-federated when the
-    // operator target carries no pin, else pinned) AND the PINNED Sidecar
+    // `dial_h2_connect_sender` backs in-cluster HBONE egress (any-federated when
+    // the operator target carries no pin, else pinned), the PINNED Sidecar
     // mesh-mTLS CONNECT tunnels (raw-TCP / UDP / WebSocket egress, all
-    // `expected_peer = Some`). None of these is the cross-cluster east-west HTTP
-    // path (that dials via `MeshMtlsConnectionPool::create_sender`), so no
-    // single-trust-domain scope applies here — pass `None`.
+    // `expected_peer = Some`), AND the CROSS-CLUSTER Ambient HBONE east-west path
+    // (`expected_peer = None`, `expected_trust_domain = Some(remote TD)`,
+    // `sni_override = Some(service FQDN)`). For the in-cluster callers both
+    // `expected_trust_domain` and `sni_override` are `None` so behavior is
+    // unchanged.
     let tls_config = build_spiffe_outbound_config(
         gateway_svid.clone(),
         expected_peer.cloned(),
-        None,
+        expected_trust_domain.cloned(),
         vec![b"h2".to_vec()],
     )?;
     let connector = TlsConnector::from(tls_config);
+    // SNI = the `sni_override` when present (cross-cluster: the destination
+    // service FQDN the remote east-west gateway routes passthrough on), else the
+    // dial host (every in-cluster path — byte-identical to the prior hardcode).
+    let sni_host = sni_override.unwrap_or(target_host);
     let server_name =
-        rustls::pki_types::ServerName::try_from(target_host.to_string()).map_err(|e| {
+        rustls::pki_types::ServerName::try_from(sni_host.to_string()).map_err(|e| {
             HbonePoolError::InvalidServerName {
-                host: target_host.to_string(),
+                host: sni_host.to_string(),
                 message: e.to_string(),
             }
         })?;
@@ -1744,6 +1814,54 @@ pub fn target_expected_peer_spiffe(
     }
 }
 
+/// Whether an HBONE target is a CROSS-CLUSTER east-west target (carries the
+/// transport-agnostic [`crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG`] =
+/// boolish-true). Such a target dials the REMOTE east-west gateway
+/// (`mesh.hbone_dial_host` / `mesh.hbone_port`) with the destination workload's
+/// pod addr:app-port as the inner CONNECT `:authority` (= `target.host:port`)
+/// and the destination service FQDN as the outer-TLS SNI override
+/// (`mesh.eastwest_sni`), using TRUST-DOMAIN-ONLY peer verification scoped to the
+/// remote trust domain (`mesh.trust_domain`). The cross-cluster / SNI / trust
+/// domain tags are shared with the Sidecar mesh-mTLS cross-cluster path (one
+/// set of tag constants, defined in `mesh_mtls_pool`); the HBONE path layers the
+/// HBONE transport tags (`mesh.hbone*`) on top.
+pub fn target_hbone_cross_cluster(target: &UpstreamTarget) -> bool {
+    target
+        .tags
+        .get(crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG)
+        .is_some_and(|value| matches_boolish_true(value))
+}
+
+/// The destination-service-FQDN outer-TLS SNI override a CROSS-CLUSTER HBONE
+/// target MUST carry ([`crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG`]).
+/// `None` when absent OR empty so the dispatch path can FAIL CLOSED — a
+/// cross-cluster HBONE dial without a usable SNI must be refused, never fall
+/// back to the gateway address as SNI (which would break the passthrough route).
+pub fn target_hbone_eastwest_sni(target: &UpstreamTarget) -> Option<&str> {
+    target
+        .tags
+        .get(crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG)
+        .map(String::as_str)
+        .filter(|sni| !sni.is_empty())
+}
+
+/// The remote trust domain a CROSS-CLUSTER HBONE target scopes verification to
+/// ([`crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG`]). `None` when absent,
+/// empty, or unparseable so the dispatch path can FAIL CLOSED — a cross-cluster
+/// HBONE dial with no usable trust domain must be refused, never fall back to
+/// any-federated verification (which would let a federated cert from a DIFFERENT
+/// trust domain complete the handshake). Cross-cluster HBONE targets carry NO
+/// `mesh.spiffe_id`, so this remote trust domain is the only identity constraint.
+pub fn target_hbone_cross_cluster_trust_domain(
+    target: &UpstreamTarget,
+) -> Option<crate::identity::spiffe::TrustDomain> {
+    target
+        .tags
+        .get(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| crate::identity::spiffe::TrustDomain::new(value.as_str()).ok())
+}
+
 pub(crate) fn authority_for_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
@@ -1850,6 +1968,8 @@ fn with_hbone_pool_key<R>(
     dns_override: Option<&str>,
     svid_fingerprint: &str,
     expected_peer: Option<&crate::identity::SpiffeId>,
+    sni_override: Option<&str>,
+    expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
     pool_config: &PoolConfig,
     f: impl FnOnce(&str) -> R,
 ) -> R {
@@ -1863,6 +1983,8 @@ fn with_hbone_pool_key<R>(
             dns_override,
             svid_fingerprint,
             expected_peer,
+            sni_override,
+            expected_trust_domain,
             pool_config,
         );
         f(&buf)
@@ -1870,6 +1992,7 @@ fn with_hbone_pool_key<R>(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn pool_key_owned(
     host: &str,
     target_port: u16,
@@ -1877,6 +2000,8 @@ fn pool_key_owned(
     dns_override: Option<&str>,
     svid_fingerprint: &str,
     expected_peer: Option<&crate::identity::SpiffeId>,
+    sni_override: Option<&str>,
+    expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
     pool_config: &PoolConfig,
 ) -> String {
     with_hbone_pool_key(
@@ -1886,6 +2011,8 @@ fn pool_key_owned(
         dns_override,
         svid_fingerprint,
         expected_peer,
+        sni_override,
+        expected_trust_domain,
         pool_config,
         |key| key.to_string(),
     )
@@ -1900,17 +2027,35 @@ fn write_hbone_pool_key(
     dns_override: Option<&str>,
     svid_fingerprint: &str,
     expected_peer: Option<&crate::identity::SpiffeId>,
+    sni_override: Option<&str>,
+    expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
     pool_config: &PoolConfig,
 ) {
     buf.clear();
     // The pinned peer identity is connection identity, not policy: a pooled
     // mTLS connection verified against one expected SVID must never be reused
-    // for a target that pins a different (or no) identity.
+    // for a target that pins a different (or no) identity. The ClientHello SNI
+    // override (the destination FQDN on cross-cluster east-west dials; empty
+    // otherwise) follows the peer field so two cross-cluster targets to the
+    // SAME gateway endpoint for DIFFERENT destination services keep isolated
+    // connections (each needs its own outer-TLS SNI / passthrough route). The
+    // expected trust domain (the remote TD a cross-cluster session was VERIFIED
+    // against; empty otherwise) follows the SNI so a session verified against
+    // remote trust domain B is never reused for C. `sni` and `td` are appended
+    // AFTER `svid_fingerprint` so `hbone_key_svid_fingerprint`'s positional
+    // parse (index 5) is unchanged — mirroring `write_mesh_mtls_pool_key`. With
+    // `sni_override = None` and `expected_trust_domain = None` the two trailing
+    // fields are empty, so the in-cluster HBONE / raw-TCP / UDP / WS keys are
+    // byte-identical to the pre-cross-cluster format (`...|{peer}||`).
     let _ = write!(
         buf,
-        "hbone|{host}|{target_port}|{hbone_port}|{}|{svid_fingerprint}|{}",
+        "hbone|{host}|{target_port}|{hbone_port}|{}|{svid_fingerprint}|{}|{}|{}",
         dns_override.unwrap_or_default(),
-        expected_peer.map(|peer| peer.as_str()).unwrap_or_default()
+        expected_peer.map(|peer| peer.as_str()).unwrap_or_default(),
+        sni_override.unwrap_or_default(),
+        expected_trust_domain
+            .map(crate::identity::spiffe::TrustDomain::as_str)
+            .unwrap_or_default()
     );
     write_pool_config_key(buf, pool_config);
 }
@@ -2210,11 +2355,18 @@ mod tests {
             Some("10.0.0.2"),
             "0123456789abcdef",
             Some(&pinned_peer),
+            None,
+            None,
             &pool_config,
         );
+        // No cross-cluster SNI / trust-domain ⇒ two empty trailing fields after
+        // the peer (byte-identical to the pre-cross-cluster format's tail except
+        // for the two appended `||`).
         assert_eq!(
             key,
-            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|spiffe://cluster.local/ns/default/sa/orders|pool=0,1,22,33,44,65535,131072,0,16384,none"
+            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|spiffe://cluster.local/ns/default/sa/orders||"
+                .to_string()
+                + "|pool=0,1,22,33,44,65535,131072,0,16384,none"
         );
         // An unpinned dial must not share a connection with a pinned one.
         let unpinned_key = pool_key_owned(
@@ -2223,6 +2375,8 @@ mod tests {
             15008,
             Some("10.0.0.2"),
             "0123456789abcdef",
+            None,
+            None,
             None,
             &pool_config,
         );
@@ -2234,6 +2388,8 @@ mod tests {
 
     #[test]
     fn hbone_key_svid_fingerprint_reads_fingerprint_field() {
+        // The fingerprint must stay at positional index 5 even with a
+        // cross-cluster SNI + trust domain appended after it.
         let key = pool_key_owned(
             "orders.default.svc.cluster.local",
             8080,
@@ -2241,6 +2397,8 @@ mod tests {
             Some("10.0.0.2"),
             "0123456789abcdef",
             None,
+            Some("svc-b.default.svc.cluster.local"),
+            Some(&TrustDomain::new("cluster-b.local").unwrap()),
             &PoolConfig::default(),
         );
 
@@ -2265,6 +2423,8 @@ mod tests {
             None,
             "fingerprint",
             None,
+            None,
+            None,
             &base_config,
         );
         let overridden_key = pool_key_owned(
@@ -2273,6 +2433,8 @@ mod tests {
             15008,
             None,
             "fingerprint",
+            None,
+            None,
             None,
             &overridden_config,
         );
@@ -2302,6 +2464,8 @@ mod tests {
             None,
             "fingerprint",
             None,
+            None,
+            None,
             &base_config,
         );
         let policy_only_key = pool_key_owned(
@@ -2310,6 +2474,8 @@ mod tests {
             15008,
             None,
             "fingerprint",
+            None,
+            None,
             None,
             &policy_only_config,
         );
@@ -2405,6 +2571,8 @@ mod tests {
             ISTIO_HBONE_PORT,
             None,
             fingerprint,
+            None,
+            None,
             None,
             &PoolConfig::default(),
         )
@@ -2735,6 +2903,8 @@ mod tests {
             None,
             "fingerprint",
             None,
+            None,
+            None,
             &pool_config,
         );
         let creation_lock = Arc::new(Mutex::new(()));
@@ -2751,6 +2921,8 @@ mod tests {
                 8080,
                 8080,
                 ISTIO_HBONE_PORT,
+                None,
+                None,
                 None,
                 &key,
                 &pool_config,
@@ -2846,12 +3018,142 @@ mod tests {
     #[test]
     fn with_hbone_pool_key_matches_pool_key_owned() {
         let pool_config = PoolConfig::default();
-        let owned = pool_key_owned("host", 8080, 15008, None, "fp", None, &pool_config);
-        let via_callback =
-            with_hbone_pool_key("host", 8080, 15008, None, "fp", None, &pool_config, |key| {
-                key.to_string()
-            });
+        let owned = pool_key_owned(
+            "host",
+            8080,
+            15008,
+            None,
+            "fp",
+            None,
+            None,
+            None,
+            &pool_config,
+        );
+        let via_callback = with_hbone_pool_key(
+            "host",
+            8080,
+            15008,
+            None,
+            "fp",
+            None,
+            None,
+            None,
+            &pool_config,
+            |key| key.to_string(),
+        );
         assert_eq!(owned, via_callback);
+    }
+
+    /// CROSS-CLUSTER pool-key isolation: a `sni_override` and/or an
+    /// `expected_trust_domain` MUST partition the pool — a session verified
+    /// against trust domain B and routed by SNI for service-X is never reused for
+    /// a different SNI / trust domain on the SAME `(host, port)` gateway endpoint.
+    /// `None`/`None` (in-cluster) stays byte-identical to the prior format.
+    #[test]
+    fn cross_cluster_sni_and_trust_domain_partition_the_pool_key() {
+        let pool_config = PoolConfig::default();
+        let td_b = TrustDomain::new("cluster-b.local").unwrap();
+        let td_c = TrustDomain::new("cluster-c.local").unwrap();
+
+        // In-cluster baseline (no SNI / TD override).
+        let in_cluster = pool_key_owned(
+            "10.9.9.9",
+            8080,
+            15443,
+            None,
+            "fp",
+            None,
+            None,
+            None,
+            &pool_config,
+        );
+        // Cross-cluster to service-X in TD-B over the SAME gateway endpoint.
+        let xc_b_svc_x = pool_key_owned(
+            "10.9.9.9",
+            8080,
+            15443,
+            None,
+            "fp",
+            None,
+            Some("svc-x.default.svc.cluster.local"),
+            Some(&td_b),
+            &pool_config,
+        );
+        // Same gateway endpoint + same TD-B but a DIFFERENT destination service
+        // (different SNI) — distinct passthrough route, must not share.
+        let xc_b_svc_y = pool_key_owned(
+            "10.9.9.9",
+            8080,
+            15443,
+            None,
+            "fp",
+            None,
+            Some("svc-y.default.svc.cluster.local"),
+            Some(&td_b),
+            &pool_config,
+        );
+        // Same gateway endpoint + same SNI but a DIFFERENT trust domain — a
+        // session verified against TD-C must never be reused as TD-B.
+        let xc_c_svc_x = pool_key_owned(
+            "10.9.9.9",
+            8080,
+            15443,
+            None,
+            "fp",
+            None,
+            Some("svc-x.default.svc.cluster.local"),
+            Some(&td_c),
+            &pool_config,
+        );
+
+        assert_ne!(
+            in_cluster, xc_b_svc_x,
+            "a cross-cluster SNI/TD session must not share with an in-cluster one"
+        );
+        assert_ne!(
+            xc_b_svc_x, xc_b_svc_y,
+            "different destination SNIs on the same gateway endpoint must partition the pool"
+        );
+        assert_ne!(
+            xc_b_svc_x, xc_c_svc_x,
+            "different trust domains on the same gateway endpoint must partition the pool"
+        );
+    }
+
+    /// The outer-TLS SNI resolution `dial_h2_connect_sender` applies: `None`
+    /// keeps the dial host (byte-identical to the prior hardcoded
+    /// `ServerName::try_from(target_host)`); `Some(x)` overrides to `x` (the
+    /// cross-cluster destination FQDN). Pins the exact expression so the
+    /// in-cluster callers can never silently change SNI.
+    #[test]
+    fn sni_override_resolves_to_dial_host_when_none_else_the_override() {
+        // Mirrors the resolution inside `dial_h2_connect_sender`:
+        //   let sni_host = sni_override.unwrap_or(target_host);
+        let resolve = |target_host: &str, sni_override: Option<&str>| -> String {
+            let sni_host = sni_override.unwrap_or(target_host);
+            let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
+                .expect("valid server name");
+            match server_name {
+                rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_string(),
+                rustls::pki_types::ServerName::IpAddress(ip) => {
+                    let ip: std::net::IpAddr = ip.into();
+                    ip.to_string()
+                }
+                _ => unreachable!("unexpected server name variant"),
+            }
+        };
+
+        // None ⇒ SNI = the dial host (unchanged in-cluster behavior).
+        assert_eq!(resolve("10.9.9.9", None), "10.9.9.9");
+        assert_eq!(
+            resolve("svc-b.default.svc.cluster.local", None),
+            "svc-b.default.svc.cluster.local"
+        );
+        // Some(x) ⇒ SNI = x even though the dial host is the gateway IP.
+        assert_eq!(
+            resolve("10.9.9.9", Some("svc-b.default.svc.cluster.local")),
+            "svc-b.default.svc.cluster.local"
+        );
     }
 
     #[test]

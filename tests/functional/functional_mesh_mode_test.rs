@@ -3728,6 +3728,567 @@ async fn functional_mesh_sidecar_cross_cluster_egress_rejects_untrusted_client()
     );
 }
 
+// ── Ambient (HBONE) cross-cluster east-west e2e ──────────────────────────────
+//
+// The HBONE counterpart of the Sidecar cross-cluster keystone above. Client A
+// (Ambient) reaches the echo backend behind dest C (Ambient) THROUGH east-west
+// gateway B. A's captured request materializes a PER-POD cross-cluster HBONE
+// target (dial the remote east-west gateway over SVID-mTLS with the destination
+// service FQDN as the outer-TLS SNI, the inner HBONE CONNECT `:authority` = the
+// destination pod addr:app-port, TRUST-DOMAIN-ONLY peer verification). B's SNI
+// passthrough delivers the outer TLS to C's HBONE :15008 listener; C's
+// transparent HBONE relay (open-relay guard) dials the CONNECT authority → C's
+// backend.
+
+/// Destination (gateway C) slice for the Ambient cross-cluster path: Ambient
+/// topology, trust domain B. Its workload addr:port (`127.0.0.1:backend_port`)
+/// is the inner HBONE CONNECT `:authority` C's transparent relay dials under the
+/// open-relay guard (loopback + a slice-declared workload port — so the
+/// authority is admitted and reaches the echo backend). `trust_bundles` federate
+/// cluster-A's CA so C's HBONE inbound peer-verifier accepts client A's SVID
+/// (trust domain A). No materialized inbound routes (Ambient) — the relay handles
+/// the CONNECT.
+fn cross_cluster_ambient_dest_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    backend_port: u16,
+    b_local_ca_pem: &str,
+    a_ca_pem: &str,
+) -> MeshSlice {
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: c_id.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "svc-c".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "svc-c".to_string(),
+            // Loopback + the backend port — the inner CONNECT authority the relay
+            // dials. Loopback passes the open-relay guard as long as a workload
+            // declares the port; dialing it reaches the echo backend.
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster-b.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-c".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-c".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: c_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        // STRICT inbound: the HBONE listener requires + verifies the peer SVID.
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        trust_bundles: Some(federated_trust_bundle_set(
+            "cluster-b.local",
+            b_local_ca_pem,
+            "cluster.local",
+            a_ca_pem,
+        )),
+        ..MeshSlice::default()
+    }
+}
+
+/// East-west gateway (B) slice for the Ambient cross-cluster path: topology
+/// EastWestGateway, trust domain B. SNI passthrough → C's HBONE :15008 listener
+/// (`c_hbone_port`). The east-west "workload" addr:port models that listener.
+///
+/// TEST-REALISM MODELING (same as the Sidecar east-west slice — NOT a datapath
+/// bug): a real cross-cluster Ambient client dials the east-west gateway with the
+/// destination service FQDN as the outer-TLS SNI; the gateway forwards the opaque
+/// TLS to the destination workload's HBONE listener. The functional test cannot
+/// run a flat dest network / iptables, so it models the east-west "workload" as
+/// C's HBONE listener directly (`c_hbone_port`) and (in the client slice) the
+/// remote pod address as loopback, so the passthrough lands on C's HBONE
+/// terminator and the inner CONNECT authority is a loopback port C can dial. The
+/// live two-cluster fixture exercises the realistic pod-IP path.
+fn cross_cluster_ambient_east_west_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    c_hbone_port: u16,
+) -> MeshSlice {
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: c_id.clone(),
+            selector: WorkloadSelector::default(),
+            service_name: "svc-c".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: c_hbone_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster-b.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-c".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-c".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: c_hbone_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: c_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Client (gateway A) slice for the Ambient cross-cluster path: Ambient topology,
+/// trust domain A. Declares `svc-c` with a REMOTE workload (network net-b, trust
+/// domain B) whose address is LOOPBACK + the backend port (so the materialized
+/// per-pod cross-cluster HBONE target's identity = the inner CONNECT authority
+/// `127.0.0.1:backend_port`, which C's relay can dial under the open-relay
+/// guard), and a `MultiClusterConfig` whose `EastWestGateway{network:net-b,
+/// host:127.0.0.1, port:b_east_west_port}` fronts net-b. `trust_bundles` federate
+/// cluster-B's CA so A's outbound (trust-domain-only) verification accepts C's
+/// server SVID (trust domain B).
+fn cross_cluster_ambient_client_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    backend_port: u16,
+    b_east_west_port: u16,
+    a_local_ca_pem: &str,
+    b_ca_pem: &str,
+) -> MeshSlice {
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: c_id.clone(),
+            selector: WorkloadSelector::default(),
+            service_name: "svc-c".to_string(),
+            // The remote pod address. In production this is a real remote pod IP
+            // (slice-declared on both sides); the test collapses it to loopback +
+            // the backend port so the inner CONNECT authority is a loopback port
+            // C can dial (the in-cluster Ambient e2e collapses the same way).
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster-b.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            network: Some("net-b".to_string()),
+            cluster: Some("cluster-b".to_string()),
+            weight: None,
+            locality: Some("remote-cluster-b/net-b".to_string()),
+            service_account: Some("svc-c".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            // Authoritative remote marker (set by remote-poll ingestion in
+            // production; set directly so `workload_is_remote` classifies it
+            // remote without a live discovery poll).
+            remote_provenance: true,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-c".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: c_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            federation_endpoint: None,
+            remote_clusters: Vec::new(),
+            east_west_gateways: vec![EastWestGateway {
+                name: "ew-net-b".to_string(),
+                namespace: "ferrum".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: b_east_west_port,
+                sni_hosts: vec!["svc-c.ferrum.svc.cluster.local".to_string()],
+                trust_domain: Some(TrustDomain::new("cluster-b.local").expect("trust domain")),
+                network: Some("net-b".to_string()),
+            }],
+        }),
+        trust_bundles: Some(federated_trust_bundle_set(
+            "cluster.local",
+            a_local_ca_pem,
+            "cluster-b.local",
+            b_ca_pem,
+        )),
+        ..MeshSlice::default()
+    }
+}
+
+/// Drive one captured app request from Ambient client gateway A across east-west
+/// gateway B to the echo backend behind Ambient dest gateway C, over two trust
+/// domains with a federated bundle, over HBONE. `client_trusted` selects whether
+/// A's SVID chains to a CA in C's federated trust set (the negative: an untrusted
+/// A must NOT reach C's backend). Returns `(status, body, combined_logs)`.
+async fn drive_ambient_cross_cluster_egress(
+    client_trusted: bool,
+) -> Result<(u16, String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let c_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/svc-c";
+    let b_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/ew-gateway";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_a = format!("functional-mesh-amb-xc-{trust_label}-a-{attempt}");
+        let node_b = format!("functional-mesh-amb-xc-{trust_label}-b-{attempt}");
+        let node_c = format!("functional-mesh-amb-xc-{trust_label}-c-{attempt}");
+        let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let temp_c = TempDir::new().map_err(|e| format!("temp dir c: {e}"))?;
+
+        // Cluster-B CA backs both the east-west gateway B and the dest C.
+        let (c_svid, b_ca) = mint_cross_cluster_svid(temp_c.path(), "gateway-c", c_spiffe);
+        let b_ca_pem = b_ca.0.clone();
+        let b_svid =
+            mint_cross_cluster_svid_under(temp_b.path(), "gateway-b", b_spiffe, &b_ca_pem, &b_ca.1);
+
+        let (a_svid, a_ca_pem) = {
+            let (svid, ca) = mint_cross_cluster_svid(temp_a.path(), "gateway-a", a_spiffe);
+            (svid, ca.0)
+        };
+        // The CA A actually chains to, for C's federated set: trusted federates
+        // A's real CA; untrusted federates a DIFFERENT throwaway CA so C never
+        // trusts the real A (both directions fail closed).
+        let a_ca_for_c_federation = if client_trusted {
+            a_ca_pem.clone()
+        } else {
+            let (_throwaway, throwaway_ca) = mint_cross_cluster_svid(
+                temp_c.path(),
+                "throwaway-a",
+                "spiffe://cluster.local/ns/ferrum/sa/nobody",
+            );
+            throwaway_ca.0
+        };
+        let b_ca_for_a_federation = if client_trusted {
+            b_ca_pem.clone()
+        } else {
+            let (_throwaway, throwaway_ca) = mint_cross_cluster_svid(
+                temp_a.path(),
+                "throwaway-b",
+                "spiffe://cluster-b.local/ns/ferrum/sa/nobody",
+            );
+            throwaway_ca.0
+        };
+
+        let backend_port = start_echo_backend().await;
+        let ports_a = reserve_mesh_ports().await;
+        let ports_b = reserve_mesh_ports().await;
+        let ports_c = reserve_mesh_ports().await;
+        let a_outbound_port = ports_a.outbound;
+        let b_east_west_port = ports_b.east_west;
+        let c_hbone_port = ports_c.hbone;
+
+        let cp_c = start_static_mesh_cp(cross_cluster_ambient_dest_slice(
+            &node_c,
+            c_spiffe,
+            backend_port,
+            &b_ca_pem,
+            &a_ca_for_c_federation,
+        ))
+        .await;
+        let cp_b = start_static_mesh_cp(cross_cluster_ambient_east_west_slice(
+            &node_b,
+            c_spiffe,
+            c_hbone_port,
+        ))
+        .await;
+        let cp_a = start_static_mesh_cp(cross_cluster_ambient_client_slice(
+            &node_a,
+            c_spiffe,
+            backend_port,
+            b_east_west_port,
+            &a_ca_pem,
+            &b_ca_for_a_federation,
+        ))
+        .await;
+
+        // Gateway C (dest, Ambient): HBONE relay → echo backend.
+        let mut child_c = spawn_mesh_gateway(
+            &temp_c,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_c.addr,
+                ports: ports_c,
+                node_id: &node_c,
+                config_protocol: "native",
+                topology: "ambient",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", c_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", c_svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", c_svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        temp_c
+                            .path()
+                            .join("gateway-c-bundle.pem")
+                            .to_str()
+                            .expect("bundle path utf8")
+                            .to_string(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(c_hbone_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway C HBONE listener never bound\n{}",
+                captured_output(&temp_c)
+            );
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Gateway B (east-west): SNI passthrough → C's HBONE listener.
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology: "east_west_gateway",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", b_svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", b_svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        temp_b
+                            .path()
+                            .join("gateway-b-bundle.pem")
+                            .to_str()
+                            .expect("bundle path utf8")
+                            .to_string(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway B east-west listener never bound\n{}",
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Gateway A (client, Ambient): outbound capture → cross-cluster HBONE
+        // egress route. Warmup is OFF: the cross-cluster HBONE path BYPASSES the
+        // capability registry (it dials the gateway :15443, not a probeable
+        // :15008 workload), so no probe is needed — and a probe to the east-west
+        // gateway would not classify it.
+        let mut child_a = spawn_mesh_gateway(
+            &temp_a,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_a.addr,
+                ports: ports_a,
+                node_id: &node_a,
+                config_protocol: "native",
+                topology: "ambient",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        temp_a
+                            .path()
+                            .join("gateway-a-bundle.pem")
+                            .to_str()
+                            .expect("bundle path utf8")
+                            .to_string(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                captured_output(&temp_a)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Drive the captured app request for svc-c. The positive path retries
+        // until 200; the negative asserts the FINAL state (never converges to 200).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<(u16, String), String> = loop {
+            let attempt =
+                match plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+                    .await
+                {
+                    Ok((status, body)) => {
+                        if status == 200 && body.contains("backend-ok") {
+                            break Ok((status, body));
+                        }
+                        Ok((status, body))
+                    }
+                    Err(e) => Err(format!("ambient cross-cluster egress GET failed: {e}")),
+                };
+            if Instant::now() >= deadline {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let output_a = captured_output(&temp_a);
+        let output_b = captured_output(&temp_b);
+        let output_c = captured_output(&temp_c);
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+
+        let logs = format!(
+            "--- gateway A (client) ---\n{output_a}\n--- gateway B (east-west) ---\n{output_b}\n\
+             --- gateway C (dest) ---\n{output_c}"
+        );
+        return match last {
+            Ok((status, body)) => Ok((status, body, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "ambient cross-cluster gateways never bound their listeners after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster keystone (Ambient HBONE): a captured plaintext request at
+/// Ambient client gateway A (trust domain A) reaches the echo backend behind
+/// Ambient dest gateway C (trust domain B) THROUGH east-west gateway B —
+/// outbound capture → materialized PER-POD CROSS-CLUSTER HBONE target (dial the
+/// remote east-west gateway over SVID-mTLS with the destination service FQDN as
+/// the outer-TLS SNI, the inner HBONE CONNECT `:authority` = the destination pod
+/// addr:app-port, TRUST-DOMAIN-ONLY peer verification) → B's SNI passthrough →
+/// C's HBONE :15008 listener (verifies A's client SVID via the FEDERATED bundle)
+/// → C's transparent relay (open-relay guard) → C's backend → response back to A.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_cross_cluster_egress_routes_a_to_c_over_east_west() {
+    let (status, body, logs) = drive_ambient_cross_cluster_egress(true)
+        .await
+        .expect("ambient cross-cluster egress drive");
+    assert_eq!(
+        status, 200,
+        "the captured request must traverse A's cross-cluster HBONE egress through the east-west \
+         gateway to C's backend; body: {body:?}\n{logs}"
+    );
+    assert!(
+        body.contains("backend-ok"),
+        "the response must carry the destination backend body: {body:?}\n{logs}"
+    );
+}
+
+/// Cross-cluster negative (Ambient HBONE): a client gateway A whose SVID is NOT
+/// in the destination's federated trust set must not reach C. C's HBONE inbound
+/// rejects A's client cert (untrusted CA) and A rejects C's server SVID
+/// (untrusted CA) — both fail the request closed, proving the cross-cluster HBONE
+/// transport really verifies SVIDs against the federated bundle (trust-domain
+/// membership, not blind tunneling) and never falls back to plaintext.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_cross_cluster_egress_rejects_untrusted_client() {
+    let (status, body, logs) = drive_ambient_cross_cluster_egress(false)
+        .await
+        .expect("untrusted ambient cross-cluster egress drive");
+    assert_ne!(
+        status, 200,
+        "an untrusted client gateway's cross-cluster HBONE request must fail closed, not reach \
+         the destination backend\n{logs}"
+    );
+    assert!(
+        !body.contains("backend-ok"),
+        "no destination backend body may leak through an unverified cross-cluster HBONE \
+         session: {body:?}\n{logs}"
+    );
+}
+
 // ── Localized file config source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) ────────
 
 /// JSON mesh document equivalent of `inbound_authz_slice`: the same routing +

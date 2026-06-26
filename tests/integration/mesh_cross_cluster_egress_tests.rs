@@ -1280,3 +1280,572 @@ fn same_trust_domain_networks_sharing_one_gateway_endpoint_collapse_to_one() {
     assert_eq!(cross[0].host, SHARED_HOST);
     assert_eq!(cross[0].port, GATEWAY_PORT);
 }
+
+// ── Ambient (HBONE) cross-cluster materialization ───────────────────────────
+//
+// The HBONE counterpart of the Sidecar cases above. The SHAPE differs: Ambient
+// cross-cluster targets are PER-REMOTE-POD (`host:port` = pod addr:app-port =
+// the inner HBONE CONNECT `:authority`) with the east-west gateway carried as a
+// DIAL OVERRIDE (`mesh.hbone_dial_host` / `mesh.hbone_port`), and the
+// destination service FQDN as the outer-TLS SNI override (`mesh.eastwest_sni`).
+// Verification is trust-domain-only (NO `mesh.spiffe_id`).
+
+use ferrum_edge::proxy::hbone_pool::{HBONE_DIAL_HOST_TAG, HBONE_PORT_TAG, HBONE_TARGET_TAG};
+
+fn ambient_client_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
+    let mut runtime = default_mesh_runtime();
+    runtime.topology = MeshTopology::Ambient;
+    runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+    runtime
+}
+
+/// Ambient: a remote workload on a network with a matching gateway materializes
+/// ONE per-pod HBONE cross-cluster target whose IDENTITY is the remote pod
+/// addr:app-port (NOT the gateway), with the gateway carried as a dial override.
+#[test]
+fn ambient_cross_cluster_per_pod_hbone_target_has_correct_tags() {
+    let runtime = ambient_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote = remote_workload(Some(REMOTE_NETWORK)); // pod IP 10.244.5.5
+    let service = svc_b_service(&local, &remote);
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(
+        cross.len(),
+        1,
+        "exactly one per-pod cross-cluster HBONE target expected, got {cross:#?}"
+    );
+    let xc = cross[0];
+
+    // IDENTITY = the remote POD addr:app-port (the inner CONNECT authority), NOT
+    // the gateway.
+    assert_eq!(
+        xc.host, "10.244.5.5",
+        "the Ambient cross-cluster target identity is the remote pod IP (the CONNECT authority)"
+    );
+    assert_eq!(xc.port, 8080, "the target port is the resolved app port");
+
+    // Ambient HBONE transport tag (NOT mesh.mtls).
+    assert_eq!(
+        xc.tags.get(HBONE_TARGET_TAG).map(String::as_str),
+        Some("true"),
+        "cross-cluster Ambient target carries the mesh.hbone transport tag"
+    );
+    assert!(
+        !xc.tags.contains_key("mesh.mtls"),
+        "Ambient cross-cluster target must NOT carry the Sidecar mesh.mtls tag"
+    );
+
+    // Dial override = the gateway (host:port), DISTINCT from the target identity.
+    assert_eq!(
+        xc.tags.get(HBONE_DIAL_HOST_TAG).map(String::as_str),
+        Some(GATEWAY_HOST),
+        "mesh.hbone_dial_host must be the east-west gateway host (≠ the pod IP)"
+    );
+    assert_eq!(
+        xc.tags.get(HBONE_PORT_TAG).map(String::as_str),
+        Some(GATEWAY_PORT.to_string().as_str()),
+        "mesh.hbone_port must be the east-west gateway port"
+    );
+
+    // Outer-TLS SNI override = the destination service FQDN.
+    assert_eq!(
+        xc.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
+        Some(SVC_B_FQDN),
+        "mesh.eastwest_sni must be the destination service FQDN"
+    );
+
+    // Cross-cluster + remote markers; trust domain = remote (B); NO pinned id.
+    assert_eq!(
+        xc.tags.get(MESH_CROSS_CLUSTER_TAG).map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        xc.tags.get("mesh.remote").map(String::as_str),
+        Some("true"),
+        "cross-cluster target must carry the reserved mesh.remote=true provenance marker"
+    );
+    assert_eq!(
+        xc.tags.get("mesh.trust_domain").map(String::as_str),
+        Some(REMOTE_TRUST_DOMAIN),
+        "mesh.trust_domain must be the remote (B) trust domain"
+    );
+    assert!(
+        !xc.tags.contains_key("mesh.spiffe_id"),
+        "Ambient cross-cluster target must NOT carry a pinned mesh.spiffe_id (trust-domain-only)"
+    );
+
+    // DR policy stays keyed by the declared SERVICE port.
+    assert_eq!(xc.service_port_policy_key, Some(8080));
+
+    // The local workload still materializes a (first-tier) pinned mesh.hbone
+    // target dialing the local pod directly — local-first failover preserved.
+    let local_targets: Vec<_> = upstreams
+        .get(SVC_B_OUTBOUND_UPSTREAM_ID)
+        .expect("first-port upstream must materialize")
+        .iter()
+        .filter(|t| {
+            t.tags.get(HBONE_TARGET_TAG).map(String::as_str) == Some("true")
+                && !t.tags.contains_key(MESH_CROSS_CLUSTER_TAG)
+        })
+        .collect();
+    assert_eq!(
+        local_targets.len(),
+        1,
+        "the local workload must still materialize one pinned mesh.hbone target"
+    );
+    assert_eq!(local_targets[0].host, "10.0.0.1");
+    assert!(
+        local_targets[0].tags.contains_key("mesh.spiffe_id"),
+        "the local Ambient target stays PINNED (carries mesh.spiffe_id)"
+    );
+    // The local target dials the pod directly: no dial-host override, no SNI.
+    assert!(
+        !local_targets[0].tags.contains_key(HBONE_DIAL_HOST_TAG),
+        "the local Ambient target has no dial-host override (dials the pod directly)"
+    );
+    assert!(!local_targets[0].tags.contains_key(MESH_EASTWEST_SNI_TAG));
+}
+
+/// Ambient: TWO remote pods on the same network behind one gateway yield TWO
+/// per-pod targets (distinct pod-IP identities) — NO same-endpoint collapse
+/// (each pod is a distinct pinned CONNECT authority, unlike the Sidecar
+/// per-gateway shape).
+#[test]
+fn ambient_cross_cluster_two_pods_same_gateway_yield_two_per_pod_targets() {
+    let runtime = ambient_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Two remote pods sharing one service-account SPIFFE id, same network/TD,
+    // DIFFERENT pod IPs (merge keeps both Workloads, one merged ref).
+    let remote_a = remote_workload(Some(REMOTE_NETWORK)); // 10.244.5.5
+    let mut remote_b = remote_workload(Some(REMOTE_NETWORK));
+    remote_b.addresses = vec!["10.244.5.6".to_string()];
+    assert_eq!(
+        remote_a.spiffe_id, remote_b.spiffe_id,
+        "test premise: the two pods share one SPIFFE id"
+    );
+    let service = svc_b_service(&local, &remote_a);
+
+    let mut mesh = mesh_config_with(vec![local, remote_a, remote_b], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    let mut hosts: Vec<&str> = cross.iter().map(|t| t.host.as_str()).collect();
+    hosts.sort();
+    assert_eq!(
+        hosts,
+        vec!["10.244.5.5", "10.244.5.6"],
+        "two remote pods behind one gateway must each yield a per-pod cross-cluster target \
+         (no same-endpoint collapse), got: {cross:#?}"
+    );
+    // Both dial the SAME gateway (dial override), with the SAME SNI.
+    for t in &cross {
+        assert_eq!(
+            t.tags.get(HBONE_DIAL_HOST_TAG).map(String::as_str),
+            Some(GATEWAY_HOST)
+        );
+        assert_eq!(
+            t.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
+            Some(SVC_B_FQDN)
+        );
+    }
+}
+
+/// Ambient: an UNREACHABLE remote workload (no addresses) yields no
+/// cross-cluster target; the local target is unaffected.
+#[test]
+fn ambient_cross_cluster_skips_unreachable_remote_workload() {
+    let runtime = ambient_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.addresses = Vec::new(); // no pod IP → unreachable
+    let service = svc_b_service(&local, &remote);
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "an unreachable remote workload (no pod IP) must yield NO cross-cluster HBONE target"
+    );
+}
+
+/// Ambient: a DECLARED named `targetPort` that does NOT resolve on the remote
+/// workload yields no cross-cluster target (fail closed; mirrors the
+/// reachability filter and `build_east_west_service_targets`'s skip).
+#[test]
+fn ambient_cross_cluster_skips_unresolvable_named_target_port() {
+    let runtime = ambient_client_runtime();
+
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = vec![WorkloadPort {
+        port: 8080,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    }];
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    // The workload exposes only a port NAMED differently than the targetPort.
+    remote.ports = vec![WorkloadPort {
+        port: 8080,
+        protocol: AppProtocol::Http,
+        name: Some("not-the-name".to_string()),
+    }];
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            // Named targetPort that the remote workload does NOT expose by name.
+            target_port: Some(ferrum_edge::modes::mesh::config::ServiceTargetPort::Name(
+                "web".to_string(),
+            )),
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "an unresolvable named targetPort must yield NO Ambient cross-cluster target (fail closed)"
+    );
+}
+
+/// Ambient: only the FIRST declared service port gets cross-cluster targets
+/// (single-port-per-SNI east-west model).
+#[test]
+fn ambient_cross_cluster_only_for_first_service_port() {
+    let runtime = ambient_client_runtime();
+
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = vec![
+        WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        },
+        WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+        },
+    ];
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.ports = local.ports.clone();
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![
+            ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            },
+            ServicePort {
+                port: 9090,
+                protocol: AppProtocol::Http,
+                name: Some("http-alt".to_string()),
+                target_port: None,
+            },
+        ],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let first_cross = upstreams
+        .get("__mesh-out-upstream-default-svc-b-8080")
+        .expect("first-port upstream")
+        .iter()
+        .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+        .count();
+    assert_eq!(
+        first_cross, 1,
+        "first port yields one per-pod cross-cluster target"
+    );
+    let second_cross = upstreams
+        .get("__mesh-out-upstream-default-svc-b-9090")
+        .expect("second-port upstream")
+        .iter()
+        .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+        .count();
+    assert_eq!(
+        second_cross, 0,
+        "a non-first service port yields no cross-cluster target"
+    );
+}
+
+/// Ambient: FAIL CLOSED when two trust domains' pods resolve to the SAME gateway
+/// DIAL ENDPOINT (a TD-less wildcard gateway fronting pods that span two trust
+/// domains) — the SNI-passthrough gateway terminates one outer-TLS identity, so
+/// a shared endpoint cannot pin a trust domain. EVERY pod target on that
+/// ambiguous endpoint is dropped.
+#[test]
+fn ambient_cross_cluster_fails_closed_on_cross_td_shared_dial_endpoint() {
+    let runtime = ambient_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Two remote pods on the SAME network, DIFFERENT trust domains.
+    let remote_td_b = remote_workload(Some(REMOTE_NETWORK)); // TD cluster-b.local
+    let mut remote_td_c = remote_workload(Some(REMOTE_NETWORK));
+    remote_td_c.spiffe_id = spiffe("spiffe://cluster-c.local/ns/default/sa/svc-b");
+    remote_td_c.trust_domain = td("cluster-c.local");
+    remote_td_c.cluster = Some("cluster-c".to_string());
+    remote_td_c.addresses = vec!["10.244.6.6".to_string()];
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_td_b.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_td_c.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(
+        vec![local, remote_td_b, remote_td_c],
+        vec![service],
+        Vec::new(),
+    );
+    // ONE trust-domain-less gateway for net-b — a candidate for BOTH trust
+    // domains, so both pods' targets resolve to this one DIAL ENDPOINT.
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![EastWestGateway {
+            name: "ew-net-b-wildcard-td".to_string(),
+            namespace: "default".to_string(),
+            host: GATEWAY_HOST.to_string(),
+            port: GATEWAY_PORT,
+            sni_hosts: vec![SVC_B_FQDN.to_string()],
+            trust_domain: None,
+            network: Some(REMOTE_NETWORK.to_string()),
+        }],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "two trust domains resolving to one shared gateway DIAL ENDPOINT must yield NO Ambient \
+         cross-cluster target (fail closed)"
+    );
+}
+
+/// Ambient: two DISTINCT-TD pods fronted by DISTINCT gateway endpoints (one per
+/// TD, distinct host:port) are NOT ambiguous → both per-pod targets are emitted.
+#[test]
+fn ambient_cross_cluster_distinct_td_distinct_endpoints_both_emitted() {
+    let runtime = ambient_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote_td_b = remote_workload(Some("net-b")); // TD cluster-b.local
+    let mut remote_td_c = remote_workload(Some("net-c"));
+    remote_td_c.spiffe_id = spiffe("spiffe://cluster-c.local/ns/default/sa/svc-b");
+    remote_td_c.trust_domain = td("cluster-c.local");
+    remote_td_c.cluster = Some("cluster-c".to_string());
+    remote_td_c.addresses = vec!["10.244.6.6".to_string()];
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_td_b.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_td_c.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    const GW_B_HOST: &str = "10.9.9.11";
+    const GW_C_HOST: &str = "10.9.9.12";
+    let mut mesh = mesh_config_with(
+        vec![local, remote_td_b, remote_td_c],
+        vec![service],
+        Vec::new(),
+    );
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            EastWestGateway {
+                name: "ew-net-b".to_string(),
+                namespace: "default".to_string(),
+                host: GW_B_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-b".to_string()),
+            },
+            EastWestGateway {
+                name: "ew-net-c".to_string(),
+                namespace: "default".to_string(),
+                host: GW_C_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td("cluster-c.local")),
+                network: Some("net-c".to_string()),
+            },
+        ],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(
+        cross.len(),
+        2,
+        "two distinct-TD pods behind distinct gateway endpoints must both emit a per-pod target, \
+         got: {cross:#?}"
+    );
+    // Each pod identity is its own pod IP; the dial override + trust domain pair
+    // up correctly per TD.
+    let mut by_host: std::collections::HashMap<&str, (&str, &str)> =
+        std::collections::HashMap::new();
+    for t in &cross {
+        by_host.insert(
+            t.host.as_str(),
+            (
+                t.tags
+                    .get(HBONE_DIAL_HOST_TAG)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                t.tags
+                    .get("mesh.trust_domain")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            ),
+        );
+    }
+    assert_eq!(
+        by_host.get("10.244.5.5"),
+        Some(&(GW_B_HOST, REMOTE_TRUST_DOMAIN))
+    );
+    assert_eq!(
+        by_host.get("10.244.6.6"),
+        Some(&(GW_C_HOST, "cluster-c.local"))
+    );
+}
+
+/// Ambient: a TCP (stream-family) service port must yield NO cross-cluster
+/// target (HTTP-family only — the L4 tunnel can't carry the SNI-passthrough
+/// semantics), proving the HTTP-family gate on the Ambient branch too.
+#[test]
+fn ambient_no_cross_cluster_target_for_tcp_service_port() {
+    let runtime = ambient_client_runtime();
+
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = vec![WorkloadPort {
+        port: 7070,
+        protocol: AppProtocol::Tcp,
+        name: Some("tcp".to_string()),
+    }];
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.ports = vec![WorkloadPort {
+        port: 7070,
+        protocol: AppProtocol::Tcp,
+        name: Some("tcp".to_string()),
+    }];
+
+    let service = MeshService {
+        cluster_ips: vec!["10.96.0.50".to_string()],
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 7070,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross_anywhere = upstreams
+        .values()
+        .flatten()
+        .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+        .count();
+    assert_eq!(
+        cross_anywhere, 0,
+        "an Ambient TCP-only service must yield NO cross-cluster target (HTTP-family only)"
+    );
+}

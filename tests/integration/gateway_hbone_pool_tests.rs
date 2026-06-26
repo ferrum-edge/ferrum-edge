@@ -362,6 +362,9 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_asserted_source_baggag
             8080,
             server_addr.port(),
             None,
+            // In-cluster: no cross-cluster trust-domain scope / SNI override.
+            None,
+            None,
             Some(&workload_id),
         ),
     )
@@ -445,6 +448,9 @@ async fn hbone_fast_path_hit_refreshes_recency_and_keeps_busy_connection_alive()
                 8080,
                 8080,
                 server_port,
+                None,
+                // In-cluster: no cross-cluster trust-domain scope / SNI override.
+                None,
                 None,
                 None,
             ),

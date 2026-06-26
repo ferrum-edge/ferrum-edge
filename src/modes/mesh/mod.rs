@@ -4695,33 +4695,59 @@ fn build_outbound_mesh_targets(
         }
     }
 
-    // CROSS-CLUSTER east-west targets (SIDECAR mesh-mTLS only for now; Ambient
-    // HBONE is a fast-follow). For a service with REMOTE workloads, emit ONE
-    // target per remote NETWORK whose east-west gateway is known, addressed at
-    // the REMOTE gateway (the single ingress for that network — the gateway does
-    // per-workload LB, so we do NOT emit one target per remote pod and we do NOT
-    // dial unreachable remote pod IPs). The dial uses trust-domain-only peer
-    // verification + a destination-FQDN SNI override (see the `mesh.cross_cluster`
-    // / `mesh.eastwest_sni` tags). Local targets above stay first-tier; these
-    // remote-tier targets only receive traffic once locals are exhausted.
+    // CROSS-CLUSTER east-west targets. For a service with REMOTE workloads,
+    // materialize targets that route to the destination cluster via its REMOTE
+    // east-west gateway (SNI passthrough), using trust-domain-only peer
+    // verification (the gateway LB-picks the destination, so no pod pinning) +
+    // the destination-FQDN SNI override (`mesh.eastwest_sni`). Local targets
+    // above stay first-tier; these remote-tier targets only receive traffic once
+    // locals are exhausted (`mesh.remote=true`).
+    //
+    // The SHAPE differs per transport (the inner protocol does):
+    // - SIDECAR mesh-mTLS: the dest sidecar routes the inner mesh-mTLS-HTTP
+    //   request by its `Host:<service-fqdn>` to loopback, so ONE target per
+    //   `(network, trust_domain)` group at the GATEWAY endpoint suffices
+    //   (`append_cross_cluster_mesh_targets`).
+    // - AMBIENT HBONE: the inner is an HBONE CONNECT whose `:authority` the dest
+    //   relay dials under the OPEN-RELAY GUARD (loopback or a slice-declared
+    //   workload addr+port — a service FQDN is REJECTED), so targets are
+    //   PER-REMOTE-POD (`host:port` = pod addr:app-port = the CONNECT authority)
+    //   with the east-west gateway carried as a DIAL OVERRIDE
+    //   (`mesh.hbone_dial_host` / `mesh.hbone_port`)
+    //   (`append_cross_cluster_ambient_hbone_targets`).
     //
     // HTTP-FAMILY ONLY: `build_outbound_mesh_targets` is shared by the HTTP,
     // raw-TCP, and UDP materializers. The cross-cluster east-west dial is an
     // HTTP/2-over-mTLS path (the gateway's SNI passthrough routes the HTTP
     // request); the L4 (raw-TCP / UDP) tunnel paths don't understand the
-    // cross-cluster / SNI-override semantics and would fail closed on the removed
-    // pin, so the append runs only for HTTP-family ports. Reuses the shared
-    // `is_http_family_mesh_protocol` classifier (do not invent a new one).
-    if transport == MeshEgressTransport::SidecarMtls && is_http_family_mesh_protocol(protocol) {
-        append_cross_cluster_mesh_targets(
-            &mut targets,
-            runtime,
-            service,
-            service_port,
-            protocol,
-            workloads,
-            multi_cluster,
-        );
+    // cross-cluster / SNI-override semantics, so the append runs only for
+    // HTTP-family ports. Reuses the shared `is_http_family_mesh_protocol`
+    // classifier (do not invent a new one).
+    if is_http_family_mesh_protocol(protocol) {
+        match transport {
+            MeshEgressTransport::SidecarMtls => append_cross_cluster_mesh_targets(
+                &mut targets,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                workloads,
+                multi_cluster,
+            ),
+            MeshEgressTransport::Hbone => append_cross_cluster_ambient_hbone_targets(
+                &mut targets,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                workloads,
+                multi_cluster,
+            ),
+            // NodeWaypoint captured-Service egress is dispatched per the selected
+            // workload's NodeWaypoint metadata, not an east-west gateway; no
+            // cross-cluster target.
+            MeshEgressTransport::NodeWaypointCapturedService => {}
+        }
     }
 
     targets
@@ -5016,6 +5042,274 @@ fn append_cross_cluster_mesh_targets(
         if emitted_endpoints.insert(endpoint) {
             targets.push(target);
         }
+    }
+}
+
+/// Append AMBIENT (HBONE) cross-cluster east-west targets for `service` on
+/// `service_port` — the HBONE counterpart of
+/// [`append_cross_cluster_mesh_targets`] (which does the Sidecar mesh-mTLS
+/// shape). The two differ in SHAPE because the inner protocol does (see the
+/// `build_outbound_mesh_targets` call site):
+///
+/// - Sidecar: inner = mesh-mTLS-HTTP, the dest sidecar routes by `Host` →
+///   loopback, so ONE target per `(network, trust_domain)` at the GATEWAY
+///   endpoint.
+/// - Ambient: inner = HBONE CONNECT, the dest relay
+///   (`build_inbound_hbone_relay_proxy`) dials the CONNECT `:authority` under the
+///   OPEN-RELAY GUARD (`inbound_hbone_relay_destination_allowed`) — the authority
+///   must be loopback OR a slice-declared workload addr+port; a service FQDN is
+///   REJECTED. The remote pod IP IS slice-declared on the dest side AND known to
+///   the client (merged remote endpoints). So Ambient cross-cluster targets are
+///   PER-REMOTE-POD: `UpstreamTarget.host:port = remote pod addr : resolved
+///   app-port` (= the inner CONNECT `:authority`), with the east-west gateway
+///   carried as a DIAL OVERRIDE.
+///
+/// Each surviving reachable remote workload's gateway is selected per the
+/// workload's own `(network, trust_domain)` (the SAME
+/// [`select_east_west_gateway_for_network`] +
+/// [`east_west_workload_is_reachable`] reuse as the Sidecar path). One target is
+/// emitted per pod ADDRESS with:
+/// - `host:port` = pod addr : resolved app-port (the inner CONNECT `:authority`);
+/// - `mesh.hbone = "true"` (Ambient transport);
+/// - `mesh.hbone_dial_host` = `gateway.host` (dial host ≠ target.host = pod IP);
+/// - `mesh.hbone_port` = `gateway.port` (the DIAL port, e.g. `:15443`);
+/// - `mesh.eastwest_sni` = the destination service FQDN (outer-TLS SNI override);
+/// - `mesh.trust_domain` = the remote TD (trust-domain-only verification);
+/// - `mesh.cross_cluster = "true"`; `mesh.remote = "true"`;
+/// - NO `mesh.spiffe_id` (the gateway LB-picks the destination, so no pod pin).
+///
+/// FAIL-CLOSED collision rule (cross-TD ambiguity on a shared GATEWAY DIAL
+/// ENDPOINT): each pod target dials `(gateway.host, gateway.port, sni)` (= the
+/// outer TLS endpoint the SNI-passthrough gateway terminates). If a SINGLE dial
+/// endpoint serves MULTIPLE trust domains (e.g. a TD-less wildcard gateway
+/// fronting pods that span two trust domains), the client cannot present a
+/// coherent trust-domain-scoped verification for that one endpoint — so EVERY
+/// pod target on that ambiguous dial endpoint is DROPPED (the operator must
+/// declare a distinct gateway endpoint per trust domain), mirroring
+/// [`append_cross_cluster_mesh_targets`]'s `[R3-3]` rule. Unlike the Sidecar
+/// path there is NO same-endpoint COLLAPSE: each pod is a distinct backend
+/// identity (`pod addr:app-port`), so same-TD pods sharing a dial endpoint are
+/// all legitimately emitted (the gateway routes each by the pinned CONNECT
+/// authority).
+fn append_cross_cluster_ambient_hbone_targets(
+    targets: &mut Vec<UpstreamTarget>,
+    runtime: &MeshRuntimeConfig,
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    protocol: AppProtocol,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) {
+    let Some(multi_cluster) = multi_cluster else {
+        return;
+    };
+
+    // FIRST-PORT ONLY: identical rationale to the Sidecar path — the east-west
+    // gateway routes a service-FQDN SNI to only the service's FIRST declared port
+    // (single-port-per-SNI; SNI carries no port). A later port would misroute
+    // through the gateway's first-port backend, so only the first declared port
+    // gets cross-cluster targets.
+    if service.ports.first().map(|sp| sp.port) != Some(service_port.port) {
+        return;
+    }
+
+    let all_remote_workloads =
+        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
+    if all_remote_workloads.is_empty() {
+        return;
+    }
+
+    // [R2-2] REACHABILITY FILTER: keep only remote workloads the destination
+    // cluster's east-west materializer could itself back (≥1 address + resolvable
+    // first-service-port targetPort), mirroring `build_east_west_service_targets`
+    // — a workload the destination would drop must not produce a dead path here.
+    let remote_workloads: Vec<_> = all_remote_workloads
+        .into_iter()
+        .filter(|workload| east_west_workload_is_reachable(service, workload))
+        .collect();
+    if remote_workloads.is_empty() {
+        warn!(
+            service = %service.name,
+            namespace = %service.namespace,
+            "Skipping Ambient cross-cluster egress: no reachable remote workload (every remote \
+             endpoint lacks an address or has an unresolved first-port targetPort)"
+        );
+        return;
+    }
+
+    // The SNI the remote east-west gateway passthrough routes on — the
+    // destination service FQDN (matches `build_east_west_service_targets`).
+    let cluster_domain = runtime.cluster_domain.trim_matches('.');
+    let service_fqdn = format!(
+        "{}.{}.svc.{cluster_domain}",
+        service.name, service.namespace
+    );
+
+    // The app (container) port the inner CONNECT `:authority` carries. Same
+    // fail-closed targetPort rule as the local pass: a DECLARED `targetPort` must
+    // resolve (skip the workload otherwise — never fall back to the service
+    // port); an ABSENT one uses the service port.
+    let resolve_app_port = |workload: &crate::modes::mesh::config::Workload| -> Option<u16> {
+        match service_port.target_port.as_ref() {
+            Some(_) => {
+                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
+                    Some(p) if p != 0 => Some(p),
+                    _ => None,
+                }
+            }
+            None if service_port.port != 0 => Some(service_port.port),
+            None => None,
+        }
+    };
+
+    // Build each pod's target into a local list first, tagging it with the
+    // selected gateway DIAL ENDPOINT so cross-trust-domain ambiguity on a shared
+    // endpoint can fail closed before any target reaches the LB.
+    struct BuiltHboneTarget {
+        target: UpstreamTarget,
+        dial_endpoint: (String, u16),
+        trust_domain: String,
+    }
+    let mut built: Vec<BuiltHboneTarget> = Vec::new();
+    for workload in &remote_workloads {
+        let Some(gateway) = select_east_west_gateway_for_network(
+            multi_cluster,
+            workload.network.as_deref(),
+            &service_fqdn,
+            &workload.trust_domain,
+        ) else {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                network = workload.network.as_deref().unwrap_or("<none>"),
+                trust_domain = %workload.trust_domain.as_str(),
+                service_fqdn = %service_fqdn,
+                "Skipping Ambient cross-cluster egress for a remote workload: no EastWestGateway on \
+                 its network whose sni_hosts claim the destination service FQDN AND whose trust \
+                 domain matches (fail closed; never broaden to a different-network catch-all or a \
+                 mismatched-trust-domain gateway)"
+            );
+            continue;
+        };
+        if gateway.host.is_empty() || gateway.port == 0 {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                gateway = %gateway.name,
+                "Skipping Ambient cross-cluster egress: EastWestGateway has no usable host:port"
+            );
+            continue;
+        }
+        let Some(app_port) = resolve_app_port(workload) else {
+            // Defensive: the reachability filter already proved the first port
+            // resolves, so this is unreachable, but never emit a `:0` authority.
+            continue;
+        };
+
+        for address in &workload.addresses {
+            // Start from the standard Ambient HBONE tag core (destination
+            // identity + service metadata), then override for the cross-cluster
+            // posture: drop the pinned pod identity, set the remote trust domain,
+            // the gateway dial host/port, the SNI override, and the markers.
+            let mut tags = crate::service_discovery::mesh::mesh_hbone_target_tags(
+                service,
+                workload,
+                protocol,
+                service_port.name.as_deref(),
+            );
+            // No pod pinning across the SNI-passthrough gateway: remove the
+            // pinned SPIFFE id so dispatch uses trust-domain-SCOPED verification.
+            tags.remove(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG);
+            // The trust_domain tag is already the workload's trust domain (set by
+            // the tag core), which is what dispatch scopes verification to.
+            // Remote provenance for strict local-first locality LB.
+            tags.insert(
+                crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+                crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
+            );
+            // The DIAL host is the east-west gateway (≠ target.host = pod IP).
+            tags.insert(
+                crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG.to_string(),
+                gateway.host.clone(),
+            );
+            // The DIAL port is the gateway port (e.g. :15443), NOT :15008.
+            tags.insert(
+                crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+                gateway.port.to_string(),
+            );
+            // Outer-TLS SNI override = the destination service FQDN.
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
+                service_fqdn.clone(),
+            );
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
+                "true".to_string(),
+            );
+
+            built.push(BuiltHboneTarget {
+                target: UpstreamTarget {
+                    // IDENTITY = the remote pod addr:app-port (= the inner CONNECT
+                    // `:authority` the dest relay dials under the open-relay
+                    // guard). The transport DIALS `mesh.hbone_dial_host` /
+                    // `mesh.hbone_port` (the gateway), so dial endpoint and target
+                    // identity deliberately DIFFER (unlike the Sidecar path, whose
+                    // identity IS the gateway endpoint).
+                    host: address.clone(),
+                    port: app_port,
+                    // DR policy stays keyed by the declared SERVICE port.
+                    service_port_policy_key: Some(service_port.port),
+                    weight: 1,
+                    tags,
+                    // Remote-tier locality so locality-LB ranks this AFTER locals.
+                    locality: workload.locality.clone(),
+                    path: None,
+                },
+                dial_endpoint: (gateway.host.clone(), gateway.port),
+                trust_domain: workload.trust_domain.as_str().to_string(),
+            });
+        }
+    }
+
+    // [R3-3] FAIL CLOSED on a cross-trust-domain shared GATEWAY DIAL ENDPOINT:
+    // the outer TLS terminates at `(gateway.host, gateway.port)` (the SNI is the
+    // one service FQDN), so if MULTIPLE trust domains' pods resolve to the SAME
+    // dial endpoint (a TD-less wildcard gateway fronting a network whose pods
+    // span trust domains), the client cannot pin a coherent trust domain for that
+    // endpoint's outer handshake — DROP every pod target on that ambiguous
+    // endpoint. (Same-TD pods sharing an endpoint are fine: each is a distinct
+    // pinned CONNECT authority; there is NO same-endpoint collapse here, unlike
+    // the per-gateway Sidecar shape.)
+    let mut tds_by_dial_endpoint: std::collections::HashMap<
+        (String, u16),
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    for entry in &built {
+        tds_by_dial_endpoint
+            .entry(entry.dial_endpoint.clone())
+            .or_default()
+            .insert(entry.trust_domain.clone());
+    }
+    for entry in built {
+        if tds_by_dial_endpoint
+            .get(&entry.dial_endpoint)
+            .map(std::collections::HashSet::len)
+            .unwrap_or(0)
+            > 1
+        {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                gateway_host = %entry.dial_endpoint.0,
+                gateway_port = entry.dial_endpoint.1,
+                "Skipping Ambient cross-cluster egress target: multiple trust domains resolve to \
+                 the same east-west gateway dial endpoint (fail closed; an SNI-passthrough gateway \
+                 terminates one outer TLS identity, so a shared endpoint cannot pin a trust domain \
+                 — declare a distinct gateway endpoint per trust domain)"
+            );
+            continue;
+        }
+        targets.push(entry.target);
     }
 }
 

@@ -1591,12 +1591,25 @@ fn can_attempt_hbone_backend(
     let Some(target) = upstream_target else {
         return false;
     };
+    // CROSS-CLUSTER HBONE targets BYPASS the capability registry: such a target
+    // dials the operator-declared east-west GATEWAY (`:15443`), not a probeable
+    // workload `:15008`, so no capability record is ever collected for it (the
+    // gateway is never enrolled in `collect_mesh_*_capability_targets`) and a
+    // registry-gated dispatch would fail closed forever. Trust the
+    // operator-declared gateway infra — the same assumption the Sidecar mesh-mTLS
+    // egress path makes (it has no capability registry at all). The SVID-present
+    // + HttpPool + `mesh.hbone` tag checks still apply.
+    let registry_ok = if hbone_pool::target_hbone_cross_cluster(target) {
+        true
+    } else {
+        registry
+            .get(proxy, Some(target))
+            .is_none_or(|record| !matches!(record.hbone, ProtocolSupport::Unsupported))
+    };
     proxy_can_dispatch_hbone(proxy)
         && hbone_pool::target_hbone_enabled(target)
         && gateway_svid_loaded
-        && registry
-            .get(proxy, Some(target))
-            .is_none_or(|record| !matches!(record.hbone, ProtocolSupport::Unsupported))
+        && registry_ok
 }
 
 /// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
@@ -8735,6 +8748,25 @@ async fn connect_mesh_websocket_backend(
             })
         }
         MeshWsEgress::AmbientHbone => {
+            // Cross-cluster Ambient WebSocket egress is NOT yet supported
+            // (HTTP-first; tracked as a follow-up like the deferred Sidecar WS
+            // cross-cluster path). A cross-cluster HBONE target carries NO
+            // `mesh.spiffe_id` (so `target_expected_peer_spiffe` returns
+            // `Ok(None)` rather than erroring) and the bare-byte-tunnel WS path
+            // has no SNI-override / trust-domain-scope plumbing — dialing it would
+            // hit the gateway with the WRONG (dial-host) SNI. FAIL CLOSED here so
+            // the upgrade errors cleanly (no plaintext, no wrong-SNI dial) and is
+            // diagnosable, mirroring the Sidecar WS cross-cluster guard.
+            if hbone_pool::target_hbone_cross_cluster(target) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = %target.host,
+                    "Cross-cluster Ambient WebSocket egress is not yet supported; failing the \
+                     upgrade closed (no cross-cluster SNI override / trust-domain scope on the \
+                     HBONE WS byte-tunnel path). Tracked as a follow-up."
+                );
+                return Err("cross-cluster Ambient WebSocket egress is not supported".into());
+            }
             let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
             let hbone_port = hbone_pool::target_hbone_port(target);
             let dial_host = hbone_pool::target_hbone_dial_host(target)?;
@@ -19615,12 +19647,8 @@ async fn proxy_to_backend_hbone(
         );
     };
 
-    debug!(
-        proxy_id = %proxy.id,
-        target_host = %target.host,
-        target_port = target.port,
-        "Proxying request via gateway HBONE tunnel"
-    );
+    // The dispatch debug (with the cross-cluster dial host / SNI / trust-domain
+    // detail) is emitted below once those are resolved.
 
     let original_req = match client_request_body {
         ClientRequestBody::Streaming(request) => *request,
@@ -19683,25 +19711,113 @@ async fn proxy_to_backend_hbone(
             );
         }
     };
-    // Pin the peer identity declared on the target. A present but corrupt
-    // `mesh.hbone_peer_spiffe_id` / `mesh.spiffe_id` tag fails CLOSED here —
-    // never silently downgrade a pinned dial to trust-domain-only verification.
-    let expected_peer = match hbone_pool::target_expected_peer_spiffe(target) {
-        Ok(peer) => peer,
-        Err(err) => {
+    // Peer-verification mode + SNI + trust-domain scope depend on whether this is
+    // a CROSS-CLUSTER east-west HBONE target (mirroring the Sidecar mesh-mTLS
+    // cross-cluster branch in `proxy_to_backend_mesh_mtls`):
+    // - Cross-cluster (`mesh.cross_cluster`): the dial host is the REMOTE
+    //   east-west gateway (carried in `mesh.hbone_dial_host`, already resolved
+    //   above), which SNI-passes the opaque outer TLS to a destination terminator
+    //   that relays the inner HBONE CONNECT to the pinned pod IP. So verification
+    //   is TRUST-DOMAIN-ONLY (`expected_peer = None`; the destination SVID must
+    //   still chain to the remote trust domain via the federated bundle — never
+    //   unverified) and the ClientHello SNI is OVERRIDDEN to the destination
+    //   service FQDN (`mesh.eastwest_sni`). A cross-cluster target carries NO
+    //   `mesh.spiffe_id` and MUST carry both a usable SNI and a usable trust
+    //   domain tag — either missing/empty/unparseable FAILS CLOSED (502; never
+    //   dial the gateway IP as SNI, never any-federated verification).
+    // - In-cluster (default): the pinned destination identity is pinned (a
+    //   present-but-corrupt tag fails closed) and there is no SNI / TD override.
+    let cross_cluster = hbone_pool::target_hbone_cross_cluster(target);
+    let (expected_peer, expected_trust_domain, sni_override) = if cross_cluster {
+        let Some(sni) = hbone_pool::target_hbone_eastwest_sni(target) else {
             error!(
                 proxy_id = %proxy.id,
                 target_host = %target.host,
-                error = %err,
-                "Refusing HBONE dispatch: invalid pinned peer identity tag"
+                "Refusing cross-cluster HBONE dispatch: missing or empty mesh.eastwest_sni tag \
+                 (fail closed, never dial the gateway IP as SNI)"
             );
             return (
-                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Cross-cluster HBONE target missing SNI"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
                 None,
                 None,
             );
-        }
+        };
+        let Some(td) = hbone_pool::target_hbone_cross_cluster_trust_domain(target) else {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                "Refusing cross-cluster HBONE dispatch: missing, empty, or unparseable \
+                 mesh.trust_domain tag (fail closed, never any-federated verification)"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Cross-cluster HBONE target missing trust domain"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+                None,
+            );
+        };
+        (None, Some(td), Some(sni))
+    } else {
+        // Pin the peer identity declared on the target. A present but corrupt
+        // `mesh.hbone_peer_spiffe_id` / `mesh.spiffe_id` tag fails CLOSED here —
+        // never silently downgrade a pinned dial to trust-domain-only.
+        let expected_peer = match hbone_pool::target_expected_peer_spiffe(target) {
+            Ok(peer) => peer,
+            Err(err) => {
+                error!(
+                    proxy_id = %proxy.id,
+                    target_host = %target.host,
+                    error = %err,
+                    "Refusing HBONE dispatch: invalid pinned peer identity tag"
+                );
+                return (
+                    hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                    None,
+                    None,
+                );
+            }
+        };
+        (expected_peer, None, None)
     };
+    debug!(
+        proxy_id = %proxy.id,
+        target_host = %target.host,
+        target_port = target.port,
+        dial_host = %dial_host,
+        hbone_port,
+        cross_cluster,
+        expected_peer = expected_peer
+            .as_ref()
+            .map(|p| p.as_str())
+            .unwrap_or("td-only"),
+        expected_trust_domain = expected_trust_domain
+            .as_ref()
+            .map(|td| td.as_str())
+            .unwrap_or(""),
+        sni_override = sni_override.unwrap_or(""),
+        "Proxying request via gateway HBONE tunnel"
+    );
     let tunnel = match state
         .hbone_pool
         .get_tunnel_via(
@@ -19712,6 +19828,8 @@ async fn proxy_to_backend_hbone(
             target.dispatch_policy_port(),
             hbone_port,
             expected_peer.as_ref(),
+            expected_trust_domain.as_ref(),
+            sni_override,
             source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref()),
         )
         .await

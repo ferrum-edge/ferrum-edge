@@ -159,6 +159,11 @@ pub(crate) async fn handle_mesh_tcp_egress(
                 target.dispatch_policy_port(),
                 hbone_port,
                 expected_peer.as_ref(),
+                // Raw-TCP HBONE egress is in-cluster only (the cross-cluster
+                // append is HTTP-family-only, so no cross-cluster target ever
+                // reaches this L4 datapath): no trust-domain scope / SNI override.
+                None,
+                None,
                 asserted_source_identity,
             )
             .await

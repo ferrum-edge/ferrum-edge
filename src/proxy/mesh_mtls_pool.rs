@@ -592,6 +592,11 @@ impl MeshMtlsConnectionPool {
             target_host,
             mtls_port,
             Some(expected_peer),
+            // In-cluster pinned-peer raw-TCP CONNECT tunnel: no cross-cluster
+            // trust-domain scope / SNI override (those ride the cross-cluster
+            // HTTP path's own TLS build in `get_sender`).
+            None,
+            None,
             &pool_config,
             keepalive_override,
             None,
@@ -691,6 +696,10 @@ impl MeshMtlsConnectionPool {
             target_host,
             mtls_port,
             Some(expected_peer),
+            // In-cluster pinned-peer datagram CONNECT tunnel: no cross-cluster
+            // trust-domain scope / SNI override.
+            None,
+            None,
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
@@ -782,6 +791,10 @@ impl MeshMtlsConnectionPool {
             dial_host,
             mtls_port,
             Some(expected_peer),
+            // In-cluster pinned-peer WebSocket CONNECT tunnel: no cross-cluster
+            // trust-domain scope / SNI override.
+            None,
+            None,
             &pool_config,
             keepalive_override,
             None,
