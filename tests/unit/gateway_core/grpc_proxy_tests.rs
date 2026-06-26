@@ -500,10 +500,15 @@ fn test_parse_grpc_timeout_empty_value() {
 }
 
 #[test]
-fn test_parse_grpc_timeout_overflow_returns_none() {
-    // Huge hour value overflows u64 in checked_mul — should return None
+fn test_parse_grpc_timeout_overflow_saturates_to_unbounded() {
+    // A syntactically VALID but unrepresentable hour value saturates to u64::MAX
+    // rather than returning None: it must stay a (very large / effectively
+    // unbounded) deadline — the consumer's overflow guard treats u64::MAX as
+    // unbounded — instead of being conflated with an absent/invalid header, which
+    // would wrongly re-enable an operator read-timeout fallback for an RPC the
+    // client made effectively unbounded.
     let headers = headers_with_grpc_timeout("999999999999999999H");
-    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(u64::MAX));
 }
 
 // --- GrpcConnectionPool creation ---

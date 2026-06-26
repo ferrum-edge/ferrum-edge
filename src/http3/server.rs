@@ -2396,6 +2396,7 @@ async fn handle_h3_request(
                     &mut stream,
                     state.max_request_body_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    proxy.backend_read_timeout_ms,
                     tls_config_fn,
                 )
                 .await
@@ -2410,6 +2411,7 @@ async fn handle_h3_request(
                     &mut stream,
                     state.max_request_body_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    proxy.backend_read_timeout_ms,
                     tls_config_fn,
                 )
                 .await
@@ -5529,6 +5531,18 @@ async fn dispatch_grpc_native_h3(
         None
     };
 
+    // The H3 pool's internal response-header wait normally uses
+    // `proxy.backend_read_timeout_ms`; under a client `grpc-timeout` pass `0`
+    // (unbounded inner) so the outer `dispatch_deadline_at` (the absolute client
+    // deadline) governs the header wait instead of the shorter read timeout — a
+    // legitimately slow-header H3 backend must not be failed before the client
+    // deadline (the inner timeout would otherwise win).
+    let grpc_header_read_timeout_ms = if client_deadline_present {
+        0
+    } else {
+        proxy.backend_read_timeout_ms
+    };
+
     let dispatch_fut = async {
         if let Some(target) = upstream_target {
             state
@@ -5543,6 +5557,7 @@ async fn dispatch_grpc_native_h3(
                     stream,
                     state.max_grpc_recv_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    grpc_header_read_timeout_ms,
                     tls_config_fn,
                 )
                 .await
@@ -5557,6 +5572,7 @@ async fn dispatch_grpc_native_h3(
                     stream,
                     state.max_grpc_recv_size_bytes,
                     Arc::clone(&request_body_bytes_seen),
+                    grpc_header_read_timeout_ms,
                     tls_config_fn,
                 )
                 .await
@@ -5940,6 +5956,10 @@ async fn dispatch_grpc_native_h3(
     // synthesized trailer in the relay loop below.
     let wire_grpc_status: Option<String> = response_headers.get("grpc-status").cloned();
     let wire_grpc_message: Option<String> = response_headers.get("grpc-message").cloned();
+    // Rich error details (`grpc-status-details-bin`) also live in the Trailers-Only
+    // header block and must survive the synthesized trailer, not just status/message.
+    let wire_grpc_status_details: Option<String> =
+        response_headers.get("grpc-status-details-bin").cloned();
     response_headers
         .retain(|k, _| !crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(k.as_str()));
 
@@ -6319,6 +6339,7 @@ async fn dispatch_grpc_native_h3(
                             stream,
                             wire_grpc_status.as_deref(),
                             wire_grpc_message.as_deref(),
+                            wire_grpc_status_details.as_deref(),
                         )
                         .await
                     };
@@ -6336,6 +6357,7 @@ async fn dispatch_grpc_native_h3(
                         stream,
                         wire_grpc_status.as_deref(),
                         wire_grpc_message.as_deref(),
+                        wire_grpc_status_details.as_deref(),
                     )
                     .await
                     {
@@ -6350,6 +6372,7 @@ async fn dispatch_grpc_native_h3(
                         stream,
                         wire_grpc_status.as_deref(),
                         wire_grpc_message.as_deref(),
+                        wire_grpc_status_details.as_deref(),
                     )
                     .await
                     {
@@ -7306,6 +7329,7 @@ async fn finish_h3_grpc_stream_trailers_only(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     grpc_status: Option<&str>,
     grpc_message: Option<&str>,
+    grpc_status_details: Option<&str>,
 ) -> bool {
     match grpc_status {
         Some(status) => {
@@ -7317,6 +7341,13 @@ async fn finish_h3_grpc_stream_trailers_only(
                 && let Ok(value) = http::HeaderValue::from_str(message)
             {
                 trailers.insert("grpc-message", value);
+            }
+            // Preserve rich error details (base64 binary trailer) on the
+            // synthesized Trailers-Only frame.
+            if let Some(details) = grpc_status_details
+                && let Ok(value) = http::HeaderValue::from_str(details)
+            {
+                trailers.insert("grpc-status-details-bin", value);
             }
             stream.send_trailers(trailers).await.is_ok() && stream.finish().await.is_ok()
         }

@@ -2025,6 +2025,11 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Response-header wait bound (ms; `0` = unbounded). Normally
+        // `proxy.backend_read_timeout_ms`, but the native-H3 gRPC path overrides it
+        // with `0` when a client `grpc-timeout` is present so the outer absolute
+        // deadline governs the header wait instead of the (shorter) read timeout.
+        header_read_timeout_ms: u64,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
@@ -2094,8 +2099,7 @@ impl Http3ConnectionPool {
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
         let response =
-            recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
-                .await?;
+            recv_h3_response_with_timeout(&mut backend_stream, header_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
         let response_headers = collect_h3_response_headers(response.headers());
@@ -2222,6 +2226,11 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Response-header wait bound (ms; `0` = unbounded), forwarded to
+        // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
+        // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
+        // so the outer absolute deadline governs the header wait.
+        header_read_timeout_ms: u64,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2249,6 +2258,7 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                header_read_timeout_ms,
             )
             .await
             {
@@ -2286,6 +2296,7 @@ impl Http3ConnectionPool {
             frontend_stream,
             max_request_body_size,
             bytes_seen,
+            header_read_timeout_ms,
         )
         .await
     }
@@ -2384,6 +2395,11 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Response-header wait bound (ms; `0` = unbounded), forwarded to
+        // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
+        // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
+        // so the outer absolute deadline governs the header wait.
+        header_read_timeout_ms: u64,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2409,6 +2425,7 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                header_read_timeout_ms,
             )
             .await
             {
@@ -2453,6 +2470,7 @@ impl Http3ConnectionPool {
             frontend_stream,
             max_request_body_size,
             bytes_seen,
+            header_read_timeout_ms,
         )
         .await
     }

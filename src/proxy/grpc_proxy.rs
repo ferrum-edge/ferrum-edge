@@ -2182,15 +2182,21 @@ pub(crate) fn parse_grpc_timeout_value(val: &str) -> Option<u64> {
     if num == 0 {
         return None;
     }
+    // SATURATE on the unit multiply rather than returning `None`: a syntactically
+    // VALID but unrepresentable deadline (e.g. `18446744073709551615H`) must stay
+    // a deadline (`u64::MAX` ms → the consumer's overflow guard treats it as
+    // unbounded), NOT be conflated with an absent/invalid header — otherwise the
+    // operator's read-timeout fallback would cut off an RPC the client made
+    // effectively unbounded. `None` is reserved for absent / invalid syntax.
     let ms = match unit {
-        b'H' => num.checked_mul(3_600_000),
-        b'M' => num.checked_mul(60_000),
-        b'S' => num.checked_mul(1_000),
-        b'm' => Some(num),
-        b'u' => Some(num / 1_000), // microseconds → ms, floor to 0 is handled by max(1) below
-        b'n' => Some(num / 1_000_000),
-        _ => None,
-    }?;
+        b'H' => num.saturating_mul(3_600_000),
+        b'M' => num.saturating_mul(60_000),
+        b'S' => num.saturating_mul(1_000),
+        b'm' => num,
+        b'u' => num / 1_000, // microseconds → ms, floor to 0 is handled by max(1) below
+        b'n' => num / 1_000_000,
+        _ => return None,
+    };
     // Ensure at least 1ms for sub-millisecond timeouts
     Some(ms.max(1))
 }
