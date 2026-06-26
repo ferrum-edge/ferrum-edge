@@ -745,3 +745,112 @@ fn build_then_reconcile_matches_buffered_writeback_scenario() {
     assert!(!wire_trailers.contains_key("x-removed-trailer"));
     assert!(!wire_trailers.contains_key("x-shadowed-removed"));
 }
+
+// ── GrpcBody::Channel (H3 cross-protocol streaming request body) ──────────────
+//
+// `GrpcBody::Channel` is the body the HTTP/3 → non-H3 gRPC bridge hands to the
+// gRPC pool: a pump task feeds request DATA frames (or `Err(())` on a frontend
+// upload failure) into the channel, and hyper drives the upload by polling this
+// body in the background. These tests exercise the body directly — proving
+// frames flow incrementally (not buffered), the size limit is enforced
+// incrementally, and a frontend error becomes a body error (backend RST) rather
+// than a clean END_STREAM the backend would mistake for a completed request.
+
+fn grpc_channel_body(
+    max_bytes: usize,
+) -> (
+    tokio::sync::mpsc::Sender<Result<bytes::Bytes, ()>>,
+    grpc_proxy::GrpcBody,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (tx, receiver) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, ()>>(8);
+    let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body = grpc_proxy::GrpcBody::Channel {
+        receiver,
+        bytes_seen: 0,
+        max_bytes,
+        exceeded: std::sync::Arc::clone(&exceeded),
+        upload_observer: None,
+    };
+    (tx, body, exceeded)
+}
+
+#[tokio::test]
+async fn grpc_channel_body_forwards_frames_in_order_then_clean_eof() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, body, exceeded) = grpc_channel_body(0); // 0 = unlimited
+    let pump = tokio::spawn(async move {
+        tx.send(Ok(bytes::Bytes::from_static(b"msg1")))
+            .await
+            .unwrap();
+        tx.send(Ok(bytes::Bytes::from_static(b"msg2")))
+            .await
+            .unwrap();
+        // Drop `tx` → channel closes → body observes a clean END_STREAM.
+    });
+    let collected = body
+        .collect()
+        .await
+        .expect("clean-EOF channel body must complete without error")
+        .to_bytes();
+    pump.await.unwrap();
+    // Frames are concatenated in send order — the body forwards them as they
+    // arrive rather than reordering or buffering past the channel capacity.
+    assert_eq!(&collected[..], b"msg1msg2");
+    assert!(
+        !exceeded.load(Ordering::Relaxed),
+        "size flag must stay clear when no limit is configured"
+    );
+}
+
+#[tokio::test]
+async fn grpc_channel_body_enforces_size_limit_incrementally() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    // 4-byte ceiling: the first 3-byte frame is under the limit; the second
+    // pushes the running total to 6 and must trip the limit *mid-stream* (not
+    // only after the whole body is collected).
+    let (tx, body, exceeded) = grpc_channel_body(4);
+    let pump = tokio::spawn(async move {
+        let _ = tx.send(Ok(bytes::Bytes::from_static(b"abc"))).await;
+        let _ = tx.send(Ok(bytes::Bytes::from_static(b"def"))).await;
+        let _ = tx.send(Ok(bytes::Bytes::from_static(b"ghi"))).await;
+    });
+    let result = body.collect().await;
+    let _ = pump.await;
+    assert!(
+        result.is_err(),
+        "body must error once the running byte count exceeds max_bytes"
+    );
+    assert!(
+        exceeded.load(Ordering::Acquire),
+        "overflow must set the shared `exceeded` flag so the dispatcher can map it to RESOURCE_EXHAUSTED"
+    );
+}
+
+#[tokio::test]
+async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, body, exceeded) = grpc_channel_body(0);
+    let pump = tokio::spawn(async move {
+        let _ = tx.send(Ok(bytes::Bytes::from_static(b"partial"))).await;
+        // Frontend (H3 recv) failure: the pump signals abort with `Err(())`.
+        let _ = tx.send(Err(())).await;
+    });
+    let result = body.collect().await;
+    let _ = pump.await;
+    assert!(
+        result.is_err(),
+        "a frontend upload failure must surface as a body error (backend RST), \
+         never a clean END_STREAM the backend would treat as a completed request"
+    );
+    assert!(
+        !exceeded.load(Ordering::Relaxed),
+        "a transport-level abort is not a size violation"
+    );
+}

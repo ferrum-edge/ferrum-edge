@@ -2056,73 +2056,51 @@ async fn handle_h3_request(
     }
 
     if !use_native_h3_pool {
-        let prebuffered = if needs_request_buffering {
-            let body_was_prebuffered = prebuffered_body_data.is_some();
-            let mut body_data = prebuffered_body_data.take().unwrap_or_default();
-            if !body_was_prebuffered {
-                while let Some(chunk) = stream.recv_data().await.inspect_err(|_e| {
-                    // Client read error during cross-protocol prebuffering,
-                    // before cross_protocol::run (which would release a
-                    // reserved HALF_OPEN probe). Release it here so an aborted
-                    // upload during HALF_OPEN can't permanently wedge the
-                    // breaker — same leak class as the oversized-body 413 path
-                    // below. ClientDisconnect drives a neutral breaker release
-                    // and suppresses the health/latency samples; status is
-                    // irrelevant (no response was produced).
-                    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
-                        &state,
-                        &proxy,
-                        &epoch.load_balancer,
-                        upstream_balancer.as_ref(),
-                        upstream_target.as_deref(),
-                        cb_target_key.as_deref(),
-                        0,
-                        false,
-                        Some(crate::retry::ErrorClass::ClientDisconnect),
-                        cb_is_half_open_probe,
-                        false,
-                        backend_start.elapsed(),
-                    );
-                })? {
-                    let bytes = chunk.chunk();
-                    if content_length_limit > 0
-                        && body_data.len() + bytes.len() > content_length_limit
-                    {
-                        record_request(&state, 413);
-                        // The circuit-breaker check above may have admitted this
-                        // request as a half-open probe (cb_is_half_open_probe),
-                        // reserving a slot. This cross-protocol prebuffering
-                        // early return bypasses cross_protocol::run (which would
-                        // release it) and no record_connection_start was issued
-                        // on this path, so use the no-conn-end variant to release
-                        // the probe slot without touching the least-connections
-                        // gauge. Without it, a single oversized upload during
-                        // HALF_OPEN permanently wedges the breaker (same leak
-                        // class as the native-H3 streaming path).
-                        //
-                        // Record this BEFORE the client-facing 413 write below: if
-                        // the client resets while the 413 is being written, that
-                        // `.await?` returns Err and the early return runs before
-                        // any code after it, so recording the outcome after the
-                        // write would skip the release and leak the probe slot
-                        // (wedging a single-slot breaker). The native-H3 reject /
-                        // read-error paths in this same patch release before their
-                        // client-facing writes for exactly this reason.
-                        //
-                        // An oversized client upload is client-caused, so
-                        // ClientDisconnect drives the outcome:
-                        //   * connection_error=false — accurate (no transport
-                        //     error occurred; we chose to 413 a too-large body).
-                        //     The ClientDisconnect class centrally suppresses both
-                        //     the least-latency sample (the synthetic 413 reflects
-                        //     no real backend latency) and the passive-health
-                        //     report (no phantom <500 success, and no failure even
-                        //     if 413 sat in unhealthy_status_codes), so passing
-                        //     true here would be redundant and less truthful.
-                        //   * the breaker still goes neutral via record_neutral():
-                        //     the ClientDisconnect arm is evaluated before
-                        //     connection_error, releasing the half-open probe slot
-                        //     without tripping the breaker.
+        // STREAMING-REQUEST gRPC bridge: H3 client → H2/h2c gRPC backend,
+        // forwarding request DATA incrementally (true client-streaming / bidi)
+        // instead of draining the full H3 body first. `can_stream_request_body`
+        // already excludes retry, request/response body buffering, and
+        // pre-buffered bodies — exactly the streaming-safe set — so the buffered
+        // `cross_protocol::run` still handles every other gRPC case. Hands the
+        // OWNED QUIC stream to the bridge so it can `.split()` into independent
+        // send/recv halves for concurrent request-upload + response-stream.
+        let outcome = if matches!(http_flavor, HttpFlavor::Grpc) && can_stream_request_body {
+            let client_ip_owned = ctx.client_ip.clone();
+            crate::http3::cross_protocol::dispatch_grpc_streaming(
+                &state,
+                &epoch,
+                &proxy,
+                stream,
+                &method,
+                &proxy_headers,
+                &backend_url,
+                upstream_target.as_deref(),
+                upstream_balancer.as_ref(),
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+                &client_ip_owned,
+                socket_ip,
+                backend_start,
+                &mut ctx,
+                &plugins,
+                backend_admission_plugins.as_ref(),
+                sticky_cookie_needed,
+            )
+            .await?
+        } else {
+            let prebuffered = if needs_request_buffering {
+                let body_was_prebuffered = prebuffered_body_data.is_some();
+                let mut body_data = prebuffered_body_data.take().unwrap_or_default();
+                if !body_was_prebuffered {
+                    while let Some(chunk) = stream.recv_data().await.inspect_err(|_e| {
+                        // Client read error during cross-protocol prebuffering,
+                        // before cross_protocol::run (which would release a
+                        // reserved HALF_OPEN probe). Release it here so an aborted
+                        // upload during HALF_OPEN can't permanently wedge the
+                        // breaker — same leak class as the oversized-body 413 path
+                        // below. ClientDisconnect drives a neutral breaker release
+                        // and suppresses the health/latency samples; status is
+                        // irrelevant (no response was produced).
                         crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                             &state,
                             &proxy,
@@ -2130,39 +2108,92 @@ async fn handle_h3_request(
                             upstream_balancer.as_ref(),
                             upstream_target.as_deref(),
                             cb_target_key.as_deref(),
-                            413,
+                            0,
                             false,
                             Some(crate::retry::ErrorClass::ClientDisconnect),
                             cb_is_half_open_probe,
                             false,
                             backend_start.elapsed(),
                         );
-                        send_h3_error_flavor_aware(
-                            &mut stream,
-                            http_flavor,
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                            "Request body exceeds maximum size",
-                        )
-                        .await?;
-                        return Ok(());
+                    })? {
+                        let bytes = chunk.chunk();
+                        if content_length_limit > 0
+                            && body_data.len() + bytes.len() > content_length_limit
+                        {
+                            record_request(&state, 413);
+                            // The circuit-breaker check above may have admitted this
+                            // request as a half-open probe (cb_is_half_open_probe),
+                            // reserving a slot. This cross-protocol prebuffering
+                            // early return bypasses cross_protocol::run (which would
+                            // release it) and no record_connection_start was issued
+                            // on this path, so use the no-conn-end variant to release
+                            // the probe slot without touching the least-connections
+                            // gauge. Without it, a single oversized upload during
+                            // HALF_OPEN permanently wedges the breaker (same leak
+                            // class as the native-H3 streaming path).
+                            //
+                            // Record this BEFORE the client-facing 413 write below: if
+                            // the client resets while the 413 is being written, that
+                            // `.await?` returns Err and the early return runs before
+                            // any code after it, so recording the outcome after the
+                            // write would skip the release and leak the probe slot
+                            // (wedging a single-slot breaker). The native-H3 reject /
+                            // read-error paths in this same patch release before their
+                            // client-facing writes for exactly this reason.
+                            //
+                            // An oversized client upload is client-caused, so
+                            // ClientDisconnect drives the outcome:
+                            //   * connection_error=false — accurate (no transport
+                            //     error occurred; we chose to 413 a too-large body).
+                            //     The ClientDisconnect class centrally suppresses both
+                            //     the least-latency sample (the synthetic 413 reflects
+                            //     no real backend latency) and the passive-health
+                            //     report (no phantom <500 success, and no failure even
+                            //     if 413 sat in unhealthy_status_codes), so passing
+                            //     true here would be redundant and less truthful.
+                            //   * the breaker still goes neutral via record_neutral():
+                            //     the ClientDisconnect arm is evaluated before
+                            //     connection_error, releasing the half-open probe slot
+                            //     without tripping the breaker.
+                            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                                &state,
+                                &proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer.as_ref(),
+                                upstream_target.as_deref(),
+                                cb_target_key.as_deref(),
+                                413,
+                                false,
+                                Some(crate::retry::ErrorClass::ClientDisconnect),
+                                cb_is_half_open_probe,
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            send_h3_error_flavor_aware(
+                                &mut stream,
+                                http_flavor,
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                r#"{"error":"Request body exceeds maximum size"}"#,
+                                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                                "Request body exceeds maximum size",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        body_data.extend_from_slice(bytes);
                     }
-                    body_data.extend_from_slice(bytes);
                 }
-            }
-            Some(body_data)
-        } else {
-            prebuffered_body_data.take()
-        };
-        // Pass the pre-resolved plugin list + mutable context so the
-        // bridge can run the same after_proxy / on_final_request_body /
-        // on_response_body / on_final_response_body / sticky-cookie
-        // pipeline as the native H3 path. Without these, H3 clients on
-        // non-H3 backends silently skip the response-transform /
-        // body-validator / sticky-session phases.
-        let client_ip_owned = ctx.client_ip.clone();
-        let outcome =
+                Some(body_data)
+            } else {
+                prebuffered_body_data.take()
+            };
+            // Pass the pre-resolved plugin list + mutable context so the
+            // bridge can run the same after_proxy / on_final_request_body /
+            // on_response_body / on_final_response_body / sticky-cookie
+            // pipeline as the native H3 path. Without these, H3 clients on
+            // non-H3 backends silently skip the response-transform /
+            // body-validator / sticky-session phases.
+            let client_ip_owned = ctx.client_ip.clone();
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
                 epoch: &epoch,
@@ -2188,7 +2219,8 @@ async fn handle_h3_request(
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
                 sticky_cookie_needed,
             })
-            .await?;
+            .await?
+        };
 
         record_request(&state, outcome.response_status);
 

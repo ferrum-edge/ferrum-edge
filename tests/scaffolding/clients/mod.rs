@@ -19,7 +19,7 @@ pub use grpc::{GrpcClient, GrpcResponse};
 pub use http1::{ClientResponse, Http1Client};
 pub use http2::Http2Client;
 pub use http3::{
-    GetOptions, H3WebSocketFrame, HostHeader, Http3Client, Http3Response, Http3WebSocket,
-    WebSocketOptions,
+    GetOptions, H3WebSocketFrame, HostHeader, Http3Client, Http3GrpcStream, Http3Response,
+    Http3WebSocket, WebSocketOptions,
 };
 pub use udp::UdpClient;

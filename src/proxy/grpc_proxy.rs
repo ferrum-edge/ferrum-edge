@@ -107,6 +107,28 @@ pub enum GrpcBody {
         /// `None` when no circuit breaker is configured for the proxy.
         upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     },
+    /// Streaming body sourced from a channel rather than a hyper `Incoming`.
+    ///
+    /// Used by the HTTP/3 cross-protocol gRPC bridge: H3's
+    /// `h3::server::RequestStream` cannot be expressed as a hyper `Incoming`,
+    /// so a pump task reads `RequestStream::recv_data()` and pushes `Bytes`
+    /// chunks — or `Err(())` on a frontend upload failure (so a truncated
+    /// upload becomes a backend RST rather than a clean END_STREAM the backend
+    /// would mistake for a completed stream) — into the bounded sender. This
+    /// body polls the receiver. Inline size enforcement (`bytes_seen` /
+    /// `max_bytes` / `exceeded`) and the upload observer match `Streaming`
+    /// exactly; only the source differs. The same `Pin<&mut Self>` exclusivity
+    /// argument as `Streaming` makes the plain `usize` counter safe.
+    Channel {
+        receiver: tokio::sync::mpsc::Receiver<Result<Bytes, ()>>,
+        bytes_seen: usize,
+        max_bytes: usize,
+        exceeded: Arc<AtomicBool>,
+        /// Fired from `Drop` when this request body terminates — same contract
+        /// as [`GrpcBody::Streaming::upload_observer`]. `None` for the H3
+        /// bridge, which records the circuit-breaker outcome at response time.
+        upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+    },
 }
 
 impl Drop for GrpcBody {
@@ -115,11 +137,16 @@ impl Drop for GrpcBody {
         // body is dropped. hyper drops it once the upload finishes (END_STREAM)
         // or the stream is reset, so this is the canonical "request upload
         // terminated" signal — independent of the response body's lifetime.
-        if let GrpcBody::Streaming {
-            upload_observer, ..
-        } = self
-            && let Some(observer) = upload_observer.as_ref()
-        {
+        let upload_observer = match self {
+            GrpcBody::Streaming {
+                upload_observer, ..
+            }
+            | GrpcBody::Channel {
+                upload_observer, ..
+            } => upload_observer.as_ref(),
+            GrpcBody::Buffered(_) => None,
+        };
+        if let Some(observer) = upload_observer {
             observer.on_upload_terminated();
         }
     }
@@ -167,6 +194,39 @@ impl http_body::Body for GrpcBody {
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
+            GrpcBody::Channel {
+                receiver,
+                bytes_seen,
+                max_bytes,
+                exceeded,
+                ..
+            } => match receiver.poll_recv(cx) {
+                Poll::Ready(Some(Ok(data))) => {
+                    if *max_bytes > 0 {
+                        *bytes_seen += data.len();
+                        if *bytes_seen > *max_bytes {
+                            exceeded.store(true, Ordering::Release);
+                            // RST_STREAM the request so the backend cannot
+                            // treat the truncated prefix as a complete stream —
+                            // identical to the `Streaming` overflow branch.
+                            return Poll::Ready(Some(Err(format!(
+                                "gRPC request payload exceeds maximum of {} bytes",
+                                max_bytes
+                            )
+                            .into())));
+                        }
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(data))))
+                }
+                // The pump task signals a frontend upload failure with `Err(())`
+                // so we RST the backend instead of sending a clean END_STREAM
+                // that the backend would mistake for a completed request.
+                Poll::Ready(Some(Err(()))) => Poll::Ready(Some(Err(
+                    "gRPC request body upload failed (frontend stream error)".into(),
+                ))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 
@@ -176,6 +236,10 @@ impl http_body::Body for GrpcBody {
             GrpcBody::Streaming {
                 incoming, exceeded, ..
             } => incoming.is_end_stream() || exceeded.load(Ordering::Relaxed),
+            // No cheap "channel closed" probe without polling; `false` is always
+            // safe (hyper polls once more to observe `None`/overflow). The
+            // `exceeded` short-circuit mirrors `Streaming`.
+            GrpcBody::Channel { exceeded, .. } => exceeded.load(Ordering::Relaxed),
         }
     }
 
@@ -183,6 +247,7 @@ impl http_body::Body for GrpcBody {
         match self {
             GrpcBody::Buffered(full) => full.size_hint(),
             GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
+            GrpcBody::Channel { .. } => http_body::SizeHint::default(),
         }
     }
 }
@@ -1604,7 +1669,86 @@ pub async fn proxy_grpc_request_streaming(
         exceeded: Arc::clone(&body_size_exceeded),
         upload_observer,
     };
+    proxy_grpc_streaming_dispatch(
+        parts.method,
+        parts.headers,
+        proxy_headers,
+        grpc_body,
+        proxy,
+        backend_url,
+        grpc_pool,
+        max_grpc_recv_size_bytes,
+        body_size_exceeded,
+    )
+    .await
+}
 
+/// Proxy a gRPC request whose body streams in from a channel rather than a
+/// hyper `Incoming`.
+///
+/// Used by the HTTP/3 cross-protocol gRPC bridge: H3's `RequestStream` cannot be
+/// expressed as a hyper `Incoming`, so a pump task feeds request DATA frames into
+/// `receiver` and this entry wraps it in a [`GrpcBody::Channel`]. Behaviour is
+/// otherwise identical to [`proxy_grpc_request_streaming`] — the response is
+/// always streamed (the request body is consumed on the wire, so retries are
+/// impossible), and request-size limits are enforced inline via the same byte
+/// counting. `body_size_exceeded` is the shared overflow flag the channel body
+/// sets on limit breach so the caller can surface `RESOURCE_EXHAUSTED`.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_grpc_request_streaming_channel(
+    method: hyper::Method,
+    headers: hyper::HeaderMap,
+    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, ()>>,
+    proxy: &Proxy,
+    backend_url: &str,
+    grpc_pool: &GrpcConnectionPool,
+    proxy_headers: &HashMap<String, String>,
+    max_grpc_recv_size_bytes: usize,
+    body_size_exceeded: Arc<AtomicBool>,
+    upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+) -> Result<GrpcResponseKind, GrpcProxyError> {
+    let grpc_body = GrpcBody::Channel {
+        receiver,
+        bytes_seen: 0,
+        max_bytes: max_grpc_recv_size_bytes,
+        exceeded: Arc::clone(&body_size_exceeded),
+        upload_observer,
+    };
+    proxy_grpc_streaming_dispatch(
+        method,
+        headers,
+        proxy_headers,
+        grpc_body,
+        proxy,
+        backend_url,
+        grpc_pool,
+        max_grpc_recv_size_bytes,
+        body_size_exceeded,
+    )
+    .await
+}
+
+/// Shared dispatch for the streaming gRPC request entry points
+/// ([`proxy_grpc_request_streaming`] over a hyper `Incoming`, and
+/// [`proxy_grpc_request_streaming_channel`] over an mpsc channel). Takes a
+/// pre-built `GrpcBody` — the only difference between the two paths is the body
+/// source — plus the request `method`/`headers`, merges + strips headers,
+/// applies the per-route Host override, sends to the gRPC pool with the
+/// streaming-aware timeout, and returns the live streaming response. One core
+/// keeps the two paths from drifting on header handling, timeout policy, or
+/// size-overflow classification.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_grpc_streaming_dispatch(
+    method: hyper::Method,
+    mut headers: hyper::HeaderMap,
+    proxy_headers: &HashMap<String, String>,
+    grpc_body: GrpcBody,
+    proxy: &Proxy,
+    backend_url: &str,
+    grpc_pool: &GrpcConnectionPool,
+    max_grpc_recv_size_bytes: usize,
+    body_size_exceeded: Arc<AtomicBool>,
+) -> Result<GrpcResponseKind, GrpcProxyError> {
     let uri: hyper::Uri = backend_url
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
@@ -1616,7 +1760,6 @@ pub async fn proxy_grpc_request_streaming(
     // can call the steps in the wrong order. See `proxy::headers` for
     // why merging FIRST is required and why `te: trailers` is
     // synthesised at the end.
-    let mut headers = parts.headers;
     merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
 
     // Apply per-route Host override AFTER the strip, mirroring
@@ -1656,7 +1799,7 @@ pub async fn proxy_grpc_request_streaming(
     let client_grpc_deadline_ms = parse_grpc_timeout_ms(&headers);
 
     let mut backend_req = Request::new(grpc_body);
-    *backend_req.method_mut() = parts.method;
+    *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
 

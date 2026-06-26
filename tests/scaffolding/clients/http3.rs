@@ -271,6 +271,54 @@ impl Http3Client {
         })
     }
 
+    /// Open an H3 gRPC request stream (POST, `content-type: application/grpc`)
+    /// WITHOUT sending the request body or END_STREAM. The caller drives
+    /// [`Http3GrpcStream::send_message`] / `finish` / `recv_response` /
+    /// `recv_body_and_trailers` to exercise client-streaming and bidirectional
+    /// gRPC over the HTTP/3 frontend — in particular, to send a request message
+    /// and receive the server's response BEFORE half-closing the request.
+    pub async fn open_grpc_stream(
+        &self,
+        url: &str,
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+        let server_name = parsed.host().unwrap_or("localhost").to_string();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(addr, &server_name)?,
+        )
+        .await
+        .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        // Only `content-type: application/grpc` is needed for the gateway's
+        // flavor detection; the gateway synthesizes `te: trailers` toward the
+        // backend itself, so we don't send it from the client.
+        let req = Request::builder()
+            .method(http::Method::POST)
+            .uri(url)
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        let stream = tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
+            .await
+            .map_err(|_| "send_request timed out")?
+            .map_err(|e| format!("send_request: {e}"))?;
+        Ok(Http3GrpcStream {
+            stream,
+            _send_request: send_request,
+            driver_task,
+        })
+    }
+
     /// Open an RFC 9220 WebSocket-over-HTTP/3 Extended CONNECT stream.
     ///
     /// The returned stream works with raw WebSocket frames in HTTP/3 DATA
@@ -372,6 +420,93 @@ pub struct Http3Response {
 impl Http3Response {
     pub fn body_text(&self) -> String {
         String::from_utf8_lossy(&self.body_bytes).to_string()
+    }
+}
+
+/// A client-driven H3 gRPC request stream for exercising client-streaming and
+/// bidirectional RPCs: send request messages, receive the response, and control
+/// exactly when the request half-closes. Returned by
+/// [`Http3Client::open_grpc_stream`].
+pub struct Http3GrpcStream {
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    driver_task: JoinHandle<()>,
+}
+
+impl Http3GrpcStream {
+    /// Send one length-prefixed gRPC message as a DATA frame WITHOUT closing the
+    /// request stream (no END_STREAM), so a backend can be observed reacting to
+    /// it before the client half-closes.
+    pub async fn send_message(
+        &mut self,
+        message: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut framed = Vec::with_capacity(message.len() + 5);
+        framed.push(0); // uncompressed flag
+        framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        framed.extend_from_slice(message);
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            self.stream.send_data(Bytes::from(framed)),
+        )
+        .await
+        .map_err(|_| "send_data timed out")?
+        .map_err(|e| format!("send_data: {e}"))?;
+        Ok(())
+    }
+
+    /// Half-close the request stream (send END_STREAM).
+    pub async fn finish(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.finish())
+            .await
+            .map_err(|_| "finish timed out")?
+            .map_err(|e| format!("finish: {e}"))?;
+        Ok(())
+    }
+
+    /// Await the response headers (status + header map). Used to prove the
+    /// backend responded BEFORE the client half-closed.
+    pub async fn recv_response(
+        &mut self,
+    ) -> Result<(StatusCode, HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        Ok((resp.status(), resp.headers().clone()))
+    }
+
+    /// Drain the response body (concatenated DATA) and the gRPC trailers.
+    pub async fn recv_body_and_trailers(
+        &mut self,
+    ) -> Result<(Bytes, HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+        let mut body = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data()).await {
+                Ok(Ok(Some(mut chunk))) => {
+                    while chunk.has_remaining() {
+                        let take = chunk.chunk().to_vec();
+                        body.extend_from_slice(&take);
+                        chunk.advance(take.len());
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(format!("recv_data: {e}").into()),
+                Err(_) => return Err("recv_data timed out".into()),
+            }
+        }
+        let trailers = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_trailers())
+            .await
+            .map_err(|_| "recv_trailers timed out")?
+            .map_err(|e| format!("recv_trailers: {e}"))?
+            .unwrap_or_default();
+        Ok((Bytes::from(body), trailers))
+    }
+}
+
+impl Drop for Http3GrpcStream {
+    fn drop(&mut self) {
+        self.driver_task.abort();
     }
 }
 
