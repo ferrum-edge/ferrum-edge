@@ -15,6 +15,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # crates.io download hardening — mirrors .cargo/config.toml [net]/[http].
+  # The config file already covers every job that builds from this checkout;
+  # surfacing the same values here makes the CI intent explicit/greppable and
+  # covers any step that shells cargo outside the repo's config layering.
+  # Rationale and the failure mode live in .cargo/config.toml.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
   fmt:

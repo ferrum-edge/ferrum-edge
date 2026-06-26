@@ -44,3 +44,29 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+
+    - name: Pre-fetch crate dependencies (isolate transient registry flakes)
+      shell: bash
+      run: |
+        # Warm the dependency download surface up front so a transient
+        # crates.io/CDN hiccup fails *here* — fast, isolated, and clearly
+        # labeled — instead of minutes into a compile where it reads as a
+        # mysterious build error and prompts a "is this my change?" re-review.
+        # On a warm Swatinem cache this is a near-instant no-op (everything is
+        # already in ~/.cargo). cargo's own net.retry / http.multiplexing=false
+        # (.cargo/config.toml) harden each fetch pass; this outer loop is the
+        # backstop for the rare case where a whole pass dies past that budget.
+        # --locked also catches Cargo.lock drift early with a clear failure.
+        attempts=5
+        for i in $(seq 1 "$attempts"); do
+          if cargo fetch --locked; then
+            exit 0
+          fi
+          if [ "$i" -lt "$attempts" ]; then
+            backoff=$((i * 5))
+            echo "::warning::cargo fetch attempt ${i}/${attempts} failed (transient registry error?); retrying in ${backoff}s"
+            sleep "$backoff"
+          fi
+        done
+        echo "::error::cargo fetch failed after ${attempts} attempts — likely a crates.io/registry outage, not this change"
+        exit 1

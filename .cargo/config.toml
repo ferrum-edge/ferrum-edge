@@ -48,7 +48,35 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 # ── Network ─────────────────────────────────────────────────────────────
+# Robustness settings shared by local and CI cargo. The flake these target:
+# intermittent "curl failed fetching a dependency" / "spurious network error"
+# while downloading crate tarballs from the crates.io CDN (CloudFront). It is
+# a connectivity/edge issue, never anything in the dependency set — each
+# occurrence lands on a different, unrelated crate and clears on a plain
+# re-run. Putting the fix in this shared file (rather than CI-only env) means
+# every cargo invocation gets the same hardening without editing ~30 job
+# definitions: local dev, each CI job, and the cross-rs / docker container
+# builds that bind-mount this tree and layer this config over their own
+# $CARGO_HOME.
 [net]
 # Use the git CLI for fetching — honors the user's SSH agent and is
 # notably faster on large/private dependency updates.
 git-fetch-with-cli = true
+# Retry transient registry/CDN errors. Cargo's default is 3; 10 absorbs the
+# multi-round CDN hiccups seen across consecutive CI runs. `retry` only
+# re-attempts errors cargo classifies as *spurious* (connection resets,
+# timeouts, 5xx), so it never masks a real resolution/auth/404 failure —
+# pure upside, including for local devs on flaky networks.
+retry = 10
+
+# ── HTTP transport ──────────────────────────────────────────────────────
+[http]
+# Force HTTP/1.1 for crates.io downloads by disabling HTTP/2 multiplexing.
+# The CloudFront edge in front of static.crates.io intermittently resets
+# HTTP/2 streams mid-transfer; cargo's libcurl downloader surfaces that reset
+# as the "curl failed fetching a dependency" flake. Several parallel HTTP/1.1
+# transfers are markedly more resilient to it on shared CI egress, and this
+# is the cargo-team-recommended mitigation for exactly this failure mode.
+# Cost is negligible: on a warm Swatinem cache almost nothing is downloaded,
+# and even cold the extra connections are cheap next to compile time.
+multiplexing = false
