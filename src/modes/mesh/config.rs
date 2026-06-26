@@ -3328,7 +3328,20 @@ fn validate_multi_cluster(
         }
     }
 
-    let mut seen_sni_routes: HashSet<String> = HashSet::new();
+    // Duplicate-SNI detection is scoped to `(network, trust_domain, sni)`, NOT
+    // the SNI string alone. On a Sidecar/Ambient CLIENT data plane,
+    // `east_west_gateways` lists the REMOTE gateways across DIFFERENT
+    // networks/clusters: two remote networks (or two remote trust domains) can
+    // each legitimately host the same service and front it with their own
+    // east-west gateway claiming that service's FQDN — the client routes them to
+    // DISTINCT `(network, trust_domain)` groups (see
+    // `select_east_west_gateway_for_network` in `modes::mesh`), so they are NOT a
+    // collision. Only two gateways with the SAME `(network, trust_domain)`
+    // claiming the same SNI are genuinely ambiguous (the client's group selector
+    // would pick one arbitrarily; on an EastWestGateway data plane they would
+    // also materialize colliding same-host passthrough proxies, still rejected
+    // downstream by `validate_stream_proxies`), so that case stays an error.
+    let mut seen_sni_routes: HashSet<(Option<String>, Option<String>, String)> = HashSet::new();
     for gateway in &multi_cluster.east_west_gateways {
         if gateway.name.trim().is_empty() {
             errors.push("EastWestGateway: name must not be empty".to_string());
@@ -3375,9 +3388,25 @@ fn validate_multi_cluster(
                 ));
                 continue;
             }
-            if !seen_sni_routes.insert(sni.to_ascii_lowercase()) {
+            // Key by `(network, trust_domain, sni)` — a duplicate is only the
+            // same SNI on the same network AND trust domain (see the comment on
+            // `seen_sni_routes`). Network/TD are lowercased for case-insensitive
+            // parity with the SNI host comparison.
+            let sni_key = (
+                gateway
+                    .network
+                    .as_deref()
+                    .map(|network| network.to_ascii_lowercase()),
+                gateway
+                    .trust_domain
+                    .as_ref()
+                    .map(|td| td.as_str().to_ascii_lowercase()),
+                sni.to_ascii_lowercase(),
+            );
+            if !seen_sni_routes.insert(sni_key) {
                 errors.push(format!(
-                    "EastWestGateway '{}': duplicate SNI host '{}'",
+                    "EastWestGateway '{}': duplicate SNI host '{}' on the same network and trust \
+                     domain",
                     gateway.name, sni
                 ));
             }

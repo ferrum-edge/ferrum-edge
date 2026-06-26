@@ -228,10 +228,19 @@ fn cross_cluster_target_is_materialized_for_remote_workload_with_matching_gatewa
         "cross-cluster target must carry the reserved mesh.remote=true provenance marker"
     );
 
-    // The request authority/Host port stays the SERVICE port.
+    // [R2-4] The cross-cluster target's IDENTITY is the gateway DIAL ENDPOINT:
+    // `port` == the gateway port (NOT the service port), so the LB/health/CB
+    // `(host, port)` key is the actual reachable gateway endpoint. The DR policy
+    // key stays the SERVICE port via `service_port_policy_key`. The inner
+    // request authority/Host is the service FQDN (route host), unaffected.
     assert_eq!(
-        xc.port, 8080,
-        "the cross-cluster target's authority/Host port stays the service app port"
+        xc.port, GATEWAY_PORT,
+        "the cross-cluster target identity port is the gateway dial port, not the service port"
+    );
+    assert_eq!(
+        xc.service_port_policy_key,
+        Some(8080),
+        "DR policy stays keyed by the declared SERVICE port"
     );
 
     // The local workload still materializes a (first-tier) target dialing the
@@ -591,5 +600,440 @@ fn no_cross_cluster_target_when_no_gateway_claims_host() {
     assert_eq!(
         cross, 0,
         "no gateway claims svc-b's FQDN, so no cross-cluster target may be materialized"
+    );
+}
+
+// ── Codex round-2 fixes ────────────────────────────────────────────────────
+
+/// Collect every materialized cross-cluster target (across all upstreams).
+fn cross_cluster_targets(
+    upstreams: &std::collections::HashMap<String, Vec<ferrum_edge::config::types::UpstreamTarget>>,
+) -> Vec<&ferrum_edge::config::types::UpstreamTarget> {
+    upstreams
+        .values()
+        .flatten()
+        .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+        .collect()
+}
+
+/// [R2-1] FAIL CLOSED: net-b HAS a gateway, but it does NOT claim svc-b's FQDN;
+/// a separate `network: None` catch-all DOES claim the FQDN (matching TD). The
+/// catch-all must NOT be used (net-b having any gateway forbids broadening to a
+/// different-network catch-all) → NO cross-cluster target.
+#[test]
+fn catch_all_not_used_when_network_has_a_gateway() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote = remote_workload(Some(REMOTE_NETWORK));
+    let service = svc_b_service(&local, &remote);
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            // net-b HAS a gateway, but it claims a DIFFERENT host.
+            EastWestGateway {
+                name: "ew-net-b-other".to_string(),
+                namespace: "default".to_string(),
+                host: GATEWAY_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec!["svc-other.default.svc.cluster.local".to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some(REMOTE_NETWORK.to_string()),
+            },
+            // A `network: None` catch-all that DOES claim svc-b's FQDN with a
+            // matching TD — it must NOT rescue net-b (fail closed).
+            EastWestGateway {
+                name: "ew-catch-all".to_string(),
+                namespace: "default".to_string(),
+                host: "10.9.9.250".to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: None,
+            },
+        ],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "the catch-all must NOT be used when the requested network has a (non-matching) gateway \
+         — fail closed, never broaden to a different-network catch-all"
+    );
+}
+
+/// [R2-1] CONTRAST: net-b has NO gateway at all; only a `network: None` catch-all
+/// claims svc-b's FQDN with a matching TD → the catch-all IS used.
+#[test]
+fn catch_all_used_when_network_has_no_gateway() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Remote workload on net-b, but NO net-b gateway exists.
+    let remote = remote_workload(Some(REMOTE_NETWORK));
+    let service = svc_b_service(&local, &remote);
+
+    const CATCH_ALL_HOST: &str = "10.9.9.250";
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![EastWestGateway {
+            name: "ew-catch-all".to_string(),
+            namespace: "default".to_string(),
+            host: CATCH_ALL_HOST.to_string(),
+            port: GATEWAY_PORT,
+            sni_hosts: vec![SVC_B_FQDN.to_string()],
+            trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+            network: None,
+        }],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(
+        cross.len(),
+        1,
+        "with NO net-b gateway, the matching catch-all must front the remote workload"
+    );
+    assert_eq!(
+        cross[0].host, CATCH_ALL_HOST,
+        "the catch-all gateway host must be selected"
+    );
+}
+
+/// [R2-2] REACHABILITY: a remote workload with NO addresses yields no
+/// cross-cluster target (the east-west gateway would have no backend to forward
+/// the SNI to). A reachable sibling on the same network still produces a target.
+#[test]
+fn no_cross_cluster_target_for_unreachable_remote_workload() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // An UNREACHABLE remote workload: no addresses (pod IP not yet assigned).
+    let mut unreachable = remote_workload(Some(REMOTE_NETWORK));
+    unreachable.spiffe_id = spiffe("spiffe://cluster-b.local/ns/default/sa/svc-b-unreachable");
+    unreachable.service_account = Some("svc-b-unreachable".to_string());
+    unreachable.addresses = Vec::new();
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: unreachable.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(vec![local, unreachable], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "an addressless remote workload is unreachable → no cross-cluster target (fail closed)"
+    );
+
+    // A reachable sibling on the same network → target IS emitted for the group.
+    let local2 = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.2"]);
+    let reachable = remote_workload(Some(REMOTE_NETWORK)); // has an address
+    let service2 = svc_b_service(&local2, &reachable);
+    let mut mesh2 = mesh_config_with(vec![local2, reachable], vec![service2], Vec::new());
+    mesh2.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+    let upstreams2 = materialize_all_upstream_targets(mesh2, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams2).len(),
+        1,
+        "a reachable remote workload on the network still yields a cross-cluster target"
+    );
+}
+
+/// [R2-2] REACHABILITY: a remote workload whose first-service-port NAMED
+/// targetPort does not resolve against the workload's ports is unreachable →
+/// no cross-cluster target (mirrors `build_east_west_service_targets`'s skip).
+#[test]
+fn no_cross_cluster_target_for_unresolvable_named_target_port() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // The remote workload's ports are named "http" (port 8080), but the service
+    // port below declares a NAMED targetPort "grpc" that does NOT exist on the
+    // workload → unresolved → unreachable (the gateway side would skip it).
+    let remote = remote_workload(Some(REMOTE_NETWORK));
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: Some(ferrum_edge::modes::mesh::config::ServiceTargetPort::Name(
+                "grpc".to_string(),
+            )),
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "an unresolved named first-port targetPort makes the remote workload unreachable → \
+         no cross-cluster target"
+    );
+}
+
+/// [R2-3] TRUST DOMAIN: net-b has two gateways BOTH claiming svc-b's FQDN; the
+/// FIRST carries a DIFFERENT trust domain, the SECOND carries the remote
+/// workloads' trust domain → the SECOND (TD-matching) gateway is selected.
+#[test]
+fn gateway_selection_requires_trust_domain_match() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote = remote_workload(Some(REMOTE_NETWORK)); // TD = cluster-b.local
+    let service = svc_b_service(&local, &remote);
+
+    const WRONG_TD_GATEWAY_HOST: &str = "10.9.9.2";
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            // FIRST: claims the FQDN but wrong trust domain — must be REJECTED.
+            EastWestGateway {
+                name: "ew-net-b-wrong-td".to_string(),
+                namespace: "default".to_string(),
+                host: WRONG_TD_GATEWAY_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td("other.local")),
+                network: Some(REMOTE_NETWORK.to_string()),
+            },
+            // SECOND: claims the FQDN AND matches the remote TD — must be picked.
+            EastWestGateway {
+                name: "ew-net-b-right-td".to_string(),
+                namespace: "default".to_string(),
+                host: GATEWAY_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some(REMOTE_NETWORK.to_string()),
+            },
+        ],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(cross.len(), 1, "exactly one cross-cluster target expected");
+    assert_eq!(
+        cross[0].host, GATEWAY_HOST,
+        "selection must pick the gateway whose trust domain matches the remote workloads', not \
+         the first (wrong-TD) gateway"
+    );
+    assert_ne!(
+        cross[0].host, WRONG_TD_GATEWAY_HOST,
+        "the wrong-trust-domain gateway must not be selected"
+    );
+}
+
+/// [R2-3] TRUST DOMAIN: a TD-LESS (wildcard) gateway claiming the FQDN matches a
+/// remote workload of ANY trust domain.
+#[test]
+fn td_less_gateway_is_a_trust_domain_wildcard() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote = remote_workload(Some(REMOTE_NETWORK)); // TD = cluster-b.local
+    let service = svc_b_service(&local, &remote);
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![EastWestGateway {
+            name: "ew-net-b-td-less".to_string(),
+            namespace: "default".to_string(),
+            host: GATEWAY_HOST.to_string(),
+            port: GATEWAY_PORT,
+            sni_hosts: vec![SVC_B_FQDN.to_string()],
+            // No trust domain → wildcard, matches any remote TD.
+            trust_domain: None,
+            network: Some(REMOTE_NETWORK.to_string()),
+        }],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(
+        cross.len(),
+        1,
+        "a TD-less gateway is a trust-domain wildcard and must front the remote workload"
+    );
+    assert_eq!(cross[0].host, GATEWAY_HOST);
+}
+
+/// [R2-4] IDENTITY: the cross-cluster target's `(host, port)` identity is the
+/// gateway DIAL endpoint — `port` == the gateway port (not the service port),
+/// `mesh.mtls_port` == the gateway port, `service_port_policy_key` == the
+/// declared service port.
+#[test]
+fn cross_cluster_target_identity_is_the_gateway_dial_endpoint() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote = remote_workload(Some(REMOTE_NETWORK));
+    let service = svc_b_service(&local, &remote);
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(cross.len(), 1, "exactly one cross-cluster target expected");
+    let xc = cross[0];
+
+    assert_eq!(
+        xc.host, GATEWAY_HOST,
+        "identity host = the gateway dial host"
+    );
+    assert_eq!(
+        xc.port, GATEWAY_PORT,
+        "identity port = the gateway dial port, NOT the service port (8080)"
+    );
+    assert_ne!(xc.port, 8080, "identity port must not be the service port");
+    assert_eq!(
+        xc.tags.get(MESH_MTLS_PORT_TAG).map(String::as_str),
+        Some(GATEWAY_PORT.to_string().as_str()),
+        "mesh.mtls_port == the gateway dial port"
+    );
+    assert_eq!(
+        xc.service_port_policy_key,
+        Some(8080),
+        "DR policy stays keyed by the declared SERVICE port"
+    );
+}
+
+/// [R2-4] DISTINCT IDENTITIES: two remote networks fronted by gateways on the
+/// SAME host but DIFFERENT ports must yield two DISTINCT `(host, port)` targets
+/// (not collapsed onto one identity).
+#[test]
+fn two_networks_on_same_gateway_host_yield_distinct_identities() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Two remote workloads on DIFFERENT networks (net-b, net-c), same TD.
+    let remote_b = remote_workload(Some("net-b"));
+    let mut remote_c = remote_workload(Some("net-c"));
+    remote_c.spiffe_id = spiffe("spiffe://cluster-b.local/ns/default/sa/svc-b-c");
+    remote_c.service_account = Some("svc-b-c".to_string());
+    remote_c.addresses = vec!["10.244.6.6".to_string()];
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_b.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_c.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    // Two gateways on the SAME host, DIFFERENT ports — one per network.
+    const SHARED_GATEWAY_HOST: &str = "10.9.9.9";
+    const NET_B_PORT: u16 = 15443;
+    const NET_C_PORT: u16 = 15444;
+    let mut mesh = mesh_config_with(vec![local, remote_b, remote_c], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            EastWestGateway {
+                name: "ew-net-b".to_string(),
+                namespace: "default".to_string(),
+                host: SHARED_GATEWAY_HOST.to_string(),
+                port: NET_B_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-b".to_string()),
+            },
+            EastWestGateway {
+                name: "ew-net-c".to_string(),
+                namespace: "default".to_string(),
+                host: SHARED_GATEWAY_HOST.to_string(),
+                port: NET_C_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-c".to_string()),
+            },
+        ],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(
+        cross.len(),
+        2,
+        "two remote networks must yield two cross-cluster targets (one per gateway)"
+    );
+    let mut identities: Vec<(String, u16)> =
+        cross.iter().map(|t| (t.host.clone(), t.port)).collect();
+    identities.sort();
+    assert_eq!(
+        identities,
+        vec![
+            (SHARED_GATEWAY_HOST.to_string(), NET_B_PORT),
+            (SHARED_GATEWAY_HOST.to_string(), NET_C_PORT),
+        ],
+        "the two targets must have DISTINCT (host, port) identities (same host, different ports)"
     );
 }

@@ -1002,6 +1002,63 @@ fn multi_cluster_rejects_duplicate_east_west_sni_hosts_on_same_backend_port() {
     );
 }
 
+/// Duplicate-SNI detection is scoped to `(network, trust_domain, sni)`, so two
+/// east-west gateways claiming the SAME SNI host on DIFFERENT networks (or
+/// different trust domains) are NOT a collision — on a Sidecar/Ambient CLIENT
+/// the same service can be hosted by multiple remote networks/clusters, each
+/// fronted by its own east-west gateway claiming that service's FQDN. The client
+/// routes them to distinct `(network, trust_domain)` groups. Only the same SNI
+/// on the SAME network AND trust domain is a duplicate (covered by the test
+/// above).
+#[test]
+fn multi_cluster_allows_same_east_west_sni_on_different_network_or_trust_domain() {
+    let td_b = TrustDomain::new("cluster-b.local").unwrap();
+    let td_c = TrustDomain::new("cluster-c.local").unwrap();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                // Same SNI, DIFFERENT network (net-b vs net-c), same TD.
+                EastWestGateway {
+                    name: "ew-net-b".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["api.global".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+                EastWestGateway {
+                    name: "ew-net-c".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-c.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["api.global".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-c".to_string()),
+                },
+                // Same SNI, same network (net-b), DIFFERENT trust domain.
+                EastWestGateway {
+                    name: "ew-net-b-td-c".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-bc.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["api.global".to_string()],
+                    trust_domain: Some(td_c.clone()),
+                    network: Some("net-b".to_string()),
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        !errors.iter().any(|err| err.contains("duplicate SNI host")),
+        "same SNI on different (network, trust_domain) must NOT be a duplicate, got: {errors:?}"
+    );
+}
+
 #[test]
 fn gateway_config_validate_mesh_fields_dispatches() {
     let cfg = GatewayConfig {
