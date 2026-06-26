@@ -2359,15 +2359,21 @@ impl LoadBalancer {
         }
 
         // No source locality → no tier preference. Default (fail-open) returns
-        // the input unchanged — the mixed local + remote pool. Strict mode
-        // (fail-closed-to-local) OR the presence of a cross-cluster east-west
-        // gateway failover target (always local-first regardless of the strict
-        // opt-in) instead restricts to LOCAL endpoints, failing closed to
-        // unhealthy local rather than widening to remote (see
-        // `strict_local_bitset`).
+        // the input unchanged — the mixed local + remote pool.
+        //  - STRICT mode (operator opt-in) restricts to LOCAL endpoints and fails
+        //    CLOSED to unhealthy local rather than widening to remote
+        //    (`strict_local_bitset`).
+        //  - Otherwise, a cross-cluster east-west GATEWAY failover target
+        //    (always local-first regardless of the strict opt-in) prefers HEALTHY
+        //    local but fails OVER to the healthy remote gateway when no healthy
+        //    local remains (`local_first_failover_bitset`, codex r5 [R5-2]) — NOT
+        //    a strict fail-closed-to-unhealthy-local.
         if self.target_locality_ranks.is_empty() {
-            if self.locality_lb_strict || self.cross_cluster_failover_present {
+            if self.locality_lb_strict {
                 return self.strict_local_bitset(candidates, scope);
+            }
+            if self.cross_cluster_failover_present {
+                return self.local_first_failover_bitset(candidates);
             }
             return (*candidates, false);
         }
@@ -2446,12 +2452,17 @@ impl LoadBalancer {
         }
 
         // No source locality → no tier preference. Default returns the mixed
-        // local + remote pool; strict mode OR a cross-cluster gateway failover
-        // target restricts to LOCAL endpoints (Vec-path counterpart of
-        // `strict_local_bitset`).
+        // local + remote pool; STRICT mode fails closed to local
+        // (`strict_local_candidates`), while a cross-cluster gateway failover
+        // target prefers healthy local but fails OVER to the healthy remote
+        // gateway (`local_first_failover_candidates`, codex r5 [R5-2]). Vec-path
+        // counterpart of `preferred_locality_bitset`.
         if self.target_locality_ranks.is_empty() {
-            if self.locality_lb_strict || self.cross_cluster_failover_present {
+            if self.locality_lb_strict {
                 return self.strict_local_candidates(candidates, scope_indices);
+            }
+            if self.cross_cluster_failover_present {
+                return self.local_first_failover_candidates(candidates);
             }
             return (candidates, false);
         }
@@ -2606,6 +2617,57 @@ impl LoadBalancer {
             return (scope_local, true);
         }
         self.warn_strict_locality_widen();
+        (candidates, false)
+    }
+
+    /// Local-first FAILOVER selection (codex r5 [R5-2]) for cross-cluster
+    /// east-west gateway targets when `locality_lb_strict` is OFF. UNLIKE
+    /// [`Self::strict_local_bitset`] — which fails CLOSED to unhealthy local — this
+    /// prefers HEALTHY local endpoints but falls OVER to the healthy remote
+    /// gateway when no healthy local remains: a cross-cluster gateway is a
+    /// deliberate failover target, not a fail-closed boundary. `candidates` is the
+    /// already health-filtered set, so "no healthy local" widens to the full
+    /// healthy set (which includes the healthy gateway). Always `degraded = false`
+    /// (there is no fail-closed-to-unhealthy-local step).
+    fn local_first_failover_bitset(&self, candidates: &HealthBitset) -> (HealthBitset, bool) {
+        if self.local_locality_mask.is_empty() {
+            return (*candidates, false);
+        }
+        let mut local = HealthBitset::empty();
+        for idx in 0..self.targets.len() {
+            if candidates.contains(idx)
+                && self.local_locality_mask.get(idx).copied().unwrap_or(true)
+            {
+                local.set(idx);
+            }
+        }
+        if !local.is_empty() {
+            return (local, false);
+        }
+        // No healthy local → fail OVER to the full healthy candidate set (which
+        // includes the healthy cross-cluster gateway), NOT closed to unhealthy
+        // local.
+        (*candidates, false)
+    }
+
+    /// Vec-path counterpart of [`Self::local_first_failover_bitset`] for the
+    /// >128-target fallback.
+    fn local_first_failover_candidates<'a>(
+        &'a self,
+        candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
+    ) -> (Vec<(usize, &'a Arc<UpstreamTarget>)>, bool) {
+        if self.local_locality_mask.is_empty() {
+            return (candidates, false);
+        }
+        let local: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+            .iter()
+            .copied()
+            .filter(|(idx, _)| self.local_locality_mask.get(*idx).copied().unwrap_or(true))
+            .collect();
+        if !local.is_empty() {
+            return (local, false);
+        }
+        // No healthy local → fail OVER to the healthy remote gateway, not closed.
         (candidates, false)
     }
 

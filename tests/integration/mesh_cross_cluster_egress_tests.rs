@@ -1199,3 +1199,84 @@ fn no_cross_cluster_targets_when_two_trust_domains_share_one_gateway_endpoint() 
          target (fail closed)"
     );
 }
+
+/// [R5-3] Two remote networks in the SAME trust domain configured to use the
+/// SAME east-west gateway `host:port` are NOT ambiguous (same SNI + same
+/// trust-domain verification), so they COLLAPSE to a single cross-cluster target
+/// rather than being dropped — a remote-only service stays reachable.
+#[test]
+fn same_trust_domain_networks_sharing_one_gateway_endpoint_collapse_to_one() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Two remote workloads on DIFFERENT networks but the SAME trust domain.
+    let remote_b = remote_workload(Some("net-b"));
+    let mut remote_c = remote_workload(Some("net-c"));
+    remote_c.spiffe_id = spiffe("spiffe://cluster-b.local/ns/default/sa/svc-b-c");
+    remote_c.service_account = Some("svc-b-c".to_string());
+    remote_c.addresses = vec!["10.244.6.6".to_string()];
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_b.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_c.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    // Two gateways on the SAME host:port — one per network, SAME trust domain.
+    const SHARED_HOST: &str = "10.9.9.7";
+    let mut mesh = mesh_config_with(vec![local, remote_b, remote_c], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            EastWestGateway {
+                name: "ew-net-b".to_string(),
+                namespace: "default".to_string(),
+                host: SHARED_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-b".to_string()),
+            },
+            EastWestGateway {
+                name: "ew-net-c".to_string(),
+                namespace: "default".to_string(),
+                host: SHARED_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-c".to_string()),
+            },
+        ],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    assert_eq!(
+        cross.len(),
+        1,
+        "two same-trust-domain networks sharing one gateway endpoint must COLLAPSE to one target \
+         (not drop), got: {cross:#?}"
+    );
+    assert_eq!(cross[0].host, SHARED_HOST);
+    assert_eq!(cross[0].port, GATEWAY_PORT);
+}

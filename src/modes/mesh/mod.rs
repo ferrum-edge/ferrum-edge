@@ -1557,6 +1557,7 @@ fn gateway_config_from_mesh_slice_with_federation(
     // instead of leaking one generation until the discovery reconciler (sourced
     // from the accepted slice) evicts the store entry. Fail-closed: a slice with
     // no `multi_cluster` admits no remote endpoints (codex F7.2 round-4).
+    let merged_remote = matches!(remote_endpoints, Some(snapshot) if !snapshot.is_empty());
     let (workloads, services) = match remote_endpoints {
         Some(snapshot) if !snapshot.is_empty() => multicluster::merge_remote_endpoints_into_mesh(
             &slice.workloads,
@@ -1566,6 +1567,27 @@ fn gateway_config_from_mesh_slice_with_federation(
         ),
         _ => (slice.workloads.clone(), slice.services.clone()),
     };
+
+    // Materialization (`materialize_mesh_outbound_proxies` → `build_outbound_mesh_targets`,
+    // and the inbound / TCP / UDP materializers) reads workloads and services
+    // from the SLICE it is handed, NOT from `config.mesh`. So when remote
+    // endpoints were merged in — the `remote_clusters` DISCOVERY path, where the
+    // multi-cluster poller learns remote workloads instead of them being embedded
+    // in the slice — the merged set must ALSO reach materialization through the
+    // slice, or cross-cluster east-west targets are built only from endpoints
+    // already in the slice and miss every poller-discovered remote workload
+    // (codex r5 [R5-4]). Mirror the merged workloads/services onto a synthetic
+    // slice; the LOCAL materializers still filter remote workloads out
+    // (`matched_local_service_workloads`), so only the cross-cluster materializer
+    // picks the extra endpoints up. Built only when a merge happened, so the
+    // common no-remote-endpoint apply clones nothing.
+    let merged_slice = merged_remote.then(|| MeshSlice {
+        workloads: workloads.clone(),
+        services: services.clone(),
+        ..slice.clone()
+    });
+    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
+
     let config = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
             workloads,
@@ -1589,7 +1611,7 @@ fn gateway_config_from_mesh_slice_with_federation(
         loaded_at,
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_native_slice(config, runtime, slice)
+    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
 }
 
 async fn wait_for_initial_mesh_config(
@@ -4923,28 +4945,43 @@ fn append_cross_cluster_mesh_targets(
         });
     }
 
-    // [R3-3] FAIL CLOSED on duplicate gateway DIAL ENDPOINTS for this service.
-    // When two `(network, trust_domain)` groups select the SAME gateway
-    // `host:port` — e.g. one TD-less wildcard gateway fronting a network whose
-    // workloads span two trust domains — both targets share the LB / passive-
-    // health / circuit-breaker / retry key (which is `host:port`), so a TLS or
-    // passive-health failure charged to one trust domain would eject or skip the
-    // sibling target for the OTHER. And because the SNI-passthrough gateway
-    // LB-picks the backend, the client cannot steer a shared endpoint to its
-    // expected trust domain — the topology is genuinely ambiguous. Drop EVERY
-    // target on a colliding endpoint (never silently pick one trust domain); the
-    // operator must declare a distinct gateway endpoint per trust domain.
-    let mut endpoint_counts: std::collections::HashMap<(String, u16), usize> =
-        std::collections::HashMap::new();
+    // [R3-3]/[R5-3] Resolve targets that share a gateway DIAL ENDPOINT
+    // (`host:port` — the LB / passive-health / circuit-breaker / retry key).
+    // Group the built targets by endpoint and inspect the DISTINCT trust domains
+    // landing on each:
+    //   - ONE trust domain (e.g. two remote networks fronted by a single shared
+    //     east-west gateway): NOT ambiguous — same SNI, same trust-domain
+    //     verification — so COLLAPSE the duplicates to a single target (codex r5
+    //     [R5-3]); dropping them would leave a remote-only service unreachable.
+    //   - MULTIPLE trust domains on one endpoint (e.g. a TD-less wildcard gateway
+    //     fronting a network whose workloads span two trust domains): genuinely
+    //     ambiguous — the SNI-passthrough gateway LB-picks the backend, so the
+    //     client cannot steer the shared endpoint to its expected trust domain,
+    //     and the targets would collapse under one `host:port` LB/health key. FAIL
+    //     CLOSED — drop EVERY target on that endpoint ([R3-3]); the operator must
+    //     declare a distinct gateway endpoint per trust domain.
+    let mut tds_by_endpoint: std::collections::HashMap<
+        (String, u16),
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for target in &built {
-        *endpoint_counts
+        let trust_domain = target
+            .tags
+            .get(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
+            .cloned()
+            .unwrap_or_default();
+        tds_by_endpoint
             .entry((target.host.clone(), target.port))
-            .or_insert(0) += 1;
+            .or_default()
+            .insert(trust_domain);
     }
+    let mut emitted_endpoints: std::collections::HashSet<(String, u16)> =
+        std::collections::HashSet::new();
     for target in built {
-        if endpoint_counts
-            .get(&(target.host.clone(), target.port))
-            .copied()
+        let endpoint = (target.host.clone(), target.port);
+        if tds_by_endpoint
+            .get(&endpoint)
+            .map(std::collections::HashSet::len)
             .unwrap_or(0)
             > 1
         {
@@ -4953,11 +4990,6 @@ fn append_cross_cluster_mesh_targets(
                 namespace = %service.namespace,
                 gateway_host = %target.host,
                 gateway_port = target.port,
-                trust_domain = target
-                    .tags
-                    .get(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
-                    .map(String::as_str)
-                    .unwrap_or("<none>"),
                 "Skipping cross-cluster egress target: multiple trust domains resolve to the same \
                  east-west gateway endpoint (fail closed; an SNI-passthrough gateway LB-picks the \
                  backend, so a shared endpoint cannot pin a trust domain — declare a distinct \
@@ -4965,7 +4997,12 @@ fn append_cross_cluster_mesh_targets(
             );
             continue;
         }
-        targets.push(target);
+        // Sole trust domain on this endpoint: emit ONE target per endpoint,
+        // collapsing duplicate same-domain groups (e.g. two networks behind one
+        // shared gateway) onto a single LB identity.
+        if emitted_endpoints.insert(endpoint) {
+            targets.push(target);
+        }
     }
 }
 
@@ -22534,6 +22571,151 @@ mod tests {
         )
         .expect(
             "validation must accept CP bootstrap bundle even when fail-closed keeps it inactive",
+        );
+    }
+
+    /// [R5-4] A Sidecar client whose remote endpoints are NOT embedded in the
+    /// slice but discovered via the `remote_clusters` poller (a
+    /// `RemoteEndpointSnapshot`) must still materialize a cross-cluster east-west
+    /// target — the merged remote workloads have to reach materialization through
+    /// the slice it reads, not only the local-only original slice.
+    #[test]
+    fn federation_merge_materializes_cross_cluster_target_from_polled_remote_endpoints() {
+        let remote_td = TrustDomain::new("cluster-b.local").unwrap();
+        // Local svc-b workload (embedded in the slice).
+        let local = Workload {
+            addresses: vec!["10.0.0.1".to_string()],
+            ..workload("svc-b", "svc-b")
+        };
+        // Remote svc-b workload — discovered by the poller, NOT present in the slice.
+        let remote = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster-b.local/ns/default/sa/svc-b").unwrap(),
+            trust_domain: remote_td.clone(),
+            network: Some("net-b".to_string()),
+            cluster: Some("cluster-b".to_string()),
+            addresses: vec!["10.244.5.5".to_string()],
+            locality: Some("remote-cluster-b/net-b".to_string()),
+            remote_provenance: true,
+            ..workload("svc-b", "svc-b")
+        };
+        let svc_local = MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-b".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            }],
+            protocol_overrides: HashMap::new(),
+        };
+        // The remote cluster's view of svc-b (refs the remote workload).
+        let svc_remote = MeshService {
+            workloads: vec![WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            }],
+            ..svc_local.clone()
+        };
+
+        let east_cluster = RemoteCluster {
+            name: "east".to_string(),
+            trust_domain: remote_td.clone(),
+            network: Some("net-b".to_string()),
+            control_plane_url: Some("https://cp-east.remote.example:15010".to_string()),
+            federation_endpoint: None,
+            discovery_credential_ref: None,
+        };
+        let slice = MeshSlice {
+            version: "xc-federation".to_string(),
+            workloads: vec![local],
+            services: vec![svc_local],
+            multi_cluster: Some(MultiClusterConfig {
+                remote_clusters: vec![east_cluster],
+                east_west_gateways: vec![EastWestGateway {
+                    name: "ew-net-b".to_string(),
+                    namespace: "default".to_string(),
+                    host: "10.9.9.9".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["svc-b.default.svc.cluster.local".to_string()],
+                    trust_domain: Some(remote_td.clone()),
+                    network: Some("net-b".to_string()),
+                }],
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshSlice::default()
+        };
+
+        // The poller snapshot (admitted by the slice's declared `east` cluster).
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "east".to_string(),
+            multicluster::RemoteClusterEntry::new(
+                "east".to_string(),
+                remote_td,
+                Some("net-b".to_string()),
+                Some("https://cp-east.remote.example:15010".to_string()),
+                None,
+                multicluster::RemoteClusterEndpoints {
+                    workloads: vec![remote],
+                    services: vec![svc_remote],
+                },
+                1,
+            ),
+        );
+        let snapshot = multicluster::RemoteEndpointSnapshot { clusters };
+
+        let mut runtime = test_mesh_runtime_config();
+        runtime.workload_spiffe_id =
+            Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+        let activation = FederationActivation {
+            fail_open: false,
+            poll_enabled: true,
+        };
+
+        let cross_cluster_to_gateway = |config: &GatewayConfig| {
+            config.upstreams.iter().any(|upstream| {
+                upstream.targets.iter().any(|target| {
+                    target
+                        .tags
+                        .get(crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG)
+                        .map(String::as_str)
+                        == Some("true")
+                        && target.host == "10.9.9.9"
+                })
+            })
+        };
+
+        // WITH the snapshot: the poller-discovered remote endpoint materializes a
+        // cross-cluster target addressed at the east-west gateway.
+        let with_snapshot = gateway_config_from_mesh_slice_with_federation(
+            &slice,
+            &runtime,
+            Some(&federation::FederationSnapshot::default()),
+            Some(&snapshot),
+            activation,
+        )
+        .expect("prepared with snapshot");
+        assert!(
+            cross_cluster_to_gateway(&with_snapshot),
+            "poller-discovered remote endpoints must materialize a cross-cluster east-west target"
+        );
+
+        // WITHOUT the snapshot: no remote workload is known, so no cross-cluster target.
+        let without_snapshot = gateway_config_from_mesh_slice_with_federation(
+            &slice,
+            &runtime,
+            Some(&federation::FederationSnapshot::default()),
+            None,
+            activation,
+        )
+        .expect("prepared without snapshot");
+        assert!(
+            !cross_cluster_to_gateway(&without_snapshot),
+            "with no remote-endpoint snapshot there is no remote workload to route cross-cluster"
         );
     }
 

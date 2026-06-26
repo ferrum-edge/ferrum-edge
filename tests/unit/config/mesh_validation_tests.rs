@@ -997,8 +997,8 @@ fn multi_cluster_rejects_duplicate_east_west_sni_hosts_on_same_backend_port() {
 
     let errors = mesh.validate();
     assert!(
-        errors.iter().any(|err| err.contains("duplicate SNI host")),
-        "expected duplicate SNI error, got: {errors:?}"
+        errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "expected overlapping-SNI error, got: {errors:?}"
     );
 }
 

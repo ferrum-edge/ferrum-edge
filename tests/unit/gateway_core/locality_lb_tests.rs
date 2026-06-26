@@ -799,6 +799,49 @@ fn cross_cluster_gateway_target_serves_when_no_local_endpoint() {
 }
 
 #[test]
+fn cross_cluster_unhealthy_local_fails_over_to_healthy_gateway() {
+    // [R5-2] No source locality, locality_lb_strict OFF: when the LOCAL endpoint
+    // is unhealthy (health-checked down) and the cross-cluster gateway is
+    // healthy, selection must fail OVER to the healthy gateway — NOT fail closed
+    // to the unhealthy local (the strict-mode contract, which is the OPPOSITE of
+    // what a deliberate failover target wants).
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            local.clone(),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    assert!(!up.locality_lb_strict, "test premise: strict stays off");
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &local), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("xc-failover-{i}"),
+            Some(&health),
+        )
+        .expect("failover selected");
+        assert_eq!(
+            selection.target.host, "eastwest-gw.local",
+            "unhealthy local must fail OVER to the healthy cross-cluster gateway, not fail closed"
+        );
+    }
+}
+
+#[test]
 fn strict_locality_present_source_unchanged_priority_tier() {
     // With a resolved source locality, strict mode is inert: priority-tier
     // preference still picks the exact-match local target and ignores the flag.

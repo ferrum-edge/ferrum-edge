@@ -3416,7 +3416,20 @@ fn validate_multi_cluster(
             if !trust_domains_overlap {
                 continue;
             }
-            if crate::config::types::hosts_overlap(&earlier.sni_hosts, &later.sni_hosts) {
+            // Lowercase both SNI lists so the overlap is case-insensitive even on
+            // un-normalized input (`validate` can run before `normalize_mesh_fields`),
+            // matching how the selector compares against a lowercased FQDN.
+            let earlier_snis: Vec<String> = earlier
+                .sni_hosts
+                .iter()
+                .map(|sni| sni.to_ascii_lowercase())
+                .collect();
+            let later_snis: Vec<String> = later
+                .sni_hosts
+                .iter()
+                .map(|sni| sni.to_ascii_lowercase())
+                .collect();
+            if crate::config::types::hosts_overlap(&earlier_snis, &later_snis) {
                 errors.push(format!(
                     "EastWestGateway '{}': sni_hosts overlap EastWestGateway '{}' on the same \
                      network for an overlapping trust domain (both can route the same destination \
