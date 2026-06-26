@@ -354,43 +354,44 @@ pub async fn start_http3_listener_with_signal(
         frontend_tls_reload,
     } = options;
 
-    // DP mode binds the H3 socket with a throwaway
-    // `temporary_disabled_listener_tls_config` and immediately disables QUIC
-    // handshakes until CP delivers real frontend TLS material — the reload slot
-    // is empty at boot. That throwaway config never serves a handshake, so
-    // building the client-CA verifier for it would only let a transiently
-    // unreadable CA bundle abort DP startup instead of binding disabled and
-    // recovering on the first CP push. Snapshot the slot ONCE and, when starting
-    // disabled, skip the verifier on this startup config; the fail-closed
-    // verifier build is still enforced on the reload path that builds the real,
-    // handshake-enabled config (and a reload whose verifier fails keeps the
-    // previous, still-disabled config). Every H3 config that actually serves a
-    // handshake is still built fail-closed.
+    // DP mode binds the H3 socket while it waits for CP to deliver frontend TLS
+    // material — the reload slot is empty at boot. Create the endpoint with NO
+    // server config so it is disabled from the very first datagram. This avoids
+    // ever installing a no-client-auth throwaway config when mTLS is configured:
+    // building a real client-CA verifier needs the (possibly transiently
+    // unreadable) CA bundle, and a post-bind `set_server_config(None)` would
+    // still leave a window in which Quinn could admit an Initial under a
+    // certificate-less config. The real, fail-closed config — including the
+    // configured client-CA verifier — is installed only on the reload path when
+    // material arrives; a reload whose verifier fails keeps the previous (here,
+    // disabled) config. Every H3 config that actually serves a handshake is
+    // built fail-closed.
     let start_disabled = frontend_tls_reload
         .as_ref()
         .is_some_and(|reload| reload.tls_slot.load_full().as_ref().is_none());
-    let startup_client_ca = if start_disabled {
-        None
+
+    let endpoint = if start_disabled {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+        let endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+        info!("HTTP/3 listener started disabled until frontend TLS material is available");
+        endpoint
     } else {
-        client_ca_bundle_path.as_deref()
+        let server_config = build_h3_quinn_server_config(
+            &tls_config,
+            tls_policy,
+            client_ca_bundle_path.as_deref(),
+            &client_crls,
+            &h3_config,
+        )?;
+        quinn::Endpoint::server(server_config, addr)?
     };
-
-    let server_config = build_h3_quinn_server_config(
-        &tls_config,
-        tls_policy,
-        startup_client_ca,
-        &client_crls,
-        &h3_config,
-    )?;
-
-    let endpoint = quinn::Endpoint::server(server_config, addr)?;
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
     let frontend_listen_port = bound_addr.map(|addr| addr.port());
-    if start_disabled {
-        endpoint.set_server_config(None);
-        info!("HTTP/3 listener started disabled until frontend TLS material is available");
-    }
     info!("HTTP/3 (QUIC) listener started on {}", local_addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
