@@ -185,13 +185,17 @@ fn build_h3_quinn_server_config(
     // inbound verifier — only an explicitly *unconfigured* client CA (the
     // `else` branch) yields no client auth.
     let mut server_tls_config = if let Some(ca_path) = client_ca_bundle_path {
+        // Do NOT interpolate `ca_path` into the error: a client CA bundle can be
+        // configured as inline PEM (`CertSource::InlinePem`), so the "path" may
+        // itself be secret material (e.g. a pasted private key in a malformed
+        // bundle). `build_client_cert_verifier` already surfaces the redacted
+        // source id (`CertSource::source_id()` -> `inline-pem:<redacted>`) in
+        // `e`, so the wrapper only adds operator-facing context.
         let verifier =
             crate::tls::build_client_cert_verifier(ca_path, client_crls).map_err(|e| {
                 anyhow::anyhow!(
-                    "HTTP/3 mTLS is configured (client CA bundle '{}') but the client \
-                     certificate verifier could not be built: {}. Refusing to serve HTTP/3 \
-                     without client authentication.",
-                    ca_path,
+                    "HTTP/3 mTLS is configured but the client certificate verifier could not \
+                     be built: {}. Refusing to serve HTTP/3 without client authentication.",
                     e
                 )
             })?;
@@ -350,10 +354,31 @@ pub async fn start_http3_listener_with_signal(
         frontend_tls_reload,
     } = options;
 
+    // DP mode binds the H3 socket with a throwaway
+    // `temporary_disabled_listener_tls_config` and immediately disables QUIC
+    // handshakes until CP delivers real frontend TLS material — the reload slot
+    // is empty at boot. That throwaway config never serves a handshake, so
+    // building the client-CA verifier for it would only let a transiently
+    // unreadable CA bundle abort DP startup instead of binding disabled and
+    // recovering on the first CP push. Snapshot the slot ONCE and, when starting
+    // disabled, skip the verifier on this startup config; the fail-closed
+    // verifier build is still enforced on the reload path that builds the real,
+    // handshake-enabled config (and a reload whose verifier fails keeps the
+    // previous, still-disabled config). Every H3 config that actually serves a
+    // handshake is still built fail-closed.
+    let start_disabled = frontend_tls_reload
+        .as_ref()
+        .is_some_and(|reload| reload.tls_slot.load_full().as_ref().is_none());
+    let startup_client_ca = if start_disabled {
+        None
+    } else {
+        client_ca_bundle_path.as_deref()
+    };
+
     let server_config = build_h3_quinn_server_config(
         &tls_config,
         tls_policy,
-        client_ca_bundle_path.as_deref(),
+        startup_client_ca,
         &client_crls,
         &h3_config,
     )?;
@@ -362,9 +387,7 @@ pub async fn start_http3_listener_with_signal(
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
     let frontend_listen_port = bound_addr.map(|addr| addr.port());
-    if let Some(reload) = frontend_tls_reload.as_ref()
-        && reload.tls_slot.load_full().as_ref().is_none()
-    {
+    if start_disabled {
         endpoint.set_server_config(None);
         info!("HTTP/3 listener started disabled until frontend TLS material is available");
     }
