@@ -171,21 +171,37 @@ fn build_h3_quinn_server_config(
 
     // Reuse the cert chain and key from the original config.
     // Carry forward mTLS (client cert verification) if configured.
+    //
+    // FAIL CLOSED: when a client CA bundle IS configured but the client-cert
+    // verifier cannot be built (missing / unreadable / invalid / empty CA
+    // bundle, or a transient read fault), return an error instead of silently
+    // downgrading to `with_no_client_auth()`. Silently dropping client auth
+    // would let HTTP/3 clients present no certificate to a listener the
+    // operator configured for mTLS. At startup the error aborts the H3
+    // listener; on a frontend TLS reload the caller keeps the previous,
+    // still-mTLS-protected server config (see the `Err` arm of the reload
+    // handler). This mirrors the fail-closed contract of the H1/H2 frontend
+    // path (`crate::tls::load_tls_config_with_client_auth*`) and the mesh
+    // inbound verifier — only an explicitly *unconfigured* client CA (the
+    // `else` branch) yields no client auth.
     let mut server_tls_config = if let Some(ca_path) = client_ca_bundle_path {
-        match crate::tls::build_client_cert_verifier(ca_path, client_crls) {
-            Ok(verifier) => h3_builder
-                .with_client_cert_verifier(verifier)
-                .with_cert_resolver(tls_config.cert_resolver.clone()),
-            Err(e) => {
-                warn!(
-                    "Failed to build client cert verifier for HTTP/3, disabling mTLS: {}",
+        // Do NOT interpolate `ca_path` into the error: a client CA bundle can be
+        // configured as inline PEM (`CertSource::InlinePem`), so the "path" may
+        // itself be secret material (e.g. a pasted private key in a malformed
+        // bundle). `build_client_cert_verifier` already surfaces the redacted
+        // source id (`CertSource::source_id()` -> `inline-pem:<redacted>`) in
+        // `e`, so the wrapper only adds operator-facing context.
+        let verifier =
+            crate::tls::build_client_cert_verifier(ca_path, client_crls).map_err(|e| {
+                anyhow::anyhow!(
+                    "HTTP/3 mTLS is configured but the client certificate verifier could not \
+                     be built: {}. Refusing to serve HTTP/3 without client authentication.",
                     e
-                );
-                h3_builder
-                    .with_no_client_auth()
-                    .with_cert_resolver(tls_config.cert_resolver.clone())
-            }
-        }
+                )
+            })?;
+        h3_builder
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(tls_config.cert_resolver.clone())
     } else {
         h3_builder
             .with_no_client_auth()
@@ -338,24 +354,44 @@ pub async fn start_http3_listener_with_signal(
         frontend_tls_reload,
     } = options;
 
-    let server_config = build_h3_quinn_server_config(
-        &tls_config,
-        tls_policy,
-        client_ca_bundle_path.as_deref(),
-        &client_crls,
-        &h3_config,
-    )?;
+    // DP mode binds the H3 socket while it waits for CP to deliver frontend TLS
+    // material — the reload slot is empty at boot. Create the endpoint with NO
+    // server config so it is disabled from the very first datagram. This avoids
+    // ever installing a no-client-auth throwaway config when mTLS is configured:
+    // building a real client-CA verifier needs the (possibly transiently
+    // unreadable) CA bundle, and a post-bind `set_server_config(None)` would
+    // still leave a window in which Quinn could admit an Initial under a
+    // certificate-less config. The real, fail-closed config — including the
+    // configured client-CA verifier — is installed only on the reload path when
+    // material arrives; a reload whose verifier fails keeps the previous (here,
+    // disabled) config. Every H3 config that actually serves a handshake is
+    // built fail-closed.
+    let start_disabled = frontend_tls_reload
+        .as_ref()
+        .is_some_and(|reload| reload.tls_slot.load_full().as_ref().is_none());
 
-    let endpoint = quinn::Endpoint::server(server_config, addr)?;
+    let endpoint = if start_disabled {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("HTTP/3 listener requires a Tokio runtime"))?;
+        let endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+        info!("HTTP/3 listener started disabled until frontend TLS material is available");
+        endpoint
+    } else {
+        let server_config = build_h3_quinn_server_config(
+            &tls_config,
+            tls_policy,
+            client_ca_bundle_path.as_deref(),
+            &client_crls,
+            &h3_config,
+        )?;
+        quinn::Endpoint::server(server_config, addr)?
+    };
     let bound_addr = endpoint.local_addr().ok();
     let local_addr = bound_addr.unwrap_or(addr);
     let frontend_listen_port = bound_addr.map(|addr| addr.port());
-    if let Some(reload) = frontend_tls_reload.as_ref()
-        && reload.tls_slot.load_full().as_ref().is_none()
-    {
-        endpoint.set_server_config(None);
-        info!("HTTP/3 listener started disabled until frontend TLS material is available");
-    }
     info!("HTTP/3 (QUIC) listener started on {}", local_addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
@@ -7366,6 +7402,149 @@ mod build_h3_backend_headers_tests {
             header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
             Some(&b"203.0.113.1"[..]),
             "direct connections must not duplicate the peer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_h3_quinn_server_config_mtls_tests {
+    //! Regression tests for the HTTP/3 mTLS fail-CLOSED contract in
+    //! `build_h3_quinn_server_config` (module-private `fn`, so the tests must
+    //! live inline).
+    //!
+    //! Before the fix, a *configured* client CA bundle that could not be
+    //! loaded/parsed into a verifier (missing / invalid / empty / truncated
+    //! during rotation) caused this function to `warn!` and silently rebuild
+    //! the QUIC `ServerConfig` with `with_no_client_auth()`, returning `Ok`.
+    //! Because the frontend-TLS reload handler only keeps the previous config
+    //! when this function returns `Err`, that silent downgrade let a reload
+    //! swap a previously mTLS-protected H3 listener for one that accepts
+    //! clients presenting no certificate. The function must now FAIL CLOSED:
+    //! a configured-but-unloadable client CA returns `Err`; only an explicitly
+    //! *unconfigured* client CA (`None`) yields no client auth.
+    use std::sync::{Arc, Once};
+
+    use super::build_h3_quinn_server_config;
+    use crate::config::EnvConfig;
+    use crate::http3::config::Http3ServerConfig;
+    use crate::tls::{CrlList, TlsPolicy};
+
+    fn ensure_crypto_provider() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// Minimal frontend `ServerConfig`. The only field the H3 rebuild path
+    /// reads from it is `cert_resolver`, which `with_single_cert` populates.
+    fn test_server_config() -> Arc<rustls::ServerConfig> {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign cert");
+        let cert_pem = cert.pem();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .filter_map(Result::ok)
+            .collect();
+        let key_pem = key_pair.serialize_pem();
+        let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .expect("read private key")
+            .expect("private key present");
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, private_key)
+                .expect("server cert"),
+        )
+    }
+
+    /// Write a valid self-signed CA bundle and return its path.
+    fn write_valid_ca(dir: &std::path::Path) -> String {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test Client CA");
+        params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+        let cert = params.self_signed(&key_pair).expect("self-sign ca");
+        let ca_path = dir.join("client-ca.pem");
+        std::fs::write(&ca_path, cert.pem()).expect("write ca");
+        ca_path.to_string_lossy().into_owned()
+    }
+
+    /// Drive `build_h3_quinn_server_config` with the given client CA bundle.
+    fn build(client_ca: Option<&str>) -> Result<quinn::ServerConfig, anyhow::Error> {
+        ensure_crypto_provider();
+        let tls_config = test_server_config();
+        let tls_policy = TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
+        let crls: CrlList = Arc::new(Vec::new());
+        let h3_config = Http3ServerConfig::default();
+        build_h3_quinn_server_config(&tls_config, &tls_policy, client_ca, &crls, &h3_config)
+    }
+
+    #[test]
+    fn invalid_client_ca_fails_closed() {
+        // A corrupted/non-PEM CA bundle (e.g. truncated mid-rotation) must NOT
+        // silently downgrade H3 to no-client-auth.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("garbage-ca.pem");
+        std::fs::write(&ca_path, b"this file is not a PEM certificate at all\n").expect("write");
+        let result = build(Some(ca_path.to_str().expect("utf8 path")));
+        assert!(
+            result.is_err(),
+            "configured-but-invalid H3 client CA must fail closed (Err), not silently disable mTLS"
+        );
+    }
+
+    #[test]
+    fn missing_client_ca_fails_closed() {
+        let result = build(Some("/nonexistent/path/to/client-ca.pem"));
+        assert!(
+            result.is_err(),
+            "configured-but-missing H3 client CA must fail closed (Err)"
+        );
+    }
+
+    #[test]
+    fn empty_client_ca_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("empty-ca.pem");
+        std::fs::write(&ca_path, b"").expect("write");
+        let result = build(Some(ca_path.to_str().expect("utf8 path")));
+        assert!(
+            result.is_err(),
+            "configured-but-empty H3 client CA must fail closed (Err)"
+        );
+    }
+
+    #[test]
+    fn valid_client_ca_builds_with_mtls() {
+        // The happy path: a valid client CA bundle still yields a usable QUIC
+        // server config (now with client-cert verification wired in).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = write_valid_ca(dir.path());
+        let result = build(Some(&ca_path));
+        assert!(
+            result.is_ok(),
+            "valid H3 client CA must build successfully: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn no_client_ca_builds_without_client_auth() {
+        // The only path that legitimately yields no client auth is an
+        // explicitly *unconfigured* client CA bundle.
+        let result = build(None);
+        assert!(
+            result.is_ok(),
+            "H3 without a configured client CA must build (no client auth): {:?}",
+            result.err()
         );
     }
 }

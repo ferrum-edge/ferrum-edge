@@ -726,6 +726,185 @@ fn non_strict_absent_source_returns_mixed_local_and_remote() {
     );
 }
 
+/// A CROSS-CLUSTER east-west GATEWAY target — carries BOTH the remote-provenance
+/// tag (so it counts as remote) AND the `mesh.cross_cluster` marker, mirroring
+/// `append_cross_cluster_mesh_targets`. Its presence forces local-first
+/// selection regardless of the `locality_lb_strict` opt-in.
+fn cross_cluster_target(host: &str, locality: Option<&str>) -> UpstreamTarget {
+    let mut t = remote_target(host, locality);
+    t.tags
+        .insert("mesh.cross_cluster".to_string(), "true".to_string());
+    t
+}
+
+#[test]
+fn cross_cluster_gateway_target_is_local_first_without_strict_opt_in() {
+    // [R4-2] No source locality + locality_lb_strict at its DEFAULT false: a
+    // cross-cluster east-west GATEWAY target (mesh.cross_cluster=true) is
+    // always-failover, so selection must restrict to healthy LOCAL endpoints and
+    // NOT round-robin onto the remote gateway — UNLIKE a plain `mesh.remote`
+    // target (see `non_strict_absent_source_returns_mixed_local_and_remote`,
+    // which stays mixed). This is the optional-locality default the M5 east-west
+    // datapath must get right.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            target("local-a.local", Some("us-west/us-west-1/a")),
+            target("local-b.local", Some("us-west/us-west-1/b")),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    assert!(
+        !up.locality_lb_strict,
+        "test premise: locality_lb_strict stays at its default false"
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "local endpoints must keep serving — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("eastwest-gw.local"),
+        "the cross-cluster gateway target must NOT be selected while local endpoints are healthy, \
+         even with locality_lb_strict at its default false — saw {seen:?}"
+    );
+}
+
+#[test]
+fn cross_cluster_gateway_target_serves_when_no_local_endpoint() {
+    // A service that exists ONLY remotely (no local endpoint): local-first must
+    // WIDEN to the cross-cluster gateway rather than black-holing.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![cross_cluster_target(
+            "eastwest-gw.local",
+            Some("remote-cluster-east"),
+        )],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("eastwest-gw.local"),
+        "with no local endpoint, selection must widen to the cross-cluster gateway — saw {seen:?}"
+    );
+}
+
+#[test]
+fn cross_cluster_unhealthy_local_fails_over_to_healthy_gateway() {
+    // [R5-2] No source locality, locality_lb_strict OFF: when the LOCAL endpoint
+    // is unhealthy (health-checked down) and the cross-cluster gateway is
+    // healthy, selection must fail OVER to the healthy gateway — NOT fail closed
+    // to the unhealthy local (the strict-mode contract, which is the OPPOSITE of
+    // what a deliberate failover target wants).
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            local.clone(),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    assert!(!up.locality_lb_strict, "test premise: strict stays off");
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &local), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("xc-failover-{i}"),
+            Some(&health),
+        )
+        .expect("failover selected");
+        assert_eq!(
+            selection.target.host, "eastwest-gw.local",
+            "unhealthy local must fail OVER to the healthy cross-cluster gateway, not fail closed"
+        );
+    }
+}
+
+#[test]
+fn cross_cluster_local_first_when_source_locality_present_but_locals_unlabeled() {
+    // [R6-1] Source HAS a locality but the LOCAL endpoints carry no locality
+    // metadata: every ranked tier misses, so without the cross-cluster pre-filter
+    // selection would fall through to the mixed pool and round-robin onto the
+    // gateway. The pre-filter keeps it local-first.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        Some("us-west/us-west-1/a"),
+        vec![
+            target("local-a.local", None),
+            target("local-b.local", None),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "unlabeled local endpoints must keep serving — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("eastwest-gw.local"),
+        "cross-cluster gateway must not round-robin with healthy locals even when ranked tiers \
+         miss (source locality present, locals unlabeled) — saw {seen:?}"
+    );
+}
+
+#[test]
+fn cross_cluster_local_first_when_locality_lb_disabled() {
+    // [R6-2] `localityLbSetting.enabled=false` short-circuits the tier logic; the
+    // cross-cluster failover pre-filter runs BEFORE that short-circuit, so the
+    // gateway stays failover-only behind healthy locals.
+    let mut up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            target("local-a.local", Some("us-west/us-west-1/a")),
+            target("local-b.local", Some("us-west/us-west-1/b")),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    up.locality_lb_setting = Some(UpstreamLocalityLbSetting {
+        enabled: false,
+        distribute: Vec::new(),
+        failover: Vec::new(),
+    });
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "local endpoints must keep serving with locality LB disabled — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("eastwest-gw.local"),
+        "cross-cluster gateway must stay failover-only even when localityLbSetting.enabled=false \
+         — saw {seen:?}"
+    );
+}
+
 #[test]
 fn strict_locality_present_source_unchanged_priority_tier() {
     // With a resolved source locality, strict mode is inert: priority-tier

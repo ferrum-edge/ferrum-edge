@@ -1576,3 +1576,405 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
         "H3 backend must have received the frontend GET; recorded: {received:#?}"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests 13–14 — H1/H2 frontend → native H3 backend RESPONSE STREAMING downgrade.
+//
+// When a response-body plugin (here `compression`) is active and the client
+// offers `accept-encoding`, the base decision is to BUFFER the response
+// (`should_stream_response_body` == false). For a `206`/`Content-Range` (or SSE)
+// body that the plugin would release, the reqwest / direct-H2 backend paths
+// already DOWNGRADE buffer→stream via `refine_stream_response_for_content_type`
+// once the response headers are known. The H1/H2-frontend → native-H3-backend
+// path used to be unable to: the H3 pool's buffered `request()` drained the
+// whole body internally before exposing headers, so a large ranged H3 download
+// was buffered (and could trip the response-size limit into a `502
+// ResponseBodyTooLarge`) and backend trailers were dropped.
+//
+// These tests pin the fix: `proxy_to_backend_http3` now calls the STREAMING H3
+// pool API on the buffered branch, runs the same `refine_*` downgrade, and
+// streams the response (forwarding backend trailers via `H3FrameSource`). They
+// reuse the proven h2c-frontend → native-H3-backend wiring from Test 12.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// File-mode YAML for one HTTPS proxy at `(127.0.0.1, port)` with a
+/// proxy-scoped `compression` plugin. compression buffers the response by
+/// default (when the client offers `accept-encoding`), forcing the buffered
+/// dispatch decision these tests need to exercise the downgrade.
+fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{ "plugin_config_id": "compress-1" }],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "compress-1",
+            "proxy_id": "scripted-h3",
+            "plugin_name": "compression",
+            "scope": "proxy",
+            "enabled": true,
+            "config": { "algorithms": ["gzip"] },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// Minimal response captured by [`raw_h2c_request`].
+struct RawH2Response {
+    status: u16,
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+    /// Response trailers (lower-cased names), populated from the H2 trailers
+    /// frame. reqwest discards trailers, so the tests can't use `Http2Client`.
+    trailers: std::collections::HashMap<String, String>,
+    /// `Some` when the body stream ended with an error (e.g. a `RST_STREAM`
+    /// after a mid-stream size-limit truncation) instead of a clean END_STREAM.
+    body_error: Option<String>,
+}
+
+/// Drive a single raw h2c (HTTP/2 prior-knowledge over cleartext) request to
+/// the gateway and capture status, headers, body, AND trailers. The status +
+/// headers are read as soon as the response head arrives, so a request whose
+/// body later truncates (size-limit `RST_STREAM`) still surfaces its `206`
+/// status — the signal that the response STREAMED rather than being rejected
+/// as a buffered `502`.
+async fn raw_h2c_request(
+    url: &str,
+    method: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<RawH2Response, Box<dyn std::error::Error + Send + Sync>> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let uri: hyper::Uri = url.parse()?;
+    let authority = uri.authority().ok_or("url missing authority")?.to_string();
+    let addr: std::net::SocketAddr = authority.parse()?;
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = hyper::Request::builder().method(method).uri(url);
+    for (k, v) in extra_headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Empty::<bytes::Bytes>::new())?;
+    let resp = tokio::time::timeout(Duration::from_secs(15), sender.send_request(req)).await??;
+
+    let status = resp.status().as_u16();
+    let mut headers = std::collections::HashMap::new();
+    for (k, v) in resp.headers() {
+        if let Ok(s) = v.to_str() {
+            headers.insert(k.as_str().to_ascii_lowercase(), s.to_string());
+        }
+    }
+
+    let mut body = Vec::new();
+    let mut trailers = std::collections::HashMap::new();
+    let mut body_error = None;
+    let mut incoming = resp.into_body();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), incoming.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    body.extend_from_slice(data);
+                } else if let Some(tr) = frame.trailers_ref() {
+                    for (k, v) in tr {
+                        if let Ok(s) = v.to_str() {
+                            trailers.insert(k.as_str().to_ascii_lowercase(), s.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Some(Err(e))) => {
+                body_error = Some(e.to_string());
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                body_error = Some("body read timed out".to_string());
+                break;
+            }
+        }
+    }
+    conn_task.abort();
+
+    Ok(RawH2Response {
+        status,
+        headers,
+        body,
+        trailers,
+        body_error,
+    })
+}
+
+/// Spawn the colocated TCP+TLS capability sidecar + scripted H3 backend +
+/// gateway (compression-enabled), wait for `h3 = supported`, and return the
+/// harness + backend handle. Shared by tests 13–14.
+async fn spawn_h3_streaming_downgrade_harness(
+    ca_name: &str,
+    h3_steps: Vec<H3Step>,
+    extra_env: &[(&str, &str)],
+) -> (GatewayHarness, ScriptedH3Backend) {
+    let ca = TestCa::new(ca_name).expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // TCP+TLS sidecar answers the capability probe (advertises h2+http/1.1);
+    // the real request lands on the H3 backend once h3=supported.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+    // Keep the sidecar alive for the whole test (probe may re-run).
+    Box::leak(Box::new(_tcp_backend));
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(h3_steps)
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let mut builder = GatewayHarness::builder()
+        .file_config(file_mode_yaml_for_h3_with_compression(backend_port))
+        .log_level("info")
+        .capture_output()
+        // Avoid pool warmup issuing an extra H3 request before the test's GET.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+    for (k, v) in extra_env {
+        builder = builder.env(*k, *v);
+    }
+    let harness = builder.spawn().await.expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the request uses the native H3 backend path; entry: {entry:#?}"
+    );
+
+    (harness, h3_backend)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 13 — a 206 the buffered (compression) decision would have buffered is
+// DOWNGRADED to streaming, delivering the full body AND forwarding backend
+// trailers to the H2 downstream client (with hop-by-hop trailer names stripped).
+// Pre-fix this path drained the body buffered and dropped the trailers.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trailers() {
+    let body_len = 512usize;
+    let body = bytes::Bytes::from(vec![b'r'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness(
+        "phase-h3-206-trailers",
+        vec![
+            H3Step::AcceptStream,
+            // 206 + Content-Range WITH Content-Length. The Content-Length is
+            // load-bearing: the backend drops the QUIC connection
+            // (H3_NO_ERROR) at end-of-script, and `H3FrameSource`'s
+            // graceful-close recovery only treats that close as a clean EOS
+            // when the body is provably complete — which needs a
+            // Content-Length (see `is_response_body_complete`). Without it the
+            // streamed body ends in an error instead of clean END_STREAM.
+            H3Step::RespondHeaders(vec![
+                (":status", "206".to_string()),
+                (
+                    "content-range",
+                    format!("bytes 0-{}/{}", body_len - 1, body_len * 8),
+                ),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            // Let HEADERS+DATA reach the gateway + stream to the client before
+            // the trailers, mirroring the proven streaming-test shape.
+            H3Step::StallFor(Duration::from_millis(50)),
+            H3Step::RespondTrailers(vec![
+                ("x-backend-checksum", "sha256-deadbeef".to_string()),
+                // Hop-by-hop trailer name — must be stripped before forwarding.
+                ("transfer-encoding", "chunked".to_string()),
+            ]),
+            // Keep the connection open briefly so trailers propagate before the
+            // implicit end-of-script connection drop.
+            H3Step::StallFor(Duration::from_millis(100)),
+        ],
+        // Unlimited response size: this test is about the downgrade + trailer
+        // forwarding, so the full body + trailers must arrive cleanly.
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+    )
+    .await;
+
+    let resp = raw_h2c_request(
+        &harness.proxy_url("/api/range"),
+        "GET",
+        // No explicit Host: the H2 `:authority` is set from the request URI
+        // (127.0.0.1:<port>); an extra mismatched Host would trip
+        // `check_host_authority_consistency` (400) before routing.
+        &[("accept-encoding", "gzip"), ("range", "bytes=0-511")],
+    )
+    .await
+    .unwrap_or_else(|e| {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+    });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 206,
+        "expected the 206 to STREAM (not a buffered 502); headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected a clean stream end; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(
+        resp.body.len(),
+        body_len,
+        "expected the full {body_len}-byte body; got {}",
+        resp.body.len()
+    );
+    assert_eq!(
+        resp.body.as_slice(),
+        body.as_ref(),
+        "downstream body must match the backend body byte-for-byte"
+    );
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-deadbeef"),
+        "backend trailer must be forwarded to the H2 downstream client (the buffered \
+         decision was downgraded to streaming); trailers={:?}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("transfer-encoding"),
+        "hop-by-hop trailer name must be stripped before forwarding; trailers={:?}",
+        resp.trailers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.method == "GET"),
+        "H3 backend must have received the GET; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14 — a LARGE 206 (no Content-Length) under a small response-size limit
+// is STREAMED (status 206 reaches the client) instead of being converted into a
+// buffered `502 ResponseBodyTooLarge`. The streamed body is then truncated at
+// the limit (a mid-stream `RST_STREAM`), but the `206` status proves the
+// response started streaming — pre-fix the buffered drain rejected it with a
+// 502 before any bytes/headers reached the client.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_large_206_streams_not_buffered_502() {
+    // Keep `LIMIT` and the env string below in lock-step.
+    const LIMIT: usize = 4096;
+    const LIMIT_ENV: &str = "4096";
+    // First chunk is UNDER the limit, second chunk pushes cumulative OVER it.
+    let first_chunk = bytes::Bytes::from(vec![b'd'; 2048]);
+    let second_chunk = bytes::Bytes::from(vec![b'e'; 4096]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness(
+        "phase-h3-large-206",
+        vec![
+            H3Step::AcceptStream,
+            // 206 with NO Content-Length: the declared-length pre-stream reject
+            // can't fire, so the downgrade must stream and the incremental
+            // size-limit applies WHILE streaming (truncating mid-body) rather
+            // than rejecting up front with a buffered 502.
+            H3Step::RespondHeaders(vec![
+                (":status", "206".to_string()),
+                ("content-range", format!("bytes 0-12287/{}", 64 * 1024)),
+                ("content-type", "application/octet-stream".to_string()),
+            ]),
+            // First (under-limit) chunk, then a stall so the gateway's coalescer
+            // flushes the 206 headers + this chunk to the client BEFORE the
+            // over-limit chunk trips the size guard. Without that flush, the
+            // size error would surface on the first body poll (before headers)
+            // and reset the stream with no status — masking the "streamed, not
+            // buffered-502" signal.
+            H3Step::RespondData(first_chunk),
+            H3Step::StallFor(Duration::from_millis(60)),
+            // This chunk pushes cumulative bytes past the limit → mid-stream
+            // truncation (RST_STREAM), NOT a pre-stream buffered 502.
+            H3Step::RespondData(second_chunk),
+            H3Step::StallFor(Duration::from_millis(100)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", LIMIT_ENV)],
+    )
+    .await;
+
+    let resp = raw_h2c_request(
+        &harness.proxy_url("/api/big-range"),
+        "GET",
+        // No explicit Host (see the trailers test): the URI sets `:authority`.
+        &[("accept-encoding", "gzip"), ("range", "bytes=0-")],
+    )
+    .await
+    .unwrap_or_else(|e| {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+    });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    // The KEY assertion: the client sees 206 (streaming started), NOT a buffered
+    // 502 ResponseBodyTooLarge. Pre-fix the H3 buffered drain produced the 502.
+    assert_eq!(
+        resp.status, 206,
+        "large H3-backend range response must STREAM (status 206) instead of being \
+         converted into a buffered 502; got {} headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.status, resp.headers, resp.body_error
+    );
+    // The body is bounded by the incremental size limit (the stream is cut once
+    // it would exceed the cap), so the client received at most ~`limit` bytes
+    // and the stream ended with an error rather than a clean END_STREAM.
+    assert!(
+        resp.body.len() <= LIMIT,
+        "streamed body must be bounded by the incremental size limit ({LIMIT}); got {}",
+        resp.body.len()
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.method == "GET"),
+        "H3 backend must have received the GET; recorded: {received:#?}"
+    );
+}

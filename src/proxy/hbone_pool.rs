@@ -1344,9 +1344,16 @@ pub(crate) async fn dial_h2_connect_sender(
         pool_config.tcp_keepalive_seconds,
     );
 
+    // `dial_h2_connect_sender` backs HBONE egress (any-federated when the
+    // operator target carries no pin, else pinned) AND the PINNED Sidecar
+    // mesh-mTLS CONNECT tunnels (raw-TCP / UDP / WebSocket egress, all
+    // `expected_peer = Some`). None of these is the cross-cluster east-west HTTP
+    // path (that dials via `MeshMtlsConnectionPool::create_sender`), so no
+    // single-trust-domain scope applies here — pass `None`.
     let tls_config = build_spiffe_outbound_config(
         gateway_svid.clone(),
         expected_peer.cloned(),
+        None,
         vec![b"h2".to_vec()],
     )?;
     let connector = TlsConnector::from(tls_config);

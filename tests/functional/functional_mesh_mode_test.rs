@@ -46,9 +46,10 @@ use ferrum_edge::identity::workload_api::proto::{
     X509svidResponse,
 };
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, ServicePort, ServiceTargetPort, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, EastWestGateway, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode,
+    MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, ServicePort,
+    ServiceTargetPort, TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef,
+    WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -3026,6 +3027,704 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
     assert!(
         !body.contains("backend-ok"),
         "no backend body may leak through an unverified mTLS session: {body:?}\n{logs}"
+    );
+}
+
+// ── Cross-cluster east-west egress (Sidecar mesh-mTLS, two trust domains) ────
+
+/// A minted SVID's on-disk cert/key paths. The issuing CA PEM is returned
+/// separately by the minters (so the OTHER cluster's slice can federate this
+/// CA's root for cross-trust-domain verification).
+struct CrossClusterSvid {
+    cert_path: String,
+    key_path: String,
+}
+
+/// Mint a fresh CA and a leaf SVID carrying `spiffe_id`'s URI SAN under it,
+/// writing the cert/key/bundle into `dir` under `prefix`. Returns the SVID
+/// material + `(CA PEM, Issuer)` so additional leaves can be minted under the
+/// SAME CA via [`mint_cross_cluster_svid_under`] (e.g. the east-west gateway B
+/// and dest C both under cluster-B's CA).
+fn mint_cross_cluster_svid(
+    dir: &std::path::Path,
+    prefix: &str,
+    spiffe_id: &str,
+) -> (
+    CrossClusterSvid,
+    (String, rcgen::Issuer<'static, rcgen::KeyPair>),
+) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+    params
+        .subject_alt_names
+        .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.not_before = not_before;
+    params.not_after = not_after;
+    let cert = params.signed_by(&leaf_key, &issuer).expect("leaf cert");
+
+    let cert_path = dir.join(format!("{prefix}-svid.crt"));
+    let key_path = dir.join(format!("{prefix}-svid.key"));
+    let bundle_path = dir.join(format!("{prefix}-bundle.pem"));
+    std::fs::write(&cert_path, cert.pem()).expect("write svid cert");
+    std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write svid key");
+    std::fs::write(&bundle_path, &ca_pem).expect("write trust bundle");
+    let to_str = |p: PathBuf| p.to_str().expect("path utf8").to_string();
+    (
+        CrossClusterSvid {
+            cert_path: to_str(cert_path),
+            key_path: to_str(key_path),
+        },
+        (ca_pem, issuer),
+    )
+}
+
+/// Mint a leaf SVID under an ALREADY-minted CA `issuer` (same trust domain), so
+/// the east-west gateway and the destination workload can both chain to one
+/// cluster CA. Writes cert/key/bundle and returns the SVID material.
+fn mint_cross_cluster_svid_under(
+    dir: &std::path::Path,
+    prefix: &str,
+    spiffe_id: &str,
+    ca_pem: &str,
+    issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+) -> CrossClusterSvid {
+    use rcgen::{
+        CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+    params
+        .subject_alt_names
+        .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.not_before = not_before;
+    params.not_after = not_after;
+    let cert = params.signed_by(&leaf_key, issuer).expect("leaf cert");
+
+    let cert_path = dir.join(format!("{prefix}-svid.crt"));
+    let key_path = dir.join(format!("{prefix}-svid.key"));
+    let bundle_path = dir.join(format!("{prefix}-bundle.pem"));
+    std::fs::write(&cert_path, cert.pem()).expect("write svid cert");
+    std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write svid key");
+    std::fs::write(&bundle_path, ca_pem).expect("write trust bundle");
+    let to_str = |p: PathBuf| p.to_str().expect("path utf8").to_string();
+    CrossClusterSvid {
+        cert_path: to_str(cert_path),
+        key_path: to_str(key_path),
+    }
+}
+
+/// A config-layer `TrustBundle` (base64 DER) for `trust_domain` from a CA PEM.
+fn config_trust_bundle(trust_domain: &str, ca_pem: &str) -> TrustBundle {
+    use base64::Engine;
+    let der = ca_der_from_pem(ca_pem);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    TrustBundle {
+        trust_domain: TrustDomain::new(trust_domain).expect("trust domain"),
+        x509_authorities: vec![b64],
+        jwt_authorities: Vec::new(),
+        refresh_hint_seconds: None,
+    }
+}
+
+/// A `TrustBundleSet` with `local` = own CA and `federated` = the peer's CA, so
+/// a slice can verify cross-trust-domain peers (set directly in the static
+/// slice — no live federation poller in the functional test).
+fn federated_trust_bundle_set(
+    local_td: &str,
+    local_ca_pem: &str,
+    federated_td: &str,
+    federated_ca_pem: &str,
+) -> TrustBundleSet {
+    TrustBundleSet {
+        local: config_trust_bundle(local_td, local_ca_pem),
+        federated: vec![config_trust_bundle(federated_td, federated_ca_pem)],
+    }
+}
+
+/// Destination (gateway C) slice: Sidecar, trust domain B. Serves `svc-c`
+/// inbound (STRICT mTLS) → the echo backend at `127.0.0.1:backend_port`. Its
+/// `trust_bundles` federate cluster-A's CA so C's STRICT inbound accepts the
+/// client A's SVID (trust domain A).
+fn cross_cluster_dest_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    backend_port: u16,
+    b_local_ca_pem: &str,
+    a_ca_pem: &str,
+) -> MeshSlice {
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: c_id.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "svc-c".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "svc-c".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster-b.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            // C is the LOCAL workload here; leave cluster/network UNSET so
+            // `workload_is_local` (SPIFFE + cluster match) recognizes it as local
+            // and materializes the inbound loopback route. A mismatched `cluster`
+            // (vs C's unset local cluster) would classify it non-local and skip
+            // inbound materialization → 404.
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-c".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-c".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: backend_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: c_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        trust_bundles: Some(federated_trust_bundle_set(
+            "cluster-b.local",
+            b_local_ca_pem,
+            "cluster.local",
+            a_ca_pem,
+        )),
+        ..MeshSlice::default()
+    }
+}
+
+/// East-west gateway (B) slice: topology EastWestGateway, trust domain B. SNI
+/// passthrough — its per-service inbound for `svc-c` forwards SNI=`svc-c` FQDN →
+/// C's sidecar inbound listener at `127.0.0.1:c_inbound_port`.
+///
+/// TEST-REALISM MODELING (Codex round-1 finding #7 — NOT a client/datapath bug):
+/// the CLIENT (gateway A) datapath is correct — it dials the east-west gateway
+/// with the destination service FQDN as the ClientHello SNI, exactly as a real
+/// cross-cluster sidecar would. In a real injected-sidecar destination, the
+/// gateway forwards the opaque TLS to the destination workload's APP port, and
+/// the destination pod's INBOUND iptables capture REDIRECTS that app-port traffic
+/// to the sidecar's `:15006` mTLS listener (the same model same-cluster east-west
+/// INBOUND uses — `build_east_west_service_targets` forwards to the workload
+/// app/target port, NOT `:15006`). The functional test cannot run iptables, so it
+/// COLLAPSES that destination-side redirect by modeling the service port (and the
+/// east-west "workload" address) as C's sidecar inbound mTLS listener directly
+/// (`c_inbound_port`) — so the passthrough lands straight on the listener that
+/// terminates the client mTLS. This is a test-harness limitation, not a client
+/// bug; the live two-cluster k8s fixture (Stage 2) exercises the realistic
+/// app-port→`:15006` iptables path. See `docs/mesh.md` (cross-cluster east-west).
+fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: u16) -> MeshSlice {
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        // The east-west passthrough forwards SNI → the service workload addr:port;
+        // here that "workload" is C's INBOUND mTLS listener (modeling the
+        // destination's inbound iptables redirect — see the fn doc).
+        workloads: vec![Workload {
+            spiffe_id: c_id.clone(),
+            selector: WorkloadSelector::default(),
+            service_name: "svc-c".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: c_inbound_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster-b.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("svc-c".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-c".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: c_inbound_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: c_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Client (gateway A) slice: Sidecar, trust domain A. Declares `svc-c` with a
+/// REMOTE workload (network net-b, trust domain B) and a `MultiClusterConfig`
+/// whose `EastWestGateway{network:net-b, host:127.0.0.1, port:b_east_west_port}`
+/// fronts net-b. Its `trust_bundles` federate cluster-B's CA so A's outbound
+/// (trust-domain-only) verification accepts C's server SVID (trust domain B).
+fn cross_cluster_client_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    service_port: u16,
+    b_east_west_port: u16,
+    a_local_ca_pem: &str,
+    b_ca_pem: &str,
+) -> MeshSlice {
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        // The REMOTE workload of svc-c (trust domain B, network net-b). Its
+        // address is a remote pod IP that must NEVER be dialed directly — the
+        // cross-cluster target dials the east-west gateway instead.
+        workloads: vec![Workload {
+            spiffe_id: c_id.clone(),
+            selector: WorkloadSelector::default(),
+            service_name: "svc-c".to_string(),
+            addresses: vec!["10.244.7.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: service_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster-b.local").expect("trust domain"),
+            namespace: "ferrum".to_string(),
+            network: Some("net-b".to_string()),
+            cluster: Some("cluster-b".to_string()),
+            weight: None,
+            locality: Some("remote-cluster-b/net-b".to_string()),
+            service_account: Some("svc-c".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            // Authoritative remote marker (set by remote-poll ingestion in
+            // production; set here directly so `workload_is_remote` classifies
+            // it remote without a live discovery poll).
+            remote_provenance: true,
+        }],
+        services: vec![MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-c".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: service_port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: c_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            federation_endpoint: None,
+            remote_clusters: Vec::new(),
+            east_west_gateways: vec![EastWestGateway {
+                name: "ew-net-b".to_string(),
+                namespace: "ferrum".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: b_east_west_port,
+                sni_hosts: vec!["svc-c.ferrum.svc.cluster.local".to_string()],
+                trust_domain: Some(TrustDomain::new("cluster-b.local").expect("trust domain")),
+                network: Some("net-b".to_string()),
+            }],
+        }),
+        trust_bundles: Some(federated_trust_bundle_set(
+            "cluster.local",
+            a_local_ca_pem,
+            "cluster-b.local",
+            b_ca_pem,
+        )),
+        ..MeshSlice::default()
+    }
+}
+
+/// Drive one captured app request from client gateway A across the east-west
+/// gateway B to the echo backend behind dest gateway C, over two trust domains
+/// with a federated bundle. `client_trusted` selects whether A's SVID chains to
+/// a CA in C's federated trust set (the negative: an untrusted A must NOT reach
+/// C's backend). Returns `(status, body, combined_logs)`.
+async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let c_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/svc-c";
+    let b_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/ew-gateway";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_a = format!("functional-mesh-xc-{trust_label}-a-{attempt}");
+        let node_b = format!("functional-mesh-xc-{trust_label}-b-{attempt}");
+        let node_c = format!("functional-mesh-xc-{trust_label}-c-{attempt}");
+        let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let temp_c = TempDir::new().map_err(|e| format!("temp dir c: {e}"))?;
+
+        // Cluster-B CA backs both the east-west gateway B and the dest C.
+        let (c_svid, b_ca) = mint_cross_cluster_svid(temp_c.path(), "gateway-c", c_spiffe);
+        let b_ca_pem = b_ca.0.clone();
+        let b_svid =
+            mint_cross_cluster_svid_under(temp_b.path(), "gateway-b", b_spiffe, &b_ca_pem, &b_ca.1);
+
+        // Cluster-A CA backs client A. A trusted A chains to its own CA, which
+        // C federates; an UNTRUSTED A mints a separate CA that C does NOT
+        // federate (and whose bundle does not contain B's CA), so both
+        // directions of the handshake fail closed.
+        let (a_svid, a_ca_pem) = {
+            let (svid, ca) = mint_cross_cluster_svid(temp_a.path(), "gateway-a", a_spiffe);
+            (svid, ca.0)
+        };
+        // The CA A's identity actually chains to (for C's federated set): the
+        // trusted A federates A's real CA; the untrusted case federates a
+        // DIFFERENT throwaway CA so C never trusts the real A.
+        let a_ca_for_c_federation = if client_trusted {
+            a_ca_pem.clone()
+        } else {
+            // A throwaway CA unrelated to A's SVID — C federates this, so A's
+            // real SVID is rejected by C's STRICT inbound.
+            let (_throwaway, throwaway_ca) = mint_cross_cluster_svid(
+                temp_c.path(),
+                "throwaway-a",
+                "spiffe://cluster.local/ns/ferrum/sa/nobody",
+            );
+            throwaway_ca.0
+        };
+        // Symmetrically, the B CA A federates: the trusted A federates B's real
+        // CA (so A accepts C's server SVID); the untrusted A federates a
+        // throwaway so A also rejects C.
+        let b_ca_for_a_federation = if client_trusted {
+            b_ca_pem.clone()
+        } else {
+            let (_throwaway, throwaway_ca) = mint_cross_cluster_svid(
+                temp_a.path(),
+                "throwaway-b",
+                "spiffe://cluster-b.local/ns/ferrum/sa/nobody",
+            );
+            throwaway_ca.0
+        };
+
+        let backend_port = start_echo_backend().await;
+        let ports_a = reserve_mesh_ports().await;
+        let ports_b = reserve_mesh_ports().await;
+        let ports_c = reserve_mesh_ports().await;
+        let a_outbound_port = ports_a.outbound;
+        let b_east_west_port = ports_b.east_west;
+        let c_inbound_port = ports_c.inbound;
+
+        let cp_c = start_static_mesh_cp(cross_cluster_dest_slice(
+            &node_c,
+            c_spiffe,
+            backend_port,
+            &b_ca_pem,
+            &a_ca_for_c_federation,
+        ))
+        .await;
+        let cp_b = start_static_mesh_cp(cross_cluster_east_west_slice(
+            &node_b,
+            c_spiffe,
+            c_inbound_port,
+        ))
+        .await;
+        let cp_a = start_static_mesh_cp(cross_cluster_client_slice(
+            &node_a,
+            c_spiffe,
+            backend_port,
+            b_east_west_port,
+            &a_ca_pem,
+            &b_ca_for_a_federation,
+        ))
+        .await;
+
+        // Gateway C (dest): serves svc-c inbound STRICT → echo backend.
+        let mut child_c = spawn_mesh_gateway(
+            &temp_c,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_c.addr,
+                ports: ports_c,
+                node_id: &node_c,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", c_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", c_svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", c_svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        temp_c
+                            .path()
+                            .join("gateway-c-bundle.pem")
+                            .to_str()
+                            .expect("bundle path utf8")
+                            .to_string(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(c_inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway C inbound listener never bound\n{}",
+                captured_output(&temp_c)
+            );
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Gateway B (east-west): SNI passthrough → C's inbound.
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology: "east_west_gateway",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", b_svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", b_svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        temp_b
+                            .path()
+                            .join("gateway-b-bundle.pem")
+                            .to_str()
+                            .expect("bundle path utf8")
+                            .to_string(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway B east-west listener never bound\n{}",
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Gateway A (client): outbound capture → cross-cluster egress route.
+        let mut child_a = spawn_mesh_gateway(
+            &temp_a,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_a.addr,
+                ports: ports_a,
+                node_id: &node_a,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        temp_a
+                            .path()
+                            .join("gateway-a-bundle.pem")
+                            .to_str()
+                            .expect("bundle path utf8")
+                            .to_string(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                captured_output(&temp_a)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Drive the captured app request for svc-c. The positive path retries
+        // until it converges to 200 (slice apply / route materialization race);
+        // the negative asserts the FINAL state (must never converge to 200).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<(u16, String), String> = loop {
+            let attempt =
+                match plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+                    .await
+                {
+                    Ok((status, body)) => {
+                        if status == 200 && body.contains("backend-ok") {
+                            break Ok((status, body));
+                        }
+                        Ok((status, body))
+                    }
+                    Err(e) => Err(format!("cross-cluster egress GET failed: {e}")),
+                };
+            if Instant::now() >= deadline {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let output_a = captured_output(&temp_a);
+        let output_b = captured_output(&temp_b);
+        let output_c = captured_output(&temp_c);
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+
+        let logs = format!(
+            "--- gateway A (client) ---\n{output_a}\n--- gateway B (east-west) ---\n{output_b}\n\
+             --- gateway C (dest) ---\n{output_c}"
+        );
+        return match last {
+            Ok((status, body)) => Ok((status, body, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "cross-cluster gateways never bound their listeners after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster keystone (Sidecar mesh-mTLS): a captured plaintext request at
+/// client gateway A (trust domain A) reaches the echo backend behind dest
+/// gateway C (trust domain B) THROUGH the east-west gateway B — outbound capture
+/// → materialized CROSS-CLUSTER egress target (dial the remote east-west gateway
+/// with SNI = the destination service FQDN, TRUST-DOMAIN-ONLY peer verification)
+/// → B's SNI passthrough → C's STRICT inbound (verifies A's client SVID via the
+/// FEDERATED bundle) → materialized loopback route → C's backend → response back
+/// to A.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_cross_cluster_egress_routes_a_to_c_over_east_west() {
+    let (status, body, logs) = drive_cross_cluster_egress(true)
+        .await
+        .expect("cross-cluster egress drive");
+    assert_eq!(
+        status, 200,
+        "the captured request must traverse A's cross-cluster egress through the east-west \
+         gateway to C's backend; body: {body:?}\n{logs}"
+    );
+    assert!(
+        body.contains("backend-ok"),
+        "the response must carry the destination backend body: {body:?}\n{logs}"
+    );
+}
+
+/// Cross-cluster negative: a client gateway A whose SVID is NOT in the
+/// destination's federated trust set must not reach C. C's STRICT inbound
+/// rejects A's client cert (untrusted CA) and A rejects C's server SVID
+/// (untrusted CA) — both fail the request closed, proving the cross-cluster
+/// transport really verifies SVIDs against the federated bundle (trust-domain
+/// membership, not blind tunneling) and never falls back to plaintext.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_cross_cluster_egress_rejects_untrusted_client() {
+    let (status, body, logs) = drive_cross_cluster_egress(false)
+        .await
+        .expect("untrusted cross-cluster egress drive");
+    assert_ne!(
+        status, 200,
+        "an untrusted client gateway's cross-cluster request must fail closed, not reach \
+         the destination backend\n{logs}"
+    );
+    assert!(
+        !body.contains("backend-ok"),
+        "no destination backend body may leak through an unverified cross-cluster mTLS \
+         session: {body:?}\n{logs}"
     );
 }
 
