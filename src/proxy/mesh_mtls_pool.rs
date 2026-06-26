@@ -67,6 +67,28 @@ pub const ISTIO_SIDECAR_INBOUND_PORT: u16 = 15006;
 /// Single-port destinations are never stamped and keep the client authority
 /// byte-for-byte.
 pub const MESH_MTLS_AUTHORITY_PORT_TAG: &str = "mesh.mtls_authority_port";
+/// Tag overriding the ClientHello SNI of a Sidecar mesh-mTLS dial. Value = the
+/// DESTINATION service FQDN. Stamped ONLY on cross-cluster east-west targets
+/// (see [`MESH_CROSS_CLUSTER_TAG`]): the dial host is the remote east-west
+/// gateway address, but the gateway does SNI passthrough and routes the opaque
+/// outer TLS to the destination workload by the ClientHello SNI, so the SNI
+/// must name the destination service rather than the gateway. Absent ⇒ the SNI
+/// is the dial host (the normal in-cluster sidecar path). When a cross-cluster
+/// target is missing this tag the dispatch path FAILS CLOSED — it never falls
+/// back to the gateway IP as SNI (that would silently break passthrough
+/// routing).
+pub const MESH_EASTWEST_SNI_TAG: &str = "mesh.eastwest_sni";
+/// Tag (`= "true"`) marking a Sidecar mesh-mTLS target as a CROSS-CLUSTER
+/// east-west target whose dial host is a remote east-west gateway. The
+/// gateway SNI-passes the connection to an LB-picked destination workload the
+/// client cannot name, so the dial uses TRUST-DOMAIN-ONLY peer verification
+/// (`expected_peer = None`) rather than a pinned pod SPIFFE — the destination
+/// SVID must still be in a TRUSTED (federated) trust domain, never unverified.
+/// A cross-cluster target therefore carries NO `mesh.spiffe_id` and MUST carry
+/// [`MESH_EASTWEST_SNI_TAG`]. The pool key is partitioned so a trust-domain-only
+/// / SNI-overridden session never shares a pooled connection with a
+/// pinned-peer one.
+pub const MESH_CROSS_CLUSTER_TAG: &str = "mesh.cross_cluster";
 
 /// Multiplexed hyper H2 sender over the SVID-mTLS session. The body type is
 /// [`SizeLimitedIncoming`] so dispatch enforces `max_request_body_size_bytes`
@@ -114,12 +136,40 @@ pub fn target_mesh_mtls_authority_port(target: &UpstreamTarget) -> Option<u16> {
         .filter(|port| *port > 0)
 }
 
+/// Whether a target is a CROSS-CLUSTER east-west mesh-mTLS target (carries
+/// [`MESH_CROSS_CLUSTER_TAG`] = boolish-true). Such a target dials the remote
+/// east-west gateway with a destination-FQDN SNI override and uses
+/// trust-domain-only peer verification — see [`MESH_CROSS_CLUSTER_TAG`].
+pub fn target_mesh_mtls_cross_cluster(target: &UpstreamTarget) -> bool {
+    target
+        .tags
+        .get(MESH_CROSS_CLUSTER_TAG)
+        .is_some_and(|value| matches_boolish_true(value))
+}
+
+/// The destination-service-FQDN SNI override a cross-cluster target MUST carry
+/// ([`MESH_EASTWEST_SNI_TAG`]). Returns `None` when the tag is absent OR empty
+/// so the dispatch path can FAIL CLOSED — a cross-cluster dial without a usable
+/// SNI must be refused, never fall back to the gateway address as SNI.
+pub fn target_mesh_mtls_eastwest_sni(target: &UpstreamTarget) -> Option<&str> {
+    target
+        .tags
+        .get(MESH_EASTWEST_SNI_TAG)
+        .map(String::as_str)
+        .filter(|sni| !sni.is_empty())
+}
+
 /// The pinned peer identity a `mesh.mtls` target MUST declare. Unlike HBONE
 /// (where operator-supplied targets may legitimately omit the tag), Sidecar
 /// mTLS targets are only ever produced by the mesh materializer, which always
 /// stamps the destination workload identity — so an absent tag here is a
 /// config-corruption signal and fails the dial closed rather than silently
 /// downgrading to trust-domain-only verification.
+///
+/// NOTE: this is for PINNED (in-cluster) targets only. CROSS-CLUSTER east-west
+/// targets ([`target_mesh_mtls_cross_cluster`]) deliberately carry NO
+/// `mesh.spiffe_id` and use trust-domain-only verification; dispatch must NOT
+/// call this for them.
 pub fn target_mesh_mtls_expected_peer(target: &UpstreamTarget) -> Result<SpiffeId, HbonePoolError> {
     target_expected_peer_spiffe(target)?.ok_or_else(|| HbonePoolError::InvalidPeerSpiffeTag {
         value: String::new(),
@@ -382,13 +432,31 @@ impl MeshMtlsConnectionPool {
         record_mesh_mtls_evictions(evicted);
     }
 
-    /// Checkout (or create) a multiplexed H2 sender to `target_host:mtls_port`
-    /// whose mTLS session is pinned to `expected_peer`. The returned sender is
-    /// a cheap clone of the pooled connection handle. `app_port` is the
-    /// target's app (container) port — it never changes what is dialed, but it
-    /// partitions the pool so per-port siblings of a multi-port service don't
-    /// share connections (stream-cap saturation / idle pruning isolation; the
-    /// same per-app-port pool-key isolation the HBONE pool keeps).
+    /// Checkout (or create) a multiplexed H2 sender to `target_host:mtls_port`.
+    /// The returned sender is a cheap clone of the pooled connection handle.
+    /// `app_port` is the target's app (container) port — it never changes what
+    /// is dialed, but it partitions the pool so per-port siblings of a
+    /// multi-port service don't share connections (stream-cap saturation / idle
+    /// pruning isolation; the same per-app-port pool-key isolation the HBONE
+    /// pool keeps).
+    ///
+    /// Peer verification follows `expected_peer`:
+    /// - `Some(id)` — PINNED (in-cluster) dial: the peer's server SVID URI SAN
+    ///   must EQUAL `id` (trust-domain membership alone is not enough).
+    /// - `None` — TRUST-DOMAIN-ONLY (cross-cluster east-west) dial: the peer's
+    ///   SVID must be in a TRUSTED (federated) trust domain, but no specific
+    ///   pod identity is pinned (the east-west gateway LB-picks the workload).
+    ///   NEVER unverified — `build_spiffe_outbound_config(None)` still requires
+    ///   a trust bundle for the peer's trust domain.
+    ///
+    /// `sni_override` sets the ClientHello SNI when `Some` (cross-cluster: the
+    /// destination service FQDN so the gateway's SNI passthrough routes the
+    /// opaque TLS to the destination workload); `None` uses `target_host`.
+    ///
+    /// The pool key folds the SNI override and an expected-peer-or-`td-only`
+    /// discriminator so a trust-domain-only / SNI-overridden session NEVER
+    /// shares a pooled connection with a pinned-peer one.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
@@ -396,7 +464,8 @@ impl MeshMtlsConnectionPool {
         app_port: u16,
         app_policy_port: u16,
         mtls_port: u16,
-        expected_peer: &SpiffeId,
+        expected_peer: Option<&SpiffeId>,
+        sni_override: Option<&str>,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
         let fingerprint = self.current_svid_fingerprint_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
@@ -408,6 +477,7 @@ impl MeshMtlsConnectionPool {
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
             expected_peer,
+            sni_override,
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
@@ -422,6 +492,7 @@ impl MeshMtlsConnectionPool {
             proxy.dns_override.as_deref(),
             fingerprint.as_ref(),
             expected_peer,
+            sni_override,
             &pool_config,
             |key| key.to_string(),
         );
@@ -432,6 +503,7 @@ impl MeshMtlsConnectionPool {
             app_policy_port,
             mtls_port,
             expected_peer,
+            sni_override,
             &key,
             &pool_config,
         )
@@ -712,7 +784,8 @@ impl MeshMtlsConnectionPool {
         _app_port: u16,
         app_policy_port: u16,
         mtls_port: u16,
-        expected_peer: &SpiffeId,
+        expected_peer: Option<&SpiffeId>,
+        sni_override: Option<&str>,
         key: &str,
         pool_config: &PoolConfig,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
@@ -766,6 +839,7 @@ impl MeshMtlsConnectionPool {
                 target_host,
                 mtls_port,
                 expected_peer,
+                sni_override,
                 pool_config,
                 keepalive_override,
             ),
@@ -813,7 +887,7 @@ impl MeshMtlsConnectionPool {
             debug!(
                 target_host,
                 mtls_port,
-                expected_peer = %expected_peer.as_str(),
+                expected_peer = expected_peer_display(expected_peer),
                 "Sidecar SVID-mTLS connection completed under a rotated SVID; serving without pooling"
             );
             return Ok(sender);
@@ -843,7 +917,7 @@ impl MeshMtlsConnectionPool {
         debug!(
             target_host,
             mtls_port,
-            expected_peer = %expected_peer.as_str(),
+            expected_peer = expected_peer_display(expected_peer),
             "Created sidecar SVID-mTLS HTTP/2 connection"
         );
         Ok(sender)
@@ -921,7 +995,8 @@ impl MeshMtlsConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         mtls_port: u16,
-        expected_peer: &SpiffeId,
+        expected_peer: Option<&SpiffeId>,
+        sni_override: Option<&str>,
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
@@ -974,18 +1049,32 @@ impl MeshMtlsConnectionPool {
 
         // Plain mesh HTTP over mTLS speaks h2 to the peer sidecar's frontend
         // (which advertises h2 and preface-sniffs via `auto`), so advertise h2
-        // only. The peer identity is PINNED: its server SVID URI SAN must equal
-        // `expected_peer` exactly.
+        // only.
+        //
+        // Peer verification:
+        // - `Some(id)` (in-cluster) — the peer's server SVID URI SAN must EQUAL
+        //   `id` exactly (pinned identity).
+        // - `None` (cross-cluster east-west) — TRUST-DOMAIN-ONLY: the peer's
+        //   SVID is verified against the cached trust-bundle snapshot for its
+        //   own trust domain (which must be present in the federated bundle),
+        //   but no pod identity is pinned. NOT unverified.
         let tls_config = build_spiffe_outbound_config(
             self.gateway_svid.clone(),
-            Some(expected_peer.clone()),
+            expected_peer.cloned(),
             vec![b"h2".to_vec()],
         )?;
         let connector = TlsConnector::from(tls_config);
-        let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())
-            .map_err(|e| HbonePoolError::InvalidServerName {
-                host: target_host.to_string(),
-                message: e.to_string(),
+        // SNI: the destination service FQDN for a cross-cluster east-west dial
+        // (so the remote gateway's SNI passthrough routes the opaque TLS to the
+        // destination workload), else the dial host (the normal in-cluster
+        // path).
+        let sni_host = sni_override.unwrap_or(target_host);
+        let server_name =
+            rustls::pki_types::ServerName::try_from(sni_host.to_string()).map_err(|e| {
+                HbonePoolError::InvalidServerName {
+                    host: sni_host.to_string(),
+                    message: e.to_string(),
+                }
             })?;
 
         let Some(remaining) =
@@ -1065,10 +1154,22 @@ impl MeshMtlsConnectionPool {
 }
 
 /// SVID-fingerprint field of a mesh mTLS pool key:
-/// `mesh-mtls|{host}|{app_port}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|pool=...`
-/// — keep the index in sync with `write_mesh_mtls_pool_key`.
+/// `mesh-mtls|{host}|{app_port}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|{sni}|pool=...`
+/// — keep the index (5) in sync with `write_mesh_mtls_pool_key`. The `{peer}`
+/// and `{sni}` discriminators were appended AFTER the fingerprint field
+/// specifically so this positional parse did not move.
 fn mesh_mtls_key_svid_fingerprint(key: &str) -> Option<&str> {
     key.split('|').nth(5)
+}
+
+/// `tracing` display for the optional expected-peer identity used in pool/debug
+/// logs. `Some(id)` shows the pinned SPIFFE id; `None` shows the
+/// trust-domain-only marker (cross-cluster east-west dials).
+fn expected_peer_display(expected_peer: Option<&SpiffeId>) -> &str {
+    match expected_peer {
+        Some(peer) => peer.as_str(),
+        None => "td-only",
+    }
 }
 
 fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
@@ -1097,7 +1198,8 @@ fn with_mesh_mtls_pool_key<R>(
     mtls_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
-    expected_peer: &SpiffeId,
+    expected_peer: Option<&SpiffeId>,
+    sni_override: Option<&str>,
     pool_config: &PoolConfig,
     f: impl FnOnce(&str) -> R,
 ) -> R {
@@ -1111,6 +1213,7 @@ fn with_mesh_mtls_pool_key<R>(
             dns_override,
             svid_fingerprint,
             expected_peer,
+            sni_override,
             pool_config,
         );
         f(&buf)
@@ -1125,19 +1228,30 @@ fn write_mesh_mtls_pool_key(
     mtls_port: u16,
     dns_override: Option<&str>,
     svid_fingerprint: &str,
-    expected_peer: &SpiffeId,
+    expected_peer: Option<&SpiffeId>,
+    sni_override: Option<&str>,
     pool_config: &PoolConfig,
 ) {
     buf.clear();
-    // The pinned peer identity is connection identity: a session verified
-    // against one expected SVID must never serve a target pinning another.
-    // `app_port` mirrors the HBONE key's target-port field: per-port siblings
-    // of a multi-port service keep isolated connections.
+    // The peer-verification mode is connection identity: a session verified
+    // against one pinned SVID must never serve a target pinning another, and a
+    // TRUST-DOMAIN-ONLY / SNI-overridden cross-cluster session must NEVER share
+    // a pooled connection with a pinned-peer one. The peer field is the pinned
+    // SPIFFE id, or the `td-only` discriminator when verification is
+    // trust-domain-only (`expected_peer == None`). The SNI override (the
+    // destination FQDN on cross-cluster dials; empty otherwise) follows it so
+    // two cross-cluster targets to the SAME gateway for DIFFERENT destination
+    // services also keep isolated connections (each needs its own SNI). `peer`
+    // and `sni` are appended AFTER `svid_fingerprint` so
+    // `mesh_mtls_key_svid_fingerprint`'s positional parse (index 5) is
+    // unchanged. `app_port` mirrors the HBONE key's target-port field: per-port
+    // siblings of a multi-port service keep isolated connections.
     let _ = write!(
         buf,
-        "mesh-mtls|{host}|{app_port}|{mtls_port}|{}|{svid_fingerprint}|{}",
+        "mesh-mtls|{host}|{app_port}|{mtls_port}|{}|{svid_fingerprint}|{}|{}",
         dns_override.unwrap_or_default(),
-        expected_peer.as_str()
+        expected_peer_display(expected_peer),
+        sni_override.unwrap_or_default()
     );
     write_pool_config_key(buf, pool_config);
 }
@@ -1217,6 +1331,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cross_cluster_tag_and_eastwest_sni_parse() {
+        // Absent tags: an ordinary (in-cluster) target is not cross-cluster and
+        // carries no SNI override.
+        let plain = target_with_tags(&[(MESH_MTLS_TARGET_TAG, "true")]);
+        assert!(!target_mesh_mtls_cross_cluster(&plain));
+        assert_eq!(target_mesh_mtls_eastwest_sni(&plain), None);
+
+        // Cross-cluster target: the marker is boolish-true and the SNI override
+        // is the destination FQDN.
+        let xc = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_EASTWEST_SNI_TAG, "svc-b.ferrum.svc.cluster.local"),
+        ]);
+        assert!(target_mesh_mtls_cross_cluster(&xc));
+        assert_eq!(
+            target_mesh_mtls_eastwest_sni(&xc),
+            Some("svc-b.ferrum.svc.cluster.local")
+        );
+
+        // Empty SNI fails closed (None) so dispatch refuses the dial rather
+        // than falling back to the gateway address as SNI.
+        let empty_sni = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_EASTWEST_SNI_TAG, ""),
+        ]);
+        assert!(target_mesh_mtls_cross_cluster(&empty_sni));
+        assert_eq!(target_mesh_mtls_eastwest_sni(&empty_sni), None);
+    }
+
     #[tokio::test]
     async fn open_datagram_tunnel_fails_closed_without_svid() {
         // The Sidecar UDP datagram tunnel (#1808) must fail closed before dialing
@@ -1267,7 +1413,8 @@ mod tests {
                 15006,
                 None,
                 fp,
-                peer,
+                Some(peer),
+                None,
                 &pool_config,
                 |key| key.to_string(),
             )
@@ -1286,6 +1433,44 @@ mod tests {
     }
 
     #[test]
+    fn pool_key_isolates_trust_domain_only_and_sni_overridden_sessions() {
+        // A cross-cluster (trust-domain-only) / SNI-overridden mesh-mTLS session
+        // must NEVER share a pooled connection with a pinned-peer one, and two
+        // cross-cluster targets to the same gateway for different destination
+        // services must not share either.
+        let pool_config = PoolConfig::default();
+        let peer = test_peer();
+        let key = |peer: Option<&SpiffeId>, sni: Option<&str>| {
+            with_mesh_mtls_pool_key(
+                "10.9.9.9", // east-west gateway address
+                8080,
+                15443,
+                None,
+                "fp",
+                peer,
+                sni,
+                &pool_config,
+                |key| key.to_string(),
+            )
+        };
+        let pinned = key(Some(&peer), None);
+        let td_only = key(None, Some("svc-b.ferrum.svc.cluster.local"));
+        assert_ne!(
+            pinned, td_only,
+            "a trust-domain-only / SNI-overridden session must not share a pinned-peer connection"
+        );
+        // Same gateway + same td-only verification, different destination SNI.
+        let td_only_other = key(None, Some("svc-c.ferrum.svc.cluster.local"));
+        assert_ne!(
+            td_only, td_only_other,
+            "cross-cluster targets to the same gateway for different services need isolated pools"
+        );
+        // The fingerprint field stays positionally parseable with the new
+        // peer/SNI discriminators appended.
+        assert_eq!(mesh_mtls_key_svid_fingerprint(&td_only), Some("fp"));
+    }
+
+    #[test]
     fn pool_key_partitions_by_app_port() {
         let pool_config = PoolConfig::default();
         let peer = test_peer();
@@ -1296,7 +1481,8 @@ mod tests {
                 15006,
                 None,
                 "fp",
-                &peer,
+                Some(&peer),
+                None,
                 &pool_config,
                 |key| key.to_string(),
             )
@@ -1334,7 +1520,8 @@ mod tests {
             ISTIO_SIDECAR_INBOUND_PORT,
             None,
             fingerprint,
-            &test_peer(),
+            Some(&test_peer()),
+            None,
             &PoolConfig::default(),
             |key| key.to_string(),
         )

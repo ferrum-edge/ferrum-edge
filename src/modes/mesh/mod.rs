@@ -1995,6 +1995,50 @@ pub(crate) fn matched_local_service_workloads<'a>(
     matched
 }
 
+/// The REMOTE-cluster counterpart of [`matched_local_service_workloads`]: the
+/// service's workloads that ARE remote (`workload_is_remote == true`). Used by
+/// cross-cluster east-west materialization to learn (per remote network) the
+/// remote trust domain a service is reachable in, so a SIDECAR client can route
+/// the service to the remote network's east-west gateway. The local materializer
+/// filters these OUT (their pod IPs are unreachable); this helper deliberately
+/// keeps ONLY them — it never produces targets that dial a remote pod IP (the
+/// caller addresses the east-west gateway instead).
+///
+/// Mirrors the local helper's SPIFFE-ref + namespace matching and the
+/// `service_name`-vs-stale-metadata fallback, with the remoteness predicate
+/// flipped. The de-dup-by-index guard keeps one workload per ref.
+fn matched_remote_service_workloads<'a>(
+    service: &crate::modes::mesh::config::MeshService,
+    workloads: &'a [crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) -> Vec<&'a crate::modes::mesh::config::Workload> {
+    let mut matched = Vec::new();
+    let mut used_workload_indices = std::collections::HashSet::new();
+
+    for workload_ref in &service.workloads {
+        let has_matching_service_metadata = workloads.iter().any(|workload| {
+            workload.spiffe_id == workload_ref.spiffe_id
+                && workload.namespace == service.namespace
+                && workload.service_name == service.name
+        });
+        let Some((workload_index, workload)) =
+            workloads.iter().enumerate().find(|(idx, workload)| {
+                !used_workload_indices.contains(idx)
+                    && workload.spiffe_id == workload_ref.spiffe_id
+                    && workload.namespace == service.namespace
+                    && (workload.service_name == service.name || !has_matching_service_metadata)
+                    && crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
+            })
+        else {
+            continue;
+        };
+        used_workload_indices.insert(workload_index);
+        matched.push(workload);
+    }
+
+    matched
+}
+
 /// Build upstream targets from workloads that belong to the given service.
 ///
 /// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list.
@@ -4606,7 +4650,193 @@ fn build_outbound_mesh_targets(
         }
     }
 
+    // CROSS-CLUSTER east-west targets (SIDECAR mesh-mTLS only for now; Ambient
+    // HBONE is a fast-follow). For a service with REMOTE workloads, emit ONE
+    // target per remote NETWORK whose east-west gateway is known, addressed at
+    // the REMOTE gateway (the single ingress for that network — the gateway does
+    // per-workload LB, so we do NOT emit one target per remote pod and we do NOT
+    // dial unreachable remote pod IPs). The dial uses trust-domain-only peer
+    // verification + a destination-FQDN SNI override (see the `mesh.cross_cluster`
+    // / `mesh.eastwest_sni` tags). Local targets above stay first-tier; these
+    // remote-tier targets only receive traffic once locals are exhausted.
+    if transport == MeshEgressTransport::SidecarMtls {
+        append_cross_cluster_mesh_targets(
+            &mut targets,
+            runtime,
+            service,
+            service_port,
+            protocol,
+            workloads,
+            multi_cluster,
+        );
+    }
+
     targets
+}
+
+/// Append SIDECAR cross-cluster east-west targets for `service` on
+/// `service_port` (see the call site in [`build_outbound_mesh_targets`]).
+///
+/// For each remote NETWORK that has ≥1 remote workload of this service AND a
+/// matching [`EastWestGateway`](crate::modes::mesh::config::EastWestGateway),
+/// emits exactly ONE target addressed at `gateway.host` with:
+/// - `mesh.mtls = "true"` (Sidecar transport) and NO `mesh.spiffe_id` (the
+///   gateway LB-picks the destination workload, so no pod pinning — verification
+///   is trust-domain-only against the remote trust domain);
+/// - `mesh.trust_domain` = the remote workloads' trust domain;
+/// - `mesh.mtls_port` = `gateway.port` (the DIAL port, e.g. `:15443`);
+/// - `mesh.eastwest_sni` = the destination service FQDN (the SNI the remote
+///   gateway's passthrough routes on);
+/// - `mesh.cross_cluster = "true"`;
+/// - `port` = the SERVICE app port (so the inner request authority/Host stays
+///   the service FQDN), `service_port_policy_key` = the declared Service port;
+/// - `locality` = a remote workload's (already remote-tiered) locality so
+///   locality-LB ranks it AFTER local targets (local-first failover).
+///
+/// Gateway matching prefers an EXACT `gateway.network == workload.network`; a
+/// `network: None` gateway is the catch-all ONLY when no network-specific
+/// gateway matches. A remote workload on a network with NO matching gateway is
+/// SKIPPED with a warning — fail closed, never dial an unresolved address.
+fn append_cross_cluster_mesh_targets(
+    targets: &mut Vec<UpstreamTarget>,
+    runtime: &MeshRuntimeConfig,
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    protocol: AppProtocol,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) {
+    let Some(multi_cluster) = multi_cluster else {
+        return;
+    };
+    let remote_workloads =
+        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
+    if remote_workloads.is_empty() {
+        return;
+    }
+
+    // The SNI the remote east-west gateway passthrough routes on — the
+    // destination service FQDN. Matches `build_east_west_service_targets`'s
+    // gateway-side hosts (`{name}.{namespace}.svc.{cluster_domain}`).
+    let cluster_domain = runtime.cluster_domain.trim_matches('.');
+    let service_fqdn = format!(
+        "{}.{}.svc.{cluster_domain}",
+        service.name, service.namespace
+    );
+
+    // Group remote workloads by network so we emit ONE target per network (the
+    // gateway is that network's single ingress). `None`-network remote
+    // workloads group under the catch-all key.
+    let mut networks: Vec<Option<String>> = Vec::new();
+    for workload in &remote_workloads {
+        if !networks.contains(&workload.network) {
+            networks.push(workload.network.clone());
+        }
+    }
+
+    for network in networks {
+        // Representative remote workload for this network — its trust domain is
+        // the cross-cluster verification target and its locality keeps the
+        // target in the remote tier.
+        let Some(representative) = remote_workloads
+            .iter()
+            .find(|workload| workload.network == network)
+        else {
+            continue;
+        };
+        let Some(gateway) = select_east_west_gateway_for_network(multi_cluster, network.as_deref())
+        else {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                network = network.as_deref().unwrap_or("<none>"),
+                "Skipping cross-cluster egress for remote network with no matching \
+                 EastWestGateway (fail closed; never dial an unresolved address)"
+            );
+            continue;
+        };
+        if gateway.host.is_empty() || gateway.port == 0 {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                gateway = %gateway.name,
+                "Skipping cross-cluster egress: EastWestGateway has no usable host:port"
+            );
+            continue;
+        }
+
+        // Start from the standard Sidecar mesh-mTLS tag core, then override for
+        // the cross-cluster posture: drop the pinned pod identity, set the
+        // remote trust domain, the dial port, the SNI override, and the marker.
+        let mut tags = crate::service_discovery::mesh::mesh_sidecar_mtls_target_tags(
+            service,
+            representative,
+            protocol,
+            service_port.name.as_deref(),
+        );
+        // No pod pinning across the SNI-passthrough gateway: remove the pinned
+        // SPIFFE id so dispatch uses trust-domain-only verification. The
+        // trust_domain tag is set to the REMOTE workloads' trust domain.
+        tags.remove(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG);
+        tags.insert(
+            "mesh.trust_domain".to_string(),
+            representative.trust_domain.as_str().to_string(),
+        );
+        // Dial port = the east-west gateway port (e.g. :15443), NOT :15006.
+        tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
+            gateway.port.to_string(),
+        );
+        tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
+            service_fqdn.clone(),
+        );
+        tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
+            "true".to_string(),
+        );
+        // The east-west gateway routes purely by SNI (single-port-per-SNI Beta
+        // limitation; see `build_east_west_service_targets`), so multi-port
+        // `mesh.mtls_authority_port` is moot for cross-cluster — never stamped.
+
+        targets.push(UpstreamTarget {
+            // Dial the REMOTE east-west gateway, not a remote pod IP.
+            host: gateway.host.clone(),
+            // The SERVICE app port (the inner request authority/Host port);
+            // the actual transport dial port is the gateway port via
+            // `mesh.mtls_port`.
+            port: service_port.port,
+            service_port_policy_key: Some(service_port.port),
+            weight: 1,
+            tags,
+            // Remote-tier locality so locality-LB ranks this AFTER local targets.
+            locality: representative.locality.clone(),
+            path: None,
+        });
+    }
+}
+
+/// Select the [`EastWestGateway`](crate::modes::mesh::config::EastWestGateway)
+/// that fronts `network`. Prefers an EXACT `gateway.network == network` match;
+/// a gateway with `network: None` is the catch-all and is used ONLY when no
+/// network-specific gateway matches. Returns `None` when nothing matches.
+fn select_east_west_gateway_for_network<'a>(
+    multi_cluster: &'a crate::modes::mesh::config::MultiClusterConfig,
+    network: Option<&str>,
+) -> Option<&'a crate::modes::mesh::config::EastWestGateway> {
+    // Exact network match first.
+    if let Some(exact) = multi_cluster
+        .east_west_gateways
+        .iter()
+        .find(|gateway| gateway.network.as_deref() == network)
+    {
+        return Some(exact);
+    }
+    // Catch-all (`network: None`) only when no exact match exists.
+    multi_cluster
+        .east_west_gateways
+        .iter()
+        .find(|gateway| gateway.network.is_none())
 }
 
 /// An HTTP-family `/` proxy on the outbound capture listener whose `HttpPool`

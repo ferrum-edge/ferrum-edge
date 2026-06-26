@@ -20109,29 +20109,82 @@ async fn proxy_to_backend_mesh_mtls(
         );
     };
 
-    // The pinned destination identity is mandatory for mesh.mtls targets —
-    // missing or corrupt fails closed before any dial.
-    let expected_peer = match mesh_mtls_pool::target_mesh_mtls_expected_peer(target) {
-        Ok(peer) => peer,
-        Err(err) => {
-            error!(
-                proxy_id = %proxy.id,
-                target_host = %target.host,
-                error = %err,
-                "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
-            );
-            return (
-                hbone_pool_error_response(state, proxy, &err, resolved_ip),
-                None,
-            );
+    // Peer-verification mode + SNI depend on whether this is a CROSS-CLUSTER
+    // east-west target:
+    // - Cross-cluster (`mesh.cross_cluster`): the dial host is the REMOTE
+    //   east-west gateway, which SNI-passes the opaque TLS to an LB-picked
+    //   destination workload the client cannot name. So verification is
+    //   TRUST-DOMAIN-ONLY (`expected_peer = None`; the destination SVID must
+    //   still chain to a TRUSTED/federated trust domain — never unverified) and
+    //   the ClientHello SNI is OVERRIDDEN to the destination service FQDN
+    //   (`mesh.eastwest_sni`). A cross-cluster target carries NO `mesh.spiffe_id`
+    //   and MUST carry a usable SNI tag — a missing/empty SNI FAILS CLOSED
+    //   (never fall back to the gateway address as SNI, which would silently
+    //   break passthrough routing and tunnel to whatever the gateway IP's own
+    //   SNI resolves to).
+    // - In-cluster (default): the pinned destination identity is mandatory —
+    //   missing or corrupt fails closed before any dial — and no SNI override.
+    let cross_cluster = mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
+    let expected_peer = if cross_cluster {
+        None
+    } else {
+        match mesh_mtls_pool::target_mesh_mtls_expected_peer(target) {
+            Ok(peer) => Some(peer),
+            Err(err) => {
+                error!(
+                    proxy_id = %proxy.id,
+                    target_host = %target.host,
+                    error = %err,
+                    "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
+                );
+                return (
+                    hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                    None,
+                );
+            }
         }
+    };
+    let sni_override = if cross_cluster {
+        match mesh_mtls_pool::target_mesh_mtls_eastwest_sni(target) {
+            Some(sni) => Some(sni),
+            None => {
+                error!(
+                    proxy_id = %proxy.id,
+                    target_host = %target.host,
+                    "Refusing cross-cluster sidecar mTLS dispatch: missing or empty \
+                     mesh.eastwest_sni tag (fail closed, never dial the gateway IP as SNI)"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: true,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    },
+                    None,
+                );
+            }
+        }
+    } else {
+        None
     };
 
     debug!(
         proxy_id = %proxy.id,
         target_host = %target.host,
         target_port = target.port,
-        expected_peer = %expected_peer.as_str(),
+        cross_cluster,
+        expected_peer = expected_peer
+            .as_ref()
+            .map(|p| p.as_str())
+            .unwrap_or("td-only"),
+        sni_override = sni_override.unwrap_or(""),
         "Proxying request via sidecar SVID-mTLS HTTP/2"
     );
 
@@ -20186,7 +20239,8 @@ async fn proxy_to_backend_mesh_mtls(
             target.port,
             target.dispatch_policy_port(),
             mtls_port,
-            &expected_peer,
+            expected_peer.as_ref(),
+            sni_override,
         )
         .await
     {
