@@ -1284,13 +1284,18 @@ fn same_trust_domain_networks_sharing_one_gateway_endpoint_collapse_to_one() {
 // ── Ambient (HBONE) cross-cluster materialization ───────────────────────────
 //
 // The HBONE counterpart of the Sidecar cases above. The SHAPE differs: Ambient
-// cross-cluster targets are PER-REMOTE-POD (`host:port` = pod addr:app-port =
-// the inner HBONE CONNECT `:authority`) with the east-west gateway carried as a
-// DIAL OVERRIDE (`mesh.hbone_dial_host` / `mesh.hbone_port`), and the
-// destination service FQDN as the outer-TLS SNI override (`mesh.eastwest_sni`).
-// Verification is trust-domain-only (NO `mesh.spiffe_id`).
+// cross-cluster targets are PER-REMOTE-POD with the east-west gateway carried as
+// a DIAL OVERRIDE (`mesh.hbone_dial_host` / `mesh.hbone_port`), the destination
+// service FQDN as the outer-TLS SNI override (`mesh.eastwest_sni`), and
+// trust-domain-only verification (NO `mesh.spiffe_id`). The per-pod IDENTITY
+// (`UpstreamTarget.host`) is a SCOPED SYNTHETIC host keyed by `(gateway dial
+// endpoint, real pod addr)` (so overlapping-CIDR same-IP pods reached through
+// different gateways never collapse to one host:port runtime key); the REAL pod
+// addr (the inner HBONE CONNECT `:authority`) rides `mesh.hbone_authority_host`.
 
-use ferrum_edge::proxy::hbone_pool::{HBONE_DIAL_HOST_TAG, HBONE_PORT_TAG, HBONE_TARGET_TAG};
+use ferrum_edge::proxy::hbone_pool::{
+    HBONE_AUTHORITY_HOST_TAG, HBONE_DIAL_HOST_TAG, HBONE_PORT_TAG, HBONE_TARGET_TAG,
+};
 
 fn ambient_client_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
     let mut runtime = default_mesh_runtime();
@@ -1300,8 +1305,9 @@ fn ambient_client_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
 }
 
 /// Ambient: a remote workload on a network with a matching gateway materializes
-/// ONE per-pod HBONE cross-cluster target whose IDENTITY is the remote pod
-/// addr:app-port (NOT the gateway), with the gateway carried as a dial override.
+/// ONE per-pod HBONE cross-cluster target whose IDENTITY is a scoped synthetic
+/// host (NOT the gateway, NOT the bare pod IP), with the real pod addr on
+/// `mesh.hbone_authority_host` and the gateway carried as a dial override.
 #[test]
 fn ambient_cross_cluster_per_pod_hbone_target_has_correct_tags() {
     let runtime = ambient_client_runtime();
@@ -1322,11 +1328,29 @@ fn ambient_cross_cluster_per_pod_hbone_target_has_correct_tags() {
     );
     let xc = cross[0];
 
-    // IDENTITY = the remote POD addr:app-port (the inner CONNECT authority), NOT
-    // the gateway.
-    assert_eq!(
+    // IDENTITY = a SCOPED SYNTHETIC host keyed by (gateway endpoint, pod addr) —
+    // NOT the gateway and NOT the bare pod IP (so overlapping-CIDR collisions
+    // can't collapse two pods onto one host:port runtime key). It must NOT be a
+    // dialable address: it carries the gateway endpoint + the pod IP but is not
+    // the pod IP alone.
+    assert_ne!(
         xc.host, "10.244.5.5",
-        "the Ambient cross-cluster target identity is the remote pod IP (the CONNECT authority)"
+        "the synthetic identity must NOT be the bare pod IP (overlapping-CIDR collision risk)"
+    );
+    assert_ne!(
+        xc.host, GATEWAY_HOST,
+        "the synthetic identity must NOT be the gateway host either"
+    );
+    assert!(
+        xc.host.contains("10.244.5.5") && xc.host.contains(GATEWAY_HOST),
+        "the synthetic identity must scope the pod addr by the gateway endpoint, got {:?}",
+        xc.host
+    );
+    // The REAL pod addr (the inner CONNECT authority) rides the dedicated tag.
+    assert_eq!(
+        xc.tags.get(HBONE_AUTHORITY_HOST_TAG).map(String::as_str),
+        Some("10.244.5.5"),
+        "mesh.hbone_authority_host must carry the real pod addr (the CONNECT authority)"
     );
     assert_eq!(xc.port, 8080, "the target port is the resolved app port");
 
@@ -1412,6 +1436,83 @@ fn ambient_cross_cluster_per_pod_hbone_target_has_correct_tags() {
     assert!(!local_targets[0].tags.contains_key(MESH_EASTWEST_SNI_TAG));
 }
 
+/// Ties the materialized Ambient cross-cluster target to the RUNTIME guards: the
+/// dispatch helpers must read the gateway dial host / SNI / trust domain / real
+/// CONNECT authority off it, and `target_hbone_cross_cluster` (the predicate the
+/// gRPC fail-closed guard, the capability-collection skip, and the dispatch
+/// branch all key on) must return `true`. The LOCAL (in-cluster) target must
+/// read its authority back as its own host (no override) and not be classed
+/// cross-cluster.
+#[test]
+fn ambient_cross_cluster_target_drives_runtime_dispatch_helpers() {
+    use ferrum_edge::proxy::hbone_pool;
+
+    let runtime = ambient_client_runtime();
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    let remote = remote_workload(Some(REMOTE_NETWORK)); // pod IP 10.244.5.5
+    let service = svc_b_service(&local, &remote);
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    let xc = cross[0];
+
+    // The predicate the gRPC fail-closed guard, the capability-collection skip,
+    // and the dispatch cross-cluster branch all key on.
+    assert!(
+        hbone_pool::target_hbone_cross_cluster(xc),
+        "the materialized target must be recognized as cross-cluster by the runtime predicate"
+    );
+    // Dispatch reads the gateway as the network DIAL host (not the synthetic id).
+    assert_eq!(
+        hbone_pool::target_hbone_dial_host(xc).unwrap(),
+        GATEWAY_HOST,
+        "dispatch dials the east-west gateway"
+    );
+    assert_eq!(hbone_pool::target_hbone_port(xc), GATEWAY_PORT);
+    // Dispatch reads the REAL pod addr (NOT the synthetic host) as the inner
+    // CONNECT authority.
+    assert_eq!(
+        hbone_pool::target_hbone_authority_host(xc).unwrap(),
+        "10.244.5.5",
+        "dispatch uses the real pod addr as the CONNECT authority, never the synthetic identity"
+    );
+    assert_ne!(
+        hbone_pool::target_hbone_authority_host(xc).unwrap(),
+        xc.host.as_str(),
+        "the synthetic identity and the CONNECT authority host are distinct for cross-cluster"
+    );
+    // Required cross-cluster verification inputs are present + usable.
+    assert_eq!(
+        hbone_pool::target_hbone_eastwest_sni(xc),
+        Some(SVC_B_FQDN),
+        "the outer-TLS SNI override is the destination service FQDN"
+    );
+    assert!(
+        hbone_pool::target_hbone_cross_cluster_trust_domain(xc).is_some(),
+        "the remote trust domain is present + parseable (else dispatch fails closed)"
+    );
+
+    // The LOCAL (in-cluster) Ambient target is NOT cross-cluster, and its CONNECT
+    // authority reads back as its own host (no override tag).
+    let local_target = upstreams
+        .get(SVC_B_OUTBOUND_UPSTREAM_ID)
+        .expect("first-port upstream")
+        .iter()
+        .find(|t| {
+            t.tags.get(HBONE_TARGET_TAG).map(String::as_str) == Some("true")
+                && !t.tags.contains_key(MESH_CROSS_CLUSTER_TAG)
+        })
+        .expect("a pinned local mesh.hbone target");
+    assert!(!hbone_pool::target_hbone_cross_cluster(local_target));
+    assert_eq!(
+        hbone_pool::target_hbone_authority_host(local_target).unwrap(),
+        local_target.host.as_str(),
+        "an in-cluster target's CONNECT authority IS its host (no synthetic indirection)"
+    );
+}
+
 /// Ambient: TWO remote pods on the same network behind one gateway yield TWO
 /// per-pod targets (distinct pod-IP identities) — NO same-endpoint collapse
 /// (each pod is a distinct pinned CONNECT authority, unlike the Sidecar
@@ -1437,13 +1538,34 @@ fn ambient_cross_cluster_two_pods_same_gateway_yield_two_per_pod_targets() {
 
     let upstreams = materialize_all_upstream_targets(mesh, &runtime);
     let cross = cross_cluster_targets(&upstreams);
-    let mut hosts: Vec<&str> = cross.iter().map(|t| t.host.as_str()).collect();
-    hosts.sort();
+    // Each pod's REAL CONNECT-authority addr (the `mesh.hbone_authority_host`
+    // tag) must be its own pod IP — proving the per-pod fan-out (no
+    // same-endpoint collapse) routes each by its pinned authority.
+    let mut authority_hosts: Vec<&str> = cross
+        .iter()
+        .map(|t| {
+            t.tags
+                .get(HBONE_AUTHORITY_HOST_TAG)
+                .map(String::as_str)
+                .expect("every cross-cluster target carries mesh.hbone_authority_host")
+        })
+        .collect();
+    authority_hosts.sort();
     assert_eq!(
-        hosts,
+        authority_hosts,
         vec!["10.244.5.5", "10.244.5.6"],
         "two remote pods behind one gateway must each yield a per-pod cross-cluster target \
          (no same-endpoint collapse), got: {cross:#?}"
+    );
+    // The SYNTHETIC identities (`UpstreamTarget.host`) must also be DISTINCT so
+    // the two pods never share a host:port-keyed runtime map entry.
+    let mut synthetic_hosts: Vec<&str> = cross.iter().map(|t| t.host.as_str()).collect();
+    synthetic_hosts.sort();
+    synthetic_hosts.dedup();
+    assert_eq!(
+        synthetic_hosts.len(),
+        2,
+        "the two pods' synthetic identities must be distinct, got: {cross:#?}"
     );
     // Both dial the SAME gateway (dial override), with the SAME SNI.
     for t in &cross {
@@ -1765,13 +1887,19 @@ fn ambient_cross_cluster_distinct_td_distinct_endpoints_both_emitted() {
         "two distinct-TD pods behind distinct gateway endpoints must both emit a per-pod target, \
          got: {cross:#?}"
     );
-    // Each pod identity is its own pod IP; the dial override + trust domain pair
-    // up correctly per TD.
-    let mut by_host: std::collections::HashMap<&str, (&str, &str)> =
+    // Each pod's CONNECT-authority addr (`mesh.hbone_authority_host`) is its own
+    // pod IP; the dial override + trust domain pair up correctly per TD. The
+    // synthetic `target.host` identities must also be distinct.
+    let mut by_authority: std::collections::HashMap<&str, (&str, &str)> =
         std::collections::HashMap::new();
+    let mut synthetic_hosts: Vec<&str> = Vec::new();
     for t in &cross {
-        by_host.insert(
-            t.host.as_str(),
+        synthetic_hosts.push(t.host.as_str());
+        by_authority.insert(
+            t.tags
+                .get(HBONE_AUTHORITY_HOST_TAG)
+                .map(String::as_str)
+                .expect("every cross-cluster target carries mesh.hbone_authority_host"),
             (
                 t.tags
                     .get(HBONE_DIAL_HOST_TAG)
@@ -1785,12 +1913,19 @@ fn ambient_cross_cluster_distinct_td_distinct_endpoints_both_emitted() {
         );
     }
     assert_eq!(
-        by_host.get("10.244.5.5"),
+        by_authority.get("10.244.5.5"),
         Some(&(GW_B_HOST, REMOTE_TRUST_DOMAIN))
     );
     assert_eq!(
-        by_host.get("10.244.6.6"),
+        by_authority.get("10.244.6.6"),
         Some(&(GW_C_HOST, "cluster-c.local"))
+    );
+    synthetic_hosts.sort();
+    synthetic_hosts.dedup();
+    assert_eq!(
+        synthetic_hosts.len(),
+        2,
+        "the two distinct-TD pods' synthetic identities must be distinct"
     );
 }
 

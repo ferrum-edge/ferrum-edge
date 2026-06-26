@@ -5045,6 +5045,24 @@ fn append_cross_cluster_mesh_targets(
     }
 }
 
+/// Build the SCOPED SYNTHETIC `UpstreamTarget.host` for an AMBIENT cross-cluster
+/// HBONE target, keyed by `(east-west gateway dial endpoint, real pod addr)`. It
+/// is an OPAQUE identity for every host:port-keyed runtime map (load balancer,
+/// passive+active health, circuit breaker, retry-exclusion, adaptive
+/// concurrency) so two remote pods that share a pod IP across overlapping CIDRs
+/// but are reached through DIFFERENT gateways never collapse to one key. It is
+/// NEVER dialed or DNS-resolved (the transport dials `mesh.hbone_dial_host`; the
+/// real CONNECT `:authority` rides `mesh.hbone_authority_host`). The `mesh-xc-`
+/// prefix guarantees it cannot be mistaken for a real hostname and never starts
+/// with `*.` (so `concretize_wildcard_target_for_request` leaves it untouched).
+fn cross_cluster_hbone_synthetic_host(
+    gateway_host: &str,
+    gateway_port: u16,
+    pod_addr: &str,
+) -> String {
+    format!("mesh-xc-hbone|{gateway_host}|{gateway_port}|{pod_addr}")
+}
+
 /// Append AMBIENT (HBONE) cross-cluster east-west targets for `service` on
 /// `service_port` — the HBONE counterpart of
 /// [`append_cross_cluster_mesh_targets`] (which does the Sidecar mesh-mTLS
@@ -5060,18 +5078,28 @@ fn append_cross_cluster_mesh_targets(
 ///   must be loopback OR a slice-declared workload addr+port; a service FQDN is
 ///   REJECTED. The remote pod IP IS slice-declared on the dest side AND known to
 ///   the client (merged remote endpoints). So Ambient cross-cluster targets are
-///   PER-REMOTE-POD: `UpstreamTarget.host:port = remote pod addr : resolved
-///   app-port` (= the inner CONNECT `:authority`), with the east-west gateway
-///   carried as a DIAL OVERRIDE.
+///   PER-REMOTE-POD, with the east-west gateway carried as a DIAL OVERRIDE.
+///
+/// IDENTITY (overlapping-CIDR collision avoidance): `UpstreamTarget.host` is a
+/// SCOPED SYNTHETIC identity keyed by `(gateway dial endpoint, real pod addr)`
+/// (`cross_cluster_hbone_synthetic_host`), NOT the bare pod addr — two remote
+/// pods that share an IP across overlapping CIDRs but are reached through
+/// DIFFERENT gateways would otherwise collapse to one `(host, port)` key and
+/// cross-contaminate every host:port-keyed runtime map (LB / health / circuit
+/// breaker / retry / adaptive concurrency). The REAL pod addr (the inner CONNECT
+/// `:authority` the dest relay dials under the open-relay guard) rides
+/// `mesh.hbone_authority_host`, which dispatch reads for `app_host`; the
+/// synthetic host is never dialed/resolved.
 ///
 /// Each surviving reachable remote workload's gateway is selected per the
 /// workload's own `(network, trust_domain)` (the SAME
 /// [`select_east_west_gateway_for_network`] +
 /// [`east_west_workload_is_reachable`] reuse as the Sidecar path). One target is
 /// emitted per pod ADDRESS with:
-/// - `host:port` = pod addr : resolved app-port (the inner CONNECT `:authority`);
+/// - `host` = the scoped synthetic identity; `port` = resolved app-port;
+/// - `mesh.hbone_authority_host` = the real pod addr (inner CONNECT `:authority`);
 /// - `mesh.hbone = "true"` (Ambient transport);
-/// - `mesh.hbone_dial_host` = `gateway.host` (dial host ≠ target.host = pod IP);
+/// - `mesh.hbone_dial_host` = `gateway.host` (the network dial host);
 /// - `mesh.hbone_port` = `gateway.port` (the DIAL port, e.g. `:15443`);
 /// - `mesh.eastwest_sni` = the destination service FQDN (outer-TLS SNI override);
 /// - `mesh.trust_domain` = the remote TD (trust-domain-only verification);
@@ -5088,9 +5116,29 @@ fn append_cross_cluster_mesh_targets(
 /// declare a distinct gateway endpoint per trust domain), mirroring
 /// [`append_cross_cluster_mesh_targets`]'s `[R3-3]` rule. Unlike the Sidecar
 /// path there is NO same-endpoint COLLAPSE: each pod is a distinct backend
-/// identity (`pod addr:app-port`), so same-TD pods sharing a dial endpoint are
-/// all legitimately emitted (the gateway routes each by the pinned CONNECT
-/// authority).
+/// identity (the scoped synthetic host above), so same-TD pods sharing a dial
+/// endpoint are all legitimately emitted (the gateway routes each by the pinned
+/// CONNECT authority carried in `mesh.hbone_authority_host`).
+///
+/// DESTINATION-SIDE FORWARDING (why the dest east-west gateway forwards to the
+/// app port, not `:15008`): the remote cluster's east-west gateway is a SNI
+/// passthrough that forwards the opaque outer TLS to the destination workload's
+/// APP PORT (`build_east_west_service_targets` resolves the first service port's
+/// `targetPort` / container port, NOT a mesh terminator port). The destination
+/// pod's INBOUND CAPTURE then redirects that app-port traffic to the mesh
+/// terminator — iptables REDIRECT app-port → `:15008` for Ambient (an HBONE
+/// CONNECT relayed by `handle_hbone_request` under the open-relay guard),
+/// `:15006` for Sidecar. This is the SAME capture-based model same-cluster
+/// east-west *inbound* uses, and it is exactly how the merged #1897 Sidecar
+/// cross-cluster path works too (its `build_east_west_service_targets` also
+/// forwards to the app/target port and relies on the dest capture → `:15006`).
+/// So this is a CONSISTENT, pre-existing architecture, not an Ambient-specific
+/// gap: NO destination-side change is needed for cross-cluster, and there is no
+/// gateway-side analog the Sidecar path lacks. The functional fixture models the
+/// captured hop by setting the destination service port to the terminator port
+/// (the dest gateway forwards straight to `:15008`); the live two-cluster SPIRE
+/// fixture validates the real captured path. See `docs/mesh.md`
+/// ("Destination inbound relies on the standard inbound capture").
 fn append_cross_cluster_ambient_hbone_targets(
     targets: &mut Vec<UpstreamTarget>,
     runtime: &MeshRuntimeConfig,
@@ -5246,16 +5294,36 @@ fn append_cross_cluster_ambient_hbone_targets(
                 crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
                 "true".to_string(),
             );
+            // The REAL pod addr is the inner HBONE CONNECT `:authority` HOST the
+            // dest relay dials under the open-relay guard. It rides this tag
+            // because `target.host` is set to a SCOPED SYNTHETIC identity below.
+            tags.insert(
+                crate::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG.to_string(),
+                address.clone(),
+            );
 
             built.push(BuiltHboneTarget {
                 target: UpstreamTarget {
-                    // IDENTITY = the remote pod addr:app-port (= the inner CONNECT
-                    // `:authority` the dest relay dials under the open-relay
-                    // guard). The transport DIALS `mesh.hbone_dial_host` /
-                    // `mesh.hbone_port` (the gateway), so dial endpoint and target
-                    // identity deliberately DIFFER (unlike the Sidecar path, whose
-                    // identity IS the gateway endpoint).
-                    host: address.clone(),
+                    // IDENTITY = a SCOPED SYNTHETIC host keyed by `(gateway dial
+                    // endpoint, real pod addr)`, NOT the bare pod addr. Two REMOTE
+                    // pods that share a pod IP across overlapping CIDRs but are
+                    // reached through DIFFERENT east-west gateways would otherwise
+                    // collapse to one `(host, port)` and cross-contaminate every
+                    // host:port-keyed runtime map — load balancer least-conn /
+                    // hash ring, passive+active health, circuit breaker
+                    // (`circuit_breaker::target_key`), retry-exclusion,
+                    // adaptive-concurrency. The synthetic host disambiguates them
+                    // while the REAL pod addr (the inner CONNECT `:authority`)
+                    // rides `mesh.hbone_authority_host` (read by dispatch for
+                    // `app_host`). The transport NEVER dials this synthetic host:
+                    // it dials `mesh.hbone_dial_host` / `mesh.hbone_port` (the
+                    // gateway), and the only consumer that resolves `target.host`
+                    // (the observability `dns_cache.resolve`) just yields `None`.
+                    // The HBONE pool key is keyed on the gateway dial host + SNI +
+                    // trust domain (already isolated per gateway), so this does not
+                    // affect connection reuse. Pin matched by the synthetic-host
+                    // unit test; do NOT collapse it back to the pod addr.
+                    host: cross_cluster_hbone_synthetic_host(&gateway.host, gateway.port, address),
                     port: app_port,
                     // DR policy stays keyed by the declared SERVICE port.
                     service_port_policy_key: Some(service_port.port),

@@ -40,6 +40,19 @@ pub const HBONE_PORT_TAG: &str = "mesh.hbone_port";
 /// Optional tag carrying the outer TCP/TLS dial host for an HBONE target. When
 /// absent, the target host is both the dial host and CONNECT authority host.
 pub const HBONE_DIAL_HOST_TAG: &str = "mesh.hbone_dial_host";
+/// Optional tag carrying the inner HBONE CONNECT `:authority` HOST for a target
+/// whose `UpstreamTarget.host` is a SCOPED SYNTHETIC identity rather than a real
+/// dialable address. This is set for AMBIENT CROSS-CLUSTER targets: their
+/// `target.host` is a `(network/gateway, pod IP)`-scoped synthetic so that the
+/// load balancer / passive+active health / circuit breaker / retry-exclusion
+/// keys (all keyed on `host:port`) never collapse two REMOTE pods that share a
+/// pod IP across overlapping CIDRs but are reached through DIFFERENT east-west
+/// gateways. The real destination pod addr (the inner CONNECT `:authority` the
+/// dest relay dials under the open-relay guard) rides here so dispatch reads it
+/// for `app_host` instead of the synthetic `target.host`. ABSENT for every
+/// in-cluster target — `target.host` is then both the identity and the CONNECT
+/// authority host, byte-identical to the pre-cross-cluster behavior.
+pub const HBONE_AUTHORITY_HOST_TAG: &str = "mesh.hbone_authority_host";
 /// Optional tag overriding the server SVID the HBONE mTLS handshake pins. This
 /// is used when the peer is a waypoint/relay identity rather than the workload
 /// identity carried in [`MESH_SPIFFE_ID_TAG`].
@@ -103,6 +116,8 @@ pub enum HbonePoolError {
     InvalidServerName { host: String, message: String },
     #[error("invalid {HBONE_DIAL_HOST_TAG} tag '{value}' on mesh target: {message}")]
     InvalidDialHostTag { value: String, message: String },
+    #[error("invalid {HBONE_AUTHORITY_HOST_TAG} tag '{value}' on mesh target: {message}")]
+    InvalidAuthorityHostTag { value: String, message: String },
     #[error("invalid {MESH_SPIFFE_ID_TAG} tag '{value}' on mesh target: {message}")]
     InvalidPeerSpiffeTag { value: String, message: String },
     #[error("SPIFFE TLS config failed: {0}")]
@@ -131,6 +146,7 @@ impl HbonePoolError {
             | Self::NoLeafCert
             | Self::TlsConfig(_)
             | Self::InvalidDialHostTag { .. }
+            | Self::InvalidAuthorityHostTag { .. }
             | Self::InvalidPeerSpiffeTag { .. } => ErrorClass::ConnectionPoolError,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
@@ -502,7 +518,6 @@ impl HboneConnectionPool {
     /// `app_host:app_port`. The ordinary Ambient path passes the same host for
     /// both. NodeWaypoint secured egress passes the destination NodeWaypoint as
     /// `dial_host` while preserving the selected workload IP/DNS as `app_host`.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub async fn get_tunnel_via(
         &self,
@@ -1789,6 +1804,32 @@ pub fn target_hbone_dial_host(target: &UpstreamTarget) -> Result<&str, HbonePool
     }
 }
 
+/// The inner HBONE CONNECT `:authority` HOST for this target — the real
+/// destination pod address the dest relay dials under the open-relay guard.
+/// Reads [`HBONE_AUTHORITY_HOST_TAG`] when present (AMBIENT CROSS-CLUSTER, whose
+/// `target.host` is a scoped synthetic identity, NOT a dialable address), else
+/// falls back to `target.host` (every in-cluster target, byte-identical to the
+/// prior behavior). A present-but-empty override fails closed so a corrupt tag
+/// can never produce a `:0`/empty CONNECT authority — the dispatch path treats
+/// this as a fatal cross-cluster misconfiguration (502), never dialing the
+/// synthetic identity as the authority.
+pub fn target_hbone_authority_host(target: &UpstreamTarget) -> Result<&str, HbonePoolError> {
+    match target.tags.get(HBONE_AUTHORITY_HOST_TAG) {
+        None => Ok(target.host.as_str()),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Err(HbonePoolError::InvalidAuthorityHostTag {
+                    value: value.clone(),
+                    message: "HBONE CONNECT authority host must not be empty".to_string(),
+                })
+            } else {
+                Ok(trimmed)
+            }
+        }
+    }
+}
+
 /// The destination identity an outbound mesh dial must PIN, read from the
 /// target's [`HBONE_PEER_SPIFFE_ID_TAG`] override, or else
 /// [`MESH_SPIFFE_ID_TAG`]. `Ok(None)` when both are absent — operator-supplied
@@ -2265,6 +2306,35 @@ mod tests {
         assert!(matches!(
             target_hbone_dial_host(&target_with_tags(&[(HBONE_DIAL_HOST_TAG, " ")])),
             Err(HbonePoolError::InvalidDialHostTag { .. })
+        ));
+    }
+
+    /// The inner-CONNECT `:authority` host falls back to `target.host` for an
+    /// in-cluster target (no override tag) and reads the override for a
+    /// cross-cluster target whose `target.host` is a scoped synthetic identity.
+    /// A present-but-empty override fails CLOSED so dispatch never dials the
+    /// synthetic identity as the CONNECT authority.
+    #[test]
+    fn hbone_authority_host_defaults_to_target_host_else_override() {
+        // In-cluster: no tag ⇒ authority host = target.host (byte-identical to
+        // the prior behavior).
+        assert_eq!(
+            target_hbone_authority_host(&target_with_tags(&[])).unwrap(),
+            "orders.default.svc.cluster.local"
+        );
+        // Cross-cluster: the synthetic identity lives in `target.host`, the REAL
+        // pod addr lives in the override tag, which is what the authority reads.
+        let mut xc = target_with_tags(&[(HBONE_AUTHORITY_HOST_TAG, "10.244.5.5")]);
+        xc.host = "mesh-xc-hbone|10.9.9.9|15443|10.244.5.5".to_string();
+        assert_eq!(
+            target_hbone_authority_host(&xc).unwrap(),
+            "10.244.5.5",
+            "the CONNECT authority must be the real pod addr, never the synthetic host"
+        );
+        // A present-but-empty override fails closed.
+        assert!(matches!(
+            target_hbone_authority_host(&target_with_tags(&[(HBONE_AUTHORITY_HOST_TAG, "  ")])),
+            Err(HbonePoolError::InvalidAuthorityHostTag { .. })
         ));
     }
 

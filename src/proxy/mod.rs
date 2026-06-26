@@ -4587,6 +4587,20 @@ impl ProxyState {
                 && let Some(upstream) = upstream_map.get(upstream_id.as_str())
             {
                 for target in &upstream.targets {
+                    // SKIP cross-cluster east-west HBONE targets: they dial the
+                    // operator-declared east-west gateway (`:15443`), never a
+                    // probeable workload `:15008`, so a capability probe would
+                    // dial the gateway with the WRONG (dial-host) SNI and no
+                    // trust-domain scope, AND dispatch already BYPASSES the
+                    // registry for them (`can_attempt_hbone_backend`). Enrolling
+                    // them would only produce wrong-SNI gateway dials and
+                    // reload/startup probe delays. They are emitted onto the
+                    // HTTP mesh-egress upstream a config proxy references, so
+                    // this proxy-driven walk is where they would otherwise be
+                    // collected.
+                    if crate::proxy::hbone_pool::target_hbone_cross_cluster(target) {
+                        continue;
+                    }
                     let probe_target =
                         BackendCapabilityProbeTarget::from_proxy(proxy, Some(target));
                     if seen.insert(probe_target.key.clone()) {
@@ -4660,8 +4674,14 @@ impl ProxyState {
                     // a mesh-mTLS CONNECT tunnel with NO capability probe
                     // (slice-declared sidecars speak mesh-mTLS by construction),
                     // so enrolling them would dial a non-existent `:15008` HBONE
-                    // listener and record a spurious unsupported verdict.
-                    if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                    // listener and record a spurious unsupported verdict. Also
+                    // skip any cross-cluster east-west target (HTTP-family-only by
+                    // construction, so it should never land on a raw-TCP upstream
+                    // — defensive: it dials the gateway `:15443`, never a
+                    // probeable `:15008`, and dispatch bypasses the registry).
+                    if !crate::proxy::hbone_pool::target_hbone_enabled(target)
+                        || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+                    {
                         continue;
                     }
                     let probe_target =
@@ -4697,7 +4717,13 @@ impl ProxyState {
                 &spec.upstream_id,
             );
             for target in &upstream.targets {
-                if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                // Ambient `mesh.hbone` per-workload targets only; Sidecar
+                // `mesh.mtls` (no probe) and cross-cluster east-west targets
+                // (HTTP-family-only, gateway-dialed, registry-bypassed) are
+                // excluded — same rationale as the VIP pass above.
+                if !crate::proxy::hbone_pool::target_hbone_enabled(target)
+                    || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+                {
                     continue;
                 }
                 let probe_target =
@@ -4737,7 +4763,13 @@ impl ProxyState {
                     &upstream_id,
                 );
                 for target in &upstream.targets {
-                    if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                    // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
+                    // (no probe) and cross-cluster east-west targets
+                    // (HTTP-family-only, gateway-dialed, registry-bypassed) are
+                    // excluded — same rationale as the raw-TCP passes above.
+                    if !crate::proxy::hbone_pool::target_hbone_enabled(target)
+                        || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+                    {
                         continue;
                     }
                     let probe_target =
@@ -4794,6 +4826,14 @@ impl ProxyState {
                     };
                     effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
                     for target in &upstream.targets {
+                        // SKIP cross-cluster east-west HBONE targets — a
+                        // mesh_route_dispatch rule could point at the same mesh
+                        // egress upstream; same rationale as the proxy-driven
+                        // walk above (dispatch bypasses the registry for them,
+                        // probing dials the gateway with the wrong SNI).
+                        if crate::proxy::hbone_pool::target_hbone_cross_cluster(target) {
+                            continue;
+                        }
                         let probe_target = BackendCapabilityProbeTarget::from_proxy(
                             &effective_proxy,
                             Some(target),
@@ -6202,6 +6242,13 @@ impl ProxyState {
                 .collect();
             for upstream in &new_config.upstreams {
                 for target in &upstream.targets {
+                    // Skip CROSS-CLUSTER HBONE targets: `target.host` is a scoped
+                    // synthetic identity (never a resolvable address — the
+                    // transport dials `mesh.hbone_dial_host`), so warming it just
+                    // logs a failed lookup and adds startup/reload latency.
+                    if hbone_pool::target_hbone_cross_cluster(target) {
+                        continue;
+                    }
                     hostnames.push((target.host.clone(), None, None));
                 }
             }
@@ -6428,6 +6475,12 @@ impl ProxyState {
             .chain(delta.modified_upstreams.iter())
         {
             for target in &upstream.targets {
+                // Skip CROSS-CLUSTER HBONE targets — `target.host` is a scoped
+                // synthetic identity, never a resolvable address (see the
+                // full-config warmup above).
+                if hbone_pool::target_hbone_cross_cluster(target) {
+                    continue;
+                }
                 new_hostnames.push((target.host.clone(), None, None));
             }
         }
@@ -6805,6 +6858,12 @@ impl ProxyState {
             .chain(delta.modified_upstreams.iter())
         {
             for target in &upstream.targets {
+                // Skip CROSS-CLUSTER HBONE targets — `target.host` is a scoped
+                // synthetic identity, never a resolvable address (see the
+                // full-config warmup above).
+                if hbone_pool::target_hbone_cross_cluster(target) {
+                    continue;
+                }
                 new_hostnames.push((target.host.clone(), None, None));
             }
         }
@@ -8284,6 +8343,43 @@ fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(format!("[{host}]"))
     } else {
         std::borrow::Cow::Borrowed(host)
+    }
+}
+
+/// Rewrite the AUTHORITY HOST of a `{scheme}://{host}:{port}{path}` backend URL,
+/// replacing the rendered `from_host` (in the authority position only) with the
+/// rendered `to_host`. Used by the CROSS-CLUSTER HBONE dispatch to turn a URL
+/// whose authority is a non-parseable SCOPED SYNTHETIC identity into a parseable
+/// one whose authority is the real pod addr (only `path_and_query` is read from
+/// the result; the host part is dropped). The replacement is scoped to the
+/// authority (the segment after `://`, before the next `/`, `?`, or `#`) so a
+/// host substring that also appears in the path is never touched. If the URL has
+/// no `://` or the authority does not start with the rendered `from_host`, the
+/// URL is returned unchanged (defensive; the caller still fails closed on a
+/// subsequent parse error).
+fn rewrite_backend_url_authority_host(url: &str, from_host: &str, to_host: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    // The authority runs to the first '/', '?' or '#'.
+    let authority_end_rel = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end_rel];
+    let suffix = &rest[authority_end_rel..];
+    let rendered_from = url_render_host(from_host);
+    // The authority is `{rendered_host}:{port}` (or bare `{rendered_host}`).
+    if let Some(after_host) = authority.strip_prefix(rendered_from.as_ref()) {
+        let rendered_to = url_render_host(to_host);
+        format!(
+            "{}{}{}{}",
+            &url[..authority_start],
+            rendered_to,
+            after_host,
+            suffix
+        )
+    } else {
+        url.to_string()
     }
 }
 
@@ -13135,6 +13231,49 @@ async fn handle_proxy_request_inner(
     // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
     // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
     if is_grpc_request && proxy.dispatch_kind.is_http_family() {
+        // FAIL CLOSED on a gRPC request routed to a CROSS-CLUSTER east-west
+        // target (Ambient `mesh.hbone` or Sidecar `mesh.mtls`). The gRPC branch
+        // runs BEFORE the HBONE / mesh-mTLS dispatch gates and dials
+        // `target.host:target.port` directly via `GrpcConnectionPool` — for a
+        // cross-cluster target that host is a remote-pod / scoped synthetic
+        // identity that is NOT directly routable, and the dial has no east-west
+        // gateway dial-host override, no destination-FQDN SNI override, and no
+        // trust-domain-scoped verification. So a gRPC request here would either
+        // fail or — worse — bypass the SNI/trust-domain east-west path. Refuse
+        // it cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
+        // connection-level failure) before any backend dial / circuit-breaker
+        // charge. Full gRPC-over-HBONE / gRPC-over-mesh-mTLS cross-cluster is a
+        // documented follow-up (HTTP-first), mirroring the WebSocket
+        // cross-cluster fail-closed guards.
+        if let Some(target) = upstream_target.as_deref()
+            && (hbone_pool::target_hbone_cross_cluster(target)
+                || mesh_mtls_pool::target_mesh_mtls_cross_cluster(target))
+        {
+            warn!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                "Refusing gRPC dispatch to a cross-cluster east-west target: gRPC over \
+                 cross-cluster HBONE / mesh-mTLS is not yet supported (no gateway dial-host / \
+                 SNI override / trust-domain scope on the gRPC path). Failing closed with \
+                 gRPC UNAVAILABLE; tracked as a follow-up."
+            );
+            // Release a HALF_OPEN circuit-breaker probe slot that
+            // `check_circuit_breaker` may have admitted for this request — this
+            // reject precedes any backend dispatch, so a leaked probe slot would
+            // wedge the breaker (mirrors the WebSocket gateway-side rejects).
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+            return Ok(grpc_proxy::build_grpc_error_response(
+                14, // UNAVAILABLE
+                "gRPC over cross-cluster east-west routing is not supported",
+            ));
+        }
+
         // Honor DestinationRule per-port `connect_timeout_ms` overrides on
         // the gRPC path — the gRPC transport reads
         // `proxy.backend_{host,port,connect_timeout_ms}` directly
@@ -19711,6 +19850,31 @@ async fn proxy_to_backend_hbone(
             );
         }
     };
+    // The inner HBONE CONNECT `:authority` HOST = the REAL destination pod addr
+    // the dest relay dials under the open-relay guard. For a CROSS-CLUSTER target
+    // `target.host` is a SCOPED SYNTHETIC identity (so LB / health / circuit
+    // breaker / retry keys never collapse two remote pods that share an IP across
+    // overlapping CIDRs but are reached through DIFFERENT gateways), so the real
+    // authority rides the `mesh.hbone_authority_host` tag; in-cluster targets have
+    // no such tag and `target.host` IS the authority (byte-identical to before).
+    // A present-but-empty tag fails CLOSED (502) — never dial the synthetic
+    // identity as the CONNECT authority.
+    let app_host = match hbone_pool::target_hbone_authority_host(target) {
+        Ok(host) => host,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing HBONE dispatch: invalid CONNECT authority host tag"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+                None,
+            );
+        }
+    };
     // Peer-verification mode + SNI + trust-domain scope depend on whether this is
     // a CROSS-CLUSTER east-west HBONE target (mirroring the Sidecar mesh-mTLS
     // cross-cluster branch in `proxy_to_backend_mesh_mtls`):
@@ -19805,6 +19969,7 @@ async fn proxy_to_backend_hbone(
         target_host = %target.host,
         target_port = target.port,
         dial_host = %dial_host,
+        app_host = %app_host,
         hbone_port,
         cross_cluster,
         expected_peer = expected_peer
@@ -19823,7 +19988,10 @@ async fn proxy_to_backend_hbone(
         .get_tunnel_via(
             proxy,
             dial_host,
-            &target.host,
+            // The inner CONNECT `:authority` host = the REAL pod addr (= the
+            // synthetic-host cross-cluster target's `mesh.hbone_authority_host`,
+            // else `target.host`); the network dial uses `dial_host` (gateway).
+            app_host,
             target.port,
             target.dispatch_policy_port(),
             hbone_port,
@@ -19874,7 +20042,24 @@ async fn proxy_to_backend_hbone(
         }
     });
 
-    let uri: hyper::Uri = match backend_url.parse() {
+    // `backend_url` was built by the caller with `target.host` as the authority.
+    // For a CROSS-CLUSTER target that host is a SCOPED SYNTHETIC identity (with
+    // `|` separators) that is NOT a valid URI authority, so the parse below would
+    // fail. Only `path_and_query` is read out of this URI (the host part is
+    // dropped — the inner CONNECT already targets `app_host:port`), so rebuild a
+    // PARSEABLE equivalent by swapping the synthetic authority for the real
+    // `app_host` (the CONNECT authority). In-cluster targets keep `backend_url`
+    // verbatim (no synthetic host), so this is byte-identical for them.
+    let backend_url_for_parse: std::borrow::Cow<'_, str> = if cross_cluster {
+        std::borrow::Cow::Owned(rewrite_backend_url_authority_host(
+            backend_url,
+            &target.host,
+            app_host,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(backend_url)
+    };
+    let uri: hyper::Uri = match backend_url_for_parse.parse() {
         Ok(uri) => uri,
         Err(e) => {
             error!(proxy_id = %proxy.id, error = %e, "Invalid HBONE backend URL");
@@ -22477,6 +22662,44 @@ mod tests {
             }
         }))
         .expect("valid proxy")
+    }
+
+    /// The cross-cluster HBONE backend-URL authority rewrite swaps the
+    /// (non-parseable) scoped synthetic host for the real pod addr in the
+    /// AUTHORITY position only, leaving the path/query (and any host-like
+    /// substring inside the path) untouched, so the resulting URL parses and
+    /// yields the correct `path_and_query`.
+    #[test]
+    fn rewrite_backend_url_authority_host_swaps_authority_only() {
+        let synth = "mesh-xc-hbone|10.9.9.9|15443|10.244.5.5";
+        let url = format!("http://{synth}:8080/api/v1?host={synth}&x=1");
+        let rewritten = rewrite_backend_url_authority_host(&url, synth, "10.244.5.5");
+        assert_eq!(
+            rewritten,
+            "http://10.244.5.5:8080/api/v1?host=mesh-xc-hbone|10.9.9.9|15443|10.244.5.5&x=1",
+            "only the authority host is swapped; the query's host= value is preserved"
+        );
+        // The rewritten URL must parse and expose the original path_and_query.
+        let uri: hyper::Uri = rewritten.parse().expect("rewritten URL parses");
+        assert_eq!(
+            uri.path_and_query().map(|pq| pq.as_str()),
+            Some("/api/v1?host=mesh-xc-hbone|10.9.9.9|15443|10.244.5.5&x=1")
+        );
+
+        // An IPv6 real pod addr is bracketed in the rewritten authority.
+        let url6 = format!("http://{synth}:8080/p");
+        let rewritten6 = rewrite_backend_url_authority_host(&url6, synth, "fd00::5");
+        assert_eq!(rewritten6, "http://[fd00::5]:8080/p");
+
+        // No `://` or a non-matching authority ⇒ returned unchanged (defensive).
+        assert_eq!(
+            rewrite_backend_url_authority_host("not-a-url", synth, "10.0.0.1"),
+            "not-a-url"
+        );
+        assert_eq!(
+            rewrite_backend_url_authority_host("http://other-host:80/p", synth, "10.0.0.1"),
+            "http://other-host:80/p"
+        );
     }
 
     #[test]
