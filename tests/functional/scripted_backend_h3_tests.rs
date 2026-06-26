@@ -1803,14 +1803,20 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
         "phase-h3-206-trailers",
         vec![
             H3Step::AcceptStream,
-            // 206 + Content-Range, no Content-Length: the body is delimited by
-            // the trailers/END_STREAM, keeping the trailered response clean.
+            // 206 + Content-Range WITH Content-Length. The Content-Length is
+            // load-bearing: the backend drops the QUIC connection
+            // (H3_NO_ERROR) at end-of-script, and `H3FrameSource`'s
+            // graceful-close recovery only treats that close as a clean EOS
+            // when the body is provably complete — which needs a
+            // Content-Length (see `is_response_body_complete`). Without it the
+            // streamed body ends in an error instead of clean END_STREAM.
             H3Step::RespondHeaders(vec![
                 (":status", "206".to_string()),
                 (
                     "content-range",
                     format!("bytes 0-{}/{}", body_len - 1, body_len * 8),
                 ),
+                ("content-length", body_len.to_string()),
                 ("content-type", "text/plain".to_string()),
             ]),
             H3Step::RespondData(body.clone()),
@@ -1900,10 +1906,11 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
 #[ignore]
 async fn h2c_frontend_h3_backend_large_206_streams_not_buffered_502() {
     // Keep `LIMIT` and the env string below in lock-step.
-    const LIMIT: usize = 2048;
-    const LIMIT_ENV: &str = "2048";
-    let body_len = 8192usize; // 4× the response-size limit
-    let body = bytes::Bytes::from(vec![b'd'; body_len]);
+    const LIMIT: usize = 4096;
+    const LIMIT_ENV: &str = "4096";
+    // First chunk is UNDER the limit, second chunk pushes cumulative OVER it.
+    let first_chunk = bytes::Bytes::from(vec![b'd'; 2048]);
+    let second_chunk = bytes::Bytes::from(vec![b'e'; 4096]);
 
     let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness(
         "phase-h3-large-206",
@@ -1915,13 +1922,20 @@ async fn h2c_frontend_h3_backend_large_206_streams_not_buffered_502() {
             // than rejecting up front with a buffered 502.
             H3Step::RespondHeaders(vec![
                 (":status", "206".to_string()),
-                (
-                    "content-range",
-                    format!("bytes 0-{}/{}", body_len - 1, body_len * 4),
-                ),
+                ("content-range", format!("bytes 0-12287/{}", 64 * 1024)),
                 ("content-type", "application/octet-stream".to_string()),
             ]),
-            H3Step::RespondData(body),
+            // First (under-limit) chunk, then a stall so the gateway's coalescer
+            // flushes the 206 headers + this chunk to the client BEFORE the
+            // over-limit chunk trips the size guard. Without that flush, the
+            // size error would surface on the first body poll (before headers)
+            // and reset the stream with no status — masking the "streamed, not
+            // buffered-502" signal.
+            H3Step::RespondData(first_chunk),
+            H3Step::StallFor(Duration::from_millis(60)),
+            // This chunk pushes cumulative bytes past the limit → mid-stream
+            // truncation (RST_STREAM), NOT a pre-stream buffered 502.
+            H3Step::RespondData(second_chunk),
             H3Step::StallFor(Duration::from_millis(100)),
         ],
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", LIMIT_ENV)],

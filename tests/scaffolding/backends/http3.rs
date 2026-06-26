@@ -583,11 +583,23 @@ async fn run_h3_script(
                     .send_trailers(trailers)
                     .await
                     .map_err(|e| format!("send_trailers: {e}"))?;
-                // `send_trailers` finishes the send side. Do NOT return here:
-                // a following `StallFor` keeps the QUIC connection open briefly
-                // so the trailers reach the gateway before the implicit
-                // end-of-script connection drop (mirrors the `StallFor` the
-                // RespondData paths use to avoid a close-race at recv_response).
+                // `send_trailers` writes only the trailers HEADERS frame — h3
+                // requires `finish()` to send the stream FIN. Send it NOW (not
+                // at end-of-script) so the trailers + FIN flush together; a
+                // following `StallFor` then keeps the QUIC connection open past
+                // them so the gateway reads the complete trailered response
+                // BEFORE the implicit end-of-script connection drop. Deferring
+                // the FIN to end-of-script races it against that drop, and the
+                // gateway's `H3FrameSource` has no graceful-close recovery in
+                // its trailers state, so the streamed body would end in an
+                // error instead of clean END_STREAM.
+                stream
+                    .finish()
+                    .await
+                    .map_err(|e| format!("finish after trailers: {e}"))?;
+                // Stream is finalized; drop the handle so the end-of-script
+                // `finish()` is skipped (a second finish would error).
+                response_stream = None;
             }
             H3Step::SendStreamReset(code) => {
                 let stream = response_stream
