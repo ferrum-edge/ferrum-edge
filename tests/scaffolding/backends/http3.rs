@@ -582,7 +582,14 @@ async fn run_h3_script(
                     .send_trailers(trailers)
                     .await
                     .map_err(|e| format!("send_trailers: {e}"))?;
-                // Trailers are terminal — the stream is finished. End the script.
+                // `send_trailers` only writes the trailer HEADERS frame; `finish()`
+                // is required to FIN the stream so the client's `recv_trailers()`
+                // sees EOS (otherwise it blocks until the trailer timeout and
+                // observes no `grpc-status`). End the script after finishing.
+                stream
+                    .finish()
+                    .await
+                    .map_err(|e| format!("finish after trailers: {e}"))?;
                 return Ok(());
             }
             H3Step::SendStreamReset(code) => {

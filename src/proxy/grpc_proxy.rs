@@ -2163,7 +2163,13 @@ pub fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
 /// Returns `None` if the header is absent, malformed, or the value is 0.
 /// Per the gRPC spec, the timeout is a positive integer followed by a unit suffix.
 pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
-    let val = headers.get("grpc-timeout")?.to_str().ok()?;
+    parse_grpc_timeout_value(headers.get("grpc-timeout")?.to_str().ok()?)
+}
+
+/// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into
+/// milliseconds. Shared by [`parse_grpc_timeout_ms`] (hyper `HeaderMap` callers)
+/// and the native-H3 gRPC path, whose headers are a `HashMap<String, String>`.
+pub(crate) fn parse_grpc_timeout_value(val: &str) -> Option<u64> {
     let bytes = val.as_bytes();
     if bytes.is_empty() {
         return None;
