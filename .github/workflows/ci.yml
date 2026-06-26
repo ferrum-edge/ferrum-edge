@@ -360,6 +360,7 @@ jobs:
               integration::mesh_federation_poller_tests
               integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests
+              integration::mesh_cross_cluster_egress_tests
               integration::mesh_proxy_config_tests
               integration::mesh_outbound_registry_stream_tests
               integration::mesh_node_waypoint_stream_scope_tests
