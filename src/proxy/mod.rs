@@ -21107,151 +21107,44 @@ async fn proxy_to_backend_http3(
 
                 return match h3_result {
                     Ok(response) => {
+                        // Now that the response headers are observable, run the
+                        // same content-type buffer→stream downgrade the reqwest /
+                        // direct-H2 paths perform: a `206`/`Content-Range`, SSE,
+                        // or other release-eligible body streams through (backend
+                        // trailers forwarded via `H3FrameSource`) instead of being
+                        // buffered and capped by the response size limit. The
+                        // streaming-incoming-body API already hands back the
+                        // pre-drain headers + `recv_stream`, so only the refine
+                        // call was missing on this branch.
+                        let stream_response = refine_stream_response_for_content_type(
+                            stream_response,
+                            proxy,
+                            plugins,
+                            ctx.as_deref(),
+                            response.status,
+                            &response.headers,
+                        );
                         if stream_response {
-                            if let Some(len) = declared_response_length_exceeds_limit(
-                                &response.headers,
-                                state.max_response_body_size_bytes,
-                            ) {
-                                return (
-                                    h3_response_body_too_large_response(
-                                        proxy,
-                                        resolved_ip,
-                                        Some(len),
-                                        state.max_response_body_size_bytes,
-                                    ),
-                                    None,
-                                );
-                            }
-                            debug!(
-                                proxy_id = %proxy.id,
-                                status = response.status,
-                                "HTTP/3 backend streaming request successful"
-                            );
                             (
-                                retry::BackendResponse {
-                                    status_code: response.status,
-                                    body: ResponseBody::StreamingH3(Box::new(response)),
-                                    // The sole caller moves the headers out of the
-                                    // `StreamingH3` payload via
-                                    // `std::mem::take(&mut h3_resp.headers)` — leave
-                                    // this empty instead of cloning the map per request.
-                                    headers: HashMap::new(),
-                                    connection_error: false,
-                                    backend_resolved_ip: resolved_ip,
-                                    error_class: None,
-                                },
+                                h3_streaming_backend_response(
+                                    response,
+                                    proxy,
+                                    resolved_ip,
+                                    state.max_response_body_size_bytes,
+                                ),
                                 None,
                             )
                         } else {
-                            let status = response.status;
-                            let response_headers = response.headers;
-                            let mut recv_stream = response.recv_stream;
-                            let content_length: Option<u64> = response_headers
-                                .get("content-length")
-                                .and_then(|v| v.parse().ok());
-
-                            let response_body = match crate::http3::client::drain_h3_response_body(
-                                &mut recv_stream,
-                                method,
-                                status,
-                                content_length,
-                                state.max_response_body_size_bytes,
-                                proxy.backend_read_timeout_ms,
-                            )
-                            .await
-                            {
-                                // Trailers (issue #1630) are not forwarded on this
-                                // H1/H2-frontend → H3-backend path: emitting them to
-                                // an H1/H2 client needs chunked-trailer / trailers-
-                                // frame machinery that is out of scope. Discard the
-                                // trailer slot the drain helper now returns.
-                                Ok((body, _trailers)) => body,
-                                Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge {
-                                    ..
-                                }) => {
-                                    error!(
-                                        proxy_id = %proxy.id,
-                                        backend_url = %strip_query_params(backend_url),
-                                        max_response_body_size_bytes = state.max_response_body_size_bytes,
-                                        "HTTP/3 backend response body exceeded configured maximum"
-                                    );
-                                    return (
-                                        retry::BackendResponse {
-                                            status_code: 502,
-                                            body: ResponseBody::Buffered(
-                                                r#"{"error":"Backend response body exceeds maximum size"}"#
-                                                    .as_bytes()
-                                                    .to_vec(),
-                                            ),
-                                            headers: HashMap::new(),
-                                            connection_error: false,
-                                            backend_resolved_ip: resolved_ip,
-                                            error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
-                                        },
-                                        None,
-                                    );
-                                }
-                                Err(crate::http3::client::H3BodyDrainError::ReadTimeout {
-                                    timeout_ms,
-                                }) => {
-                                    warn!(
-                                        proxy_id = %proxy.id,
-                                        backend_url = %strip_query_params(backend_url),
-                                        timeout_ms = timeout_ms,
-                                        "HTTP/3 backend buffered response read timed out"
-                                    );
-                                    return (h3_read_timeout_backend_response(resolved_ip), None);
-                                }
-                                Err(crate::http3::client::H3BodyDrainError::Stream(e)) => {
-                                    let (error_kind, error_class) = classify_h3_error(&e);
-                                    record_port_exhaustion_if_class(&state.overload, error_class);
-                                    // We have already received response headers and
-                                    // started reading the body — the request was on
-                                    // the wire and the backend already processed it.
-                                    // `connection_error=false` unconditionally so a
-                                    // mid-body QUIC failure does not bypass
-                                    // `retry_on_methods`. Graceful close after a
-                                    // complete body is recovered inside
-                                    // `drain_h3_response_body` and never reaches here.
-                                    error!(
-                                        proxy_id = %proxy.id,
-                                        backend_url = %strip_query_params(backend_url),
-                                        error_kind = error_kind,
-                                        error = %e,
-                                        "HTTP/3 backend buffered response read failed"
-                                    );
-                                    return (
-                                        retry::BackendResponse {
-                                            status_code: 502,
-                                            body: ResponseBody::Buffered(
-                                                r#"{"error":"HTTP/3 backend request failed"}"#
-                                                    .as_bytes()
-                                                    .to_vec(),
-                                            ),
-                                            headers: HashMap::new(),
-                                            connection_error: false,
-                                            backend_resolved_ip: resolved_ip,
-                                            error_class: Some(error_class),
-                                        },
-                                        None,
-                                    );
-                                }
-                            };
-
-                            debug!(
-                                proxy_id = %proxy.id,
-                                status = status,
-                                "HTTP/3 backend request with streaming request body successful"
-                            );
                             (
-                                retry::BackendResponse {
-                                    status_code: status,
-                                    body: ResponseBody::Buffered(response_body),
-                                    headers: response_headers,
-                                    connection_error: false,
-                                    backend_resolved_ip: resolved_ip,
-                                    error_class: None,
-                                },
+                                drain_h3_streaming_response_to_buffered(
+                                    response,
+                                    state,
+                                    proxy,
+                                    method,
+                                    backend_url,
+                                    resolved_ip,
+                                )
+                                .await,
                                 None,
                             )
                         }
@@ -21442,7 +21335,9 @@ async fn proxy_to_backend_http3(
     let request_body =
         apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
             .await;
-    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
+    // Keep `ctx` alive (reborrow instead of move) — the buffered-response branch
+    // below needs it to run `refine_stream_response_for_content_type`.
+    match run_final_request_body_hooks(plugins, ctx.as_deref_mut(), headers, &request_body).await {
         PluginResult::Continue => {}
         reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
             return (
@@ -21517,42 +21412,15 @@ async fn proxy_to_backend_http3(
         };
 
         match h3_result {
-            Ok(response) => {
-                if let Some(len) = declared_response_length_exceeds_limit(
-                    &response.headers,
+            Ok(response) => (
+                h3_streaming_backend_response(
+                    response,
+                    proxy,
+                    resolved_ip,
                     state.max_response_body_size_bytes,
-                ) {
-                    return (
-                        h3_response_body_too_large_response(
-                            proxy,
-                            resolved_ip,
-                            Some(len),
-                            state.max_response_body_size_bytes,
-                        ),
-                        retained_body,
-                    );
-                }
-                debug!(
-                    proxy_id = %proxy.id,
-                    status = response.status,
-                    "HTTP/3 backend streaming request successful"
-                );
-                (
-                    retry::BackendResponse {
-                        status_code: response.status,
-                        body: ResponseBody::StreamingH3(Box::new(response)),
-                        // The sole caller moves the headers out of the
-                        // `StreamingH3` payload via
-                        // `std::mem::take(&mut h3_resp.headers)` — leave
-                        // this empty instead of cloning the map per request.
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: None,
-                    },
-                    retained_body,
-                )
-            }
+                ),
+                retained_body,
+            ),
             Err(e) => {
                 if e.is_read_timeout() {
                     // `backend_read_timeout_ms` expired waiting for response
@@ -21595,27 +21463,18 @@ async fn proxy_to_backend_http3(
             }
         }
     } else {
-        // RESIDUAL (range/SSE buffering downgrade): unlike the reqwest and
-        // direct-H2/HBONE backend paths — which call
-        // `refine_stream_response_for_content_type` once the response headers
-        // are known and downgrade a buffered decision to streaming for a
-        // `206`/`Content-Range` (or SSE) body — the H3 pool's `.request()` /
-        // `.request_with_target()` methods drain the whole body internally and
-        // only hand back already-buffered `response.body`, so the response
-        // content-type/status are not observable before the drain. A large
-        // ranged H3-backend download therefore stays buffered here and is
-        // capped by the pool's size limit (graceful `502 ResponseBodyTooLarge`,
-        // never an OOM) rather than streamed through. This is a
-        // graceful-degradation gap, NOT a correctness bug: the range mislabel /
-        // byte-offset corruption that motivated the marker is already prevented
-        // because the sole caller stamps `RANGE_RESPONSE_METADATA_KEY` from the
-        // pristine headers before its `after_proxy` phase (see the H1/H2 stamp
-        // in `handle_proxy_request_inner`), so `compression.after_proxy` declines
-        // to compress regardless. Closing this fully needs the H3 buffered pool
-        // call to expose pre-drain headers + `recv_stream` (as
-        // `request_streaming_incoming_body` already does) so the same
-        // header-time downgrade can run before draining; deferred to keep this
-        // hot-path/pool change out of a guard-hardening PR.
+        // The base decision was to buffer (a response-body plugin such as
+        // `compression` is active), but call the STREAMING H3 API anyway: it
+        // returns the response headers + `recv_stream` BEFORE draining, so the
+        // same `refine_stream_response_for_content_type` downgrade the reqwest /
+        // direct-H2 paths run can fire here too. A `206`/`Content-Range`, SSE, or
+        // other release-eligible body then streams through — forwarding backend
+        // trailers via `H3FrameSource` — instead of being fully buffered and
+        // capped by the response size limit (which previously turned large ranged
+        // H3-backend downloads into `502 ResponseBodyTooLarge`). When the refine
+        // keeps the buffered decision, `drain_h3_streaming_response_to_buffered`
+        // drains the body with the same incremental size enforcement the pool's
+        // `request()` applied internally.
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
@@ -21623,7 +21482,7 @@ async fn proxy_to_backend_http3(
             let proxy_clone = proxy.clone();
             state
                 .h3_pool
-                .request_with_target(
+                .request_with_target_streaming(
                     proxy,
                     &target_host,
                     target_port,
@@ -21639,7 +21498,7 @@ async fn proxy_to_backend_http3(
             let proxy_clone = proxy.clone();
             state
                 .h3_pool
-                .request(
+                .request_streaming(
                     proxy,
                     method,
                     backend_url,
@@ -21652,32 +21511,46 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
-                debug!(proxy_id = %proxy.id, status = response.status, "HTTP/3 backend request successful");
-                // Backend trailers (`response.trailers`) are intentionally
-                // dropped on this H1/H2-frontend → H3-backend path: forwarding
-                // them would require H1 chunked-trailer / H2 trailers-frame
-                // emission on the client side, which is out of scope for issue
-                // #1630 (limited to the plain H3-frontend → H3-backend buffered
-                // path). The H3-frontend buffered path forwards them.
-                (
-                    retry::BackendResponse {
-                        status_code: response.status,
-                        body: ResponseBody::Buffered(response.body),
-                        headers: response.headers,
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: None,
-                    },
-                    retained_body,
-                )
+                let stream_response = refine_stream_response_for_content_type(
+                    stream_response,
+                    proxy,
+                    plugins,
+                    ctx.as_deref(),
+                    response.status,
+                    &response.headers,
+                );
+                if stream_response {
+                    (
+                        h3_streaming_backend_response(
+                            response,
+                            proxy,
+                            resolved_ip,
+                            state.max_response_body_size_bytes,
+                        ),
+                        retained_body,
+                    )
+                } else {
+                    (
+                        drain_h3_streaming_response_to_buffered(
+                            response,
+                            state,
+                            proxy,
+                            method,
+                            backend_url,
+                            resolved_ip,
+                        )
+                        .await,
+                        retained_body,
+                    )
+                }
             }
             Err(e) => {
                 if e.is_read_timeout() {
                     // `backend_read_timeout_ms` expired waiting for response
-                    // headers (`recv_response`) or buffered body frames
-                    // (`recv_data` inside the pool's drain) — surface 504
-                    // Backend timeout like the direct-H2 / HBONE
-                    // read-timeout arms, not a generic 502.
+                    // headers (`recv_response`) — surface 504 Backend timeout
+                    // like the direct-H2 / HBONE read-timeout arms, not a
+                    // generic 502. Body-drain timeouts surface separately
+                    // inside `drain_h3_streaming_response_to_buffered`.
                     warn!(
                         proxy_id = %proxy.id,
                         backend_url = %strip_query_params(backend_url),
@@ -21711,6 +21584,161 @@ async fn proxy_to_backend_http3(
                     },
                     retained_body,
                 )
+            }
+        }
+    }
+}
+
+/// Build the [`retry::BackendResponse`] for an H3 backend response that has
+/// been chosen to stream downstream (`StreamingH3`), applying the declared-
+/// `Content-Length` pre-stream size check (mirroring the reqwest retry path's
+/// pre-stream reject). Returns the size-limit `502` when the declared length
+/// exceeds the configured cap.
+///
+/// `headers` is left empty intentionally: the sole dispatch caller
+/// (`backend_dispatch` site in `handle_proxy_request_inner`) moves the headers
+/// out of the `StreamingH3` payload via `std::mem::take(&mut h3_resp.headers)`
+/// rather than cloning the map per request. Backend response trailers ride
+/// along on the streamed `recv_stream` and are forwarded — with hop-by-hop
+/// trailer names stripped — by [`crate::proxy::body::H3FrameSource`], so both
+/// H1 (chunked trailers) and H2 (trailers frame) downstream clients receive
+/// them.
+fn h3_streaming_backend_response(
+    response: crate::http3::client::H3StreamingResponse,
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    max_response_body_size_bytes: usize,
+) -> retry::BackendResponse {
+    if let Some(len) =
+        declared_response_length_exceeds_limit(&response.headers, max_response_body_size_bytes)
+    {
+        return h3_response_body_too_large_response(
+            proxy,
+            resolved_ip,
+            Some(len),
+            max_response_body_size_bytes,
+        );
+    }
+    debug!(
+        proxy_id = %proxy.id,
+        status = response.status,
+        "HTTP/3 backend streaming request successful"
+    );
+    retry::BackendResponse {
+        status_code: response.status,
+        body: ResponseBody::StreamingH3(Box::new(response)),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: None,
+    }
+}
+
+/// Drain a fully-headers-received
+/// [`H3StreamingResponse`](crate::http3::client::H3StreamingResponse) into a
+/// buffered [`retry::BackendResponse`], enforcing `max_response_body_size_bytes`
+/// incrementally and mapping drain failures exactly as the rest of the H3
+/// dispatcher does: oversized → `502` `ResponseBodyTooLarge`, read timeout →
+/// `504`, mid-body protocol fault → `502`.
+///
+/// Backend response trailers (the second tuple element from
+/// [`drain_h3_response_body`](crate::http3::client::drain_h3_response_body)) are
+/// dropped on this buffered path: `ResponseBody::Buffered` cannot carry them and
+/// the buffered decision is only reached when a response-body plugin needs the
+/// full body (plugins cannot inspect trailers today). The streaming path
+/// ([`h3_streaming_backend_response`]) forwards them instead.
+///
+/// A mid-body `Stream` fault is classified with [`classify_h3_error`] on the raw
+/// `h3::error::StreamError` (not `classify_h3_pool_error`) because a close
+/// mid-body is a real protocol fault — the backend signalled completion but
+/// truncated the response — matching the streaming-incoming-body drain site.
+async fn drain_h3_streaming_response_to_buffered(
+    response: crate::http3::client::H3StreamingResponse,
+    state: &ProxyState,
+    proxy: &Proxy,
+    method: &str,
+    backend_url: &str,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let status = response.status;
+    let response_headers = response.headers;
+    let mut recv_stream = response.recv_stream;
+    let content_length: Option<u64> = response_headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok());
+
+    match crate::http3::client::drain_h3_response_body(
+        &mut recv_stream,
+        method,
+        status,
+        content_length,
+        state.max_response_body_size_bytes,
+        proxy.backend_read_timeout_ms,
+    )
+    .await
+    {
+        Ok((body, _trailers)) => retry::BackendResponse {
+            status_code: status,
+            body: ResponseBody::Buffered(body),
+            headers: response_headers,
+            connection_error: false,
+            backend_resolved_ip: resolved_ip,
+            error_class: None,
+        },
+        Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge { .. }) => {
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                max_response_body_size_bytes = state.max_response_body_size_bytes,
+                "HTTP/3 backend response body exceeded configured maximum"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+            }
+        }
+        Err(crate::http3::client::H3BodyDrainError::ReadTimeout { timeout_ms }) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                timeout_ms = timeout_ms,
+                "HTTP/3 backend buffered response read timed out"
+            );
+            h3_read_timeout_backend_response(resolved_ip)
+        }
+        Err(crate::http3::client::H3BodyDrainError::Stream(e)) => {
+            let (error_kind, error_class) = classify_h3_error(&e);
+            record_port_exhaustion_if_class(&state.overload, error_class);
+            // Headers were already received and the body read started — the
+            // request was on the wire and the backend processed it.
+            // `connection_error=false` so a mid-body QUIC failure does not
+            // bypass `retry_on_methods`. Graceful close after a complete body
+            // is recovered inside `drain_h3_response_body` and never reaches
+            // here.
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                error_kind = error_kind,
+                error = %e,
+                "HTTP/3 backend buffered response read failed"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(error_class),
             }
         }
     }

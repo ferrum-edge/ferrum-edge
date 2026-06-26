@@ -78,6 +78,11 @@ pub enum H3Step {
     RespondHeaders(Vec<(&'static str, String)>),
     /// Send a chunk of response body.
     RespondData(Bytes),
+    /// Send an H3 trailers (HEADERS) frame with the given `(name, value)`
+    /// pairs after the response body, then finish the stream. Pseudo-headers
+    /// are rejected — trailers carry only regular header fields. Used to
+    /// exercise backend-trailer forwarding to H1/H2 downstream clients.
+    RespondTrailers(Vec<(&'static str, String)>),
     /// Send `RESET_STREAM` with the given application error code, then
     /// end the script.
     SendStreamReset(u64),
@@ -558,6 +563,31 @@ async fn run_h3_script(
                     .send_data(bytes)
                     .await
                     .map_err(|e| format!("send_data: {e}"))?;
+            }
+            H3Step::RespondTrailers(pairs) => {
+                let stream = response_stream.as_mut().ok_or_else(|| {
+                    "RespondTrailers without preceding RespondHeaders".to_string()
+                })?;
+                let mut trailers = http::HeaderMap::new();
+                for (name, value) in pairs {
+                    if name.starts_with(':') {
+                        return Err(format!("pseudo-header {name:?} is illegal in trailers"));
+                    }
+                    let hn = HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|e| format!("bad trailer name {name}: {e}"))?;
+                    let hv = HeaderValue::from_str(&value)
+                        .map_err(|e| format!("bad trailer value {value}: {e}"))?;
+                    trailers.append(hn, hv);
+                }
+                stream
+                    .send_trailers(trailers)
+                    .await
+                    .map_err(|e| format!("send_trailers: {e}"))?;
+                // `send_trailers` finishes the send side. Do NOT return here:
+                // a following `StallFor` keeps the QUIC connection open briefly
+                // so the trailers reach the gateway before the implicit
+                // end-of-script connection drop (mirrors the `StallFor` the
+                // RespondData paths use to avoid a close-race at recv_response).
             }
             H3Step::SendStreamReset(code) => {
                 let stream = response_stream
