@@ -842,6 +842,70 @@ fn cross_cluster_unhealthy_local_fails_over_to_healthy_gateway() {
 }
 
 #[test]
+fn cross_cluster_local_first_when_source_locality_present_but_locals_unlabeled() {
+    // [R6-1] Source HAS a locality but the LOCAL endpoints carry no locality
+    // metadata: every ranked tier misses, so without the cross-cluster pre-filter
+    // selection would fall through to the mixed pool and round-robin onto the
+    // gateway. The pre-filter keeps it local-first.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        Some("us-west/us-west-1/a"),
+        vec![
+            target("local-a.local", None),
+            target("local-b.local", None),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "unlabeled local endpoints must keep serving — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("eastwest-gw.local"),
+        "cross-cluster gateway must not round-robin with healthy locals even when ranked tiers \
+         miss (source locality present, locals unlabeled) — saw {seen:?}"
+    );
+}
+
+#[test]
+fn cross_cluster_local_first_when_locality_lb_disabled() {
+    // [R6-2] `localityLbSetting.enabled=false` short-circuits the tier logic; the
+    // cross-cluster failover pre-filter runs BEFORE that short-circuit, so the
+    // gateway stays failover-only behind healthy locals.
+    let mut up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            target("local-a.local", Some("us-west/us-west-1/a")),
+            target("local-b.local", Some("us-west/us-west-1/b")),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    up.locality_lb_setting = Some(UpstreamLocalityLbSetting {
+        enabled: false,
+        distribute: Vec::new(),
+        failover: Vec::new(),
+    });
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "local endpoints must keep serving with locality LB disabled — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("eastwest-gw.local"),
+        "cross-cluster gateway must stay failover-only even when localityLbSetting.enabled=false \
+         — saw {seen:?}"
+    );
+}
+
+#[test]
 fn strict_locality_present_source_unchanged_priority_tier() {
     // With a resolved source locality, strict mode is inert: priority-tier
     // preference still picks the exact-match local target and ignores the flag.

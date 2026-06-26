@@ -1311,16 +1311,26 @@ fn project_mesh_source_locality(
 }
 
 fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
+    // The source workload is ALWAYS the LOCAL sidecar — never a remote-cluster
+    // endpoint merged in by multi-cluster discovery (codex r6 [R6-3]). When remote
+    // endpoint polling is active the slice now carries remote workloads, and a
+    // remote replica that shares the local service-account SPIFFE (same-domain
+    // multi-network) or matches the local labels could otherwise stamp a REMOTE
+    // locality — or, on the label path, conflict and clear `source_locality`,
+    // disabling the local-first priority tiers for every upstream. Skip remote
+    // workloads in BOTH resolution paths.
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+
     // SPIFFE-matched workload is authoritative: if the configured workload
-    // identity matches a known workload, that workload's locality is the
+    // identity matches a known LOCAL workload, that workload's locality is the
     // answer — even when it is `None`. Falling through to the label-based
     // heuristic here would pick up a different pod's metadata and silently
     // disagree with the SPIFFE source of truth.
     if let Some(spiffe_id) = mesh_slice.workload_spiffe_id.as_deref()
-        && let Some(workload) = mesh_slice
-            .workloads
-            .iter()
-            .find(|workload| workload.spiffe_id.as_str() == spiffe_id)
+        && let Some(workload) = mesh_slice.workloads.iter().find(|workload| {
+            workload.spiffe_id.as_str() == spiffe_id
+                && !crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
+        })
     {
         return workload.locality.as_deref();
     }
@@ -1331,6 +1341,9 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
     // Bail out only when two label-matched workloads disagree on locality.
     let mut matched_locality: Option<&str> = None;
     for workload in &mesh_slice.workloads {
+        if crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster) {
+            continue;
+        }
         if workload.namespace != mesh_slice.namespace {
             continue;
         }
@@ -20794,6 +20807,38 @@ mod tests {
         };
 
         assert_eq!(mesh_source_workload_locality(&slice), None);
+    }
+
+    #[test]
+    fn mesh_source_workload_locality_ignores_remote_replica_sharing_labels() {
+        // [R6-3] A label-attributed sidecar (no workload_spiffe_id) with a remote
+        // replica merged into the slice that shares the local labels but carries a
+        // DIFFERENT (remote) locality must NOT clear or override the local source
+        // locality — the source workload is always the LOCAL sidecar.
+        let mut local = workload("reviews-1", "reviews");
+        local.locality = Some("us-west/us-west-1/a".to_string());
+
+        // A remote replica (remote_provenance => classified remote) sharing the
+        // local `app=reviews` label but in a remote locality.
+        let mut remote = workload("reviews-remote", "reviews");
+        remote.locality = Some("remote-cluster-east/net2".to_string());
+        remote.remote_provenance = true;
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            workloads: vec![local, remote],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            mesh_source_workload_locality(&slice),
+            Some("us-west/us-west-1/a"),
+            "a remote replica sharing the local labels must not clear/override the local source \
+             locality"
+        );
     }
 
     #[test]
