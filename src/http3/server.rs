@@ -5522,12 +5522,13 @@ async fn dispatch_grpc_native_h3(
             let h3_error_class = classify_h3_error(&e);
             crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             let is_client_request_body_disconnect = is_h3_client_request_body_disconnect(&err_msg);
+            let is_oversize = err_msg.contains("exceeds maximum size");
             let is_read_timeout = e.is_read_timeout();
 
             // gRPC error signalling mirrors the cross-protocol bridge's
             // dispatch-failure mapping: oversized upload -> RESOURCE_EXHAUSTED,
             // read timeout -> DEADLINE_EXCEEDED, everything else -> UNAVAILABLE.
-            let (grpc_status, grpc_message) = if err_msg.contains("exceeds maximum size") {
+            let (grpc_status, grpc_message) = if is_oversize {
                 (
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
@@ -5546,9 +5547,10 @@ async fn dispatch_grpc_native_h3(
 
             // A cached H3 capability that fails with a transport error means the
             // backend probably lost UDP/QUIC; downgrade so the next gRPC request
-            // takes the cross-protocol bridge. A client upload abort is not a
-            // backend-capability signal.
+            // takes the cross-protocol bridge. A client upload abort or an
+            // oversized upload is client-caused, not a backend-capability signal.
             if !is_client_request_body_disconnect
+                && !is_oversize
                 && crate::proxy::is_h3_transport_error_class(h3_error_class)
             {
                 state
@@ -5561,15 +5563,27 @@ async fn dispatch_grpc_native_h3(
             // it on a client disconnect during the error write.
             let _ = send_h3_grpc_error(stream, grpc_status, grpc_message).await;
 
-            // HTTP-equivalent status for CB/passive-health accounting (matching
-            // the plain native-H3 streaming-body failure path): 504 on a backend
-            // read timeout, 502 otherwise.
-            let reject_status_code = if is_read_timeout { 504 } else { 502 };
-            let (outcome_connection_error, outcome_error_class) = h3_streaming_body_failure_outcome(
-                is_client_request_body_disconnect,
-                is_read_timeout,
-                h3_error_class,
-            );
+            // Split the WIRE status from the backend-HEALTH status, exactly like
+            // the H1/H2 and cross-protocol gRPC paths (`write_grpc_error` returns
+            // `response_status: 200`). The wire response is a trailers-only gRPC
+            // error (HTTP 200 + `grpc-status`), so logs / the runtime status
+            // counter record 200 and carry the gRPC status in metadata; CB /
+            // passive-health / adaptive concurrency use the HTTP-equivalent health
+            // status (504 on read timeout, 502 otherwise). An oversized client
+            // upload is client-caused and stays NEUTRAL — 413 + `ClientDisconnect`,
+            // matching the plain native-H3 streaming 413 path — so it never
+            // poisons the breaker / passive health / adaptive concurrency.
+            let (health_status, outcome_connection_error, outcome_error_class) = if is_oversize {
+                (413, false, Some(crate::retry::ErrorClass::ClientDisconnect))
+            } else {
+                let status = if is_read_timeout { 504 } else { 502 };
+                let (connection_error, error_class) = h3_streaming_body_failure_outcome(
+                    is_client_request_body_disconnect,
+                    is_read_timeout,
+                    h3_error_class,
+                );
+                (status, connection_error, error_class)
+            };
             crate::proxy::backend_dispatch::record_backend_outcome(
                 state,
                 proxy,
@@ -5577,7 +5591,7 @@ async fn dispatch_grpc_native_h3(
                 upstream_balancer,
                 upstream_target,
                 cb_target_key,
-                reject_status_code,
+                health_status,
                 outcome_connection_error,
                 outcome_error_class,
                 cb_is_half_open_probe,
@@ -5586,11 +5600,16 @@ async fn dispatch_grpc_native_h3(
             );
             record_h3_backend_admission_outcome(
                 &mut backend_admission_permits,
-                reject_status_code,
+                health_status,
                 outcome_connection_error,
                 outcome_error_class,
                 backend_admission_start.elapsed(),
             );
+            // Wire/log status is HTTP 200 (gRPC errors ride on 200); stash the
+            // gRPC status/message in metadata so observability still reflects the
+            // failure, matching the H1/H2 + cross-protocol gRPC error paths.
+            crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message);
+            let wire_status = StatusCode::OK.as_u16();
             log_h3_grpc_transaction(
                 proxy,
                 ctx,
@@ -5600,7 +5619,7 @@ async fn dispatch_grpc_native_h3(
                 backend_url,
                 backend_resolved_ip,
                 proxy_headers,
-                reject_status_code,
+                wire_status,
                 request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                 0,
                 false,
@@ -5612,7 +5631,7 @@ async fn dispatch_grpc_native_h3(
                 *plugin_execution_ns,
             )
             .await;
-            record_request(state, reject_status_code);
+            record_request(state, wire_status);
             return Ok(());
         }
     };
@@ -5623,12 +5642,16 @@ async fn dispatch_grpc_native_h3(
     let mut response_headers = h3_resp.headers;
     stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
-    // gRPC response body size ceiling (Content-Length fast path).
-    if state.max_grpc_recv_size_bytes > 0
+    // Response body size ceiling (Content-Length fast path). Backend RESPONSE
+    // bytes are bounded by `max_response_body_size_bytes` — the same limit the
+    // plain native-H3 streaming path and the cross-protocol streaming gRPC bridge
+    // apply — NOT the request-side gRPC receive cap, so a large-but-valid gRPC
+    // response is not spuriously rejected.
+    if state.max_response_body_size_bytes > 0
         && let Some(len) = response_headers
             .get("content-length")
             .and_then(|v| v.parse::<usize>().ok())
-        && len > state.max_grpc_recv_size_bytes
+        && len > state.max_response_body_size_bytes
     {
         let _ = send_h3_grpc_error(
             stream,
@@ -5660,7 +5683,16 @@ async fn dispatch_grpc_native_h3(
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             backend_admission_response_elapsed,
         );
-        record_request(state, 502);
+        // The wire response is a trailers-only gRPC error (HTTP 200 +
+        // RESOURCE_EXHAUSTED), so the runtime status counter records 200 with the
+        // gRPC status in metadata — matching the cross-protocol gRPC
+        // ResponseTooLarge path and the dispatch-failure branch above.
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Backend response exceeds maximum size",
+        );
+        record_request(state, StatusCode::OK.as_u16());
         return Ok(());
     }
 
@@ -5710,6 +5742,19 @@ async fn dispatch_grpc_native_h3(
             None,
             backend_admission_response_elapsed,
         );
+        // Normalize the reject for logging/metrics: `send_h3_reject_flavor_aware`
+        // wrote a trailers-only gRPC response (HTTP 200 + `grpc-status`), so the
+        // access log and runtime status counter must record 200 with the gRPC
+        // status in metadata — matching the earlier H3 gRPC reject phases
+        // (`run_h3_backend_admission_or_send_reject`). The reject body becomes the
+        // `grpc-message`, not a wire DATA frame, so no response body bytes are sent.
+        let log_status = h3_reject_log_status_and_metadata(
+            ctx,
+            HttpFlavor::Grpc,
+            reject_status,
+            &reject.body,
+            &reject.headers,
+        );
         log_h3_grpc_transaction(
             proxy,
             ctx,
@@ -5719,13 +5764,9 @@ async fn dispatch_grpc_native_h3(
             backend_url,
             backend_resolved_ip,
             proxy_headers,
-            reject.status_code,
+            log_status,
             0,
-            if reject_sent {
-                reject.body.len() as u64
-            } else {
-                0
-            },
+            0,
             reject_sent,
             !reject_sent,
             None,
@@ -5735,7 +5776,7 @@ async fn dispatch_grpc_native_h3(
             *plugin_execution_ns,
         )
         .await;
-        record_request(state, reject.status_code);
+        record_request(state, log_status);
         return Ok(());
     }
 
@@ -5846,8 +5887,11 @@ async fn dispatch_grpc_native_h3(
                         just_received_backend_frame = true;
                         let chunk_len = chunk.remaining();
                         total_streamed += chunk_len;
-                        if state.max_grpc_recv_size_bytes > 0
-                            && total_streamed > state.max_grpc_recv_size_bytes
+                        // Backend RESPONSE bytes are bounded by the response-body
+                        // limit (matching the plain native-H3 streaming path), not
+                        // the request-side gRPC receive cap.
+                        if state.max_response_body_size_bytes > 0
+                            && total_streamed > state.max_response_body_size_bytes
                         {
                             crate::http3::stream_util::abort_response_stream(stream);
                             body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
@@ -6024,6 +6068,23 @@ async fn dispatch_grpc_native_h3(
         | Some(crate::retry::ErrorClass::ClientDisconnect) => false,
         Some(_) => true,
     };
+    // When the backend itself returned a failure status (a raw HTTP 5xx instead of
+    // a gRPC response, or a status the proxy configured as a breaker failure), a
+    // concurrent client disconnect during the body/trailer forward must NOT mask
+    // it: `ClientDisconnect` is client-side and skips CB / passive-health entirely,
+    // so the real backend failure would be neutralized. Drop the body class in that
+    // case so the failure status drives the recorded outcome — mirrors the plain
+    // native-H3 streaming path. (gRPC application failures still ride on HTTP 200
+    // and are not failure statuses here.)
+    let backend_failure_status = response_status >= 500
+        || proxy
+            .circuit_breaker
+            .as_ref()
+            .is_some_and(|cb| cb.failure_status_codes.contains(&response_status));
+    let body_outcome_error_class = match body_error_class {
+        Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => None,
+        other => other,
+    };
     crate::proxy::backend_dispatch::record_backend_outcome(
         state,
         proxy,
@@ -6033,7 +6094,7 @@ async fn dispatch_grpc_native_h3(
         cb_target_key,
         response_status,
         body_outcome_connection_error,
-        body_error_class,
+        body_outcome_error_class,
         cb_is_half_open_probe,
         false,
         backend_start.elapsed(),
@@ -6059,7 +6120,7 @@ async fn dispatch_grpc_native_h3(
         &mut backend_admission_permits,
         admission_status,
         body_outcome_connection_error,
-        body_error_class,
+        body_outcome_error_class,
         backend_admission_response_elapsed,
     );
     log_h3_grpc_transaction(
