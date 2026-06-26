@@ -2579,6 +2579,35 @@ where
         }
     }
 
+    // Late client-upload overflow (codex P2): on a bidi/early-response RPC the
+    // channel body can trip `max_grpc_recv_size_bytes` AFTER the response headers
+    // were forwarded, so `proxy_grpc_request_streaming_channel` could not surface
+    // it. If `request_body_exceeded` tripped, the gateway RST the stream on a
+    // CLIENT overrun — reclassify the (otherwise backend-looking) body error as
+    // `RequestBodyTooLarge` so the overrun trains neither backend health nor
+    // adaptive concurrency, even if the backend happened to finish first. (No-op
+    // for the buffered-request path, which size-checks before dispatch.)
+    let request_overflowed_late = streaming
+        .request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire));
+    let outcome_error_class = if request_overflowed_late {
+        Some(ErrorClass::RequestBodyTooLarge)
+    } else {
+        body_error_class
+    };
+    // The backend-health sample (circuit breaker / passive health / least-latency)
+    // must reflect the TRUE gRPC outcome, not just the HTTP 200 status line
+    // (codex P2): a non-OK `grpc-status` trailer or a mid-stream body error is a
+    // backend failure, while a client-side terminal (disconnect / oversized upload)
+    // is neutral. Response headers already arrived here, so `connection_error` is
+    // always false (no pre-wire connect failure) — the failure signal rides the
+    // mapped status + error class. The adaptive-concurrency sample uses the same
+    // triple so circuit-breaker / passive-health and admission cannot drift.
+    let outcome_status = match grpc_trailer_status {
+        Some(code) if code != 0 => crate::proxy::grpc_proxy::grpc_status_to_http_status(code),
+        _ => streaming.status,
+    };
     record_backend_outcome(
         state,
         proxy,
@@ -2586,30 +2615,18 @@ where
         upstream_balancer,
         current_target_ref,
         current_cb_target_key,
-        streaming.status,
+        outcome_status,
         false,
-        None,
+        outcome_error_class,
         cb_is_half_open_probe,
         false,
         backend_start.elapsed(),
     );
-    let backend_admission_connection_error = match body_error_class {
-        Some(ErrorClass::ClientDisconnect) => false,
-        Some(_) => true,
-        None => false,
-    };
-    // On a clean completion the backend health rides in the grpc-status
-    // trailer (HTTP 200) — map a non-OK status to 5xx so the limiter shrinks;
-    // a mid-stream body error already drives `connection_error`/error_class.
-    let admission_status = match grpc_trailer_status {
-        Some(code) if code != 0 => crate::proxy::grpc_proxy::grpc_status_to_http_status(code),
-        _ => streaming.status,
-    };
     record_cross_protocol_backend_admission_outcome(
         backend_admission_permits,
-        admission_status,
-        backend_admission_connection_error,
-        body_error_class,
+        outcome_status,
+        false,
+        outcome_error_class,
         backend_admission_start.elapsed(),
     );
     Ok(CrossProtocolOutcome {
@@ -2622,7 +2639,7 @@ where
         client_disconnected: final_client_disconnected,
         connection_error: false,
         error_class: None,
-        body_error_class,
+        body_error_class: outcome_error_class,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -3553,6 +3570,11 @@ pub(crate) async fn dispatch_grpc_streaming(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ()>>(capacity);
     let request_bytes_seen = Arc::new(AtomicU64::new(0));
     let pump_bytes = Arc::clone(&request_bytes_seen);
+    // Set by the pump when the H3 recv half errors (the client reset its upload).
+    // The resulting backend RST must be recorded as a CLIENT abort, not a backend
+    // fault (codex P2) — read in the dispatch Err arm below.
+    let frontend_upload_failed = Arc::new(AtomicBool::new(false));
+    let pump_frontend_failed = Arc::clone(&frontend_upload_failed);
     // Lets the response side terminate the pump promptly once the RPC is over
     // (e.g. a bidi server that sends its status before the client half-closes),
     // so the recv half is closed via STOP_SENDING(H3_NO_ERROR) instead of
@@ -3575,7 +3597,19 @@ pub(crate) async fn dispatch_grpc_streaming(
                             // already `bytes::Bytes` (always true with h3-quinn).
                             let body_bytes = chunk.copy_to_bytes(len);
                             pump_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                            if tx.send(Ok(body_bytes)).await.is_err() {
+                            // The send MUST stay cancellable (codex P1): on
+                            // bounded-channel backpressure, a bidi backend that
+                            // finished its response and stopped polling the request
+                            // body would otherwise park us forever inside
+                            // `tx.send(...).await`, and the post-response
+                            // `pump_shutdown.notify_one()` (observed only by this
+                            // select) could never unblock the awaited `pump`.
+                            let send_result = tokio::select! {
+                                biased;
+                                _ = pump_shutdown_signal.notified() => break,
+                                res = tx.send(Ok(body_bytes)) => res,
+                            };
+                            if send_result.is_err() {
                                 // Backend dropped the request body (RPC done / RST):
                                 // nothing left to feed.
                                 break;
@@ -3585,9 +3619,17 @@ pub(crate) async fn dispatch_grpc_streaming(
                         // observes END_STREAM and forwards the FIN to the backend.
                         Ok(None) => break,
                         Err(_e) => {
-                            // Frontend upload failure: tell the channel body to RST
-                            // the backend instead of sending a clean END_STREAM.
-                            let _ = tx.send(Err(())).await;
+                            // Frontend upload failure: flag it (so the dispatch Err
+                            // arm records a client abort, not a backend fault) and
+                            // best-effort signal the channel body to RST the backend
+                            // instead of sending a clean END_STREAM. The send stays
+                            // cancellable for the same reason as the data send above.
+                            pump_frontend_failed.store(true, Ordering::Release);
+                            tokio::select! {
+                                biased;
+                                _ = pump_shutdown_signal.notified() => {}
+                                _ = tx.send(Err(())) => {}
+                            }
                             break;
                         }
                     }
@@ -3622,7 +3664,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
 
-    let outcome = match result {
+    let outcome_result: Result<CrossProtocolOutcome, anyhow::Error> = match result {
         Ok(GrpcResponseKind::Streaming(streaming)) => {
             let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
             handle_h3_grpc_streaming_response(
@@ -3672,24 +3714,23 @@ pub(crate) async fn dispatch_grpc_streaming(
                 Some(ErrorClass::ProtocolError),
                 backend_admission_start.elapsed(),
             );
-            let mut outcome = write_grpc_error_send(
+            write_grpc_error_send(
                 &mut send_half,
                 grpc_proxy::grpc_status::INTERNAL,
                 "Internal gateway error",
                 backend_start,
                 bytes_sent,
             )
-            .await?;
-            outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
-            outcome.error_class = Some(ErrorClass::ProtocolError);
-            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
-            Ok(outcome)
+            .await
+            .map(|mut outcome| {
+                outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
+                outcome.error_class = Some(ErrorClass::ProtocolError);
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome
+            })
         }
         Err(err) => {
             let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
-            // Same gRPC-status mapping + wire-boundary `connection_error`
-            // derivation as the buffered path's Err arm, so an H3-streaming gRPC
-            // failure trains the breaker / limiter identically.
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
                 grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -3710,23 +3751,30 @@ pub(crate) async fn dispatch_grpc_streaming(
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
             };
-            // A `ResourceExhausted` on this streaming path is ALWAYS the gateway
-            // rejecting an oversized CLIENT upload (the channel body tripped
-            // `max_grpc_recv_size_bytes`), never a backend fault. Classify it as a
-            // client/gateway-side terminal (`RequestBodyTooLarge`, neutralized by
-            // `client_side_no_backend_signal`) so it releases any HALF_OPEN probe and
-            // trains NEITHER backend health NOR adaptive concurrency — matching the
-            // buffered H3 path, which rejects the oversized upload before the backend
-            // is dialed (codex P2). Every other error keeps the wire-boundary
-            // derivation so a real backend failure still trains the limiter.
+            // Two pre-headers failures on this path are CLIENT/gateway-side, not
+            // backend faults, and must train neither backend health nor adaptive
+            // concurrency (both neutralized by `client_side_no_backend_signal`):
+            //   * `ResourceExhausted` — the gateway rejected an oversized client
+            //     upload (the channel body tripped `max_grpc_recv_size_bytes`).
+            //   * a frontend upload abort — the H3 recv half errored, so the pump
+            //     set `frontend_upload_failed` and RST the backend; the resulting
+            //     `BackendUnavailable` is a consequence of the client reset.
+            // Both mirror the buffered H3 path, which releases the probe without
+            // training backend health (codex P2). Every other error keeps the
+            // wire-boundary derivation so a real backend failure still trains the
+            // limiter.
             let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
+            let frontend_aborted = frontend_upload_failed.load(Ordering::Acquire);
             let error_class = if request_overflow {
                 ErrorClass::RequestBodyTooLarge
+            } else if frontend_aborted {
+                ErrorClass::ClientDisconnect
             } else {
                 crate::retry::classify_grpc_proxy_error(&err)
             };
-            let connection_error =
-                !request_overflow && !crate::retry::request_reached_wire(error_class);
+            let connection_error = !request_overflow
+                && !frontend_aborted
+                && !crate::retry::request_reached_wire(error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -3756,30 +3804,37 @@ pub(crate) async fn dispatch_grpc_streaming(
                 Some(error_class),
                 backend_admission_start.elapsed(),
             );
-            let mut outcome = write_grpc_error_send(
+            write_grpc_error_send(
                 &mut send_half,
                 grpc_status_code,
                 grpc_message,
                 backend_start,
                 bytes_sent,
             )
-            .await?;
-            outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
-            outcome.connection_error = connection_error;
-            outcome.error_class = Some(error_class);
-            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
-            Ok(outcome)
+            .await
+            .map(|mut outcome| {
+                outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
+                outcome.connection_error = connection_error;
+                outcome.error_class = Some(error_class);
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome
+            })
         }
     };
 
-    // The RPC is over (response fully delivered, or we wrote a gRPC error). Stop
-    // the pump and let it cleanly STOP_SENDING the recv half. `notify_one`
-    // stores a permit if the pump is between selects, so there is no lost
-    // wakeup; awaiting the join handle guarantees the recv-half teardown ran.
+    // Pump cleanup ALWAYS runs — even if the response / error write above failed
+    // (the `?` is deferred until after this). `notify_one` stores a permit so
+    // there is no lost wakeup, and the pump's data/abort sends are cancellable
+    // (codex P1), so the join cannot hang on a full channel.
     pump_shutdown.notify_one();
     let _ = pump.await;
 
-    outcome
+    let mut outcome = outcome_result?;
+    // Final upload byte count (codex P2): in bidi/client-streaming the pump can
+    // forward request DATA while the response is streaming, so re-read after the
+    // pump terminates rather than trusting the header-time snapshot.
+    outcome.bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+    Ok(outcome)
 }
 
 async fn apply_buffered_plain_plugin_reject(
@@ -6162,6 +6217,39 @@ mod tests {
             "request-size overflow on the streaming path must classify as \
              RequestBodyTooLarge (client-side, neutralized by client_side_no_backend_signal) \
              so it trains neither backend health nor adaptive concurrency"
+        );
+        // A frontend upload abort must be recorded as a client disconnect, not a
+        // backend fault (codex P2).
+        assert!(
+            body.contains("ErrorClass::ClientDisconnect"),
+            "a frontend upload abort on the streaming path must classify as \
+             ClientDisconnect so a client reset cannot poison backend health"
+        );
+    }
+
+    /// Regression guard (codex P1): the request-body pump's channel send must be
+    /// cancellable via the shutdown signal. A bare `tx.send(...).await` outside
+    /// the `select!` lets a bidi backend that stops polling the request body while
+    /// the bounded channel is full hang `pump.await` (and the request task) forever.
+    #[test]
+    fn h3_grpc_streaming_pump_send_is_shutdown_cancellable() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("pub(crate) async fn dispatch_grpc_streaming")
+            .expect("dispatch_grpc_streaming not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\nasync fn apply_buffered_plain_plugin_reject")
+            .expect("end of dispatch_grpc_streaming not found");
+        let body = &tail[..end];
+        assert!(
+            !body.contains("tx.send(Ok(body_bytes)).await"),
+            "regression: the pump's data send is a bare await — it must be cancellable \
+             via pump_shutdown or `pump.await` can hang on a full channel"
+        );
+        assert!(
+            body.contains("res = tx.send(Ok(body_bytes)) => res"),
+            "the pump's data send must be a cancellable select arm racing pump_shutdown"
         );
     }
 
