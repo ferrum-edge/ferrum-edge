@@ -5490,41 +5490,44 @@ async fn dispatch_grpc_native_h3(
     // it an H3-only backend that ignores the header could keep streaming or stall
     // past the client's deadline, holding the request/admission guards. The
     // post-plugin value rides in the forwarded headers.
-    let grpc_deadline_at: Option<tokio::time::Instant> = proxy_headers
+    // Did the client set a parseable `grpc-timeout`? Case-insensitive — a
+    // before_proxy plugin / request-transformer may set canonical `Grpc-Timeout`,
+    // which `build_h3_backend_headers` still forwards. When present, the client RPC
+    // deadline is AUTHORITATIVE and we switch to the absolute-deadline regime (like
+    // the H2 path's `TotalDeadlineBody`): the per-frame `backend_read_timeout_ms`
+    // idle guard is disabled in the response loop below so a server-streaming RPC
+    // may idle up to the client deadline, and the upload fallback is NOT applied.
+    let client_grpc_deadline_ms: Option<u64> = proxy_headers
         .iter()
-        // Case-insensitive: a before_proxy plugin / request-transformer may set the
-        // header with canonical HTTP casing (`Grpc-Timeout`), which
-        // `build_h3_backend_headers` still forwards to the backend — match the H2
-        // path's case-insensitive `HeaderMap` lookup so the local deadline stays
-        // armed.
         .find(|(k, _)| k.eq_ignore_ascii_case("grpc-timeout"))
-        .and_then(|(_, v)| crate::proxy::grpc_proxy::parse_grpc_timeout_value(v))
-        .and_then(|deadline_ms| {
+        .and_then(|(_, v)| crate::proxy::grpc_proxy::parse_grpc_timeout_value(v));
+    let client_deadline_present = client_grpc_deadline_ms.is_some();
+
+    // Absolute deadline instant, anchored at request receipt. `checked_add`: a
+    // pathologically large value (e.g. `u64::MAX m`) would overflow
+    // `Instant + Duration` and panic the request task; an unrepresentable client
+    // deadline is treated as UNBOUNDED (None) — NOT downgraded to the read-timeout
+    // fallback, since the client explicitly asked for a (very large) deadline.
+    let grpc_deadline_at: Option<tokio::time::Instant> =
+        client_grpc_deadline_ms.and_then(|deadline_ms| {
             let elapsed_ms = start_time.elapsed().as_millis() as u64;
             let remaining_ms = deadline_ms.saturating_sub(elapsed_ms).max(1);
-            // `checked_add`: a pathologically large `grpc-timeout` (e.g.
-            // `u64::MAX m`) would overflow `Instant + Duration` and panic the
-            // request task on platforms with a smaller `Instant` range. Treat an
-            // overflowing deadline as unbounded (None), matching the H2 gRPC path's
-            // overflow guard.
             tokio::time::Instant::now().checked_add(Duration::from_millis(remaining_ms))
         });
 
-    // Fall back to `backend_read_timeout_ms` to bound the request upload +
-    // response-header wait when the client set no `grpc-timeout`: `dispatch_fut`
-    // first drains the entire client request body, so a stalled client-streaming
-    // upload would otherwise pin backend admission permits, least-connections
-    // state, and the backend QUIC stream indefinitely. The H2 gRPC path applies
-    // the same fallback around `send_request`. When neither is set the dispatch is
-    // genuinely unbounded (no timeout configured at all).
-    let dispatch_deadline_at = grpc_deadline_at.or_else(|| {
-        let ms = proxy.backend_read_timeout_ms;
-        if ms > 0 {
-            tokio::time::Instant::now().checked_add(Duration::from_millis(ms))
-        } else {
-            None
-        }
-    });
+    // Bound the request upload + response-header wait. WITH a client deadline that
+    // is the absolute deadline (or unbounded if it overflowed); WITHOUT one, fall
+    // back to `backend_read_timeout_ms` so a stalled upload can't pin admission /
+    // LB / QUIC state indefinitely (matching the H2 path's fallback around
+    // `send_request`).
+    let dispatch_deadline_at = if client_deadline_present {
+        grpc_deadline_at
+    } else if proxy.backend_read_timeout_ms > 0 {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+    } else {
+        None
+    };
 
     let dispatch_fut = async {
         if let Some(target) = upstream_target {
@@ -5927,10 +5930,21 @@ async fn dispatch_grpc_native_h3(
         .and_then(|v| v.parse::<u64>().ok());
     response_headers.remove("content-length");
 
+    // gRPC carries its terminal status in the TRAILERS frame; the initial HEADERS
+    // must NOT also carry `grpc-status` / `grpc-message` for a non-empty response
+    // (a backend that copies them there is malformed, and the client could observe
+    // an early or conflicting terminal status before the real trailers). Strip the
+    // reserved terminal metadata from the wire headers so the trailer is
+    // authoritative — capturing it first so a genuine Trailers-Only response
+    // (status only in the headers, no body, no trailers) is re-emitted as a
+    // synthesized trailer in the relay loop below.
+    let wire_grpc_status: Option<String> = response_headers.get("grpc-status").cloned();
+    let wire_grpc_message: Option<String> = response_headers.get("grpc-message").cloned();
+    response_headers
+        .retain(|k, _| !crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(k.as_str()));
+
     // Send response headers. gRPC carries its own `content-type`
-    // (`application/grpc`); never override it with the plain JSON default, and
-    // forward a trailers-only response (`grpc-status` already in the initial
-    // headers, empty body) unchanged.
+    // (`application/grpc`); never override it with the plain JSON default.
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_builder =
         apply_response_headers(Response::builder().status(status), &response_headers);
@@ -6010,7 +6024,12 @@ async fn dispatch_grpc_native_h3(
     let flush_timer = tokio::time::sleep(flush_interval);
     tokio::pin!(flush_timer);
     let backend_read_timeout_ms = proxy.backend_read_timeout_ms;
-    let read_timeout_active = backend_read_timeout_ms > 0;
+    // Per-frame idle guard, DISABLED when the client set a `grpc-timeout`: in that
+    // regime the absolute `grpc_deadline_sleep` is the only response-phase bound,
+    // so a server-streaming RPC may idle up to the client deadline rather than
+    // being aborted after the shorter `backend_read_timeout_ms` (matching the H2
+    // path's switch to `TotalDeadlineBody`).
+    let read_timeout_active = backend_read_timeout_ms > 0 && !client_deadline_present;
     let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
         backend_read_timeout_ms.max(1),
     ));
@@ -6110,7 +6129,20 @@ async fn dispatch_grpc_native_h3(
                             error!("Error reading backend h3 gRPC response during streaming: {}", error);
                             coalesce_buf.clear();
                             crate::http3::stream_util::abort_response_stream(stream);
-                            body_error_class = Some(crate::http3::client::classify_http3_error(&error));
+                            let class = crate::http3::client::classify_http3_error(&error);
+                            // A mid-stream QUIC/H3 transport failure (reset /
+                            // protocol error) is a capability-downgrade signal —
+                            // otherwise subsequent gRPC requests keep taking the
+                            // native H3 path and repeat the failure until the next
+                            // refresh. `is_h3_transport_error_class` excludes client
+                            // disconnects, size errors, graceful close, and read
+                            // timeouts.
+                            if crate::proxy::is_h3_transport_error_class(class) {
+                                state
+                                    .backend_capabilities
+                                    .mark_h3_unsupported(proxy, upstream_target);
+                            }
+                            body_error_class = Some(class);
                             break 'outer;
                         }
                     }
@@ -6195,9 +6227,13 @@ async fn dispatch_grpc_native_h3(
             // forward the sanitized trailers (or FIN if none survive). The wait is
             // bounded by whichever is sooner: the per-frame `backend_read_timeout_ms`
             // (like the plain trailer-finish helper) or the absolute gRPC deadline.
-            let trailer_read_at = (backend_read_timeout_ms > 0).then(|| {
-                tokio::time::Instant::now() + Duration::from_millis(backend_read_timeout_ms)
-            });
+            // Per-frame backend read timeout for the trailer wait — DISABLED under
+            // a client `grpc-timeout` so only the absolute deadline bounds it (same
+            // regime switch as the body loop's `read_timeout_active`).
+            let trailer_read_at =
+                (backend_read_timeout_ms > 0 && !client_deadline_present).then(|| {
+                    tokio::time::Instant::now() + Duration::from_millis(backend_read_timeout_ms)
+                });
             let trailer_wait_at: Option<tokio::time::Instant> =
                 match (grpc_deadline_at, trailer_read_at) {
                     (Some(deadline), Some(read)) => Some(deadline.min(read)),
@@ -6276,7 +6312,15 @@ async fn dispatch_grpc_native_h3(
                         stream.send_trailers(trailers).await.is_ok()
                             && stream.finish().await.is_ok()
                     } else {
-                        stream.finish().await.is_ok()
+                        // Real trailers were all hop-by-hop: if the backend put its
+                        // terminal status only in the (stripped) initial headers,
+                        // re-emit it as a synthesized trailer.
+                        finish_h3_grpc_stream_trailers_only(
+                            stream,
+                            wire_grpc_status.as_deref(),
+                            wire_grpc_message.as_deref(),
+                        )
+                        .await
                     };
                     if finish_ok {
                         body_completed = true;
@@ -6286,7 +6330,15 @@ async fn dispatch_grpc_native_h3(
                     }
                 }
                 Ok(None) => {
-                    if stream.finish().await.is_ok() {
+                    // No terminal TRAILERS frame — a Trailers-Only response carries
+                    // its status in the (stripped) initial headers; re-emit it.
+                    if finish_h3_grpc_stream_trailers_only(
+                        stream,
+                        wire_grpc_status.as_deref(),
+                        wire_grpc_message.as_deref(),
+                    )
+                    .await
+                    {
                         body_completed = true;
                     } else {
                         client_disconnected = true;
@@ -6294,7 +6346,13 @@ async fn dispatch_grpc_native_h3(
                     }
                 }
                 Err(err) if crate::http3::client::is_h3_graceful_close(&err) => {
-                    if stream.finish().await.is_ok() {
+                    if finish_h3_grpc_stream_trailers_only(
+                        stream,
+                        wire_grpc_status.as_deref(),
+                        wire_grpc_message.as_deref(),
+                    )
+                    .await
+                    {
                         body_completed = true;
                     } else {
                         client_disconnected = true;
@@ -6307,7 +6365,16 @@ async fn dispatch_grpc_native_h3(
                         err
                     );
                     crate::http3::stream_util::abort_response_stream(stream);
-                    body_error_class = Some(crate::http3::client::classify_http3_error(&err));
+                    let class = crate::http3::client::classify_http3_error(&err);
+                    // Same capability-downgrade signal as the body-relay error arm:
+                    // a transport-class failure at the trailer boundary should stop
+                    // routing subsequent gRPC requests to this H3 target.
+                    if crate::proxy::is_h3_transport_error_class(class) {
+                        state
+                            .backend_capabilities
+                            .mark_h3_unsupported(proxy, upstream_target);
+                    }
+                    body_error_class = Some(class);
                 }
             }
             break;
@@ -7225,6 +7292,36 @@ async fn send_h3_grpc_terminal_trailers(
         trailers.insert("grpc-message", value);
     }
     stream.send_trailers(trailers).await.is_ok() && stream.finish().await.is_ok()
+}
+
+/// FIN an already-open native-H3 gRPC response stream that produced NO terminal
+/// TRAILERS frame. When the backend carried its terminal status only in the
+/// initial HEADERS (a genuine Trailers-Only response — which the dispatch path
+/// strips from the wire so the trailer is authoritative), re-emit it as a
+/// synthesized TRAILERS frame so the client still receives `grpc-status` in the
+/// canonical location; otherwise just FIN. Returns `true` if the FIN (and any
+/// synthesized trailers) reached the client. `grpc_status` / `grpc_message` are
+/// the raw stripped header values.
+async fn finish_h3_grpc_stream_trailers_only(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    grpc_status: Option<&str>,
+    grpc_message: Option<&str>,
+) -> bool {
+    match grpc_status {
+        Some(status) => {
+            let mut trailers = http::HeaderMap::new();
+            if let Ok(value) = http::HeaderValue::from_str(status) {
+                trailers.insert("grpc-status", value);
+            }
+            if let Some(message) = grpc_message
+                && let Ok(value) = http::HeaderValue::from_str(message)
+            {
+                trailers.insert("grpc-message", value);
+            }
+            stream.send_trailers(trailers).await.is_ok() && stream.finish().await.is_ok()
+        }
+        None => stream.finish().await.is_ok(),
+    }
 }
 
 /// Flavor-aware rejection for H3. When the request is gRPC, emits a
