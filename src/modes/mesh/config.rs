@@ -3328,30 +3328,11 @@ fn validate_multi_cluster(
         }
     }
 
-    // Duplicate-SNI detection is scoped per `(network, sni)`, with the trust
-    // domain compared by OVERLAP, not equality. On a Sidecar/Ambient CLIENT data
-    // plane, `east_west_gateways` lists the REMOTE gateways across DIFFERENT
-    // networks/clusters: two remote networks can each legitimately host the same
-    // service and front it with their own east-west gateway claiming that
-    // service's FQDN — the client routes them to DISTINCT `(network,
-    // trust_domain)` groups (see `select_east_west_gateway_for_network` in
-    // `modes::mesh`), so a different NETWORK is never a collision. WITHIN one
-    // network, though, a gateway that OMITS `trust_domain` is a WILDCARD
-    // candidate for EVERY trust domain at selection time
-    // (`gateway.trust_domain.is_none_or(...)`), so a TD-less gateway claiming an
-    // SNI OVERLAPS any other gateway claiming that same SNI on its network —
-    // including a specific-TD one — and list order would silently decide which
-    // wins (a remote workload in the specific TD could be routed to the wrong
-    // gateway). Two specific-TD gateways collide only when the trust domains are
-    // EQUAL. Genuinely-overlapping claims are rejected here; on an
-    // EastWestGateway data plane, same-host passthrough-proxy collisions are
-    // still caught downstream by `validate_stream_proxies`.
-    //
-    // Map key = `(network, sni)` (lowercased for case-insensitive parity with
-    // the SNI host comparison); value = the trust-domain keys already claimed for
-    // it (`None` = a wildcard claim).
-    let mut seen_sni_routes: HashMap<(Option<String>, String), Vec<Option<String>>> =
-        HashMap::new();
+    // Per-gateway field validation. Cross-gateway SNI-overlap ambiguity is
+    // checked in a SEPARATE pairwise pass below — it needs the SAME wildcard-
+    // aware `hosts_overlap` semantics `select_east_west_gateway_for_network` uses
+    // to resolve a destination FQDN, which a literal per-SNI-string key cannot
+    // express.
     for gateway in &multi_cluster.east_west_gateways {
         if gateway.name.trim().is_empty() {
             errors.push("EastWestGateway: name must not be empty".to_string());
@@ -3396,35 +3377,53 @@ fn validate_multi_cluster(
                     "EastWestGateway '{}': sni_hosts must not contain empty entries",
                     gateway.name
                 ));
+            }
+        }
+    }
+
+    // [R4-1] Reject AMBIGUOUS east-west gateway claims using the SAME wildcard-
+    // aware host-overlap semantics the selector uses. Two gateways on the SAME
+    // network whose trust domains OVERLAP (a TD-less gateway is a wildcard that
+    // overlaps every trust domain; two specific TDs overlap only when EQUAL) AND
+    // whose `sni_hosts` OVERLAP under `hosts_overlap` (so
+    // `*.default.svc.cluster.local` vs `reviews.default.svc.cluster.local` is
+    // caught, not only literal string equality) can BOTH route the same
+    // destination FQDN, and `select_east_west_gateway_for_network` would silently
+    // pick whichever is first. On a CLIENT data plane these are remote gateways
+    // across networks, so a DIFFERENT network is never a collision; on an
+    // EastWestGateway data plane same-host passthrough-proxy collisions remain
+    // caught downstream by `validate_stream_proxies`. (Gateways with an empty
+    // `sni_hosts` are already rejected above, so they are skipped here rather
+    // than reported a second time as catch-all overlaps.)
+    let gateways = &multi_cluster.east_west_gateways;
+    for (earlier_idx, earlier) in gateways.iter().enumerate() {
+        if earlier.sni_hosts.is_empty() {
+            continue;
+        }
+        for later in gateways.iter().skip(earlier_idx + 1) {
+            if later.sni_hosts.is_empty() {
                 continue;
             }
-            // Overlap check (see the comment on `seen_sni_routes`): a `None`
-            // (wildcard) trust domain overlaps EVERY trust domain on its network;
-            // a specific TD overlaps an equal specific TD or any wildcard already
-            // claimed for this `(network, sni)`.
-            let network_key = gateway
-                .network
-                .as_deref()
-                .map(|network| network.to_ascii_lowercase());
-            let td_key = gateway
-                .trust_domain
-                .as_ref()
-                .map(|td| td.as_str().to_ascii_lowercase());
-            let claimed = seen_sni_routes
-                .entry((network_key, sni.to_ascii_lowercase()))
-                .or_default();
-            if claimed
-                .iter()
-                .any(|existing| existing.is_none() || td_key.is_none() || existing == &td_key)
-            {
+            let same_network = earlier.network.as_deref().map(str::to_ascii_lowercase)
+                == later.network.as_deref().map(str::to_ascii_lowercase);
+            if !same_network {
+                continue;
+            }
+            let trust_domains_overlap = match (&earlier.trust_domain, &later.trust_domain) {
+                (None, _) | (_, None) => true,
+                (Some(a), Some(b)) => a == b,
+            };
+            if !trust_domains_overlap {
+                continue;
+            }
+            if crate::config::types::hosts_overlap(&earlier.sni_hosts, &later.sni_hosts) {
                 errors.push(format!(
-                    "EastWestGateway '{}': duplicate SNI host '{}' on the same network for an \
-                     overlapping trust domain (a gateway without a trust_domain is a wildcard that \
-                     overlaps every trust domain on its network)",
-                    gateway.name, sni
+                    "EastWestGateway '{}': sni_hosts overlap EastWestGateway '{}' on the same \
+                     network for an overlapping trust domain (both can route the same destination \
+                     FQDN; selection would silently pick one — disambiguate by sni_hosts, network, \
+                     or trust_domain)",
+                    later.name, earlier.name
                 ));
-            } else {
-                claimed.push(td_key);
             }
         }
     }

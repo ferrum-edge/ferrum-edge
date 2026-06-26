@@ -1054,8 +1054,8 @@ fn multi_cluster_allows_same_east_west_sni_on_different_network_or_trust_domain(
 
     let errors = mesh.validate();
     assert!(
-        !errors.iter().any(|err| err.contains("duplicate SNI host")),
-        "same SNI on different (network, trust_domain) must NOT be a duplicate, got: {errors:?}"
+        !errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "same SNI on different (network, trust_domain) must NOT be an overlap, got: {errors:?}"
     );
 }
 
@@ -1100,12 +1100,93 @@ fn multi_cluster_rejects_wildcard_and_specific_trust_domain_same_sni_same_networ
 
     let errors = mesh.validate();
     assert!(
-        errors
-            .iter()
-            .any(|err| err.contains("duplicate SNI host")
-                && err.contains("overlapping trust domain")),
+        errors.iter().any(
+            |err| err.contains("sni_hosts overlap") && err.contains("overlapping trust domain")
+        ),
         "a TD-less wildcard overlapping a specific-TD gateway on the same network+SNI must be \
          rejected, got: {errors:?}"
+    );
+}
+
+/// [R4-1] The overlap check uses the SAME wildcard-aware `hosts_overlap`
+/// semantics the selector uses, so a `*.default.svc.cluster.local` wildcard
+/// gateway and a `reviews.default.svc.cluster.local` exact gateway on the same
+/// network + trust domain — which BOTH route `reviews.default.svc.cluster.local`
+/// — are rejected even though their literal SNI strings differ.
+#[test]
+fn multi_cluster_rejects_wildcard_sni_overlapping_exact_sni_same_network() {
+    let td_b = TrustDomain::new("cluster-b.local").unwrap();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                EastWestGateway {
+                    name: "ew-wildcard".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["*.default.svc.cluster.local".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+                EastWestGateway {
+                    name: "ew-exact".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b2.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["reviews.default.svc.cluster.local".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "a wildcard SNI overlapping an exact SNI on the same network+TD must be rejected (literal \
+         strings differ but both route the same FQDN), got: {errors:?}"
+    );
+}
+
+/// A wildcard and exact SNI that DON'T overlap (different subdomains) on the same
+/// network + trust domain are NOT a collision.
+#[test]
+fn multi_cluster_allows_non_overlapping_wildcard_and_exact_sni() {
+    let td_b = TrustDomain::new("cluster-b.local").unwrap();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                EastWestGateway {
+                    name: "ew-wildcard-foo".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["*.foo.svc.cluster.local".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+                EastWestGateway {
+                    name: "ew-exact-bar".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b2.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["reviews.bar.svc.cluster.local".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        !errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "non-overlapping wildcard/exact SNIs must NOT be a collision, got: {errors:?}"
     );
 }
 

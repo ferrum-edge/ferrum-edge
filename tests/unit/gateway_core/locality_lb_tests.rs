@@ -726,6 +726,78 @@ fn non_strict_absent_source_returns_mixed_local_and_remote() {
     );
 }
 
+/// A CROSS-CLUSTER east-west GATEWAY target — carries BOTH the remote-provenance
+/// tag (so it counts as remote) AND the `mesh.cross_cluster` marker, mirroring
+/// `append_cross_cluster_mesh_targets`. Its presence forces local-first
+/// selection regardless of the `locality_lb_strict` opt-in.
+fn cross_cluster_target(host: &str, locality: Option<&str>) -> UpstreamTarget {
+    let mut t = remote_target(host, locality);
+    t.tags
+        .insert("mesh.cross_cluster".to_string(), "true".to_string());
+    t
+}
+
+#[test]
+fn cross_cluster_gateway_target_is_local_first_without_strict_opt_in() {
+    // [R4-2] No source locality + locality_lb_strict at its DEFAULT false: a
+    // cross-cluster east-west GATEWAY target (mesh.cross_cluster=true) is
+    // always-failover, so selection must restrict to healthy LOCAL endpoints and
+    // NOT round-robin onto the remote gateway — UNLIKE a plain `mesh.remote`
+    // target (see `non_strict_absent_source_returns_mixed_local_and_remote`,
+    // which stays mixed). This is the optional-locality default the M5 east-west
+    // datapath must get right.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            target("local-a.local", Some("us-west/us-west-1/a")),
+            target("local-b.local", Some("us-west/us-west-1/b")),
+            cross_cluster_target("eastwest-gw.local", Some("remote-cluster-east")),
+        ],
+    );
+    assert!(
+        !up.locality_lb_strict,
+        "test premise: locality_lb_strict stays at its default false"
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "local endpoints must keep serving — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("eastwest-gw.local"),
+        "the cross-cluster gateway target must NOT be selected while local endpoints are healthy, \
+         even with locality_lb_strict at its default false — saw {seen:?}"
+    );
+}
+
+#[test]
+fn cross_cluster_gateway_target_serves_when_no_local_endpoint() {
+    // A service that exists ONLY remotely (no local endpoint): local-first must
+    // WIDEN to the cross-cluster gateway rather than black-holing.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![cross_cluster_target(
+            "eastwest-gw.local",
+            Some("remote-cluster-east"),
+        )],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("eastwest-gw.local"),
+        "with no local endpoint, selection must widen to the cross-cluster gateway — saw {seen:?}"
+    );
+}
+
 #[test]
 fn strict_locality_present_source_unchanged_priority_tier() {
     // With a resolved source locality, strict mode is inert: priority-tier
