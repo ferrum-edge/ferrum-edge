@@ -22,7 +22,15 @@
 //! - **Outbound**: trust anchors come from the bundle. When the caller pins
 //!   `expected_peer`, the verifier additionally requires the peer's URI SAN
 //!   to match exactly — this is how an outbound mesh hop can pin "I expect
-//!   service /ns/foo/sa/bar".
+//!   service /ns/foo/sa/bar". When the caller instead supplies
+//!   `expected_trust_domain` (and NO `expected_peer`), the verifier requires the
+//!   peer's SPIFFE id to be in exactly that trust domain — IN ADDITION to the
+//!   existing federated-bundle-exists check, never instead of it. This scopes a
+//!   cross-cluster east-west dial (where the SNI-passthrough gateway LB-picks the
+//!   workload, so a pod identity cannot be pinned) to the TARGET's remote trust
+//!   domain, so a misrouted/malicious path cannot complete TLS with a cert from a
+//!   DIFFERENT federated trust domain. With both `None` the verifier keeps the
+//!   any-federated behavior (HBONE operator targets).
 
 use arc_swap::ArcSwap;
 use rustls::client::WantsClientCert;
@@ -139,7 +147,17 @@ pub fn build_spiffe_client_cert_verifier(
 /// - Presents the SVID currently in `bundle_slot`.
 /// - Validates the server's SVID against the trust bundle.
 /// - Optionally pins the peer SPIFFE ID (`expected_peer`).
+/// - Optionally scopes verification to a single trust domain
+///   (`expected_trust_domain`) when no peer is pinned.
 /// - Advertises the given `alpn_protocols`.
+///
+/// `expected_peer` and `expected_trust_domain` are mutually exclusive in
+/// practice (the pinned-peer path already constrains the domain): when BOTH are
+/// set, the peer pin takes precedence (it is strictly stronger) and the
+/// trust-domain scope is redundant. The cross-cluster east-west dispatch passes
+/// `expected_peer = None` + `expected_trust_domain = Some(target_td)`; the
+/// in-cluster pinned path passes `Some(peer)` + `None`; other callers pass both
+/// `None` (any-federated HBONE operator targets).
 ///
 /// HBONE callers pass `["h2"]` (HTTP/2 CONNECT over mTLS). Sidecar outbound
 /// SVID-mTLS-HTTP origination (to a peer's `:15006`, which negotiates
@@ -149,6 +167,7 @@ pub fn build_spiffe_client_cert_verifier(
 pub fn build_spiffe_outbound_config(
     bundle_slot: SharedBundleSlot,
     expected_peer: Option<SpiffeId>,
+    expected_trust_domain: Option<TrustDomain>,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<Arc<ClientConfig>, SpiffeTlsError> {
     if bundle_slot.load_full().is_none() {
@@ -159,7 +178,8 @@ pub fn build_spiffe_outbound_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| SpiffeTlsError::Rustls(e.to_string()))?;
 
-    let verifier = SpiffeServerCertVerifier::new(bundle_slot.clone(), expected_peer);
+    let verifier =
+        SpiffeServerCertVerifier::new(bundle_slot.clone(), expected_peer, expected_trust_domain);
     let resolver = SpiffeClientCertResolver::new(bundle_slot);
 
     let mut cfg: ClientConfig = builder
@@ -308,6 +328,10 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
             end_entity,
             intermediates,
             None,
+            // Inbound mesh verification is any-federated (a peer from any trust
+            // domain with a bundle is accepted; fine-grained source checks are
+            // AuthorizationPolicy's job) — no single-trust-domain scope.
+            None,
             &self.crls,
         )
         .map(|_| rustls::server::danger::ClientCertVerified::assertion())
@@ -359,15 +383,26 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
 struct SpiffeServerCertVerifier {
     slot: SharedBundleSlot,
     expected_peer: Option<SpiffeId>,
+    /// When set (and `expected_peer` is `None`), the peer's SPIFFE id must be in
+    /// exactly this trust domain — an ADDITIONAL constraint on top of the
+    /// federated-bundle-exists check, never a replacement. Scopes cross-cluster
+    /// east-west dials to the target's remote trust domain so a federated cert
+    /// from a DIFFERENT trust domain cannot complete the handshake.
+    expected_trust_domain: Option<TrustDomain>,
     schemes: Vec<rustls::SignatureScheme>,
     peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
 
 impl SpiffeServerCertVerifier {
-    fn new(slot: SharedBundleSlot, expected_peer: Option<SpiffeId>) -> Self {
+    fn new(
+        slot: SharedBundleSlot,
+        expected_peer: Option<SpiffeId>,
+        expected_trust_domain: Option<TrustDomain>,
+    ) -> Self {
         Self {
             slot,
             expected_peer,
+            expected_trust_domain,
             schemes: rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
@@ -402,6 +437,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             end_entity,
             intermediates,
             self.expected_peer.as_ref(),
+            self.expected_trust_domain.as_ref(),
             // Outbound/backend mesh CRL is intentionally unchanged here: the PR
             // scopes revocation enforcement to inbound mesh peers. Passing an
             // empty slice skips `.with_crls(...)`, so behavior is identical to
@@ -520,9 +556,27 @@ fn verify_peer_against_cached_snapshot(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     expected_peer: Option<&SpiffeId>,
+    expected_trust_domain: Option<&TrustDomain>,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<SpiffeId, String> {
     let peer_id = extract_and_check_peer_spiffe_id(end_entity, expected_peer)?;
+    // Scope to the target's trust domain when requested (cross-cluster east-west:
+    // no pod pin possible across the SNI-passthrough gateway). This is an
+    // ADDITIONAL constraint, evaluated BEFORE the federated-bundle check below —
+    // it never removes the requirement that a trust bundle exist for the peer's
+    // domain. `expected_peer` (when set) is strictly stronger, so the scope is
+    // skipped under a pin (mutually exclusive in practice; peer wins).
+    if expected_peer.is_none()
+        && let Some(td) = expected_trust_domain
+        && peer_id.trust_domain() != td
+    {
+        return Err(format!(
+            "peer SPIFFE ID '{}' is in trust domain '{}', expected trust domain '{}'",
+            peer_id,
+            peer_id.trust_domain(),
+            td
+        ));
+    }
     if trust_bundles.get(peer_id.trust_domain()).is_none() {
         return Err(format!(
             "no trust bundle for peer's trust domain '{}'",
@@ -1237,5 +1291,108 @@ mod tests {
             msg.to_lowercase().contains("revok"),
             "rejection should cite revocation, got: {msg}"
         );
+    }
+
+    /// Build a `TrustBundleSet` whose LOCAL domain is `local` (root `local_der`)
+    /// and which FEDERATES `federated` (root `federated_der`) — both trust
+    /// domains have a usable bundle, so a cert in EITHER chains successfully
+    /// under the any-federated rule.
+    fn bundle_with_federated(
+        local: TrustDomain,
+        local_der: Vec<u8>,
+        federated: TrustDomain,
+        federated_der: Vec<u8>,
+    ) -> TrustBundleSet {
+        let mut set = TrustBundleSet::local_only(TrustBundle {
+            trust_domain: local,
+            x509_authorities: vec![local_der],
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        });
+        set.federated.insert(
+            federated.clone(),
+            TrustBundle {
+                trust_domain: federated,
+                x509_authorities: vec![federated_der],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        );
+        set
+    }
+
+    #[test]
+    fn outbound_trust_domain_scope_rejects_other_federated_domain() {
+        // SECURITY (cross-cluster east-west, Codex round-1 finding #4): a server
+        // SVID in trust domain C must be REJECTED when the dial scoped
+        // verification to trust domain B (`expected_trust_domain = Some(B)`),
+        // EVEN THOUGH C is a FEDERATED/trusted domain — so a misrouted/malicious
+        // east-west path cannot complete TLS with a cert from a different trusted
+        // domain. The same cert is ACCEPTED when the scope is C.
+        let td_b = TrustDomain::new("cluster-b.local").unwrap();
+        let td_c = TrustDomain::new("cluster-c.local").unwrap();
+        let (root_b_der, _root_b_pem, _root_b_key) = synthetic_root(&td_b);
+        let (root_c_der, root_c_pem, root_c_key) = synthetic_root(&td_c);
+
+        // The server presents a VALID SVID in trust domain C, signed by C's root.
+        let server_c = SpiffeId::from_parts(&td_c, "ns/default/sa/svc-c").unwrap();
+        let (server_leaf, server_key) = issue_leaf_with_key(&server_c, &root_c_pem, &root_c_key);
+
+        // The client's bundle is local B + federated C (both trusted).
+        let trust_bundles =
+            bundle_with_federated(td_b.clone(), root_b_der, td_c.clone(), root_c_der);
+        // A client SVID in B so the slot is populated (the slot is the client's
+        // own identity bundle; only `trust_bundles` matters for server verify).
+        let client_b = SpiffeId::from_parts(&td_b, "ns/default/sa/client").unwrap();
+        let slot: SharedBundleSlot = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle_with_key(
+            client_b,
+            trust_bundles,
+            server_leaf.clone(),
+            server_key,
+        )))));
+        let server_name = ServerName::try_from("svc-b.default.svc.cluster.local").unwrap();
+
+        // Scoped to B: the C-domain server cert must be REJECTED even though C is
+        // federated. expected_peer = None (trust-domain-only, like cross-cluster).
+        let scoped_b = SpiffeServerCertVerifier::new(slot.clone(), None, Some(td_b.clone()));
+        let err = rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            &scoped_b,
+            &CertificateDer::from(server_leaf.clone()),
+            &[],
+            &server_name,
+            &[],
+            UnixTime::now(),
+        )
+        .expect_err("a federated-but-wrong-trust-domain server cert must be rejected when scoped");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected trust domain") && msg.contains("cluster-b.local"),
+            "rejection should cite the expected trust domain, got: {msg}"
+        );
+
+        // Scoped to C (the cert's actual domain): ACCEPTED.
+        let scoped_c = SpiffeServerCertVerifier::new(slot.clone(), None, Some(td_c));
+        rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            &scoped_c,
+            &CertificateDer::from(server_leaf.clone()),
+            &[],
+            &server_name,
+            &[],
+            UnixTime::now(),
+        )
+        .expect("a server cert in the scoped trust domain must verify");
+
+        // No scope (any-federated, both None): the same C cert ACCEPTED — proves
+        // the rejection above is the scope and not some other chain failure.
+        let unscoped = SpiffeServerCertVerifier::new(slot, None, None);
+        rustls::client::danger::ServerCertVerifier::verify_server_cert(
+            &unscoped,
+            &CertificateDer::from(server_leaf),
+            &[],
+            &server_name,
+            &[],
+            UnixTime::now(),
+        )
+        .expect("any-federated verification (no scope) must still accept a federated cert");
     }
 }

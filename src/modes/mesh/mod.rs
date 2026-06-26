@@ -4659,7 +4659,15 @@ fn build_outbound_mesh_targets(
     // verification + a destination-FQDN SNI override (see the `mesh.cross_cluster`
     // / `mesh.eastwest_sni` tags). Local targets above stay first-tier; these
     // remote-tier targets only receive traffic once locals are exhausted.
-    if transport == MeshEgressTransport::SidecarMtls {
+    //
+    // HTTP-FAMILY ONLY: `build_outbound_mesh_targets` is shared by the HTTP,
+    // raw-TCP, and UDP materializers. The cross-cluster east-west dial is an
+    // HTTP/2-over-mTLS path (the gateway's SNI passthrough routes the HTTP
+    // request); the L4 (raw-TCP / UDP) tunnel paths don't understand the
+    // cross-cluster / SNI-override semantics and would fail closed on the removed
+    // pin, so the append runs only for HTTP-family ports. Reuses the shared
+    // `is_http_family_mesh_protocol` classifier (do not invent a new one).
+    if transport == MeshEgressTransport::SidecarMtls && is_http_family_mesh_protocol(protocol) {
         append_cross_cluster_mesh_targets(
             &mut targets,
             runtime,
@@ -4709,6 +4717,19 @@ fn append_cross_cluster_mesh_targets(
     let Some(multi_cluster) = multi_cluster else {
         return;
     };
+
+    // FIRST-PORT ONLY: the east-west gateway routes a service-FQDN SNI to only
+    // the service's FIRST DECLARED port (single-port-per-SNI — SNI carries no
+    // port; see `build_east_west_service_targets`, which picks
+    // `service.ports.first()`). Emitting a cross-cluster target for every
+    // HTTP-family `service_port` would misroute later ports through the gateway's
+    // first-port backend, so only the first declared port gets one. Non-first
+    // ports: no cross-cluster target (they are unreachable across clusters in
+    // this Beta east-west model).
+    if service.ports.first().map(|sp| sp.port) != Some(service_port.port) {
+        return;
+    }
+
     let remote_workloads =
         matched_remote_service_workloads(service, workloads, Some(multi_cluster));
     if remote_workloads.is_empty() {
@@ -4744,14 +4765,17 @@ fn append_cross_cluster_mesh_targets(
         else {
             continue;
         };
-        let Some(gateway) = select_east_west_gateway_for_network(multi_cluster, network.as_deref())
+        let Some(gateway) =
+            select_east_west_gateway_for_network(multi_cluster, network.as_deref(), &service_fqdn)
         else {
             warn!(
                 service = %service.name,
                 namespace = %service.namespace,
                 network = network.as_deref().unwrap_or("<none>"),
-                "Skipping cross-cluster egress for remote network with no matching \
-                 EastWestGateway (fail closed; never dial an unresolved address)"
+                service_fqdn = %service_fqdn,
+                "Skipping cross-cluster egress: no EastWestGateway on the remote network whose \
+                 sni_hosts claim the destination service FQDN (fail closed; the gateway would \
+                 blackhole an SNI it does not own)"
             );
             continue;
         };
@@ -4775,12 +4799,24 @@ fn append_cross_cluster_mesh_targets(
             service_port.name.as_deref(),
         );
         // No pod pinning across the SNI-passthrough gateway: remove the pinned
-        // SPIFFE id so dispatch uses trust-domain-only verification. The
-        // trust_domain tag is set to the REMOTE workloads' trust domain.
+        // SPIFFE id so dispatch uses trust-domain-SCOPED verification. The
+        // trust_domain tag is set to the REMOTE workloads' trust domain (the
+        // domain dispatch scopes verification to — fail-closed if absent).
         tags.remove(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG);
         tags.insert(
-            "mesh.trust_domain".to_string(),
+            crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG.to_string(),
             representative.trust_domain.as_str().to_string(),
+        );
+        // Remote provenance: the target is built from REMOTE workloads (it dials
+        // the remote east-west gateway), so stamp the reserved `mesh.remote=true`
+        // marker that strict local-first locality LB (`Upstream.locality_lb_strict`
+        // / `FERRUM_MESH_LOCALITY_LB_STRICT=true`) keys remote-vs-local on. Without
+        // it the gateway target would be ranked LOCAL and could be picked over
+        // healthy local endpoints. (The remote-tier `locality` below is a fallback
+        // for non-strict locality LB; the explicit tag is authoritative.)
+        tags.insert(
+            crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+            crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
         );
         // Dial port = the east-west gateway port (e.g. :15443), NOT :15006.
         tags.insert(
@@ -4817,26 +4853,51 @@ fn append_cross_cluster_mesh_targets(
 }
 
 /// Select the [`EastWestGateway`](crate::modes::mesh::config::EastWestGateway)
-/// that fronts `network`. Prefers an EXACT `gateway.network == network` match;
-/// a gateway with `network: None` is the catch-all and is used ONLY when no
-/// network-specific gateway matches. Returns `None` when nothing matches.
+/// that fronts `network` AND claims the destination service FQDN in its
+/// `sni_hosts`.
+///
+/// The gateway forwards the (opaque) outer TLS purely by ClientHello SNI, so a
+/// gateway that does not OWN the destination FQDN host would blackhole the
+/// request. Selection therefore requires BOTH:
+/// 1. the network matches — an EXACT `gateway.network == network` is preferred;
+///    a `network: None` gateway is the catch-all, used ONLY when no
+///    network-specific gateway matches; AND
+/// 2. the gateway's `sni_hosts` overlaps `service_fqdn`, using the SAME
+///    wildcard-aware [`hosts_overlap`](crate::config::types::hosts_overlap)
+///    semantics east-west materialization uses — an EMPTY `sni_hosts` is a
+///    wildcard/any-host gateway and matches everything.
+///
+/// Returns `None` (the caller then SKIPS + warns, fail-closed) when no gateway
+/// satisfies both — including when a network-matching gateway exists but none of
+/// the network's gateways claim the host.
 fn select_east_west_gateway_for_network<'a>(
     multi_cluster: &'a crate::modes::mesh::config::MultiClusterConfig,
     network: Option<&str>,
+    service_fqdn: &str,
 ) -> Option<&'a crate::modes::mesh::config::EastWestGateway> {
-    // Exact network match first.
+    // An EMPTY `sni_hosts` is a wildcard (matches any host); a non-empty list
+    // must overlap the destination FQDN. `hosts_overlap` already treats an empty
+    // side as a catch-all, so passing `gateway.sni_hosts` (possibly empty)
+    // against the single-FQDN slice yields exactly this semantics.
+    let fqdn = [service_fqdn.to_string()];
+    let claims_host = |gateway: &crate::modes::mesh::config::EastWestGateway| {
+        crate::config::types::hosts_overlap(&gateway.sni_hosts, &fqdn)
+    };
+
+    // Exact network match first — but only a gateway that ALSO claims the host.
     if let Some(exact) = multi_cluster
         .east_west_gateways
         .iter()
-        .find(|gateway| gateway.network.as_deref() == network)
+        .find(|gateway| gateway.network.as_deref() == network && claims_host(gateway))
     {
         return Some(exact);
     }
-    // Catch-all (`network: None`) only when no exact match exists.
+    // Catch-all (`network: None`) that claims the host, only when no exact
+    // network+host match exists.
     multi_cluster
         .east_west_gateways
         .iter()
-        .find(|gateway| gateway.network.is_none())
+        .find(|gateway| gateway.network.is_none() && claims_host(gateway))
 }
 
 /// An HTTP-family `/` proxy on the outbound capture listener whose `HttpPool`

@@ -35,7 +35,7 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
-use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle};
+use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
 use crate::proxy::body::SizeLimitedIncoming;
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
@@ -157,6 +157,29 @@ pub fn target_mesh_mtls_eastwest_sni(target: &UpstreamTarget) -> Option<&str> {
         .get(MESH_EASTWEST_SNI_TAG)
         .map(String::as_str)
         .filter(|sni| !sni.is_empty())
+}
+
+/// Tag carrying the destination workloads' trust domain (`mesh.trust_domain`).
+/// On a CROSS-CLUSTER east-west target this is the REMOTE trust domain the dial
+/// scopes verification to (the gateway LB-picks the workload, so the client
+/// cannot pin a pod, but it CAN require the server SVID to be in exactly this
+/// federated trust domain).
+pub const MESH_TRUST_DOMAIN_TAG: &str = "mesh.trust_domain";
+
+/// The remote trust domain a CROSS-CLUSTER east-west target scopes verification
+/// to ([`MESH_TRUST_DOMAIN_TAG`]). Returns `None` when the tag is absent, empty,
+/// or unparseable so the dispatch path can FAIL CLOSED — a cross-cluster dial
+/// with no usable trust domain must be REFUSED, never fall back to any-federated
+/// verification (which would let a federated cert from a DIFFERENT trust domain
+/// complete the handshake). Only meaningful for cross-cluster targets; the
+/// in-cluster pinned path constrains the domain via the pinned peer identity and
+/// never reads this.
+pub fn target_mesh_mtls_cross_cluster_trust_domain(target: &UpstreamTarget) -> Option<TrustDomain> {
+    target
+        .tags
+        .get(MESH_TRUST_DOMAIN_TAG)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| TrustDomain::new(value.as_str()).ok())
 }
 
 /// The pinned peer identity a `mesh.mtls` target MUST declare. Unlike HBONE
@@ -453,9 +476,15 @@ impl MeshMtlsConnectionPool {
     /// destination service FQDN so the gateway's SNI passthrough routes the
     /// opaque TLS to the destination workload); `None` uses `target_host`.
     ///
-    /// The pool key folds the SNI override and an expected-peer-or-`td-only`
-    /// discriminator so a trust-domain-only / SNI-overridden session NEVER
-    /// shares a pooled connection with a pinned-peer one.
+    /// `expected_trust_domain` scopes verification to a single remote trust
+    /// domain on cross-cluster east-west dials (always paired with
+    /// `expected_peer = None`); the in-cluster pinned path passes `None`.
+    ///
+    /// The pool key folds the SNI override, an expected-peer-or-`td-only`
+    /// discriminator, AND the expected trust domain so a session verified
+    /// against one remote trust domain is NEVER reused for another (and a
+    /// trust-domain-scoped / SNI-overridden session never shares a pooled
+    /// connection with a pinned-peer one).
     #[allow(clippy::too_many_arguments)]
     pub async fn get_sender(
         &self,
@@ -465,6 +494,7 @@ impl MeshMtlsConnectionPool {
         app_policy_port: u16,
         mtls_port: u16,
         expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
         sni_override: Option<&str>,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
         let fingerprint = self.current_svid_fingerprint_cached()?;
@@ -478,6 +508,7 @@ impl MeshMtlsConnectionPool {
             fingerprint.as_ref(),
             expected_peer,
             sni_override,
+            expected_trust_domain,
             &pool_config,
             |key| self.try_cached_sender_read(key),
         );
@@ -493,6 +524,7 @@ impl MeshMtlsConnectionPool {
             fingerprint.as_ref(),
             expected_peer,
             sni_override,
+            expected_trust_domain,
             &pool_config,
             |key| key.to_string(),
         );
@@ -503,6 +535,7 @@ impl MeshMtlsConnectionPool {
             app_policy_port,
             mtls_port,
             expected_peer,
+            expected_trust_domain,
             sni_override,
             &key,
             &pool_config,
@@ -785,6 +818,7 @@ impl MeshMtlsConnectionPool {
         app_policy_port: u16,
         mtls_port: u16,
         expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
         sni_override: Option<&str>,
         key: &str,
         pool_config: &PoolConfig,
@@ -839,6 +873,7 @@ impl MeshMtlsConnectionPool {
                 target_host,
                 mtls_port,
                 expected_peer,
+                expected_trust_domain,
                 sni_override,
                 pool_config,
                 keepalive_override,
@@ -996,6 +1031,7 @@ impl MeshMtlsConnectionPool {
         target_host: &str,
         mtls_port: u16,
         expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
         sni_override: Option<&str>,
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
@@ -1053,14 +1089,18 @@ impl MeshMtlsConnectionPool {
         //
         // Peer verification:
         // - `Some(id)` (in-cluster) — the peer's server SVID URI SAN must EQUAL
-        //   `id` exactly (pinned identity).
-        // - `None` (cross-cluster east-west) — TRUST-DOMAIN-ONLY: the peer's
-        //   SVID is verified against the cached trust-bundle snapshot for its
-        //   own trust domain (which must be present in the federated bundle),
-        //   but no pod identity is pinned. NOT unverified.
+        //   `id` exactly (pinned identity); `expected_trust_domain` is `None`
+        //   (the pin already constrains the domain).
+        // - `None` + `expected_trust_domain = Some(td)` (cross-cluster
+        //   east-west) — TRUST-DOMAIN-SCOPED: the peer's SVID must be in EXACTLY
+        //   `td` (the TARGET's remote trust domain) AND chain to a federated
+        //   bundle — a federated cert from a DIFFERENT trust domain is rejected.
+        //   No pod identity is pinned (the gateway LB-picks the workload). NOT
+        //   unverified, and NOT any-federated.
         let tls_config = build_spiffe_outbound_config(
             self.gateway_svid.clone(),
             expected_peer.cloned(),
+            expected_trust_domain.cloned(),
             vec![b"h2".to_vec()],
         )?;
         let connector = TlsConnector::from(tls_config);
@@ -1154,9 +1194,9 @@ impl MeshMtlsConnectionPool {
 }
 
 /// SVID-fingerprint field of a mesh mTLS pool key:
-/// `mesh-mtls|{host}|{app_port}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|{sni}|pool=...`
-/// — keep the index (5) in sync with `write_mesh_mtls_pool_key`. The `{peer}`
-/// and `{sni}` discriminators were appended AFTER the fingerprint field
+/// `mesh-mtls|{host}|{app_port}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|{sni}|{td}|pool=...`
+/// — keep the index (5) in sync with `write_mesh_mtls_pool_key`. The `{peer}`,
+/// `{sni}`, and `{td}` discriminators were appended AFTER the fingerprint field
 /// specifically so this positional parse did not move.
 fn mesh_mtls_key_svid_fingerprint(key: &str) -> Option<&str> {
     key.split('|').nth(5)
@@ -1200,6 +1240,7 @@ fn with_mesh_mtls_pool_key<R>(
     svid_fingerprint: &str,
     expected_peer: Option<&SpiffeId>,
     sni_override: Option<&str>,
+    expected_trust_domain: Option<&TrustDomain>,
     pool_config: &PoolConfig,
     f: impl FnOnce(&str) -> R,
 ) -> R {
@@ -1214,6 +1255,7 @@ fn with_mesh_mtls_pool_key<R>(
             svid_fingerprint,
             expected_peer,
             sni_override,
+            expected_trust_domain,
             pool_config,
         );
         f(&buf)
@@ -1230,28 +1272,35 @@ fn write_mesh_mtls_pool_key(
     svid_fingerprint: &str,
     expected_peer: Option<&SpiffeId>,
     sni_override: Option<&str>,
+    expected_trust_domain: Option<&TrustDomain>,
     pool_config: &PoolConfig,
 ) {
     buf.clear();
     // The peer-verification mode is connection identity: a session verified
     // against one pinned SVID must never serve a target pinning another, and a
-    // TRUST-DOMAIN-ONLY / SNI-overridden cross-cluster session must NEVER share
-    // a pooled connection with a pinned-peer one. The peer field is the pinned
-    // SPIFFE id, or the `td-only` discriminator when verification is
+    // TRUST-DOMAIN-SCOPED / SNI-overridden cross-cluster session must NEVER
+    // share a pooled connection with a pinned-peer one. The peer field is the
+    // pinned SPIFFE id, or the `td-only` discriminator when verification is
     // trust-domain-only (`expected_peer == None`). The SNI override (the
     // destination FQDN on cross-cluster dials; empty otherwise) follows it so
     // two cross-cluster targets to the SAME gateway for DIFFERENT destination
-    // services also keep isolated connections (each needs its own SNI). `peer`
-    // and `sni` are appended AFTER `svid_fingerprint` so
-    // `mesh_mtls_key_svid_fingerprint`'s positional parse (index 5) is
-    // unchanged. `app_port` mirrors the HBONE key's target-port field: per-port
-    // siblings of a multi-port service keep isolated connections.
+    // services also keep isolated connections (each needs its own SNI). The
+    // expected trust domain (the remote TD a cross-cluster session was VERIFIED
+    // against; empty otherwise) follows the SNI so a session verified against
+    // remote trust domain B is never reused for C. `peer`, `sni`, and `td` are
+    // all appended AFTER `svid_fingerprint` so `mesh_mtls_key_svid_fingerprint`'s
+    // positional parse (index 5) is unchanged. `app_port` mirrors the HBONE
+    // key's target-port field: per-port siblings of a multi-port service keep
+    // isolated connections.
     let _ = write!(
         buf,
-        "mesh-mtls|{host}|{app_port}|{mtls_port}|{}|{svid_fingerprint}|{}|{}",
+        "mesh-mtls|{host}|{app_port}|{mtls_port}|{}|{svid_fingerprint}|{}|{}|{}",
         dns_override.unwrap_or_default(),
         expected_peer_display(expected_peer),
-        sni_override.unwrap_or_default()
+        sni_override.unwrap_or_default(),
+        expected_trust_domain
+            .map(TrustDomain::as_str)
+            .unwrap_or_default()
     );
     write_pool_config_key(buf, pool_config);
 }
@@ -1415,6 +1464,7 @@ mod tests {
                 fp,
                 Some(peer),
                 None,
+                None,
                 &pool_config,
                 |key| key.to_string(),
             )
@@ -1434,13 +1484,16 @@ mod tests {
 
     #[test]
     fn pool_key_isolates_trust_domain_only_and_sni_overridden_sessions() {
-        // A cross-cluster (trust-domain-only) / SNI-overridden mesh-mTLS session
+        // A cross-cluster (trust-domain-scoped) / SNI-overridden mesh-mTLS session
         // must NEVER share a pooled connection with a pinned-peer one, and two
         // cross-cluster targets to the same gateway for different destination
-        // services must not share either.
+        // services must not share either. A session verified against one remote
+        // trust domain must also never be reused for another.
         let pool_config = PoolConfig::default();
         let peer = test_peer();
-        let key = |peer: Option<&SpiffeId>, sni: Option<&str>| {
+        let td_b = TrustDomain::new("cluster-b.local").unwrap();
+        let td_c = TrustDomain::new("cluster-c.local").unwrap();
+        let key = |peer: Option<&SpiffeId>, sni: Option<&str>, td: Option<&TrustDomain>| {
             with_mesh_mtls_pool_key(
                 "10.9.9.9", // east-west gateway address
                 8080,
@@ -1449,24 +1502,33 @@ mod tests {
                 "fp",
                 peer,
                 sni,
+                td,
                 &pool_config,
                 |key| key.to_string(),
             )
         };
-        let pinned = key(Some(&peer), None);
-        let td_only = key(None, Some("svc-b.ferrum.svc.cluster.local"));
+        let pinned = key(Some(&peer), None, None);
+        let td_only = key(None, Some("svc-b.ferrum.svc.cluster.local"), Some(&td_b));
         assert_ne!(
             pinned, td_only,
-            "a trust-domain-only / SNI-overridden session must not share a pinned-peer connection"
+            "a trust-domain-scoped / SNI-overridden session must not share a pinned-peer connection"
         );
         // Same gateway + same td-only verification, different destination SNI.
-        let td_only_other = key(None, Some("svc-c.ferrum.svc.cluster.local"));
+        let td_only_other = key(None, Some("svc-c.ferrum.svc.cluster.local"), Some(&td_b));
         assert_ne!(
             td_only, td_only_other,
             "cross-cluster targets to the same gateway for different services need isolated pools"
         );
+        // Same gateway + same SNI but a DIFFERENT expected trust domain: a session
+        // verified against B must never be reused for C.
+        let td_b_session = key(None, Some("svc-b.ferrum.svc.cluster.local"), Some(&td_b));
+        let td_c_session = key(None, Some("svc-b.ferrum.svc.cluster.local"), Some(&td_c));
+        assert_ne!(
+            td_b_session, td_c_session,
+            "a session verified against trust domain B must not be reused for trust domain C"
+        );
         // The fingerprint field stays positionally parseable with the new
-        // peer/SNI discriminators appended.
+        // peer/SNI/td discriminators appended.
         assert_eq!(mesh_mtls_key_svid_fingerprint(&td_only), Some("fp"));
     }
 
@@ -1482,6 +1544,7 @@ mod tests {
                 None,
                 "fp",
                 Some(&peer),
+                None,
                 None,
                 &pool_config,
                 |key| key.to_string(),
@@ -1521,6 +1584,7 @@ mod tests {
             None,
             fingerprint,
             Some(&test_peer()),
+            None,
             None,
             &PoolConfig::default(),
             |key| key.to_string(),

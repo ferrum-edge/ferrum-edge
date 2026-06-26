@@ -3259,6 +3259,22 @@ fn cross_cluster_dest_slice(
 /// East-west gateway (B) slice: topology EastWestGateway, trust domain B. SNI
 /// passthrough — its per-service inbound for `svc-c` forwards SNI=`svc-c` FQDN →
 /// C's sidecar inbound listener at `127.0.0.1:c_inbound_port`.
+///
+/// TEST-REALISM MODELING (Codex round-1 finding #7 — NOT a client/datapath bug):
+/// the CLIENT (gateway A) datapath is correct — it dials the east-west gateway
+/// with the destination service FQDN as the ClientHello SNI, exactly as a real
+/// cross-cluster sidecar would. In a real injected-sidecar destination, the
+/// gateway forwards the opaque TLS to the destination workload's APP port, and
+/// the destination pod's INBOUND iptables capture REDIRECTS that app-port traffic
+/// to the sidecar's `:15006` mTLS listener (the same model same-cluster east-west
+/// INBOUND uses — `build_east_west_service_targets` forwards to the workload
+/// app/target port, NOT `:15006`). The functional test cannot run iptables, so it
+/// COLLAPSES that destination-side redirect by modeling the service port (and the
+/// east-west "workload" address) as C's sidecar inbound mTLS listener directly
+/// (`c_inbound_port`) — so the passthrough lands straight on the listener that
+/// terminates the client mTLS. This is a test-harness limitation, not a client
+/// bug; the live two-cluster k8s fixture (Stage 2) exercises the realistic
+/// app-port→`:15006` iptables path. See `docs/mesh.md` (cross-cluster east-west).
 fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: u16) -> MeshSlice {
     let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
     MeshSlice {
@@ -3266,7 +3282,8 @@ fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: 
         namespace: "ferrum".to_string(),
         version: Utc::now().to_rfc3339(),
         // The east-west passthrough forwards SNI → the service workload addr:port;
-        // here that "workload" is C's INBOUND mTLS listener.
+        // here that "workload" is C's INBOUND mTLS listener (modeling the
+        // destination's inbound iptables redirect — see the fn doc).
         workloads: vec![Workload {
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
