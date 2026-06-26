@@ -78,9 +78,14 @@ pub enum H3Step {
     RespondHeaders(Vec<(&'static str, String)>),
     /// Send a chunk of response body.
     RespondData(Bytes),
-    /// Send the terminal H3 TRAILERS frame with the given `(name, value)`
-    /// pairs (e.g. `grpc-status` / `grpc-message`), then FIN the stream and
-    /// end the script. No pseudo-headers are allowed in trailers.
+    /// Send an H3 trailers (HEADERS) frame with the given `(name, value)`
+    /// pairs after the response body (e.g. `grpc-status` / `grpc-message`),
+    /// then FIN the stream. Pseudo-headers are rejected — trailers carry only
+    /// regular header fields. `finish()` is sent immediately so the trailers +
+    /// FIN flush together; follow with a `StallFor` to keep the connection open
+    /// until the gateway has read the complete trailered response. Used to
+    /// exercise backend-trailer forwarding to H1/H2 and native-H3 (gRPC)
+    /// downstream clients.
     RespondTrailers(Vec<(&'static str, String)>),
     /// Send `RESET_STREAM` with the given application error code, then
     /// end the script.
@@ -570,7 +575,7 @@ async fn run_h3_script(
                 let mut trailers = http::HeaderMap::new();
                 for (name, value) in pairs {
                     if name.starts_with(':') {
-                        return Err(format!("pseudo-header {name:?} not allowed in trailers"));
+                        return Err(format!("pseudo-header {name:?} is illegal in trailers"));
                     }
                     let hn = HeaderName::from_bytes(name.as_bytes())
                         .map_err(|e| format!("bad trailer name {name}: {e}"))?;
@@ -582,15 +587,25 @@ async fn run_h3_script(
                     .send_trailers(trailers)
                     .await
                     .map_err(|e| format!("send_trailers: {e}"))?;
-                // `send_trailers` only writes the trailer HEADERS frame; `finish()`
-                // is required to FIN the stream so the client's `recv_trailers()`
-                // sees EOS (otherwise it blocks until the trailer timeout and
-                // observes no `grpc-status`). End the script after finishing.
+                // `send_trailers` writes only the trailers HEADERS frame — h3
+                // requires `finish()` to send the stream FIN so the client's
+                // `recv_trailers()` sees EOS (otherwise it blocks until the
+                // trailer timeout and observes no `grpc-status`). Send it NOW
+                // (not at end-of-script) so the trailers + FIN flush together; a
+                // following `StallFor` then keeps the QUIC connection open past
+                // them so the gateway reads the complete trailered response
+                // BEFORE the implicit end-of-script connection drop. Deferring
+                // the FIN to end-of-script races it against that drop, and the
+                // gateway's `H3FrameSource` has no graceful-close recovery in
+                // its trailers state, so the streamed body would end in an
+                // error instead of clean END_STREAM.
                 stream
                     .finish()
                     .await
                     .map_err(|e| format!("finish after trailers: {e}"))?;
-                return Ok(());
+                // Stream is finalized; drop the handle so the end-of-script
+                // `finish()` is skipped (a second finish would error).
+                response_stream = None;
             }
             H3Step::SendStreamReset(code) => {
                 let stream = response_stream

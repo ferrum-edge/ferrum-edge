@@ -3328,7 +3328,11 @@ fn validate_multi_cluster(
         }
     }
 
-    let mut seen_sni_routes: HashSet<String> = HashSet::new();
+    // Per-gateway field validation. Cross-gateway SNI-overlap ambiguity is
+    // checked in a SEPARATE pairwise pass below — it needs the SAME wildcard-
+    // aware `hosts_overlap` semantics `select_east_west_gateway_for_network` uses
+    // to resolve a destination FQDN, which a literal per-SNI-string key cannot
+    // express.
     for gateway in &multi_cluster.east_west_gateways {
         if gateway.name.trim().is_empty() {
             errors.push("EastWestGateway: name must not be empty".to_string());
@@ -3373,12 +3377,65 @@ fn validate_multi_cluster(
                     "EastWestGateway '{}': sni_hosts must not contain empty entries",
                     gateway.name
                 ));
+            }
+        }
+    }
+
+    // [R4-1] Reject AMBIGUOUS east-west gateway claims using the SAME wildcard-
+    // aware host-overlap semantics the selector uses. Two gateways on the SAME
+    // network whose trust domains OVERLAP (a TD-less gateway is a wildcard that
+    // overlaps every trust domain; two specific TDs overlap only when EQUAL) AND
+    // whose `sni_hosts` OVERLAP under `hosts_overlap` (so
+    // `*.default.svc.cluster.local` vs `reviews.default.svc.cluster.local` is
+    // caught, not only literal string equality) can BOTH route the same
+    // destination FQDN, and `select_east_west_gateway_for_network` would silently
+    // pick whichever is first. On a CLIENT data plane these are remote gateways
+    // across networks, so a DIFFERENT network is never a collision; on an
+    // EastWestGateway data plane same-host passthrough-proxy collisions remain
+    // caught downstream by `validate_stream_proxies`. (Gateways with an empty
+    // `sni_hosts` are already rejected above, so they are skipped here rather
+    // than reported a second time as catch-all overlaps.)
+    let gateways = &multi_cluster.east_west_gateways;
+    for (earlier_idx, earlier) in gateways.iter().enumerate() {
+        if earlier.sni_hosts.is_empty() {
+            continue;
+        }
+        for later in gateways.iter().skip(earlier_idx + 1) {
+            if later.sni_hosts.is_empty() {
                 continue;
             }
-            if !seen_sni_routes.insert(sni.to_ascii_lowercase()) {
+            let same_network = earlier.network.as_deref().map(str::to_ascii_lowercase)
+                == later.network.as_deref().map(str::to_ascii_lowercase);
+            if !same_network {
+                continue;
+            }
+            let trust_domains_overlap = match (&earlier.trust_domain, &later.trust_domain) {
+                (None, _) | (_, None) => true,
+                (Some(a), Some(b)) => a == b,
+            };
+            if !trust_domains_overlap {
+                continue;
+            }
+            // Lowercase both SNI lists so the overlap is case-insensitive even on
+            // un-normalized input (`validate` can run before `normalize_mesh_fields`),
+            // matching how the selector compares against a lowercased FQDN.
+            let earlier_snis: Vec<String> = earlier
+                .sni_hosts
+                .iter()
+                .map(|sni| sni.to_ascii_lowercase())
+                .collect();
+            let later_snis: Vec<String> = later
+                .sni_hosts
+                .iter()
+                .map(|sni| sni.to_ascii_lowercase())
+                .collect();
+            if crate::config::types::hosts_overlap(&earlier_snis, &later_snis) {
                 errors.push(format!(
-                    "EastWestGateway '{}': duplicate SNI host '{}'",
-                    gateway.name, sni
+                    "EastWestGateway '{}': sni_hosts overlap EastWestGateway '{}' on the same \
+                     network for an overlapping trust domain (both can route the same destination \
+                     FQDN; selection would silently pick one — disambiguate by sni_hosts, network, \
+                     or trust_domain)",
+                    later.name, earlier.name
                 ));
             }
         }
