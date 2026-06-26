@@ -5491,8 +5491,14 @@ async fn dispatch_grpc_native_h3(
     // past the client's deadline, holding the request/admission guards. The
     // post-plugin value rides in the forwarded headers.
     let grpc_deadline_at: Option<tokio::time::Instant> = proxy_headers
-        .get("grpc-timeout")
-        .and_then(|v| crate::proxy::grpc_proxy::parse_grpc_timeout_value(v))
+        .iter()
+        // Case-insensitive: a before_proxy plugin / request-transformer may set the
+        // header with canonical HTTP casing (`Grpc-Timeout`), which
+        // `build_h3_backend_headers` still forwards to the backend — match the H2
+        // path's case-insensitive `HeaderMap` lookup so the local deadline stays
+        // armed.
+        .find(|(k, _)| k.eq_ignore_ascii_case("grpc-timeout"))
+        .and_then(|(_, v)| crate::proxy::grpc_proxy::parse_grpc_timeout_value(v))
         .map(|deadline_ms| {
             let elapsed_ms = start_time.elapsed().as_millis() as u64;
             let remaining_ms = deadline_ms.saturating_sub(elapsed_ms).max(1);
@@ -5706,12 +5712,13 @@ async fn dispatch_grpc_native_h3(
             .and_then(|v| v.parse::<usize>().ok())
         && len > state.max_response_body_size_bytes
     {
-        let _ = send_h3_grpc_error(
+        let error_sent = send_h3_grpc_error(
             stream,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Backend response exceeds maximum size",
         )
-        .await;
+        .await
+        .is_ok();
         // CB/passive-health see the real backend status (the backend responded
         // before we found the body too large); the adaptive limiter treats the
         // oversized response as a failure.
@@ -5760,8 +5767,8 @@ async fn dispatch_grpc_native_h3(
             StatusCode::OK.as_u16(),
             request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
             0,
-            false,
-            false,
+            error_sent,
+            !error_sent,
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             None,
             start_time,
@@ -6098,12 +6105,37 @@ async fn dispatch_grpc_native_h3(
             }
             // Absolute deadline: unlike `read_deadline` this is NOT gated on an
             // empty coalesce buffer — once the client's RPC deadline passes we stop
-            // regardless of buffered/in-flight frames.
+            // regardless of buffered/in-flight frames. Headers (HTTP 200 +
+            // content-type) are already on the wire, so complete the RPC with a
+            // terminal `grpc-status: 4` trailer instead of an H3 reset — the client
+            // then surfaces gRPC DEADLINE_EXCEEDED, not a transport failure.
             _ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done => {
-                warn!("gRPC deadline (grpc-timeout) exceeded during HTTP/3 response streaming; aborting");
+                warn!(
+                    "gRPC deadline (grpc-timeout) exceeded during HTTP/3 response streaming; \
+                     completing with grpc-status DEADLINE_EXCEEDED"
+                );
                 coalesce_buf.clear();
-                crate::http3::stream_util::abort_response_stream(stream);
-                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                if send_h3_grpc_terminal_trailers(
+                    stream,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded",
+                )
+                .await
+                {
+                    grpc_trailer_status =
+                        Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
+                    body_completed = true;
+                } else {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                }
+                // Record the gRPC status in metadata so observability reflects the
+                // deadline, matching the pre-header timeout path.
+                crate::proxy::insert_grpc_error_metadata(
+                    &mut ctx.metadata,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded",
+                );
                 break 'outer;
             }
         }
@@ -6123,25 +6155,58 @@ async fn dispatch_grpc_native_h3(
             // forward the sanitized trailers (or FIN if none survive). The wait is
             // bounded by whichever is sooner: the per-frame `backend_read_timeout_ms`
             // (like the plain trailer-finish helper) or the absolute gRPC deadline.
-            let trailer_wait_at: Option<tokio::time::Instant> = match (
-                grpc_deadline_at,
-                (backend_read_timeout_ms > 0).then(|| {
-                    tokio::time::Instant::now() + Duration::from_millis(backend_read_timeout_ms)
-                }),
-            ) {
-                (Some(deadline), Some(read)) => Some(deadline.min(read)),
-                (Some(deadline), None) => Some(deadline),
-                (None, Some(read)) => Some(read),
-                (None, None) => None,
+            let trailer_read_at = (backend_read_timeout_ms > 0).then(|| {
+                tokio::time::Instant::now() + Duration::from_millis(backend_read_timeout_ms)
+            });
+            let trailer_wait_at: Option<tokio::time::Instant> =
+                match (grpc_deadline_at, trailer_read_at) {
+                    (Some(deadline), Some(read)) => Some(deadline.min(read)),
+                    (Some(deadline), None) => Some(deadline),
+                    (None, Some(read)) => Some(read),
+                    (None, None) => None,
+                };
+            // Whether the bound firing first is the client's gRPC deadline (vs a
+            // per-frame backend read timeout) — decides whether a timeout completes
+            // the RPC with grpc-status: 4 or is treated as a backend read-timeout.
+            let trailer_timeout_is_deadline = match (grpc_deadline_at, trailer_read_at) {
+                (Some(deadline), Some(read)) => deadline <= read,
+                (Some(_), None) => true,
+                _ => false,
             };
             let trailers_result = match trailer_wait_at {
                 Some(at) => {
                     match tokio::time::timeout_at(at, h3_resp.recv_stream.recv_trailers()).await {
                         Ok(result) => result,
+                        Err(_) if trailer_timeout_is_deadline => {
+                            warn!(
+                                "gRPC deadline (grpc-timeout) exceeded while awaiting trailers; \
+                                 completing with grpc-status DEADLINE_EXCEEDED"
+                            );
+                            if send_h3_grpc_terminal_trailers(
+                                stream,
+                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                "Deadline exceeded",
+                            )
+                            .await
+                            {
+                                grpc_trailer_status =
+                                    Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
+                                body_completed = true;
+                            } else {
+                                client_disconnected = true;
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                            }
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                "Deadline exceeded",
+                            );
+                            break;
+                        }
                         Err(_) => {
                             warn!(
-                                "Backend trailer read timed out (read_timeout={}ms, grpc-timeout deadline={}) during HTTP/3 gRPC streaming response",
-                                backend_read_timeout_ms, grpc_deadline_active
+                                "Backend trailer read timed out ({}ms) during HTTP/3 gRPC streaming response",
+                                backend_read_timeout_ms
                             );
                             crate::http3::stream_util::abort_response_stream(stream);
                             body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
@@ -6207,14 +6272,16 @@ async fn dispatch_grpc_native_h3(
 
     // Record outcome. CB / passive-health key off the HTTP transport status:
     // gRPC application failures ride on HTTP 200 and must not trip the breaker
-    // or passive health (matching the H2 gRPC bridge). A post-headers body
-    // fault is post-wire; ReadWriteTimeout / ClientDisconnect stay neutral.
-    let body_outcome_connection_error = match body_error_class {
-        None
-        | Some(crate::retry::ErrorClass::ReadWriteTimeout)
-        | Some(crate::retry::ErrorClass::ClientDisconnect) => false,
-        Some(_) => true,
-    };
+    // or passive health (matching the H2 gRPC bridge). Every fault reaching this
+    // point is POST-HEADER — the backend's response headers were already received
+    // and forwarded, so the request reached the backend application layer and
+    // `connection_error` is always false. The specific mid-response fault (reset,
+    // malformed trailers, ResponseBodyTooLarge) rides in `body_outcome_error_class`
+    // so the post-wire error-class breaker path counts it; recording
+    // `connection_error=true` here would instead be filtered for proxies with
+    // `trip_on_connection_errors=false`. ReadWriteTimeout / ClientDisconnect stay
+    // neutral via their classes.
+    let body_outcome_connection_error = false;
     // When the backend itself returned a failure status (a raw HTTP 5xx instead of
     // a gRPC response, or a status the proxy configured as a breaker failure), a
     // concurrent client disconnect during the body/trailer forward must NOT mask
@@ -7092,6 +7159,28 @@ async fn send_h3_grpc_error(
     stream.finish().await?;
     crate::http3::stream_util::halt_request_body(stream);
     Ok(())
+}
+
+/// Send a terminal gRPC status as TRAILERS on an **already-open** H3 response
+/// stream (response headers — and possibly some body DATA — were already sent),
+/// then FIN the stream. Used when a deadline expires mid-stream so the client
+/// receives a proper gRPC terminal status (`grpc-status: 4`) instead of an H3
+/// transport reset. Returns `true` if both the trailers and FIN reached the
+/// client. Unlike [`send_h3_grpc_error`] this does NOT send a response head —
+/// the `:status`/`content-type` are already on the wire.
+async fn send_h3_grpc_terminal_trailers(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    grpc_status: u32,
+    grpc_message: &str,
+) -> bool {
+    let mut trailers = http::HeaderMap::new();
+    if let Ok(value) = http::HeaderValue::from_str(&grpc_status.to_string()) {
+        trailers.insert("grpc-status", value);
+    }
+    if let Ok(value) = http::HeaderValue::from_str(grpc_message) {
+        trailers.insert("grpc-message", value);
+    }
+    stream.send_trailers(trailers).await.is_ok() && stream.finish().await.is_ok()
 }
 
 /// Flavor-aware rejection for H3. When the request is gRPC, emits a
