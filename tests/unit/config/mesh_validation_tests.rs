@@ -1059,6 +1059,56 @@ fn multi_cluster_allows_same_east_west_sni_on_different_network_or_trust_domain(
     );
 }
 
+/// A gateway that OMITS `trust_domain` is a wildcard candidate for EVERY trust
+/// domain at selection time, so on a given network it OVERLAPS a specific-TD
+/// gateway claiming the same SNI — list order would silently decide which wins,
+/// and a remote workload in the specific TD could be routed to the wrong gateway.
+/// Such an overlap is rejected as a duplicate (treat `None` as overlapping every
+/// trust domain), forcing the operator to disambiguate.
+#[test]
+fn multi_cluster_rejects_wildcard_and_specific_trust_domain_same_sni_same_network() {
+    let td_b = TrustDomain::new("cluster-b.local").unwrap();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                // Specific-TD gateway for net-b claiming api.global.
+                EastWestGateway {
+                    name: "ew-net-b-specific".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["api.global".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+                // TD-LESS (wildcard) gateway for net-b claiming the SAME SNI —
+                // it overlaps the specific-TD gateway above on (net-b, api.global).
+                EastWestGateway {
+                    name: "ew-net-b-wildcard".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b2.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["api.global".to_string()],
+                    trust_domain: None,
+                    network: Some("net-b".to_string()),
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|err| err.contains("duplicate SNI host")
+                && err.contains("overlapping trust domain")),
+        "a TD-less wildcard overlapping a specific-TD gateway on the same network+SNI must be \
+         rejected, got: {errors:?}"
+    );
+}
+
 #[test]
 fn gateway_config_validate_mesh_fields_dispatches() {
     let cfg = GatewayConfig {

@@ -1037,3 +1037,165 @@ fn two_networks_on_same_gateway_host_yield_distinct_identities() {
         "the two targets must have DISTINCT (host, port) identities (same host, different ports)"
     );
 }
+
+// ── Codex round-3 fixes ────────────────────────────────────────────────────
+
+/// [R3-2] SAME-SPIFFE REMOTE NETWORKS: replicas of a service in two remote
+/// networks (net-b, net-c) that share ONE service-account SPIFFE id collapse to a
+/// SINGLE merged `WorkloadRef` (`merge_remote_endpoints_into_mesh` unions service
+/// refs by SPIFFE id), while BOTH networks' `Workload`s survive the merge (keyed
+/// by endpoint, incl. network + address). The materializer must surface BOTH
+/// networks — one target per network's east-west gateway — not just the first.
+#[test]
+fn cross_cluster_targets_for_same_spiffe_replicas_across_networks() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Two remote replicas SHARING one service-account SPIFFE id, on different
+    // networks with different pod IPs.
+    let remote_b = remote_workload(Some("net-b")); // spiffe ...sa/svc-b, 10.244.5.5
+    let mut remote_c = remote_workload(Some("net-c"));
+    remote_c.addresses = vec!["10.244.6.6".to_string()];
+    assert_eq!(
+        remote_b.spiffe_id, remote_c.spiffe_id,
+        "test premise: the two remote replicas share one SPIFFE id"
+    );
+
+    // The merged service carries a SINGLE remote ref for that shared SPIFFE id.
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_b.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    const NET_B_GATEWAY_HOST: &str = "10.9.9.11";
+    const NET_C_GATEWAY_HOST: &str = "10.9.9.12";
+    let mut mesh = mesh_config_with(vec![local, remote_b, remote_c], vec![service], Vec::new());
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![
+            EastWestGateway {
+                name: "ew-net-b".to_string(),
+                namespace: "default".to_string(),
+                host: NET_B_GATEWAY_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-b".to_string()),
+            },
+            EastWestGateway {
+                name: "ew-net-c".to_string(),
+                namespace: "default".to_string(),
+                host: NET_C_GATEWAY_HOST.to_string(),
+                port: GATEWAY_PORT,
+                sni_hosts: vec![SVC_B_FQDN.to_string()],
+                trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+                network: Some("net-c".to_string()),
+            },
+        ],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    let cross = cross_cluster_targets(&upstreams);
+    let mut hosts: Vec<&str> = cross.iter().map(|t| t.host.as_str()).collect();
+    hosts.sort();
+    assert_eq!(
+        hosts,
+        vec![NET_B_GATEWAY_HOST, NET_C_GATEWAY_HOST],
+        "both remote networks sharing one SPIFFE id must each yield a cross-cluster target, got: \
+         {cross:#?}"
+    );
+}
+
+/// [R3-3] FAIL CLOSED on a shared gateway endpoint: two remote workloads on the
+/// SAME network in DIFFERENT trust domains, fronted by a SINGLE trust-domain-less
+/// (wildcard-TD) gateway, both resolve to that one gateway `host:port`. Emitting
+/// two targets with the same identity would collapse them in LB / passive-health
+/// (the key is `host:port`), and the SNI-passthrough gateway can't be steered to
+/// a trust domain — so NO cross-cluster target is emitted (the operator must
+/// declare a distinct gateway endpoint per trust domain).
+#[test]
+fn no_cross_cluster_targets_when_two_trust_domains_share_one_gateway_endpoint() {
+    let runtime = sidecar_client_runtime();
+
+    let local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    // Two remote workloads on the SAME network, DIFFERENT trust domains (distinct
+    // SPIFFE ids → distinct refs).
+    let remote_td_b = remote_workload(Some(REMOTE_NETWORK)); // TD cluster-b.local
+    let mut remote_td_c = remote_workload(Some(REMOTE_NETWORK));
+    remote_td_c.spiffe_id = spiffe("spiffe://cluster-c.local/ns/default/sa/svc-b");
+    remote_td_c.trust_domain = td("cluster-c.local");
+    remote_td_c.cluster = Some("cluster-c".to_string());
+    remote_td_c.addresses = vec!["10.244.6.6".to_string()];
+
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_td_b.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote_td_c.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(
+        vec![local, remote_td_b, remote_td_c],
+        vec![service],
+        Vec::new(),
+    );
+    // ONE trust-domain-less gateway for net-b — a candidate for BOTH trust
+    // domains, so both groups select this single endpoint.
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![EastWestGateway {
+            name: "ew-net-b-wildcard-td".to_string(),
+            namespace: "default".to_string(),
+            host: GATEWAY_HOST.to_string(),
+            port: GATEWAY_PORT,
+            sni_hosts: vec![SVC_B_FQDN.to_string()],
+            trust_domain: None,
+            network: Some(REMOTE_NETWORK.to_string()),
+        }],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+    assert_eq!(
+        cross_cluster_targets(&upstreams).len(),
+        0,
+        "two trust domains resolving to one shared gateway endpoint must yield NO cross-cluster \
+         target (fail closed)"
+    );
+}

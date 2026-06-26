@@ -2006,7 +2006,17 @@ pub(crate) fn matched_local_service_workloads<'a>(
 ///
 /// Mirrors the local helper's SPIFFE-ref + namespace matching and the
 /// `service_name`-vs-stale-metadata fallback, with the remoteness predicate
-/// flipped. The de-dup-by-index guard keeps one workload per ref.
+/// flipped — but, UNLIKE the local helper, it collects ALL remote workloads a
+/// ref matches, not one-per-ref (codex r3): `merge_remote_endpoints_into_mesh`
+/// UNIONS remote service workload refs by SPIFFE id, so in the common
+/// same-trust-domain multi-cluster case where replicas of a service in different
+/// remote NETWORKS share one service-account SPIFFE id, the service carries a
+/// SINGLE ref for that id even though both networks' `Workload`s survive the
+/// merge (keyed by endpoint, incl. network+address). A one-per-ref `.find` would
+/// return only the first network and the second network's east-west gateway
+/// would never be reached by `(network, trust_domain)` grouping. The
+/// `used_workload_indices` guard still prevents double-counting a single
+/// workload across refs that share a SPIFFE id.
 fn matched_remote_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
@@ -2021,19 +2031,19 @@ fn matched_remote_service_workloads<'a>(
                 && workload.namespace == service.namespace
                 && workload.service_name == service.name
         });
-        let Some((workload_index, workload)) =
-            workloads.iter().enumerate().find(|(idx, workload)| {
-                !used_workload_indices.contains(idx)
-                    && workload.spiffe_id == workload_ref.spiffe_id
-                    && workload.namespace == service.namespace
-                    && (workload.service_name == service.name || !has_matching_service_metadata)
-                    && crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
-            })
-        else {
-            continue;
-        };
-        used_workload_indices.insert(workload_index);
-        matched.push(workload);
+        // Collect EVERY not-yet-used remote workload this ref matches (one ref
+        // can stand for replicas across multiple remote networks).
+        for (workload_index, workload) in workloads.iter().enumerate() {
+            if !used_workload_indices.contains(&workload_index)
+                && workload.spiffe_id == workload_ref.spiffe_id
+                && workload.namespace == service.namespace
+                && (workload.service_name == service.name || !has_matching_service_metadata)
+                && crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster)
+            {
+                used_workload_indices.insert(workload_index);
+                matched.push(workload);
+            }
+        }
     }
 
     matched
@@ -4807,6 +4817,9 @@ fn append_cross_cluster_mesh_targets(
             .or_insert(idx);
     }
 
+    // Build each group's target into a local list first so duplicate gateway
+    // DIAL ENDPOINTS can be rejected (codex r3 [R3-3]) before any reach the LB.
+    let mut built: Vec<UpstreamTarget> = Vec::new();
     for ((network, _trust_domain_str), representative_idx) in groups {
         // Representative reachable remote workload for this group — its trust
         // domain is the cross-cluster verification target and its locality keeps
@@ -4887,7 +4900,7 @@ fn append_cross_cluster_mesh_targets(
         // limitation; see `build_east_west_service_targets`), so multi-port
         // `mesh.mtls_authority_port` is moot for cross-cluster — never stamped.
 
-        targets.push(UpstreamTarget {
+        built.push(UpstreamTarget {
             // [R2-4] IDENTITY = the gateway DIAL ENDPOINT (`host:port`). The
             // LB/health/CB key is `(host, port)`, so this MUST be the actual
             // reachable gateway endpoint — using the service port would collapse
@@ -4908,6 +4921,51 @@ fn append_cross_cluster_mesh_targets(
             locality: representative.locality.clone(),
             path: None,
         });
+    }
+
+    // [R3-3] FAIL CLOSED on duplicate gateway DIAL ENDPOINTS for this service.
+    // When two `(network, trust_domain)` groups select the SAME gateway
+    // `host:port` — e.g. one TD-less wildcard gateway fronting a network whose
+    // workloads span two trust domains — both targets share the LB / passive-
+    // health / circuit-breaker / retry key (which is `host:port`), so a TLS or
+    // passive-health failure charged to one trust domain would eject or skip the
+    // sibling target for the OTHER. And because the SNI-passthrough gateway
+    // LB-picks the backend, the client cannot steer a shared endpoint to its
+    // expected trust domain — the topology is genuinely ambiguous. Drop EVERY
+    // target on a colliding endpoint (never silently pick one trust domain); the
+    // operator must declare a distinct gateway endpoint per trust domain.
+    let mut endpoint_counts: std::collections::HashMap<(String, u16), usize> =
+        std::collections::HashMap::new();
+    for target in &built {
+        *endpoint_counts
+            .entry((target.host.clone(), target.port))
+            .or_insert(0) += 1;
+    }
+    for target in built {
+        if endpoint_counts
+            .get(&(target.host.clone(), target.port))
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                gateway_host = %target.host,
+                gateway_port = target.port,
+                trust_domain = target
+                    .tags
+                    .get(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
+                    .map(String::as_str)
+                    .unwrap_or("<none>"),
+                "Skipping cross-cluster egress target: multiple trust domains resolve to the same \
+                 east-west gateway endpoint (fail closed; an SNI-passthrough gateway LB-picks the \
+                 backend, so a shared endpoint cannot pin a trust domain — declare a distinct \
+                 gateway endpoint per trust domain)"
+            );
+            continue;
+        }
+        targets.push(target);
     }
 }
 

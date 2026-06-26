@@ -3328,20 +3328,30 @@ fn validate_multi_cluster(
         }
     }
 
-    // Duplicate-SNI detection is scoped to `(network, trust_domain, sni)`, NOT
-    // the SNI string alone. On a Sidecar/Ambient CLIENT data plane,
-    // `east_west_gateways` lists the REMOTE gateways across DIFFERENT
-    // networks/clusters: two remote networks (or two remote trust domains) can
-    // each legitimately host the same service and front it with their own
-    // east-west gateway claiming that service's FQDN — the client routes them to
-    // DISTINCT `(network, trust_domain)` groups (see
-    // `select_east_west_gateway_for_network` in `modes::mesh`), so they are NOT a
-    // collision. Only two gateways with the SAME `(network, trust_domain)`
-    // claiming the same SNI are genuinely ambiguous (the client's group selector
-    // would pick one arbitrarily; on an EastWestGateway data plane they would
-    // also materialize colliding same-host passthrough proxies, still rejected
-    // downstream by `validate_stream_proxies`), so that case stays an error.
-    let mut seen_sni_routes: HashSet<(Option<String>, Option<String>, String)> = HashSet::new();
+    // Duplicate-SNI detection is scoped per `(network, sni)`, with the trust
+    // domain compared by OVERLAP, not equality. On a Sidecar/Ambient CLIENT data
+    // plane, `east_west_gateways` lists the REMOTE gateways across DIFFERENT
+    // networks/clusters: two remote networks can each legitimately host the same
+    // service and front it with their own east-west gateway claiming that
+    // service's FQDN — the client routes them to DISTINCT `(network,
+    // trust_domain)` groups (see `select_east_west_gateway_for_network` in
+    // `modes::mesh`), so a different NETWORK is never a collision. WITHIN one
+    // network, though, a gateway that OMITS `trust_domain` is a WILDCARD
+    // candidate for EVERY trust domain at selection time
+    // (`gateway.trust_domain.is_none_or(...)`), so a TD-less gateway claiming an
+    // SNI OVERLAPS any other gateway claiming that same SNI on its network —
+    // including a specific-TD one — and list order would silently decide which
+    // wins (a remote workload in the specific TD could be routed to the wrong
+    // gateway). Two specific-TD gateways collide only when the trust domains are
+    // EQUAL. Genuinely-overlapping claims are rejected here; on an
+    // EastWestGateway data plane, same-host passthrough-proxy collisions are
+    // still caught downstream by `validate_stream_proxies`.
+    //
+    // Map key = `(network, sni)` (lowercased for case-insensitive parity with
+    // the SNI host comparison); value = the trust-domain keys already claimed for
+    // it (`None` = a wildcard claim).
+    let mut seen_sni_routes: HashMap<(Option<String>, String), Vec<Option<String>>> =
+        HashMap::new();
     for gateway in &multi_cluster.east_west_gateways {
         if gateway.name.trim().is_empty() {
             errors.push("EastWestGateway: name must not be empty".to_string());
@@ -3388,27 +3398,33 @@ fn validate_multi_cluster(
                 ));
                 continue;
             }
-            // Key by `(network, trust_domain, sni)` — a duplicate is only the
-            // same SNI on the same network AND trust domain (see the comment on
-            // `seen_sni_routes`). Network/TD are lowercased for case-insensitive
-            // parity with the SNI host comparison.
-            let sni_key = (
-                gateway
-                    .network
-                    .as_deref()
-                    .map(|network| network.to_ascii_lowercase()),
-                gateway
-                    .trust_domain
-                    .as_ref()
-                    .map(|td| td.as_str().to_ascii_lowercase()),
-                sni.to_ascii_lowercase(),
-            );
-            if !seen_sni_routes.insert(sni_key) {
+            // Overlap check (see the comment on `seen_sni_routes`): a `None`
+            // (wildcard) trust domain overlaps EVERY trust domain on its network;
+            // a specific TD overlaps an equal specific TD or any wildcard already
+            // claimed for this `(network, sni)`.
+            let network_key = gateway
+                .network
+                .as_deref()
+                .map(|network| network.to_ascii_lowercase());
+            let td_key = gateway
+                .trust_domain
+                .as_ref()
+                .map(|td| td.as_str().to_ascii_lowercase());
+            let claimed = seen_sni_routes
+                .entry((network_key, sni.to_ascii_lowercase()))
+                .or_default();
+            if claimed
+                .iter()
+                .any(|existing| existing.is_none() || td_key.is_none() || existing == &td_key)
+            {
                 errors.push(format!(
-                    "EastWestGateway '{}': duplicate SNI host '{}' on the same network and trust \
-                     domain",
+                    "EastWestGateway '{}': duplicate SNI host '{}' on the same network for an \
+                     overlapping trust domain (a gateway without a trust_domain is a wildcard that \
+                     overlaps every trust domain on its network)",
                     gateway.name, sni
                 ));
+            } else {
+                claimed.push(td_key);
             }
         }
     }
