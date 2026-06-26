@@ -183,9 +183,14 @@ impl Http3Client {
             }
         }
 
-        // Best-effort drain of any trailers (we don't expose them but
-        // need to advance the stream to a clean shutdown).
-        let _ = stream.recv_trailers().await;
+        // Capture any terminal trailers (e.g. gRPC `grpc-status` / `grpc-message`)
+        // so trailer-preservation tests can assert on them; draining also
+        // advances the stream to a clean shutdown.
+        let trailers = tokio::time::timeout(Duration::from_secs(15), stream.recv_trailers())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten();
         drop(send_request);
         driver_task.abort();
 
@@ -193,6 +198,7 @@ impl Http3Client {
             status,
             headers,
             body_bytes: Bytes::from(body_bytes),
+            trailers,
         })
     }
 
@@ -268,6 +274,7 @@ impl Http3Client {
             status,
             headers,
             body_bytes: Bytes::from(body_bytes),
+            trailers: None,
         })
     }
 
@@ -367,11 +374,47 @@ pub struct Http3Response {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body_bytes: Bytes,
+    /// Terminal H3 trailers (e.g. gRPC `grpc-status` / `grpc-message`), if the
+    /// backend/gateway sent a TRAILERS frame. `None` for a trailers-only or
+    /// no-trailer response.
+    pub trailers: Option<HeaderMap>,
 }
 
 impl Http3Response {
     pub fn body_text(&self) -> String {
         String::from_utf8_lossy(&self.body_bytes).to_string()
+    }
+
+    /// Read a terminal trailer value (TRAILERS frame) by name.
+    pub fn trailer(&self, name: &str) -> Option<&str> {
+        self.trailers
+            .as_ref()
+            .and_then(|t| t.get(name))
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// gRPC terminal status, read from the TRAILERS frame first (normal gRPC
+    /// responses) then the initial headers (Trailers-Only responses). `None`
+    /// when neither carries `grpc-status`.
+    pub fn grpc_status(&self) -> Option<i32> {
+        self.trailer("grpc-status")
+            .or_else(|| {
+                self.headers
+                    .get("grpc-status")
+                    .and_then(|v| v.to_str().ok())
+            })
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    }
+
+    /// gRPC status message (`grpc-message`), from trailers then initial headers.
+    pub fn grpc_message(&self) -> Option<String> {
+        self.trailer("grpc-message")
+            .or_else(|| {
+                self.headers
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+            })
+            .map(|s| s.to_string())
     }
 }
 

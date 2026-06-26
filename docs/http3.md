@@ -38,7 +38,8 @@ Every H3 request goes through the same plugin lifecycle as H1/H2 (route match �
 |---|---|---|
 | `HttpsPool` + target classified as `h3` | `Plain` | **Native H3 pool** (quinn/h3 → QUIC upstream) |
 | `HttpsPool` + target not classified as `h3` | `Plain` | Cross-protocol bridge → reqwest / direct H2 as needed |
-| `HttpsPool` | `Grpc` | Cross-protocol bridge → `GrpcConnectionPool` (HTTP/2 + trailers) |
+| `HttpsPool` + target classified as `h3` | `Grpc` | **Native H3 pool** (`dispatch_grpc_native_h3` → QUIC upstream) when the body can stream (no retry / body-plugin buffering, no reqwest-forcing plugin) — the only path that reaches an **H3-only** gRPC backend |
+| `HttpsPool` + target not classified as `h3` (or buffering forced) | `Grpc` | Cross-protocol bridge → `GrpcConnectionPool` (HTTP/2 + trailers) |
 | `HttpsPool` | `WebSocket` | [H3 WebSocket bridge](#websocket-over-http3-rfc-9220-extended-connect) → H1.1 / H2 backend WebSocket |
 | `HttpPool` | `Plain` / `Grpc` | Cross-protocol bridge → plaintext reqwest (`Plain`) / gRPC h2c (`Grpc`) |
 | `HttpPool` | `WebSocket` | [H3 WebSocket bridge](#websocket-over-http3-rfc-9220-extended-connect) (`ws://` backend over plaintext H1.1) |
@@ -57,6 +58,8 @@ When the matched proxy has `backend_scheme: https`, the concrete backend target 
 - Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. No buffering.
 - Response body: streamed back via `CoalescingH3Body` / `DirectH3Body` with the coalesce knobs below.
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
+
+The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`: the gRPC request frames stream over `request_streaming_body()`, the response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded verbatim (after response-direction hop-by-hop stripping). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, and client-streaming RPCs are supported (the request stream is drained before the response is read, exactly like the cross-protocol bridge buffers it), while full bidirectional streaming and the retry/body-buffering cases fall through to the H2 gRPC bridge. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
 Use this path when the backend is known to speak QUIC. When startup or background refresh has not classified the target as H3-capable, the gateway routes via the cross-protocol bridge instead — this prevents the common failure mode of pointing H3 frontend traffic at an HTTP/2-only backend and seeing opaque QUIC connect errors on live requests.
 
@@ -116,7 +119,7 @@ Tests: `h3_buffered_response_survives_graceful_close_race`, `h3_goaway_after_com
 
 Module: [src/http3/cross_protocol.rs](../src/http3/cross_protocol.rs).
 
-For every dispatch case that is **not** `Plain + target classified as h3`, the H3 listener delegates to `cross_protocol::run()`, which reuses the same backend infrastructure as the H1/H2 proxy path — `state.connection_pool` (reqwest) for Plain flavor and `state.grpc_pool` (hyper H2 direct) for Grpc flavor. This is the decoupling that lets a single `https://backend` serve H1, H2, and H3 clients uniformly.
+For every dispatch case that is **not** served by a native H3 path — i.e. anything other than `Plain + target classified as h3` or `Grpc + target classified as h3 + streamable` (see [Native H3 fast path](#native-h3-fast-path)) — the H3 listener delegates to `cross_protocol::run()`, which reuses the same backend infrastructure as the H1/H2 proxy path — `state.connection_pool` (reqwest) for Plain flavor and `state.grpc_pool` (hyper H2 direct) for Grpc flavor. This is the decoupling that lets a single `https://backend` serve H1, H2, and H3 clients uniformly. A `Grpc` request to a backend that does **not** speak QUIC (or that needs retry / body-plugin buffering) still uses this bridge to the HTTP/2 gRPC pool.
 
 Flow:
 

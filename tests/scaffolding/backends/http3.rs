@@ -78,6 +78,10 @@ pub enum H3Step {
     RespondHeaders(Vec<(&'static str, String)>),
     /// Send a chunk of response body.
     RespondData(Bytes),
+    /// Send the terminal H3 TRAILERS frame with the given `(name, value)`
+    /// pairs (e.g. `grpc-status` / `grpc-message`), then FIN the stream and
+    /// end the script. No pseudo-headers are allowed in trailers.
+    RespondTrailers(Vec<(&'static str, String)>),
     /// Send `RESET_STREAM` with the given application error code, then
     /// end the script.
     SendStreamReset(u64),
@@ -558,6 +562,28 @@ async fn run_h3_script(
                     .send_data(bytes)
                     .await
                     .map_err(|e| format!("send_data: {e}"))?;
+            }
+            H3Step::RespondTrailers(pairs) => {
+                let stream = response_stream.as_mut().ok_or_else(|| {
+                    "RespondTrailers without preceding RespondHeaders".to_string()
+                })?;
+                let mut trailers = http::HeaderMap::new();
+                for (name, value) in pairs {
+                    if name.starts_with(':') {
+                        return Err(format!("pseudo-header {name:?} not allowed in trailers"));
+                    }
+                    let hn = HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|e| format!("bad trailer name {name}: {e}"))?;
+                    let hv = HeaderValue::from_str(&value)
+                        .map_err(|e| format!("bad trailer value {value}: {e}"))?;
+                    trailers.append(hn, hv);
+                }
+                stream
+                    .send_trailers(trailers)
+                    .await
+                    .map_err(|e| format!("send_trailers: {e}"))?;
+                // Trailers are terminal — the stream is finished. End the script.
+                return Ok(());
             }
             H3Step::SendStreamReset(code) => {
                 let stream = response_stream
