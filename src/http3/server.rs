@@ -5499,11 +5499,32 @@ async fn dispatch_grpc_native_h3(
         // armed.
         .find(|(k, _)| k.eq_ignore_ascii_case("grpc-timeout"))
         .and_then(|(_, v)| crate::proxy::grpc_proxy::parse_grpc_timeout_value(v))
-        .map(|deadline_ms| {
+        .and_then(|deadline_ms| {
             let elapsed_ms = start_time.elapsed().as_millis() as u64;
             let remaining_ms = deadline_ms.saturating_sub(elapsed_ms).max(1);
-            tokio::time::Instant::now() + Duration::from_millis(remaining_ms)
+            // `checked_add`: a pathologically large `grpc-timeout` (e.g.
+            // `u64::MAX m`) would overflow `Instant + Duration` and panic the
+            // request task on platforms with a smaller `Instant` range. Treat an
+            // overflowing deadline as unbounded (None), matching the H2 gRPC path's
+            // overflow guard.
+            tokio::time::Instant::now().checked_add(Duration::from_millis(remaining_ms))
         });
+
+    // Fall back to `backend_read_timeout_ms` to bound the request upload +
+    // response-header wait when the client set no `grpc-timeout`: `dispatch_fut`
+    // first drains the entire client request body, so a stalled client-streaming
+    // upload would otherwise pin backend admission permits, least-connections
+    // state, and the backend QUIC stream indefinitely. The H2 gRPC path applies
+    // the same fallback around `send_request`. When neither is set the dispatch is
+    // genuinely unbounded (no timeout configured at all).
+    let dispatch_deadline_at = grpc_deadline_at.or_else(|| {
+        let ms = proxy.backend_read_timeout_ms;
+        if ms > 0 {
+            tokio::time::Instant::now().checked_add(Duration::from_millis(ms))
+        } else {
+            None
+        }
+    });
 
     let dispatch_fut = async {
         if let Some(target) = upstream_target {
@@ -5538,16 +5559,17 @@ async fn dispatch_grpc_native_h3(
                 .await
         }
     };
-    // Bound the request upload + response-header wait by the deadline; on expiry
-    // map to a read-timeout error so the failure branch emits DEADLINE_EXCEEDED
-    // (post-wire, no capability downgrade — see `H3PoolError::read_timeout`).
-    let streaming_resp = match grpc_deadline_at {
+    // Bound the request upload + response-header wait by the deadline (client
+    // grpc-timeout, else the backend_read_timeout fallback); on expiry map to a
+    // read-timeout error so the failure branch emits DEADLINE_EXCEEDED (post-wire,
+    // no capability downgrade — see `H3PoolError::read_timeout`).
+    let streaming_resp = match dispatch_deadline_at {
         Some(at) => tokio::time::timeout_at(at, dispatch_fut)
             .await
             .unwrap_or_else(|_| {
                 Err(crate::http3::client::H3PoolError::read_timeout(
                     anyhow::anyhow!(
-                        "gRPC deadline (grpc-timeout) exceeded before backend response headers"
+                        "gRPC backend dispatch timed out before response headers (grpc-timeout / backend_read_timeout)"
                     ),
                 ))
             }),
@@ -5720,8 +5742,9 @@ async fn dispatch_grpc_native_h3(
         .await
         .is_ok();
         // CB/passive-health see the real backend status (the backend responded
-        // before we found the body too large); the adaptive limiter treats the
-        // oversized response as a failure.
+        // before we found the body too large) but with `ResponseBodyTooLarge` so
+        // the post-wire backend-failure path counts it — matching the streaming
+        // overrun path below; the adaptive limiter likewise treats it as a failure.
         crate::proxy::backend_dispatch::record_backend_outcome(
             state,
             proxy,
@@ -5731,7 +5754,7 @@ async fn dispatch_grpc_native_h3(
             cb_target_key,
             response_status,
             false,
-            None,
+            Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
@@ -5891,6 +5914,18 @@ async fn dispatch_grpc_native_h3(
         sticky_cookie_needed,
         &mut response_headers,
     );
+
+    // gRPC streaming completes via the terminal `grpc-status` trailer, NOT
+    // `Content-Length` — and the gateway may synthesize an EARLY terminal trailer
+    // (`grpc-status: 4`) on a mid-stream deadline, sending fewer DATA bytes than a
+    // backend-advertised Content-Length. An H3 client enforcing Content-Length
+    // would treat that truncated body as malformed before surfacing the gRPC
+    // status, so strip it from the client-facing headers (captured first for the
+    // internal graceful-close completeness check in the relay loop below).
+    let declared_content_length: Option<u64> = response_headers
+        .get("content-length")
+        .and_then(|v| v.parse::<u64>().ok());
+    response_headers.remove("content-length");
 
     // Send response headers. gRPC carries its own `content-type`
     // (`application/grpc`); never override it with the plain JSON default, and
@@ -6060,15 +6095,14 @@ async fn dispatch_grpc_native_h3(
                     }
                     Ok(None) => stream_done = true,
                     Err(error) => {
-                        let content_length = response_headers
-                            .get("content-length")
-                            .and_then(|v| v.parse::<u64>().ok());
+                        // `declared_content_length` was captured before the
+                        // Content-Length header was stripped from the wire response.
                         if crate::http3::client::is_h3_graceful_close(&error)
                             && crate::http3::client::is_response_body_complete(
                                 total_streamed as u64,
                                 method,
                                 response_status,
-                                content_length,
+                                declared_content_length,
                             )
                         {
                             stream_done = true;
@@ -6125,6 +6159,12 @@ async fn dispatch_grpc_native_h3(
                     grpc_trailer_status =
                         Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
                     body_completed = true;
+                    // The backend exceeded the client RPC deadline — carry a
+                    // post-wire timeout class so CB / passive-health count the slow
+                    // backend (the H2 path's `TotalDeadlineBody` reports the same
+                    // `ReadWriteTimeout`). The client still received a clean
+                    // terminal `grpc-status: 4`.
+                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
                 } else {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
@@ -6192,6 +6232,10 @@ async fn dispatch_grpc_native_h3(
                                 grpc_trailer_status =
                                     Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
                                 body_completed = true;
+                                // Post-wire timeout class so CB / passive-health
+                                // count the slow backend (see the body-loop deadline
+                                // arm above).
+                                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
                             } else {
                                 client_disconnected = true;
                                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
