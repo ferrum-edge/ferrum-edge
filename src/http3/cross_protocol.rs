@@ -3690,7 +3690,6 @@ pub(crate) async fn dispatch_grpc_streaming(
             // Same gRPC-status mapping + wire-boundary `connection_error`
             // derivation as the buffered path's Err arm, so an H3-streaming gRPC
             // failure trains the breaker / limiter identically.
-            let error_class = crate::retry::classify_grpc_proxy_error(&err);
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
                 grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -3711,7 +3710,23 @@ pub(crate) async fn dispatch_grpc_streaming(
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
             };
-            let connection_error = !crate::retry::request_reached_wire(error_class);
+            // A `ResourceExhausted` on this streaming path is ALWAYS the gateway
+            // rejecting an oversized CLIENT upload (the channel body tripped
+            // `max_grpc_recv_size_bytes`), never a backend fault. Classify it as a
+            // client/gateway-side terminal (`RequestBodyTooLarge`, neutralized by
+            // `client_side_no_backend_signal`) so it releases any HALF_OPEN probe and
+            // trains NEITHER backend health NOR adaptive concurrency — matching the
+            // buffered H3 path, which rejects the oversized upload before the backend
+            // is dialed (codex P2). Every other error keeps the wire-boundary
+            // derivation so a real backend failure still trains the limiter.
+            let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
+            let error_class = if request_overflow {
+                ErrorClass::RequestBodyTooLarge
+            } else {
+                crate::retry::classify_grpc_proxy_error(&err)
+            };
+            let connection_error =
+                !request_overflow && !crate::retry::request_reached_wire(error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -6124,6 +6139,29 @@ mod tests {
         assert!(
             !body.contains("proxy_grpc_request_from_bytes"),
             "regression: the streaming path must not fall back to the buffered-bytes dispatch"
+        );
+    }
+
+    /// Regression guard (codex P2): an oversized CLIENT upload on the streaming
+    /// path must be recorded as a client-side terminal (`RequestBodyTooLarge`),
+    /// not a synthetic backend 502, so it can never trip the circuit breaker or
+    /// shrink adaptive concurrency for a healthy backend.
+    #[test]
+    fn h3_grpc_streaming_request_overflow_is_client_side_not_backend_fault() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("pub(crate) async fn dispatch_grpc_streaming")
+            .expect("dispatch_grpc_streaming not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\nasync fn apply_buffered_plain_plugin_reject")
+            .expect("end of dispatch_grpc_streaming not found");
+        let body = &tail[..end];
+        assert!(
+            body.contains("ErrorClass::RequestBodyTooLarge"),
+            "request-size overflow on the streaming path must classify as \
+             RequestBodyTooLarge (client-side, neutralized by client_side_no_backend_signal) \
+             so it trains neither backend health nor adaptive concurrency"
         );
     }
 
