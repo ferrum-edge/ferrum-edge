@@ -70,11 +70,27 @@ jobs:
       - name: Run cache accounting and reload safety regressions
         run: |
           set -euo pipefail
-          cargo test --test unit_tests -- \
-            test_concurrent_stores_keep_size_bounded_and_non_wrapping \
-            test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache \
-            test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache \
-            test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+          hardening_tests=(
+            unit::plugins::response_caching_tests::test_concurrent_stores_keep_size_bounded_and_non_wrapping
+            unit::plugins::plugin_cache_tests::test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache
+            unit::plugins::plugin_cache_tests::test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache
+            unit::plugins::plugin_cache_tests::test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+          )
+
+          set +e
+          test_output="$(cargo test --test unit_tests -- --exact "${hardening_tests[@]}" 2>&1)"
+          test_status=$?
+          set -e
+
+          printf '%s\n' "$test_output"
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+
+          if ! printf '%s\n' "$test_output" | grep -qE '^test result: ok\. 4 passed; 0 failed; 0 ignored;'; then
+            echo "::error::expected exactly 4 plugin hardening unit regressions to run and pass"
+            exit 1
+          fi
         env:
           RUST_BACKTRACE: 1
 
