@@ -371,12 +371,21 @@ wait_for_svc_pod_ip() {
 # This way no pod is ever restarted with a config that points at a since-rotated
 # IP.
 #
-# IMPORTANT: NO `trust_bundles` in any document — the SPIRE Agent supplies the
-# SVID *and* the federated peer bundle (set up by federate_spire), and a static
-# file `trust_bundles` overlay would OVERRIDE that and defeat the federation
-# proof. Cross-cluster remote classification rides `local_cluster` + the
-# workload's `cluster` field (workload_is_remote fallback), so no live remote
-# discovery poll is needed.
+# INBOUND vs OUTBOUND federation trust differ in Ferrum, so only the `dest`
+# document declares `trust_bundles`:
+#   - OUTBOUND (client -> peer): the mesh-mTLS pool verifies the peer's SERVER
+#     SVID against the gateway SVID bundle, which DOES include the SPIRE Agent's
+#     `-federatesWith` peer bundles — so the client needs no slice trust_bundles.
+#   - INBOUND (dest verifies the client cert): the :15006 STRICT verifier sources
+#     federated trust ONLY from `slice.trust_bundles`
+#     (`merge_trust_overlay_into_svid_bundle` DROPS the SVID's `-federatesWith`
+#     bundles for inbound) — so without the peer bundle declared in the dest
+#     document the handshake fails "no trust bundle for peer's trust domain".
+# `render_dest_config` therefore fetches the peer SPIRE server's bundle live and
+# declares it as a federated trust bundle (the `ew` gateway is SNI passthrough
+# and the `client` is outbound-only, so neither needs one). Cross-cluster remote
+# classification rides `local_cluster` + the workload's `cluster` field
+# (workload_is_remote fallback), so no live remote discovery poll is needed.
 
 apply_configmap() {
   local context="$1" name="$2" mesh_yaml="$3"
@@ -432,22 +441,65 @@ YAML
 )"
 }
 
+# Emit a cluster's SPIRE trust bundle as base64-encoded DER X.509 authorities,
+# one per line — the encoding `MeshConfig.trust_bundles[].x509_authorities` wants
+# (`decode_x509_authorities` base64-STANDARD-decodes each entry to DER). A PEM
+# certificate body IS exactly standard-base64 DER, so we strip the PEM armor and
+# join each block's wrapped lines; a multi-cert bundle yields multiple lines.
+spire_bundle_b64der() {
+  local context="$1"
+  ferrum_spire_server_exec "$context" "$SPIRE_NS" bundle show -format pem 2>/dev/null \
+    | awk '
+        /-----BEGIN CERTIFICATE-----/ { cap = 1; buf = ""; next }
+        /-----END CERTIFICATE-----/   { if (cap) print buf; cap = 0; next }
+        cap { gsub(/[[:space:]]/, ""); buf = buf $0 }
+      '
+}
+
+# Render an `x509_authorities:` YAML list (one `- <b64der>` per line) at $1
+# indent from a newline-separated base64-DER blob ($2).
+yaml_x509_authorities() {
+  local indent="$1" blob="$2" line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && printf '%s- %s\n' "$indent" "$line"
+  done <<<"$blob"
+}
+
 # Dest svc: LOCAL workload (loopback) + STRICT PeerAuth + a DENY
-# AuthorizationPolicy for the PEER cluster's rogue principal. workload_is_local
-# materializes the inbound loopback route to the app on :8080. No discovery.
+# AuthorizationPolicy for the PEER cluster's rogue principal + the FEDERATED
+# peer trust bundle. workload_is_local materializes the inbound loopback route to
+# the app on :8080. No discovery.
+#
+# trust_bundles is LOAD-BEARING for cross-cluster INBOUND mTLS: Ferrum's inbound
+# SPIFFE verifier validates a peer cert's trust domain against the gateway SVID's
+# LOCAL bundle plus the SLICE's federated bundles (`slice.trust_bundles`,
+# `merge_trust_overlay_into_svid_bundle`) — it intentionally DROPS the SPIRE
+# Agent's `-federatesWith` bundles for inbound (those feed only the OUTBOUND
+# pool's trust). So even with a federated SVID, the dest's :15006 STRICT inbound
+# rejects a peer-trust-domain cert ("no trust bundle for peer's trust domain")
+# unless the peer bundle is declared HERE. We source it live from the peer's
+# SPIRE server (`spire_bundle_b64der`). `local` re-declares this cluster's own
+# bundle (same trust domain as the SVID ⇒ additive/deduped, never a replacement).
 #
 # The DENY policy is what makes the negative prove a DESTINATION-SIDE trust-
 # boundary rejection rather than an incidental client-side TLS failure: once
-# the peer trust domain is federated, STRICT PeerAuth alone cannot tell sa/rogue
-# from sa/client (both present a valid peer SVID in the now-trusted domain), so
-# this fixture registers BOTH client AND rogue as federated and relies on this
-# identity-scoped DENY on the destination's mesh_authz to reject exactly the
-# rogue principal. A matched DENY makes mesh_authz return a 403 with the body
-# {"error":"Mesh authorization denied"} — a signal SOURCED AT THE DESTINATION —
-# while the federated sa/client still gets 200/svc-<dest>. The policy is scoped
-# to the local svc workload and denies the peer trust domain's rogue SPIFFE.
+# the peer trust domain is federated (above), STRICT PeerAuth alone cannot tell
+# sa/rogue from sa/client (both present a valid peer SVID in the now-trusted
+# domain), so this fixture registers BOTH client AND rogue as federated and
+# relies on this identity-scoped DENY on the destination's mesh_authz to reject
+# exactly the rogue principal. A matched DENY makes mesh_authz return a 403 with
+# the body {"error":"Mesh authorization denied"} — a signal SOURCED AT THE
+# DESTINATION — while the federated sa/client still gets 200/svc-<dest>. The
+# policy is scoped to the local svc workload and denies the peer rogue SPIFFE.
 render_dest_config() {
-  local context="$1" local_td="$2" peer_td="$3"
+  local context="$1" local_td="$2" peer_context="$3" peer_td="$4"
+  local local_b64 peer_b64
+  local_b64="$(spire_bundle_b64der "$context")"
+  peer_b64="$(spire_bundle_b64der "$peer_context")"
+  if [[ -z "$local_b64" || -z "$peer_b64" ]]; then
+    echo "failed to fetch SPIRE trust bundle(s) for dest config (local=$local_td peer=$peer_td)" >&2
+    return 1
+  fi
   apply_configmap "$context" ferrum-mesh-dest "$(cat <<YAML
 mesh:
   workloads:
@@ -475,6 +527,15 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$local_td/ns/$NS/sa/svc
+  trust_bundles:
+    local:
+      trust_domain: $local_td
+      x509_authorities:
+$(yaml_x509_authorities "        " "$local_b64")
+    federated:
+      - trust_domain: $peer_td
+        x509_authorities:
+$(yaml_x509_authorities "          " "$peer_b64")
   mesh_policies:
     - name: deny-peer-rogue
       namespace: $NS
@@ -805,8 +866,8 @@ main() {
   # Dest (loopback) + client (peer node IP) ConfigMaps — no svc-pod-IP needed.
   # Each dest's DENY policy targets the PEER cluster's rogue principal (the
   # source identity that cluster's rogue presents over cross-cluster mTLS).
-  render_dest_config "$CONTEXT_A" "$TRUST_DOMAIN_A" "$TRUST_DOMAIN_B"
-  render_dest_config "$CONTEXT_B" "$TRUST_DOMAIN_B" "$TRUST_DOMAIN_A"
+  render_dest_config "$CONTEXT_A" "$TRUST_DOMAIN_A" "$CONTEXT_B" "$TRUST_DOMAIN_B"
+  render_dest_config "$CONTEXT_B" "$TRUST_DOMAIN_B" "$CONTEXT_A" "$TRUST_DOMAIN_A"
   # Cluster A's client reaches cluster B's svc through B's east-west NodePort.
   render_client_config "$CONTEXT_A" "$CLUSTER_A" \
     "$CLUSTER_B" "$TRUST_DOMAIN_B" "$NETWORK_B" "$NODE_IP_B"

@@ -65,9 +65,23 @@ their SVID and federated bundle from the local SPIRE agent
 (`FERRUM_MESH_CA_BACKEND=spire_agent`,
 `FERRUM_MESH_SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock`).
 
-The SPIRE-supplied bundle is authoritative: the file-config mesh documents carry
-NO `trust_bundles` overlay (which would override the SPIRE-fetched federated
-bundle and defeat the federation proof).
+Inbound and outbound cross-cluster trust resolve from DIFFERENT sources in
+Ferrum, so the two directions are configured separately:
+
+- **Outbound** (client → peer svc): the mesh-mTLS pool verifies the peer's
+  server SVID against the gateway SVID bundle, which DOES include the SPIRE
+  Agent's `-federatesWith` peer bundles. So the client needs nothing extra — the
+  SPIRE federation above is sufficient for outbound.
+- **Inbound** (the peer svc's `:15006` STRICT verifier validating the client
+  cert): Ferrum's inbound SPIFFE verifier sources federated trust ONLY from the
+  slice's `trust_bundles` — `merge_trust_overlay_into_svid_bundle` intentionally
+  DROPS the SVID's `-federatesWith` bundles for inbound, treating the slice as
+  authoritative for inbound federation policy. So the `dest` mesh document
+  declares the peer trust domain's bundle explicitly (`render_dest_config` fetches
+  it live from the peer SPIRE server as base64-DER `x509_authorities`); without
+  it the inbound handshake fails "no trust bundle for peer's trust domain". The
+  `ew` gateway is SNI passthrough (terminates no TLS) and the `client` is
+  outbound-only, so neither declares `trust_bundles`.
 
 ## Cross-cluster networking
 
