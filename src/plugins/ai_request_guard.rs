@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
@@ -36,6 +36,7 @@ pub struct AiRequestGuard {
     temperature_range: Option<(f64, f64)>,
     block_system_prompts: bool,
     required_metadata_fields: Vec<String>,
+    fail_on_uninspectable_body: bool,
     /// True when the plugin needs to modify the request body (clamp or inject defaults).
     needs_body_transform: bool,
     /// True when any configured policy needs the request body to be inspected.
@@ -126,6 +127,8 @@ impl AiRequestGuard {
 
         let required_metadata_fields =
             optional_string_vec(config, "required_metadata_fields")?.unwrap_or_default();
+        let fail_on_uninspectable_body =
+            optional_bool(config, "fail_on_uninspectable_body")?.unwrap_or(true);
 
         let needs_body_transform = (max_tokens_limit.is_some()
             && enforce_max_tokens == MaxTokensAction::Clamp)
@@ -163,6 +166,7 @@ impl AiRequestGuard {
             temperature_range,
             block_system_prompts,
             required_metadata_fields,
+            fail_on_uninspectable_body,
             needs_body_transform,
             requires_request_body,
         })
@@ -300,6 +304,60 @@ impl AiRequestGuard {
 
         Ok(())
     }
+
+    fn handle_uninspectable_body(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &'static str,
+        status_code: u16,
+        details: String,
+    ) -> PluginResult {
+        let action = if self.fail_on_uninspectable_body {
+            "reject"
+        } else {
+            "allow"
+        };
+        ctx.metadata.insert(
+            "ai_request_guard.uninspectable_body".to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_request_guard.uninspectable_body_reason".to_string(),
+            reason.to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_request_guard.uninspectable_body_action".to_string(),
+            action.to_string(),
+        );
+
+        if !self.fail_on_uninspectable_body {
+            debug!(
+                reason,
+                action,
+                status_code,
+                details = %details,
+                "ai_request_guard: uninspectable request body allowed by compatibility mode"
+            );
+            return PluginResult::Continue;
+        }
+
+        warn!(
+            reason,
+            action,
+            status_code,
+            details = %details,
+            "ai_request_guard: rejecting uninspectable request body"
+        );
+        PluginResult::Reject {
+            status_code,
+            body: serde_json::json!({
+                "error": "Request body uninspectable",
+                "details": details,
+            })
+            .to_string(),
+            headers: HashMap::new(),
+        }
+    }
 }
 
 /// Count total characters in a message's content field.
@@ -383,15 +441,52 @@ impl Plugin for AiRequestGuard {
         // Get request body from metadata
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
-            _ => return PluginResult::Continue,
+            Some(_) => {
+                return self.handle_uninspectable_body(
+                    ctx,
+                    "empty_body",
+                    400,
+                    "JSON request body is empty and cannot be inspected by ai_request_guard"
+                        .to_string(),
+                );
+            }
+            None => {
+                let status_code = if ctx.metadata.contains_key("request_body_size_bytes") {
+                    400
+                } else {
+                    500
+                };
+                let reason = if status_code == 400 {
+                    "non_utf8_body"
+                } else {
+                    "missing_buffered_body"
+                };
+                let details = if status_code == 400 {
+                    "Request body was buffered but is not valid UTF-8 JSON"
+                } else {
+                    "Buffered request body metadata was unavailable for ai_request_guard inspection"
+                };
+                return self.handle_uninspectable_body(
+                    ctx,
+                    reason,
+                    status_code,
+                    details.to_string(),
+                );
+            }
         };
 
         // Parse JSON
         let mut json: Value = match serde_json::from_str(body) {
             Ok(v) => v,
-            Err(_) => {
-                // Let the backend handle malformed JSON
-                return PluginResult::Continue;
+            Err(err) => {
+                return self.handle_uninspectable_body(
+                    ctx,
+                    "malformed_json",
+                    400,
+                    format!(
+                        "Malformed JSON request body cannot be inspected by ai_request_guard: {err}"
+                    ),
+                );
             }
         };
 

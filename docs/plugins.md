@@ -3739,7 +3739,7 @@ config:
 
 Validates and constrains AI/LLM API requests before they reach the backend.
 
-Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured.
+Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured. By default, configured guard policies fail closed when the body cannot be inspected: malformed JSON, empty JSON bodies, non-UTF-8 buffered bodies, or missing buffered-body metadata are rejected before backend dispatch. Oversized bodies are rejected earlier by the proxy request-body buffer limit. Production AI proxies should keep this default so malformed or unbuffered requests cannot bypass model, token, prompt, or metadata policy; set `fail_on_uninspectable_body: false` only for compatibility when the upstream service must own malformed JSON handling.
 
 At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1).
 
@@ -3758,6 +3758,7 @@ At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_mo
 | `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for temperature |
 | `block_system_prompts` | Boolean | `false` | Reject requests with `role: "system"` messages |
 | `required_metadata_fields` | String[] | `[]` | Required fields in request body |
+| `fail_on_uninspectable_body` | Boolean | `true` | Reject matching JSON `POST` requests whose body is missing, empty, non-UTF-8, or malformed JSON |
 
 ```yaml
 plugin_name: ai_request_guard

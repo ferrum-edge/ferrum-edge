@@ -67,6 +67,7 @@ fn test_invalid_config_shapes_rejected() {
         json!({"max_prompt_characters": "1000"}),
         json!({"block_system_prompts": "false"}),
         json!({"required_metadata_fields": ["stream", 123]}),
+        json!({"max_messages": 10, "fail_on_uninspectable_body": "false"}),
     ] {
         let result = AiRequestGuard::new(&config);
         assert!(result.is_err(), "config should be rejected: {config:?}");
@@ -599,20 +600,82 @@ async fn test_non_json_content_type_passes() {
 }
 
 #[tokio::test]
-async fn test_empty_body_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+async fn missing_buffered_body_rejected_when_policy_requires_body() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert_reject(result, Some(500));
+    assert_eq!(
+        ctx.metadata.get("ai_request_guard.uninspectable_body"),
+        Some(&"true".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"missing_buffered_body".to_string())
+    );
 }
 
 #[tokio::test]
-async fn test_malformed_json_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+async fn empty_buffered_body_rejected_when_policy_requires_body() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), String::new());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "0".to_string());
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"empty_body".to_string())
+    );
+}
+
+#[tokio::test]
+async fn malformed_json_rejected_when_fail_on_uninspectable_body() {
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), "not valid json{{{".to_string());
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata.get("ai_request_guard.uninspectable_body"),
+        Some(&"true".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"malformed_json".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"reject".to_string())
+    );
+}
+
+#[tokio::test]
+async fn compatibility_mode_allows_backend_to_handle_malformed_json() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 1000,
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
@@ -622,6 +685,11 @@ async fn test_malformed_json_passes() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"allow".to_string())
+    );
 }
 
 // ─── Required metadata fields ───────────────────────────────────────────
