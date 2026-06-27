@@ -30,6 +30,7 @@ pub struct AiRequestGuard {
     default_max_tokens: Option<u64>,
     allowed_models: HashSet<String>,
     blocked_models: HashSet<String>,
+    require_model_for_model_policy: bool,
     require_user_field: bool,
     max_messages: Option<u64>,
     max_prompt_characters: Option<u64>,
@@ -78,6 +79,8 @@ impl AiRequestGuard {
 
         let allowed_models = optional_lowercase_set(config, "allowed_models")?.unwrap_or_default();
         let blocked_models = optional_lowercase_set(config, "blocked_models")?.unwrap_or_default();
+        let require_model_for_model_policy =
+            optional_bool(config, "require_model_for_model_policy")?.unwrap_or(true);
 
         let require_user_field = optional_bool(config, "require_user_field")?.unwrap_or(false);
         let max_messages = optional_u64(config, "max_messages")?;
@@ -157,6 +160,7 @@ impl AiRequestGuard {
             default_max_tokens,
             allowed_models,
             blocked_models,
+            require_model_for_model_policy,
             require_user_field,
             max_messages,
             max_prompt_characters,
@@ -171,30 +175,51 @@ impl AiRequestGuard {
     /// Validate the request body JSON. Returns Err with a rejection tuple on failure.
     fn validate(&self, json: &Value) -> Result<(), (String, String)> {
         // Model blocking/allowlisting
-        if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
-            let model_lower = model.to_lowercase();
+        if !self.allowed_models.is_empty() || !self.blocked_models.is_empty() {
+            match json.get("model").and_then(|v| v.as_str()) {
+                Some(model) => {
+                    if self.require_model_for_model_policy && model.trim().is_empty() {
+                        return Err((
+                            "Missing required model field".to_string(),
+                            "The 'model' field must be a non-empty string when model policy is configured"
+                                .to_string(),
+                        ));
+                    }
 
-            if !self.blocked_models.is_empty() && self.blocked_models.contains(model_lower.as_str())
-            {
-                return Err((
-                    "Model not allowed".to_string(),
-                    format!(
-                        "Model '{}' is blocked by gateway policy",
-                        escape_json_string(model)
-                    ),
-                ));
-            }
+                    let model_lower = model.to_lowercase();
 
-            if !self.allowed_models.is_empty()
-                && !self.allowed_models.contains(model_lower.as_str())
-            {
-                return Err((
-                    "Model not allowed".to_string(),
-                    format!(
-                        "Model '{}' is not in the allowed models list",
-                        escape_json_string(model)
-                    ),
-                ));
+                    if !self.blocked_models.is_empty()
+                        && self.blocked_models.contains(model_lower.as_str())
+                    {
+                        return Err((
+                            "Model not allowed".to_string(),
+                            format!(
+                                "Model '{}' is blocked by gateway policy",
+                                escape_json_string(model)
+                            ),
+                        ));
+                    }
+
+                    if !self.allowed_models.is_empty()
+                        && !self.allowed_models.contains(model_lower.as_str())
+                    {
+                        return Err((
+                            "Model not allowed".to_string(),
+                            format!(
+                                "Model '{}' is not in the allowed models list",
+                                escape_json_string(model)
+                            ),
+                        ));
+                    }
+                }
+                None if self.require_model_for_model_policy => {
+                    return Err((
+                        "Missing required model field".to_string(),
+                        "The 'model' field must be a non-empty string when model policy is configured"
+                            .to_string(),
+                    ));
+                }
+                None => {}
             }
         }
 

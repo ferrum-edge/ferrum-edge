@@ -1,7 +1,7 @@
 //! Tests for ai_request_guard plugin
 
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, ai_request_guard::AiRequestGuard, priority,
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ai_request_guard::AiRequestGuard, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,6 +24,19 @@ fn make_post_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers
+}
+
+fn assert_reject_error(result: PluginResult, expected_status: u16, expected_error: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, expected_status);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"], expected_error);
+        }
+        _ => panic!("Expected Reject, got {:?}", result),
+    }
 }
 
 // ─── Plugin basics ──────────────────────────────────────────────────────
@@ -62,6 +75,7 @@ fn test_invalid_config_shapes_rejected() {
         json!({"allowed_models": "gpt-4"}),
         json!({"allowed_models": ["gpt-4", 123]}),
         json!({"blocked_models": ["gpt-4", false]}),
+        json!({"require_model_for_model_policy": "true"}),
         json!({"require_user_field": "true"}),
         json!({"max_messages": "10"}),
         json!({"max_prompt_characters": "1000"}),
@@ -112,6 +126,21 @@ async fn test_non_blocked_model_passes() {
     assert_continue(result);
 }
 
+#[tokio::test]
+async fn blocked_models_requires_model_or_documented_behavior() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+
+    let mut missing_ctx = make_post_ctx(&json!({"messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut missing_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Missing required model field");
+
+    let mut non_string_ctx = make_post_ctx(&json!({"model": 4, "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut non_string_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Missing required model field");
+}
+
 // ─── Model allowlist ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -131,6 +160,47 @@ async fn test_unlisted_model_rejected() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn allowed_models_requires_model() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o"]})).unwrap();
+
+    let mut missing_ctx = make_post_ctx(&json!({"messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut missing_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Missing required model field");
+
+    let mut non_string_ctx = make_post_ctx(&json!({"model": true, "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut non_string_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Missing required model field");
+}
+
+#[tokio::test]
+async fn explicit_require_model_for_model_policy_true_rejects_missing_model() {
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4o"],
+        "require_model_for_model_policy": true
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({"messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Missing required model field");
+}
+
+#[tokio::test]
+async fn explicit_require_model_for_model_policy_false_allows_missing_model() {
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4o"],
+        "require_model_for_model_policy": false
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({"messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 #[tokio::test]

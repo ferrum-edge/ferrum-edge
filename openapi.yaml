@@ -14329,6 +14329,10 @@ components:
             type: string
           default: []
           description: Blacklist of model names (takes precedence over allowed)
+        require_model_for_model_policy:
+          type: boolean
+          default: true
+          description: Require a non-empty string model field when allowed_models or blocked_models is configured
         require_user_field:
           type: boolean
           default: false
