@@ -1135,22 +1135,16 @@ jobs:
         id: helm_changes
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          base_sha="${{ github.event.pull_request.base.sha }}"
-          changed_files="$(git diff --name-only "${base_sha}...HEAD")"
 
           # Helm chart validation runs for changes that can affect:
           # - chart sources, dashboards, schemas, and examples under charts/
           # - this CI workflow and local .github/actions/ image packaging
           # - Docker/runtime packaging metadata and Cargo/proto build inputs
           # - ferrum.conf plus runtime config defaults rendered into the chart
-          # - control-plane startup, admin, gRPC, Kubernetes, and secret paths
-          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/(main|startup|cli)\.rs$|src/config/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/grpc/|src/k8s_controller/|src/secrets/)'
-          if printf '%s\n' "$changed_files" | grep -Eq "$helm_change_regex"; then
+          # - control-plane startup, admin, gRPC, xDS, DNS, TLS, identity,
+          #   Kubernetes, and secret paths exercised by the Helm install checks
+          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/(main|startup|cli)\.rs$|src/config/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/secrets/|src/tls/|src/xds/)'
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq "$helm_change_regex"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
