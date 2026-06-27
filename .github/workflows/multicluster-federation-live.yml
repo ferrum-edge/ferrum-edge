@@ -23,12 +23,18 @@ on:
       - "src/proxy/hbone_proxy.rs"
       - "src/proxy/mod.rs"
       # The east-west gateway materializes SNI-passthrough proxies that are
-      # reconciled through the stream listener manager and relayed by the TCP
-      # proxy, so changes to those files alter the actual cross-cluster datapath.
+      # reconciled through the stream listener manager, choose the backend by
+      # ClientHello SNI (`sni::extract_sni_from_tcp_stream`), and are relayed by
+      # the TCP proxy — so changes to any of these alter the cross-cluster datapath.
       - "src/proxy/stream_listener.rs"
       - "src/proxy/tcp_proxy.rs"
+      - "src/proxy/sni.rs"
       - "src/capture/**"
-      - "charts/ferrum-mesh/**"
+      # NOTE: charts/ferrum-mesh is intentionally NOT a trigger — this fixture
+      # deploys hand-crafted NodePort manifests (the chart's east-west Service is
+      # ClusterIP-only, not cross-cluster reachable), so a chart edit does not
+      # change what this job exercises. The chart is covered by the `Helm Chart`
+      # CI job (lint/template/install).
       - "tests/k8s/lib/**"
       - "tests/k8s/multicluster-federation/**"
       - "docs/mesh.md"

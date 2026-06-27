@@ -31,8 +31,10 @@ driven in BOTH directions:
   cluster's east-west gateway NodePort, plus a `curl` container that drives the
   captured request directly at the outbound capture listener `:15001` (mirroring
   the functional test's `plaintext_http_get`);
-- a **rogue** client identical to the client but whose SVID is registered
-  WITHOUT `FederatesWith` the peer trust domain — the negative.
+- a **rogue** client identical to the client and ALSO registered with
+  `-federatesWith` the peer trust domain — so its SVID completes valid
+  cross-cluster mTLS and the negative proves a DESTINATION-SIDE rejection (the
+  peer `svc`'s `deny-peer-rogue` MeshPolicy → 403), not a client-side TLS failure.
 
 The A→B path: cluster A's client captures a plaintext request → cross-cluster
 target dialing B's east-west NodePort with `svc.ferrum.svc.cluster.local` as the
@@ -116,12 +118,12 @@ live suite gates its `node_waypoint.*` IDs in its own run.sh REQUIRED array):
 | `multicluster.spire.federation_ready_a` | cluster A's SPIRE server holds cluster B's federated bundle |
 | `multicluster.spire.federation_ready_b` | cluster B's SPIRE server holds cluster A's federated bundle |
 | `multicluster.federation.trust_bundle_exchange` | both servers hold the peer bundle |
-| `multicluster.spire.workload_entries` | federated `svc`/`ew-gateway`/`client` entries registered in both clusters |
+| `multicluster.spire.workload_entries` | federated `svc`/`ew-gateway`/`client`/`rogue` entries registered in both clusters |
 | `multicluster.eastwest.gateway_reachable` | TCP connect succeeds to both east-west NodePorts cross-cluster |
 | `multicluster.eastwest.a_to_b_authenticated` | A's captured request reaches B's `svc` (200, body `svc-b`) over the federated mTLS path |
 | `multicluster.eastwest.b_to_a_authenticated` | the mirror direction (200, body `svc-a`) |
 | `multicluster.eastwest.bidirectional_authenticated_traffic` | both directions pass |
-| `multicluster.eastwest.untrusted_peer_rejected` | the unfederated `rogue` client is rejected (not 200/`svc-b`) |
+| `multicluster.eastwest.untrusted_peer_rejected` | the federated `rogue` client is rejected at the DESTINATION by MeshPolicy (403 `Mesh authorization denied`, not 200/`svc-b`) |
 
 Cross-cluster east-west is Beta/Experimental in `docs/mesh.md`, so there is
 intentionally no `ga_contract.yaml` row yet — a GA promotion would add a

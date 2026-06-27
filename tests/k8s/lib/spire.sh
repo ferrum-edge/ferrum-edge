@@ -117,6 +117,11 @@ data:
         bundle_endpoint {
           address = "0.0.0.0"
           port = "$FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT"
+          # SPIRE 1.12.4 DEFAULTS an unset profile to https_spiffe with a
+          # deprecation warning ("will be fatal in a future release") — it does
+          # NOT reject the config (the live jobs run green without this). Set it
+          # explicitly to silence the warning and stay forward-compatible.
+          profile "https_spiffe" {}
         }
       }
     }

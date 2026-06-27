@@ -636,13 +636,28 @@ probe_gateway_reachable() {
   # From a client pod in A, TCP-connect to B's east-west NodePort, and vice
   # versa. A successful TCP open proves L4 cross-cluster routing independent of
   # the mTLS/auth path.
-  local ok_a=false ok_b=false
-  if [[ "$(probe_tcp_connect "$CONTEXT_A" "$NODE_IP_B" "$EAST_WEST_NODEPORT")" == "1" ]]; then
-    ok_a=true
-  fi
-  if [[ "$(probe_tcp_connect "$CONTEXT_B" "$NODE_IP_A" "$EAST_WEST_NODEPORT")" == "1" ]]; then
-    ok_b=true
-  fi
+  #
+  # RETRY (not one-shot): `wait_for_rollouts` returns when Kubernetes marks the
+  # Deployments rolled out, but the east-west Ferrum container has no readiness
+  # probe and may still be loading its SPIRE SVID/config — so the :15443 SNI
+  # listener can bind a few seconds AFTER rollout. A single connect would
+  # false-FAIL this required assertion on a slow node; retry each direction
+  # (latching successes) until both converge, mirroring the HTTP traffic probes.
+  local ok_a=false ok_b=false _
+  for _ in $(seq 1 30); do
+    if [[ "$ok_a" != "true" ]] &&
+      [[ "$(probe_tcp_connect "$CONTEXT_A" "$NODE_IP_B" "$EAST_WEST_NODEPORT")" == "1" ]]; then
+      ok_a=true
+    fi
+    if [[ "$ok_b" != "true" ]] &&
+      [[ "$(probe_tcp_connect "$CONTEXT_B" "$NODE_IP_A" "$EAST_WEST_NODEPORT")" == "1" ]]; then
+      ok_b=true
+    fi
+    if [[ "$ok_a" == "true" && "$ok_b" == "true" ]]; then
+      break
+    fi
+    sleep 2
+  done
   if [[ "$ok_a" == "true" && "$ok_b" == "true" ]]; then
     record_live_assertion multicluster.eastwest.gateway_reachable pass \
       "" "" "tcp-connect-both-east-west-nodeports"
@@ -711,14 +726,19 @@ drive_positive_both_directions() {
   if [[ "$status_ba" == "200" && "$body_ba" == *"svc-a"* ]]; then
     pass_ba=pass
   fi
+  # workload NAMES go in the source/destination_workload fields (3/4); the
+  # observed SPIFFE IDs go in observed_source/destination_spiffe (6/7) so the
+  # identity evidence lands in live-assertions.json's SPIFFE fields.
   record_live_assertion multicluster.eastwest.a_to_b_authenticated "$pass_ab" \
+    client svc \
+    "status=$status_ab body=$body_ab" \
     "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/client" \
-    "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc" \
-    "status=$status_ab body=$body_ab"
+    "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc"
   record_live_assertion multicluster.eastwest.b_to_a_authenticated "$pass_ba" \
+    client svc \
+    "status=$status_ba body=$body_ba" \
     "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/client" \
-    "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/svc" \
-    "status=$status_ba body=$body_ba"
+    "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/svc"
   if [[ "$pass_ab" == "pass" && "$pass_ba" == "pass" ]]; then
     record_live_assertion multicluster.eastwest.bidirectional_authenticated_traffic pass \
       "" "" "a_to_b=200/$body_ab b_to_a=200/$body_ba"
@@ -776,9 +796,10 @@ drive_untrusted_negative() {
   log "rogue A -> B result: status=$status body=$body"
   if [[ "$status" == "403" && "$body" == *"Mesh authorization denied"* && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.eastwest.untrusted_peer_rejected pass \
+      rogue svc \
+      "dest-side-mesh-authz-denied status=$status body=$body" \
       "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/rogue" \
-      "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc" \
-      "dest-side-mesh-authz-denied status=$status body=$body"
+      "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc"
   else
     record_live_assertion multicluster.eastwest.untrusted_peer_rejected fail \
       "" "" "rogue-not-rejected-by-dest-authz status=$status body=$body"
@@ -824,6 +845,12 @@ collect_diagnostics() {
   if [[ -f "$LIVE_ASSERTIONS_FILE" ]]; then
     cp "$LIVE_ASSERTIONS_FILE" "$ARTIFACT_DIR/live-assertions.json" 2>/dev/null || true
   fi
+  # The bundle/entry dumps (`cluster-{a,b}-{bundles,entries}.txt`) are written to
+  # RESULTS_DIR and referenced BY BASENAME from live-assertions.json's diagnostic
+  # paths, but the workflow uploads ARTIFACT_DIR (+ only the JSON from RESULTS_DIR).
+  # Copy them into ARTIFACT_DIR so a failed-assertion artifact actually contains
+  # the files it points at.
+  cp "$RESULTS_DIR"/*.txt "$ARTIFACT_DIR/" 2>/dev/null || true
 }
 
 require_live_assertions() {
