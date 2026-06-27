@@ -2378,6 +2378,37 @@ fn build_h3_grpc_backend_headers(
     hmap
 }
 
+/// Extract the gateway-trusted consumer-identity headers (`x-consumer-username`
+/// / `x-consumer-custom-id`) from the materialised `proxy_headers` into a
+/// minimal map.
+///
+/// The H3 gRPC dispatch builds its backend header set up-front
+/// ([`build_h3_grpc_backend_headers`]) and passes empty `proxy_headers` to the
+/// gRPC core so the canonical forwarding headers it synthesised
+/// (`x-forwarded-*`, `via`, `forwarded`) are not re-merged. But the core's
+/// `merge_proxy_headers_and_strip_for_grpc` strips reserved identity headers
+/// from the base map and re-adds them ONLY from its `proxy_headers` arg (so a
+/// client cannot forge a principal). An empty arg therefore drops the
+/// gateway-verified `x-consumer-*` that `build_h3_grpc_backend_headers` copied
+/// in, hiding the authenticated principal from the backend. Passing this minimal
+/// map preserves the trusted identity while still keeping the forwarding headers
+/// from being re-merged. Empty when no principal was resolved — the merge then
+/// strips any client-forged value and adds nothing, preserving the spoof
+/// protection (codex P2).
+fn trusted_identity_proxy_headers(
+    proxy_headers: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut identity = HashMap::new();
+    // Mirrors `proxy::headers::strip_reserved_consumer_identity_headers`. Keys in
+    // `proxy_headers` are already lowercased by the H3 header materialisation.
+    for name in ["x-consumer-username", "x-consumer-custom-id"] {
+        if let Some(value) = proxy_headers.get(name) {
+            identity.insert(name.to_string(), value.clone());
+        }
+    }
+    identity
+}
+
 /// Stream a live gRPC backend response (`GrpcResponseKind::Streaming`) onto an
 /// H3 send half: run `after_proxy` + sticky-cookie on the headers, send the
 /// response head, stream the body frame-by-frame through the coalescer, then
@@ -2537,11 +2568,30 @@ where
 
     let mut final_body_completed = body_completed;
     let mut final_client_disconnected = client_disconnected;
+    // Late client-upload overflow (codex P2): on a bidi/early-response RPC the
+    // channel body can trip `max_grpc_recv_size_bytes` AFTER the response headers
+    // were forwarded, so `proxy_grpc_request_streaming_channel` could not surface
+    // it. An oversized upload must NOT be delivered to the client as a successful
+    // gRPC response: when the flag tripped, RST the H3 response (withholding the
+    // backend's possibly-`grpc-status: 0` trailer) so the client observes an
+    // aborted RPC rather than success. HEADERS/DATA already on the wire cannot be
+    // unsent, but the success status is suppressed. Metrics below reclassify the
+    // overrun as a client-side `RequestBodyTooLarge` (neutral for backend health
+    // and adaptive concurrency, even if the backend finished first). No-op for the
+    // buffered-request path, which size-checks before dispatch.
+    let request_overflowed_late = streaming
+        .request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire));
     // Capture the backend gRPC outcome from the trailers before they are
     // stripped/forwarded, so the admission sample below reflects a backend
     // gRPC failure (e.g. 14 -> 503) instead of the HTTP 200 status line.
     let mut grpc_trailer_status: Option<u32> = None;
-    if body_completed && let Some(mut trailers) = trailers {
+    if request_overflowed_late {
+        // Suppress the (possibly successful) backend status on an oversized upload.
+        crate::http3::stream_util::abort_response_stream(stream);
+        final_body_completed = false;
+    } else if body_completed && let Some(mut trailers) = trailers {
         grpc_trailer_status = trailers
             .get("grpc-status")
             .and_then(|v| v.to_str().ok())
@@ -2579,18 +2629,6 @@ where
         }
     }
 
-    // Late client-upload overflow (codex P2): on a bidi/early-response RPC the
-    // channel body can trip `max_grpc_recv_size_bytes` AFTER the response headers
-    // were forwarded, so `proxy_grpc_request_streaming_channel` could not surface
-    // it. If `request_body_exceeded` tripped, the gateway RST the stream on a
-    // CLIENT overrun — reclassify the (otherwise backend-looking) body error as
-    // `RequestBodyTooLarge` so the overrun trains neither backend health nor
-    // adaptive concurrency, even if the backend happened to finish first. (No-op
-    // for the buffered-request path, which size-checks before dispatch.)
-    let request_overflowed_late = streaming
-        .request_body_exceeded
-        .as_ref()
-        .is_some_and(|flag| flag.load(Ordering::Acquire));
     let outcome_error_class = if request_overflowed_late {
         Some(ErrorClass::RequestBodyTooLarge)
     } else {
@@ -2817,8 +2855,11 @@ where
     // (plugin-transformed end-to-end headers + canonical forwarding
     // headers synthesized by this bridge). Passing the original
     // `proxy_headers` again would let the shared gRPC core overwrite
-    // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`).
-    let empty_proxy_headers: HashMap<String, String> = HashMap::new();
+    // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`), so
+    // pass ONLY the gateway-trusted consumer identity: the core's merge strips
+    // reserved `x-consumer-*` from `hmap` and re-adds them solely from this arg,
+    // so an empty map would drop the authenticated principal (codex P2).
+    let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
         initial_hmap,
@@ -2827,7 +2868,7 @@ where
         &current_url,
         &state.grpc_pool,
         &state.dns_cache,
-        &empty_proxy_headers,
+        &identity_proxy_headers,
         stream_grpc_response,
         state.max_response_body_size_bytes,
     )
@@ -2964,7 +3005,7 @@ where
                 &current_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                &empty_proxy_headers,
+                &identity_proxy_headers,
                 stream_grpc_response,
                 state.max_response_body_size_bytes,
             )
@@ -3643,10 +3684,13 @@ pub(crate) async fn dispatch_grpc_streaming(
 
     // Dispatch with the channel-backed streaming body. No retry: the request
     // body is consumed on the wire. `hmap` already carries the canonical
-    // forwarding headers, so pass empty proxy_headers — otherwise the shared
-    // gRPC core would re-merge them and overwrite the canonical values.
+    // forwarding headers, so don't re-pass the full `proxy_headers` (the core
+    // would re-merge and overwrite them) — pass only the gateway-trusted consumer
+    // identity, since the core's merge strips reserved `x-consumer-*` from `hmap`
+    // and re-adds them solely from this arg, so an empty map would drop the
+    // authenticated principal (codex P2).
     let body_size_exceeded = Arc::new(AtomicBool::new(false));
-    let empty_proxy_headers: HashMap<String, String> = HashMap::new();
+    let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
     let result = grpc_proxy::proxy_grpc_request_streaming_channel(
         hyper_method,
         hmap,
@@ -3654,7 +3698,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         proxy,
         backend_url,
         &state.grpc_pool,
-        &empty_proxy_headers,
+        &identity_proxy_headers,
         state.max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
         None,
@@ -6250,6 +6294,53 @@ mod tests {
         assert!(
             body.contains("res = tx.send(Ok(body_bytes)) => res"),
             "the pump's data send must be a cancellable select arm racing pump_shutdown"
+        );
+    }
+
+    /// Regression guard (codex P2): the H3 gRPC dispatch must forward the
+    /// gateway-trusted consumer identity (`x-consumer-*`) to the backend. The
+    /// shared gRPC core's `merge_proxy_headers_and_strip_for_grpc` strips reserved
+    /// identity headers from the pre-built header map and re-adds them ONLY from
+    /// its proxy_headers arg, so passing an empty map drops the authenticated
+    /// principal. Both the buffered and streaming H3 gRPC paths must pass the
+    /// trusted-identity map instead.
+    #[test]
+    fn h3_grpc_dispatch_preserves_trusted_consumer_identity() {
+        let src = include_str!("cross_protocol.rs");
+        assert!(
+            src.contains("fn trusted_identity_proxy_headers"),
+            "the trusted-identity extraction helper must exist"
+        );
+        // Build the forbidden pattern from parts so this assertion's own source
+        // text does not trip the `include_str!` self-scan.
+        let forbidden_empty = ["let empty", "_proxy_headers"].concat();
+        assert!(
+            !src.contains(&forbidden_empty),
+            "regression: an H3 gRPC dispatch declares an empty proxy_headers map for the \
+             gRPC core, whose merge would then DROP the authenticated x-consumer-* \
+             identity — pass trusted_identity_proxy_headers(proxy_headers) instead"
+        );
+    }
+
+    /// Regression guard (codex P2): a late client-upload overflow on the streaming
+    /// path must abort the H3 response rather than forward the backend's
+    /// (possibly successful) gRPC status to the client.
+    #[test]
+    fn h3_grpc_streaming_late_overflow_aborts_response() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("async fn handle_h3_grpc_streaming_response")
+            .expect("handle_h3_grpc_streaming_response not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>")
+            .expect("end of handle_h3_grpc_streaming_response not found");
+        let body = &tail[..end];
+        assert!(
+            body.contains("if request_overflowed_late {")
+                && body.contains("abort_response_stream(stream)"),
+            "a late request overflow must RST the response (abort_response_stream) \
+             instead of forwarding the backend's success trailer"
         );
     }
 
