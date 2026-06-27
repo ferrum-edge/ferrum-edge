@@ -952,15 +952,60 @@ jobs:
     name: Gateway API Conformance
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - name: Summarize Gateway API conformance owner
+      - name: Mirror dedicated Gateway API conformance result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: gateway-api-conformance.yml
         run: |
+          set -euo pipefail
+
           {
             echo "## Gateway API Conformance"
             echo ""
-            echo "Full Gateway API conformance is owned by .github/workflows/gateway-api-conformance.yml."
-            echo "This CI placeholder preserves the historical CI job/status without building the gateway image or installing Kubernetes tooling a second time."
           } >> "$GITHUB_STEP_SUMMARY"
+
+          run_id=""
+          for _ in $(seq 1 60); do
+            run_id="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
+                --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty'
+            )"
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "Dedicated Gateway API conformance workflow did not start for this commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Mirroring dedicated workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
+
+          for _ in $(seq 1 720); do
+            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}")"
+            status="$(printf '%s' "$run_json" | jq -r '.status')"
+            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""')"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Dedicated Gateway API conformance workflow passed." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Dedicated Gateway API conformance workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          echo "Timed out waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
@@ -1330,7 +1375,7 @@ jobs:
           echo "| Functional archive build | ${{ needs.build-functional-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Plugin hardening Redis regression | ${{ needs.plugin-hardening-redis-regression.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Gateway API conformance owner placeholder | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Mesh multicluster federation | ${{ needs.mesh-multicluster-federation.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Helm chart | ${{ needs.helm-chart.result }} |" >> $GITHUB_STEP_SUMMARY
 

@@ -2,27 +2,6 @@ name: Gateway API Conformance
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/gateway-api-conformance.yml"
-      - ".github/workflows/ci.yml"
-      - ".github/actions/package-ferrum-runtime-image/**"
-      - "scripts/gateway_api_data_plane_conformance.sh"
-      - "Dockerfile"
-      - "charts/**"
-      - "proto/**"
-      - "src/config/env_config.rs"
-      - "src/config_sources/k8s/**"
-      - "src/grpc/**"
-      - "src/k8s_controller/**"
-      - "src/modes/control_plane.rs"
-      - "src/modes/data_plane.rs"
-      - "src/modes/mesh/**"
-      - "src/router_cache.rs"
-      - "src/load_balancer.rs"
-      - "src/plugins/**"
-      - "src/proxy/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       gateway_api_version:
@@ -47,10 +26,10 @@ on:
 permissions:
   contents: read
 
-# PR, scheduled, and manual runs all produce useful artifact bundles; serialize
-# them so a Monday cron tick does not race workflow_dispatch on the same budget.
+# PRs get independent lanes so conformance feedback for one PR does not queue
+# behind another. Scheduled/manual runs keep sharing one lane for lab budget.
 concurrency:
-  group: gateway-api-conformance
+  group: ${{ github.event_name == 'pull_request' && format('gateway-api-conformance-pr-{0}', github.event.pull_request.number) || 'gateway-api-conformance-shared' }}
   cancel-in-progress: false
 
 env:
@@ -59,10 +38,43 @@ env:
   KUBECTL_VERSION: v1.32.3
 
 jobs:
+  changes:
+    name: Gateway API conformance trigger
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for Gateway API conformance changes
+        id: filter
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD")"
+
+          # This is the sole PR trigger surface for full Gateway API
+          # conformance. Add new Gateway/controller/data-plane/routing/chart
+          # surfaces here so relevant PRs cannot silently skip the lab.
+          gateway_api_regex='^(\.github/workflows/(ci|gateway-api-conformance)\.yml$|\.github/actions/package-ferrum-runtime-image/|scripts/gateway_api_data_plane_conformance\.sh$|Dockerfile$|charts/|proto/|src/config/env_config\.rs$|src/config_sources/k8s/|src/grpc/|src/k8s_controller/|src/modes/(control_plane|data_plane)\.rs$|src/modes/mesh/|src/router_cache\.rs$|src/load_balancer\.rs$|src/plugins/|src/proxy/|Cargo\.(toml|lock)$)'
+          if printf '%s\n' "$changed_files" | grep -Eq "$gateway_api_regex"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
   gateway-api-conformance:
-    name: Gateway API conformance
-    # This workflow owns full PR Gateway API conformance. CI keeps only a
-    # lightweight status placeholder so PRs do not run this Kubernetes lab twice.
+    name: Gateway API conformance suite
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     # The host-built binary is packaged into a distroless Debian 13 image.
     # Pin the build host so its glibc stays no newer than the runtime image.
     runs-on: ubuntu-24.04
@@ -159,3 +171,35 @@ jobs:
           name: gateway-api-conformance-${{ steps.inputs.outputs.gateway_api_version }}
           path: conformance-results/
           retention-days: 90
+
+  gate:
+    name: Gateway API Conformance
+    needs:
+      - changes
+      - gateway-api-conformance
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize Gateway API conformance result
+        run: |
+          {
+            echo "## Gateway API Conformance"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Skipped full conformance: this PR does not touch Gateway API, controller, data-plane, routing, chart, image, proto, script, dependency, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.gateway-api-conformance.result }}" != "success" ]; then
+            echo "Full conformance failed or did not complete: ${{ needs.gateway-api-conformance.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Full conformance passed." >> "$GITHUB_STEP_SUMMARY"
