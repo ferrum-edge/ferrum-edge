@@ -114,6 +114,32 @@ struct SemanticConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultimodalCacheMode {
+    /// Bypass caching for requests that include non-text content parts.
+    Reject,
+    /// Cache exact multimodal matches with fingerprints, but do not use
+    /// text-only semantic embeddings for multimodal cache hits.
+    ExactOnly,
+    /// Include multimodal fingerprints in semantic scope keys so semantic hits
+    /// can only reuse entries with the same non-text content.
+    IncludeFingerprints,
+}
+
+impl MultimodalCacheMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "reject" => Ok(Self::Reject),
+            "exact_only" | "exact-only" => Ok(Self::ExactOnly),
+            "include_fingerprints" | "include-fingerprints" => Ok(Self::IncludeFingerprints),
+            other => Err(format!(
+                "ai_semantic_cache: unknown 'cache_multimodal' value '{other}' \
+                 (expected reject, exact_only, or include_fingerprints)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingProvider {
     OpenAi,
     AzureOpenAi,
@@ -251,6 +277,8 @@ pub struct AiSemanticCache {
     include_params_in_key: bool,
     /// Whether to scope cache entries by authenticated consumer.
     scope_by_consumer: bool,
+    /// Multimodal cache behavior for requests with non-text content parts.
+    cache_multimodal: MultimodalCacheMode,
     /// Optional semantic-similarity configuration.
     semantic: Option<SemanticConfig>,
     /// Shared outbound HTTP client for embedding calls.
@@ -319,6 +347,7 @@ impl AiSemanticCache {
         // shared cache (e.g., a public LLM proxy with no per-tenant data)
         // must set this to `false`.
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
+        let cache_multimodal = parse_multimodal_cache_mode(config)?;
         let semantic = parse_semantic_config(config, http_client.backend_allow_ips())?;
 
         // Build optional Redis client
@@ -344,6 +373,7 @@ impl AiSemanticCache {
             include_model_in_key,
             include_params_in_key,
             scope_by_consumer,
+            cache_multimodal,
             semantic,
             http_client,
             cache: Arc::new(DashMap::new()),
@@ -366,12 +396,18 @@ impl AiSemanticCache {
     /// 2. Optionally scope by proxy and authenticated consumer
     /// 3. Optionally include model name and sampling parameters
     /// 4. Lowercase and collapse whitespace in `messages[*].content`
-    /// 5. Include the Anthropic top-level `system` prompt (string or array form)
-    /// 6. Include `tools` / `tool_choice` / `response_format` / `seed` /
+    /// 5. Include hashed fingerprints for non-text multimodal content parts
+    /// 6. Include the Anthropic top-level `system` prompt (string or array form)
+    /// 7. Include `tools` / `tool_choice` / `response_format` / `seed` /
     ///    `logit_bias` / `stream` when present — any change to these fields
     ///    materially changes the response and must not collapse to the same key
-    /// 7. SHA-256 hash the normalized representation
-    fn build_cache_key(&self, ctx: &RequestContext, body: &Value) -> Option<String> {
+    /// 8. SHA-256 hash the normalized representation
+    fn build_cache_key(
+        &self,
+        ctx: &RequestContext,
+        body: &Value,
+        multimodal_fingerprint: Option<&str>,
+    ) -> Option<String> {
         let mut key_input = String::with_capacity(512);
         let mut has_part = false;
 
@@ -439,6 +475,12 @@ impl AiSemanticCache {
         } else {
             // No messages array — not a chat completion request, skip caching
             return None;
+        }
+
+        if let Some(fingerprint) = multimodal_fingerprint {
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str("mm:");
+            key_input.push_str(fingerprint);
         }
 
         // Top-level `system` prompt (Anthropic Messages API). Included AFTER
@@ -509,7 +551,12 @@ impl AiSemanticCache {
         normalize_text(&raw)
     }
 
-    fn build_semantic_scope_key(&self, ctx: &RequestContext, body: &Value) -> Option<String> {
+    fn build_semantic_scope_key(
+        &self,
+        ctx: &RequestContext,
+        body: &Value,
+        multimodal_fingerprint: Option<&str>,
+    ) -> Option<String> {
         let messages = body.get("messages").and_then(|m| m.as_array())?;
         let mut key_input = String::with_capacity(512);
         let mut has_part = false;
@@ -594,6 +641,12 @@ impl AiSemanticCache {
             start_key_part(&mut key_input, &mut has_part);
             key_input.push_str("sys:");
             key_input.push_str(&normalize_system_value(system));
+        }
+
+        if let Some(fingerprint) = multimodal_fingerprint {
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str("mm:");
+            key_input.push_str(fingerprint);
         }
 
         append_response_shape_fields(body, &mut key_input, &mut has_part);
@@ -1052,6 +1105,169 @@ fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mu
     }
 }
 
+fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
+    let mut descriptor = String::with_capacity(256);
+    let mut has_part = false;
+
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for (message_index, message) in messages.iter().enumerate() {
+            let role = message
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
+            if let Some(content) = message.get("content") {
+                append_multimodal_content_fingerprint(
+                    &mut descriptor,
+                    &mut has_part,
+                    "message",
+                    Some(message_index),
+                    Some(role),
+                    content,
+                );
+            }
+        }
+    }
+
+    if let Some(system) = body.get("system") {
+        append_multimodal_content_fingerprint(
+            &mut descriptor,
+            &mut has_part,
+            "system",
+            None,
+            None,
+            system,
+        );
+    }
+
+    if has_part {
+        let hash = Sha256::digest(descriptor.as_bytes());
+        Some(hex::encode(hash))
+    } else {
+        None
+    }
+}
+
+fn append_multimodal_content_fingerprint(
+    buffer: &mut String,
+    has_part: &mut bool,
+    owner: &str,
+    owner_index: Option<usize>,
+    role: Option<&str>,
+    content: &Value,
+) {
+    match content {
+        Value::String(_) => {}
+        Value::Array(parts) => {
+            for (part_index, part) in parts.iter().enumerate() {
+                if is_text_content_part(part) {
+                    continue;
+                }
+                append_multimodal_part_descriptor(
+                    buffer,
+                    has_part,
+                    owner,
+                    owner_index,
+                    role,
+                    Some(part_index),
+                    part,
+                );
+            }
+        }
+        Value::Null => {}
+        other => {
+            if !is_text_content_part(other) {
+                append_multimodal_part_descriptor(
+                    buffer,
+                    has_part,
+                    owner,
+                    owner_index,
+                    role,
+                    None,
+                    other,
+                );
+            }
+        }
+    }
+}
+
+fn append_multimodal_part_descriptor(
+    buffer: &mut String,
+    has_part: &mut bool,
+    owner: &str,
+    owner_index: Option<usize>,
+    role: Option<&str>,
+    part_index: Option<usize>,
+    part: &Value,
+) {
+    start_key_part(buffer, has_part);
+    buffer.push_str(owner);
+    if let Some(index) = owner_index {
+        let _ = write!(buffer, "[{index}]");
+    }
+    if let Some(role) = role {
+        buffer.push_str(":role:");
+        push_ascii_lowercase(buffer, role);
+    }
+    if let Some(index) = part_index {
+        let _ = write!(buffer, ":part[{index}]");
+    }
+    buffer.push(':');
+    append_canonical_multimodal_value(buffer, part);
+}
+
+fn is_text_content_part(part: &Value) -> bool {
+    part.get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|part_type| part_type.eq_ignore_ascii_case("text"))
+}
+
+fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
+    match value {
+        Value::Null => buffer.push_str("null"),
+        Value::Bool(value) => {
+            let _ = write!(buffer, "bool:{value}");
+        }
+        Value::Number(value) => {
+            buffer.push_str("number:");
+            buffer.push_str(&value.to_string());
+        }
+        Value::String(value) => {
+            buffer.push_str("string_sha256:");
+            buffer.push_str(&hex::encode(Sha256::digest(value.as_bytes())));
+        }
+        Value::Array(values) => {
+            buffer.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    buffer.push(',');
+                }
+                append_canonical_multimodal_value(buffer, value);
+            }
+            buffer.push(']');
+        }
+        Value::Object(map) => {
+            buffer.push('{');
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    buffer.push(',');
+                }
+                buffer.push_str(key);
+                buffer.push(':');
+                if key == "type"
+                    && let Some(part_type) = map.get(key).and_then(|value| value.as_str())
+                {
+                    push_ascii_lowercase(buffer, part_type);
+                } else if let Some(value) = map.get(key) {
+                    append_canonical_multimodal_value(buffer, value);
+                }
+            }
+            buffer.push('}');
+        }
+    }
+}
+
 fn insert_optional_model(payload: &mut Value, model: &Option<String>) {
     if let (Value::Object(map), Some(model)) = (payload, model) {
         map.insert("model".to_string(), Value::String(model.clone()));
@@ -1341,8 +1557,17 @@ impl Plugin for AiSemanticCache {
             Err(_) => return PluginResult::Continue,
         };
 
+        let multimodal_fingerprint = build_multimodal_fingerprint(&json);
+        if multimodal_fingerprint.is_some() && self.cache_multimodal == MultimodalCacheMode::Reject
+        {
+            debug!(
+                "ai_semantic_cache: skipping multimodal request because cache_multimodal=reject"
+            );
+            return PluginResult::Continue;
+        }
+
         // Build cache key
-        let cache_key = match self.build_cache_key(ctx, &json) {
+        let cache_key = match self.build_cache_key(ctx, &json, multimodal_fingerprint.as_deref()) {
             Some(k) => k,
             None => return PluginResult::Continue,
         };
@@ -1405,9 +1630,13 @@ impl Plugin for AiSemanticCache {
 
         self.refresh_vector_index_if_due();
 
+        let semantic_allowed = multimodal_fingerprint.is_none()
+            || self.cache_multimodal == MultimodalCacheMode::IncludeFingerprints;
+
         if self.semantic.is_some()
+            && semantic_allowed
             && let (Some(scope_key), Some(input)) = (
-                self.build_semantic_scope_key(ctx, &json),
+                self.build_semantic_scope_key(ctx, &json, multimodal_fingerprint.as_deref()),
                 self.build_semantic_input(&json),
             )
         {
@@ -1669,6 +1898,14 @@ fn optional_non_empty_string(
         return Err(format!("ai_semantic_cache: '{field}' must not be empty"));
     }
     Ok(Some(value))
+}
+
+fn parse_multimodal_cache_mode(config: &Value) -> Result<MultimodalCacheMode, String> {
+    optional_non_empty_string(config, "cache_multimodal")?
+        .as_deref()
+        .map(MultimodalCacheMode::parse)
+        .transpose()
+        .map(|mode| mode.unwrap_or(MultimodalCacheMode::ExactOnly))
 }
 
 fn optional_threshold(config: &Value, field: &'static str) -> Result<Option<f32>, String> {

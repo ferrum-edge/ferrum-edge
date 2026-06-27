@@ -14155,6 +14155,11 @@ components:
           type: boolean
           default: true
           description: Scope cache entries per consumer (authenticated consumer ID is included in the cache key). Default `true` — different consumers must not see each other's cached responses. Set `false` only on a public LLM proxy with no per-tenant data.
+        cache_multimodal:
+          type: string
+          enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
+          default: exact_only
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys.
         semantic_similarity_enabled:
           type: boolean
           default: false

@@ -6,7 +6,7 @@ use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, header, method, path};
@@ -74,6 +74,28 @@ async fn run_before_proxy_get_status(
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::RejectBinary { .. }
     )
+}
+
+async fn run_before_proxy(
+    plugin: &AiSemanticCache,
+    body_str: &str,
+    consumer: Option<Arc<Consumer>>,
+) -> (RequestContext, PluginResult) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), body_str.to_string());
+    if let Some(c) = consumer {
+        ctx.identified_consumer = Some(c);
+    }
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (ctx, result)
 }
 
 /// MISS+store helper: send a request through `before_proxy` (cache MISS) and
@@ -194,6 +216,29 @@ fn semantic_config(server: &MockServer) -> serde_json::Value {
     })
 }
 
+fn multimodal_body(part: Value) -> Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                part
+            ]
+        }]
+    })
+}
+
+fn multimodal_image_url_body(url: &str) -> Value {
+    multimodal_body(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": url,
+            "detail": "high"
+        }
+    }))
+}
+
 #[test]
 fn test_new_default_config() {
     let config = json!({});
@@ -243,6 +288,9 @@ fn test_new_invalid_config_shapes_fail() {
         json!({"include_model_in_key": "true"}),
         json!({"include_params_in_key": "true"}),
         json!({"scope_by_consumer": "false"}),
+        json!({"cache_multimodal": true}),
+        json!({"cache_multimodal": ""}),
+        json!({"cache_multimodal": "bad"}),
         json!({"semantic_similarity_enabled": "true"}),
         json!({"semantic_similarity_enabled": true}),
         json!({"semantic_similarity_enabled": true, "semantic_embedding_endpoint": "not a url"}),
@@ -489,6 +537,217 @@ async fn test_cache_miss_then_hit() {
         }
         _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
     }
+}
+
+#[tokio::test]
+async fn exact_cache_key_differs_for_different_image_url() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body_a = multimodal_image_url_body("https://example.com/a.png");
+    let body_b = multimodal_image_url_body("https://example.com/b.png");
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_a).unwrap(),
+        None,
+        b"A",
+    )
+    .await;
+
+    let body_b_str = serde_json::to_string(&body_b).unwrap();
+    let (mut ctx_b, result) = run_before_proxy(&plugin, &body_b_str, None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "different image_url must exact-miss instead of replaying cached response A"
+    );
+    assert_eq!(
+        ctx_b.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx_b, 200, &response_headers, b"B")
+        .await;
+
+    let (_, result) = run_before_proxy(&plugin, &body_b_str, None).await;
+    match result {
+        PluginResult::RejectBinary { body, .. } => {
+            assert_eq!(&body[..], b"B");
+        }
+        other => panic!("Expected exact cache HIT for request B, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exact_cache_key_differs_for_base64_audio_and_file_parts() {
+    let cases = [
+        (
+            "base64 image_url",
+            multimodal_body(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,QUFB",
+                    "detail": "high"
+                }
+            })),
+            multimodal_body(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,QkJC",
+                    "detail": "high"
+                }
+            })),
+        ),
+        (
+            "input_audio",
+            multimodal_body(json!({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "QUFB",
+                    "format": "wav"
+                }
+            })),
+            multimodal_body(json!({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "QkJC",
+                    "format": "wav"
+                }
+            })),
+        ),
+        (
+            "file_id",
+            multimodal_body(json!({
+                "type": "file",
+                "file": {
+                    "file_id": "file-a"
+                }
+            })),
+            multimodal_body(json!({
+                "type": "file",
+                "file": {
+                    "file_id": "file-b"
+                }
+            })),
+        ),
+    ];
+
+    for (name, body_a, body_b) in cases {
+        let plugin = make_plugin(json!({"ttl_seconds": 300}));
+        store_response(
+            &plugin,
+            &serde_json::to_string(&body_a).unwrap(),
+            None,
+            b"A",
+        )
+        .await;
+
+        let (_, result) =
+            run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{name} content must exact-miss instead of replaying cached response A"
+        );
+    }
+}
+
+#[tokio::test]
+async fn semantic_cache_scope_differs_for_different_image_url() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let mut config = semantic_config(&mock_server);
+    config["cache_multimodal"] = json!("include_fingerprints");
+    let plugin = make_plugin(config);
+
+    let body_a = multimodal_image_url_body("https://example.com/a.png");
+    let body_b = multimodal_image_url_body("https://example.com/b.png");
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_a).unwrap(),
+        None,
+        b"A",
+    )
+    .await;
+
+    let (ctx_b, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "semantic scope must include image fingerprint and miss different image_url"
+    );
+    assert_eq!(
+        ctx_b.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
+}
+
+#[tokio::test]
+async fn cache_does_not_store_raw_multimodal_url_in_metadata() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 1).await;
+    let mut config = semantic_config(&mock_server);
+    config["cache_multimodal"] = json!("include_fingerprints");
+    let plugin = make_plugin(config);
+
+    let url = "https://example.com/private-image.png?token=secret";
+    let body = multimodal_image_url_body(url);
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    for key in ["_ai_cache_key", "ai_cache_status", "ai_cache_match"] {
+        if let Some(value) = ctx.metadata.get(key) {
+            assert!(
+                !value.contains(url),
+                "plugin metadata key {key} must not contain raw multimodal URL"
+            );
+            assert!(
+                !value.contains("private-image.png"),
+                "plugin metadata key {key} must not contain raw multimodal URL path"
+            );
+        }
+    }
+    if let Some(scope_key) = &ctx.ai_semantic_cache_scope_key {
+        assert!(!scope_key.contains(url));
+        assert!(!scope_key.contains("private-image.png"));
+    }
+}
+
+#[tokio::test]
+async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let mut config = semantic_config(&mock_server);
+    config["scope_by_consumer"] = json!(false);
+    config["cache_multimodal"] = json!("include_fingerprints");
+    let plugin = make_plugin(config);
+    let alice = make_consumer("alice");
+    let bob = make_consumer("bob");
+
+    let body_a = multimodal_image_url_body("https://example.com/a.png");
+    let body_b = multimodal_image_url_body("https://example.com/b.png");
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_a).unwrap(),
+        Some(alice),
+        b"alice-image-answer",
+    )
+    .await;
+
+    let (ctx_b, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "multimodal fingerprint must prevent cross-replay even when consumer scoping is disabled"
+    );
+    assert_eq!(
+        ctx_b.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
 }
 
 #[tokio::test]
