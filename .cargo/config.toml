@@ -14,9 +14,11 @@
 # sections explicit keeps the CI fallback working.
 
 # ── sccache ─────────────────────────────────────────────────────────────
-# Compiler cache. ~100% hit rate on clean rebuilds. Honors $SCCACHE_DIR if
-# set in the shell environment (local custom cache location).
-# Install: `cargo install sccache` (local) or `setup-sccache` action (CI).
+# Compiler-output cache. CI's setup-sccache action enables the GitHub Actions
+# backend before starting the daemon so entries can be reused across jobs/runs;
+# Swatinem/rust-cache separately restores Cargo/target directories with
+# per-job/per-target keys. Locally this honors $SCCACHE_DIR if set.
+# Install: `cargo install sccache` (local) or use `setup-sccache` action (CI).
 [build]
 rustc-wrapper = "sccache"
 incremental = false       # prevent cache corruption on concurrent/agent builds and external APFS volumes
