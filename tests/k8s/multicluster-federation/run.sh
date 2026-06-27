@@ -21,10 +21,12 @@ set -euo pipefail
 #
 # A -> B drives cluster A's client at the svc in cluster B; B -> A mirrors it.
 #
-# SCOPE: Stage 2 only (two-cluster SPIRE federation + injected workloads +
-# bidirectional authenticated traffic + a negative). Bundle rotation/removal,
-# endpoint failover, and network partitions are Stage 3 (see `# STAGE 3:`
-# markers below).
+# SCOPE: Stage 2 (two-cluster SPIRE federation + injected workloads +
+# bidirectional authenticated traffic + a negative) PLUS Stage 3 failure
+# injection (peer-trust revocation -> fail closed -> restore -> recover; dest
+# endpoint black-hole -> recover). Network-partition / last-good retention is
+# explicitly DEFERRED (it is a federation/remote-discovery POLLER property; this
+# static file-config fixture runs no poller — see the "Stage 3" section below).
 #
 # Run locally (requires docker, kind, kubectl, helm, curl, python3):
 #   FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true \
@@ -81,6 +83,12 @@ REQUIRED_LIVE_ASSERTIONS=(
   multicluster.eastwest.b_to_a_authenticated
   multicluster.eastwest.bidirectional_authenticated_traffic
   multicluster.eastwest.untrusted_peer_rejected
+  # Stage 3 failure injection (A -> B): revoke peer trust -> fail closed -> restore
+  # -> recover; scale dest to 0 -> black-hole -> scale up -> recover.
+  multicluster.federation.bundle_revoked_rejected
+  multicluster.federation.trust_restored_recovers
+  multicluster.eastwest.endpoint_blackhole_when_dest_down
+  multicluster.eastwest.endpoint_recovers_when_dest_returns
 )
 # NOTE: these required IDs are the live-gate for cross-cluster east-west, gated
 # below by `ferrum_live_assertions_require_all_passed` exactly as the
@@ -352,7 +360,12 @@ wait_for_svc_pod_ip() {
   local context="$1"
   local ip="" _
   for _ in $(seq 1 60); do
+    # Filter to a RUNNING pod: after a Stage-3 rollout restart / scale-up there
+    # can briefly be a Terminating old pod alongside the new one, and an
+    # unfiltered items[0] could return the dead pod's IP. (Initial deploy has a
+    # single pod, so this is strictly more correct everywhere.)
     ip="$(kubectl --context "$context" -n "$NS" get pod -l app=svc \
+      --field-selector=status.phase=Running \
       -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)"
     if [[ -n "$ip" ]]; then
       printf '%s' "$ip"
@@ -361,6 +374,24 @@ wait_for_svc_pod_ip() {
     sleep 2
   done
   echo "svc pod never reported a pod IP in $context" >&2
+  return 1
+}
+
+# Block until NO svc pod remains in `context` (incl. Terminating). Stage 3's
+# black-hole probe calls this after `scale --replicas=0` so a request can't
+# transiently hit a still-draining pod during its termination grace period and
+# observe a 200 (which would false-fail the fail-closed assertion).
+wait_for_no_svc_pod() {
+  local context="$1" n _
+  for _ in $(seq 1 60); do
+    n="$(kubectl --context "$context" -n "$NS" get pod -l app=svc \
+      --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$n" == "0" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "svc pods did not terminate in $context" >&2
   return 1
 }
 
@@ -493,12 +524,24 @@ yaml_x509_authorities() {
 # policy is scoped to the local svc workload and denies the peer rogue SPIFFE.
 render_dest_config() {
   local context="$1" local_td="$2" peer_context="$3" peer_td="$4"
-  local local_b64 peer_b64
+  # include_peer_trust=false renders the dest with LOCAL trust only — no federated
+  # peer bundle — so the peer trust domain is no longer accepted on inbound mTLS.
+  # Stage 3 revocation uses this; default true is the normal cross-cluster posture.
+  local include_peer_trust="${5:-true}"
+  local local_b64 peer_b64 federated_block=""
   local_b64="$(spire_bundle_b64der "$context")"
-  peer_b64="$(spire_bundle_b64der "$peer_context")"
-  if [[ -z "$local_b64" || -z "$peer_b64" ]]; then
-    echo "failed to fetch SPIRE trust bundle(s) for dest config (local=$local_td peer=$peer_td)" >&2
+  if [[ -z "$local_b64" ]]; then
+    echo "failed to fetch local SPIRE trust bundle for dest config (local=$local_td)" >&2
     return 1
+  fi
+  if [[ "$include_peer_trust" == "true" ]]; then
+    peer_b64="$(spire_bundle_b64der "$peer_context")"
+    if [[ -z "$peer_b64" ]]; then
+      echo "failed to fetch peer SPIRE trust bundle for dest config (peer=$peer_td)" >&2
+      return 1
+    fi
+    federated_block="$(printf '    federated:\n      - trust_domain: %s\n        x509_authorities:\n%s' \
+      "$peer_td" "$(yaml_x509_authorities "          " "$peer_b64")")"
   fi
   apply_configmap "$context" ferrum-mesh-dest "$(cat <<YAML
 mesh:
@@ -532,10 +575,7 @@ mesh:
       trust_domain: $local_td
       x509_authorities:
 $(yaml_x509_authorities "        " "$local_b64")
-    federated:
-      - trust_domain: $peer_td
-        x509_authorities:
-$(yaml_x509_authorities "          " "$peer_b64")
+$federated_block
   mesh_policies:
     - name: deny-peer-rogue
       namespace: $NS
@@ -802,12 +842,155 @@ drive_untrusted_negative() {
   fi
 }
 
-# STAGE 3: bundle rotation/removal/invalid-delivery, endpoint failover, and
-# network partitions hook in HERE. e.g. withdraw cluster B's federated bundle on
-# A's SPIRE server (`spire-server bundle delete -id spiffe://$TRUST_DOMAIN_B`),
-# re-drive A -> B, and assert it now fails closed (multicluster.federation.bundle_revoked_rejected);
-# scale svc to 0 in B and assert failover/black-hole semantics; partition the
-# kind docker network and assert last-good behavior. Out of scope for Stage 2.
+# ── Stage 3: failure injection ──────────────────────────────────────────────
+#
+# These run AFTER the positive/negative traffic tests and MUTATE cluster state,
+# each scenario self-contained (inject -> assert fail-closed -> restore -> assert
+# recovery) so it leaves the mesh healthy for the next. They exercise A -> B only
+# (the dest is cluster B); one direction proves the property.
+#
+# IMPORTANT — why restart, not SIGHUP: the Ferrum runtime image is distroless (no
+# shell / no `kill`), so an in-pod SIGHUP live-reload isn't reachable via
+# `kubectl exec`; reloads happen by `rollout restart` (the new pod reads the
+# updated ConfigMap at startup — deterministic, no ConfigMap-mount-propagation
+# race). A svc restart changes the svc POD IP, and this file-config fixture's
+# east-west gateway pins a STATIC svc pod IP (no live endpoint discovery), so any
+# svc replacement must also re-render + restart the gateway to follow the new IP.
+# `restart_dest_with_trust` encapsulates that.
+#
+# DEFERRED (network partition / last-good retention): bounded-staleness last-good
+# retention is a property of the federation/remote-discovery POLLER, which this
+# static file-config fixture does not run (endpoints are statically declared, not
+# polled) — so a partition here would only prove "network down => fail; up =>
+# recover", not the M5 retention machinery. A meaningful partition/last-good test
+# needs poller-driven remote discovery (CP- or federation-endpoint-fed) and is a
+# separate fixture; kind also has no NetworkPolicy enforcement (kindnet), so a
+# clean in-cluster partition primitive is unavailable here regardless.
+
+# Drive a captured request and CONFIRM it fails closed (never 200) — for the
+# revocation / black-hole scenarios. Exits immediately on any 200 (so a stale
+# still-draining connection serving 200 correctly FAILS the "fail-closed"
+# assertion), otherwise settles on a stable non-200. Echoes "<status>\t<body>".
+drive_request_expect_failclosed() {
+  local context="$1" deploy="$2"
+  local host="svc.$NS.svc.cluster.local"
+  # shellcheck disable=SC2016
+  kubectl --context "$context" -n "$NS" exec "deploy/$deploy" -c curl -- \
+    sh -c '
+      host="$1"
+      out=000
+      body=""
+      stable=0
+      for _ in $(seq 1 30); do
+        out="$(curl -s -m 5 -o /tmp/body -w "%{http_code}" \
+          -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || echo 000)"
+        body="$(tr -d "\r\n" </tmp/body 2>/dev/null || true)"
+        if [ "$out" = "200" ]; then
+          printf "%s\t%s\n" "$out" "$body"
+          exit 0
+        fi
+        stable=$((stable + 1))
+        if [ "$stable" -ge 3 ]; then
+          printf "%s\t%s\n" "$out" "$body"
+          exit 0
+        fi
+        sleep 2
+      done
+      printf "%s\t%s\n" "$out" "$body"
+    ' sh "$host" 2>/dev/null || printf '000\t'
+}
+
+# Re-render `context`'s dest mesh config (optionally WITHOUT the federated peer
+# trust bundle), restart svc so it loads the new config, then re-render + restart
+# the east-west gateway to follow svc's new pod IP. Leaves both rolled out.
+restart_dest_with_trust() {
+  local context="$1" local_td="$2" peer_context="$3" peer_td="$4" include_peer_trust="$5"
+  render_dest_config "$context" "$local_td" "$peer_context" "$peer_td" "$include_peer_trust"
+  kubectl --context "$context" -n "$NS" rollout restart deploy/svc
+  kubectl --context "$context" -n "$NS" rollout status deploy/svc --timeout=3m
+  local new_ip
+  new_ip="$(wait_for_svc_pod_ip "$context")"
+  render_ew_config "$context" "$local_td" "$new_ip"
+  kubectl --context "$context" -n "$NS" rollout restart deploy/ferrum-mesh-east-west
+  kubectl --context "$context" -n "$NS" rollout status deploy/ferrum-mesh-east-west --timeout=3m
+}
+
+# Scenario A — trust revocation: drop cluster A's federated bundle from cluster
+# B's dest, reload, and assert A -> B now fails closed; then restore and assert
+# it recovers. Proves slice.trust_bundles is load-bearing for inbound mTLS.
+inject_trust_revocation() {
+  log "STAGE 3: revoking cluster-A trust on cluster-B dest; expect A -> B fails closed"
+  restart_dest_with_trust "$CONTEXT_B" "$TRUST_DOMAIN_B" "$CONTEXT_A" "$TRUST_DOMAIN_A" false
+  local out status body
+  out="$(drive_request_expect_failclosed "$CONTEXT_A" client)"
+  status="${out%%$'\t'*}"
+  body="${out#*$'\t'}"
+  log "A -> B after revocation: status=$status body=$body"
+  if [[ "$status" != "200" && "$body" != *"svc-b"* ]]; then
+    record_live_assertion multicluster.federation.bundle_revoked_rejected pass \
+      client svc "revoked-peer-trust-fails-closed status=$status body=$body"
+  else
+    record_live_assertion multicluster.federation.bundle_revoked_rejected fail \
+      client svc "still-served-after-revocation status=$status body=$body"
+  fi
+
+  log "STAGE 3: restoring cluster-A trust on cluster-B dest; expect A -> B recovers"
+  restart_dest_with_trust "$CONTEXT_B" "$TRUST_DOMAIN_B" "$CONTEXT_A" "$TRUST_DOMAIN_A" true
+  out="$(drive_request "$CONTEXT_A" client)"
+  status="${out%%$'\t'*}"
+  body="${out#*$'\t'}"
+  log "A -> B after trust restore: status=$status body=$body"
+  if [[ "$status" == "200" && "$body" == *"svc-b"* ]]; then
+    record_live_assertion multicluster.federation.trust_restored_recovers pass \
+      client svc "status=$status body=$body"
+  else
+    record_live_assertion multicluster.federation.trust_restored_recovers fail \
+      client svc "did-not-recover-after-restore status=$status body=$body"
+    return 1
+  fi
+}
+
+# Scenario B — endpoint black-hole: scale cluster B's svc to 0 and assert A -> B
+# fails fast (the gateway's pinned backend is gone), then scale back up, re-render
+# the gateway for the new pod IP, and assert recovery.
+inject_endpoint_blackhole() {
+  log "STAGE 3: scaling cluster-B svc to 0; expect A -> B black-holes (fail-fast)"
+  kubectl --context "$CONTEXT_B" -n "$NS" scale deploy/svc --replicas=0
+  wait_for_no_svc_pod "$CONTEXT_B"
+  local out status body
+  out="$(drive_request_expect_failclosed "$CONTEXT_A" client)"
+  status="${out%%$'\t'*}"
+  body="${out#*$'\t'}"
+  log "A -> B with dest down: status=$status body=$body"
+  if [[ "$status" != "200" && "$body" != *"svc-b"* ]]; then
+    record_live_assertion multicluster.eastwest.endpoint_blackhole_when_dest_down pass \
+      client svc "dest-scaled-to-zero status=$status body=$body"
+  else
+    record_live_assertion multicluster.eastwest.endpoint_blackhole_when_dest_down fail \
+      client svc "served-despite-dest-down status=$status body=$body"
+  fi
+
+  log "STAGE 3: scaling cluster-B svc back up + re-rendering gateway; expect recovery"
+  kubectl --context "$CONTEXT_B" -n "$NS" scale deploy/svc --replicas=1
+  kubectl --context "$CONTEXT_B" -n "$NS" rollout status deploy/svc --timeout=3m
+  local new_ip
+  new_ip="$(wait_for_svc_pod_ip "$CONTEXT_B")"
+  render_ew_config "$CONTEXT_B" "$TRUST_DOMAIN_B" "$new_ip"
+  kubectl --context "$CONTEXT_B" -n "$NS" rollout restart deploy/ferrum-mesh-east-west
+  kubectl --context "$CONTEXT_B" -n "$NS" rollout status deploy/ferrum-mesh-east-west --timeout=3m
+  out="$(drive_request "$CONTEXT_A" client)"
+  status="${out%%$'\t'*}"
+  body="${out#*$'\t'}"
+  log "A -> B after dest recovery: status=$status body=$body"
+  if [[ "$status" == "200" && "$body" == *"svc-b"* ]]; then
+    record_live_assertion multicluster.eastwest.endpoint_recovers_when_dest_returns pass \
+      client svc "status=$status body=$body"
+  else
+    record_live_assertion multicluster.eastwest.endpoint_recovers_when_dest_returns fail \
+      client svc "did-not-recover-after-scale-up status=$status body=$body"
+    return 1
+  fi
+}
 
 # ── diagnostics + gate ──────────────────────────────────────────────────────
 
@@ -922,6 +1105,10 @@ main() {
   probe_gateway_reachable
   drive_positive_both_directions
   drive_untrusted_negative
+
+  # Stage 3 failure injection (mutates cluster state; each scenario self-restores).
+  inject_trust_revocation
+  inject_endpoint_blackhole
 
   require_live_assertions
   log "multicluster-federation fixture PASSED; artifacts in $ARTIFACT_DIR"
