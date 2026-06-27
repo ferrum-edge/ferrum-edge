@@ -726,19 +726,16 @@ drive_positive_both_directions() {
   if [[ "$status_ba" == "200" && "$body_ba" == *"svc-a"* ]]; then
     pass_ba=pass
   fi
-  # workload NAMES go in the source/destination_workload fields (3/4); the
-  # observed SPIFFE IDs go in observed_source/destination_spiffe (6/7) so the
-  # identity evidence lands in live-assertions.json's SPIFFE fields.
+  # source/destination_workload (3/4) carry the workload NAMES. The observed-
+  # SPIFFE fields (6/7) are LEFT EMPTY on purpose: this fixture does not read the
+  # peer SVID off the datapath, so filling them from the configured trust domains
+  # would record EXPECTED identities as if OBSERVED. The real identity proof is
+  # implicit in the outcome — only a valid federated client SVID completes mTLS to
+  # get 200/svc-<dest>, and the rogue negative below proves the dest-side 403.
   record_live_assertion multicluster.eastwest.a_to_b_authenticated "$pass_ab" \
-    client svc \
-    "status=$status_ab body=$body_ab" \
-    "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/client" \
-    "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc"
+    client svc "status=$status_ab body=$body_ab"
   record_live_assertion multicluster.eastwest.b_to_a_authenticated "$pass_ba" \
-    client svc \
-    "status=$status_ba body=$body_ba" \
-    "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/client" \
-    "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/svc"
+    client svc "status=$status_ba body=$body_ba"
   if [[ "$pass_ab" == "pass" && "$pass_ba" == "pass" ]]; then
     record_live_assertion multicluster.eastwest.bidirectional_authenticated_traffic pass \
       "" "" "a_to_b=200/$body_ab b_to_a=200/$body_ba"
@@ -797,9 +794,7 @@ drive_untrusted_negative() {
   if [[ "$status" == "403" && "$body" == *"Mesh authorization denied"* && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.eastwest.untrusted_peer_rejected pass \
       rogue svc \
-      "dest-side-mesh-authz-denied status=$status body=$body" \
-      "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/rogue" \
-      "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc"
+      "dest-side-mesh-authz-denied status=$status body=$body"
   else
     record_live_assertion multicluster.eastwest.untrusted_peer_rejected fail \
       "" "" "rogue-not-rejected-by-dest-authz status=$status body=$body"

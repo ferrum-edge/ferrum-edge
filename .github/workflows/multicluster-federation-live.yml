@@ -13,6 +13,10 @@ on:
       - "build.rs"
       - "proto/**"
       - "src/modes/mesh/**"
+      # The mesh plugins enforce the datapath: `mesh/authz.rs` backs the
+      # required `untrusted_peer_rejected` destination-side 403, and
+      # `mesh/spiffe_identity.rs` stamps the verified peer identity.
+      - "src/plugins/mesh/**"
       - "src/grpc/**"
       - "src/identity/**"
       - "src/tls/**"
