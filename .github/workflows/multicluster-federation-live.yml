@@ -1,0 +1,142 @@
+name: Multicluster Federation Live Datapath
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/multicluster-federation-live.yml"
+      - ".github/actions/package-ferrum-runtime-image/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "Dockerfile.release"
+      - "build.rs"
+      - "proto/**"
+      - "src/modes/mesh/**"
+      - "src/grpc/**"
+      - "src/identity/**"
+      - "src/tls/**"
+      - "src/secrets/**"
+      - "src/service_discovery/**"
+      - "src/proxy/hbone_pool.rs"
+      - "src/proxy/mesh_mtls_pool.rs"
+      - "src/proxy/hbone_proxy.rs"
+      - "src/proxy/mod.rs"
+      - "src/capture/**"
+      - "charts/ferrum-mesh/**"
+      - "tests/k8s/lib/**"
+      - "tests/k8s/multicluster-federation/**"
+      - "docs/mesh.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multicluster-federation-live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: multicluster-federation
+  CLUSTER_A: ferrum-fed-a
+  CLUSTER_B: ferrum-fed-b
+  KIND_VERSION: v0.27.0
+  KUBECTL_VERSION: v1.32.3
+
+jobs:
+  multicluster-federation-live:
+    name: Multicluster federation live datapath
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-multicluster-federation-live"
+
+      - name: Build runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package runtime image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Create both kind clusters
+        run: |
+          set -euo pipefail
+          kind create cluster --name "$CLUSTER_A" --wait 180s
+          kind create cluster --name "$CLUSTER_B" --wait 180s
+          kubectl --context "kind-$CLUSTER_A" get nodes -o wide
+          kubectl --context "kind-$CLUSTER_B" get nodes -o wide
+
+      - name: Load runtime image into both clusters
+        run: |
+          set -euo pipefail
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$CLUSTER_A"
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$CLUSTER_B"
+
+      - name: Run live multicluster federation datapath validation
+        env:
+          FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
+          FERRUM_SKIP_IMAGE_BUILD: "1"
+          FERRUM_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
+          FERRUM_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
+        run: tests/k8s/multicluster-federation/run.sh
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/multicluster-federation-results"
+          mkdir -p "$results"
+          for cluster in "$CLUSTER_A" "$CLUSTER_B"; do
+            ctx="kind-$cluster"
+            kubectl --context "$ctx" get nodes -o wide > "$results/${cluster}-nodes.txt" 2>&1
+            kubectl --context "$ctx" get pods -A -o wide > "$results/${cluster}-pods.txt" 2>&1
+            kubectl --context "$ctx" get events -A --sort-by=.lastTimestamp > "$results/${cluster}-events.txt" 2>&1
+            kubectl --context "$ctx" -n ferrum get all -o wide > "$results/${cluster}-ferrum-all.txt" 2>&1
+            kubectl --context "$ctx" -n ferrum describe pods > "$results/${cluster}-ferrum-pods-describe.txt" 2>&1
+            kubectl --context "$ctx" -n ferrum get configmap -o yaml > "$results/${cluster}-configmaps.yaml" 2>&1
+            kubectl --context "$ctx" -n spire-system get all -o wide > "$results/${cluster}-spire-all.txt" 2>&1
+            kubectl --context "$ctx" -n spire-system logs statefulset/spire-server --all-containers --tail=500 > "$results/${cluster}-spire-server.log" 2>&1
+            kubectl --context "$ctx" -n spire-system logs daemonset/spire-agent --all-containers --tail=500 > "$results/${cluster}-spire-agent.log" 2>&1
+            for deploy in svc ferrum-mesh-east-west client rogue; do
+              kubectl --context "$ctx" -n ferrum logs "deploy/$deploy" --all-containers --tail=500 > "$results/${cluster}-${deploy}.log" 2>&1
+            done
+            kubectl --context "$ctx" -n ferrum logs deploy/svc -c ferrum-edge-init --tail=50 > "$results/${cluster}-svc-iptables.txt" 2>&1
+          done
+          if [ -d "$GITHUB_WORKSPACE/.context/multicluster-federation" ]; then
+            cp -R "$GITHUB_WORKSPACE/.context/multicluster-federation" "$results/artifacts"
+          fi
+          if [ -f target/multicluster-federation/live-assertions.json ]; then
+            cp target/multicluster-federation/live-assertions.json "$results/live-assertions.json"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: multicluster-federation-results
+          path: multicluster-federation-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Delete kind clusters
+        if: always()
+        run: |
+          kind delete cluster --name "$CLUSTER_A" || true
+          kind delete cluster --name "$CLUSTER_B" || true
