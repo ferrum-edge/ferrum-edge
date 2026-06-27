@@ -22,6 +22,10 @@ on:
       - "src/tls/**"
       - "src/secrets/**"
       - "src/service_discovery/**"
+      # The fixture starts mesh mode through FERRUM_MESH_* / CA-backend env; this
+      # is the parser/validator for them (and is already in the sibling
+      # deploy-only smoke filter in ci.yml).
+      - "src/config/env_config.rs"
       - "src/proxy/hbone_pool.rs"
       - "src/proxy/mesh_mtls_pool.rs"
       - "src/proxy/hbone_proxy.rs"
