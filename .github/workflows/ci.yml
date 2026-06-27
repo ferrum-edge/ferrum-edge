@@ -1545,8 +1545,22 @@ jobs:
       - name: Build BPF programs (kernel object)
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
 
-      - name: Build live-kernel test binary (--features ebpf)
-        run: cargo test --features ebpf --lib --no-run
+      - name: Build and locate live-kernel test binary (--features ebpf)
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          mapfile -t bins < <(
+            cargo test --features ebpf --lib --no-run --message-format=json \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          BIN="${bins[0]}"
+          echo "Live-kernel test binary: $BIN"
+          echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
       - name: Ensure bpffs is mounted
         run: sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
@@ -1560,9 +1574,7 @@ jobs:
         # never runs as root against the user-owned target dir.
         run: |
           set -euo pipefail
-          BIN=$(cargo test --features ebpf --lib --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
-            | tail -n1)
+          BIN="${{ steps.build_test_bin.outputs.test_bin }}"
           echo "Live-kernel test binary: $BIN"
           sudo -E "FERRUM_NODE_AGENT_BPF_ELF_PATH=$GITHUB_WORKSPACE/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf" \
             "$BIN" ebpf::loader::live_kernel_tests --ignored --nocapture --test-threads=1
@@ -1580,8 +1592,22 @@ jobs:
         with:
           shared-key: "ci-netns-capture-live"
 
-      - name: Build live test binary
-        run: cargo test --lib --no-run
+      - name: Build and locate live test binary
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          mapfile -t bins < <(
+            cargo test --lib --no-run --message-format=json \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          BIN="${bins[0]}"
+          echo "In-netns live test binary: $BIN"
+          echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
       - name: Run in-netns capture live tests as root
         # Privileged functional tests for the per-pod-netns outbound capture
@@ -1604,9 +1630,7 @@ jobs:
         # root against the user-owned target.
         run: |
           set -euo pipefail
-          BIN=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
-            | tail -n1)
+          BIN="${{ steps.build_test_bin.outputs.test_bin }}"
           echo "In-netns live test binary: $BIN"
           sudo -E "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests proxy::mesh_udp_capture::live_netns_tests --ignored --nocapture --test-threads=1
         env:
