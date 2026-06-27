@@ -1463,11 +1463,11 @@ jobs:
           echo "## eBPF/Netns Live Gate" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ "$changed" = "true" ]; then
-            echo "Live-kernel-sensitive files changed; CI will run the eBPF userspace, eBPF live-kernel, and netns live checks." >> "$GITHUB_STEP_SUMMARY"
+            echo "Live-kernel-sensitive files changed; CI will run the eBPF live-kernel and netns live checks." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No live-kernel-sensitive files changed; CI will skip the eBPF userspace, eBPF live-kernel, and netns live checks for this PR." >> "$GITHUB_STEP_SUMMARY"
+            echo "No live-kernel-sensitive files changed; CI will skip the eBPF live-kernel and netns live checks for this PR." >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "The dedicated NodeWaypoint eBPF workflow keeps its own broader path filter for full datapath validation." >> "$GITHUB_STEP_SUMMARY"
+            echo "The eBPF userspace compile guard still runs on every PR." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: List changed files for live gate
@@ -1533,11 +1533,7 @@ jobs:
 
   build-ebpf-userspace:
     name: Build eBPF Userspace Loader
-    needs: detect-ebpf-live-changes
-    # Keep this expensive Linux-only `--features ebpf` build off unrelated PRs.
-    # It still runs for eBPF/netns/node-waypoint-sensitive changes; docs/charts
-    # rely on cheaper checks and the dedicated NodeWaypoint workflow path gate.
-    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6

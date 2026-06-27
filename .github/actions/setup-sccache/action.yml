@@ -52,7 +52,7 @@ runs:
         # later steps see the variables while the already-running daemon keeps
         # using its default local-disk backend.
         export RUSTC_WRAPPER=sccache
-        export SCCACHE_GHA_ENABLED=on
+        export SCCACHE_GHA_ENABLED=true
         # Disable the sccache server idle timeout (default 600s). The release
         # build compiles the large `ferrum-edge` lib crate as a single rustc
         # invocation (fat LTO, codegen-units=1) that hovers right around 600s
@@ -67,7 +67,7 @@ runs:
         sccache --stop-server > /dev/null 2>&1 || true
         if sccache --start-server 2>/dev/null; then
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
           # Persist for build steps in case sccache lazily re-spawns a server.
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
           echo "sccache enabled with GitHub Actions backend (idle timeout disabled)"
