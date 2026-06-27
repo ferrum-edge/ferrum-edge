@@ -254,15 +254,23 @@ jobs:
         # used to build the archive. Keep archive builders and shard runners on
         # matching OS/arch + checkout layout, or update this artifact/path with
         # any future runner/workspace/target-dir change.
-        run: cargo build --bin ferrum-cni
+        #
+        # This binary is transferred to every integration shard. Keep full
+        # local dev debuginfo intact, but avoid carrying it in the CI artifact.
+        run: cargo build --config profile.dev.debug=0 --bin ferrum-cni
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
+        #
+        # Full test debuginfo makes this archive hundreds of MB larger and is
+        # downloaded by every integration shard. CI still keeps Rust backtraces
+        # and test stdout/stderr, but omits DWARF from this transfer-only build.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
+            --config profile.test.debug=0 \
             --test integration_tests \
             --archive-file "$archive_file"
 
@@ -595,9 +603,14 @@ jobs:
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
+        #
+        # Full test debuginfo makes this archive hundreds of MB larger and is
+        # downloaded by every functional shard. CI still keeps Rust backtraces
+        # and test stdout/stderr, but omits DWARF from this transfer-only build.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
+            --config profile.test.debug=0 \
             --test functional_tests \
             --archive-file "$archive_file"
 
