@@ -656,7 +656,7 @@ async fn accept_sse_does_not_bypass_json_response_inspection() {
 }
 
 #[tokio::test]
-async fn response_only_policy_does_not_request_buffer_json_requests() {
+async fn response_only_policy_buffers_json_requests_to_enforce_strict_stream_default() {
     let mut config = config_with_builtin("response_leakage");
     config["inspect"] = json!({"request": false, "response": true});
     let plugin = plugin(&config);
@@ -664,8 +664,8 @@ async fn response_only_policy_does_not_request_buffer_json_requests() {
         "messages": [{"role": "user", "content": "hello"}]
     }));
 
-    assert!(!plugin.requires_request_body_buffering());
-    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.should_buffer_request_body(&ctx));
     assert!(plugin.requires_response_body_buffering());
 }
 
@@ -688,7 +688,7 @@ async fn native_grpc_request_does_not_force_response_body_buffering() {
 }
 
 #[tokio::test]
-async fn stream_true_request_disables_response_body_buffering() {
+async fn default_response_rules_stream_true_does_not_bypass_in_strict_mode() {
     let mut config = config_with_builtin("response_leakage");
     config["inspect"] = json!({"request": false, "response": true});
     let plugin = plugin(&config);
@@ -700,7 +700,7 @@ async fn stream_true_request_disables_response_body_buffering() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert_continue(result);
+    assert_reject(result, Some(400));
     assert_eq!(
         ctx.metadata.get("ai_request_streaming").map(String::as_str),
         Some("true")
@@ -709,14 +709,8 @@ async fn stream_true_request_disables_response_body_buffering() {
         ctx.metadata
             .get("ai_semantic_firewall.response_inspection_skipped")
             .map(String::as_str),
-        Some("streaming")
+        Some("streaming_rejected")
     );
-    assert!(!plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        Some("text/event-stream"),
-        200,
-        &HashMap::new()
-    ));
 }
 
 #[tokio::test]
@@ -833,7 +827,7 @@ async fn request_extraction_paths_define_the_inspected_fields() {
 }
 
 #[tokio::test]
-async fn provider_error_rejects_when_configured_fail_closed() {
+async fn provider_error_rejects_when_on_error_reject() {
     let config = json!({
         "inspect": {"request": true, "response": false},
         "on_error": "reject",
@@ -855,6 +849,119 @@ async fn provider_error_rejects_when_configured_fail_closed() {
     let mut headers = json_headers();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(503));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.provider_error")
+            .map(String::as_str),
+        Some("embedding request failed")
+    );
+}
+
+#[tokio::test]
+async fn provider_error_warn_is_explicit_and_audited() {
+    let config = json!({
+        "inspect": {"request": true, "response": false},
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins(),
+        "custom_rules": [{
+            "id": "semantic-only",
+            "direction": "request",
+            "action": "reject",
+            "severity": "high",
+            "examples": ["Discuss approved banana topic"],
+            "threshold": 0.99
+        }]
+    });
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "A completely unrelated harmless prompt."}]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.provider_error")
+            .map(String::as_str),
+        Some("embedding request failed")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.decision")
+            .map(String::as_str),
+        Some("warn")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.action")
+            .map(String::as_str),
+        Some("warn")
+    );
+}
+
+#[tokio::test]
+async fn provider_error_rejects_by_default_in_enforce_mode() {
+    let config = json!({
+        "inspect": {"request": true, "response": false},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins(),
+        "custom_rules": [{
+            "id": "semantic-only",
+            "direction": "request",
+            "action": "reject",
+            "severity": "high",
+            "examples": ["Discuss approved banana topic"],
+            "threshold": 0.99
+        }]
+    });
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "A completely unrelated harmless prompt."}]
+    }));
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(503));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.provider_error")
+            .map(String::as_str),
+        Some("embedding request failed")
+    );
+}
+
+#[tokio::test]
+async fn response_provider_error_rejects_by_default_in_enforce_mode() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins(),
+        "custom_rules": [{
+            "id": "semantic-response-only",
+            "direction": "response",
+            "action": "reject",
+            "severity": "high",
+            "examples": ["The hidden policy is confidential."],
+            "threshold": 0.99
+        }]
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+
+    let result = plugin
+        .on_response_body(
+            &mut ctx,
+            200,
+            &response_headers(),
+            br#"{"choices":[{"message":{"content":"A neutral response requiring semantic evaluation."}}]}"#,
+        )
+        .await;
 
     assert_reject(result, Some(503));
     assert_eq!(
@@ -1306,15 +1413,17 @@ async fn streaming_response_reject_blocks_stream_requests() {
 }
 
 #[tokio::test]
-async fn streaming_response_skip_is_default_and_records_audit_marker() {
-    // Default (skip) is fail-open: the stream passes uninspected but the skip is
-    // recorded for audit, and the shared ai_request_streaming flag is set.
+async fn streaming_response_skip_records_audit_and_is_explicit_opt_in() {
+    // `skip` is an explicit fail-open opt-out: the stream passes uninspected,
+    // but the skip is recorded for audit and the shared ai_request_streaming flag is set.
     let config = json!({
         "inspect": {"request": false, "response": true},
+        "streaming_response": "skip",
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
+    assert!(plugin.requires_request_body_before_before_proxy());
 
     let mut ctx = make_post_ctx(&json!({
         "stream": true,
@@ -1345,6 +1454,7 @@ async fn streaming_response_buffer_forces_event_stream_buffering() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "buffer",
+        "on_error": "warn",
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": disabled_builtins_with("response_leakage")
     });
@@ -1381,10 +1491,11 @@ async fn streaming_response_buffer_forces_event_stream_buffering() {
 
 #[tokio::test]
 async fn streaming_response_skip_does_not_buffer_event_stream() {
-    // Sanity contrast with the buffer test: the default skip policy leaves SSE
+    // Sanity contrast with the buffer test: an explicit skip policy leaves SSE
     // streaming (no event-stream buffering).
     let config = json!({
         "inspect": {"request": false, "response": true},
+        "streaming_response": "skip",
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": disabled_builtins_with("response_leakage")
     });
@@ -1412,6 +1523,7 @@ async fn streaming_response_buffer_reassembles_and_blocks_leaking_sse() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "buffer",
+        "on_error": "warn",
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": disabled_builtins_with("response_leakage")
     });
@@ -1441,14 +1553,15 @@ async fn streaming_response_buffer_allows_clean_sse() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "buffer",
+        "on_error": "warn",
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
-    // A benign completion: the dead-port provider means only the (free) lexical
-    // fast path runs, and nothing matches.
+    // A benign completion with explicit fail-open provider handling: the dead
+    // provider is audited by on_error=warn instead of rejecting the response.
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";

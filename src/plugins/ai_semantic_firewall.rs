@@ -436,6 +436,7 @@ pub struct AiSemanticFirewall {
     inspect_request: bool,
     inspect_response: bool,
     streaming_response: StreamingResponsePolicy,
+    audit_streaming_skip: bool,
     has_request_rules: bool,
     has_response_rules: bool,
     /// Windowed-inspection config, `Some` only when `streaming_response: inspect`.
@@ -465,7 +466,11 @@ impl AiSemanticFirewall {
             }
         };
 
-        let on_error = match optional_string(config, "on_error")?.unwrap_or("warn") {
+        let on_error_default = match mode {
+            EnforcementMode::Enforce => "reject",
+            EnforcementMode::DryRun => "warn",
+        };
+        let on_error = match optional_string(config, "on_error")?.unwrap_or(on_error_default) {
             "allow" => OnErrorAction::Allow,
             "warn" => OnErrorAction::Warn,
             "reject" => OnErrorAction::Reject,
@@ -476,21 +481,22 @@ impl AiSemanticFirewall {
             }
         };
 
-        let streaming_response = match optional_string(config, "streaming_response")?
-            .unwrap_or("skip")
-        {
-            "skip" => StreamingResponsePolicy::Skip,
-            "reject" => StreamingResponsePolicy::Reject,
-            "buffer" => StreamingResponsePolicy::Buffer,
-            "inspect" => StreamingResponsePolicy::Inspect,
-            other => {
+        let configured_streaming_response = match optional_string(config, "streaming_response")? {
+            Some("skip") => Some(StreamingResponsePolicy::Skip),
+            Some("reject") => Some(StreamingResponsePolicy::Reject),
+            Some("buffer") => Some(StreamingResponsePolicy::Buffer),
+            Some("inspect") => Some(StreamingResponsePolicy::Inspect),
+            Some(other) => {
                 return Err(format!(
                     "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', 'buffer', or 'inspect', got {other:?}"
                 ));
             }
+            None => None,
         };
 
-        let streaming_config = if streaming_response == StreamingResponsePolicy::Inspect {
+        let streaming_config = if configured_streaming_response
+            == Some(StreamingResponsePolicy::Inspect)
+        {
             Some(parse_streaming_inspect_config(config)?)
         } else {
             if config.get("streaming").is_some() {
@@ -563,7 +569,10 @@ impl AiSemanticFirewall {
                 enabled,
                 inspect_request,
                 inspect_response,
-                streaming_response,
+                streaming_response: configured_streaming_response
+                    .unwrap_or(StreamingResponsePolicy::Skip),
+                audit_streaming_skip: configured_streaming_response
+                    == Some(StreamingResponsePolicy::Skip),
                 has_request_rules: false,
                 has_response_rules: false,
                 streaming_config,
@@ -641,11 +650,21 @@ impl AiSemanticFirewall {
             );
         }
 
+        let streaming_response = configured_streaming_response.unwrap_or_else(|| {
+            if mode == EnforcementMode::Enforce && has_response_rules {
+                StreamingResponsePolicy::Reject
+            } else {
+                StreamingResponsePolicy::Skip
+            }
+        });
+
         Ok(Self {
             enabled,
             inspect_request,
             inspect_response,
             streaming_response,
+            audit_streaming_skip: configured_streaming_response
+                == Some(StreamingResponsePolicy::Skip),
             has_request_rules,
             has_response_rules,
             streaming_config,
@@ -1452,6 +1471,13 @@ impl Plugin for AiSemanticFirewall {
                 // otherwise do not buffer the request body).
                 || (self.streaming_response != StreamingResponsePolicy::Skip
                     && self.inspect_response
+                    && self.has_response_rules)
+                // An explicit `skip` is a production opt-out from response-side
+                // stream enforcement. Read the request body so stream:true skips
+                // are visible in audit metadata instead of silently passing.
+                || (self.streaming_response == StreamingResponsePolicy::Skip
+                    && self.audit_streaming_skip
+                    && self.inspect_response
                     && self.has_response_rules))
     }
 
@@ -1545,7 +1571,7 @@ impl Plugin for AiSemanticFirewall {
                         headers: json_headers(),
                     };
                 }
-                // `skip` (default), `reject` in dry-run, or no response rules: the
+                // Explicit `skip`, `reject` in dry-run, or no response rules: the
                 // streamed response is not inspected. Record the skip for audit.
                 _ => {
                     ctx.metadata
