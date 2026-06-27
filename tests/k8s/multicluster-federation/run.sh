@@ -267,8 +267,16 @@ register_spire_workloads() {
       done
     done
   }
-  _register_cluster_workloads "$CONTEXT_A" "$TRUST_DOMAIN_A" "$TRUST_DOMAIN_B"
-  _register_cluster_workloads "$CONTEXT_B" "$TRUST_DOMAIN_B" "$TRUST_DOMAIN_A"
+  # Guard under `set -e`: `_register_cluster_workloads` `return 1`s when no agent
+  # is attested or the k8s_psat parent lookup times out. Without `|| ...` the
+  # script would exit HERE, skipping the entry-diagnostics dump and the
+  # `multicluster.spire.workload_entries fail` record below. The function already
+  # sets `registered_ok=false` on those paths; the `||` just lets that branch run
+  # so the failure is recorded (and the run still fails via the `return 1` below).
+  _register_cluster_workloads "$CONTEXT_A" "$TRUST_DOMAIN_A" "$TRUST_DOMAIN_B" \
+    || registered_ok=false
+  _register_cluster_workloads "$CONTEXT_B" "$TRUST_DOMAIN_B" "$TRUST_DOMAIN_A" \
+    || registered_ok=false
 
   ferrum_spire_server_exec "$CONTEXT_A" "$SPIRE_NS" entry show \
     > "$RESULTS_DIR/cluster-a-entries.txt" 2>&1 || true

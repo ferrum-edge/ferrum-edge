@@ -1050,6 +1050,9 @@ jobs:
       FERRUM_SKIP_IMAGE_BUILD: "1"
       FERRUM_IMAGE_REPOSITORY: ferrum-edge
       FERRUM_IMAGE_TAG: multicluster-federation
+      # This deploy-only smoke creates and destroys disposable kind clusters in
+      # CI; acknowledge run.sh's preflight guard (the live workflow sets the same).
+      FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
     steps:
       - uses: actions/checkout@v7
         with:

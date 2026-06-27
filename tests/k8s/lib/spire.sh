@@ -545,13 +545,26 @@ ferrum_spire_federate_bundles() {
 }
 
 # Return 0 iff `context`'s SPIRE server holds a federated bundle for `peer_td`.
+#
+# NOTE: `spire-server bundle show` prints only the server's OWN trust-domain
+# bundle and does NOT accept `-id`; a federated PEER bundle is read with
+# `spire-server bundle list -id spiffe://<td>` (per the SPIRE command
+# reference). Calling `bundle show -id ...` fails at CLI arg-parsing (the error
+# is swallowed by the redirect), which would record a SUCCESSFUL federation as
+# failed even after `bundle set` (BatchSetFederatedBundle) succeeded.
 ferrum_spire_assert_federated_bundle_present() {
   local context="${1:?kube context is required}"
   local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
   local peer_td="${3:?peer trust domain is required}"
 
-  ferrum_spire_server_exec "$context" "$namespace" \
-    bundle show -id "spiffe://$peer_td" -format spiffe >/dev/null 2>&1
+  local listing
+  if ! listing="$(ferrum_spire_server_exec "$context" "$namespace" \
+    bundle list -id "spiffe://$peer_td" -format spiffe 2>/dev/null)"; then
+    return 1
+  fi
+  # `bundle list -id <absent-td>` exits non-zero, but guard against a future CLI
+  # that exits 0 with empty output: a present bundle prints a non-empty document.
+  [[ -n "$listing" ]]
 }
 
 # Register a k8s workload entry that FEDERATES WITH a peer trust domain, so the

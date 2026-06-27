@@ -22,6 +22,11 @@ on:
       - "src/proxy/mesh_mtls_pool.rs"
       - "src/proxy/hbone_proxy.rs"
       - "src/proxy/mod.rs"
+      # The east-west gateway materializes SNI-passthrough proxies that are
+      # reconciled through the stream listener manager and relayed by the TCP
+      # proxy, so changes to those files alter the actual cross-cluster datapath.
+      - "src/proxy/stream_listener.rs"
+      - "src/proxy/tcp_proxy.rs"
       - "src/capture/**"
       - "charts/ferrum-mesh/**"
       - "tests/k8s/lib/**"
@@ -73,7 +78,6 @@ jobs:
           sudo chmod +x /usr/local/bin/kind
           sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           sudo chmod +x /usr/local/bin/kubectl
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
       - name: Create both kind clusters
         run: |

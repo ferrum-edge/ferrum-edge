@@ -50,10 +50,17 @@ spiffe` piped into the peer's `spire-server bundle set`) rather than live
 `https_spiffe` bundle-endpoint polling — the manual path is synchronous, needs no
 cross-cluster bundle-endpoint reachability, and avoids the chicken-and-egg of
 both endpoints having to be up before either can poll. After exchange, each
-server holds the peer's federated bundle. Each workload entry for `svc`,
-`ew-gateway`, and `client` is registered with `-federatesWith spiffe://<peer-td>`
-so its SPIRE-issued SVID carries the peer trust bundle and the proxy can verify
-cross-cluster peers; `rogue` is registered without it. The Ferrum proxies fetch
+server holds the peer's federated bundle. EVERY workload entry — `svc`,
+`ew-gateway`, `client`, AND `rogue` — is registered with `-federatesWith
+spiffe://<peer-td>` so its SPIRE-issued SVID carries the peer trust bundle and the
+proxy can verify cross-cluster peers. `rogue` is federated on purpose: the negative
+proves a DESTINATION-SIDE rejection, not an incidental client-side TLS failure.
+Because both `client` and `rogue` present a valid peer SVID once the trust domain is
+federated, STRICT PeerAuthentication alone cannot tell them apart; the destination's
+`deny-peer-rogue` MeshPolicy (an identity-scoped DENY on the peer trust domain's
+`sa/rogue` principal) is what rejects exactly `rogue` — `mesh_authz` returns `403`
+with body `{"error":"Mesh authorization denied"}`, while the federated `sa/client`
+still gets `200 svc-<dest>`. The Ferrum proxies fetch
 their SVID and federated bundle from the local SPIRE agent
 (`FERRUM_MESH_CA_BACKEND=spire_agent`,
 `FERRUM_MESH_SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock`).
