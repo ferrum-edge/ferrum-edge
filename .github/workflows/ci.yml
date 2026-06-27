@@ -1128,8 +1128,36 @@ jobs:
       KUBECTL_VERSION: v1.32.3
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for Helm chart changes
+        id: helm_changes
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          changed_files="$(git diff --name-only "${base_sha}...HEAD")"
+
+          # Helm chart validation runs for changes that can affect:
+          # - chart sources, dashboards, schemas, and examples under charts/
+          # - this CI workflow and local .github/actions/ image packaging
+          # - Docker/runtime packaging metadata and Cargo/proto build inputs
+          # - ferrum.conf plus runtime config defaults rendered into the chart
+          # - control-plane startup, admin, gRPC, Kubernetes, and secret paths
+          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/(main|startup|cli)\.rs$|src/config/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/grpc/|src/k8s_controller/|src/secrets/)'
+          if printf '%s\n' "$changed_files" | grep -Eq "$helm_change_regex"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install Kubernetes tools
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
@@ -1139,6 +1167,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
       - name: Helm static validation
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
@@ -1196,18 +1225,21 @@ jobs:
           done
 
       - name: Download prebuilt gateway binary
+        if: steps.helm_changes.outputs.changed == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
 
       - name: Package Ferrum image
+        if: steps.helm_changes.outputs.changed == 'true'
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
           binary-path: target/debug/ferrum-edge
           image: ${{ env.FERRUM_IMAGE }}
 
       - name: Create kind cluster
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           chmod +x target/debug/ferrum-edge
@@ -1215,6 +1247,7 @@ jobs:
           kind load docker-image "$FERRUM_IMAGE" --name ferrum-helm
 
       - name: Default install renders no unusable control plane
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           kubectl create namespace ferrum-default
@@ -1231,6 +1264,7 @@ jobs:
           fi
 
       - name: Development values become Ready
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           kubectl create namespace ferrum-dev
@@ -1259,6 +1293,7 @@ jobs:
           fi
 
       - name: Existing Secret production-style values become Ready
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           kubectl create namespace ferrum-prod
@@ -1347,7 +1382,7 @@ jobs:
           done
 
       - name: Collect Helm chart diagnostics
-        if: always()
+        if: always() && steps.helm_changes.outputs.changed == 'true'
         run: |
           set +e
           mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
@@ -1359,12 +1394,19 @@ jobs:
           done
 
       - name: Upload Helm chart diagnostics
-        if: always()
+        if: always() && steps.helm_changes.outputs.changed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ferrum-mesh-helm-chart
           path: ${{ runner.temp }}/ferrum-helm-results
           retention-days: 7
+
+      - name: Summarize Helm chart skip
+        if: steps.helm_changes.outputs.changed != 'true'
+        run: |
+          echo "## Helm Chart" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch chart sources, chart test values, CI workflow/actions, Docker or runtime image packaging, proto, ferrum.conf, runtime config, control-plane startup, admin, gRPC, Kubernetes controller, or secret surfaces." >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Tests
