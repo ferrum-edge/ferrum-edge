@@ -2038,6 +2038,12 @@ impl Http3ConnectionPool {
         // A valid zero-message / trailers-only client-streaming RPC opens the stream
         // with no body bytes, so byte count alone would misclassify it as pre-wire.
         stream_opened: Arc<AtomicBool>,
+        // Set to `true` once the client request upload is fully forwarded and the
+        // backend stream is `finish`ed (i.e. we are now waiting on backend response
+        // headers). The native-H3 gRPC dispatch reads this to separate an upload-phase
+        // timeout (a stalled client — neutral for backend health) from a header-wait
+        // timeout (a slow backend — a real read-timeout fault).
+        upload_complete: Arc<AtomicBool>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
@@ -2125,10 +2131,38 @@ impl Http3ConnectionPool {
         // request-body fault (post-wire, neutral for backend health — see
         // `is_h3_client_request_body_disconnect`). Absent trailers are fine.
         match frontend_stream.recv_trailers().await {
-            Ok(Some(trailers)) if !trailers.is_empty() => {
-                backend_stream.send_trailers(trailers).await.map_err(|e| {
-                    H3PoolError::post_wire(anyhow::anyhow!("send request trailers failed: {}", e))
-                })?;
+            Ok(Some(mut trailers)) if !trailers.is_empty() => {
+                // Client request trailers are read AFTER the initial headers were
+                // stripped/sanitized, so a malicious client can smuggle hop-by-hop
+                // fields (`connection`, `te`, ...) or reserved gateway metadata
+                // (`x-consumer-*`, `x-path-param-*`) here that the gateway removed
+                // from the initial header block. Apply the same backend-request strip
+                // + reserved-name filter before forwarding. HTTP/3 header names are
+                // always lowercase, so exact lowercase comparisons suffice.
+                let strip: Vec<http::header::HeaderName> = trailers
+                    .keys()
+                    .filter(|n| {
+                        let s = n.as_str();
+                        is_backend_request_strip_header(s)
+                            || s == "x-consumer-username"
+                            || s == "x-consumer-custom-id"
+                            || s.starts_with("x-path-param-")
+                    })
+                    .cloned()
+                    .collect();
+                for name in strip {
+                    trailers.remove(&name);
+                }
+                // Only forward a still-non-empty block; an all-reserved trailer set
+                // collapses to nothing and must not emit an empty trailer frame.
+                if !trailers.is_empty() {
+                    backend_stream.send_trailers(trailers).await.map_err(|e| {
+                        H3PoolError::post_wire(anyhow::anyhow!(
+                            "send request trailers failed: {}",
+                            e
+                        ))
+                    })?;
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -2142,6 +2176,10 @@ impl Http3ConnectionPool {
             .finish()
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        // The client upload (body + trailers) is fully forwarded and the backend
+        // send side is FINished — any timeout from here on is the backend being slow
+        // to return response headers, NOT a stalled client upload.
+        upload_complete.store(true, Ordering::Release);
 
         let response =
             recv_h3_response_with_timeout(&mut backend_stream, header_read_timeout_ms).await?;
@@ -2280,6 +2318,10 @@ impl Http3ConnectionPool {
         // dispatch reads it to distinguish pre-wire connect failures from post-wire
         // read timeouts. Forwarded verbatim to `do_request_streaming_body`.
         stream_opened: Arc<AtomicBool>,
+        // Flipped to `true` once the client upload is fully forwarded and the backend
+        // stream is FINished; lets the dispatch separate an upload-phase stall (client
+        // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
+        upload_complete: Arc<AtomicBool>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2309,6 +2351,7 @@ impl Http3ConnectionPool {
                 Arc::clone(&bytes_seen),
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
+                Arc::clone(&upload_complete),
             )
             .await
             {
@@ -2348,6 +2391,7 @@ impl Http3ConnectionPool {
             bytes_seen,
             header_read_timeout_ms,
             stream_opened,
+            upload_complete,
         )
         .await
     }
@@ -2455,6 +2499,10 @@ impl Http3ConnectionPool {
         // dispatch reads it to distinguish pre-wire connect failures from post-wire
         // read timeouts. Forwarded verbatim to `do_request_streaming_body`.
         stream_opened: Arc<AtomicBool>,
+        // Flipped to `true` once the client upload is fully forwarded and the backend
+        // stream is FINished; lets the dispatch separate an upload-phase stall (client
+        // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
+        upload_complete: Arc<AtomicBool>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2482,6 +2530,7 @@ impl Http3ConnectionPool {
                 Arc::clone(&bytes_seen),
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
+                Arc::clone(&upload_complete),
             )
             .await
             {
@@ -2528,6 +2577,7 @@ impl Http3ConnectionPool {
             bytes_seen,
             header_read_timeout_ms,
             stream_opened,
+            upload_complete,
         )
         .await
     }

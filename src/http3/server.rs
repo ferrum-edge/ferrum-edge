@@ -1763,25 +1763,39 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
-    // Inject identity headers when authentication resolved a principal.
-    if let Some(username) = ctx.backend_consumer_username() {
+    // Reserved consumer-identity headers are gateway-asserted. Strip any
+    // client- OR plugin-supplied value UNCONDITIONALLY before backend dispatch,
+    // then inject the authenticated value when a principal resolved. `materialize_headers`
+    // only removed the RAW client header BEFORE plugins ran, so an unauthenticated
+    // route where a `before_proxy` transformer adds `x-consumer-*` would otherwise
+    // forward that plugin value to the backend — the exact spoofing path. The strip
+    // is case-insensitive (the gateway injects mixed-case keys; the H3 wire and
+    // plugins use lowercase). To preserve the zero-alloc hot path, only
+    // materialize/scrub when a principal must be injected OR a reserved header is
+    // actually present in the effective source.
+    let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let principal_custom_id = principal_username
+        .as_ref()
+        .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
+    let source_has_reserved_identity = owned_proxy_headers
+        .as_ref()
+        .unwrap_or(&ctx.headers)
+        .keys()
+        .any(|k| {
+            k.eq_ignore_ascii_case("x-consumer-username")
+                || k.eq_ignore_ascii_case("x-consumer-custom-id")
+        });
+    if principal_username.is_some() || source_has_reserved_identity {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        // Mirror the H1/H2 dispatch path (`sanitize_reserved_consumer_identity_headers`):
-        // drop any pre-existing reserved identity header before injecting the
-        // gateway-asserted value, so the backend sees exactly ONE authoritative
-        // consumer identity — never a spoofed or duplicate one. Client-supplied
-        // values are already stripped at ingress (`materialize_headers`), but a
-        // `before_proxy` transformer can re-add one; the match is case-insensitive
-        // because the gateway injects mixed-case keys here while a plugin or the
-        // H3 wire would use lowercase, and both must be collapsed. Without this the
-        // native H3 gRPC path forwarded both to the backend.
         headers.retain(|k, _| {
             !k.eq_ignore_ascii_case("x-consumer-username")
                 && !k.eq_ignore_ascii_case("x-consumer-custom-id")
         });
-        headers.insert("X-Consumer-Username".to_string(), username.to_string());
-        if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.to_string());
+        if let Some(username) = principal_username {
+            headers.insert("X-Consumer-Username".to_string(), username);
+            if let Some(custom_id) = principal_custom_id {
+                headers.insert("X-Consumer-Custom-Id".to_string(), custom_id);
+            }
         }
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
@@ -2398,9 +2412,10 @@ async fn handle_h3_request(
         // The plain native H3 path awaits dispatch directly (no outer `timeout_at`
         // wrapper), so it classifies pre-/post-wire from the returned
         // `H3PoolError::request_on_wire()` and does not consult this flag — unlike the
-        // gRPC dispatch, which reads it on deadline expiry. Pass a local throwaway to
+        // gRPC dispatch, which reads it on deadline expiry. Pass local throwaways to
         // satisfy the shared signature.
         let request_stream_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let streaming_resp = if let Some(target) = upstream_target.as_deref() {
             state
@@ -2417,6 +2432,7 @@ async fn handle_h3_request(
                     Arc::clone(&request_body_bytes_seen),
                     proxy.backend_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
+                    Arc::clone(&request_upload_complete),
                     tls_config_fn,
                 )
                 .await
@@ -2433,6 +2449,7 @@ async fn handle_h3_request(
                     Arc::clone(&request_body_bytes_seen),
                     proxy.backend_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
+                    Arc::clone(&request_upload_complete),
                     tls_config_fn,
                 )
                 .await
@@ -2519,10 +2536,20 @@ async fn handle_h3_request(
                         .backend_capabilities
                         .mark_h3_unsupported(&proxy, upstream_target.as_deref());
                 }
-                // Read timeouts surface as 504 Backend timeout (matching the
-                // direct-H2 / HBONE read-timeout arms); everything else keeps
-                // the generic 502.
-                let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
+                // A malformed client request-trailer block is a bad CLIENT request,
+                // not backend unavailability — surface 400 so the client does not
+                // retry it as a server outage. Read timeouts surface as 504 Backend
+                // timeout (matching the direct-H2 / HBONE read-timeout arms);
+                // everything else keeps the generic 502.
+                let (reject_status, reject_body) =
+                    if err_msg.contains("malformed client request trailers") {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            r#"{"error":"Malformed request trailers"}"#,
+                        )
+                    } else {
+                        h3_backend_failure_status_body(&e)
+                    };
                 let reject_status_code = reject_status.as_u16();
                 // Do NOT propagate a send error: record_backend_outcome below
                 // releases the LB active-connection count, so a `?` here would
@@ -5528,6 +5555,12 @@ async fn dispatch_grpc_native_h3(
     // without sending any body bytes, so a byte-count test would wrongly downgrade a
     // healthy backend on a slow-upload timeout.
     let request_stream_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Flipped to `true` once the client upload is fully forwarded and the backend
+    // stream is FINished. With `request_stream_opened` this gives the dispatch
+    // `timeout_at` three phases: connecting (not opened), uploading (opened, not
+    // complete), and waiting-on-headers (complete) — so an upload-phase stall is
+    // accounted as a neutral client fault, not a backend read timeout.
+    let request_upload_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Honor the client gRPC deadline (`grpc-timeout`) as an ABSOLUTE end-to-end
     // RPC deadline anchored at request receipt — exactly like the H2 /
@@ -5606,6 +5639,7 @@ async fn dispatch_grpc_native_h3(
                     Arc::clone(&request_body_bytes_seen),
                     grpc_header_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
+                    Arc::clone(&request_upload_complete),
                     tls_config_fn,
                 )
                 .await
@@ -5622,6 +5656,7 @@ async fn dispatch_grpc_native_h3(
                     Arc::clone(&request_body_bytes_seen),
                     grpc_header_read_timeout_ms,
                     Arc::clone(&request_stream_opened),
+                    Arc::clone(&request_upload_complete),
                     tls_config_fn,
                 )
                 .await
@@ -5636,25 +5671,52 @@ async fn dispatch_grpc_native_h3(
             Ok(r) => r,
             Err(_) => {
                 // This `timeout_at` wraps the COLD connect (QUIC/TLS/H3) + the
-                // request upload + the response-header wait. `request_stream_opened`
-                // is the authoritative pre-/post-wire signal: the pool flips it the
-                // instant `send_request` opens the backend stream. If it is still
-                // `false` the connect / pre-wire phase was in flight and the request
-                // never reached the backend — a PRE-WIRE connect failure
-                // (`connection_error=true` + capability downgrade, so a broken QUIC
-                // connect stops routing here). Once the stream is open it is a genuine
-                // post-wire deadline (read timeout, no downgrade). Body-byte count is
-                // NOT used: a valid zero-message / trailers-only client-streaming RPC
-                // opens the stream with no body bytes and must not be misread as
-                // pre-wire.
-                if !request_stream_opened.load(std::sync::atomic::Ordering::Acquire) {
-                    state
-                        .backend_capabilities
-                        .mark_h3_unsupported(proxy, upstream_target);
-                    Err(crate::http3::client::H3PoolError::pre_wire(
-                        anyhow::anyhow!(
-                            "gRPC backend connect/dispatch timed out before the request reached the wire"
-                        ),
+                // request upload + the response-header wait. The two atomics split it
+                // into three phases so the failure is attributed correctly:
+                //
+                //   * NOT opened — the connect / pre-wire phase was still in flight.
+                //     If this was the operator `backend_read_timeout_ms` FALLBACK
+                //     (no client deadline) the backend connect was too slow: a genuine
+                //     PRE-WIRE connect failure (`connection_error=true` + capability
+                //     downgrade). But if the CLIENT's `grpc-timeout` drove the expiry,
+                //     the client simply chose a deadline too tight to even connect —
+                //     NOT a backend capability/health signal; surface a neutral
+                //     DEADLINE_EXCEEDED with no downgrade.
+                //   * opened but upload NOT complete — the client request upload is
+                //     still streaming; a stalled client, neutral for backend health.
+                //   * opened AND upload complete — the backend is slow returning
+                //     response headers: a real post-wire read timeout (504, no
+                //     downgrade).
+                //
+                // Byte count is NOT used: a valid zero-message / trailers-only
+                // client-streaming RPC opens the stream with no body bytes.
+                let opened = request_stream_opened.load(std::sync::atomic::Ordering::Acquire);
+                let uploaded = request_upload_complete.load(std::sync::atomic::Ordering::Acquire);
+                if !opened {
+                    if client_deadline_present {
+                        // Client-chosen deadline expired before the stream opened —
+                        // neutral, no capability downgrade (see the failure branch's
+                        // `is_client_side_neutral_timeout` mapping).
+                        Err(crate::http3::client::H3PoolError::read_timeout(
+                            anyhow::anyhow!(
+                                "client grpc-timeout deadline exceeded before the backend stream opened"
+                            ),
+                        ))
+                    } else {
+                        state
+                            .backend_capabilities
+                            .mark_h3_unsupported(proxy, upstream_target);
+                        Err(crate::http3::client::H3PoolError::pre_wire(
+                            anyhow::anyhow!(
+                                "gRPC backend connect/dispatch timed out before the request reached the wire"
+                            ),
+                        ))
+                    }
+                } else if !uploaded {
+                    // Stalled client upload after the stream opened — client-side,
+                    // neutral for backend health (see `is_client_side_neutral_timeout`).
+                    Err(crate::http3::client::H3PoolError::read_timeout(
+                        anyhow::anyhow!("client request upload stalled past the dispatch deadline"),
                     ))
                 } else {
                     Err(crate::http3::client::H3PoolError::read_timeout(
@@ -5677,14 +5739,33 @@ async fn dispatch_grpc_native_h3(
             let is_client_request_body_disconnect = is_h3_client_request_body_disconnect(&err_msg);
             let is_oversize = err_msg.contains("exceeds maximum size");
             let is_read_timeout = e.is_read_timeout();
+            // A malformed/undecodable client request-trailer block is a bad CLIENT
+            // request, not backend unavailability — surface INVALID_ARGUMENT so the
+            // caller does not retry it as a server outage.
+            let is_malformed_request_trailers =
+                err_msg.contains("malformed client request trailers");
+            // Deadline expiries the dispatch attributed to the CLIENT (a grpc-timeout
+            // too tight to even connect, or a stalled client upload) are neutral for
+            // backend health: the backend is not at fault. Both arrive as
+            // `read_timeout` (DEADLINE_EXCEEDED on the wire) but must NOT poison
+            // CB / passive health / adaptive concurrency.
+            let is_client_side_neutral_timeout = err_msg
+                .contains("client grpc-timeout deadline exceeded before")
+                || err_msg.contains("client request upload stalled");
 
             // gRPC error signalling mirrors the cross-protocol bridge's
             // dispatch-failure mapping: oversized upload -> RESOURCE_EXHAUSTED,
-            // read timeout -> DEADLINE_EXCEEDED, everything else -> UNAVAILABLE.
+            // malformed client trailers -> INVALID_ARGUMENT, read timeout / client
+            // deadline -> DEADLINE_EXCEEDED, everything else -> UNAVAILABLE.
             let (grpc_status, grpc_message) = if is_oversize {
                 (
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
+                )
+            } else if is_malformed_request_trailers {
+                (
+                    crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Malformed request trailers",
                 )
             } else if is_read_timeout {
                 (
@@ -5732,6 +5813,17 @@ async fn dispatch_grpc_native_h3(
             // poisons the breaker / passive health / adaptive concurrency.
             let (health_status, outcome_error_class) = if is_oversize {
                 (413, Some(crate::retry::ErrorClass::ClientDisconnect))
+            } else if is_malformed_request_trailers {
+                // Bad client request — wire is INVALID_ARGUMENT; neutral for backend
+                // health (`ClientDisconnect` skips CB / passive health / admission).
+                (400, Some(crate::retry::ErrorClass::ClientDisconnect))
+            } else if is_client_side_neutral_timeout {
+                // Client-chosen deadline expired before connect, or stalled client
+                // upload — neutral for backend health even though the wire status is
+                // DEADLINE_EXCEEDED. Without this the `read_timeout` would fall through
+                // to the 504 / `ReadWriteTimeout` arm and wrongly trip the breaker /
+                // passive health for a healthy backend.
+                (504, Some(crate::retry::ErrorClass::ClientDisconnect))
             } else {
                 let status = if is_read_timeout { 504 } else { 502 };
                 let (_, error_class) = h3_streaming_body_failure_outcome(
@@ -6565,10 +6657,16 @@ async fn dispatch_grpc_native_h3(
         backend_start.elapsed(),
     );
     // The adaptive-concurrency limiter samples the backend gRPC terminal status:
-    // a completed response with a non-OK `grpc-status` (trailer or trailers-only
-    // header) maps to a 5xx so the limiter shrinks, while a client-side status
-    // stays healthy. Mirrors the H2 streaming gRPC bridge.
-    let admission_status = if body_completed {
+    // a non-OK `grpc-status` (trailer or trailers-only header) maps to a 5xx so the
+    // limiter shrinks, while a client-side status stays healthy. Mirrors the H2
+    // streaming gRPC bridge. Gate on whether a backend terminal status was actually
+    // RECEIVED — NOT on `body_completed` (the client-side `send_trailers`/`finish`
+    // succeeding): if an H3-only backend returns `grpc-status: 14` and the downstream
+    // client then disconnects while we write the trailers, `body_completed` is false
+    // but the backend still failed, and recording HTTP 200 would make a failing
+    // backend look healthy to the limiter.
+    let admission_status = if grpc_trailer_status.is_some() || backend_header_grpc_status.is_some()
+    {
         let mut trailer_view: HashMap<String, String> = HashMap::new();
         if let Some(code) = grpc_trailer_status {
             trailer_view.insert("grpc-status".to_string(), code.to_string());
