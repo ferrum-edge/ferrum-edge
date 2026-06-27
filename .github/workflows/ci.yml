@@ -951,91 +951,16 @@ jobs:
   gateway-api-conformance:
     name: Gateway API Conformance
     if: github.event_name == 'pull_request'
-    needs: build-gateway-binary
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
-      KIND_VERSION: v0.27.0
-      KUBECTL_VERSION: v1.32.3
-      GATEWAY_API_VERSION: v1.5.1
-      GATEWAY_API_PROFILE: GATEWAY-HTTP
-      GATEWAY_API_SUPPORTED_FEATURES: Gateway,ReferenceGrant,HTTPRoute
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Check for Gateway API conformance changes
-        id: changes
+      - name: Summarize Gateway API conformance owner
         run: |
-          set -euo pipefail
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/(ci|gateway-api-conformance)\.yml|\.github/actions/package-ferrum-runtime-image/|scripts/gateway_api_data_plane_conformance\.sh|Cargo\.(toml|lock)|Dockerfile|charts/ferrum-mesh/|proto/|src/config/env_config\.rs|src/config_sources/k8s/|src/grpc/|src/k8s_controller/|src/modes/(control_plane|data_plane|mesh)/|src/proxy/|src/router_cache\.rs|src/load_balancer\.rs|src/plugins/mesh_route_dispatch\.rs)'; then
-            echo "gateway_api_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "gateway_api_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up Go
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.25.x"
-
-      - name: Install Kubernetes tools
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-      - name: Download prebuilt gateway binary
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
-          path: target/debug
-
-      - name: Package Ferrum image
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: ./.github/actions/package-ferrum-runtime-image
-        with:
-          binary-path: target/debug/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE }}
-
-      - name: Set up Ferrum Gateway API lab
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh setup
-
-      - name: Run upstream Gateway API conformance
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        id: conformance
-        run: bash scripts/gateway_api_data_plane_conformance.sh upstream
-
-      - name: Run Ferrum Gateway API black-box checks
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
-
-      - name: Collect Gateway API conformance diagnostics
-        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh diagnostics
-
-      - name: Upload Gateway API conformance artifacts
-        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: gateway-api-conformance-${{ env.GATEWAY_API_VERSION }}
-          path: conformance-results/
-
-      - name: Summarize Gateway API conformance skip
-        if: steps.changes.outputs.gateway_api_changed != 'true'
-        run: |
-          echo "## Gateway API Conformance" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Skipped: this PR does not touch Gateway API, controller, data-plane, routing, chart, image, proto, script, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Gateway API Conformance"
+            echo ""
+            echo "Full Gateway API conformance is owned by .github/workflows/gateway-api-conformance.yml."
+            echo "This CI placeholder preserves the historical CI job/status without building the gateway image or installing Kubernetes tooling a second time."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
@@ -1405,7 +1330,7 @@ jobs:
           echo "| Functional archive build | ${{ needs.build-functional-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Plugin hardening Redis regression | ${{ needs.plugin-hardening-redis-regression.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Gateway API conformance owner placeholder | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Mesh multicluster federation | ${{ needs.mesh-multicluster-federation.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Helm chart | ${{ needs.helm-chart.result }} |" >> $GITHUB_STEP_SUMMARY
 

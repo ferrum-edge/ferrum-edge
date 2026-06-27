@@ -4,13 +4,21 @@ on:
   pull_request:
     paths:
       - ".github/workflows/gateway-api-conformance.yml"
+      - ".github/workflows/ci.yml"
+      - ".github/actions/package-ferrum-runtime-image/**"
       - "scripts/gateway_api_data_plane_conformance.sh"
+      - "Dockerfile"
       - "charts/**"
+      - "proto/**"
+      - "src/config/env_config.rs"
       - "src/config_sources/k8s/**"
       - "src/grpc/**"
       - "src/k8s_controller/**"
       - "src/modes/control_plane.rs"
       - "src/modes/data_plane.rs"
+      - "src/modes/mesh/**"
+      - "src/router_cache.rs"
+      - "src/load_balancer.rs"
       - "src/plugins/**"
       - "src/proxy/**"
       - "Cargo.toml"
@@ -39,8 +47,8 @@ on:
 permissions:
   contents: read
 
-# Both runs are useful artifact bundles, so keep both, but serialize them so a
-# Monday cron tick does not race a manual workflow_dispatch on the same budget.
+# PR, scheduled, and manual runs all produce useful artifact bundles; serialize
+# them so a Monday cron tick does not race workflow_dispatch on the same budget.
 concurrency:
   group: gateway-api-conformance
   cancel-in-progress: false
@@ -53,6 +61,8 @@ env:
 jobs:
   gateway-api-conformance:
     name: Gateway API conformance
+    # This workflow owns full PR Gateway API conformance. CI keeps only a
+    # lightweight status placeholder so PRs do not run this Kubernetes lab twice.
     # The host-built binary is packaged into a distroless Debian 13 image.
     # Pin the build host so its glibc stays no newer than the runtime image.
     runs-on: ubuntu-24.04
@@ -79,10 +89,12 @@ jobs:
           if [ -z "$supported_features" ]; then
             supported_features="Gateway,ReferenceGrant,HTTPRoute"
           fi
-          echo "gateway_api_version=$gateway_api_version" >> "$GITHUB_OUTPUT"
-          echo "conformance_profile=$conformance_profile" >> "$GITHUB_OUTPUT"
-          echo "supported_features=$supported_features" >> "$GITHUB_OUTPUT"
-          echo "skip_tests=$skip_tests" >> "$GITHUB_OUTPUT"
+          {
+            echo "gateway_api_version=$gateway_api_version"
+            echo "conformance_profile=$conformance_profile"
+            echo "supported_features=$supported_features"
+            echo "skip_tests=$skip_tests"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/setup-rust-ci
         with:
