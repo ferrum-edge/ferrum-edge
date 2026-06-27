@@ -75,31 +75,45 @@ async fn spawn_h3_grpc_gateway(
     backend_port: u16,
     extra_env: &[(&str, String)],
 ) -> (GatewayHarness, u16) {
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
+    // Outer retry (codex P3): `FERRUM_PROXY_HTTPS_PORT` is a fixed port we
+    // reserve-then-drop before the subprocess binds it, so a parallel test can
+    // steal it in the bind-drop-rebind window. Re-reserve a FRESH port (and fresh
+    // certs) and re-spawn on failure rather than retrying the same stolen port —
+    // per the testing.md "port allocation must retry" rule.
+    let mut last_err = String::new();
+    for _ in 0..5 {
+        let reservation = reserve_port().await.expect("reserve https port");
+        let https_port = reservation.port;
+        drop(reservation);
 
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (cert_path, key_path) = write_frontend_certs(scratch.path());
-    Box::leak(Box::new(scratch));
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (cert_path, key_path) = write_frontend_certs(scratch.path());
 
-    let mut builder = GatewayHarness::builder()
-        .file_config(file_mode_yaml(backend_port))
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        // gRPC always uses the cross-protocol bridge (never the native-H3 pool),
-        // so the capability registry is irrelevant — skip the warmup probe.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false");
-    for (k, v) in extra_env {
-        builder = builder.env(*k, v.clone());
+        let mut builder = GatewayHarness::builder()
+            .file_config(file_mode_yaml(backend_port))
+            .log_level("info")
+            .capture_output()
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            // gRPC always uses the cross-protocol bridge (never the native-H3 pool),
+            // so the capability registry is irrelevant — skip the warmup probe.
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+        for (k, v) in extra_env {
+            builder = builder.env(*k, v.clone());
+        }
+        match builder.spawn().await {
+            Ok(harness) => {
+                // Keep the cert files alive for the gateway's lifetime.
+                Box::leak(Box::new(scratch));
+                return (harness, https_port);
+            }
+            Err(e) => last_err = e.to_string(),
+        }
     }
-    let harness = builder.spawn().await.expect("spawn gateway");
-    (harness, https_port)
+    panic!("failed to spawn H3 gRPC gateway after retries: {last_err}");
 }
 
 /// Length-prefix a gRPC message (1-byte flag + 4-byte BE length + payload).

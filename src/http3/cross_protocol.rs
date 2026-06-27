@@ -2399,11 +2399,18 @@ fn trusted_identity_proxy_headers(
     proxy_headers: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut identity = HashMap::new();
-    // Mirrors `proxy::headers::strip_reserved_consumer_identity_headers`. Keys in
-    // `proxy_headers` are already lowercased by the H3 header materialisation.
-    for name in ["x-consumer-username", "x-consumer-custom-id"] {
-        if let Some(value) = proxy_headers.get(name) {
-            identity.insert(name.to_string(), value.clone());
+    // The H3 server injects these post-auth as `X-Consumer-Username` /
+    // `X-Consumer-Custom-Id` (capitalised — see `src/http3/server.rs`), so match
+    // CASE-INSENSITIVELY: a case-sensitive lowercase lookup would miss them and
+    // still drop the authenticated principal (codex P2). Stored lowercase — the
+    // gRPC core's merge re-parses the name via `HeaderName` (which lowercases)
+    // regardless. The reserved set mirrors
+    // `proxy::headers::strip_reserved_consumer_identity_headers`.
+    for (key, value) in proxy_headers {
+        if key.eq_ignore_ascii_case("x-consumer-username")
+            || key.eq_ignore_ascii_case("x-consumer-custom-id")
+        {
+            identity.insert(key.to_ascii_lowercase(), value.clone());
         }
     }
     identity
@@ -2438,11 +2445,61 @@ async fn handle_h3_grpc_streaming_response<S>(
     bytes_sent: u64,
     backend_target_url: &str,
     final_backend_resolved_ip: Option<String>,
+    // Set by the streaming-request pump when the H3 client resets its upload; used
+    // to classify a resulting response-body error as a CLIENT abort rather than a
+    // backend fault (codex P2). `None` on the buffered-request path (no pump).
+    frontend_upload_failed: Option<&Arc<AtomicBool>>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: SendStream<Bytes>,
 {
     let current_target_ref: Option<&UpstreamTarget> = current_target.map(|t| t.as_ref());
+    // Pre-head late-overflow guard (codex P2): if the client upload already tripped
+    // `max_grpc_recv_size_bytes` by the time the backend response is ready — e.g. a
+    // trailers-only success whose `grpc-status` rides the HEADER block — do NOT
+    // forward that success: emit RESOURCE_EXHAUSTED before any response head reaches
+    // the client. The post-body check further down covers overflows that trip while
+    // the response body streams; a success already delivered in the header block
+    // before the overflow trips cannot be retracted (accepted narrow-race limit).
+    if streaming
+        .request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        record_backend_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target_ref,
+            current_cb_target_key,
+            200,
+            false,
+            Some(ErrorClass::RequestBodyTooLarge),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        record_cross_protocol_backend_admission_outcome(
+            backend_admission_permits,
+            200,
+            false,
+            Some(ErrorClass::RequestBodyTooLarge),
+            backend_admission_start.elapsed(),
+        );
+        let mut outcome = write_grpc_error_send(
+            stream,
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Request payload exceeded backend limit",
+            backend_start,
+            bytes_sent,
+        )
+        .await?;
+        outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+        outcome.error_class = Some(ErrorClass::RequestBodyTooLarge);
+        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        return Ok(outcome);
+    }
     // Streaming variant: pool returned a live hyper Incoming. Run
     // after_proxy + sticky cookie on headers BEFORE streaming
     // begins — body-level hooks (`on_response_body`,
@@ -2629,8 +2686,16 @@ where
         }
     }
 
+    // A client upload reset (recv-half error) makes the pump set
+    // `frontend_upload_failed`; the backend then sees an RST and the response body
+    // surfaces a hyper error here. That is a CLIENT abort, not a backend fault — so
+    // classify it as ClientDisconnect (neutral for backend health / adaptive
+    // concurrency) rather than the protocol/timeout class hyper reports (codex P2).
+    let frontend_aborted = frontend_upload_failed.is_some_and(|flag| flag.load(Ordering::Acquire));
     let outcome_error_class = if request_overflowed_late {
         Some(ErrorClass::RequestBodyTooLarge)
+    } else if frontend_aborted && body_error_class.is_some() {
+        Some(ErrorClass::ClientDisconnect)
     } else {
         body_error_class
     };
@@ -3419,6 +3484,9 @@ where
                 bytes_sent,
                 &current_url,
                 final_backend_resolved_ip.clone(),
+                // Buffered-request path: the body was fully drained + size-checked
+                // before dispatch, so there is no streaming pump / client-abort flag.
+                None,
             )
             .await
         }
@@ -3730,6 +3798,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 bytes_sent,
                 backend_url,
                 final_backend_resolved_ip.clone(),
+                Some(&frontend_upload_failed),
             )
             .await
         }
@@ -6320,6 +6389,44 @@ mod tests {
              gRPC core, whose merge would then DROP the authenticated x-consumer-* \
              identity — pass trusted_identity_proxy_headers(proxy_headers) instead"
         );
+    }
+
+    /// The H3 server injects the trusted principal as `X-Consumer-Username` /
+    /// `X-Consumer-Custom-Id` (capitalised), so the extraction must match
+    /// case-insensitively — a case-sensitive lowercase lookup would silently drop
+    /// the authenticated identity for every H3 gRPC request (codex P2).
+    #[test]
+    fn trusted_identity_proxy_headers_matches_case_insensitively() {
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("X-Consumer-Username".to_string(), "alice".to_string());
+        proxy_headers.insert("X-Consumer-Custom-Id".to_string(), "cid-1".to_string());
+        proxy_headers.insert("x-forwarded-for".to_string(), "1.2.3.4".to_string());
+
+        let identity = super::trusted_identity_proxy_headers(&proxy_headers);
+
+        assert_eq!(
+            identity.get("x-consumer-username").map(String::as_str),
+            Some("alice"),
+            "capitalised X-Consumer-Username must be matched case-insensitively"
+        );
+        assert_eq!(
+            identity.get("x-consumer-custom-id").map(String::as_str),
+            Some("cid-1")
+        );
+        assert!(
+            !identity.contains_key("x-forwarded-for"),
+            "only the reserved identity headers are extracted"
+        );
+        assert_eq!(identity.len(), 2);
+    }
+
+    #[test]
+    fn trusted_identity_proxy_headers_empty_without_principal() {
+        // No resolved principal: the merge then strips any client-forged value and
+        // re-adds nothing, preserving the spoof protection.
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("host".to_string(), "example.test".to_string());
+        assert!(super::trusted_identity_proxy_headers(&proxy_headers).is_empty());
     }
 
     /// Regression guard (codex P2): a late client-upload overflow on the streaming
