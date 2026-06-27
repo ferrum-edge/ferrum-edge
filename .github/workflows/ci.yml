@@ -70,10 +70,11 @@ jobs:
       - name: Run cache accounting and reload safety regressions
         run: |
           set -euo pipefail
-          cargo test --test unit_tests test_concurrent_stores_keep_size_bounded_and_non_wrapping
-          cargo test --test unit_tests test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache
-          cargo test --test unit_tests test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache
-          cargo test --test unit_tests test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+          cargo test --test unit_tests -- \
+            test_concurrent_stores_keep_size_bounded_and_non_wrapping \
+            test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache \
+            test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache \
+            test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
         env:
           RUST_BACKTRACE: 1
 
