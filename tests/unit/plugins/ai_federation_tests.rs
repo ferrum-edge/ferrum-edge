@@ -106,6 +106,8 @@ fn test_invalid_config_shapes_rejected() {
         json!({"providers": [valid_provider.clone()], "fallback_on_network_errors": "false"}),
         json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": "429"}),
         json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": [429, "500"]}),
+        json!({"providers": [valid_provider.clone()], "fail_on_missing_model": "true"}),
+        json!({"providers": [valid_provider.clone()], "fail_on_no_matching_provider": "true"}),
     ] {
         let result = ai_federation::AiFederation::new(&config, create_test_http_client());
         assert!(result.is_err(), "config should be rejected: {config:?}");
@@ -1597,11 +1599,117 @@ async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
 }
 
 #[tokio::test]
-async fn test_before_proxy_passes_through_streaming_for_unmatched_model() {
-    // A `stream: true` request whose model matches NO provider must NOT be
-    // rejected — the plugin does not intercept it, so there is nothing to
-    // break. Rejecting it would be over-restriction.
+async fn federation_missing_model_rejects_by_default() {
     let plugin = streaming_plugin();
+    let body = json!({
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "missing_model");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_unknown_model_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "model_not_found");
+            assert!(
+                parsed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown-model")
+            );
+        }
+        other => panic!("expected RejectBinary 404, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_pass_through_requires_explicit_opt_in() {
+    let unknown_model_body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut strict_ctx = post_json_ctx(&unknown_model_body);
+    let mut strict_headers = json_headers();
+    let strict_result = streaming_plugin()
+        .before_proxy(&mut strict_ctx, &mut strict_headers)
+        .await;
+    assert!(
+        !matches!(strict_result, PluginResult::Continue),
+        "strict default must not pass unknown models through"
+    );
+
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }],
+        "fail_on_missing_model": false,
+        "fail_on_no_matching_provider": false
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+
+    for body in [
+        json!({"messages": [{"role": "user", "content": "Hi"}]}),
+        unknown_model_body,
+    ] {
+        let mut ctx = post_json_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "explicit opt-in pass-through should continue, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_before_proxy_passes_through_streaming_for_unmatched_model_with_explicit_opt_in() {
+    // Legacy pass-through for unmatched models remains available only as an
+    // explicit opt-in. The plugin still checks streaming only after it has
+    // decided to intercept a matching provider.
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }],
+        "fail_on_no_matching_provider": false
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
     let body = json!({
         "model": "claude-3-opus", // not matched by ["gpt-*"]
         "messages": [{"role": "user", "content": "Hi"}],

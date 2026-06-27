@@ -494,6 +494,8 @@ pub struct AiFederation {
     fallback_enabled: bool,
     fallback_status_codes: HashSet<u16>,
     fallback_on_network_errors: bool,
+    fail_on_missing_model: bool,
+    fail_on_no_matching_provider: bool,
     http_client: PluginHttpClient,
 }
 
@@ -620,11 +622,17 @@ impl AiFederation {
         let fallback_on_network_errors =
             optional_bool(config, "fallback_on_network_errors")?.unwrap_or(true);
 
+        let fail_on_missing_model = optional_bool(config, "fail_on_missing_model")?.unwrap_or(true);
+        let fail_on_no_matching_provider =
+            optional_bool(config, "fail_on_no_matching_provider")?.unwrap_or(true);
+
         Ok(Self {
             providers,
             fallback_enabled,
             fallback_status_codes,
             fallback_on_network_errors,
+            fail_on_missing_model,
+            fail_on_no_matching_provider,
             http_client,
         })
     }
@@ -1885,7 +1893,19 @@ impl Plugin for AiFederation {
         let model = match openai_body["model"].as_str() {
             Some(m) => m.to_string(),
             None => {
-                debug!("ai_federation: request missing 'model' field, skipping");
+                if self.fail_on_missing_model {
+                    debug!("ai_federation: rejecting request missing 'model' field");
+                    return self.openai_error_response(
+                        400,
+                        "Missing required 'model' field",
+                        "invalid_request_error",
+                        Some("model"),
+                        Some("missing_model"),
+                    );
+                }
+                debug!(
+                    "ai_federation: request missing 'model' field, passing through by explicit opt-in"
+                );
                 return PluginResult::Continue;
             }
         };
@@ -1893,20 +1913,34 @@ impl Plugin for AiFederation {
         // Find matching providers
         let matching_providers = self.find_providers_for_model(&model);
         if matching_providers.is_empty() {
+            if self.fail_on_no_matching_provider {
+                debug!(
+                    model = %model,
+                    "ai_federation: rejecting request because no provider matches model"
+                );
+                return self.openai_error_response(
+                    404,
+                    &format!("No ai_federation provider is configured for model '{model}'"),
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("model_not_found"),
+                );
+            }
             debug!(
                 model = %model,
-                "ai_federation: no provider matches model, passing through"
+                "ai_federation: no provider matches model, passing through by explicit opt-in"
             );
             return PluginResult::Continue;
         }
 
         // Streaming is not supported by the terminate-and-respond design. We
-        // only check once we know a provider matches (so requests we don't
-        // intercept still pass through untouched). Reject with a clear,
-        // OpenAI-shaped error rather than forwarding `stream: true` to the
-        // provider — which would either yield an SSE body that fails JSON
-        // normalization (opaque 502) or silently degrade to a single buffered
-        // object for the translating providers. See finding #11.
+        // only check after model routing has found a provider; missing models
+        // and unmatched models have already followed the configured fail-closed
+        // or explicit pass-through policy. Reject with a clear, OpenAI-shaped
+        // error rather than forwarding `stream: true` to the provider — which
+        // would either yield an SSE body that fails JSON normalization (opaque
+        // 502) or silently degrade to a single buffered object for the
+        // translating providers. See finding #11.
         if request_wants_streaming(&openai_body) {
             debug!(
                 model = %model,
@@ -2154,6 +2188,31 @@ impl AiFederation {
                 "message": message,
                 "type": "ai_federation_error",
                 "code": status
+            }
+        });
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        PluginResult::RejectBinary {
+            status_code: status,
+            body: Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+            headers,
+        }
+    }
+
+    fn openai_error_response(
+        &self,
+        status: u16,
+        message: &str,
+        error_type: &str,
+        param: Option<&str>,
+        code: Option<&str>,
+    ) -> PluginResult {
+        let body = json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code,
             }
         });
         let mut headers = HashMap::new();

@@ -3296,6 +3296,7 @@ Recent releases tightened config validation for several AI plugins. Operators up
 - **`ai_prompt_shield`** and **`ai_response_guard`** now reject unknown built-in pattern names and built-in patterns that fail to compile. Previously these were logged as warnings and silently skipped. Both plugins also pre-render their per-pattern redaction placeholders at config-load time, eliminating per-request `String::replace` on the hot redaction path.
 - **`ai_rate_limiter`** now rejects unknown `count_mode` and `limit_by` values. Previously these silently fell back to defaults.
 - **`ai_token_metrics`** now rejects negative or non-finite (`NaN`/`Inf`) values for `cost_per_prompt_token` and `cost_per_completion_token`. Negative cost rates would emit nonsensical negative cost metrics that pollute observability and chargeback pipelines; non-finite rates would break Prometheus exporters. Zero is still accepted (e.g., free-tier accounting).
+- **`ai_federation`** now fails closed by default when a JSON POST is missing the top-level `model` field or when no provider matches that model. Previously these requests continued to the normal backend. Restore that legacy behavior only with explicit `fail_on_missing_model: false` and/or `fail_on_no_matching_provider: false`, and only when the backend path is protected by equivalent AI gateway policy.
 
 Validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
 
@@ -3307,7 +3308,9 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
 
-**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched.
+**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay.
+
+**Model routing fails closed by default.** JSON POST requests without a top-level string `model` field are rejected with an OpenAI-shaped `400`. Requests whose `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required. Pass-through can bypass AI gateway policy enforced by `ai_federation` provider routing, fallback, translation, token metadata, and any downstream assumptions that federation will short-circuit the request.
 
 **Priority:** 2985
 
@@ -3321,6 +3324,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `fallback_enabled` | Boolean | `true` | Try next provider on failure |
 | `fallback_on_status_codes` | Array | `[429, 500, 502, 503]` | HTTP status codes that trigger fallback |
 | `fallback_on_network_errors` | Boolean | `true` | TCP/TLS failures trigger fallback |
+| `fail_on_missing_model` | Boolean | `true` | Reject JSON POST requests that lack a top-level string `model` field. Set to `false` only to explicitly pass such requests through to the normal backend |
+| `fail_on_no_matching_provider` | Boolean | `true` | Reject requests whose `model` does not match any provider. Set to `false` only to explicitly pass unsupported models through to the normal backend |
 
 **Provider configuration fields:**
 
@@ -3375,7 +3380,27 @@ plugins:
             bedrock-claude: "anthropic.claude-3-sonnet-20240229-v1:0"
       fallback_enabled: true
       fallback_on_status_codes: [429, 500, 502, 503]
+      fail_on_missing_model: true
+      fail_on_no_matching_provider: true
 ```
+
+Legacy pass-through is explicit opt-in:
+
+```yaml
+plugins:
+  - name: ai_federation
+    enabled: true
+    config:
+      fail_on_missing_model: false
+      fail_on_no_matching_provider: false
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: "sk-..."
+          model_patterns: ["gpt-*"]
+```
+
+Use this only when the normal backend has equivalent authentication, model allow-listing, rate limits, prompt/body validation, and logging. Otherwise a request with no `model` or an unsupported `model` can avoid the federated provider path entirely.
 
 **Cross-plugin synergy:** Works with all other AI plugins on the same proxy:
 - `ai_prompt_shield` (2925) scans/redacts PII before federation
@@ -3957,6 +3982,8 @@ plugins:
           priority: 3
           model_patterns: ["gemini-*"]
       fallback_enabled: true
+      fail_on_missing_model: true
+      fail_on_no_matching_provider: true
   - plugin_name: ai_response_guard
     config:
       action: redact
