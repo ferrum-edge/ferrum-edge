@@ -1442,6 +1442,72 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  detect-ebpf-live-changes:
+    name: Detect eBPF/Netns Live Changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect live-kernel-sensitive paths
+        id: changes
+        run: |
+          set -euo pipefail
+
+          git diff --name-only "origin/${{ github.base_ref }}...HEAD" | sort > "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
+          changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/ci.yml|\
+              .github/workflows/node-waypoint-ebpf-live.yml|\
+              .github/actions/setup-rust-ci/*|.github/actions/setup-rust-ci/**|\
+              .github/actions/setup-sccache/*|.github/actions/setup-sccache/**|\
+              .github/actions/setup-fast-linker/*|.github/actions/setup-fast-linker/**|\
+              Cargo.toml|Cargo.lock|.cargo/*|.cargo/**|rust-toolchain.toml|build.rs|proto/*|proto/**|\
+              ebpf/*|ebpf/**|\
+              src/capture/*|src/capture/**|\
+              src/ebpf/*|src/ebpf/**|\
+              src/grpc/*|src/grpc/**|\
+              src/identity/*|src/identity/**|\
+              src/k8s_controller/*|src/k8s_controller/**|\
+              src/modes/control_plane.rs|\
+              src/modes/mesh/*|src/modes/mesh/**|\
+              src/modes/node_agent.rs|src/modes/node_agent_cni_server.rs|\
+              src/plugins/mesh/*|src/plugins/mesh/**|src/plugins/prometheus_metrics.rs|\
+              src/proxy/hbone_pool.rs|src/proxy/hbone_proxy.rs|src/proxy/mesh_tcp_egress.rs|\
+              src/proxy/mesh_udp_capture.rs|src/proxy/mod.rs|src/proxy/netns_capture.rs|src/proxy/tcp_proxy.rs|\
+              src/router_cache.rs|src/socket_opts.rs|\
+              tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
+              tests/*capture*|tests/*ebpf*|tests/*netns*|tests/*node_waypoint*)
+                changed=true
+                break
+                ;;
+            esac
+          done < "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+          echo "## eBPF/Netns Live Gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$changed" = "true" ]; then
+            echo "Live-kernel-sensitive files changed; CI will run the eBPF userspace, eBPF live-kernel, and netns live checks." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No live-kernel-sensitive files changed; CI will skip the eBPF userspace, eBPF live-kernel, and netns live checks for this PR." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The dedicated NodeWaypoint eBPF workflow keeps its own broader path filter for full datapath validation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: List changed files for live gate
+        if: always()
+        run: |
+          echo "Changed files considered by the eBPF/netns live gate:"
+          cat "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
   build-ebpf:
     name: Build eBPF Programs
     if: github.event_name == 'pull_request'
@@ -1499,7 +1565,11 @@ jobs:
 
   build-ebpf-userspace:
     name: Build eBPF Userspace Loader
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # Keep this expensive Linux-only `--features ebpf` build off unrelated PRs.
+    # It still runs for eBPF/netns/node-waypoint-sensitive changes; docs/charts
+    # rely on cheaper checks and the dedicated NodeWaypoint workflow path gate.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1521,7 +1591,10 @@ jobs:
 
   ebpf-live:
     name: eBPF Live-Kernel Test
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # Live kernel validation is high-value for BPF/node-waypoint-sensitive
+    # changes, but it adds several minutes to every PR when run unconditionally.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1568,7 +1641,10 @@ jobs:
 
   netns-capture-live:
     name: Node-Waypoint In-Netns Capture Live Test
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # The netns tests require privileged live-kernel operations; the path gate
+    # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
