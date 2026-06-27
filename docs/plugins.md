@@ -3307,7 +3307,7 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
 
-**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched.
+**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched. There is no streaming opt-in knob; config fields named `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation so operators do not get a false sense that provider streaming is enabled.
 
 **Priority:** 2985
 
