@@ -2093,6 +2093,18 @@ impl Http3ConnectionPool {
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
+        // Forward client REQUEST trailers (trailing metadata) the client sent after
+        // the final DATA frame, before FINishing the backend stream — client- /
+        // bidi-streaming gRPC RPCs may carry them, and the H2 streaming gRPC path
+        // forwards them too. Absent trailers or a benign trailer read error is fine
+        // (the request body is already complete); only a non-empty block is sent.
+        if let Ok(Some(trailers)) = frontend_stream.recv_trailers().await
+            && !trailers.is_empty()
+        {
+            backend_stream.send_trailers(trailers).await.map_err(|e| {
+                H3PoolError::post_wire(anyhow::anyhow!("send request trailers failed: {}", e))
+            })?;
+        }
         backend_stream
             .finish()
             .await
