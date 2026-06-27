@@ -500,15 +500,21 @@ fn test_parse_grpc_timeout_empty_value() {
 }
 
 #[test]
-fn test_parse_grpc_timeout_overflow_saturates_to_unbounded() {
-    // A syntactically VALID but unrepresentable hour value saturates to u64::MAX
-    // rather than returning None: it must stay a (very large / effectively
-    // unbounded) deadline — the consumer's overflow guard treats u64::MAX as
-    // unbounded — instead of being conflated with an absent/invalid header, which
-    // would wrongly re-enable an operator read-timeout fallback for an RPC the
-    // client made effectively unbounded.
+fn test_parse_grpc_timeout_overflow_returns_none() {
+    // The gRPC wire format allows at most 8 digits; an 18-digit value violates the
+    // grammar and is rejected (`None`), exactly like the `grpc_deadline` plugin.
+    // Returning `None` — rather than saturating to `u64::MAX` — keeps the operator's
+    // `backend_read_timeout_ms` fallback in force so a malformed client header cannot
+    // opt out of the operator timeout by presenting an effectively unbounded deadline.
     let headers = headers_with_grpc_timeout("999999999999999999H");
-    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(u64::MAX));
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+
+    // A maximal IN-grammar value (8 digits) is still accepted and never overflows.
+    let headers = headers_with_grpc_timeout("99999999H");
+    assert_eq!(
+        grpc_proxy::parse_grpc_timeout_ms(&headers),
+        Some(99_999_999u64 * 3_600_000)
+    );
 }
 
 // --- GrpcConnectionPool creation ---

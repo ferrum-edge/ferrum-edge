@@ -2174,24 +2174,35 @@ pub(crate) fn parse_grpc_timeout_value(val: &str) -> Option<u64> {
     if bytes.is_empty() {
         return None;
     }
-    // The unit suffix is always a single ASCII byte per the gRPC spec.
-    // Split on the last byte to avoid panicking on multi-byte UTF-8 input.
+    // The unit suffix is always a single ASCII letter per the gRPC spec. Reject
+    // multi-byte UTF-8 (and any non-letter) here so the digit split below cannot
+    // land on a char boundary or treat a stray byte as the unit.
     let unit = *bytes.last()?;
+    if !unit.is_ascii_alphabetic() {
+        return None;
+    }
     let num_str = std::str::from_utf8(&bytes[..bytes.len() - 1]).ok()?;
+    // The gRPC wire format constrains the value to a positive integer of AT MOST
+    // 8 digits (matching the `grpc_deadline` plugin's own validation). Reject
+    // anything longer or non-numeric by returning `None` so a malformed header
+    // such as `18446744073709551615H` does NOT become a present-but-unbounded
+    // deadline — that would let a bad client opt out of the operator's
+    // `backend_read_timeout_ms` fallback. `None` means "absent or invalid", and
+    // the caller then applies the fallback. With at most 8 digits the largest
+    // representable value is `99_999_999 H` ≈ 3.6e14 ms, which always fits in a
+    // `u64`, so the unit multiplies below can never actually overflow for valid
+    // input.
+    if num_str.is_empty() || num_str.len() > 8 || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let num: u64 = num_str.parse().ok()?;
     if num == 0 {
         return None;
     }
-    // SATURATE on the unit multiply rather than returning `None`: a syntactically
-    // VALID but unrepresentable deadline (e.g. `18446744073709551615H`) must stay
-    // a deadline (`u64::MAX` ms → the consumer's overflow guard treats it as
-    // unbounded), NOT be conflated with an absent/invalid header — otherwise the
-    // operator's read-timeout fallback would cut off an RPC the client made
-    // effectively unbounded. `None` is reserved for absent / invalid syntax.
     let ms = match unit {
-        b'H' => num.saturating_mul(3_600_000),
-        b'M' => num.saturating_mul(60_000),
-        b'S' => num.saturating_mul(1_000),
+        b'H' => num * 3_600_000,
+        b'M' => num * 60_000,
+        b'S' => num * 1_000,
         b'm' => num,
         b'u' => num / 1_000, // microseconds → ms, floor to 0 is handled by max(1) below
         b'n' => num / 1_000_000,
