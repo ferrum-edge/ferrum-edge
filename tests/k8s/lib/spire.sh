@@ -103,6 +103,22 @@ data:
       trust_domain = "$trust_domain"
       data_dir = "/run/spire/data"
       log_level = "INFO"
+      federation {
+        # Expose a SPIFFE bundle-endpoint identity so this server CAN serve its
+        # trust bundle to peers. \`federation\` is a \`server{}\` option in the
+        # spire-server schema (NOT a top-level config block), so it lives INSIDE
+        # this server block. Cross-cluster bundle exchange in the live
+        # multicluster-federation fixture is bootstrapped MANUALLY via
+        # \`spire-server bundle show | bundle set\` (see ferrum_spire_federate_bundles)
+        # rather than live https_spiffe polling — there is intentionally NO
+        # \`federates_with\` block here, so a server with no peer bundle set yet
+        # never spins on an unreachable endpoint. The endpoint stays available
+        # for operators who prefer live polling.
+        bundle_endpoint {
+          address = "0.0.0.0"
+          port = "$FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT"
+        }
+      }
     }
     plugins {
       DataStore "sql" {
@@ -124,20 +140,6 @@ data:
         plugin_data {
           keys_path = "/run/spire/data/keys.json"
         }
-      }
-    }
-    federation {
-      # Expose a SPIFFE bundle-endpoint identity so this server CAN serve its
-      # trust bundle to peers. Cross-cluster bundle exchange in the live
-      # multicluster-federation fixture is bootstrapped MANUALLY via
-      # \`spire-server bundle show | bundle set\` (see ferrum_spire_federate_bundles)
-      # rather than live https_spiffe polling — there is intentionally NO
-      # \`federates_with\` block here, so a server with no peer bundle set yet
-      # never spins on an unreachable endpoint. The endpoint stays available for
-      # operators who prefer live polling.
-      bundle_endpoint {
-        address = "0.0.0.0"
-        port = "$FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT"
       }
     }
     health_checks {

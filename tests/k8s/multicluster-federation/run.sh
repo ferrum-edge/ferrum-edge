@@ -248,22 +248,23 @@ register_spire_workloads() {
         registered_ok=false
         return 1
       }
-      # svc, ew-gateway, client federate WITH the peer trust domain so their
-      # SVIDs carry the peer bundle (cross-cluster verification). rogue is
-      # registered WITHOUT FederatesWith — the negative's trust boundary.
+      # svc, ew-gateway, client AND rogue all federate WITH the peer trust
+      # domain so their SVIDs carry the peer bundle (cross-cluster mTLS
+      # verification). The negative's trust boundary is NOT "rogue can't do
+      # cross-cluster TLS" (that would be an incidental client-side failure that
+      # never reaches the destination) — it is a DESTINATION-SIDE identity DENY:
+      # rogue completes valid federated mTLS to the peer svc and is then
+      # rejected by the peer svc's `deny-peer-rogue` AuthorizationPolicy
+      # (mesh_authz 403). So rogue is registered federated, exactly like client,
+      # and the dest-side DENY (render_dest_config) is what distinguishes them.
       local sa
-      for sa in svc ew-gateway client; do
+      for sa in svc ew-gateway client rogue; do
         ferrum_spire_register_k8s_workload_federated \
           "$context" "$SPIRE_NS" \
           "spiffe://$trust_domain/ns/$NS/sa/$sa" \
           "$parent_id" "$NS" "$sa" "$peer_td" \
           "k8s:node-name:$node" || registered_ok=false
       done
-      ferrum_spire_register_k8s_workload \
-        "$context" "$SPIRE_NS" \
-        "spiffe://$trust_domain/ns/$NS/sa/rogue" \
-        "$parent_id" "$NS" rogue \
-        "k8s:node-name:$node" || registered_ok=false
     done
   }
   _register_cluster_workloads "$CONTEXT_A" "$TRUST_DOMAIN_A" "$TRUST_DOMAIN_B"
@@ -276,7 +277,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion multicluster.spire.workload_entries pass \
-      "" "" "federated-svc-ew-client-entries-registered-both-clusters" "" "" \
+      "" "" "federated-svc-ew-client-rogue-entries-registered-both-clusters" "" "" \
       "cluster-a-entries.txt,cluster-b-entries.txt"
   else
     record_live_assertion multicluster.spire.workload_entries fail \
@@ -290,15 +291,30 @@ register_spire_workloads() {
 apply_workloads() {
   local context="$1" trust_domain="$2" app_body="$3"
   log "applying workloads in $context ($app_body)"
-  awk -v ns="$NS" -v td="$trust_domain" -v image="$IMAGE" -v body="$app_body" '
+  awk -v ns="$NS" -v td="$trust_domain" -v image="$IMAGE" -v body="$app_body" \
+    -v nodeport="$EAST_WEST_NODEPORT" '
     {
       gsub(/__NAMESPACE__/, ns)
       gsub(/__TRUST_DOMAIN__/, td)
       gsub(/__IMAGE__/, image)
       gsub(/__APP_BODY__/, body)
+      gsub(/__EAST_WEST_NODEPORT__/, nodeport)
       print
     }
   ' "$MANIFESTS" | kubectl --context "$context" apply -f -
+}
+
+# Idempotently create the workload namespace in `context`. The namespaced mesh
+# ConfigMaps are rendered+applied (render_dest_config / render_client_config /
+# render_ew_config) BEFORE apply_workloads creates the Namespace object from the
+# manifest, so on a fresh kind cluster the first ConfigMap apply would fail with
+# `namespaces "$NS" not found`. Creating the namespace up front (per context)
+# fixes the ordering; apply_workloads later re-applies the same Namespace object
+# (with its mesh label) idempotently.
+ensure_namespace() {
+  local context="$1"
+  kubectl --context "$context" create namespace "$NS" \
+    --dry-run=client -o yaml | kubectl --context "$context" apply -f -
 }
 
 # Discover a kind node's address on the shared kind docker network. The east-west
@@ -408,10 +424,22 @@ YAML
 )"
 }
 
-# Dest svc: LOCAL workload (loopback) + STRICT PeerAuth. workload_is_local
+# Dest svc: LOCAL workload (loopback) + STRICT PeerAuth + a DENY
+# AuthorizationPolicy for the PEER cluster's rogue principal. workload_is_local
 # materializes the inbound loopback route to the app on :8080. No discovery.
+#
+# The DENY policy is what makes the negative prove a DESTINATION-SIDE trust-
+# boundary rejection rather than an incidental client-side TLS failure: once
+# the peer trust domain is federated, STRICT PeerAuth alone cannot tell sa/rogue
+# from sa/client (both present a valid peer SVID in the now-trusted domain), so
+# this fixture registers BOTH client AND rogue as federated and relies on this
+# identity-scoped DENY on the destination's mesh_authz to reject exactly the
+# rogue principal. A matched DENY makes mesh_authz return a 403 with the body
+# {"error":"Mesh authorization denied"} — a signal SOURCED AT THE DESTINATION —
+# while the federated sa/client still gets 200/svc-<dest>. The policy is scoped
+# to the local svc workload and denies the peer trust domain's rogue SPIFFE.
 render_dest_config() {
-  local context="$1" local_td="$2"
+  local context="$1" local_td="$2" peer_td="$3"
   apply_configmap "$context" ferrum-mesh-dest "$(cat <<YAML
 mesh:
   workloads:
@@ -439,6 +467,19 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$local_td/ns/$NS/sa/svc
+  mesh_policies:
+    - name: deny-peer-rogue
+      namespace: $NS
+      scope:
+        kind: workload_selector
+        selector:
+          labels:
+            app: svc
+          namespace: $NS
+      rules:
+        - action: deny
+          from:
+            - spiffe_id_pattern: spiffe://$peer_td/ns/$NS/sa/rogue
   peer_authentications:
     - name: mesh-strict
       namespace: $NS
@@ -494,20 +535,43 @@ wait_for_rollouts() {
   done
 }
 
+# Echo "1" iff a TCP connect to host:port from `context`'s client pod succeeds.
+# A successful connect to the open SNI-passthrough listener keeps the stream
+# open (the gateway sends nothing on a bare TCP connect), so BOTH a small
+# `--max-time` AND a connect-specific success signal are load-bearing: --max-time
+# stops the probe from BLOCKING until the workflow timeout, and curl's
+# `%{time_connect}` write-out (nonzero once the TCP handshake completes) is what
+# we assert on — curl exits 28 when --max-time fires AFTER a successful connect
+# (no data ever arrives), which is indistinguishable by EXIT CODE from a
+# connect-timeout, so exit code alone would false-FAIL a reachable gateway. A
+# refused/unroutable port yields an empty/zero connect time → not reachable.
+probe_tcp_connect() {
+  local context="$1" host="$2" port="$3"
+  local connect_time
+  # shellcheck disable=SC2016
+  connect_time="$(kubectl --context "$context" -n "$NS" exec deploy/client -c curl -- \
+    sh -c '
+      curl -s --connect-timeout 5 --max-time 5 -o /dev/null \
+        -w "%{time_connect}" "telnet://$1:$2" 2>/dev/null || true
+    ' sh "$host" "$port" 2>/dev/null || true)"
+  # time_connect is "0.000000" (or empty) when no TCP connection was established,
+  # nonzero once the handshake completed.
+  case "$connect_time" in
+    "" | 0 | 0.0 | 0.00 | 0.000 | 0.000000) printf '0' ;;
+    *) printf '1' ;;
+  esac
+}
+
 probe_gateway_reachable() {
   log "probing cross-cluster east-west reachability"
   # From a client pod in A, TCP-connect to B's east-west NodePort, and vice
   # versa. A successful TCP open proves L4 cross-cluster routing independent of
   # the mTLS/auth path.
   local ok_a=false ok_b=false
-  if kubectl --context "$CONTEXT_A" -n "$NS" exec deploy/client -c curl -- \
-    sh -c "curl -sS --connect-timeout 5 -o /dev/null \
-      telnet://$NODE_IP_B:$EAST_WEST_NODEPORT" >/dev/null 2>&1; then
+  if [[ "$(probe_tcp_connect "$CONTEXT_A" "$NODE_IP_B" "$EAST_WEST_NODEPORT")" == "1" ]]; then
     ok_a=true
   fi
-  if kubectl --context "$CONTEXT_B" -n "$NS" exec deploy/client -c curl -- \
-    sh -c "curl -sS --connect-timeout 5 -o /dev/null \
-      telnet://$NODE_IP_A:$EAST_WEST_NODEPORT" >/dev/null 2>&1; then
+  if [[ "$(probe_tcp_connect "$CONTEXT_B" "$NODE_IP_A" "$EAST_WEST_NODEPORT")" == "1" ]]; then
     ok_b=true
   fi
   if [[ "$ok_a" == "true" && "$ok_b" == "true" ]]; then
@@ -596,23 +660,59 @@ drive_positive_both_directions() {
   fi
 }
 
+# Like drive_request but for the rogue: it must never get 200, so DON'T spin the
+# 30×-retry-until-200 loop. Retry only until the dest-side authz DENY signal
+# settles (a 403 whose body is mesh_authz's {"error":"Mesh authorization
+# denied"}) so a one-off route-materialization race doesn't masquerade as the
+# rejection, then echo the final "<status>\t<body>". The DENY is sourced AT THE
+# DESTINATION (the peer svc's mesh_authz), which is the whole point of the
+# negative — a client-side transport failure (000/502, no authz body) is NOT an
+# acceptable proof and is surfaced as-is so the assertion can reject it.
+drive_request_expect_dest_deny() {
+  local context="$1" deploy="$2"
+  local host="svc.$NS.svc.cluster.local"
+  # shellcheck disable=SC2016
+  kubectl --context "$context" -n "$NS" exec "deploy/$deploy" -c curl -- \
+    sh -c '
+      host="$1"
+      out=000
+      body=""
+      for _ in $(seq 1 30); do
+        out="$(curl -s -m 5 -o /tmp/body -w "%{http_code}" \
+          -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || echo 000)"
+        body="$(tr -d "\r\n" </tmp/body 2>/dev/null || true)"
+        # Settle on the destination-side authz DENY (403 + mesh_authz body).
+        if [ "$out" = "403" ] && printf "%s" "$body" | grep -q "Mesh authorization denied"; then
+          printf "%s\t%s\n" "$out" "$body"
+          exit 0
+        fi
+        sleep 2
+      done
+      printf "%s\t%s\n" "$out" "$body"
+    ' sh "$host" 2>/dev/null || printf '000\t'
+}
+
 drive_untrusted_negative() {
-  log "driving untrusted (unfederated) cross-cluster request A -> B"
-  # The rogue pod's SVID is NOT federated with cluster B, so cluster B's STRICT
-  # inbound rejects it. The request must NOT return 200/svc-b.
+  log "driving rogue cross-cluster request A -> B (expect dest-side authz DENY)"
+  # rogue is FEDERATED (so it completes valid cross-cluster mTLS to the peer
+  # svc) but is denied at the DESTINATION by the peer svc's `deny-peer-rogue`
+  # AuthorizationPolicy. The proof is a 403 sourced by the peer's mesh_authz —
+  # NOT merely "any non-200" (which a client-side TLS failure would also produce
+  # without ever reaching the destination). We assert BOTH the 403 status AND
+  # mesh_authz's body, AND that it did not reach the app (no svc-b body).
   local out status body
-  out="$(drive_request "$CONTEXT_A" rogue)"
+  out="$(drive_request_expect_dest_deny "$CONTEXT_A" rogue)"
   status="${out%%$'\t'*}"
   body="${out#*$'\t'}"
-  log "untrusted A -> B result: status=$status body=$body"
-  if [[ "$status" != "200" || "$body" != *"svc-b"* ]]; then
+  log "rogue A -> B result: status=$status body=$body"
+  if [[ "$status" == "403" && "$body" == *"Mesh authorization denied"* && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.eastwest.untrusted_peer_rejected pass \
       "spiffe://$TRUST_DOMAIN_A/ns/$NS/sa/rogue" \
       "spiffe://$TRUST_DOMAIN_B/ns/$NS/sa/svc" \
-      "rejected status=$status body=$body"
+      "dest-side-mesh-authz-denied status=$status body=$body"
   else
     record_live_assertion multicluster.eastwest.untrusted_peer_rejected fail \
-      "" "" "unfederated-peer-unexpectedly-reached-destination status=$status body=$body"
+      "" "" "rogue-not-rejected-by-dest-authz status=$status body=$body"
     return 1
   fi
 }
@@ -688,9 +788,17 @@ main() {
   NODE_IP_B="$(discover_node_ip "$CLUSTER_B")"
   log "cluster A node IP=$NODE_IP_A   cluster B node IP=$NODE_IP_B"
 
+  # The mesh ConfigMaps below are namespaced, so the workload namespace must
+  # exist before they are applied (apply_workloads creates the Namespace object
+  # only later). Create it idempotently per cluster first.
+  ensure_namespace "$CONTEXT_A"
+  ensure_namespace "$CONTEXT_B"
+
   # Dest (loopback) + client (peer node IP) ConfigMaps — no svc-pod-IP needed.
-  render_dest_config "$CONTEXT_A" "$TRUST_DOMAIN_A"
-  render_dest_config "$CONTEXT_B" "$TRUST_DOMAIN_B"
+  # Each dest's DENY policy targets the PEER cluster's rogue principal (the
+  # source identity that cluster's rogue presents over cross-cluster mTLS).
+  render_dest_config "$CONTEXT_A" "$TRUST_DOMAIN_A" "$TRUST_DOMAIN_B"
+  render_dest_config "$CONTEXT_B" "$TRUST_DOMAIN_B" "$TRUST_DOMAIN_A"
   # Cluster A's client reaches cluster B's svc through B's east-west NodePort.
   render_client_config "$CONTEXT_A" "$CLUSTER_A" \
     "$CLUSTER_B" "$TRUST_DOMAIN_B" "$NETWORK_B" "$NODE_IP_B"

@@ -23,16 +23,18 @@
 # does not define it.
 #
 # Substituted placeholders (per cluster):
-#   __NAMESPACE__        workload namespace (ferrum)
-#   __TRUST_DOMAIN__     this cluster's trust domain (cluster-a.test / cluster-b.test)
-#   __IMAGE__            ferrum runtime image ref
-#   __APP_BODY__         echo body marker (svc-a / svc-b) so traffic is attributable
+#   __NAMESPACE__            workload namespace (ferrum)
+#   __TRUST_DOMAIN__         this cluster's trust domain (cluster-a.test / cluster-b.test)
+#   __IMAGE__                ferrum runtime image ref
+#   __APP_BODY__             echo body marker (svc-a / svc-b) so traffic is attributable
+#   __EAST_WEST_NODEPORT__   east-west gateway Service nodePort (FERRUM_EAST_WEST_NODEPORT)
 #
 # Fixed identities (same in both clusters; trust domain disambiguates them):
 #   sa/svc        the destination workload service account
 #   sa/ew-gateway the east-west gateway service account
 #   sa/client     the client sidecar service account
-#   sa/rogue      an UNFEDERATED workload used by the negative test
+#   sa/rogue      a FEDERATED workload DENIED by a dest-side AuthorizationPolicy
+#                 (the negative: proves a destination-side identity rejection)
 ---
 apiVersion: v1
 kind: Namespace
@@ -108,8 +110,16 @@ spec:
     spec:
       serviceAccountName: svc
       initContainers:
+        # The init container needs a SHELL + the `iptables` binary to install the
+        # inbound REDIRECT. The Ferrum runtime image (__IMAGE__) is DISTROLESS
+        # (gcr.io/distroless/cc-debian13) — it ships NO /bin/sh and NO iptables —
+        # so the capture-init runs on a small public Alpine image with iptables
+        # apk-installed at start instead. Alpine is universally pullable on the
+        # CI runner / kind node (same as the python:3.12-alpine + curlimages/curl
+        # images this fixture already pulls). The Ferrum image stays as the
+        # sidecar (mesh DP) container below; only the iptables installer differs.
         - name: ferrum-edge-init
-          image: __IMAGE__
+          image: alpine:3.21
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 0
@@ -119,19 +129,26 @@ spec:
               drop: ["ALL"]
               add: ["NET_ADMIN", "NET_RAW"]
           command: ["/bin/sh", "-c"]
-          # Mirror the Ferrum injector's inbound REDIRECT shape
+          # Mirror the Ferrum injector's INBOUND REDIRECT shape
           # (src/capture/mod.rs): a dedicated nat chain jumped from PREROUTING,
-          # the proxy-UID RETURN self-exclusion FIRST, then REDIRECT the app
-          # port to the sidecar inbound port. `set -e` fails the pod closed if
-          # any rule fails to apply.
+          # then REDIRECT the app port to the sidecar inbound port. `set -e`
+          # fails the pod closed if any rule (or the iptables install) fails.
+          #
+          # NO `-m owner --uid-owner` self-exclusion in this PREROUTING/inbound
+          # chain: `-m owner` matches only LOCALLY-GENERATED packets, so it is
+          # valid only in OUTPUT/POSTROUTING (per iptables-extensions(8)) and
+          # ERRORS in PREROUTING. This fixture's capture is inbound-only, so the
+          # proxy-UID exclusion (an OUTBOUND-capture concern) is not needed here;
+          # src/capture/mod.rs likewise keeps the owner RETURN out of its
+          # PREROUTING-reached FERRUM_MESH_INBOUND chain. The :15006 RETURN keeps
+          # the sidecar's own inbound port from being re-redirected onto itself.
           args:
             - |
               set -e
+              apk add --no-cache iptables
               iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
               iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
                 iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
-              iptables -t nat -C FERRUM_INBOUND -m owner --uid-owner 1337 -j RETURN 2>/dev/null || \
-                iptables -t nat -A FERRUM_INBOUND -m owner --uid-owner 1337 -j RETURN
               iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
                 iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
               iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
@@ -202,7 +219,16 @@ spec:
               import threading
               import time
 
-              RESPONSE = b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n__APP_BODY__\n"
+              # Content-Length is computed from the ACTUAL body bytes so an echo
+              # marker of any length (svc-a / svc-b, or an override) stays exact —
+              # a hardcoded length truncated the body and made curl see a short
+              # read on close, which could false-fail the positive assertions.
+              BODY = b"__APP_BODY__\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
 
               def serve():
                   s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -307,8 +333,11 @@ metadata:
   name: ferrum-mesh-east-west
   namespace: __NAMESPACE__
 spec:
-  # Patched to NodePort by run.sh so the PEER cluster can dial it across the
-  # shared kind docker network (ClusterIP VIPs are not cross-cluster routable).
+  # NodePort so the PEER cluster can dial it across the shared kind docker
+  # network (ClusterIP VIPs are not cross-cluster routable). The nodePort is
+  # TEMPLATED from FERRUM_EAST_WEST_NODEPORT (placeholder substituted by
+  # run.sh's apply_workloads awk) so it stays in lock-step with the value
+  # run.sh uses for the rendered client mesh-config + the reachability probes.
   type: NodePort
   selector:
     app: ferrum-mesh-east-west
@@ -316,7 +345,7 @@ spec:
     - name: tls-passthru
       port: 15443
       targetPort: tls-passthru
-      nodePort: 31443
+      nodePort: __EAST_WEST_NODEPORT__
 ---
 # ── Client sidecar pod ──────────────────────────────────────────────────────
 # topology=sidecar with an outbound capture listener on :15001. Its file-config
@@ -399,11 +428,15 @@ spec:
           configMap:
             name: ferrum-mesh-client
 ---
-# ── Rogue (unfederated) client pod ──────────────────────────────────────────
-# Identical to the client but its SVID entry is registered WITHOUT FederatesWith
-# the peer trust domain (see run.sh), so it has no usable cross-cluster trust:
-# the peer destination's STRICT inbound rejects its SVID. Proves the trust
-# boundary holds (the negative).
+# ── Rogue client pod (dest-side authz negative) ─────────────────────────────
+# Identical to the client and registered FEDERATED with the peer trust domain
+# (see run.sh), so it completes valid cross-cluster mTLS to the peer svc — but
+# the peer svc's `deny-peer-rogue` AuthorizationPolicy (render_dest_config)
+# DENIES its principal at the DESTINATION (mesh_authz 403). This proves a
+# destination-side identity trust boundary: once the trust domain is federated,
+# STRICT PeerAuth alone can't distinguish sa/rogue from sa/client, so the dest
+# DENY is what holds the boundary. (Using an UNfederated rogue would only prove
+# an incidental client-side TLS failure that never reaches the destination.)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
