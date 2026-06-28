@@ -3195,6 +3195,57 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
     );
 }
 
+#[tokio::test]
+async fn responses_request_without_input_is_treated_as_ai() {
+    // Codex P2: an OpenAI Responses request can be driven by `instructions` or
+    // `previous_response_id` with no `input` field — a shape `ai_request_guard`
+    // already accepts (`looks_like_responses`). The limiter must recognize it so
+    // the reservation + `on_unmetered_response` policy still apply.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 100_000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for body in [
+        json!({"model": "gpt-4o", "instructions": "be terse"}),
+        json!({"model": "gpt-4o", "previous_response_id": "resp_123"}),
+        json!({"previous_response_id": "resp_123"}), // strong marker on its own
+    ] {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            ctx.metadata.contains_key("ai_ratelimit_request"),
+            "Responses-without-input must be marked as an AI request: {body}"
+        );
+    }
+
+    // A bare generic `instructions` without `model` is NOT an AI request (it
+    // could be any non-LLM JSON), so it stays exempt from the unmetered policy.
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({"instructions": "assemble the widget"})).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "bare `instructions` without `model` must not be marked as an AI request"
+    );
+}
+
 #[test]
 fn compressed_request_is_not_pre_buffered() {
     // Codex P2: `before_proxy` forces `reserved_tokens = 0` for a compressed body

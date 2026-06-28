@@ -835,23 +835,26 @@ fn requested_completion_tokens(json: &Value) -> u64 {
 /// `system` is intentionally absent: an Anthropic body always carries `messages`,
 /// so a bare top-level `system` (a common generic word) is never the sole signal.
 const AI_REQUEST_STRONG_MARKERS: &[&str] = &[
-    "messages",     // OpenAI / Anthropic / Mistral chat (array)
-    "contents",     // Google Gemini / Vertex (array)
-    "chat_history", // Cohere history (array)
-    "inputs",       // TGI / HuggingFace
-    "inputText",    // Amazon Titan
-    "prompt",       // legacy completions
-    "input",        // OpenAI Responses / embeddings
+    "messages",             // OpenAI / Anthropic / Mistral chat (array)
+    "contents",             // Google Gemini / Vertex (array)
+    "chat_history",         // Cohere history (array)
+    "inputs",               // TGI / HuggingFace
+    "inputText",            // Amazon Titan
+    "prompt",               // legacy completions
+    "input",                // OpenAI Responses / embeddings
+    "previous_response_id", // OpenAI Responses continuation (no `input` needed)
 ];
 
 /// Generic words that ALSO appear in ordinary non-LLM JSON (e.g. `{"message":
-/// "contact me"}`). They mark an AI request only when corroborated by a top-level
-/// `model` field — which real LLM requests (Cohere v2 chat) carry — so a bare
-/// `{"message": "..."}` on a shared proxy is NOT classified as AI and is never
-/// turned into a false 502 under `reject`. (`input` stays strong: as a top-level
-/// request field it is LLM-idiomatic — OpenAI Responses/embeddings — and Codex
-/// flagged only the much more generic `message`.)
-const AI_REQUEST_WEAK_MARKERS: &[&str] = &["message"];
+/// "contact me"}`, `{"instructions": "..."}`). They mark an AI request only when
+/// corroborated by a top-level `model` field — which real LLM requests (Cohere v2
+/// chat, OpenAI Responses) carry — so a bare `{"message": "..."}` on a shared
+/// proxy is NOT classified as AI and is never turned into a false 502 under
+/// `reject`. `instructions` is the OpenAI Responses system field (matching
+/// `ai_request_guard::looks_like_responses`), gated on `model` for the same
+/// false-positive reason. (`input` stays strong: as a top-level request field it
+/// is LLM-idiomatic, and Codex flagged only the much more generic `message`.)
+const AI_REQUEST_WEAK_MARKERS: &[&str] = &["message", "instructions"];
 
 /// Whether a parsed request body looks like an LLM/AI call. A strong marker alone
 /// qualifies; a generic weak marker qualifies only alongside a top-level `model`.
