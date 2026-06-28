@@ -106,6 +106,8 @@ fn test_invalid_config_shapes_rejected() {
         json!({"providers": [valid_provider.clone()], "fallback_on_network_errors": "false"}),
         json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": "429"}),
         json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": [429, "500"]}),
+        json!({"providers": [valid_provider.clone()], "fail_on_missing_model": "true"}),
+        json!({"providers": [valid_provider.clone()], "fail_on_no_matching_provider": "true"}),
     ] {
         let result = ai_federation::AiFederation::new(&config, create_test_http_client());
         assert!(result.is_err(), "config should be rejected: {config:?}");
@@ -1119,6 +1121,9 @@ fn test_normalize_error_response() {
             .unwrap()
             .contains("429")
     );
+    assert_eq!(normalized["error"]["type"], "upstream_error");
+    assert!(normalized["error"]["param"].is_null());
+    assert_eq!(normalized["error"]["code"], "upstream_error");
     assert_eq!(prompt, 0);
     assert_eq!(completion, 0);
     assert_eq!(total, 0);
@@ -1167,6 +1172,9 @@ fn test_fallback_error_body_is_capped_before_return() {
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains("XXX"));
     assert!(message.len() <= test_helpers::MAX_UPSTREAM_ERROR_BYTES + 64);
+    assert_eq!(json["error"]["type"], "upstream_error");
+    assert!(json["error"]["param"].is_null());
+    assert_eq!(json["error"]["code"], "upstream_error");
 }
 
 #[test]
@@ -1597,6 +1605,10 @@ fn streaming_plugin() -> ai_federation::AiFederation {
 }
 
 fn post_json_ctx(body: &Value) -> RequestContext {
+    post_json_ctx_with_raw_body(serde_json::to_string(body).unwrap())
+}
+
+fn post_json_ctx_with_raw_body(body: String) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
@@ -1604,10 +1616,18 @@ fn post_json_ctx(body: &Value) -> RequestContext {
     );
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        serde_json::to_string(body).unwrap(),
+    ctx.metadata.insert("request_body".to_string(), body);
+    ctx
+}
+
+fn post_json_ctx_without_body() -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
     );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
     ctx
 }
 
@@ -1677,7 +1697,9 @@ fn assert_streaming_rejected(provider_type: &str, result: PluginResult) {
                 "{provider_type} streaming must be rejected with 501"
             );
             let parsed: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(parsed["error"]["type"], "ai_federation_error");
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "stream");
+            assert_eq!(parsed["error"]["code"], "streaming_not_supported");
             let msg = parsed["error"]["message"].as_str().unwrap();
             assert!(
                 msg.to_lowercase().contains("stream"),
@@ -1700,7 +1722,23 @@ async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
     let mut headers = json_headers();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_streaming_rejected("openai", result);
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 501, "streaming must be rejected with 501");
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "stream");
+            assert_eq!(parsed["error"]["code"], "streaming_not_supported");
+            let msg = parsed["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.to_lowercase().contains("stream"),
+                "error should mention streaming: {msg}"
+            );
+        }
+        other => panic!("expected RejectBinary 501, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1722,11 +1760,457 @@ async fn test_before_proxy_rejects_streaming_request_for_translating_providers()
 }
 
 #[tokio::test]
-async fn test_before_proxy_passes_through_streaming_for_unmatched_model() {
-    // A `stream: true` request whose model matches NO provider must NOT be
-    // rejected — the plugin does not intercept it, so there is nothing to
-    // break. Rejecting it would be over-restriction.
+async fn federation_missing_buffered_body_rejects_by_default() {
     let plugin = streaming_plugin();
+    let mut ctx = post_json_ctx_without_body();
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert!(parsed["error"]["param"].is_null());
+            assert_eq!(parsed["error"]["code"], "missing_request_body");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_invalid_json_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let mut ctx = post_json_ctx_with_raw_body("{not-json".to_string());
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert!(parsed["error"]["param"].is_null());
+            assert_eq!(parsed["error"]["code"], "invalid_json");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_missing_model_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let body = json!({
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "missing_model");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_non_string_model_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let body = json!({
+        "model": 123,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "invalid_model");
+            assert!(
+                parsed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected a string")
+            );
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_unknown_model_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "model_not_found");
+            assert!(
+                parsed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown-model")
+            );
+        }
+        other => panic!("expected RejectBinary 404, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncate_model_for_error_passes_short_values_through() {
+    // Short, realistic model ids are echoed verbatim.
+    assert_eq!(test_helpers::truncate_model_for_error("gpt-4o"), "gpt-4o");
+    // A value exactly at the cap is not truncated.
+    let at_cap: String = "a".repeat(test_helpers::MAX_ECHOED_MODEL_CHARS);
+    assert_eq!(test_helpers::truncate_model_for_error(&at_cap), at_cap);
+}
+
+#[test]
+fn truncate_model_for_error_bounds_hostile_values() {
+    // A model far longer than the cap is truncated with an explicit marker, and
+    // the kept prefix is exactly the cap length (counted in characters).
+    let hostile: String = "z".repeat(10_000);
+    let truncated = test_helpers::truncate_model_for_error(&hostile);
+    assert!(
+        truncated.ends_with("… (truncated)"),
+        "truncation marker must be present: {truncated}"
+    );
+    let kept_prefix = truncated.trim_end_matches("… (truncated)");
+    assert_eq!(
+        kept_prefix.chars().count(),
+        test_helpers::MAX_ECHOED_MODEL_CHARS
+    );
+}
+
+#[test]
+fn truncate_model_for_error_truncates_on_char_boundary() {
+    // Multi-byte characters past the cap must not panic and must yield valid
+    // UTF-8 (truncation counts characters, not bytes).
+    let hostile: String = "🦀".repeat(10_000);
+    let truncated = test_helpers::truncate_model_for_error(&hostile);
+    let kept_prefix = truncated.trim_end_matches("… (truncated)");
+    assert_eq!(
+        kept_prefix.chars().count(),
+        test_helpers::MAX_ECHOED_MODEL_CHARS
+    );
+    assert!(truncated.contains("🦀"));
+}
+
+#[tokio::test]
+async fn federation_unknown_model_404_bounds_echoed_model() {
+    let plugin = streaming_plugin();
+    // A hostile, oversized model that does not match the configured `gpt-*`
+    // pattern: it reaches the no-match 404 path and must be bounded in the body.
+    let hostile_model = "x".repeat(50_000);
+    let body = json!({
+        "model": hostile_model,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            // The echoed model must be bounded — nowhere near the 50k input.
+            assert!(
+                body.len() < 1024,
+                "no-match 404 body must be bounded, got {} bytes",
+                body.len()
+            );
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["code"], "model_not_found");
+            let msg = parsed["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("(truncated)"),
+                "bounded message should mark truncation: {msg}"
+            );
+        }
+        other => panic!("expected RejectBinary 404, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_grpc_content_type_classifier_matches_dispatch() {
+    // The skip predicate must agree with the dispatch-path classifier: bare and
+    // suffixed gRPC are native; `+json` (which `is_json_content_type` accepts) is
+    // still native gRPC; grpc-web and bogus suffixes are not.
+    assert!(test_helpers::is_native_grpc_content_type(
+        "application/grpc"
+    ));
+    assert!(test_helpers::is_native_grpc_content_type(
+        "application/grpc+proto"
+    ));
+    assert!(test_helpers::is_native_grpc_content_type(
+        "application/grpc+json"
+    ));
+    assert!(!test_helpers::is_native_grpc_content_type(
+        "application/grpc-web"
+    ));
+    assert!(!test_helpers::is_native_grpc_content_type(
+        "application/grpcfoo"
+    ));
+    assert!(!test_helpers::is_native_grpc_content_type(
+        "application/json"
+    ));
+}
+
+#[tokio::test]
+async fn federation_native_grpc_json_body_passes_through_in_strict_mode() {
+    // `application/grpc+json` is accepted by `is_json_content_type` and the
+    // plugin advertises gRPC support, so without the native-gRPC skip a
+    // length-prefixed gRPC frame would hit the strict JSON parse and be rejected
+    // as malformed JSON (400). It must instead pass through untouched.
+    let plugin = streaming_plugin();
+
+    // Simulate a native gRPC DATA frame: 5-byte prefix (uncompressed, len=2) +
+    // payload. This is not valid JSON.
+    let grpc_body = String::from_utf8_lossy(&[0u8, 0, 0, 0, 2, b'h', b'i']).to_string();
+    let mut ctx = post_json_ctx_with_raw_body(grpc_body);
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "native gRPC body must pass through, got {result:?}"
+    );
+}
+
+#[test]
+fn should_buffer_request_body_skips_native_grpc() {
+    // The H1/H2 path buffers the request body *before* `before_proxy` runs when
+    // `requires_request_body_before_before_proxy()` is true, gated per-request by
+    // `should_buffer_request_body`. Because `is_json_content_type` accepts the
+    // `+json` suffix, `application/grpc+json` would otherwise be buffered here and
+    // a client-streaming / large gRPC call fully drained even though
+    // `before_proxy` then passes it through. The native-gRPC exclusion must apply
+    // to the buffering decision too, mirroring the `before_proxy` skip.
+    let plugin = streaming_plugin();
+
+    // Native gRPC content-types must NOT be buffered.
+    let mut grpc_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    grpc_ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&grpc_ctx),
+        "native gRPC (application/grpc+json) request body must not be buffered"
+    );
+
+    let mut grpc_proto_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    grpc_proto_ctx
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&grpc_proto_ctx),
+        "native gRPC (application/grpc) request body must not be buffered"
+    );
+
+    // Plain OpenAI JSON POSTs are still buffered (the plugin needs the body).
+    let mut json_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    json_ctx
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&json_ctx),
+        "OpenAI JSON request body must still be buffered"
+    );
+}
+
+#[tokio::test]
+async fn federation_pass_through_requires_explicit_opt_in() {
+    let unknown_model_body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut strict_ctx = post_json_ctx(&unknown_model_body);
+    let mut strict_headers = json_headers();
+    let strict_result = streaming_plugin()
+        .before_proxy(&mut strict_ctx, &mut strict_headers)
+        .await;
+    assert!(
+        !matches!(strict_result, PluginResult::Continue),
+        "strict default must not pass unknown models through"
+    );
+
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }],
+        "fail_on_missing_model": false,
+        "fail_on_no_matching_provider": false
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+
+    for body in [
+        json!({"messages": [{"role": "user", "content": "Hi"}]}),
+        json!({"model": 123, "messages": [{"role": "user", "content": "Hi"}]}),
+        unknown_model_body,
+    ] {
+        let mut ctx = post_json_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "explicit opt-in pass-through should continue, got {result:?}"
+        );
+    }
+
+    let mut invalid_json_ctx = post_json_ctx_with_raw_body("{not-json".to_string());
+    let mut invalid_json_headers = json_headers();
+    let invalid_json_result = plugin
+        .before_proxy(&mut invalid_json_ctx, &mut invalid_json_headers)
+        .await;
+    assert!(
+        matches!(invalid_json_result, PluginResult::Continue),
+        "explicit opt-in malformed JSON pass-through should continue, got {invalid_json_result:?}"
+    );
+
+    let mut missing_body_ctx = post_json_ctx_without_body();
+    let mut missing_body_headers = json_headers();
+    let missing_body_result = plugin
+        .before_proxy(&mut missing_body_ctx, &mut missing_body_headers)
+        .await;
+    assert!(
+        matches!(missing_body_result, PluginResult::Continue),
+        "explicit opt-in missing buffered body pass-through should continue, got {missing_body_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn federation_asymmetric_flags_missing_model_passes_unmatched_rejects() {
+    // The two flags are independent. With `fail_on_missing_model: false` and
+    // `fail_on_no_matching_provider: true` (the default for the latter), a
+    // request that cannot yield a `model` passes through to the backend, while
+    // a request whose `model` is present but matches no provider still fails
+    // closed with a 404.
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }],
+        "fail_on_missing_model": false,
+        "fail_on_no_matching_provider": true
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+
+    // No `model` field → gated by `fail_on_missing_model: false` → pass through.
+    let missing_model_body = json!({
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut missing_ctx = post_json_ctx(&missing_model_body);
+    let mut missing_headers = json_headers();
+    let missing_result = plugin
+        .before_proxy(&mut missing_ctx, &mut missing_headers)
+        .await;
+    assert!(
+        matches!(missing_result, PluginResult::Continue),
+        "missing model must pass through when fail_on_missing_model is false, got {missing_result:?}"
+    );
+
+    // Unknown/unmatched `model` → gated by `fail_on_no_matching_provider: true`
+    // → still rejected with 404.
+    let unknown_model_body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut unknown_ctx = post_json_ctx(&unknown_model_body);
+    let mut unknown_headers = json_headers();
+    let unknown_result = plugin
+        .before_proxy(&mut unknown_ctx, &mut unknown_headers)
+        .await;
+    match unknown_result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(
+                status_code, 404,
+                "unmatched model must still be rejected when fail_on_no_matching_provider is true"
+            );
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "model_not_found");
+        }
+        other => panic!("expected RejectBinary 404, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_before_proxy_passes_through_streaming_for_unmatched_model_with_explicit_opt_in() {
+    // Legacy pass-through for unmatched models remains available only as an
+    // explicit opt-in. The plugin still checks streaming only after it has
+    // decided to intercept a matching provider.
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }],
+        "fail_on_no_matching_provider": false
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
     let body = json!({
         "model": "claude-3-opus", // not matched by ["gpt-*"]
         "messages": [{"role": "user", "content": "Hi"}],
