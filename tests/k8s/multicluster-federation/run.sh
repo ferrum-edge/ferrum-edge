@@ -360,20 +360,41 @@ wait_for_svc_pod_ip() {
   local context="$1"
   local ip="" _
   for _ in $(seq 1 60); do
-    # Filter to a RUNNING pod: after a Stage-3 rollout restart / scale-up there
-    # can briefly be a Terminating old pod alongside the new one, and an
-    # unfiltered items[0] could return the dead pod's IP. (Initial deploy has a
-    # single pod, so this is strictly more correct everywhere.)
-    ip="$(kubectl --context "$context" -n "$NS" get pod -l app=svc \
-      --field-selector=status.phase=Running \
-      -o jsonpath='{.items[0].status.podIP}' 2>/dev/null || true)"
+    # Select a Running, Ready, NON-terminating svc pod's IP. `Terminating` is NOT
+    # a pod phase — a deleting pod keeps phase=Running with a deletionTimestamp
+    # set — so a phase filter alone still matches the OLD pod during a Stage-3
+    # rollout/scale, and rendering the east-west gateway with that soon-dead IP
+    # makes recovery fail. Pick the pod with no deletionTimestamp whose Ready
+    # condition is True (python3 is a fixture preflight requirement).
+    ip="$(kubectl --context "$context" -n "$NS" get pod -l app=svc -o json 2>/dev/null |
+      python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for pod in data.get("items", []):
+    if pod.get("metadata", {}).get("deletionTimestamp"):
+        continue
+    status = pod.get("status", {})
+    if status.get("phase") != "Running":
+        continue
+    ready = any(
+        c.get("type") == "Ready" and c.get("status") == "True"
+        for c in status.get("conditions", [])
+    )
+    ip = status.get("podIP")
+    if ready and ip:
+        print(ip)
+        break
+' 2>/dev/null || true)"
     if [[ -n "$ip" ]]; then
       printf '%s' "$ip"
       return 0
     fi
     sleep 2
   done
-  echo "svc pod never reported a pod IP in $context" >&2
+  echo "svc pod never reported a ready non-terminating pod IP in $context" >&2
   return 1
 }
 
@@ -871,6 +892,14 @@ drive_untrusted_negative() {
 # revocation / black-hole scenarios. Exits immediately on any 200 (so a stale
 # still-draining connection serving 200 correctly FAILS the "fail-closed"
 # assertion), otherwise settles on a stable non-200. Echoes "<status>\t<body>".
+# Probe the FULL window and report the worst case for a "fails closed" claim:
+# exit IMMEDIATELY with a 200 if the route ever serves one (so the assertion
+# fails), otherwise keep probing the whole window and report the final non-200.
+# Probing the whole window — not just the first few samples — prevents a transient
+# post-restart 000/502 from passing while the route is still materializing
+# (rollout-status already waited for Ready, but the mesh slice loads slightly
+# after). `%{time_total}` lets callers tell a real error response (fast 5xx) from
+# a hang to curl's own timeout (000). Echoes "<status>\t<time_total>\t<body>".
 drive_request_expect_failclosed() {
   local context="$1" deploy="$2"
   local host="svc.$NS.svc.cluster.local"
@@ -879,25 +908,23 @@ drive_request_expect_failclosed() {
     sh -c '
       host="$1"
       out=000
+      ttot=0
       body=""
-      stable=0
-      for _ in $(seq 1 30); do
-        out="$(curl -s -m 5 -o /tmp/body -w "%{http_code}" \
-          -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || echo 000)"
+      for _ in $(seq 1 20); do
+        resp="$(curl -s -m 10 -o /tmp/body -w "%{http_code} %{time_total}" \
+          -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null)"
+        [ -z "$resp" ] && resp="000 0"
+        out="${resp%% *}"
+        ttot="${resp##* }"
         body="$(tr -d "\r\n" </tmp/body 2>/dev/null || true)"
         if [ "$out" = "200" ]; then
-          printf "%s\t%s\n" "$out" "$body"
-          exit 0
-        fi
-        stable=$((stable + 1))
-        if [ "$stable" -ge 3 ]; then
-          printf "%s\t%s\n" "$out" "$body"
+          printf "%s\t%s\t%s\n" "$out" "$ttot" "$body"
           exit 0
         fi
         sleep 2
       done
-      printf "%s\t%s\n" "$out" "$body"
-    ' sh "$host" 2>/dev/null || printf '000\t'
+      printf "%s\t%s\t%s\n" "$out" "$ttot" "$body"
+    ' sh "$host" 2>/dev/null || printf '000\t0\t'
 }
 
 # Re-render `context`'s dest mesh config (optionally WITHOUT the federated peer
@@ -921,17 +948,21 @@ restart_dest_with_trust() {
 inject_trust_revocation() {
   log "STAGE 3: revoking cluster-A trust on cluster-B dest; expect A -> B fails closed"
   restart_dest_with_trust "$CONTEXT_B" "$TRUST_DOMAIN_B" "$CONTEXT_A" "$TRUST_DOMAIN_A" false
-  local out status body
+  local out status ttot body rest
+  # drive_request_expect_failclosed returns "<status>\t<time_total>\t<body>" and
+  # only short-circuits on a 200 (which would mean trust was NOT revoked).
   out="$(drive_request_expect_failclosed "$CONTEXT_A" client)"
   status="${out%%$'\t'*}"
-  body="${out#*$'\t'}"
-  log "A -> B after revocation: status=$status body=$body"
+  rest="${out#*$'\t'}"
+  ttot="${rest%%$'\t'*}"
+  body="${rest#*$'\t'}"
+  log "A -> B after revocation: status=$status time=${ttot}s body=$body"
   if [[ "$status" != "200" && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.federation.bundle_revoked_rejected pass \
-      client svc "revoked-peer-trust-fails-closed status=$status body=$body"
+      client svc "revoked-peer-trust-fails-closed-over-window status=$status time=${ttot}s body=$body"
   else
     record_live_assertion multicluster.federation.bundle_revoked_rejected fail \
-      client svc "still-served-after-revocation status=$status body=$body"
+      client svc "still-served-after-revocation status=$status time=${ttot}s body=$body"
   fi
 
   log "STAGE 3: restoring cluster-A trust on cluster-B dest; expect A -> B recovers"
@@ -957,17 +988,22 @@ inject_endpoint_blackhole() {
   log "STAGE 3: scaling cluster-B svc to 0; expect A -> B black-holes (fail-fast)"
   kubectl --context "$CONTEXT_B" -n "$NS" scale deploy/svc --replicas=0
   wait_for_no_svc_pod "$CONTEXT_B"
-  local out status body
+  local out status ttot body rest
   out="$(drive_request_expect_failclosed "$CONTEXT_A" client)"
   status="${out%%$'\t'*}"
-  body="${out#*$'\t'}"
-  log "A -> B with dest down: status=$status body=$body"
-  if [[ "$status" != "200" && "$body" != *"svc-b"* ]]; then
+  rest="${out#*$'\t'}"
+  ttot="${rest%%$'\t'*}"
+  body="${rest#*$'\t'}"
+  log "A -> B with dest down: status=$status time=${ttot}s body=$body"
+  # Fail-fast proof: the client must return a REAL upstream error (a 5xx from the
+  # client sidecar — its gateway backend is gone), NOT 000 (which means curl hit
+  # its own -m, i.e. the request HUNG) and NOT 200. A 000 hang fails this claim.
+  if [[ "$status" != "200" && "$status" != "000" && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.eastwest.endpoint_blackhole_when_dest_down pass \
-      client svc "dest-scaled-to-zero status=$status body=$body"
+      client svc "dest-down-real-error-not-hang status=$status time=${ttot}s body=$body"
   else
     record_live_assertion multicluster.eastwest.endpoint_blackhole_when_dest_down fail \
-      client svc "served-despite-dest-down status=$status body=$body"
+      client svc "not-fast-fail-or-served status=$status time=${ttot}s body=$body"
   fi
 
   log "STAGE 3: scaling cluster-B svc back up + re-rendering gateway; expect recovery"

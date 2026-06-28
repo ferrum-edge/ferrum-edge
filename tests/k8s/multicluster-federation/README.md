@@ -126,7 +126,7 @@ live suite gates its `node_waypoint.*` IDs in its own run.sh REQUIRED array):
 | `multicluster.eastwest.untrusted_peer_rejected` | the federated `rogue` client is rejected at the DESTINATION by MeshPolicy (403 `Mesh authorization denied`, not 200/`svc-b`) |
 | `multicluster.federation.bundle_revoked_rejected` | (Stage 3) after dropping cluster A's federated bundle from B's dest slice + reload, A→B fails closed (no 200/`svc-b`) |
 | `multicluster.federation.trust_restored_recovers` | (Stage 3) re-adding the federated bundle + reload restores A→B (200, body `svc-b`) |
-| `multicluster.eastwest.endpoint_blackhole_when_dest_down` | (Stage 3) with B's `svc` scaled to 0, A→B fails fast (no 200) instead of hanging |
+| `multicluster.eastwest.endpoint_blackhole_when_dest_down` | (Stage 3) with B's `svc` scaled to 0, A→B returns a real upstream error (a 5xx from the client sidecar — not a `000` curl-timeout hang, not 200) |
 | `multicluster.eastwest.endpoint_recovers_when_dest_returns` | (Stage 3) scaling `svc` back up + re-rendering the gateway for the new pod IP restores A→B (200, body `svc-b`) |
 
 Cross-cluster east-west is Beta/Experimental in `docs/mesh.md`, so there is
