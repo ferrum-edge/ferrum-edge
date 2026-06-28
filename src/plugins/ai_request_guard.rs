@@ -1336,17 +1336,19 @@ fn contains_system_prompt(json: &Value, aliases: &HashSet<String>) -> bool {
 /// that tells the model how to behave. It is a de-facto system prompt: the
 /// backend applies it even when the top-level `messages` carry only ordinary
 /// `user` turns, so a caller could otherwise smuggle disallowed system/developer
-/// instructions past `block_system_prompts`. Treat a NON-EMPTY `role_information`
+/// instructions past `block_system_prompts`. Treat a NON-BLANK `role_information`
 /// on any data source as a system prompt.
 ///
-/// Empty (`""`) is intentionally allowed — a deliberate departure from the
-/// presence-based top-level `object_has_system_prompt_field`: an empty instruction
-/// carries no directive, and Azure clients legitimately include data sources
-/// without one, so blocking those would be a false positive. Scoped to this exact
-/// nested field (both casings) to avoid flagging arbitrary user-supplied text.
+/// A blank value (empty or whitespace-only) is intentionally allowed — a
+/// deliberate departure from the presence-based top-level
+/// `object_has_system_prompt_field`: it carries no directive, and Azure clients
+/// legitimately include data sources without one, so blocking those would be a
+/// false positive. (Non-whitespace invisible characters are not trimmed, so they
+/// still block — fail-closed.) Scoped to this exact nested field (both casings) to
+/// avoid flagging arbitrary user-supplied text.
 fn data_sources_have_role_information(json: &Value) -> bool {
     azure_data_source_items(json)
-        .any(|source| azure_role_information_values(source).any(|ri| !ri.is_empty()))
+        .any(|source| azure_role_information_values(source).any(|ri| !ri.trim().is_empty()))
 }
 
 fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bool {

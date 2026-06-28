@@ -1476,6 +1476,15 @@ async fn block_system_prompts_allows_data_sources_without_role_information() {
                 "parameters": {"role_information": ""}
             }]
         }),
+        // Whitespace-only is also blank (no directive) and must pass.
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "data_sources": [{
+                "type": "azure_search",
+                "parameters": {"role_information": "   \n\t"}
+            }]
+        }),
     ] {
         let mut ctx = make_post_ctx(&body);
         let mut headers = make_post_headers();
