@@ -1001,6 +1001,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW_FILE: gateway-api-conformance.yml
+          # This CI run's own id, used to derive the floor timestamp below so we
+          # only mirror a dedicated run created for the *current* event.
+          CI_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
 
@@ -1009,26 +1012,67 @@ jobs:
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # A reused head commit (PR close/reopen, or a second PR opened from the
-          # same commit) can surface an older gateway-api-conformance.yml run for
-          # this head_sha. Filtering by head_sha alone would then mirror that
-          # stale run's conclusion. Prefer the most recent run whose
-          # `.pull_requests[]` includes THIS PR number; only when none match
-          # (cross-fork PR runs report an empty `.pull_requests`) fall back to
-          # the most recent head_sha run so forked PRs still get a result.
+          # A reused head commit (PR close/reopen, or re-running CI without a new
+          # commit) can surface an OLDER gateway-api-conformance.yml run for this
+          # same head_sha that still matches the PR-number filter. Selecting "the
+          # most recent run for this PR" would then `break` on that stale run and
+          # mirror its old conclusion instead of the current attempt's. To make a
+          # reused-SHA stale run unselectable, floor the search by this CI run's
+          # own trigger time: both this CI run and the dedicated conformance run
+          # are launched by the *same* `pull_request` event, so the dedicated run
+          # we want has `created_at` at/after this CI run's `created_at`. A prior
+          # attempt's run for the same SHA was created on an earlier event and is
+          # always strictly older, so the floor drops it.
+          #
+          # `created_at` (event/trigger time) is shared across workflows for one
+          # event, unlike `run_started_at` (runner pickup time, which varies with
+          # queue depth). Subtract a small skew tolerance so a few seconds of
+          # per-workflow registration jitter on the *same* event never excludes
+          # the run we want; this window is far smaller than the minutes-to-hours
+          # gap to any prior attempt for the same SHA.
+          SKEW_TOLERANCE_SECONDS=120
+          ci_created_at=""
+          for _ in $(seq 1 10); do
+            ci_created_at="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
+                --jq '.created_at // empty' 2>/dev/null || true
+            )"
+            if [ -n "$ci_created_at" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$ci_created_at" ]; then
+            echo "Could not resolve this CI run's created_at to floor the conformance run search." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # GNU date on the ubuntu runner; falls back to BSD date for local use.
+          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || echo "${ci_created_at}")"
+          echo "Only mirroring dedicated runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
+
+          # Among dedicated runs for this head_sha that are at/after the floor,
+          # prefer the most recent run whose `.pull_requests[]` includes THIS PR
+          # number; only when none match (cross-fork PR runs report an empty
+          # `.pull_requests`) fall back to the most recent in-window head_sha run
+          # so forked PRs still get a result. The `created_at >= $since` floor is
+          # applied to BOTH paths so a stale same-SHA run cannot satisfy either.
           run_id=""
           for _ in $(seq 1 60); do
-            # `$pr` below is a jq variable bound via `--arg pr`, not a shell
-            # variable, so the jq program is intentionally single-quoted.
+            # `$pr` / `$since` below are jq variables bound via `--arg`, not shell
+            # variables, so the jq program is intentionally single-quoted.
             # shellcheck disable=SC2016
             run_id="$(
               gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
                 --jq '
-                  [.workflow_runs[]] | sort_by(.created_at) | reverse
+                  [.workflow_runs[]]
+                  | map(select(.created_at >= $since))
+                  | sort_by(.created_at) | reverse
                   | (map(select(any(.pull_requests[]?; .number == ($pr | tonumber)))) | .[0].id)
                     // (.[0].id)
                     // empty
-                ' --arg pr "${PR_NUMBER}" 2>/dev/null || true
+                ' --arg pr "${PR_NUMBER}" --arg since "${since}" 2>/dev/null || true
             )"
             if [ -n "$run_id" ]; then
               break
@@ -1037,7 +1081,7 @@ jobs:
           done
 
           if [ -z "$run_id" ]; then
-            echo "Dedicated Gateway API conformance workflow did not start for this commit." >> "$GITHUB_STEP_SUMMARY"
+            echo "Dedicated Gateway API conformance workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
