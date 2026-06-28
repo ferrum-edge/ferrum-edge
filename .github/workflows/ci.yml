@@ -998,6 +998,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW_FILE: gateway-api-conformance.yml
         run: |
@@ -1008,11 +1009,26 @@ jobs:
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # A reused head commit (PR close/reopen, or a second PR opened from the
+          # same commit) can surface an older gateway-api-conformance.yml run for
+          # this head_sha. Filtering by head_sha alone would then mirror that
+          # stale run's conclusion. Prefer the most recent run whose
+          # `.pull_requests[]` includes THIS PR number; only when none match
+          # (cross-fork PR runs report an empty `.pull_requests`) fall back to
+          # the most recent head_sha run so forked PRs still get a result.
           run_id=""
           for _ in $(seq 1 60); do
+            # `$pr` below is a jq variable bound via `--arg pr`, not a shell
+            # variable, so the jq program is intentionally single-quoted.
+            # shellcheck disable=SC2016
             run_id="$(
               gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
-                --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty' 2>/dev/null || true
+                --jq '
+                  [.workflow_runs[]] | sort_by(.created_at) | reverse
+                  | (map(select(any(.pull_requests[]?; .number == ($pr | tonumber)))) | .[0].id)
+                    // (.[0].id)
+                    // empty
+                ' --arg pr "${PR_NUMBER}" 2>/dev/null || true
             )"
             if [ -n "$run_id" ]; then
               break
