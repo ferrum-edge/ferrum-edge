@@ -3319,11 +3319,34 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 **Response guardrails still apply.** Successful synthetic responses returned by `ai_federation` are passed through the normal buffered response-side hooks before reaching the client. This means response-side `ai_semantic_firewall`, `ai_response_guard`, response body transforms, and final-response hooks inspect the normalized provider body. `ai_federation` still writes token metadata directly, and `ai_rate_limiter` records those tokens through its rejection-path `after_proxy` hook.
 
+**Multimodal content is explicit.** OpenAI Chat Completions content arrays may contain text plus non-text parts such as `image_url`. Provider configs accept `multimodal_mode`:
+
+| Mode | Behavior |
+|---|---|
+| `reject` | Reject matched requests containing non-text content parts with HTTP `400`. |
+| `translate` | Preserve supported non-text parts by converting them to the provider-native request format. Unsupported parts are rejected with HTTP `400`. |
+| `text_only_with_warning` | Intentionally drop non-text parts, send only text, log a warning, and set `ai_federation_multimodal_*` metadata. |
+
+Translated providers default to `reject` unless configured otherwise. OpenAI-compatible providers and Cohere default to `translate` because their outbound request shape preserves OpenAI-style content parts instead of flattening them.
+
+Multimodal capability is provider-specific, so a per-provider multimodal rejection (a `reject`-mode provider, or a `translate`-mode provider that cannot translate a specific part — e.g. AWS Bedrock with an HTTP(S) image URL or an unsupported image format) does **not** abort the fallback chain when `fallback_enabled` is set. The request falls through to the next matching provider exactly like a translation failure does, so a mixed list (e.g. a `reject`-mode provider followed by a `translate`-mode one) can still serve the image from the later provider. If **every** matching provider declines the request at the multimodal policy gate and no provider was ever dialed, the caller receives the final HTTP `400`.
+
 **Priority:** 2985
 
 **Supported providers:**
 - **OpenAI-compatible** (send OpenAI format directly): OpenAI, Mistral, xAI (Grok), DeepSeek, Meta Llama, Hugging Face, Azure OpenAI
 - **Requires translation**: Anthropic (Messages API), Google Gemini, Google Vertex AI (OAuth2), AWS Bedrock (Converse API, SigV4), Cohere v2
+
+**Multimodal support matrix:**
+
+| Provider type | Default mode | `translate` support |
+|---|---|---|
+| `openai`, `azure_openai`, `mistral`, `xai`, `deepseek`, `meta_llama`, `hugging_face` | `translate` | Sends OpenAI content parts unchanged; provider/model decides whether each part is supported. |
+| `cohere` | `translate` | Preserves OpenAI-style content parts in the Cohere v2 Chat request; provider/model decides whether each part is supported. |
+| `anthropic` | `reject` | Converts user/assistant `image_url` parts to Anthropic image blocks: HTTP(S) URLs use URL sources and data URLs use base64 sources. Only `jpeg`/`png`/`gif`/`webp` data-URL media types are accepted; other types (e.g. `svg+xml`) are rejected with HTTP `400`. Non-text system/developer parts are rejected. |
+| `google_gemini` | `reject` | Converts user/assistant `image_url` parts to Gemini parts: data URLs become `inlineData` blocks and `gs://` GCS URIs / Files API URIs become `fileData` blocks. Only `jpeg`/`png`/`webp`/`heic`/`heif` image media types are accepted (`svg+xml`/`bmp`/`tiff`/`gif` are rejected with HTTP `400`). `fileData.mimeType` is required by Google whenever `fileUri` is set, so it is resolved from the URI extension or an explicit `image_url.mime_type` field; an extensionless Files API URI without `mime_type` is rejected with HTTP `400`. Arbitrary HTTP(S) image URLs are rejected with HTTP `400` because the plugin does not fetch/inline remote images. Non-text system/developer parts are rejected. |
+| `google_vertex` | `reject` | Same Gemini `generateContent` request shape, media-type set, and `fileData.mimeType` handling as `google_gemini`; arbitrary HTTP(S) image URLs rejected with HTTP `400`. Non-text system/developer parts are rejected. |
+| `aws_bedrock` | `reject` | Converts **user-message** data URL `image_url` parts to Bedrock Converse image blocks; only `png`/`jpeg`/`gif`/`webp` media types are accepted. Images in `assistant` (or system/developer) messages are rejected with HTTP `400` because the Converse `Message` API only allows image content on `user` messages. HTTP(S) image URLs and unsupported formats are rejected with HTTP `400` because Converse requires supported image bytes. |
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3345,6 +3368,7 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
 | `model_mapping` | Object | `{}` | Map client model names to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
+| `multimodal_mode` | String | Provider-specific | One of `reject`, `translate`, `text_only_with_warning`; controls handling of non-text OpenAI content parts |
 | `connect_timeout_seconds` | Integer | `5` | Per-provider TCP + TLS handshake timeout for outbound provider calls |
 | `read_timeout_seconds` | Integer | `60` | Overall per-request deadline for outbound provider calls |
 | `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
@@ -3416,7 +3440,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_federation` (2985) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
-**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility.
+**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
@@ -3775,9 +3799,11 @@ config:
 
 Validates and constrains AI/LLM API requests before they reach the backend.
 
-Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured.
+Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured. Inspection is therefore **best-effort and scoped**: model-policy and guard checks apply only after the plugin can inspect a well-formed buffered JSON body on a `POST` carrying a JSON `Content-Type`. Bodies that are absent, empty, or not valid JSON — and any request sent under a non-JSON `Content-Type` — are uninspectable and continue to the backend unchanged for compatibility. The realistic residual risk is **content-type confusion**: a client sends an uninspectable body (e.g. a JSON payload labelled `text/plain`, or no body at all) to a backend that parses it as JSON regardless of `Content-Type`, bypassing model policy.
 
-At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1).
+The gateway plugins **cannot** turn this into a hard boundary on their own — and, critically, **forcing all traffic through `ai_request_guard` does not close the gap either**. The plugin's `before_proxy` returns `Continue` (passes the request through unchanged, un-inspected) for every case it cannot inspect: non-`POST` methods, non-JSON `Content-Type`s, absent/empty bodies, and bodies that fail to parse as JSON. That behavior is independent of ingress topology, so even if `ai_request_guard` is the **only** ingress path to the backend, those request shapes still reach the backend without model-policy or guard enforcement. The neighbouring plugins do not help: `body_validator` returns `Continue` whenever the body is absent/empty or the `Content-Type` falls outside its `content_types` set (it validates matching bodies, it does not reject unlisted ones or require a body to be present), and `request_size_limiting` only enforces a `max_bytes` ceiling — neither offers a content-type allowlist-reject or a "body required" check. A true *"the backend never receives un-inspected traffic"* guarantee for non-JSON / no-`Content-Type` / malformed-JSON requests therefore requires a component that **actively rejects** non-conforming requests before the backend accepts them — a content-type allowlist plus a body-required policy enforced at a layer the gateway plugins do not currently provide for this purpose, and/or the backend itself refusing any request that is not a well-formed JSON `POST`.
+
+At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1). When `allowed_models` or `blocked_models` is configured, requests must include a non-empty string `model` field by default; missing or non-string model values fail closed with HTTP 400. Set `require_model_for_model_policy: false` only for compatibility with backends that intentionally derive the model outside the request body — the opt-out relaxes **only** the genuinely-absent case. A `model` that is present but invalid (a non-string value, or an empty/whitespace string) is still rejected with HTTP 400 even with the opt-out, so a malformed value can never skip the allow-/block-list.
 
 **Priority:** 2975
 
@@ -3788,6 +3814,7 @@ At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_mo
 | `default_max_tokens` | Integer | *(none)* | Inject `max_tokens` if not present |
 | `allowed_models` | String[] | `[]` | Whitelist of allowed model names (empty = allow all) |
 | `blocked_models` | String[] | `[]` | Blacklist of model names (takes precedence) |
+| `require_model_for_model_policy` | Boolean | `true` | Require a non-empty string `model` when `allowed_models` or `blocked_models` is configured. Set `false` to allow a genuinely-absent `model`; a present-but-invalid `model` (non-string or empty/whitespace) is rejected regardless |
 | `require_user_field` | Boolean | `false` | Require `user` field in request body |
 | `max_messages` | Integer | *(none)* | Maximum messages in the messages array |
 | `max_prompt_characters` | Integer | *(none)* | Maximum total characters across messages |

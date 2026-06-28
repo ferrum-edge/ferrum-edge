@@ -41,7 +41,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -157,6 +157,48 @@ enum AuthMethod {
     AwsSigV4 { config: aws_sigv4::AwsSigV4Config },
     /// Google OAuth2 via service account JWT
     GoogleOAuth2 { cache: Arc<OAuth2Cache> },
+}
+
+/// How ai_federation handles OpenAI content parts that are not plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultimodalMode {
+    /// Reject matched requests with non-text content parts before dispatch.
+    Reject,
+    /// Translate non-text parts into provider-native request shapes when this
+    /// plugin has an explicit preservation mapping.
+    Translate,
+    /// Drop non-text parts intentionally, send only text, and record metadata
+    /// so downstream logs make the omission visible.
+    TextOnlyWithWarning,
+}
+
+impl MultimodalMode {
+    fn from_str(s: &str, provider_name: &str) -> Result<Self, String> {
+        match s {
+            "reject" => Ok(Self::Reject),
+            "translate" => Ok(Self::Translate),
+            "text_only_with_warning" => Ok(Self::TextOnlyWithWarning),
+            other => Err(format!(
+                "ai_federation: provider '{provider_name}' unknown multimodal_mode '{other}' (expected reject, translate, or text_only_with_warning)"
+            )),
+        }
+    }
+
+    fn default_for_provider(provider_type: ProviderType) -> Self {
+        if provider_type.is_openai_compatible() || provider_type == ProviderType::Cohere {
+            Self::Translate
+        } else {
+            Self::Reject
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Translate => "translate",
+            Self::TextOnlyWithWarning => "text_only_with_warning",
+        }
+    }
 }
 
 /// Cached OAuth2 access token with expiry.
@@ -299,6 +341,7 @@ struct ResolvedProvider {
     model_patterns: Vec<String>,
     model_mapping: HashMap<String, String>,
     default_model: Option<String>,
+    multimodal_mode: MultimodalMode,
     /// Per-provider connect deadline applied via Ferrum's patched reqwest
     /// per-request override.
     connect_timeout: Duration,
@@ -554,6 +597,10 @@ impl AiFederation {
             let model_mapping = optional_string_map(pv, "model_mapping")?.unwrap_or_default();
 
             let default_model = pv["default_model"].as_str().map(String::from);
+            let multimodal_mode = match optional_str(pv, "multimodal_mode")? {
+                Some(mode) => MultimodalMode::from_str(mode, &name)?,
+                None => MultimodalMode::default_for_provider(provider_type),
+            };
 
             let connect_timeout =
                 Duration::from_secs(optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5));
@@ -614,6 +661,7 @@ impl AiFederation {
                 model_patterns,
                 model_mapping,
                 default_model,
+                multimodal_mode,
                 connect_timeout,
                 read_timeout,
                 base_url,
@@ -685,6 +733,16 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         .as_bool()
         .map(Some)
         .ok_or_else(|| format!("ai_federation: '{field}' must be a boolean"))
+}
+
+fn optional_str<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| format!("ai_federation: '{field}' must be a string"))
 }
 
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -1105,7 +1163,11 @@ fn translate_openai_compatible(
     openai_body: &Value,
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
-    let mut body = openai_body.clone();
+    let mut body = if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning {
+        text_only_openai_body(openai_body)
+    } else {
+        openai_body.clone()
+    };
     body["model"] = Value::String(resolved_model.to_string());
 
     // For Azure, strip the model field — the deployment is in the URL
@@ -1125,12 +1187,10 @@ fn translate_openai_compatible(
 
 /// OpenAI chat-completions messages accept `content` as either a plain
 /// string OR an array of content parts (`[{"type":"text","text":"..."},
-/// {"type":"image_url","image_url":{...}}, ...]`). The text-only
-/// translation targets used by other providers only carry text, so we
-/// need to flatten array-form content down to its `text` parts. Using
-/// `Value::as_str` alone silently drops every multimodal message —
-/// including system prompts that operators rely on for safety
-/// guardrails.
+/// {"type":"image_url","image_url":{...}}, ...]`). This helper extracts
+/// text parts only. Callers must run the explicit multimodal policy first:
+/// it is used for instruction text and the opt-in `text_only_with_warning`
+/// path, not as an implicit fallback.
 fn flatten_openai_message_text(content: &Value) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();
@@ -1138,10 +1198,7 @@ fn flatten_openai_message_text(content: &Value) -> String {
     if let Some(parts) = content.as_array() {
         let mut out = String::new();
         for part in parts {
-            // OpenAI's spec: `{"type": "text", "text": "..."}`. Anything
-            // without a `text` field (image_url, input_audio, etc.) is
-            // intentionally omitted — the destination request schemas
-            // here are text-only.
+            // OpenAI's spec: `{"type": "text", "text": "..."}`.
             if part.get("type").and_then(Value::as_str) == Some("text")
                 && let Some(text) = part.get("text").and_then(Value::as_str)
                 && !text.is_empty()
@@ -1155,6 +1212,671 @@ fn flatten_openai_message_text(content: &Value) -> String {
         return out;
     }
     String::new()
+}
+
+fn text_only_openai_body(openai_body: &Value) -> Value {
+    let mut body = openai_body.clone();
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(obj) = message.as_object_mut()
+                && obj.get("content").is_some()
+            {
+                let text = flatten_openai_message_text(&obj["content"]);
+                obj.insert("content".to_string(), Value::String(text));
+            }
+        }
+    }
+    body
+}
+
+#[derive(Debug, Clone)]
+struct MultimodalUsage {
+    non_text_parts: usize,
+    types: BTreeSet<String>,
+    roles: BTreeSet<String>,
+}
+
+impl MultimodalUsage {
+    fn is_empty(&self) -> bool {
+        self.non_text_parts == 0
+    }
+
+    fn types_csv(&self) -> String {
+        self.types.iter().cloned().collect::<Vec<_>>().join(",")
+    }
+
+    fn roles_csv(&self) -> String {
+        self.roles.iter().cloned().collect::<Vec<_>>().join(",")
+    }
+}
+
+fn analyze_multimodal_usage(openai_body: &Value) -> MultimodalUsage {
+    let mut usage = MultimodalUsage {
+        non_text_parts: 0,
+        types: BTreeSet::new(),
+        roles: BTreeSet::new(),
+    };
+
+    let Some(messages) = openai_body.get("messages").and_then(Value::as_array) else {
+        return usage;
+    };
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("text")
+                && part.get("text").and_then(Value::as_str).is_some()
+            {
+                continue;
+            }
+
+            usage.non_text_parts += 1;
+            usage.roles.insert(role.to_string());
+            usage.types.insert(
+                part.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+            );
+        }
+    }
+
+    usage
+}
+
+fn is_instruction_role(role: &str) -> bool {
+    role == "system" || role == "developer"
+}
+
+fn multimodal_unsupported_message(
+    provider: &ResolvedProvider,
+    usage: &MultimodalUsage,
+    reason: &str,
+) -> String {
+    format!(
+        "Multimodal content cannot be sent to ai_federation provider '{}' ({}) with multimodal_mode='{}': {reason}; found {} non-text content part(s), types [{}], roles [{}]",
+        provider.name,
+        provider.provider_type.as_str(),
+        provider.multimodal_mode.as_str(),
+        usage.non_text_parts,
+        usage.types_csv(),
+        usage.roles_csv()
+    )
+}
+
+fn validate_multimodal_policy(
+    provider: &ResolvedProvider,
+    openai_body: &Value,
+    usage: &MultimodalUsage,
+) -> Result<(), String> {
+    if usage.is_empty() {
+        return Ok(());
+    }
+
+    match provider.multimodal_mode {
+        MultimodalMode::Reject => Err(multimodal_unsupported_message(
+            provider,
+            usage,
+            "the provider is configured to reject non-text content",
+        )),
+        MultimodalMode::TextOnlyWithWarning => Ok(()),
+        MultimodalMode::Translate => validate_multimodal_translate_support(provider, openai_body)
+            .map_err(|reason| multimodal_unsupported_message(provider, usage, &reason)),
+    }
+}
+
+fn validate_multimodal_translate_support(
+    provider: &ResolvedProvider,
+    openai_body: &Value,
+) -> Result<(), String> {
+    if provider.provider_type.is_openai_compatible()
+        || provider.provider_type == ProviderType::Cohere
+    {
+        return Ok(());
+    }
+
+    let messages = openai_body["messages"]
+        .as_array()
+        .ok_or_else(|| "request missing 'messages' array".to_string())?;
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("text") {
+                if part.get("text").and_then(Value::as_str).is_some() {
+                    continue;
+                }
+                return Err("text content part missing text field".to_string());
+            }
+
+            let part_type = part
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if is_instruction_role(role) {
+                return Err(format!(
+                    "non-text content part '{part_type}' is not supported in {role} messages for provider-native translation"
+                ));
+            }
+            if role != "user" && role != "assistant" {
+                return Err(format!(
+                    "non-text content part '{part_type}' is not supported for role '{role}'"
+                ));
+            }
+            if part_type != "image_url" {
+                return Err(format!(
+                    "non-text content part '{part_type}' has no provider-native translation"
+                ));
+            }
+
+            // Bedrock only allows image (and document) content blocks on
+            // `user` messages — the Converse `Message` API rejects images in
+            // `assistant` messages. Reject here so it is a clean gate 400
+            // instead of an upstream 502 that the default fallback never
+            // retries. (Instruction roles are already rejected above; this
+            // narrows the remaining user/assistant set to user-only.)
+            if provider.provider_type == ProviderType::AwsBedrock && role != "user" {
+                return Err(format!(
+                    "AWS Bedrock Converse only allows image content in user messages, not '{role}' messages"
+                ));
+            }
+
+            match provider.provider_type {
+                // Anthropic's Messages API accepts both base64 data URLs and
+                // remote `https`/`http` image sources. Validate the data-URL
+                // media type here (jpeg/png/gif/webp only) so an unsupported
+                // type like `image/svg+xml` is a clean gate 400 rather than an
+                // upstream 502 the default fallback never retries; remote URLs
+                // carry no media type, so only their scheme is checked.
+                ProviderType::Anthropic => {
+                    let url = image_url_value(part)?;
+                    if url.starts_with("data:") {
+                        let parsed = parse_image_data_url(url)?;
+                        anthropic_image_media_type(parsed.media_type)?;
+                    } else {
+                        validate_openai_image_url(part)?;
+                    }
+                }
+                // Gemini/Vertex translation accepts a base64 data URL
+                // (`inlineData`) or a provider-fetchable URI — a `gs://` GCS URI
+                // or a Files API URI (`.../v1beta/files/...`) emitted as
+                // `fileData.fileUri`. This plugin does not fetch/inline arbitrary
+                // public `http(s)` URLs, so those are rejected at the gate
+                // instead of producing an opaque provider rejection (502).
+                ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
+                    classify_gemini_image_url(part)?;
+                }
+                ProviderType::AwsBedrock => {
+                    let url = image_url_value(part)?;
+                    let parsed = parse_image_data_url(url).map_err(|e| {
+                        format!("AWS Bedrock Converse only supports image_url data URLs: {e}")
+                    })?;
+                    // Validate the concrete format here so the gate (a clean
+                    // 400) is the single source of truth — otherwise an
+                    // unsupported format (e.g. svg+xml/bmp/tiff) passes the
+                    // gate and fails later in `openai_content_to_bedrock_blocks`
+                    // via the translation-error path as a 502.
+                    bedrock_image_format(parsed.media_type)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_openai_image_url(part: &Value) -> Result<(), String> {
+    let url = image_url_value(part)?;
+
+    if url.starts_with("data:") {
+        parse_image_data_url(url)?;
+        return Ok(());
+    }
+
+    let parsed = Url::parse(url).map_err(|e| format!("image_url.url is not a valid URL: {e}"))?;
+    match parsed.scheme() {
+        "https" | "http" => Ok(()),
+        other => Err(format!(
+            "image_url.url scheme '{other}' is unsupported (expected https, http, or data)"
+        )),
+    }
+}
+
+struct ParsedImageDataUrl<'a> {
+    media_type: &'a str,
+    data: &'a str,
+}
+
+/// Decode a base64 image payload from a `data:` URL. Padding is indifferent
+/// (clients sometimes strip trailing `=`); the alphabet is the standard `+/`
+/// set so a URL-safe payload is rejected rather than silently corrupting the
+/// image bytes on the provider side.
+fn decode_image_base64(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    use base64::alphabet;
+    use base64::engine::DecodePaddingMode;
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+
+    const DECODER: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    DECODER.decode(data.as_bytes())
+}
+
+fn parse_image_data_url(url: &str) -> Result<ParsedImageDataUrl<'_>, String> {
+    let rest = url
+        .strip_prefix("data:")
+        .ok_or("image_url.url is not a data URL")?;
+    let (metadata, data) = rest
+        .split_once(',')
+        .ok_or("image_url data URL missing comma separator")?;
+    let metadata = metadata
+        .strip_suffix(";base64")
+        .ok_or("image_url data URL must be base64 encoded")?;
+
+    // The media type may carry parameters (e.g. `image/png;charset=utf-8`).
+    // Strip them so the bare type is what providers receive and what
+    // per-provider media-type checks see — Anthropic/Bedrock reject an
+    // unexpected parameterized `media_type`/`mimeType` string.
+    let media_type = metadata.split(';').next().unwrap_or(metadata).trim();
+
+    if !media_type.starts_with("image/") {
+        return Err(format!(
+            "image_url data URL media type '{media_type}' is not an image"
+        ));
+    }
+    if data.is_empty() {
+        return Err("image_url data URL has empty image data".to_string());
+    }
+    // Validate the payload is actually base64 so a malformed value
+    // (e.g. `not@@base64`) is a clean policy-gate 400 instead of an opaque
+    // provider 502 — the translators copy `data` verbatim into the provider
+    // request (Anthropic `source.data`, Gemini `inlineData.data`, Bedrock
+    // `source.bytes`), all of which expect valid base64 image bytes. Padding is
+    // indifferent (some clients strip trailing `=`); the alphabet stays
+    // standard (`+/`) so we never silently accept a URL-safe payload that would
+    // corrupt the image on the provider side.
+    decode_image_base64(data)
+        .map_err(|e| format!("image_url data URL has invalid base64 image data: {e}"))?;
+
+    Ok(ParsedImageDataUrl { media_type, data })
+}
+
+fn image_url_value(part: &Value) -> Result<&str, String> {
+    part.get("image_url")
+        .and_then(Value::as_object)
+        .and_then(|image_url| image_url.get("url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "image_url content part must include image_url.url".to_string())
+}
+
+fn openai_content_to_anthropic(content: &Value, mode: MultimodalMode) -> Result<Value, String> {
+    if mode == MultimodalMode::TextOnlyWithWarning {
+        return Ok(Value::String(flatten_openai_message_text(content)));
+    }
+    if let Some(text) = content.as_str() {
+        return Ok(Value::String(text.to_string()));
+    }
+    let Some(parts) = content.as_array() else {
+        return Ok(Value::String(String::new()));
+    };
+
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    out.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            Some("image_url") => {
+                let url = image_url_value(part)?;
+                if url.starts_with("data:") {
+                    let parsed = parse_image_data_url(url).map_err(|e| {
+                        format!("ai_federation: invalid image_url data URL for Anthropic translation: {e}")
+                    })?;
+                    // Defense-in-depth: the policy gate already rejects
+                    // unsupported media types, but re-validate so the translator
+                    // never emits an Anthropic `media_type` the API will reject.
+                    let media_type = anthropic_image_media_type(parsed.media_type)?;
+                    out.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": parsed.data
+                        }
+                    }));
+                } else {
+                    out.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": url
+                        }
+                    }));
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "ai_federation: unsupported multimodal content part '{other}' for Anthropic translation"
+                ));
+            }
+            None => {
+                return Err(
+                    "ai_federation: content part missing 'type' for Anthropic translation"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(Value::Array(out))
+}
+
+fn openai_content_to_gemini_parts(
+    content: &Value,
+    mode: MultimodalMode,
+) -> Result<Vec<Value>, String> {
+    if mode == MultimodalMode::TextOnlyWithWarning {
+        return Ok(vec![
+            json!({ "text": flatten_openai_message_text(content) }),
+        ]);
+    }
+    if let Some(text) = content.as_str() {
+        return Ok(vec![json!({ "text": text })]);
+    }
+    let Some(parts) = content.as_array() else {
+        return Ok(vec![json!({ "text": "" })]);
+    };
+
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push(json!({ "text": text }));
+                }
+            }
+            Some("image_url") => {
+                // Data URLs inline as `inlineData`; `gs://` GCS URIs and Files
+                // API URIs pass through as `fileData.fileUri`; arbitrary public
+                // `http(s)` URLs are rejected (Gemini cannot fetch them and this
+                // plugin does not fetch/inline them). The policy gate normally
+                // catches an unsupported URL first; this keeps the translator
+                // honest if it is ever called on its own.
+                match classify_gemini_image_url(part).map_err(|e| format!("ai_federation: {e}"))? {
+                    GeminiImageRef::Inline { parsed, mime_type } => {
+                        out.push(json!({
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": parsed.data
+                            }
+                        }));
+                    }
+                    GeminiImageRef::FileUri { uri, mime_type } => {
+                        // Google's `FileData` requires `mimeType` whenever
+                        // `fileUri` is set; emit the inferred type alongside it.
+                        out.push(json!({
+                            "fileData": {
+                                "mimeType": mime_type,
+                                "fileUri": uri
+                            }
+                        }));
+                    }
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "ai_federation: unsupported multimodal content part '{other}' for Gemini translation"
+                ));
+            }
+            None => {
+                return Err(
+                    "ai_federation: content part missing 'type' for Gemini translation".to_string(),
+                );
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(json!({ "text": "" }));
+    }
+    Ok(out)
+}
+
+/// How a Gemini/Vertex `image_url` should be translated.
+enum GeminiImageRef<'a> {
+    /// `data:` URL → inlined as `inlineData` (base64 bytes). Carries the
+    /// validated/canonical Gemini `mimeType`.
+    Inline {
+        parsed: ParsedImageDataUrl<'a>,
+        mime_type: &'static str,
+    },
+    /// `gs://` GCS URI or Files API URI → passed through as `fileData.fileUri`.
+    /// Google's `FileData` requires `mimeType` whenever `fileUri` is set, so we
+    /// infer it from the URI's file extension.
+    FileUri {
+        uri: &'a str,
+        mime_type: &'static str,
+    },
+}
+
+/// Classify a Gemini/Vertex `image_url` content part. Gemini `generateContent`
+/// accepts base64-inlined images (`inlineData`) and provider-fetchable URIs
+/// (`fileData.fileUri`): a `gs://` GCS URI or a Files API URI
+/// (`https://generativelanguage.googleapis.com/v1beta/files/...`). It does NOT
+/// fetch arbitrary public `http(s)` URLs, and this plugin never fetches/inlines
+/// them either, so those are rejected.
+///
+/// For both forms the MIME type is validated/derived here so the gate (a clean
+/// 400) is the single source of truth: an inline data URL with an unsupported
+/// type (e.g. `image/svg+xml`) and a `fileData` URI whose `mimeType` cannot be
+/// determined are rejected before dispatch instead of producing an opaque
+/// upstream 400 the default fallback never retries.
+///
+/// For `fileData` URIs the `mimeType` is resolved from (1) an explicit
+/// `image_url.mime_type` field on the part, else (2) the URI's file extension.
+/// Files API URIs (`files/abc123`) carry no extension, so callers reference them
+/// by adding `mime_type` to the `image_url` object.
+fn classify_gemini_image_url(part: &Value) -> Result<GeminiImageRef<'_>, String> {
+    let url = image_url_value(part)?;
+    if url.starts_with("data:") {
+        let parsed = parse_image_data_url(url).map_err(|e| {
+            format!("Gemini/Vertex image translation: invalid image_url data URL: {e}")
+        })?;
+        let mime_type = gemini_image_mime_type(parsed.media_type)?;
+        return Ok(GeminiImageRef::Inline { parsed, mime_type });
+    }
+    if url.starts_with("gs://") || is_gemini_files_api_uri(url) {
+        let mime_type = gemini_file_uri_mime_type(part, url)?;
+        return Ok(GeminiImageRef::FileUri {
+            uri: url,
+            mime_type,
+        });
+    }
+    Err(format!(
+        "Gemini/Vertex image translation only supports image_url data URLs, gs:// GCS URIs, or Files API URIs (arbitrary remote URL '{url}' is not fetched/inlined)"
+    ))
+}
+
+/// Gemini's `generateContent` vision input accepts a limited set of image MIME
+/// types. Returns the canonical `mimeType` string to send upstream, or an error
+/// for anything else (e.g. `image/svg+xml`, `image/bmp`, `image/tiff`).
+fn gemini_image_mime_type(media_type: &str) -> Result<&'static str, String> {
+    match media_type {
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg"),
+        "image/png" => Ok("image/png"),
+        "image/webp" => Ok("image/webp"),
+        "image/heic" => Ok("image/heic"),
+        "image/heif" => Ok("image/heif"),
+        other => Err(format!(
+            "ai_federation: unsupported Gemini image media type '{other}' (expected jpeg, png, webp, heic, or heif)"
+        )),
+    }
+}
+
+/// Resolve the Gemini `fileData.mimeType` for a `gs://`/Files API URI. Google's
+/// `FileData` requires `mimeType` whenever `fileUri` is set, but the URI itself
+/// carries no declared type, so it is resolved from an explicit
+/// `image_url.mime_type` field first, then the URI's file extension. When
+/// neither is available (e.g. an extensionless Files API URI without an explicit
+/// `mime_type`) the request is rejected at the gate rather than emitting a
+/// `fileData` block the provider rejects.
+fn gemini_file_uri_mime_type(part: &Value, uri: &str) -> Result<&'static str, String> {
+    if let Some(explicit) = part
+        .get("image_url")
+        .and_then(Value::as_object)
+        .and_then(|image_url| image_url.get("mime_type"))
+        .and_then(Value::as_str)
+    {
+        return gemini_image_mime_type(explicit);
+    }
+
+    // Strip any query/fragment, then take the segment after the last '.'.
+    let path = uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(uri)
+        .trim_end_matches('/');
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.rsplit_once('.').map(|(_, ext)| ext))
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => Ok("image/jpeg"),
+        Some("png") => Ok("image/png"),
+        Some("webp") => Ok("image/webp"),
+        Some("heic") => Ok("image/heic"),
+        Some("heif") => Ok("image/heif"),
+        _ => Err(format!(
+            "Gemini/Vertex image translation: cannot determine a supported image mimeType for fileData URI '{uri}' (add an explicit image_url.mime_type, or use a .jpg/.jpeg/.png/.webp/.heic/.heif extension)"
+        )),
+    }
+}
+
+/// True for a Gemini Files API URI, e.g.
+/// `https://generativelanguage.googleapis.com/v1beta/files/abc123`. The host
+/// must be the Generative Language API and the path must reference `/files/`.
+fn is_gemini_files_api_uri(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    if parsed.host_str() != Some("generativelanguage.googleapis.com") {
+        return false;
+    }
+    parsed.path().contains("/files/")
+}
+
+fn bedrock_image_format(media_type: &str) -> Result<&'static str, String> {
+    match media_type {
+        "image/png" => Ok("png"),
+        "image/jpeg" | "image/jpg" => Ok("jpeg"),
+        "image/gif" => Ok("gif"),
+        "image/webp" => Ok("webp"),
+        other => Err(format!(
+            "ai_federation: unsupported Bedrock image media type '{other}'"
+        )),
+    }
+}
+
+/// Anthropic's Messages API only accepts JPEG, PNG, GIF, and WebP image media
+/// types. Returns the canonical `media_type` string to send upstream, or an
+/// error for anything else (e.g. `image/svg+xml`, `image/bmp`).
+fn anthropic_image_media_type(media_type: &str) -> Result<&'static str, String> {
+    match media_type {
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg"),
+        "image/png" => Ok("image/png"),
+        "image/gif" => Ok("image/gif"),
+        "image/webp" => Ok("image/webp"),
+        other => Err(format!(
+            "ai_federation: unsupported Anthropic image media type '{other}' (expected jpeg, png, gif, or webp)"
+        )),
+    }
+}
+
+fn openai_content_to_bedrock_blocks(
+    content: &Value,
+    mode: MultimodalMode,
+) -> Result<Vec<Value>, String> {
+    if mode == MultimodalMode::TextOnlyWithWarning {
+        return Ok(vec![
+            json!({ "text": flatten_openai_message_text(content) }),
+        ]);
+    }
+    if let Some(text) = content.as_str() {
+        return Ok(vec![json!({ "text": text })]);
+    }
+    let Some(parts) = content.as_array() else {
+        return Ok(vec![json!({ "text": "" })]);
+    };
+
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push(json!({ "text": text }));
+                }
+            }
+            Some("image_url") => {
+                let url = image_url_value(part)?;
+                let parsed = parse_image_data_url(url).map_err(|e| {
+                    format!(
+                        "ai_federation: AWS Bedrock Converse image_url translation requires a data URL: {e}"
+                    )
+                })?;
+                out.push(json!({
+                    "image": {
+                        "format": bedrock_image_format(parsed.media_type)?,
+                        "source": {
+                            "bytes": parsed.data
+                        }
+                    }
+                }));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "ai_federation: unsupported multimodal content part '{other}' for Bedrock translation"
+                ));
+            }
+            None => {
+                return Err(
+                    "ai_federation: content part missing 'type' for Bedrock translation"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(json!({ "text": "" }));
+    }
+    Ok(out)
 }
 
 fn translate_to_anthropic(
@@ -1172,7 +1894,7 @@ fn translate_to_anthropic(
     // dropped.
     let system_parts: Vec<String> = messages
         .iter()
-        .filter(|m| m["role"].as_str() == Some("system"))
+        .filter(|m| m["role"].as_str().is_some_and(is_instruction_role))
         .map(|m| flatten_openai_message_text(&m["content"]))
         .filter(|s| !s.is_empty())
         .collect();
@@ -1184,8 +1906,14 @@ fn translate_to_anthropic(
             let role = m["role"].as_str().unwrap_or("");
             role == "user" || role == "assistant"
         })
-        .cloned()
-        .collect();
+        .map(|m| {
+            let role = m["role"].as_str().unwrap_or("user");
+            Ok(json!({
+                "role": role,
+                "content": openai_content_to_anthropic(&m["content"], provider.multimodal_mode)?
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     let max_tokens = openai_body["max_tokens"]
         .as_u64()
@@ -1240,14 +1968,14 @@ fn translate_to_gemini(
     // string or a multimodal parts array; flatten to text either way.
     let system_parts: Vec<Value> = messages
         .iter()
-        .filter(|m| m["role"].as_str() == Some("system"))
+        .filter(|m| m["role"].as_str().is_some_and(is_instruction_role))
         .map(|m| flatten_openai_message_text(&m["content"]))
         .filter(|s| !s.is_empty())
         .map(|text| json!({ "text": text }))
         .collect();
 
-    // Map user/assistant messages → contents. Flatten OpenAI multimodal
-    // content arrays to plain text — this Gemini path is text-only.
+    // Map user/assistant messages → Gemini contents, preserving supported
+    // image_url parts when `multimodal_mode = translate`.
     let contents: Vec<Value> = messages
         .iter()
         .filter(|m| {
@@ -1259,12 +1987,12 @@ fn translate_to_gemini(
                 "assistant" => "model",
                 other => other,
             };
-            json!({
+            Ok(json!({
                 "role": role,
-                "parts": [{ "text": flatten_openai_message_text(&m["content"]) }]
-            })
+                "parts": openai_content_to_gemini_parts(&m["content"], provider.multimodal_mode)?
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     let mut body = json!({ "contents": contents });
 
@@ -1314,14 +2042,14 @@ fn translate_to_bedrock(
     // parts array; flatten both forms.
     let system_blocks: Vec<Value> = messages
         .iter()
-        .filter(|m| m["role"].as_str() == Some("system"))
+        .filter(|m| m["role"].as_str().is_some_and(is_instruction_role))
         .map(|m| flatten_openai_message_text(&m["content"]))
         .filter(|s| !s.is_empty())
         .map(|text| json!({ "text": text }))
         .collect();
 
-    // Map user/assistant messages to Bedrock Converse format. Flatten
-    // multimodal content to text — this path is text-only.
+    // Map user/assistant messages to Bedrock Converse format, preserving
+    // supported data URL image_url parts when `multimodal_mode = translate`.
     let bedrock_messages: Vec<Value> = messages
         .iter()
         .filter(|m| {
@@ -1329,12 +2057,12 @@ fn translate_to_bedrock(
             role == "user" || role == "assistant"
         })
         .map(|m| {
-            json!({
+            Ok(json!({
                 "role": m["role"].as_str().unwrap_or("user"),
-                "content": [{ "text": flatten_openai_message_text(&m["content"]) }]
-            })
+                "content": openai_content_to_bedrock_blocks(&m["content"], provider.multimodal_mode)?
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     let mut body = json!({ "messages": bedrock_messages });
 
@@ -1377,7 +2105,11 @@ fn translate_to_cohere(
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
     // Cohere v2 Chat API accepts OpenAI-style messages, but with its own model field
-    let mut body = openai_body.clone();
+    let mut body = if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning {
+        text_only_openai_body(openai_body)
+    } else {
+        openai_body.clone()
+    };
     body["model"] = Value::String(resolved_model.to_string());
 
     // Remove fields Cohere doesn't support
@@ -2100,10 +2832,21 @@ impl Plugin for AiFederation {
             );
         }
 
+        let multimodal_usage = analyze_multimodal_usage(&openai_body);
+
         // Try providers in priority order with fallback
         let mut last_error: Option<String> = None;
         let mut last_status: Option<u16> = None;
         let mut last_body: Option<Vec<u8>> = None;
+        // Multimodal capability is provider-SPECIFIC: a reject-mode (or a
+        // translate-mode provider that can't translate this particular part,
+        // e.g. Bedrock + an unsupported image format) provider failing the
+        // policy gate must not abort the whole fallback chain — a later
+        // provider may still serve the request. We record the last such
+        // rejection so that, if EVERY provider is exhausted on policy alone
+        // (no provider was ever dialed), we can return a clean 400 instead of
+        // a generic 502.
+        let mut last_multimodal_rejection: Option<String> = None;
 
         let provider_count = matching_providers.len();
         for (idx, provider) in matching_providers.iter().enumerate() {
@@ -2135,6 +2878,49 @@ impl Plugin for AiFederation {
                     "invalid_request_error",
                     Some("model"),
                     Some("invalid_model"),
+                );
+            }
+
+            if let Err(message) =
+                validate_multimodal_policy(provider, &openai_body, &multimodal_usage)
+            {
+                warn!(
+                    provider = %provider.name,
+                    provider_type = %provider.provider_type.as_str(),
+                    multimodal_mode = %provider.multimodal_mode.as_str(),
+                    non_text_parts = multimodal_usage.non_text_parts,
+                    part_types = %multimodal_usage.types_csv(),
+                    roles = %multimodal_usage.roles_csv(),
+                    "ai_federation: provider cannot serve multimodal request, trying fallback"
+                );
+                last_multimodal_rejection = Some(message);
+                // Per-provider policy rejection — fall through to the next
+                // provider exactly like a per-provider translation failure
+                // does, instead of aborting the whole chain. This lets a
+                // mixed list (e.g. a reject-mode provider followed by a
+                // translate-mode one) serve the image from the later provider.
+                if self.fallback_enabled && !is_last_provider {
+                    continue;
+                }
+                break;
+            }
+
+            if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                && !multimodal_usage.is_empty()
+            {
+                // Per-attempt warning only. The `ai_federation_multimodal_*`
+                // audit/chargeback metadata is written at COMMIT time (next to
+                // `write_token_metadata`, once this provider actually serves the
+                // request) — not here. If this provider later fails over to a
+                // `translate`-mode provider that preserves the image, writing the
+                // "dropped" metadata now would misreport the serving provider.
+                warn!(
+                    provider = %provider.name,
+                    provider_type = %provider.provider_type.as_str(),
+                    non_text_parts = multimodal_usage.non_text_parts,
+                    part_types = %multimodal_usage.types_csv(),
+                    roles = %multimodal_usage.roles_csv(),
+                    "ai_federation: dropping non-text multimodal content by explicit text_only_with_warning policy"
                 );
             }
 
@@ -2219,6 +3005,19 @@ impl Plugin for AiFederation {
                         &resolved_model,
                     );
 
+                    // Record the multimodal-drop audit/chargeback metadata only
+                    // now that THIS provider has committed to serving the
+                    // request. Writing it pre-dispatch would leave stale "parts
+                    // dropped" keys (naming the wrong provider) in the
+                    // transaction log if a `text_only_with_warning` provider
+                    // failed over to a later `translate` provider that preserved
+                    // the image.
+                    if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                        && !multimodal_usage.is_empty()
+                    {
+                        self.write_multimodal_text_only_metadata(ctx, provider, &multimodal_usage);
+                    }
+
                     info!(
                         provider = %provider.name,
                         model = %resolved_model,
@@ -2292,6 +3091,15 @@ impl Plugin for AiFederation {
                 body: Bytes::from(body),
                 headers: resp_headers,
             }
+        } else if last_error.is_none()
+            && let Some(message) = last_multimodal_rejection
+        {
+            // No provider was ever dialed and no wire error occurred — every
+            // matching provider declined the multimodal request at the policy
+            // gate. This is purely a client-input problem, so return a clean
+            // 400 (preserving the single-provider behavior) rather than a
+            // generic 502.
+            self.error_response(400, &message)
         } else {
             self.openai_error_response(
                 502,
@@ -2342,6 +3150,48 @@ impl AiFederation {
             "ai_federation_provider".to_string(),
             provider_name.to_string(),
         );
+    }
+
+    fn write_multimodal_text_only_metadata(
+        &self,
+        ctx: &mut RequestContext,
+        provider: &ResolvedProvider,
+        usage: &MultimodalUsage,
+    ) {
+        ctx.metadata.insert(
+            "ai_federation_multimodal_mode".to_string(),
+            provider.multimodal_mode.as_str().to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_federation_multimodal_dropped_parts".to_string(),
+            usage.non_text_parts.to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_federation_multimodal_dropped_types".to_string(),
+            usage.types_csv(),
+        );
+        ctx.metadata.insert(
+            "ai_federation_multimodal_dropped_roles".to_string(),
+            usage.roles_csv(),
+        );
+        ctx.metadata.insert(
+            "ai_federation_multimodal_provider".to_string(),
+            provider.name.clone(),
+        );
+    }
+
+    /// Build a JSON error response using the ai_federation error envelope.
+    fn error_response(&self, status: u16, message: &str) -> PluginResult {
+        self.json_reject_response(
+            status,
+            json!({
+                "error": {
+                    "message": message,
+                    "type": "ai_federation_error",
+                    "code": status
+                }
+            }),
+        )
     }
 
     fn openai_error_response(
@@ -2463,6 +3313,10 @@ pub mod test_helpers {
             .map(String::from);
         let google_region = provider_config["google_region"].as_str().map(String::from);
         let aws_region = provider_config["aws_region"].as_str().map(String::from);
+        let multimodal_mode = match provider_config["multimodal_mode"].as_str() {
+            Some(mode) => MultimodalMode::from_str(mode, "test")?,
+            None => MultimodalMode::default_for_provider(pt),
+        };
 
         let url_template = build_url_template(
             pt,
@@ -2485,12 +3339,43 @@ pub mod test_helpers {
             model_patterns: Vec::new(),
             model_mapping: HashMap::new(),
             default_model: None,
+            multimodal_mode,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(60),
             base_url,
             url_template,
         };
         translate_request(&provider, openai_body, model)
+    }
+
+    /// Expose the multimodal `translate`-mode policy gate for tests.
+    ///
+    /// This is the single source of the HTTP `400` returned for unsupported
+    /// multimodal parts (e.g. Bedrock with a non-image / unsupported image
+    /// format, or Gemini/Vertex with a remote HTTP(S) image URL). It runs
+    /// before any provider is dialed.
+    pub fn validate_multimodal_translate_support_test(
+        provider_type: &str,
+        openai_body: &Value,
+    ) -> Result<(), String> {
+        let pt = ProviderType::from_str(provider_type)?;
+        let provider = ResolvedProvider {
+            name: "test".to_string(),
+            provider_type: pt,
+            auth: AuthMethod::BearerToken {
+                api_key: "test-key".to_string(),
+            },
+            priority: 1,
+            model_patterns: Vec::new(),
+            model_mapping: HashMap::new(),
+            default_model: None,
+            multimodal_mode: MultimodalMode::Translate,
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(60),
+            base_url: None,
+            url_template: UrlTemplate::Static(Arc::from("https://example.test/")),
+        };
+        validate_multimodal_translate_support(&provider, openai_body)
     }
 
     /// Expose URL building for tests so we can assert the template logic.
