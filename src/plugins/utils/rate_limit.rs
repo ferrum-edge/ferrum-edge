@@ -1023,6 +1023,16 @@ impl TokenUsageWindow {
         self.current_usage(now);
 
         if let Some(id) = reservation_id.filter(|id| *id != 0) {
+            // PERF: linear scan (and the `retain` below on full release) over the
+            // window's entries while the caller holds the per-key shard
+            // write-lock. O(n) in live entries for this key (n ≈
+            // window_seconds × RPS for a hot consumer/IP). This runs at most once
+            // per request (reconciliation is idempotent) and off the
+            // request-admission hot path, so it is acceptable today; if a single
+            // hot key with a long window makes this scan dominate, replace the
+            // VecDeque + scan with an id→index map (kept consistent across
+            // record_usage / retain / pop_back / window eviction) for O(1)
+            // lookup. Documented in docs/plugins.md (Local-mode performance).
             if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
                 let new_tokens = if delta >= 0 {
                     entry.tokens.saturating_add(delta as u64)

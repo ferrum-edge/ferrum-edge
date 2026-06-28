@@ -36,6 +36,23 @@ const RESERVED_WINDOW_INDEX_METADATA_KEY: &str = "ai_ratelimit_reserved_window_i
 const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
 const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
 const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
+/// Idempotency marker: set the first time this request's reservation is
+/// reconciled or released, then checked at the top of `reconcile_usage` so no
+/// later phase can apply a second correction. A single request can reach
+/// `reconcile_usage` more than once across phases — e.g. a non-2xx backend
+/// releases the reservation in `on_response_body`, and a *later* response-body
+/// plugin's rejection re-runs `after_proxy` (in rejection context), where
+/// `should_release_gateway_rejection` fires again for the same non-2xx backend.
+/// In local mode the per-entry `reservation_id` already makes the second release
+/// a no-op (the entry is gone), but the Redis backend has no per-entry id — it
+/// only subtracts `reserved` from the shared window, so a double-release
+/// double-subtracts and under-counts the consumer's own window, permitting
+/// oversubscription (the exact bypass class this reservation model closes).
+/// This marker makes reconciliation idempotent across BOTH backends, mirroring
+/// the `FEDERATION_TOKENS_RECORDED_METADATA_KEY` dedup. Like that key it is a
+/// plain shared `ctx.metadata` entry (not per-instance) — a single
+/// `ai_rate_limiter` instance owns the reservation lifecycle for a request.
+const RESERVATION_RECONCILED_METADATA_KEY: &str = "ai_ratelimit_reservation_reconciled";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +440,29 @@ impl AiRateLimiter {
         actual_tokens: Option<u64>,
         unmetered_detail: &str,
     ) -> PluginResult {
+        // Idempotency gate: a request can reach `reconcile_usage` more than once
+        // across phases (e.g. a non-2xx release in `on_response_body` followed by
+        // a gateway-rejection re-run of `after_proxy` for the same non-2xx
+        // backend). The first call owns the reconciliation/release; any later
+        // call must be a clean no-op so the reservation is never released twice.
+        // Without this, the Redis backend — which has no per-entry reservation id
+        // and simply subtracts `reserved` from the shared window — double-subtracts
+        // and under-counts the consumer's own budget, allowing oversubscription.
+        // (Local mode already self-dedups via `reservation_id`; this makes the
+        // guard uniform across both backends.) Set the marker before doing any
+        // window work so an unmetered `reject` (which returns a 502 rather than
+        // `Continue`) is likewise reconciled exactly once.
+        if ctx
+            .metadata
+            .contains_key(RESERVATION_RECONCILED_METADATA_KEY)
+        {
+            return PluginResult::Continue;
+        }
+        ctx.metadata.insert(
+            RESERVATION_RECONCILED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+
         let reserved_tokens = Self::reserved_tokens(ctx);
         let reservation_id = Self::reservation_id(ctx);
         let reserved_window_index = Self::reserved_window_index(ctx);
@@ -1073,11 +1113,18 @@ impl Plugin for AiRateLimiter {
         // delivers the provider response via `RejectBinary`, so its after_proxy
         // always runs in rejection context and never records here — federation
         // reconciliation is handled by the `ai_federation_provider` branch below.
+        //
+        // Gated on the presence of a token reservation
+        // (`RESERVED_TOKENS_METADATA_KEY`), mirroring the proxy-side write in
+        // `run_after_proxy_hooks`: without a reservation the keep/release decision
+        // is moot (`should_release_gateway_rejection` requires `reserved > 0`), so
+        // recording the status only adds dead metadata — and a transaction-log
+        // field — to every request on the proxy, including non-AI ones.
         let in_rejection_context = ctx
             .metadata
             .get(REJECTION_RESPONSE_METADATA_KEY)
             .is_some_and(|value| value == "true");
-        if !in_rejection_context {
+        if !in_rejection_context && ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
             ctx.metadata.insert(
                 BACKEND_STATUS_METADATA_KEY.to_string(),
                 response_status.to_string(),

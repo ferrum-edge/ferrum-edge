@@ -1738,6 +1738,102 @@ async fn reject_mode_does_not_release_on_gateway_rejection() {
 }
 
 #[tokio::test]
+async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
+    // Regression for the Redis double-release: a non-2xx backend releases the
+    // reservation in `on_response_body`, and then a *later* response-body plugin's
+    // rejection re-runs `after_proxy` in rejection context, where
+    // `should_release_gateway_rejection` fires AGAIN for the same non-2xx backend.
+    // Both paths funnel through `reconcile_usage`, so without an idempotency marker
+    // the reservation is released twice. The local `TokenUsageWindow` self-dedups
+    // via `reservation_id` (the second release finds no matching entry → negative
+    // delta no-op), but the Redis backend has no per-entry id: it just subtracts
+    // `reserved` from the shared window, so a double-release double-subtracts and
+    // under-counts the consumer's own budget, permitting oversubscription.
+    //
+    // `reconcile_usage` now sets `ai_ratelimit_reservation_reconciled` on the first
+    // pass and short-circuits to `Continue` on any later pass, so the reservation
+    // is reconciled EXACTLY ONCE across both backends. This twin exercises the
+    // marker gate on the in-memory limiter; the assertions below would also catch
+    // the Redis double-subtract (which would drive the shared window below the
+    // single-release value).
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "non-2xx then a later plugin rejects");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "the pre-request reservation should be charged to the window"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_ratelimit_reservation_reconciled"),
+        "the reservation must not be marked reconciled before any response phase"
+    );
+
+    // Phase 1 — `on_response_body` with a non-2xx backend releases the full
+    // reservation (RELEASE #1) and marks the reservation reconciled.
+    let body = openai_response(500, 500);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        ctx.metadata
+            .contains_key("ai_ratelimit_reservation_reconciled"),
+        "the non-2xx release must mark the reservation reconciled"
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "the non-2xx response should release the reservation exactly once"
+    );
+
+    // Phase 2 — a later response-body plugin rejected, so the proxy sets the
+    // rejection marker and re-runs `after_proxy`. `should_release_gateway_rejection`
+    // would fire here (non-2xx backend, rejection, reserved > 0, not reject-mode),
+    // but the idempotency marker makes the second `reconcile_usage` a no-op
+    // (RELEASE #2 is suppressed). On Redis this is exactly the double-subtract that
+    // would otherwise corrupt the shared window.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut reject_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(&mut ctx, 500, &mut reject_headers).await);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "the reservation must be released exactly once, not twice"
+    );
+
+    // A fresh request must still see the full budget — the window was debited by
+    // exactly one reservation's worth, never below zero / under-counted (the Redis
+    // double-subtract symptom).
+    let mut next_ctx = ai_request_ctx(200, "follow-up after single release");
+    let mut next_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut next_ctx, &mut next_headers).await);
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved_tokens(&next_ctx),
+        "after a single release the window must reflect only the new reservation, \
+         proving no double-subtract drove the counter below the single-release value"
+    );
+}
+
+#[tokio::test]
 async fn federation_unmetered_reject_returns_502_from_after_proxy_in_isolation() {
     // DOCUMENTED LIMITATION (codex P1): this asserts only the *isolated* return
     // value of `after_proxy`. It does NOT prove the reject reaches the client on
