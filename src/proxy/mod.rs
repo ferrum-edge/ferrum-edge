@@ -151,6 +151,23 @@ fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
 /// invoked on a backend response" path (response_headers came from upstream).
 pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
+/// Marker recorded in `ctx.metadata` for the duration of
+/// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
+/// pipeline (`on_response_body`, `transform_response_body_with_context`,
+/// `on_final_response_body`) runs over a synthetic 2xx plugin short-circuit body
+/// rather than a real backend response. Unlike
+/// [`REJECTION_RESPONSE_METADATA_KEY`] (scoped to the `after_proxy` reject hooks
+/// only), this marker stays set across the body-hook phase so that a storing
+/// plugin's `on_final_response_body` can tell apart "this body was produced by a
+/// later `before_proxy`/backend-admission short-circuit" from a genuine backend
+/// response. `request_deduplication` reads this to avoid caching+replaying a
+/// synthetic short-circuit body (e.g. a `fault_injection`/`mesh_route_dispatch`
+/// 2xx abort) under the idempotency key — mirroring `response_caching`'s
+/// served-from-cache guard and `ai_semantic_cache`'s miss-only buffering key.
+/// Only ever set on the synthetic short-circuit path, so its presence is a
+/// precise signal; the normal buffered backend-response path never sets it.
+pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
 /// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
 /// range/partial response (`206` or carrying `Content-Range`), captured before
 /// any `after_proxy` hook can mutate the response headers. A plugin whose
@@ -11383,6 +11400,15 @@ async fn apply_synthetic_response_body_hooks(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
 ) {
+    // Mark the context for the duration of this body-hook phase so that storing
+    // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
+    // plugin short-circuit and skip caching/replaying it. Saved/restored so a
+    // pre-existing value is preserved and the marker never leaks past this phase.
+    let previous_synthetic_marker = ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
         let result = plugin
@@ -11455,6 +11481,17 @@ async fn apply_synthetic_response_body_hooks(
             reject,
         )
         .await;
+    }
+
+    // Restore the synthetic short-circuit marker to its prior state so it does
+    // not leak past this body-hook phase into later logging/metrics hooks.
+    if let Some(previous_synthetic_marker) = previous_synthetic_marker {
+        ctx.metadata.insert(
+            SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            previous_synthetic_marker,
+        );
+    } else {
+        ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
     }
 }
 

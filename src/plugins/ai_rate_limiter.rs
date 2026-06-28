@@ -98,11 +98,23 @@ impl AiRateLimiter {
         }
 
         // Scope the per-request federation idempotency flag to this limiter's
-        // budget dimension. Two instances with distinct budgets
-        // (limit_by/window/limit/count_mode/provider) get distinct keys so each
-        // records the federation tokens against its own window exactly once;
-        // instances that share an identical budget share one flag, which is the
-        // correct behavior because they track the same window.
+        // budget dimension. The key includes every budget-defining field
+        // (limit_by/window/limit/count_mode/provider) so that two instances with
+        // DIFFERENT budgets get DISTINCT keys, and each records the federation
+        // tokens against its own window exactly once even though `after_proxy`
+        // may run more than once on the synthetic short-circuit path.
+        //
+        // Instances that share an identical budget dimension intentionally share
+        // one flag. Note this is a deliberate trade-off, not a perfect-isolation
+        // guarantee: with the default LOCAL backend each instance owns a separate
+        // in-memory window, so two byte-identical limiters technically have
+        // distinct windows yet share this flag — the first to record sets it and
+        // the second skips, under-counting its own window for `ai_federation`
+        // traffic. That only happens under a redundant misconfiguration (two
+        // limiters with the exact same budget on one proxy); realistic
+        // per-consumer + per-IP setups differ in `limit_by` and so get distinct
+        // keys. If strict per-instance correctness is ever required, fold the
+        // plugin `id` into the key.
         let federation_flag_key = format!(
             "{FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX}:{limit_by}:{window_seconds}:{token_limit}:{count_mode}:{provider}"
         );
