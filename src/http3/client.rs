@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -2025,6 +2025,25 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Response-header wait bound (ms; `0` = unbounded). Normally
+        // `proxy.backend_read_timeout_ms`, but the native-H3 gRPC path overrides it
+        // with `0` when a client `grpc-timeout` is present so the outer absolute
+        // deadline governs the header wait instead of the (shorter) read timeout.
+        header_read_timeout_ms: u64,
+        // Set to `true` the instant `send_request` opens the backend stream (the
+        // request reaches the wire). The native-H3 gRPC dispatch wraps this future
+        // in an outer `timeout_at`; when that fires it inspects this flag — NOT the
+        // uploaded-byte count — to decide pre-wire (connect still in flight →
+        // capability downgrade) vs post-wire (stream already open → read timeout).
+        // A valid zero-message / trailers-only client-streaming RPC opens the stream
+        // with no body bytes, so byte count alone would misclassify it as pre-wire.
+        stream_opened: Arc<AtomicBool>,
+        // Set to `true` once the client request upload is fully forwarded and the
+        // backend stream is `finish`ed (i.e. we are now waiting on backend response
+        // headers). The native-H3 gRPC dispatch reads this to separate an upload-phase
+        // timeout (a stalled client — neutral for backend health) from a header-wait
+        // timeout (a slow backend — a real read-timeout fault).
+        upload_complete: Arc<AtomicBool>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
@@ -2040,6 +2059,15 @@ impl Http3ConnectionPool {
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
         for (name, value) in headers {
             match name.as_str() {
+                // `te: trailers` is the single hop-by-hop exception that MUST reach
+                // the backend: HTTP/3 permits only that one value (RFC 9114 §4.2) and
+                // strict gRPC backends require it. The native-H3 gRPC dispatch authors
+                // this header explicitly (after `build_h3_backend_headers` has already
+                // stripped any client-supplied `te`), so forward `te: trailers` as-is
+                // instead of dropping it with the generic hop-by-hop strip below.
+                "te" if value.as_bytes().eq_ignore_ascii_case(b"trailers") => {
+                    req_builder = req_builder.header(name, value);
+                }
                 // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
                 n if is_backend_request_strip_header(n) => continue,
                 _ => {
@@ -2053,6 +2081,11 @@ impl Http3ConnectionPool {
             .send_request(req)
             .await
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
+        // The stream is now open on the backend QUIC connection — the request has
+        // reached the wire. Any failure from here on is post-wire (the caller's
+        // dispatch `timeout_at` reads this to avoid misclassifying a slow upload /
+        // zero-message client-streaming RPC as a pre-wire connect failure).
+        stream_opened.store(true, Ordering::Release);
 
         // Stream request body: read chunks from frontend, forward to backend.
         // Uses Buf::copy_to_bytes() which is zero-copy when the underlying
@@ -2088,14 +2121,68 @@ impl Http3ConnectionPool {
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
+        // Forward client REQUEST trailers (trailing metadata) the client sent after
+        // the final DATA frame, before FINishing the backend stream — client- /
+        // bidi-streaming gRPC RPCs may carry them, and the H2 streaming gRPC path
+        // forwards them too. A trailer DECODE error means the inbound request is
+        // malformed (oversized / undecodable HEADERS block), so abort the request
+        // rather than silently dropping the trailing metadata and finishing the
+        // backend stream as if the client had sent none. Classified as a client
+        // request-body fault (post-wire, neutral for backend health — see
+        // `is_h3_client_request_body_disconnect`). Absent trailers are fine.
+        match frontend_stream.recv_trailers().await {
+            Ok(Some(mut trailers)) if !trailers.is_empty() => {
+                // Client request trailers are read AFTER the initial headers were
+                // stripped/sanitized, so a malicious client can smuggle hop-by-hop
+                // fields (`connection`, `te`, ...) or reserved gateway metadata
+                // (`x-consumer-*`, `x-path-param-*`) here that the gateway removed
+                // from the initial header block. Apply the same backend-request strip
+                // + reserved-name filter before forwarding. HTTP/3 header names are
+                // always lowercase, so exact lowercase comparisons suffice.
+                let strip: Vec<http::header::HeaderName> = trailers
+                    .keys()
+                    .filter(|n| {
+                        let s = n.as_str();
+                        is_backend_request_strip_header(s)
+                            || s == "x-consumer-username"
+                            || s == "x-consumer-custom-id"
+                            || s.starts_with("x-path-param-")
+                    })
+                    .cloned()
+                    .collect();
+                for name in strip {
+                    trailers.remove(&name);
+                }
+                // Only forward a still-non-empty block; an all-reserved trailer set
+                // collapses to nothing and must not emit an empty trailer frame.
+                if !trailers.is_empty() {
+                    backend_stream.send_trailers(trailers).await.map_err(|e| {
+                        H3PoolError::post_wire(anyhow::anyhow!(
+                            "send request trailers failed: {}",
+                            e
+                        ))
+                    })?;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                    "malformed client request trailers: {}",
+                    e
+                )));
+            }
+        }
         backend_stream
             .finish()
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        // The client upload (body + trailers) is fully forwarded and the backend
+        // send side is FINished — any timeout from here on is the backend being slow
+        // to return response headers, NOT a stalled client upload.
+        upload_complete.store(true, Ordering::Release);
 
         let response =
-            recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
-                .await?;
+            recv_h3_response_with_timeout(&mut backend_stream, header_read_timeout_ms).await?;
         let status = response.status().as_u16();
 
         let response_headers = collect_h3_response_headers(response.headers());
@@ -2222,6 +2309,19 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Response-header wait bound (ms; `0` = unbounded), forwarded to
+        // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
+        // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
+        // so the outer absolute deadline governs the header wait.
+        header_read_timeout_ms: u64,
+        // Flipped to `true` once the backend stream opens; the native-H3 gRPC
+        // dispatch reads it to distinguish pre-wire connect failures from post-wire
+        // read timeouts. Forwarded verbatim to `do_request_streaming_body`.
+        stream_opened: Arc<AtomicBool>,
+        // Flipped to `true` once the client upload is fully forwarded and the backend
+        // stream is FINished; lets the dispatch separate an upload-phase stall (client
+        // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
+        upload_complete: Arc<AtomicBool>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2249,6 +2349,9 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                header_read_timeout_ms,
+                Arc::clone(&stream_opened),
+                Arc::clone(&upload_complete),
             )
             .await
             {
@@ -2286,6 +2389,9 @@ impl Http3ConnectionPool {
             frontend_stream,
             max_request_body_size,
             bytes_seen,
+            header_read_timeout_ms,
+            stream_opened,
+            upload_complete,
         )
         .await
     }
@@ -2384,6 +2490,19 @@ impl Http3ConnectionPool {
         >,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
+        // Response-header wait bound (ms; `0` = unbounded), forwarded to
+        // `do_request_streaming_body`. Callers pass `proxy.backend_read_timeout_ms`
+        // normally; the native-H3 gRPC path passes `0` under a client `grpc-timeout`
+        // so the outer absolute deadline governs the header wait.
+        header_read_timeout_ms: u64,
+        // Flipped to `true` once the backend stream opens; the native-H3 gRPC
+        // dispatch reads it to distinguish pre-wire connect failures from post-wire
+        // read timeouts. Forwarded verbatim to `do_request_streaming_body`.
+        stream_opened: Arc<AtomicBool>,
+        // Flipped to `true` once the client upload is fully forwarded and the backend
+        // stream is FINished; lets the dispatch separate an upload-phase stall (client
+        // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
+        upload_complete: Arc<AtomicBool>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2409,6 +2528,9 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
+                header_read_timeout_ms,
+                Arc::clone(&stream_opened),
+                Arc::clone(&upload_complete),
             )
             .await
             {
@@ -2453,6 +2575,9 @@ impl Http3ConnectionPool {
             frontend_stream,
             max_request_body_size,
             bytes_seen,
+            header_read_timeout_ms,
+            stream_opened,
+            upload_complete,
         )
         .await
     }

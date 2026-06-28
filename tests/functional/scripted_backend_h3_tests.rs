@@ -1978,3 +1978,264 @@ async fn h2c_frontend_h3_backend_large_206_streams_not_buffered_502() {
         "H3 backend must have received the GET; recorded: {received:#?}"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Native H3 gRPC dispatch (`dispatch_grpc_native_h3`).
+//
+// A gRPC request received over the H3 frontend, whose concrete backend is
+// proven H3-capable, is streamed directly over the native QUIC backend pool —
+// NOT the H2-only gRPC pool. Because the scripted H3 backend speaks only QUIC
+// (no h2/h2c listener of its own), a successful gRPC round-trip PROVES native
+// H3 dispatch: the cross-protocol H2 gRPC bridge could never reach it. Each
+// test additionally asserts the H3 backend actually recorded the proxied gRPC
+// POST.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Length-prefixed gRPC message frame: `[compressed:1][len:u32 BE][payload]`.
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0u8); // not compressed
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Send a unary gRPC POST over the H3 frontend (`content-type: application/grpc`)
+/// and return the buffered response (status + headers + body + trailers).
+async fn h3_grpc_post(
+    harness: &GatewayHarness,
+    path: &str,
+    request_frame: Vec<u8>,
+) -> Result<crate::scaffolding::clients::Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+    let client = Http3Client::insecure()?;
+    let https_port = harness_proxy_https_port(harness)?;
+    let url = format!("https://127.0.0.1:{https_port}{path}");
+    let opts = crate::scaffolding::clients::GetOptions::default()
+        .method(http::Method::POST)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(bytes::Bytes::from(request_frame));
+    client.get_with_options(&url, opts).await
+}
+
+/// Build the colocated TCP+TLS (h2 ALPN) capability-probe backend used by the
+/// native-H3 gRPC tests so the capability registry can classify the target as
+/// H3-capable before traffic. The real gRPC request lands on the H3 backend.
+fn spawn_grpc_probe_tcp_backend(
+    listener: tokio::net::TcpListener,
+    cert: String,
+    key: String,
+) -> crate::scaffolding::backends::ScriptedTlsBackend {
+    ScriptedTlsBackend::builder(
+        listener,
+        TlsConfig::new(cert, key).with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls probe backend")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Unary gRPC over native H3: body framing + `grpc-status`/`grpc-message`
+// trailers must be preserved end to end.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_unary_preserves_body_and_trailers() {
+    let ca = TestCa::new("phase-h3-grpc-unary").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend =
+        spawn_grpc_probe_tcp_backend(tcp_res.into_listener(), cert.clone(), key.clone());
+
+    let reply_frame = grpc_frame(b"pong-from-h3-grpc");
+
+    // The script is consumed once per QUIC connection; the capability probe and
+    // the real request each get a fresh copy. Each serves a gRPC unary response:
+    // HEADERS(200, application/grpc) -> DATA(one framed message) -> terminal
+    // TRAILERS(grpc-status: 0, grpc-message: OK).
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "application/grpc".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from(reply_frame.clone())))
+        .step(H3Step::RespondTrailers(vec![
+            ("grpc-status", "0".to_string()),
+            ("grpc-message", "OK".to_string()),
+        ]))
+        // Keep the connection open after the trailers + FIN so the gateway reads
+        // the complete trailered response before the script-end connection drop
+        // (see `H3Step::RespondTrailers`).
+        .step(H3Step::StallFor(Duration::from_millis(100)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the gRPC request uses the native H3 backend path; entry: {entry:#?}"
+    );
+
+    let resp = match h3_grpc_post(&harness, "/api/echo.Echo/Unary", grpc_frame(b"ping")).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("native H3 gRPC unary request failed: {e}\n--- logs ---\n{logs}");
+        }
+    };
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "gRPC over native H3 must return HTTP 200; got {}\n--- logs ---\n{logs}",
+        resp.status
+    );
+    assert_eq!(
+        resp.headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/grpc"),
+        "content-type must be preserved as application/grpc; headers: {:#?}",
+        resp.headers
+    );
+    assert_eq!(
+        resp.grpc_status(),
+        Some(0),
+        "grpc-status trailer must be forwarded; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.grpc_message().as_deref(),
+        Some("OK"),
+        "grpc-message trailer must be forwarded; trailers: {:#?}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.body_bytes.as_ref(),
+        reply_frame.as_slice(),
+        "gRPC response body frame must be forwarded byte-for-byte"
+    );
+
+    // Proves native H3 dispatch: the H3-only backend recorded the proxied gRPC
+    // POST. The H2 gRPC bridge could never have reached this QUIC-only backend.
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/echo.Echo/Unary")),
+        "H3 backend must have received the proxied gRPC POST (native H3 dispatch); \
+         recorded: {received:#?}\n--- logs ---\n{logs}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Server-streaming gRPC over native H3: every DATA frame is relayed in order
+// and the terminal `grpc-status` trailer is preserved.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
+    let ca = TestCa::new("phase-h3-grpc-stream").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend =
+        spawn_grpc_probe_tcp_backend(tcp_res.into_listener(), cert.clone(), key.clone());
+
+    let frame_a = grpc_frame(b"stream-msg-1");
+    let frame_b = grpc_frame(b"stream-msg-2");
+    let frame_c = grpc_frame(b"stream-msg-3");
+    let mut expected_body = Vec::new();
+    expected_body.extend_from_slice(&frame_a);
+    expected_body.extend_from_slice(&frame_b);
+    expected_body.extend_from_slice(&frame_c);
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "application/grpc".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from(frame_a.clone())))
+        .step(H3Step::RespondData(bytes::Bytes::from(frame_b.clone())))
+        .step(H3Step::RespondData(bytes::Bytes::from(frame_c.clone())))
+        .step(H3Step::RespondTrailers(vec![(
+            "grpc-status",
+            "0".to_string(),
+        )]))
+        // Keep the connection open after the trailers + FIN so the gateway reads
+        // the complete trailered response before the script-end connection drop
+        // (see `H3Step::RespondTrailers`).
+        .step(H3Step::StallFor(Duration::from_millis(100)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported for native H3 gRPC server-streaming; entry: {entry:#?}"
+    );
+
+    let resp = match h3_grpc_post(&harness, "/api/echo.Echo/ServerStream", grpc_frame(b"go")).await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("native H3 gRPC server-streaming request failed: {e}\n--- logs ---\n{logs}");
+        }
+    };
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(resp.status.as_u16(), 200, "status; --- logs ---\n{logs}");
+    assert_eq!(
+        resp.grpc_status(),
+        Some(0),
+        "grpc-status trailer must be forwarded after the streamed frames; \
+         trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.body_bytes.as_ref(),
+        expected_body.as_slice(),
+        "all server-streaming gRPC frames must be relayed in order, byte-for-byte"
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received
+            .iter()
+            .any(|r| r.method == "POST" && r.path.ends_with("/echo.Echo/ServerStream")),
+        "H3 backend must have received the proxied gRPC POST (native H3 dispatch); \
+         recorded: {received:#?}\n--- logs ---\n{logs}"
+    );
+}

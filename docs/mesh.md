@@ -158,7 +158,7 @@ This section consolidates every known residual gap so operators do not have to r
 
 ### Federation / multi-cluster
 
-- **Live two-CP discovery round trip is verified in-process, not across real clusters by the default PR suite** — the gRPC dialer is covered by an in-process loopback round trip against a real `MeshSubscribe` server. A scheduled two-kind-cluster deploy smoke now lives under `tests/k8s/multicluster-federation/`; the full workload traffic/failure fixture is still required before claiming real-cluster bidirectional mTLS, endpoint failover, and network-failure recovery coverage. See [Cross-Cluster Endpoint Discovery](#cross-cluster-endpoint-discovery).
+- **Live two-CP discovery round trip is verified in-process; the cross-cluster DATAPATH is now verified across two real clusters** — the gRPC dialer is covered by an in-process loopback round trip against a real `MeshSubscribe` server, and `tests/k8s/multicluster-federation/` (workflow `.github/workflows/multicluster-federation-live.yml`) stands up two SPIRE-federated kind clusters (per-cluster trust domains, manual bundle exchange) and proves BIDIRECTIONAL authenticated cross-cluster east-west traffic over Sidecar mesh-mTLS (A→B and B→A both `200 svc-<dest>`) plus a destination-side MeshPolicy denial of a federated rogue (`403`), gated on `multicluster.*` live assertions. A lighter `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` smoke (the `Mesh Multicluster Federation` job in `ci.yml`) deploys + rolls out without driving traffic. Bundle rotation/removal, endpoint failover, and network-partition recovery remain to be added (Stage 3). See [Cross-Cluster Endpoint Discovery](#cross-cluster-endpoint-discovery).
 
 ## Failure-Mode Runbook
 

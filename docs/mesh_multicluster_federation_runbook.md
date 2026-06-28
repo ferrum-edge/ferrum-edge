@@ -107,21 +107,36 @@ The scheduled harness entry point is:
 tests/k8s/multicluster-federation/run.sh
 ```
 
-It creates or reuses two kind clusters, deploys Ferrum control planes and
-east-west gateways with independent SQLite databases and secrets, and records
-diagnostics under `${ARTIFACT_DIR:-.context/multicluster-federation}`. The PR
-`Mesh Multicluster Federation` job in `.github/workflows/ci.yml` runs it when
-mesh federation, discovery, identity, proxy, chart, image, proto, docs, config,
-or CI surfaces change. Manual `workflow_dispatch` runs force the same smoke
-regardless of changed paths. CI uses `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`,
-packages a Ferrum runtime image with the same
-`.github/actions/package-ferrum-runtime-image` path used by other kind-based
-jobs, then loads that image into both clusters.
-That proves two independent clusters and CP/east-west rollout only. Full mode
-intentionally exits non-zero until the workload traffic/failure fixture is
-completed, so no one can mistake deploy smoke for bidirectional mTLS, rotation,
-failover, and partition validation. The smoke sets
-`FERRUM_MESH_ALLOW_NO_CA=true` on the east-west gateways because it does not
-yet provision workload SVIDs. The script intentionally fails during preflight
-when Docker, kind, kubectl, or Helm are unavailable; do not treat a skipped
-local run as validation evidence.
+It runs in two modes:
+
+- **Live datapath (default):** creates two SPIRE-federated kind clusters
+  (per-cluster trust domains `cluster-a.test`/`cluster-b.test`, manual
+  `bundle show | bundle set` trust-bundle exchange), injects Sidecar mesh-mTLS
+  workloads — a `svc` whose inbound iptables init REDIRECTs the app port to
+  `:15006`, an east-west SNI-passthrough gateway on a NodePort, and
+  `client`/`rogue` sidecars — then drives BIDIRECTIONAL authenticated
+  cross-cluster traffic (A→B and B→A both return `200 svc-<dest>`) plus a
+  destination-side negative (the federated `rogue` is denied by a
+  `deny-peer-rogue` MeshPolicy → `403`/`Mesh authorization denied`). It emits and
+  gates on `multicluster.*` live assertions. Identity comes from the local SPIRE
+  Agent (`FERRUM_MESH_CA_BACKEND=spire_agent`) with REAL SVIDs provisioned, so
+  `FERRUM_MESH_ALLOW_NO_CA` is NOT set. The dest mesh document declares the peer
+  trust domain's bundle as a federated `trust_bundles` entry (Ferrum's inbound
+  verifier sources federated trust from the slice, not the SVID). This mode runs
+  in the dedicated `.github/workflows/multicluster-federation-live.yml` workflow
+  against disposable kind clusters and requires
+  `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`.
+- **Deploy-only smoke (`FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`):** stops after the
+  SPIRE/workload deploy and rollouts, before driving traffic. The PR
+  `Mesh Multicluster Federation` job in `.github/workflows/ci.yml` runs this on
+  mesh federation/discovery/identity/proxy/image/proto/docs/config/CI changes
+  (`workflow_dispatch` forces it regardless of paths). The Helm chart is NOT a
+  trigger and is NOT deployed — this fixture uses hand-crafted NodePort manifests
+  because the chart's east-west Service is ClusterIP-only and not cross-cluster
+  reachable; the chart is covered by the dedicated `Helm Chart` CI job.
+
+Diagnostics are recorded under `${ARTIFACT_DIR:-.context/multicluster-federation}`.
+Preflight requires `docker`, `kind`, `kubectl`, `curl`, and `python3` and
+intentionally fails when they are unavailable; do not treat a skipped local run
+as validation evidence. Bundle rotation/removal, endpoint failover, and
+network-partition recovery remain Stage 3 (marked `# STAGE 3:` in `run.sh`).
