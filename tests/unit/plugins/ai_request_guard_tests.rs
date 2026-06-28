@@ -1,7 +1,7 @@
 //! Tests for ai_request_guard plugin
 
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, ai_request_guard::AiRequestGuard, priority,
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ai_request_guard::AiRequestGuard, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,6 +24,19 @@ fn make_post_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers
+}
+
+fn assert_reject_error(result: PluginResult, expected_status: u16, expected_error: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, expected_status);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"], expected_error);
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
 }
 
 // ─── Plugin basics ──────────────────────────────────────────────────────
@@ -59,6 +72,9 @@ fn test_invalid_config_shapes_rejected() {
         json!({"max_tokens_limit": "1000"}),
         json!({"enforce_max_tokens": "truncate"}),
         json!({"default_max_tokens": "4096"}),
+        json!({"supported_schema": 123}),
+        json!({"supported_schema": "unsupported"}),
+        json!({"strict_schema": "true"}),
         json!({"allowed_models": "gpt-4"}),
         json!({"allowed_models": ["gpt-4", 123]}),
         json!({"blocked_models": ["gpt-4", false]}),
@@ -66,6 +82,8 @@ fn test_invalid_config_shapes_rejected() {
         json!({"max_messages": "10"}),
         json!({"max_prompt_characters": "1000"}),
         json!({"block_system_prompts": "false"}),
+        json!({"system_prompt_aliases": "policy"}),
+        json!({"system_prompt_aliases": ["policy", 123]}),
         json!({"required_metadata_fields": ["stream", 123]}),
     ] {
         let result = AiRequestGuard::new(&config);
@@ -318,6 +336,100 @@ async fn test_max_output_tokens_clamped() {
 }
 
 #[tokio::test]
+async fn provider_native_token_fields_are_rejected_over_limit() {
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
+
+    for body in [
+        json!({
+            "model": "gemini-2.0-flash",
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"maxOutputTokens": 2000}
+        }),
+        json!({
+            "model": "anthropic.claude-3-sonnet",
+            "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+            "inferenceConfig": {"maxTokens": 2000}
+        }),
+        json!({
+            "model": "legacy-anthropic",
+            "prompt": "Human: hello\n\nAssistant:",
+            "max_tokens_to_sample": 2000
+        }),
+        json!({
+            "model": "hf-model",
+            "inputs": "hello",
+            "max_new_tokens": 2000
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn provider_native_token_fields_are_clamped_in_metadata_and_transform() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 500,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "generationConfig": {"maxOutputTokens": 2000}
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    let updated_body: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(updated_body["generationConfig"]["maxOutputTokens"], 500);
+
+    let body = serde_json::to_vec(&json!({
+        "model": "anthropic.claude-3-sonnet",
+        "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        "inferenceConfig": {"maxTokens": 2000}
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(modified["inferenceConfig"]["maxTokens"], 500);
+}
+
+#[tokio::test]
+async fn default_max_tokens_uses_provider_native_containers_when_detected() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+
+    let gemini = serde_json::to_vec(&json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&gemini, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(modified["generationConfig"]["maxOutputTokens"], 256);
+
+    let bedrock = serde_json::to_vec(&json!({
+        "model": "anthropic.claude-3-sonnet",
+        "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        "inferenceConfig": {}
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&bedrock, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(modified["inferenceConfig"]["maxTokens"], 256);
+}
+
+#[tokio::test]
 async fn test_default_max_tokens_injected() {
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     assert!(plugin.modifies_request_body());
@@ -370,6 +482,41 @@ async fn test_max_messages_within_limit() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn max_messages_counts_responses_input_and_provider_native_message_arrays() {
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 1})).unwrap();
+
+    for body in [
+        json!({
+            "model": "gpt-4.1",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]}
+            ]
+        }),
+        json!({
+            "model": "gemini-2.0-flash",
+            "contents": [
+                {"role": "user", "parts": [{"text": "first"}]},
+                {"role": "user", "parts": [{"text": "second"}]}
+            ]
+        }),
+        json!({
+            "model": "command-r",
+            "chat_history": [
+                {"role": "USER", "message": "first"},
+                {"role": "CHATBOT", "message": "second"}
+            ],
+            "message": "third"
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
 }
 
 // ─── Prompt character limit ─────────────────────────────────────────────
@@ -431,6 +578,148 @@ async fn test_max_prompt_characters_counts_unicode_scalars_not_bytes() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_responses_instructions_and_input_without_messages() {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+
+    for body in [
+        json!({
+            "model": "gpt-4.1",
+            "instructions": "Follow this very long policy instruction",
+            "input": "short"
+        }),
+        json!({
+            "model": "gpt-4.1",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "this input text is too long"}]
+            }]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_provider_native_prompt_shapes() {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 12})).unwrap();
+
+    for body in [
+        json!({
+            "model": "claude-3",
+            "system": "long top-level anthropic system",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+        json!({
+            "model": "gemini-2.0-flash",
+            "systemInstruction": {"parts": [{"text": "long gemini system"}]},
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        }),
+        json!({
+            "model": "anthropic.claude-3-sonnet",
+            "system": [{"text": "long bedrock system"}],
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}]
+        }),
+        json!({
+            "model": "command-r",
+            "preamble": "long cohere preamble",
+            "message": "hi"
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_tools_arguments_and_rag_document_fields() {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 20})).unwrap();
+
+    for body in [
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "short"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "this tool description is intentionally long",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "very long query guidance"}
+                        }
+                    }
+                }
+            }]
+        }),
+        json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "assistant",
+                "content": "short",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"query\":\"this tool argument is far too long\"}"
+                    }
+                }]
+            }]
+        }),
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "short"}],
+            "context": "this retrieved context is too long"
+        }),
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "short"}],
+            "documents": [{"text": "this document text is too long"}]
+        }),
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "short"}],
+            "retrieved_context": [{"content": "this retrieved chunk is too long"}]
+        }),
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "short"}],
+            "tool_results": [{"content": "this tool result is too long"}]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn max_prompt_characters_ignores_non_text_multimodal_parts() {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 8})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "short"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,THIS_IS_A_VERY_LONG_IMAGE_PAYLOAD"}},
+                {"type": "input_audio", "input_audio": {"data": "THIS_IS_A_VERY_LONG_AUDIO_PAYLOAD"}}
+            ]
+        }]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 // ─── Temperature range ──────────────────────────────────────────────────
@@ -542,6 +831,93 @@ async fn test_block_system_prompts() {
 }
 
 #[tokio::test]
+async fn block_system_prompts_rejects_developer_role_and_responses_instructions() {
+    let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true})).unwrap();
+
+    for body in [
+        json!({
+            "model": "gpt-4.1",
+            "messages": [
+                {"role": "developer", "content": "You must follow this policy"},
+                {"role": "user", "content": "Hello"}
+            ]
+        }),
+        json!({
+            "model": "gpt-4.1",
+            "instructions": "You must follow this policy",
+            "input": "Hello"
+        }),
+        json!({
+            "model": "gpt-4.1",
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "You must follow this policy"}]
+            }]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn block_system_prompts_rejects_provider_native_system_fields() {
+    let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true})).unwrap();
+
+    for body in [
+        json!({
+            "model": "claude-3",
+            "system": "You must follow this policy",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+        json!({
+            "model": "gemini-2.0-flash",
+            "systemInstruction": {"parts": [{"text": "You must follow this policy"}]},
+            "contents": [{"role": "user", "parts": [{"text": "Hello"}]}]
+        }),
+        json!({
+            "model": "command-r",
+            "preamble": "You must follow this policy",
+            "message": "Hello"
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn block_system_prompts_rejects_configured_alias_roles_and_fields() {
+    let plugin = AiRequestGuard::new(&json!({
+        "block_system_prompts": true,
+        "system_prompt_aliases": ["policy"]
+    }))
+    .unwrap();
+
+    for body in [
+        json!({
+            "model": "gpt-4",
+            "messages": [{"role": "policy", "content": "internal policy"}]
+        }),
+        json!({
+            "model": "gpt-4",
+            "policy": "internal policy",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
 async fn test_no_system_prompts_passes() {
     let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({
@@ -568,6 +944,46 @@ async fn test_require_user_field_missing() {
 async fn test_require_user_field_present() {
     let plugin = AiRequestGuard::new(&json!({"require_user_field": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "user": "user-123"}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+// ─── Schema admission ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn strict_schema_rejects_payloads_outside_configured_schema_family() {
+    let plugin = AiRequestGuard::new(&json!({
+        "strict_schema": true,
+        "supported_schema": "responses"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Unsupported AI request schema");
+}
+
+#[tokio::test]
+async fn strict_auto_schema_rejects_unknown_json_shapes() {
+    let plugin = AiRequestGuard::new(&json!({"strict_schema": true})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"not_an_ai_request": true}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Unsupported AI request schema");
+}
+
+#[tokio::test]
+async fn non_strict_schema_keeps_compatibility_for_unknown_json_shapes() {
+    let plugin = AiRequestGuard::new(&json!({
+        "supported_schema": "responses",
+        "max_prompt_characters": 10
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({"not_an_ai_request": true}));
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);

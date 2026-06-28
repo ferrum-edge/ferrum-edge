@@ -3741,32 +3741,53 @@ Validates and constrains AI/LLM API requests before they reach the backend.
 
 Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured.
 
-At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1).
+At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, `strict_schema`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1).
 
 **Priority:** 2975
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_tokens_limit` | Integer | *(none)* | Maximum allowed `max_tokens` value |
+| `max_tokens_limit` | Integer | *(none)* | Maximum allowed output-token request value across OpenAI and provider-native token fields |
 | `enforce_max_tokens` | String | `"reject"` | `reject` (400 error) or `clamp` (silently cap) |
-| `default_max_tokens` | Integer | *(none)* | Inject `max_tokens` if not present |
+| `default_max_tokens` | Integer | *(none)* | Inject a default output-token limit if no supported token field is present; uses provider-native containers for Gemini/Bedrock-shaped bodies |
+| `supported_schema` | String | `"auto"` | Schema family used when `strict_schema` is true: `chat_completions`, `responses`, `provider_native`, or `auto` |
+| `strict_schema` | Boolean | `false` | Reject request bodies that do not match `supported_schema` coverage |
 | `allowed_models` | String[] | `[]` | Whitelist of allowed model names (empty = allow all) |
 | `blocked_models` | String[] | `[]` | Blacklist of model names (takes precedence) |
 | `require_user_field` | Boolean | `false` | Require `user` field in request body |
-| `max_messages` | Integer | *(none)* | Maximum messages in the messages array |
-| `max_prompt_characters` | Integer | *(none)* | Maximum total characters across messages |
+| `max_messages` | Integer | *(none)* | Maximum message entries across `messages`, Responses `input`, Gemini `contents`, and Cohere `chat_history` arrays |
+| `max_prompt_characters` | Integer | *(none)* | Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, and document/RAG fields |
 | `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for temperature |
-| `block_system_prompts` | Boolean | `false` | Reject requests with `role: "system"` messages |
+| `block_system_prompts` | Boolean | `false` | Reject system/developer prompt fields and roles, including Responses `instructions` and provider-native top-level system fields |
+| `system_prompt_aliases` | String[] | `[]` | Additional message roles or top-level fields treated as system prompts when `block_system_prompts` is true |
 | `required_metadata_fields` | String[] | `[]` | Required fields in request body |
+
+**Schema coverage**
+
+| Schema family | Message count | Prompt character coverage | System prompt blocking | Output-token fields |
+|---|---|---|---|---|
+| OpenAI Chat Completions | `messages[]` | `messages[].content`, text multimodal parts, `tools[]`, function-call `arguments`, document/RAG fields | `messages[].role: "system"|"developer"` and aliases | `max_tokens`, `max_completion_tokens` |
+| OpenAI Responses API | `input[]` message entries | `instructions`, `input` string/array/message content, `tools[]`, function-call `arguments` | `instructions`, `input[].role: "system"|"developer"` | `max_output_tokens`, `max_tokens` |
+| Anthropic Messages | `messages[]` | top-level `system`, `messages[].content`, tool arguments, `documents`, `context`, `retrieved_context`, `tool_results` | top-level `system`, system/developer roles if present | `max_tokens` |
+| Gemini/Vertex native-ish | `contents[]` | `systemInstruction`, `system_instruction`, `contents[].parts[].text`, tools, document/RAG fields | `systemInstruction`, `system_instruction`, aliased roles/fields | `generationConfig.maxOutputTokens`, top-level `maxOutputTokens` |
+| Bedrock Converse/native-ish | `messages[]` | `system`, `messages[].content`, tool arguments/results, document/RAG fields | top-level `system`, system/developer roles if present | `inferenceConfig.maxTokens`, top-level `maxTokens` |
+| Cohere native-ish | `chat_history[]` plus `message` | `preamble`, `message`, `chat_history[].message`, documents, tool arguments/results | `preamble`, aliased roles/fields | `max_tokens`, `max_new_tokens` |
+
+`max_prompt_characters` counts Unicode scalar values, not UTF-8 bytes. Multimodal image, audio, and file parts are ignored unless they expose a recognized text field or text content-part type (`text`, `input_text`, `output_text`). `system_prompt_aliases` is case-insensitive for role names and top-level field names. `supported_schema: auto` accepts any covered family; set `strict_schema: true` to reject unknown JSON shapes or a payload outside the configured family. Plain `messages[]` payloads without provider-specific fields can be indistinguishable across OpenAI Chat, Anthropic Messages, and Cohere v2, so strict provider matching is intentionally schema-family based rather than vendor-authentication based.
 
 ```yaml
 plugin_name: ai_request_guard
 config:
+  supported_schema: auto
+  strict_schema: true
   allowed_models: [gpt-4o-mini, gpt-4o, claude-sonnet-4-20250514]
   blocked_models: [o3]
   max_tokens_limit: 4096
   enforce_max_tokens: clamp
   default_max_tokens: 1024
+  max_prompt_characters: 24000
+  block_system_prompts: true
+  system_prompt_aliases: [policy]
 ```
 
 ### `ai_rate_limiter`

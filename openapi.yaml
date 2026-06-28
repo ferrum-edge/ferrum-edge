@@ -14301,6 +14301,10 @@ components:
           properties:
             block_system_prompts:
               const: true
+        - required: [strict_schema]
+          properties:
+            strict_schema:
+              const: true
         - required: [required_metadata_fields]
           properties:
             required_metadata_fields:
@@ -14308,7 +14312,7 @@ components:
       properties:
         max_tokens_limit:
           type: integer
-          description: Maximum allowed max_tokens value
+          description: Maximum allowed output-token request value across OpenAI and provider-native token fields
         enforce_max_tokens:
           type: string
           enum: [reject, clamp]
@@ -14316,7 +14320,16 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject max_tokens if not present
+          description: Inject a default output-token limit if no supported token field is present
+        supported_schema:
+          type: string
+          enum: [chat_completions, responses, provider_native, auto]
+          default: auto
+          description: Request schema family accepted when strict_schema is true
+        strict_schema:
+          type: boolean
+          default: false
+          description: Reject JSON request bodies that do not match supported_schema coverage
         allowed_models:
           type: array
           items:
@@ -14335,10 +14348,10 @@ components:
           description: Require user field in request body
         max_messages:
           type: integer
-          description: Maximum messages in the messages array
+          description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total characters across messages
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, and document/RAG fields
         temperature_range:
           type: array
           items:
@@ -14350,7 +14363,13 @@ components:
         block_system_prompts:
           type: boolean
           default: false
-          description: "Reject requests with role: system messages"
+          description: Reject system/developer prompt fields and roles, including Responses instructions and provider-native top-level system fields
+        system_prompt_aliases:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Additional message roles or top-level fields treated as system prompts when block_system_prompts is true
         required_metadata_fields:
           type: array
           items:

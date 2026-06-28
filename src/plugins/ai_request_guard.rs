@@ -17,6 +17,39 @@ use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
+const TOP_LEVEL_TOKEN_FIELDS: &[&str] = &[
+    "max_tokens",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "max_new_tokens",
+    "max_tokens_to_sample",
+    "maxOutputTokens",
+    "maxTokens",
+];
+
+const BUILTIN_SYSTEM_PROMPT_ROLES: &[&str] = &["system", "developer"];
+
+const BUILTIN_SYSTEM_PROMPT_FIELDS: &[&str] = &[
+    "instructions",
+    "system",
+    "systemInstruction",
+    "system_instruction",
+    "developer",
+    "preamble",
+];
+
+const TOP_LEVEL_PROMPT_FIELDS: &[&str] = &[
+    "prompt",
+    "input",
+    "instructions",
+    "system",
+    "systemInstruction",
+    "system_instruction",
+    "message",
+    "preamble",
+    "context",
+];
+
 /// Action to take when max_tokens exceeds the limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MaxTokensAction {
@@ -24,10 +57,21 @@ enum MaxTokensAction {
     Clamp,
 }
 
+/// Request schema family the guard should accept when strict schema checking is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupportedSchema {
+    ChatCompletions,
+    Responses,
+    ProviderNative,
+    Auto,
+}
+
 pub struct AiRequestGuard {
     max_tokens_limit: Option<u64>,
     enforce_max_tokens: MaxTokensAction,
     default_max_tokens: Option<u64>,
+    supported_schema: SupportedSchema,
+    strict_schema: bool,
     allowed_models: HashSet<String>,
     blocked_models: HashSet<String>,
     require_user_field: bool,
@@ -35,6 +79,7 @@ pub struct AiRequestGuard {
     max_prompt_characters: Option<u64>,
     temperature_range: Option<(f64, f64)>,
     block_system_prompts: bool,
+    system_prompt_aliases: HashSet<String>,
     required_metadata_fields: Vec<String>,
     /// True when the plugin needs to modify the request body (clamp or inject defaults).
     needs_body_transform: bool,
@@ -61,6 +106,19 @@ impl AiRequestGuard {
             }
         };
         let default_max_tokens = optional_u64(config, "default_max_tokens")?;
+        let supported_schema = match optional_string(config, "supported_schema")?.unwrap_or("auto")
+        {
+            "chat_completions" => SupportedSchema::ChatCompletions,
+            "responses" => SupportedSchema::Responses,
+            "provider_native" => SupportedSchema::ProviderNative,
+            "auto" => SupportedSchema::Auto,
+            other => {
+                return Err(format!(
+                    "ai_request_guard: 'supported_schema' must be one of 'chat_completions', 'responses', 'provider_native', or 'auto', got: {other:?}"
+                ));
+            }
+        };
+        let strict_schema = optional_bool(config, "strict_schema")?.unwrap_or(false);
 
         // Reject a contradictory cost-control config: the injected default must
         // not exceed the configured cap. `default_max_tokens` is injected when a
@@ -123,6 +181,8 @@ impl AiRequestGuard {
         };
 
         let block_system_prompts = optional_bool(config, "block_system_prompts")?.unwrap_or(false);
+        let system_prompt_aliases =
+            optional_lowercase_set(config, "system_prompt_aliases")?.unwrap_or_default();
 
         let required_metadata_fields =
             optional_string_vec(config, "required_metadata_fields")?.unwrap_or_default();
@@ -139,6 +199,7 @@ impl AiRequestGuard {
             || max_prompt_characters.is_some()
             || temperature_range.is_some()
             || block_system_prompts
+            || strict_schema
             || !required_metadata_fields.is_empty();
 
         // Reject configs that would make the plugin a no-op: at least one
@@ -147,7 +208,8 @@ impl AiRequestGuard {
             return Err("ai_request_guard: at least one policy must be configured \
                  (max_tokens_limit, default_max_tokens, allowed_models, blocked_models, \
                  require_user_field, max_messages, max_prompt_characters, \
-                 temperature_range, block_system_prompts, or required_metadata_fields)"
+                 temperature_range, block_system_prompts, strict_schema, or \
+                 required_metadata_fields)"
                 .to_string());
         }
 
@@ -155,6 +217,8 @@ impl AiRequestGuard {
             max_tokens_limit,
             enforce_max_tokens,
             default_max_tokens,
+            supported_schema,
+            strict_schema,
             allowed_models,
             blocked_models,
             require_user_field,
@@ -162,6 +226,7 @@ impl AiRequestGuard {
             max_prompt_characters,
             temperature_range,
             block_system_prompts,
+            system_prompt_aliases,
             required_metadata_fields,
             needs_body_transform,
             requires_request_body,
@@ -170,6 +235,16 @@ impl AiRequestGuard {
 
     /// Validate the request body JSON. Returns Err with a rejection tuple on failure.
     fn validate(&self, json: &Value) -> Result<(), (String, String)> {
+        // Optional schema admission. In non-strict mode, the guard still applies
+        // every configured policy to any fields it recognizes, preserving the
+        // historical pass-through behavior for unusual provider payloads.
+        if self.strict_schema && !schema_matches(json, self.supported_schema) {
+            return Err((
+                "Unsupported AI request schema".to_string(),
+                schema_rejection_details(self.supported_schema),
+            ));
+        }
+
         // Model blocking/allowlisting
         if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
             let model_lower = model.to_lowercase();
@@ -202,11 +277,7 @@ impl AiRequestGuard {
         if self.enforce_max_tokens == MaxTokensAction::Reject
             && let Some(limit) = self.max_tokens_limit
         {
-            let requested = json
-                .get("max_tokens")
-                .or_else(|| json.get("max_output_tokens"))
-                .or_else(|| json.get("max_completion_tokens"))
-                .and_then(|v| v.as_u64());
+            let requested = max_requested_tokens(json);
             if let Some(req) = requested
                 && req > limit
             {
@@ -219,24 +290,21 @@ impl AiRequestGuard {
 
         // Message count
         if let Some(max_msgs) = self.max_messages
-            && let Some(messages) = json.get("messages").and_then(|v| v.as_array())
-            && messages.len() as u64 > max_msgs
+            && count_message_entries(json) > max_msgs
         {
+            let count = count_message_entries(json);
             return Err((
                 "Too many messages".to_string(),
                 format!(
                     "Request contains {} messages, maximum allowed is {}",
-                    messages.len(),
-                    max_msgs
+                    count, max_msgs
                 ),
             ));
         }
 
         // Prompt character limit
-        if let Some(max_chars) = self.max_prompt_characters
-            && let Some(messages) = json.get("messages").and_then(|v| v.as_array())
-        {
-            let total_chars: u64 = messages.iter().map(count_message_characters).sum();
+        if let Some(max_chars) = self.max_prompt_characters {
+            let total_chars = count_prompt_characters(json);
             if total_chars > max_chars {
                 return Err((
                     "Prompt too long".to_string(),
@@ -263,18 +331,12 @@ impl AiRequestGuard {
         }
 
         // System prompt blocking
-        if self.block_system_prompts
-            && let Some(messages) = json.get("messages").and_then(|v| v.as_array())
-        {
-            for msg in messages {
-                if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
-                    return Err((
-                        "System prompts not allowed".to_string(),
-                        "Requests with system role messages are blocked by gateway policy"
-                            .to_string(),
-                    ));
-                }
-            }
+        if self.block_system_prompts && contains_system_prompt(json, &self.system_prompt_aliases) {
+            return Err((
+                "System prompts not allowed".to_string(),
+                "Requests with system, developer, instructions, or aliased system-prompt fields are blocked by gateway policy"
+                    .to_string(),
+            ));
         }
 
         // Require user field
@@ -302,32 +364,431 @@ impl AiRequestGuard {
     }
 }
 
-/// Count total characters in a message's content field.
-/// Handles both string content and multimodal array content.
-///
-/// Counts Unicode scalar values (via `chars().count()`), not UTF-8 byte
-/// length, so the value matches the `max_prompt_characters` field name and the
-/// "...characters" rejection message. Using `len()` would over-count multibyte
-/// input (CJK, emoji, accented Latin) by 2-4x and wrongly reject prompts that
-/// are under the operator's character budget.
-fn count_message_characters(msg: &Value) -> u64 {
-    match msg.get("content") {
-        Some(Value::String(s)) => s.chars().count() as u64,
-        Some(Value::Array(parts)) => parts
+fn schema_matches(json: &Value, supported_schema: SupportedSchema) -> bool {
+    match supported_schema {
+        SupportedSchema::ChatCompletions => looks_like_chat_completions(json),
+        SupportedSchema::Responses => looks_like_responses(json),
+        SupportedSchema::ProviderNative => looks_like_provider_native(json),
+        SupportedSchema::Auto => {
+            looks_like_chat_completions(json)
+                || looks_like_responses(json)
+                || looks_like_provider_native(json)
+        }
+    }
+}
+
+fn schema_rejection_details(supported_schema: SupportedSchema) -> String {
+    let expected = match supported_schema {
+        SupportedSchema::ChatCompletions => "OpenAI Chat Completions",
+        SupportedSchema::Responses => "OpenAI Responses API",
+        SupportedSchema::ProviderNative => "provider-native AI",
+        SupportedSchema::Auto => "a supported AI",
+    };
+    format!("Request body does not match {expected} schema coverage")
+}
+
+fn looks_like_chat_completions(json: &Value) -> bool {
+    json.get("messages").and_then(Value::as_array).is_some()
+        && json.get("input").is_none()
+        && json.get("instructions").is_none()
+        && json.get("contents").is_none()
+        && json.get("systemInstruction").is_none()
+        && json.get("system_instruction").is_none()
+        && json.get("inferenceConfig").is_none()
+        && json.get("generationConfig").is_none()
+}
+
+fn looks_like_responses(json: &Value) -> bool {
+    json.get("input").is_some()
+        || json.get("instructions").is_some()
+        || json.get("previous_response_id").is_some()
+}
+
+fn looks_like_provider_native(json: &Value) -> bool {
+    json.get("system").is_some()
+        || json.get("systemInstruction").is_some()
+        || json.get("system_instruction").is_some()
+        || json.get("contents").is_some()
+        || json.get("generationConfig").is_some()
+        || json.get("inferenceConfig").is_some()
+        || json.get("preamble").is_some()
+        || json.get("message").is_some()
+        || json.get("chat_history").is_some()
+        || json.get("documents").is_some()
+        || json.get("retrieved_context").is_some()
+        || json.get("tool_results").is_some()
+        // Anthropic Messages and Cohere v2 can be indistinguishable from
+        // OpenAI-style chat when they carry only a `messages` array.
+        || json.get("messages").and_then(Value::as_array).is_some()
+}
+
+fn max_requested_tokens(json: &Value) -> Option<u64> {
+    let mut requested = None;
+    for field in TOP_LEVEL_TOKEN_FIELDS {
+        update_max_token(&mut requested, json.get(field).and_then(Value::as_u64));
+    }
+    update_max_token(
+        &mut requested,
+        json.get("generationConfig")
+            .and_then(|v| v.get("maxOutputTokens"))
+            .and_then(Value::as_u64),
+    );
+    update_max_token(
+        &mut requested,
+        json.get("inferenceConfig")
+            .and_then(|v| v.get("maxTokens"))
+            .and_then(Value::as_u64),
+    );
+    update_max_token(
+        &mut requested,
+        json.get("textGenerationConfig")
+            .and_then(|v| v.get("maxTokenCount"))
+            .and_then(Value::as_u64),
+    );
+    requested
+}
+
+fn update_max_token(current: &mut Option<u64>, candidate: Option<u64>) {
+    if let Some(candidate) = candidate {
+        *current = Some(current.map_or(candidate, |value| value.max(candidate)));
+    }
+}
+
+fn has_any_max_token_field(json: &Value) -> bool {
+    TOP_LEVEL_TOKEN_FIELDS
+        .iter()
+        .any(|field| json.get(field).is_some())
+        || json
+            .get("generationConfig")
+            .is_some_and(|v| v.get("maxOutputTokens").is_some())
+        || json
+            .get("inferenceConfig")
+            .is_some_and(|v| v.get("maxTokens").is_some())
+        || json
+            .get("textGenerationConfig")
+            .is_some_and(|v| v.get("maxTokenCount").is_some())
+}
+
+fn clamp_max_token_fields(json: &mut Value, limit: u64) -> bool {
+    let mut modified = false;
+    if let Some(obj) = json.as_object_mut() {
+        for field in TOP_LEVEL_TOKEN_FIELDS {
+            modified |= clamp_number_field(obj, field, limit);
+        }
+    }
+    for (container, field) in [
+        ("generationConfig", "maxOutputTokens"),
+        ("inferenceConfig", "maxTokens"),
+        ("textGenerationConfig", "maxTokenCount"),
+    ] {
+        if let Some(obj) = json.get_mut(container).and_then(Value::as_object_mut) {
+            modified |= clamp_number_field(obj, field, limit);
+        }
+    }
+    modified
+}
+
+fn clamp_number_field(obj: &mut serde_json::Map<String, Value>, field: &str, limit: u64) -> bool {
+    if let Some(current) = obj.get(field).and_then(Value::as_u64)
+        && current > limit
+    {
+        obj.insert(field.to_string(), Value::Number(limit.into()));
+        return true;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+enum DefaultTokenTarget {
+    TopLevel,
+    Gemini,
+    Bedrock,
+}
+
+fn default_token_target(json: &Value) -> DefaultTokenTarget {
+    if json.get("generationConfig").is_some()
+        || json.get("contents").is_some()
+        || json.get("systemInstruction").is_some()
+        || json.get("system_instruction").is_some()
+    {
+        DefaultTokenTarget::Gemini
+    } else if json.get("inferenceConfig").is_some() {
+        DefaultTokenTarget::Bedrock
+    } else {
+        DefaultTokenTarget::TopLevel
+    }
+}
+
+fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
+    if has_any_max_token_field(json) {
+        return false;
+    }
+    let target = default_token_target(json);
+    let Some(obj) = json.as_object_mut() else {
+        return false;
+    };
+
+    match target {
+        DefaultTokenTarget::Gemini => {
+            let entry = obj
+                .entry("generationConfig".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(gen_config) = entry.as_object_mut() {
+                gen_config.insert("maxOutputTokens".to_string(), Value::Number(default.into()));
+                true
+            } else {
+                false
+            }
+        }
+        DefaultTokenTarget::Bedrock => {
+            let entry = obj
+                .entry("inferenceConfig".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(inference_config) = entry.as_object_mut() {
+                inference_config.insert("maxTokens".to_string(), Value::Number(default.into()));
+                true
+            } else {
+                false
+            }
+        }
+        DefaultTokenTarget::TopLevel => {
+            obj.insert("max_tokens".to_string(), Value::Number(default.into()));
+            true
+        }
+    }
+}
+
+fn count_message_entries(json: &Value) -> u64 {
+    let mut total = 0u64;
+    total = total.saturating_add(count_message_array(json.get("messages")));
+    total = total.saturating_add(count_message_array(json.get("input")));
+    total = total.saturating_add(count_message_array(json.get("contents")));
+    total = total.saturating_add(count_message_array(json.get("chat_history")));
+    total
+}
+
+fn count_message_array(value: Option<&Value>) -> u64 {
+    match value {
+        Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|part| {
-                // Multimodal format: [{"type": "text", "text": "..."}, ...]
-                if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    part.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.chars().count() as u64)
-                } else {
-                    None
+            .filter(|item| match item {
+                Value::String(_) => true,
+                Value::Object(obj) => {
+                    !is_typed_non_text_content_part(obj)
+                        && (obj.contains_key("role")
+                            || obj.contains_key("content")
+                            || obj.contains_key("parts")
+                            || obj.contains_key("message"))
                 }
+                _ => false,
             })
-            .sum(),
+            .count() as u64,
         _ => 0,
     }
+}
+
+/// Counts Unicode scalar values in model-visible request text, not UTF-8 bytes.
+///
+/// The extraction mirrors `ai_prompt_shield`'s content-mode coverage for chat
+/// messages, Responses `input`/`instructions`, Anthropic top-level `system`,
+/// and multimodal text parts. It extends that baseline for policy fields that
+/// affect prompt cost/risk: tool definitions, tool-call arguments, and common
+/// RAG/document fields. Non-text multimodal parts are intentionally ignored.
+fn count_prompt_characters(json: &Value) -> u64 {
+    let mut total = 0u64;
+
+    if let Some(messages) = json.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            count_text_value(message.get("content"), &mut total);
+        }
+    }
+
+    if let Some(contents) = json.get("contents") {
+        count_text_value(Some(contents), &mut total);
+    }
+    if let Some(chat_history) = json.get("chat_history") {
+        count_text_value(Some(chat_history), &mut total);
+    }
+
+    for field in TOP_LEVEL_PROMPT_FIELDS {
+        count_text_value(json.get(field), &mut total);
+    }
+
+    for field in [
+        "documents",
+        "retrieved_context",
+        "tool_results",
+        "toolResults",
+    ] {
+        count_text_value(json.get(field), &mut total);
+    }
+
+    count_tool_definition_text(json.get("tools"), &mut total);
+    count_tool_definition_text(json.get("functions"), &mut total);
+    count_tool_argument_fields(json, &mut total);
+
+    total
+}
+
+fn count_text_value(value: Option<&Value>, total: &mut u64) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::String(text) => add_chars(total, text),
+        Value::Array(items) => {
+            for item in items {
+                count_text_value(Some(item), total);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(part_type) = obj.get("type").and_then(Value::as_str) {
+                if is_text_content_part_type(part_type) {
+                    count_text_value(obj.get("text").or_else(|| obj.get("content")), total);
+                    return;
+                }
+                if is_typed_non_text_content_part(obj) {
+                    return;
+                }
+            }
+            if let Some(parts) = obj.get("parts") {
+                count_text_value(Some(parts), total);
+            } else if let Some(content) = obj.get("content") {
+                count_text_value(Some(content), total);
+            } else if let Some(message) = obj.get("message") {
+                count_text_value(Some(message), total);
+            } else if let Some(text) = obj.get("text") {
+                count_text_value(Some(text), total);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_text_content_part_type(part_type: &str) -> bool {
+    matches!(part_type, "text" | "input_text" | "output_text")
+}
+
+fn is_typed_non_text_content_part(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|part_type| !is_text_content_part_type(part_type))
+        && !obj.contains_key("role")
+        && !obj.contains_key("content")
+        && !obj.contains_key("parts")
+        && !obj.contains_key("message")
+}
+
+fn count_tool_definition_text(value: Option<&Value>, total: &mut u64) {
+    match value {
+        Some(Value::String(text)) => add_chars(total, text),
+        Some(Value::Array(items)) => {
+            for item in items {
+                count_tool_definition_text(Some(item), total);
+            }
+        }
+        Some(Value::Object(obj)) => {
+            for (key, value) in obj {
+                add_chars(total, key);
+                count_tool_definition_text(Some(value), total);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn count_tool_argument_fields(value: &Value, total: &mut u64) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                count_tool_argument_fields(item, total);
+            }
+        }
+        Value::Object(obj) => {
+            for (key, child) in obj {
+                if key == "tools" || key == "functions" {
+                    continue;
+                }
+                if key == "arguments" {
+                    count_argument_value(child, total);
+                } else {
+                    count_tool_argument_fields(child, total);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn count_argument_value(value: &Value, total: &mut u64) {
+    match value {
+        Value::String(text) => add_chars(total, text),
+        Value::Array(items) => {
+            for item in items {
+                count_argument_value(item, total);
+            }
+        }
+        Value::Object(obj) => {
+            for value in obj.values() {
+                count_argument_value(value, total);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn add_chars(total: &mut u64, text: &str) {
+    *total = total.saturating_add(text.chars().count() as u64);
+}
+
+fn contains_system_prompt(json: &Value, aliases: &HashSet<String>) -> bool {
+    object_has_system_prompt_field(json, aliases)
+        || value_has_system_role(json.get("messages"), aliases)
+        || value_has_system_role(json.get("input"), aliases)
+        || value_has_system_role(json.get("contents"), aliases)
+        || value_has_system_role(json.get("chat_history"), aliases)
+}
+
+fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bool {
+    let Some(obj) = json.as_object() else {
+        return false;
+    };
+
+    for field in BUILTIN_SYSTEM_PROMPT_FIELDS {
+        if obj.get(*field).is_some_and(|value| !value.is_null()) {
+            return true;
+        }
+    }
+
+    obj.iter()
+        .any(|(key, value)| !value.is_null() && aliases.contains(key.to_lowercase().as_str()))
+}
+
+fn value_has_system_role(value: Option<&Value>, aliases: &HashSet<String>) -> bool {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .any(|item| value_has_system_role(Some(item), aliases)),
+        Some(Value::Object(obj)) => {
+            obj.get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| is_system_prompt_role(role, aliases))
+                || obj
+                    .get("author")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| is_system_prompt_role(role, aliases))
+                || obj
+                    .values()
+                    .any(|child| value_has_system_role(Some(child), aliases))
+        }
+        _ => false,
+    }
+}
+
+fn is_system_prompt_role(role: &str, aliases: &HashSet<String>) -> bool {
+    let role_lower = role.to_lowercase();
+    BUILTIN_SYSTEM_PROMPT_ROLES.contains(&role_lower.as_str())
+        || aliases.contains(role_lower.as_str())
 }
 
 #[async_trait]
@@ -421,25 +882,12 @@ impl Plugin for AiRequestGuard {
         if let Some(limit) = self.max_tokens_limit
             && self.enforce_max_tokens == MaxTokensAction::Clamp
         {
-            for field_name in &["max_tokens", "max_output_tokens", "max_completion_tokens"] {
-                if let Some(current) = json.get(*field_name).and_then(|v| v.as_u64())
-                    && current > limit
-                {
-                    json[*field_name] = Value::Number(limit.into());
-                    body_modified = true;
-                }
-            }
+            body_modified |= clamp_max_token_fields(&mut json, limit);
         }
 
         // Inject default_max_tokens if not present
-        if let Some(default) = self.default_max_tokens
-            && json.get("max_tokens").is_none()
-            && json.get("max_output_tokens").is_none()
-            && json.get("max_completion_tokens").is_none()
-            && let Some(obj) = json.as_object_mut()
-        {
-            obj.insert("max_tokens".to_string(), Value::Number(default.into()));
-            body_modified = true;
+        if let Some(default) = self.default_max_tokens {
+            body_modified |= inject_default_max_tokens(&mut json, default);
         }
 
         if body_modified && let Ok(new_body) = serde_json::to_string(&json) {
@@ -473,24 +921,12 @@ impl Plugin for AiRequestGuard {
         if let Some(limit) = self.max_tokens_limit
             && self.enforce_max_tokens == MaxTokensAction::Clamp
         {
-            for field_name in &["max_tokens", "max_output_tokens", "max_completion_tokens"] {
-                if let Some(current) = json.get(*field_name).and_then(|v| v.as_u64())
-                    && current > limit
-                {
-                    json[*field_name] = Value::Number(limit.into());
-                    modified = true;
-                }
-            }
+            modified |= clamp_max_token_fields(&mut json, limit);
         }
 
         // Inject default_max_tokens if not present
-        if let Some(default) = self.default_max_tokens
-            && json.get("max_tokens").is_none()
-            && json.get("max_output_tokens").is_none()
-            && json.get("max_completion_tokens").is_none()
-        {
-            json["max_tokens"] = Value::Number(default.into());
-            modified = true;
+        if let Some(default) = self.default_max_tokens {
+            modified |= inject_default_max_tokens(&mut json, default);
         }
 
         if modified {
