@@ -430,6 +430,37 @@ async fn default_max_tokens_uses_provider_native_containers_when_detected() {
 }
 
 #[tokio::test]
+async fn default_max_tokens_routes_tgi_bodies_to_max_new_tokens() {
+    // TGI / HuggingFace text-generation bodies cap output via `max_new_tokens`;
+    // injecting a top-level `max_tokens` (which the backend ignores) would
+    // silently drop the configured default cap.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+
+    let tgi = serde_json::to_vec(&json!({"inputs": "hello"})).unwrap();
+    let result = plugin
+        .transform_request_body(&tgi, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(modified["max_new_tokens"], 256);
+    assert!(
+        modified.get("max_tokens").is_none(),
+        "TGI bodies must not receive an ignored top-level max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn default_max_tokens_not_injected_when_tgi_already_caps_output() {
+    // `max_new_tokens` already present means the client set its own cap, so the
+    // guard must leave the body untouched.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let tgi = serde_json::to_vec(&json!({"inputs": "hello", "max_new_tokens": 16})).unwrap();
+    let result = plugin
+        .transform_request_body(&tgi, Some("application/json"), &HashMap::new())
+        .await;
+    assert!(result.is_none());
+}
+
+#[tokio::test]
 async fn test_default_max_tokens_injected() {
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     assert!(plugin.modifies_request_body());
@@ -517,6 +548,44 @@ async fn max_messages_counts_responses_input_and_provider_native_message_arrays(
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_reject(result, Some(400));
     }
+}
+
+#[tokio::test]
+async fn max_messages_counts_cohere_top_level_message() {
+    // Cohere-native requests carry the current user turn in a top-level
+    // `message` string. With two prior `chat_history` entries it forms a
+    // 3-message conversation, so a `max_messages: 2` cap must reject it; if the
+    // top-level `message` were ignored the body would count as 2 and slip past.
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 2})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "command-r",
+        "chat_history": [
+            {"role": "USER", "message": "first"},
+            {"role": "CHATBOT", "message": "second"}
+        ],
+        "message": "third"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn max_messages_cohere_message_within_limit_passes() {
+    // The same shape under a cap that accommodates the current turn must pass,
+    // confirming the top-level `message` is counted as exactly one entry.
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 3})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "command-r",
+        "chat_history": [
+            {"role": "USER", "message": "first"},
+            {"role": "CHATBOT", "message": "second"}
+        ],
+        "message": "third"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 // ─── Prompt character limit ─────────────────────────────────────────────
@@ -701,6 +770,50 @@ async fn max_prompt_characters_counts_tools_arguments_and_rag_document_fields() 
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_reject(result, Some(400));
     }
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_tgi_inputs_field() {
+    // TGI / HuggingFace text-generation prompts live in the plural `inputs`
+    // field; the prompt-character cap must count them so a large prompt cannot
+    // bypass the limit.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "inputs": "this TGI prompt is well over ten characters",
+        "max_new_tokens": 16
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+
+    // A short `inputs` prompt under the cap still passes.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"inputs": "hi"}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_responses_function_call_output() {
+    // Responses API follow-up requests feed tool results back as
+    // `function_call_output` items whose `output` carries model-visible text.
+    // That text must count toward the prompt budget.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4.1",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "this tool output is far longer than the ten character budget"
+            }
+        ]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
 }
 
 #[tokio::test]
@@ -965,6 +1078,55 @@ async fn strict_schema_rejects_payloads_outside_configured_schema_family() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject_error(result, 400, "Unsupported AI request schema");
+}
+
+#[tokio::test]
+async fn strict_chat_schema_rejects_provider_native_marker_bodies() {
+    // A body carrying both a `messages` array and a provider-native top-level
+    // marker (Anthropic `system`, Cohere `preamble`/`message`/`chat_history`,
+    // RAG `documents`/`tool_results`) is NOT OpenAI Chat Completions and must be
+    // rejected under strict `chat_completions`.
+    let plugin = AiRequestGuard::new(&json!({
+        "strict_schema": true,
+        "supported_schema": "chat_completions"
+    }))
+    .unwrap();
+
+    for body in [
+        json!({"system": "you are helpful", "messages": [{"role": "user", "content": "hi"}]}),
+        json!({"preamble": "be terse", "messages": [{"role": "user", "content": "hi"}]}),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_history": [{"role": "USER", "message": "prior"}]
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "documents": [{"text": "rag doc"}]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject_error(result, 400, "Unsupported AI request schema");
+    }
+}
+
+#[tokio::test]
+async fn strict_chat_schema_admits_plain_chat_completions_body() {
+    // A clean OpenAI Chat Completions body (no provider-native markers) must
+    // still be admitted under strict `chat_completions`.
+    let plugin = AiRequestGuard::new(&json!({
+        "strict_schema": true,
+        "supported_schema": "chat_completions"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 #[tokio::test]

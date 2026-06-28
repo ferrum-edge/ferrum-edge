@@ -41,6 +41,11 @@ const BUILTIN_SYSTEM_PROMPT_FIELDS: &[&str] = &[
 const TOP_LEVEL_PROMPT_FIELDS: &[&str] = &[
     "prompt",
     "input",
+    // TGI / HuggingFace text-generation carries its prompt in the plural
+    // `inputs` field. Strict-auto admits these bodies via
+    // `looks_like_legacy_completions`, so the prompt-character cap must count
+    // them too — otherwise `{"inputs": "<huge prompt>"}` bypasses the limit.
+    "inputs",
     "instructions",
     "system",
     "systemInstruction",
@@ -397,6 +402,19 @@ fn looks_like_chat_completions(json: &Value) -> bool {
         && json.get("system_instruction").is_none()
         && json.get("inferenceConfig").is_none()
         && json.get("generationConfig").is_none()
+        // Provider-native top-level markers disqualify the body from the OpenAI
+        // Chat Completions family even when it also carries a `messages` array
+        // (e.g. Anthropic `{"system": ..., "messages": [...]}`, Cohere
+        // `preamble`/`message`/`chat_history`, RAG `documents`). In strict
+        // `chat_completions` mode these must be rejected rather than admitted as
+        // chat schema.
+        && json.get("system").is_none()
+        && json.get("preamble").is_none()
+        && json.get("message").is_none()
+        && json.get("chat_history").is_none()
+        && json.get("documents").is_none()
+        && json.get("retrieved_context").is_none()
+        && json.get("tool_results").is_none()
 }
 
 fn looks_like_responses(json: &Value) -> bool {
@@ -514,6 +532,7 @@ enum DefaultTokenTarget {
     TopLevel,
     Gemini,
     Bedrock,
+    TextGeneration,
 }
 
 /// Picks the container that `default_max_tokens` is injected into.
@@ -526,6 +545,11 @@ enum DefaultTokenTarget {
 /// messages-only Bedrock body is wire-indistinguishable from OpenAI, so this is
 /// inherent: we do not provider-sniff. This limitation is documented in the
 /// schema-coverage matrix in docs/plugins.md.
+///
+/// TGI / HuggingFace text-generation bodies (recognized by their top-level
+/// `inputs` prompt field) cap output via `max_new_tokens`, so they route to
+/// `TextGeneration`; injecting a top-level `max_tokens` there would be ignored
+/// by the backend and silently drop the intended default cap.
 fn default_token_target(json: &Value) -> DefaultTokenTarget {
     if json.get("generationConfig").is_some()
         || json.get("contents").is_some()
@@ -535,6 +559,8 @@ fn default_token_target(json: &Value) -> DefaultTokenTarget {
         DefaultTokenTarget::Gemini
     } else if json.get("inferenceConfig").is_some() {
         DefaultTokenTarget::Bedrock
+    } else if json.get("inputs").is_some() {
+        DefaultTokenTarget::TextGeneration
     } else {
         DefaultTokenTarget::TopLevel
     }
@@ -572,6 +598,10 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
                 false
             }
         }
+        DefaultTokenTarget::TextGeneration => {
+            obj.insert("max_new_tokens".to_string(), Value::Number(default.into()));
+            true
+        }
         DefaultTokenTarget::TopLevel => {
             obj.insert("max_tokens".to_string(), Value::Number(default.into()));
             true
@@ -585,6 +615,18 @@ fn count_message_entries(json: &Value) -> u64 {
     total = total.saturating_add(count_message_array(json.get("input")));
     total = total.saturating_add(count_message_array(json.get("contents")));
     total = total.saturating_add(count_message_array(json.get("chat_history")));
+    // Cohere-native requests carry the current user turn in a top-level
+    // `message` string (the prior turns live in `chat_history`). Count it as one
+    // entry so `max_messages` reflects the full conversation length; without it a
+    // request with N `chat_history` entries plus a current `message` is counted
+    // as N and slips one message past the cap.
+    if json
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| !message.is_empty())
+    {
+        total = total.saturating_add(1);
+    }
     total
 }
 
@@ -666,6 +708,18 @@ fn count_text_value(value: Option<&Value>, total: &mut u64) {
             if let Some(part_type) = obj.get("type").and_then(Value::as_str) {
                 if is_text_content_part_type(part_type) {
                     count_text_value(obj.get("text").or_else(|| obj.get("content")), total);
+                    return;
+                }
+                // Responses API tool-result items carry model-visible text in
+                // `output` (e.g. `{"type": "function_call_output", "output":
+                // "..."}`). These are typed non-text parts as far as the content
+                // matchers are concerned, so count `output` explicitly before the
+                // non-text bailout — otherwise a large tool result re-fed to the
+                // model dodges `max_prompt_characters` entirely.
+                if part_type == "function_call_output"
+                    && let Some(output) = obj.get("output")
+                {
+                    count_text_value(Some(output), total);
                     return;
                 }
                 if is_typed_non_text_content_part(obj) {
