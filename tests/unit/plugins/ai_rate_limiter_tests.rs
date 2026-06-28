@@ -2077,9 +2077,12 @@ async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
 
 #[tokio::test]
 async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
-    // When none of the recognized prompt fields are present,
-    // `prompt_character_count` falls back to counting the whole JSON body's
-    // string values (minus the max_* keys). Covers the fallback branch.
+    // When an LLM-shaped body uses none of the prompt fields
+    // `prompt_character_count` recognizes (system/messages/prompt/input/
+    // contents/tools), the estimate falls back to counting the whole JSON body's
+    // string values (minus the max_* keys). A Cohere-native body (`message` — an
+    // AI-request marker, but not one of the counted prompt fields) exercises that
+    // fallback branch while still passing the LLM-shape gate.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 100_000,
@@ -2096,11 +2099,12 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    // No system/messages/prompt/input/contents/tools — only an unrelated string
-    // field. The fallback counts its 8 chars -> ceil(8/4) = 2 tokens.
+    // Cohere-native `message` is an AI-request marker but is NOT among the fields
+    // `prompt_character_count` sums, so the estimate falls back to counting the
+    // whole body's string values (minus the max_* keys): 8 chars -> ceil(8/4) = 2.
     ctx.metadata.insert(
         "request_body".to_string(),
-        serde_json::to_string(&json!({"description": "01234567"})).unwrap(),
+        serde_json::to_string(&json!({"message": "01234567"})).unwrap(),
     );
 
     let mut headers = HashMap::new();
@@ -2933,5 +2937,275 @@ async fn test_fresh_response_is_still_charged_despite_replay_exemption() {
         observed_usage(&plugin).await,
         300,
         "a fresh (non-cached, non-replayed) response must still charge tokens"
+    );
+}
+
+// ─── Follow-up (#1923): provider-native estimation, LLM-shape gating, and
+//     federation reservation reconciliation ──────────────────────────────
+
+#[tokio::test]
+async fn completion_mode_reserves_provider_native_output_caps() {
+    // Codex P2: the reservation estimator only read top-level OpenAI-style output
+    // caps, so native Gemini/Bedrock/Titan/TGI requests reserved 0 in
+    // `completion_tokens` mode and could oversubscribe the budget. The nested
+    // provider containers must size the reservation.
+    let cases: [(&str, serde_json::Value, u64); 4] = [
+        (
+            "gemini generationConfig.maxOutputTokens",
+            json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 4096}}),
+            4096,
+        ),
+        (
+            "bedrock inferenceConfig.maxTokens",
+            json!({"messages": [{"role": "user", "content": "hi"}], "inferenceConfig": {"maxTokens": 2048}}),
+            2048,
+        ),
+        (
+            "titan textGenerationConfig.maxTokenCount",
+            json!({"inputText": "hi", "textGenerationConfig": {"maxTokenCount": 1024}}),
+            1024,
+        ),
+        (
+            "tgi parameters.max_new_tokens",
+            json!({"inputs": "hi", "parameters": {"max_new_tokens": 512}}),
+            512,
+        ),
+    ];
+
+    for (label, body, want) in cases {
+        let plugin = AiRateLimiter::new(
+            &json!({
+                "token_limit": 100_000,
+                "window_seconds": 60,
+                "count_mode": "completion_tokens",
+                "limit_by": "ip"
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            reserved_tokens(&ctx),
+            want,
+            "{label}: nested provider output cap must size the completion reservation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prompt_mode_counts_text_document_source_but_skips_binary() {
+    // Codex P2: `source` was a blanket skip, dropping the prose of an Anthropic
+    // TEXT document block (`source:{type:"text",...,data:"<prose>"}`) — real input
+    // the provider bills. A BINARY image/PDF source must still be skipped so a
+    // base64 blob can't inflate the estimate.
+    let text_doc = "x".repeat(4000); // ~1000 tokens at chars/4
+    let plugin_text = AiRateLimiter::new(
+        &json!({"token_limit": 100_000, "window_seconds": 60, "count_mode": "prompt_tokens", "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx_text = create_test_context();
+    ctx_text.method = "POST".to_string();
+    ctx_text
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx_text.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text_doc}}
+            ]}]
+        }))
+        .unwrap(),
+    );
+    let mut h_text = HashMap::new();
+    assert_continue(plugin_text.before_proxy(&mut ctx_text, &mut h_text).await);
+    assert!(
+        reserved_tokens(&ctx_text) >= 1000,
+        "text-document source prose must be counted (got {})",
+        reserved_tokens(&ctx_text)
+    );
+
+    let big_b64 = "A".repeat(4000);
+    let plugin_bin = AiRateLimiter::new(
+        &json!({"token_limit": 100_000, "window_seconds": 60, "count_mode": "prompt_tokens", "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx_bin = create_test_context();
+    ctx_bin.method = "POST".to_string();
+    ctx_bin
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx_bin.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big_b64}}
+            ]}]
+        }))
+        .unwrap(),
+    );
+    let mut h_bin = HashMap::new();
+    assert_continue(plugin_bin.before_proxy(&mut ctx_bin, &mut h_bin).await);
+    assert!(
+        reserved_tokens(&ctx_bin) < 100,
+        "binary image source must not be counted as prompt text (got {})",
+        reserved_tokens(&ctx_bin)
+    );
+}
+
+#[tokio::test]
+async fn non_llm_json_post_is_not_treated_as_ai_request() {
+    // Codex P2: any parseable JSON POST was marked an AI request, so on a shared
+    // proxy an ordinary non-LLM payload was subjected to `on_unmetered_response`
+    // (502 under `reject`). Only LLM-shaped bodies should carry the marker.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({"order_id": 42, "items": ["a", "b"]})).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "non-LLM JSON must not reserve tokens"
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "non-LLM JSON must not be marked as an AI request"
+    );
+
+    // A usage-less 2xx for the non-AI request must NOT be turned into a 502.
+    let body = serde_json::to_vec(&json!({"ok": true})).unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+
+    // Contrast: an LLM-shaped request with a usage-less 2xx IS rejected.
+    let mut ai_ctx = ai_request_ctx(50, "real prompt");
+    let mut ai_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ai_ctx, &mut ai_headers).await);
+    assert!(
+        ai_ctx.metadata.contains_key("ai_ratelimit_request"),
+        "an LLM-shaped request must be marked as an AI request"
+    );
+    let ai_body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ai_ctx, 200, &json_headers(), &ai_body)
+            .await,
+        Some(502),
+    );
+}
+
+#[test]
+fn compressed_request_is_not_pre_buffered() {
+    // Codex P2: `before_proxy` forces `reserved_tokens = 0` for a compressed body
+    // (it can't be estimated before decompression), so requesting full request
+    // buffering for it just wastes memory/latency. This withdraws only THIS
+    // plugin's buffering request; a co-located plugin can still force buffering.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "uncompressed JSON POST should be buffered"
+    );
+
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "compressed JSON POST must not be pre-buffered by ai_rate_limiter"
+    );
+
+    ctx.headers
+        .insert("content-encoding".to_string(), "identity".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "an `identity` content-encoding is not compressed and must still buffer"
+    );
+}
+
+#[tokio::test]
+async fn federation_usageless_response_kept_when_guard_rejects() {
+    // Codex P2: with `ai_rate_limiter` priority-overridden before `ai_federation`
+    // it pre-reserves for the federated call. A federation 2xx WITHOUT usage that
+    // a response-body guardrail later rejects re-runs after_proxy with the 5xx
+    // rejection status; reconciling against that 5xx would release the reservation
+    // for a provider call that already consumed tokens (a paid call made free).
+    // Reconciliation must use the ORIGINAL federation status (`ai_federation_status`)
+    // and keep the reservation via the default `charge_estimate` policy.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(300, "federated prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve estimated tokens");
+
+    // ai_federation served a 2xx but reported NO usage; it recorded the provider
+    // and the original synthetic status, but no `ai_total_tokens`.
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "primary".to_string());
+    ctx.metadata
+        .insert("ai_federation_status".to_string(), "200".to_string());
+
+    // A response-body guardrail rejected the synthetic body: after_proxy re-runs
+    // in rejection context with the 5xx status.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 502, &mut response_headers)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "a usage-less federation 2xx that is later guard-rejected must KEEP its \
+         reservation, not be released by the rejection status"
     );
 }
