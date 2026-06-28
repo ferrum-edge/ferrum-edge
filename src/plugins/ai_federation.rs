@@ -1432,6 +1432,30 @@ fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Maximum number of characters of the client-supplied `model` reflected back
+/// in a no-match error body.
+///
+/// The unmatched-model 404 echoes the requested model so operators can see what
+/// failed to route, but the value is fully client-controlled and only bounded by
+/// the request-body limit. Capping it keeps a hostile caller from forcing the
+/// gateway to clone and serialize a multi-megabyte string into the error
+/// response. Any real model id is far shorter than this.
+const MAX_ECHOED_MODEL_CHARS: usize = 128;
+
+/// Bound the client-supplied `model` string echoed back in error responses.
+///
+/// Truncates on a UTF-8 character boundary (not a byte boundary) so the result
+/// is always valid UTF-8, and appends an ellipsis marker when the value was
+/// shortened so the message stays unambiguous. The returned string is still
+/// JSON-escaped by `serde_json` when serialized into the error body.
+fn truncate_model_for_error(model: &str) -> String {
+    if model.chars().count() <= MAX_ECHOED_MODEL_CHARS {
+        return model.to_string();
+    }
+    let truncated: String = model.chars().take(MAX_ECHOED_MODEL_CHARS).collect();
+    format!("{truncated}… (truncated)")
+}
+
 fn openai_error_body(
     message: &str,
     error_type: &str,
@@ -1913,6 +1937,22 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
+        // Native gRPC bodies are length-prefixed framing (5-byte
+        // compression/length header + payload), not raw OpenAI JSON. Because
+        // this plugin advertises `HTTP_GRPC_PROTOCOLS` and `is_json_content_type`
+        // accepts the `+json` suffix, a `content-type: application/grpc+json`
+        // request would otherwise be buffered and reach the JSON parse below,
+        // which would reject the gRPC frame as malformed JSON under the
+        // fail-closed policy. gRPC model-routing is out of scope for this
+        // OpenAI-format gateway, so pass framed gRPC traffic through untouched —
+        // matching how `ai_token_metrics` opts native gRPC out of JSON parsing.
+        if crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+            debug!(
+                "ai_federation: native gRPC content-type, passing through (gRPC model routing unsupported)"
+            );
+            return PluginResult::Continue;
+        }
+
         // Read request body. `store_request_body_metadata()` in
         // `src/proxy/mod.rs` only inserts `request_body` for UTF-8 bodies and
         // removes the key for non-UTF-8 bodies, so this `None` branch covers
@@ -2006,9 +2046,10 @@ impl Plugin for AiFederation {
                     model = %model,
                     "ai_federation: rejecting request because no provider matches model"
                 );
+                let echoed_model = truncate_model_for_error(&model);
                 return self.openai_error_response(
                     404,
-                    &format!("No ai_federation provider is configured for model '{model}'"),
+                    &format!("No ai_federation provider is configured for model '{echoed_model}'"),
                     "invalid_request_error",
                     Some("model"),
                     Some("model_not_found"),
@@ -2369,6 +2410,19 @@ pub mod test_helpers {
 
     pub fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
         super::cap_upstream_error_body(body)
+    }
+
+    /// Maximum characters of the echoed `model` reflected in no-match errors.
+    pub const MAX_ECHOED_MODEL_CHARS: usize = super::MAX_ECHOED_MODEL_CHARS;
+
+    /// Expose the no-match `model` echo bounding helper for tests.
+    pub fn truncate_model_for_error(model: &str) -> String {
+        super::truncate_model_for_error(model)
+    }
+
+    /// Expose the native gRPC content-type classifier used to skip gRPC framing.
+    pub fn is_native_grpc_content_type(content_type: &str) -> bool {
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
     }
 
     /// Expose request translation for tests.

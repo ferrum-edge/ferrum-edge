@@ -1887,6 +1887,137 @@ async fn federation_unknown_model_rejects_by_default() {
     }
 }
 
+#[test]
+fn truncate_model_for_error_passes_short_values_through() {
+    // Short, realistic model ids are echoed verbatim.
+    assert_eq!(test_helpers::truncate_model_for_error("gpt-4o"), "gpt-4o");
+    // A value exactly at the cap is not truncated.
+    let at_cap: String = "a".repeat(test_helpers::MAX_ECHOED_MODEL_CHARS);
+    assert_eq!(test_helpers::truncate_model_for_error(&at_cap), at_cap);
+}
+
+#[test]
+fn truncate_model_for_error_bounds_hostile_values() {
+    // A model far longer than the cap is truncated with an explicit marker, and
+    // the kept prefix is exactly the cap length (counted in characters).
+    let hostile: String = "z".repeat(10_000);
+    let truncated = test_helpers::truncate_model_for_error(&hostile);
+    assert!(
+        truncated.ends_with("… (truncated)"),
+        "truncation marker must be present: {truncated}"
+    );
+    let kept_prefix = truncated.trim_end_matches("… (truncated)");
+    assert_eq!(
+        kept_prefix.chars().count(),
+        test_helpers::MAX_ECHOED_MODEL_CHARS
+    );
+}
+
+#[test]
+fn truncate_model_for_error_truncates_on_char_boundary() {
+    // Multi-byte characters past the cap must not panic and must yield valid
+    // UTF-8 (truncation counts characters, not bytes).
+    let hostile: String = "🦀".repeat(10_000);
+    let truncated = test_helpers::truncate_model_for_error(&hostile);
+    let kept_prefix = truncated.trim_end_matches("… (truncated)");
+    assert_eq!(
+        kept_prefix.chars().count(),
+        test_helpers::MAX_ECHOED_MODEL_CHARS
+    );
+    assert!(truncated.contains("🦀"));
+}
+
+#[tokio::test]
+async fn federation_unknown_model_404_bounds_echoed_model() {
+    let plugin = streaming_plugin();
+    // A hostile, oversized model that does not match the configured `gpt-*`
+    // pattern: it reaches the no-match 404 path and must be bounded in the body.
+    let hostile_model = "x".repeat(50_000);
+    let body = json!({
+        "model": hostile_model,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            // The echoed model must be bounded — nowhere near the 50k input.
+            assert!(
+                body.len() < 1024,
+                "no-match 404 body must be bounded, got {} bytes",
+                body.len()
+            );
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["code"], "model_not_found");
+            let msg = parsed["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("(truncated)"),
+                "bounded message should mark truncation: {msg}"
+            );
+        }
+        other => panic!("expected RejectBinary 404, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_grpc_content_type_classifier_matches_dispatch() {
+    // The skip predicate must agree with the dispatch-path classifier: bare and
+    // suffixed gRPC are native; `+json` (which `is_json_content_type` accepts) is
+    // still native gRPC; grpc-web and bogus suffixes are not.
+    assert!(test_helpers::is_native_grpc_content_type(
+        "application/grpc"
+    ));
+    assert!(test_helpers::is_native_grpc_content_type(
+        "application/grpc+proto"
+    ));
+    assert!(test_helpers::is_native_grpc_content_type(
+        "application/grpc+json"
+    ));
+    assert!(!test_helpers::is_native_grpc_content_type(
+        "application/grpc-web"
+    ));
+    assert!(!test_helpers::is_native_grpc_content_type(
+        "application/grpcfoo"
+    ));
+    assert!(!test_helpers::is_native_grpc_content_type(
+        "application/json"
+    ));
+}
+
+#[tokio::test]
+async fn federation_native_grpc_json_body_passes_through_in_strict_mode() {
+    // `application/grpc+json` is accepted by `is_json_content_type` and the
+    // plugin advertises gRPC support, so without the native-gRPC skip a
+    // length-prefixed gRPC frame would hit the strict JSON parse and be rejected
+    // as malformed JSON (400). It must instead pass through untouched.
+    let plugin = streaming_plugin();
+
+    // Simulate a native gRPC DATA frame: 5-byte prefix (uncompressed, len=2) +
+    // payload. This is not valid JSON.
+    let grpc_body = String::from_utf8_lossy(&[0u8, 0, 0, 0, 2, b'h', b'i']).to_string();
+    let mut ctx = post_json_ctx_with_raw_body(grpc_body);
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "native gRPC body must pass through, got {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn federation_pass_through_requires_explicit_opt_in() {
     let unknown_model_body = json!({
