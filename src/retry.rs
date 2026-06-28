@@ -673,6 +673,18 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::PortExhaustion;
     }
 
+    // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
+    // rebinds — to a blocked IP) surfaces as a connect-phase io error carrying
+    // "...denied by backend egress policy...". Classify it as the non-retryable,
+    // backend-health-neutral DispatchPolicyRejected BEFORE the is_connect()
+    // typed/DNS fallback mislabels it (DnsLookupError / ConnectionRefused),
+    // which would retry it under retry_on_connect_failure and charge passive
+    // health / the circuit breaker as a connect-class failure. Error-path only,
+    // so the formatting cost is irrelevant.
+    if format!("{e:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     if e.is_connect() {
         if e.is_timeout() {
             return ErrorClass::ConnectionTimeout;

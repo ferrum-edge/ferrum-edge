@@ -824,8 +824,11 @@ impl HealthChecker {
         // Screen the probe target against the backend egress policy so active
         // health checks never dial a denied address (an SSRF/port-scan vector via
         // the health probe). reqwest skips the resolver for IP literals and the
-        // TCP/UDP/gRPC probes connect directly, so screen the literal here.
+        // TCP/UDP/gRPC probes connect directly, so screen the literal here; the
+        // DNS cache (below) additionally screens hostnames for the non-HTTP
+        // probes (HTTP hostnames go through reqwest's DnsCacheResolver).
         let probe_egress_policy = self.dns_cache.as_ref().map(|c| c.backend_allow_ips());
+        let probe_dns_cache = self.dns_cache.clone();
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -870,24 +873,84 @@ impl HealthChecker {
                 } else {
                     match probe_type {
                         HealthProbeType::Http => {
+                            // reqwest routes hostnames through the
+                            // DnsCacheResolver (which screens); literal IPs skip
+                            // it and were screened by `egress_denied` above.
                             http_probe(&client, &url, timeout, &healthy_status_codes).await
                         }
-                        HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
-                        HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
-                        HealthProbeType::Grpc => {
-                            grpc_probe(
-                                &host,
-                                port,
-                                timeout,
-                                use_tls,
-                                &grpc_service_name,
-                                &probe_tls_config,
-                                probe_global_ca.as_deref(),
-                                probe_global_cert.as_deref(),
-                                probe_global_key.as_deref(),
-                                probe_no_verify,
-                            )
-                            .await
+                        // TCP/UDP/gRPC dial directly (TcpStream/UdpSocket/tonic),
+                        // bypassing the DnsCacheResolver, so resolve through the
+                        // gateway DNS cache here to enforce the egress policy on
+                        // the resolved address (hostname rebinding to a denied IP
+                        // fails). TCP/UDP then dial that exact screened IP; gRPC
+                        // keeps the hostname so TLS SNI is unchanged but is still
+                        // screened by the resolve above.
+                        HealthProbeType::Tcp | HealthProbeType::Udp | HealthProbeType::Grpc => {
+                            match probe_dns_cache.as_ref() {
+                                Some(cache) => match cache.resolve(&host, None, None).await {
+                                    Ok(resolved_ip) => {
+                                        let ip_str = resolved_ip.to_string();
+                                        match probe_type {
+                                            HealthProbeType::Tcp => {
+                                                tcp_probe(&ip_str, port, timeout).await
+                                            }
+                                            HealthProbeType::Udp => {
+                                                udp_probe(&ip_str, port, timeout, &udp_payload)
+                                                    .await
+                                            }
+                                            // gRPC: dial the hostname to preserve TLS
+                                            // SNI; the resolve above already screened
+                                            // the resolved address.
+                                            _ => {
+                                                grpc_probe(
+                                                    &host,
+                                                    port,
+                                                    timeout,
+                                                    use_tls,
+                                                    &grpc_service_name,
+                                                    &probe_tls_config,
+                                                    probe_global_ca.as_deref(),
+                                                    probe_global_cert.as_deref(),
+                                                    probe_global_key.as_deref(),
+                                                    probe_no_verify,
+                                                )
+                                                .await
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target = %host,
+                                            error = %e,
+                                            "Health probe target blocked or unresolvable by backend egress policy; marking unhealthy"
+                                        );
+                                        false
+                                    }
+                                },
+                                // No DNS cache wired (e.g. tests): fall back to the
+                                // legacy direct dial.
+                                None => match probe_type {
+                                    HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
+                                    HealthProbeType::Udp => {
+                                        udp_probe(&host, port, timeout, &udp_payload).await
+                                    }
+                                    _ => {
+                                        grpc_probe(
+                                            &host,
+                                            port,
+                                            timeout,
+                                            use_tls,
+                                            &grpc_service_name,
+                                            &probe_tls_config,
+                                            probe_global_ca.as_deref(),
+                                            probe_global_cert.as_deref(),
+                                            probe_global_key.as_deref(),
+                                            probe_no_verify,
+                                        )
+                                        .await
+                                    }
+                                },
+                            }
                         }
                     }
                 };

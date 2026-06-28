@@ -470,9 +470,33 @@ impl PluginHttpClient {
     /// than defaulting open (`BackendEgressPolicy::unrestricted()`). Without this, a CP could
     /// accept a literal-IP backend endpoint that data planes later reject.
     pub fn default_with_backend_allow_ips(backend_allow_ips: BackendEgressPolicy) -> Self {
-        let mut client = Self::from_pool_config(&PoolConfig::default());
-        client.backend_allow_ips = backend_allow_ips;
-        client
+        // Route the validation client's reqwest stack through a DnsCacheResolver
+        // carrying the same egress policy. Constructor side effects started
+        // during config-load validation (e.g. jwks_auth / oidc_relying_party
+        // background JWKS/discovery refresh) fetch hostname URLs; without the
+        // resolver they would use the OS resolver, bypassing execute_request's
+        // literal-only guard and letting a hostname that resolves — or rebinds —
+        // to a denied IP (e.g. 169.254.169.254) be dialed before the real
+        // runtime plugin is ever built. The fresh cache is cheap and short-lived
+        // (validation is a cold path), and mirrors the runtime client's screen.
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig {
+            backend_allow_ips: backend_allow_ips.clone(),
+            ..Default::default()
+        });
+        Self::new(
+            &PoolConfig::default(),
+            dns_cache,
+            1000, // slow_threshold_ms (from_pool_config default)
+            0,    // max_retries
+            100,  // retry_delay_ms (from_pool_config default)
+            false,
+            None,
+            Arc::new(Vec::new()),
+            crate::config::types::DEFAULT_NAMESPACE,
+            backend_allow_ips,
+            Arc::new(Vec::new()),
+            0, // pool_shard_amount → auto
+        )
     }
 
     /// Build a plugin HTTP client from pool config with custom slow-call and

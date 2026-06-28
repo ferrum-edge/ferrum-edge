@@ -228,6 +228,29 @@ impl ServiceDiscoveryManager {
             }
             SdProvider::Consul => {
                 if let Some(consul_config) = &sd_config.consul {
+                    // Screen the Consul API endpoint before starting the poller:
+                    // the discoverer dials `address` via the raw client
+                    // (`.send()`), bypassing execute_request's literal-IP guard,
+                    // and reqwest skips the DnsCacheResolver for IP literals — so
+                    // a denied literal address (e.g. http://169.254.169.254:8500,
+                    // which would also leak any X-Consul-Token) must be rejected
+                    // here. Hostname addresses are screened by the resolver when
+                    // the client polls.
+                    if let Ok(parsed) = url::Url::parse(&consul_config.address)
+                        .or_else(|_| url::Url::parse(&format!("http://{}", consul_config.address)))
+                        && let Err(e) = crate::plugins::utils::log_helpers::screen_url_host_egress(
+                            "service_discovery.consul",
+                            "address",
+                            &parsed,
+                            self.http_client.backend_allow_ips(),
+                        )
+                    {
+                        warn!(
+                            "Service discovery: upstream {} Consul address blocked by egress policy: {}",
+                            upstream_id, e
+                        );
+                        return;
+                    }
                     Box::new(consul::ConsulDiscoverer::new(
                         self.http_client.get().clone(),
                         consul_config.address.clone(),

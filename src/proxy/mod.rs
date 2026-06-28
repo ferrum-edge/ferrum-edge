@@ -13451,6 +13451,18 @@ async fn handle_proxy_request_inner(
                 reason,
                 "Backend egress policy denied literal-IP gRPC backend; not dialing"
             );
+            // Mirror the cross-cluster gRPC reject accounting: this reject
+            // precedes any dispatch, so release a HALF_OPEN probe slot
+            // `check_circuit_breaker` may have admitted (else it wedges the
+            // breaker) and count the request so policy-denied gRPC calls still
+            // appear in request/status metrics instead of vanishing.
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             return Ok(grpc_proxy::build_grpc_error_response(
                 14,
                 "backend address blocked by egress policy",
@@ -14041,6 +14053,31 @@ async fn handle_proxy_request_inner(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Re-screen the (possibly LB-rotated) retry target before
+                // dispatch: the gRPC pool skips the DnsCacheResolver for IP
+                // literals, so a denied literal reached via rotation must be
+                // rejected here too (mirrors the first-attempt gRPC screen). No
+                // circuit-breaker probe slot is held for the new target yet (the
+                // breaker is checked just below), so only the request is counted.
+                if let Some(ref rotated_target) = grpc_current_target
+                    && denied_literal_backend_ip(
+                        &rotated_target.host,
+                        &state.env_config.backend_allow_ips,
+                    )
+                    .is_some()
+                {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend = %rotated_target.host,
+                        "Backend egress policy denied literal-IP gRPC retry target; not dialing"
+                    );
+                    record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        14,
+                        "backend address blocked by egress policy",
+                    ));
                 }
 
                 // Enforce the (possibly rotated) target's circuit breaker before
@@ -17404,6 +17441,15 @@ pub(crate) async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // Re-screen the (possibly LB-rotated) retry target: reqwest skips the
+    // DnsCacheResolver for IP literals, so a denied literal reached via retry
+    // rotation must be rejected here too, mirroring the first-attempt screen in
+    // proxy_to_backend. (Hostname targets are screened by the resolver at
+    // dispatch and classified via classify_reqwest_error.)
+    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+        return backend_egress_denied_response(effective_host);
+    }
+
     if proxy.resolved_tls.sni.is_some() {
         warn!(
             proxy_id = %proxy.id,
@@ -17879,24 +17925,26 @@ fn denied_literal_backend_ip(
         .and_then(|ip| policy.deny_reason(&ip))
 }
 
-/// Build the fail-closed dispatch result for a literal-IP backend blocked by the
-/// egress policy: a 502 that is NOT retried and is neutral to backend health
+/// Build the fail-closed `BackendResponse` for a literal-IP backend blocked by
+/// the egress policy: a 502 that is NOT retried and is neutral to backend health
 /// (the backend was never dialed), via `ErrorClass::DispatchPolicyRejected`.
+fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: Some(host.to_string()),
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+/// Dispatch-result wrapper around [`backend_egress_denied_response`] for the
+/// first-attempt `proxy_to_backend` path.
 fn backend_egress_denied_dispatch_result(host: &str) -> BackendDispatchResult {
-    backend_dispatch_response(
-        retry::BackendResponse {
-            status_code: 502,
-            body: ResponseBody::Buffered(
-                br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
-            ),
-            headers: HashMap::new(),
-            connection_error: false,
-            backend_resolved_ip: Some(host.to_string()),
-            error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
-        },
-        None,
-        None,
-    )
+    backend_dispatch_response(backend_egress_denied_response(host), None, None)
 }
 
 /// deterministic gateway 413, masking a client/gateway policy violation as
@@ -22599,6 +22647,13 @@ async fn proxy_to_backend_http3_retry(
     let effective_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
+
+    // Re-screen the (possibly LB-rotated) retry target: the native H3 pool skips
+    // the DnsCacheResolver for IP literals, so a denied literal reached via retry
+    // rotation must be rejected here, mirroring the first-attempt H3 screen.
+    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+        return backend_egress_denied_response(effective_host);
+    }
 
     let resolved_ip = state
         .dns_cache

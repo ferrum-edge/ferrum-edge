@@ -742,10 +742,17 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // A gateway-side egress-policy denial (denied literal/rebound H3
+                // WebSocket backend) never reached a backend: non-retryable AND
+                // neutral to backend health (no CB trip, no backend-admission
+                // failure), matching the H1/H2 path.
+                let ws_egress_denied =
+                    matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     (ws_attempt < retry_config.max_retries
                         && retry_config.retry_on_connect_failure
-                        && ws_is_pre_wire)
+                        && ws_is_pre_wire
+                        && !ws_egress_denied)
                         .then(|| retry::retry_delay(retry_config, ws_attempt))
                 });
 
@@ -852,6 +859,7 @@ pub(crate) async fn handle_h3_websocket(
                     "H3 WebSocket backend connection failed"
                 );
                 if !backend_outcome_already_recorded
+                    && !ws_egress_denied
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -862,7 +870,10 @@ pub(crate) async fn handle_h3_websocket(
                     });
                 }
 
-                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
+                if !cb_failure_already_recorded
+                    && !ws_egress_denied
+                    && let Some(cb_config) = &proxy.circuit_breaker
+                {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
