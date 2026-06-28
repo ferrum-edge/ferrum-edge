@@ -229,6 +229,8 @@ fn test_admin_http_exposure_catch_all_allowlist_is_unrestricted() {
         "10.0.0.0/8,0.0.0.0/0",
         "0.0.0.0/00",
         "::ffff:0.0.0.0/96", // IPv4-mapped form the filter folds to an IPv4 /0
+        "0.0.0.0/1,128.0.0.0/1", // union covers all IPv4 with no literal /0
+        "::/1,8000::/1",     // union covers all IPv6 with no literal /0
     ] {
         let config = EnvConfig {
             admin_bind_address: "0.0.0.0".to_string(),
@@ -253,6 +255,24 @@ fn test_admin_http_exposure_public_routable_ip_no_allowlist() {
         config.admin_http_exposure(),
         AdminHttpExposure::ReachableUnrestricted
     );
+}
+
+#[test]
+fn test_admin_http_exposure_partial_coverage_allowlist_is_allowlisted() {
+    // A genuine (partial-coverage) allowlist must NOT be treated as catch-all —
+    // the union-coverage check must not over-match a half-space or a single subnet.
+    for cidrs in ["0.0.0.0/1", "10.0.0.0/8,192.168.0.0/16", "::/1"] {
+        let config = EnvConfig {
+            admin_bind_address: "0.0.0.0".to_string(),
+            admin_allowed_cidrs: cidrs.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.admin_http_exposure(),
+            AdminHttpExposure::ReachableAllowlisted,
+            "partial allowlist {cidrs:?} must stay ReachableAllowlisted"
+        );
+    }
 }
 
 // ── Writable-mode (database/cp) plaintext-admin hard-fail ───────────────────
@@ -390,6 +410,46 @@ fn test_catch_all_allowlist_does_not_satisfy_database_guard() {
         config.admin_insecure_plaintext_startup_error().is_some(),
         "a catch-all /0 allowlist must not satisfy the writable-mode guard"
     );
+}
+
+#[test]
+fn test_union_coverage_allowlist_does_not_satisfy_database_guard() {
+    // A union of CIDRs covering all of IPv4 (no literal /0) is also no
+    // protection and must hard-fail in database mode.
+    let config = EnvConfig {
+        mode: OperatingMode::Database,
+        admin_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: "0.0.0.0/1,128.0.0.0/1".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        config.admin_insecure_plaintext_startup_error().is_some(),
+        "a full-coverage CIDR union must not satisfy the writable-mode guard"
+    );
+}
+
+#[test]
+fn test_read_only_database_admin_is_not_hard_failed() {
+    // FERRUM_ADMIN_READ_ONLY=true blocks admin mutations, so a public plaintext
+    // read-only db/cp admin is warned (in main.rs), not hard-failed — it must not
+    // be forced to add an allowlist or the dev opt-in just to start.
+    for mode in [OperatingMode::Database, OperatingMode::ControlPlane] {
+        let config = EnvConfig {
+            mode: mode.clone(),
+            admin_bind_address: "0.0.0.0".to_string(),
+            admin_read_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.admin_http_exposure(),
+            AdminHttpExposure::ReachableUnrestricted,
+            "exposure classification is unchanged by read-only"
+        );
+        assert!(
+            config.admin_insecure_plaintext_startup_error().is_none(),
+            "{mode:?} with FERRUM_ADMIN_READ_ONLY=true must not hard-fail"
+        );
+    }
 }
 
 #[test]

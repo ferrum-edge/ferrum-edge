@@ -3129,13 +3129,19 @@ impl EnvConfig {
         }
     }
 
-    /// Hard-fail guard for the writable admin API. Returns `Some(error)` when a
-    /// `database`/`cp`-mode gateway would start a plaintext admin HTTP listener
-    /// reachable beyond loopback with no `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist
-    /// and without the explicit `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
+    /// Hard-fail guard for the **writable** admin API. Returns `Some(error)`
+    /// when a `database`/`cp`-mode gateway would start a plaintext admin HTTP
+    /// listener reachable beyond loopback with no (effective)
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist and without the explicit
+    /// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
     ///
-    /// Read-only admin modes (`file`/`dp`/`mesh`) are not gated here — they get
-    /// a high-severity startup warning instead (see `main.rs`). The node-agent
+    /// The hard error is reserved for the elevated risk of an unauthenticated-
+    /// network-exposed *writable* admin surface. Read-only admin surfaces get a
+    /// high-severity startup warning instead (see `main.rs`): the read-only
+    /// modes (`file`/`dp`/`mesh`), and also `database`/`cp` when
+    /// `FERRUM_ADMIN_READ_ONLY=true` blocks mutations — in that case the
+    /// remaining plaintext-token risk matches the read-only modes, so it warns
+    /// rather than forcing an allowlist/opt-in just to start. The node-agent
     /// admin listener has its own safe-by-default loopback fallback.
     ///
     /// Pure (reads only `self`), so it is unit-testable without touching the
@@ -3145,6 +3151,10 @@ impl EnvConfig {
             self.mode,
             OperatingMode::Database | OperatingMode::ControlPlane
         ) {
+            return None;
+        }
+        // A read-only db/cp admin is not a writable surface — warn, don't fail.
+        if self.admin_read_only {
             return None;
         }
         if self.admin_http_exposure() != AdminHttpExposure::ReachableUnrestricted {
