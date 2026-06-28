@@ -952,6 +952,10 @@ jobs:
     name: Gateway API Conformance
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Backstop above the in-script poll bounds (discovery <=30 min +
+    # status <=140 min) so the graceful "Timed out" branch is reachable and
+    # the job is never force-killed at GitHub's 360-min default.
+    timeout-minutes: 180
     permissions:
       actions: read
       contents: read
@@ -989,14 +993,22 @@ jobs:
 
           echo "Mirroring dedicated workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
 
-          for _ in $(seq 1 720); do
+          # ~280 polls * 30s ~= 140 min, comfortably under this job's
+          # timeout-minutes cap so the graceful timeout branch is reachable.
+          # The dedicated lab has a 90-min job timeout plus queue time, so a
+          # ~140-min ceiling leaves margin for it to finish and report.
+          for _ in $(seq 1 280); do
             run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
             if [ -z "$run_json" ]; then
               sleep 30
               continue
             fi
-            status="$(printf '%s' "$run_json" | jq -r '.status')"
-            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""')"
+            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
+            if [ -z "$status" ]; then
+              sleep 30
+              continue
+            fi
+            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
             if [ "$status" = "completed" ]; then
               if [ "$conclusion" = "success" ]; then
                 echo "Dedicated Gateway API conformance workflow passed." >> "$GITHUB_STEP_SUMMARY"
@@ -1008,7 +1020,7 @@ jobs:
             sleep 30
           done
 
-          echo "Timed out waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
+          echo "Timed out after ~140 min waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
   mesh-multicluster-federation:

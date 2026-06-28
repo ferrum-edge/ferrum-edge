@@ -30,7 +30,10 @@ permissions:
 # behind another. Scheduled/manual runs keep sharing one lane for lab budget.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('gateway-api-conformance-pr-{0}', github.event.pull_request.number) || 'gateway-api-conformance-shared' }}
-  cancel-in-progress: false
+  # Cancel a superseded PR's in-flight lab on rapid re-push (its mirror in
+  # ci.yml is already cancelled, so nothing reads the stale run). Scheduled and
+  # manual runs share one lane and must run to completion for lab budget.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
