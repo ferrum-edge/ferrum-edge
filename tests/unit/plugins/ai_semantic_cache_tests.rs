@@ -657,6 +657,62 @@ async fn exact_cache_key_differs_for_base64_audio_and_file_parts() {
 }
 
 #[tokio::test]
+async fn exact_cache_key_treats_mixed_case_text_type_as_non_text() {
+    // A content part typed lowercase "text" is folded into the message text and
+    // is NOT fingerprinted; a part typed mixed-case "Text" must be treated as a
+    // non-text part (case-sensitive, matching extract_message_content /
+    // normalize_system_value), so it IS fingerprinted and CHANGES the exact key.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let lowercase_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "text", "text": "describe it"}
+            ]
+        }]
+    });
+    let mixed_case_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "Text", "text": "describe it"}
+            ]
+        }]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&lowercase_body).unwrap(),
+        None,
+        b"A",
+    )
+    .await;
+
+    let (ctx_mixed, result) = run_before_proxy(
+        &plugin,
+        &serde_json::to_string(&mixed_case_body).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "mixed-case \"Text\" part must be fingerprinted (non-text) and exact-miss vs lowercase \"text\""
+    );
+    assert_eq!(
+        ctx_mixed
+            .metadata
+            .get("ai_cache_status")
+            .map(String::as_str),
+        Some("MISS")
+    );
+}
+
+#[tokio::test]
 async fn semantic_cache_scope_differs_for_different_image_url() {
     let mock_server = MockServer::start().await;
     mount_embedding_mock(&mock_server, 2).await;

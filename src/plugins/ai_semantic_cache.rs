@@ -1216,9 +1216,7 @@ fn append_multimodal_part_descriptor(
 }
 
 fn is_text_content_part(part: &Value) -> bool {
-    part.get("type")
-        .and_then(|t| t.as_str())
-        .is_some_and(|part_type| part_type.eq_ignore_ascii_case("text"))
+    part.get("type").and_then(|t| t.as_str()) == Some("text")
 }
 
 fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
