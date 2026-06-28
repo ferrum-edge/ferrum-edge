@@ -13,7 +13,7 @@ It is intentionally not self-skipping: the CI job that calls it must provide two
 disposable kind clusters on a shared docker network and `docker`, `kind`,
 `kubectl`, `curl`, and `python3`.
 
-## What it proves (Stage 2 of the M5 cross-cluster roadmap)
+## What it proves (Stages 2–3 of the M5 cross-cluster roadmap)
 
 Two clusters, `ferrum-fed-a` (trust domain `cluster-a.test`) and `ferrum-fed-b`
 (`cluster-b.test`), each run an identical, symmetric topology so traffic can be
@@ -124,6 +124,10 @@ live suite gates its `node_waypoint.*` IDs in its own run.sh REQUIRED array):
 | `multicluster.eastwest.b_to_a_authenticated` | the mirror direction (200, body `svc-a`) |
 | `multicluster.eastwest.bidirectional_authenticated_traffic` | both directions pass |
 | `multicluster.eastwest.untrusted_peer_rejected` | the federated `rogue` client is rejected at the DESTINATION by MeshPolicy (403 `Mesh authorization denied`, not 200/`svc-b`) |
+| `multicluster.federation.bundle_revoked_rejected` | (Stage 3) after dropping cluster A's federated bundle from B's dest slice + reload, A→B fails closed (no 200/`svc-b`) |
+| `multicluster.federation.trust_restored_recovers` | (Stage 3) re-adding the federated bundle + reload restores A→B (200, body `svc-b`) |
+| `multicluster.eastwest.endpoint_blackhole_when_dest_down` | (Stage 3) with B's `svc` scaled to 0, A→B returns a real upstream error (a 5xx from the client sidecar — not a `000` curl-timeout hang, not 200) |
+| `multicluster.eastwest.endpoint_recovers_when_dest_returns` | (Stage 3) scaling `svc` back up + re-rendering the gateway for the new pod IP restores A→B (200, body `svc-b`) |
 
 Cross-cluster east-west is Beta/Experimental in `docs/mesh.md`, so there is
 intentionally no `ga_contract.yaml` row yet — a GA promotion would add a
@@ -141,10 +145,34 @@ Set `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` to run only the SPIRE/workload deploy
 `ferrum-edge:multicluster-federation` image is already loaded into both clusters
 (CI builds + packages it via `.github/actions/package-ferrum-runtime-image`).
 
-## Stage 3 (out of scope here)
+## Stage 3 (failure injection)
 
-Bundle rotation/removal/invalid delivery, endpoint failover, and network
-partitions are Stage 3. The script marks `# STAGE 3:` hook points where they
-would attach (e.g. `spire-server bundle delete` then re-drive and assert
-fail-closed). Stage 2 keeps scope to the realistic captured-app-port→`:15006`
-bidirectional path plus the trust-boundary negative.
+After the positive/negative traffic tests, the script injects two failure
+scenarios (A→B only; each mutates state then self-restores so the next starts
+healthy), gated by the `multicluster.federation.*`/`...endpoint_*` assertions
+above:
+
+- **Trust revocation** — re-render cluster B's dest mesh document with LOCAL
+  trust only (drop the federated cluster-A bundle), `rollout restart` `svc` so it
+  loads the revoked config, and assert A→B now fails closed; then restore the
+  federated bundle and assert recovery. Proves `slice.trust_bundles` is
+  load-bearing for inbound cross-cluster mTLS.
+- **Endpoint black-hole** — scale B's `svc` to 0 and assert A→B fails fast (the
+  gateway's pinned backend is gone) rather than hanging; then scale back up,
+  re-render the gateway for the new pod IP, and assert recovery.
+
+Reloads use `rollout restart`, not SIGHUP: the Ferrum runtime image is distroless
+(no shell/`kill`), and the new pod reads the updated ConfigMap at startup
+(deterministic, no ConfigMap-mount-propagation race). Because a `svc` restart
+changes the pod IP and this file-config fixture's east-west gateway pins a
+**static** svc pod IP (no live endpoint discovery), each `svc` replacement also
+re-renders + restarts the gateway.
+
+**Deferred — network partition / last-good retention.** Bounded-staleness
+last-good retention is a property of the federation / remote-discovery POLLER,
+which this static file-config fixture does not run (endpoints are statically
+declared, not polled), so a partition here would only prove "down→fail, up→
+recover," not the M5 retention machinery. A meaningful partition/last-good test
+needs poller-driven remote discovery (a separate fixture); kind also has no
+NetworkPolicy enforcement (kindnet), so a clean in-cluster partition primitive is
+unavailable here regardless.
