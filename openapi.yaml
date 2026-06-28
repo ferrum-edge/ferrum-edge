@@ -14581,7 +14581,7 @@ components:
 
     AiFederationConfig:
       type: object
-      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing non-streaming responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Streaming Chat Completions (`stream: true`) are intentionally unsupported for matched providers and return 501; there is no provider SSE normalization path. Config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation because they do not enable streaming. Supports priority-ordered fallback across providers. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing non-streaming responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Streaming Chat Completions (`stream: true`) are intentionally unsupported for matched providers and return 501; there is no provider SSE normalization path. Config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation because they do not enable streaming. Supports priority-ordered fallback across providers. Fails closed by default when a JSON POST body cannot be inspected, is missing a top-level string `model`, or no provider matches the requested model; pass-through requires explicit opt-in and can bypass AI gateway policy. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -14695,6 +14695,14 @@ components:
           type: boolean
           default: true
           description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
+        fail_on_missing_model:
+          type: boolean
+          default: true
+          description: Reject JSON POST requests whose body cannot be inspected as JSON or lacks a top-level string `model` field. Set to false only to explicitly pass such requests through to the normal backend.
+        fail_on_no_matching_provider:
+          type: boolean
+          default: true
+          description: Reject requests whose `model` does not match any configured provider. Set to false only to explicitly pass unsupported models through to the normal backend.
 
     A2aGatewayConfig:
       type: object
