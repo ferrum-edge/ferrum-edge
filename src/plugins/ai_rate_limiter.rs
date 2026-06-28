@@ -116,18 +116,13 @@ impl AiRateLimiter {
             ));
         }
 
-        let on_unmetered_response = match optional_string(config, "on_unmetered_response")?
-            .unwrap_or("charge_estimate")
-        {
-            value @ ("reject" | "charge_estimate" | "warn") => {
-                OnUnmeteredResponse::parse(value).unwrap_or(OnUnmeteredResponse::ChargeEstimate)
-            }
-            other => {
-                return Err(format!(
-                    "ai_rate_limiter: unknown 'on_unmetered_response' value '{}' (expected 'reject', 'charge_estimate', or 'warn')",
-                    other
-                ));
-            }
+        let on_unmetered_response = match optional_string(config, "on_unmetered_response")? {
+            Some(raw) => OnUnmeteredResponse::parse(raw).ok_or_else(|| {
+                format!(
+                    "ai_rate_limiter: unknown 'on_unmetered_response' value '{raw}' (expected 'reject', 'charge_estimate', or 'warn')"
+                )
+            })?,
+            None => OnUnmeteredResponse::ChargeEstimate,
         };
 
         Ok(Self {
@@ -669,6 +664,32 @@ impl Plugin for AiRateLimiter {
     ) -> PluginResult {
         let key = self.rate_key(ctx);
         let reserved_tokens = self.estimate_request_tokens(ctx);
+        // Pre-reservation vs. fall-back-to-check behavior, and two
+        // intentional limitations operators must understand:
+        //
+        // 1. Estimate of 0 => no pre-reservation. With `count_mode:
+        //    "completion_tokens"` the estimate comes solely from
+        //    `requested_completion_tokens` (max_tokens / max_completion_tokens
+        //    / max_output_tokens). A client that omits all of those makes the
+        //    estimate 0, so this falls back to the legacy `CheckBudget` path
+        //    (no pre-reservation) and the request is only charged after the
+        //    fact via reconciliation. A caller can therefore dodge
+        //    pre-reservation in that mode by omitting the max_* fields. This is
+        //    documented under `count_mode` / `on_unmetered_response` in
+        //    docs/plugins.md; tightening it (a minimum-reservation floor) is a
+        //    follow-up.
+        //
+        // 2. Reservations are self-healing only via window/TTL expiry.
+        //    Reconciliation (`reconcile_usage` in `after_proxy` /
+        //    `on_response_body`) is best-effort: several paths reserve here but
+        //    never reconcile — fail-closed early returns (e.g. BAD_GATEWAY),
+        //    client disconnect before the buffered response, or another plugin
+        //    rejecting in `after_proxy` so `on_response_body` never runs. In
+        //    those cases the estimate stays charged until the sliding window /
+        //    Redis TTL drops it, so a burst of aborted requests can transiently
+        //    over-count usage. The window/TTL is the deliberate backstop;
+        //    eagerly releasing on every early-abort branch would require
+        //    touching broad proxy code and is intentionally out of scope here.
         let outcome = if reserved_tokens > 0 {
             self.reserve_usage(key.clone(), reserved_tokens).await
         } else {

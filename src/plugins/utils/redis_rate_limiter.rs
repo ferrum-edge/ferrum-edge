@@ -830,6 +830,51 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Increment a counter by `amount`, set expiry, and floor the result at
+    /// zero. Returns the new (floored) total.
+    ///
+    /// This is the reconciliation-safe variant of [`incrby_with_expire`]. The
+    /// AI token limiter applies reconciliation deltas (`actual - reserved`)
+    /// that are usually *negative* (reserved estimates run high; non-2xx
+    /// responses release the full reservation). A raw `INCRBY` can drive a
+    /// missing or low window counter negative, and a negative counter later
+    /// reads as zero usage — letting a consumer reserve the full limit again
+    /// and bypassing centralized enforcement. The local in-memory path floors
+    /// usage at zero (`TokenUsageWindow::adjust_usage`); this keeps the Redis
+    /// path consistent.
+    ///
+    /// When the post-`INCRBY` value is negative we issue a *compensating*
+    /// `INCRBY` of exactly `-new_total` to bring the key back to zero, rather
+    /// than a blind `SET 0`. A blind `SET` would also discard any concurrent
+    /// positive increment that landed between our write and read (a worse
+    /// under-count); compensating by exactly the observed deficit only fails
+    /// in the conservative direction (a concurrent add during the race can
+    /// leave a transient over-count, which is safe for a rate limiter — it
+    /// never under-counts usage).
+    pub async fn incrby_with_expire_floor_zero(
+        &self,
+        key: &str,
+        amount: i64,
+        ttl_seconds: u64,
+    ) -> Result<i64, ()> {
+        let new_total = self.incrby_with_expire(key, amount, ttl_seconds).await?;
+        if new_total >= 0 {
+            return Ok(new_total);
+        }
+
+        // Bring the counter back up to exactly zero, preserving the TTL.
+        match self
+            .incrby_with_expire(key, new_total.saturating_neg(), ttl_seconds)
+            .await
+        {
+            Ok(floored) => Ok(floored.max(0)),
+            // The compensating write failed (Redis went away mid-operation).
+            // `incrby_with_expire` already marked the client unavailable; report
+            // the floored value so callers never observe a negative usage.
+            Err(()) => Ok(0),
+        }
+    }
+
     /// Increment one counter by 1 and another by a specific amount in a single
     /// pipelined round-trip. Returns `(new_count, new_total)`.
     pub async fn incr_and_incrby_with_expire(

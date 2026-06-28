@@ -1098,7 +1098,24 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
                     let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
                     let ttl = self.window_seconds * 2 + 1;
-                    let _ = redis.incrby_with_expire(&redis_key, delta, ttl).await?;
+                    // Floor the per-window counter at zero. Reconciliation
+                    // deltas are usually negative (reserved ≫ actual; non-2xx
+                    // releases the full reservation); a raw INCRBY could drive
+                    // the counter negative, which later reads as zero usage and
+                    // lets the consumer reserve the full limit again — defeating
+                    // centralized enforcement. Matches the floor-at-zero in the
+                    // local `TokenUsageWindow::adjust_usage` path.
+                    //
+                    // NOTE (window attribution): `Reserve` credits the window
+                    // current at reservation time, while this adjustment debits
+                    // the window current at reconcile time. A request that
+                    // straddles a window boundary therefore corrects the wrong
+                    // window. The floor above closes the budget-bypass; precise
+                    // window attribution (carrying the reservation's window
+                    // index) is a follow-up refinement.
+                    let _ = redis
+                        .incrby_with_expire_floor_zero(&redis_key, delta, ttl)
+                        .await?;
                 }
                 Ok(RateLimitOutcome::allow())
             }
@@ -1559,6 +1576,43 @@ mod tests {
         let mut bucket = TokenBucket::from_window(1, Duration::from_secs(1));
         bucket.consume(2);
         assert_eq!(bucket.remaining(), 0);
+    }
+
+    #[test]
+    fn ai_token_window_over_release_floors_at_zero() {
+        // In-memory equivalent of the Redis reconciliation bypass: a
+        // reconciliation delta more negative than the outstanding usage must
+        // floor the window at zero, not leave it negative. A negative counter
+        // would later read as zero usage and let the consumer reserve the full
+        // limit again, defeating budget enforcement. The Redis path mirrors
+        // this via `RedisRateLimitClient::incrby_with_expire_floor_zero`
+        // (regression for the centralized path requires a live Redis server and
+        // is covered by functional/ignored tests).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        // Reserve 100 tokens, then over-release by reconciling -500 (e.g. a
+        // full reservation release stacked on a low actual count).
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        assert!(reserved.allowed);
+        algorithm.check_local(&mut state, &AiRateLimitOp::AdjustUsage { delta: -500 }, now);
+
+        // Usage must be floored at zero, and the full limit must remain
+        // available — never more than the limit (which a negative counter would
+        // wrongly imply by reading as zero usage while extra capacity leaks).
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert!(budget.allowed);
+        assert_eq!(budget.usage, Some(0));
+        assert_eq!(budget.remaining, Some(1000));
+
+        // A fresh full-limit reservation should succeed exactly once and then
+        // deny — proving the counter is at zero, not negative.
+        let full = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 1000 }, now);
+        assert!(full.allowed);
+        let over = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 1 }, now);
+        assert!(!over.allowed);
     }
 
     #[tokio::test]
