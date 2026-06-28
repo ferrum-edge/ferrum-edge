@@ -1273,26 +1273,34 @@ fn count_argument_value(value: &Value, total: &mut u64) {
     }
 }
 
-/// The Azure "On Your Data" data-source array, under either the GA snake_case
-/// `data_sources` or the original extensions-API camelCase `dataSources`. Mirrors
-/// the dual-casing this file already applies to `system_instruction` /
-/// `systemInstruction` and `tool_results` / `toolResults`.
-fn azure_data_sources(json: &Value) -> Option<&Vec<Value>> {
-    json.get("data_sources")
-        .or_else(|| json.get("dataSources"))
-        .and_then(Value::as_array)
+/// All Azure "On Your Data" data-source items, across BOTH the GA snake_case
+/// `data_sources` and the original extensions-API camelCase `dataSources` arrays.
+/// Both keys are iterated rather than short-circuited on the first one present:
+/// `Option::or_else` only falls through on `None`, so a body that pairs an
+/// empty/`null` `data_sources` with a populated `dataSources` (or vice versa)
+/// would otherwise slip the second array past the guard. Mirrors the file's
+/// `tool_results` / `toolResults` both-keys handling.
+fn azure_data_source_items(json: &Value) -> impl Iterator<Item = &Value> {
+    ["data_sources", "dataSources"]
+        .into_iter()
+        .filter_map(|key| json.get(key))
+        .filter_map(Value::as_array)
+        .flatten()
 }
 
 /// The per-data-source instruction string under `parameters.role_information`
-/// (GA) or `parameters.roleInformation` (original extensions API). `None` when
-/// absent or non-string. A single string accessor keeps the `block_system_prompts`
-/// and `max_prompt_characters` inspections in agreement on what they look at.
+/// (GA) or `parameters.roleInformation` (original extensions API). Both spellings
+/// are checked for a string value — again without short-circuiting on a present
+/// but non-string first key — so `{role_information: null, roleInformation: "…"}`
+/// can't hide an instruction. `None` when neither is a string. A single string
+/// accessor keeps the `block_system_prompts` and `max_prompt_characters`
+/// inspections in agreement on what they look at.
 fn azure_role_information(source: &Value) -> Option<&str> {
     let parameters = source.get("parameters")?;
     parameters
         .get("role_information")
-        .or_else(|| parameters.get("roleInformation"))
         .and_then(Value::as_str)
+        .or_else(|| parameters.get("roleInformation").and_then(Value::as_str))
 }
 
 /// Counts the model-visible instruction text under Azure "On Your Data"
@@ -1302,10 +1310,7 @@ fn azure_role_information(source: &Value) -> Option<&str> {
 /// index names, embedding settings) that are not sent to the model as prompt
 /// text, so counting them would inconsistently inflate `max_prompt_characters`.
 fn count_data_source_role_information(json: &Value, total: &mut u64) {
-    let Some(sources) = azure_data_sources(json) else {
-        return;
-    };
-    for source in sources {
+    for source in azure_data_source_items(json) {
         if let Some(role_information) = azure_role_information(source) {
             add_chars(total, role_information);
         }
@@ -1340,12 +1345,8 @@ fn contains_system_prompt(json: &Value, aliases: &HashSet<String>) -> bool {
 /// without one, so blocking those would be a false positive. Scoped to this exact
 /// nested field (both casings) to avoid flagging arbitrary user-supplied text.
 fn data_sources_have_role_information(json: &Value) -> bool {
-    let Some(sources) = azure_data_sources(json) else {
-        return false;
-    };
-    sources.iter().any(|source| {
-        azure_role_information(source).is_some_and(|role_information| !role_information.is_empty())
-    })
+    azure_data_source_items(json)
+        .any(|source| azure_role_information(source).is_some_and(|ri| !ri.is_empty()))
 }
 
 fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bool {
