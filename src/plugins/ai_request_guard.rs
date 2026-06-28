@@ -568,7 +568,7 @@ impl AiRequestGuard {
         if self.block_system_prompts && contains_system_prompt(json, &self.system_prompt_aliases) {
             return Err((
                 "System prompts not allowed".to_string(),
-                "Requests with system, developer, instructions, or aliased system-prompt fields are blocked by gateway policy"
+                "Requests with system, developer, instructions, aliased system-prompt fields, or Azure 'On Your Data' data_sources[].parameters.role_information are blocked by gateway policy"
                     .to_string(),
             ));
         }
@@ -1081,6 +1081,14 @@ fn count_prompt_characters(json: &Value) -> u64 {
         count_text_value(json.get(field), &mut total);
     }
 
+    // Azure OpenAI "On Your Data": the per-data-source instruction in
+    // `data_sources[].parameters.role_information` is sent to the model and
+    // billed as input, so it must count toward `max_prompt_characters`.
+    // Scoped to that exact field (not the whole `parameters` object, which holds
+    // non-prompt config such as endpoints/keys/index names) so the cap reflects
+    // model-visible text, consistent with how other RAG fields are counted.
+    count_data_source_role_information(json.get("data_sources"), &mut total);
+
     count_tool_definition_text(json.get("tools"), &mut total);
     count_tool_definition_text(json.get("functions"), &mut total);
     count_tool_argument_fields(json, &mut total);
@@ -1265,6 +1273,25 @@ fn count_argument_value(value: &Value, total: &mut u64) {
     }
 }
 
+/// Counts the model-visible instruction text under Azure "On Your Data"
+/// `data_sources[].parameters.role_information`. Only that string is counted —
+/// the rest of `parameters` carries connection/config values (endpoints, keys,
+/// index names, embedding settings) that are not sent to the model as prompt
+/// text, so counting them would inconsistently inflate `max_prompt_characters`.
+fn count_data_source_role_information(value: Option<&Value>, total: &mut u64) {
+    let Some(Value::Array(sources)) = value else {
+        return;
+    };
+    for source in sources {
+        if let Some(role_information) = source
+            .get("parameters")
+            .and_then(|parameters| parameters.get("role_information"))
+        {
+            count_text_value(Some(role_information), total);
+        }
+    }
+}
+
 fn add_chars(total: &mut u64, text: &str) {
     *total = total.saturating_add(text.chars().count() as u64);
 }
@@ -1275,6 +1302,29 @@ fn contains_system_prompt(json: &Value, aliases: &HashSet<String>) -> bool {
         || value_has_system_role(json.get("input"), aliases)
         || value_has_system_role(json.get("contents"), aliases)
         || value_has_system_role(json.get("chat_history"), aliases)
+        || data_sources_have_role_information(json.get("data_sources"))
+}
+
+/// Azure OpenAI "On Your Data" requests carry a per-data-source instruction in
+/// `data_sources[].parameters.role_information` — a free-text string that tells
+/// the model how to behave. It is a de-facto system prompt: the backend applies
+/// it even when the top-level `messages` carry only ordinary `user` turns, so a
+/// caller could otherwise smuggle disallowed system/developer instructions past
+/// `block_system_prompts`. Treat a non-empty `role_information` on any data
+/// source as a system prompt. Scoped to this exact nested field (mirroring the
+/// targeted `array_item_has_system_role` scoping) to avoid flagging arbitrary
+/// user-supplied nested text.
+fn data_sources_have_role_information(value: Option<&Value>) -> bool {
+    let Some(Value::Array(sources)) = value else {
+        return false;
+    };
+    sources.iter().any(|source| {
+        source
+            .get("parameters")
+            .and_then(|parameters| parameters.get("role_information"))
+            .and_then(Value::as_str)
+            .is_some_and(|role_information| !role_information.is_empty())
+    })
 }
 
 fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bool {

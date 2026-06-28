@@ -14358,7 +14358,7 @@ components:
           description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, and document/RAG fields
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields, and Azure "On Your Data" data_sources[].parameters.role_information
         temperature_range:
           type: array
           items:
@@ -14370,7 +14370,7 @@ components:
         block_system_prompts:
           type: boolean
           default: false
-          description: Reject system/developer prompt fields and roles, including Responses instructions and provider-native top-level system fields
+          description: Reject system/developer prompt fields and roles, including Responses instructions, provider-native top-level system fields, and Azure "On Your Data" data_sources[].parameters.role_information (a de-facto system instruction the backend applies)
         system_prompt_aliases:
           type: array
           items:
