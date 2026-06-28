@@ -1810,6 +1810,67 @@ async fn federation_pass_through_requires_explicit_opt_in() {
 }
 
 #[tokio::test]
+async fn federation_asymmetric_flags_missing_model_passes_unmatched_rejects() {
+    // The two flags are independent. With `fail_on_missing_model: false` and
+    // `fail_on_no_matching_provider: true` (the default for the latter), a
+    // request that cannot yield a `model` passes through to the backend, while
+    // a request whose `model` is present but matches no provider still fails
+    // closed with a 404.
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }],
+        "fail_on_missing_model": false,
+        "fail_on_no_matching_provider": true
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+
+    // No `model` field → gated by `fail_on_missing_model: false` → pass through.
+    let missing_model_body = json!({
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut missing_ctx = post_json_ctx(&missing_model_body);
+    let mut missing_headers = json_headers();
+    let missing_result = plugin
+        .before_proxy(&mut missing_ctx, &mut missing_headers)
+        .await;
+    assert!(
+        matches!(missing_result, PluginResult::Continue),
+        "missing model must pass through when fail_on_missing_model is false, got {missing_result:?}"
+    );
+
+    // Unknown/unmatched `model` → gated by `fail_on_no_matching_provider: true`
+    // → still rejected with 404.
+    let unknown_model_body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut unknown_ctx = post_json_ctx(&unknown_model_body);
+    let mut unknown_headers = json_headers();
+    let unknown_result = plugin
+        .before_proxy(&mut unknown_ctx, &mut unknown_headers)
+        .await;
+    match unknown_result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(
+                status_code, 404,
+                "unmatched model must still be rejected when fail_on_no_matching_provider is true"
+            );
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "model_not_found");
+        }
+        other => panic!("expected RejectBinary 404, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_before_proxy_passes_through_streaming_for_unmatched_model_with_explicit_opt_in() {
     // Legacy pass-through for unmatched models remains available only as an
     // explicit opt-in. The plugin still checks streaming only after it has

@@ -1887,15 +1887,22 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
-        // Read request body
+        // Read request body. `store_request_body_metadata()` in
+        // `src/proxy/mod.rs` only inserts `request_body` for UTF-8 bodies and
+        // removes the key for non-UTF-8 bodies, so this `None` branch covers
+        // both "no body was sent" and "a body was sent but isn't UTF-8". The
+        // message reflects both cases; either way a binary body cannot be JSON,
+        // so the 400 reject is the correct fail-closed outcome.
         let body_str = match ctx.metadata.get("request_body") {
             Some(b) => b.as_str(),
             None => {
                 if self.fail_on_missing_model {
-                    debug!("ai_federation: rejecting JSON POST without buffered request body");
+                    debug!(
+                        "ai_federation: rejecting JSON POST without a buffered UTF-8 request body"
+                    );
                     return self.openai_error_response(
                         400,
-                        "Request body is required for ai_federation model routing",
+                        "Request body is required and must be UTF-8 JSON for ai_federation model routing",
                         "invalid_request_error",
                         None,
                         Some("missing_request_body"),
@@ -2266,22 +2273,29 @@ impl AiFederation {
     }
 
     fn json_reject_response(&self, status: u16, body: Value) -> PluginResult {
-        let response_body = match serde_json::to_vec(&body) {
-            Ok(body) => Bytes::from(body),
+        // Serializing a `Value` built entirely from primitives cannot actually
+        // fail, so this fallback is unreachable defensive code. If it ever does
+        // fire we override the caller's status to 500 so the HTTP status line
+        // stays consistent with the `server_error` / `internal_error` body.
+        let (status_code, response_body) = match serde_json::to_vec(&body) {
+            Ok(body) => (status, Bytes::from(body)),
             Err(e) => {
                 warn!(
                     error = %e,
                     "ai_federation: failed to serialize JSON error response"
                 );
-                Bytes::from_static(
-                    br#"{"error":{"message":"Failed to serialize error response","type":"server_error","param":null,"code":"internal_error"}}"#,
+                (
+                    500,
+                    Bytes::from_static(
+                        br#"{"error":{"message":"Failed to serialize error response","type":"server_error","param":null,"code":"internal_error"}}"#,
+                    ),
                 )
             }
         };
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
         PluginResult::RejectBinary {
-            status_code: status,
+            status_code,
             body: response_body,
             headers,
         }

@@ -3312,6 +3312,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 **Model routing fails closed by default.** JSON POST requests with no buffered body, malformed JSON, or no top-level string `model` field are rejected with an OpenAI-shaped `400`. Requests whose `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required. Pass-through can bypass AI gateway policy enforced by `ai_federation` provider routing, fallback, translation, token metadata, and any downstream assumptions that federation will short-circuit the request.
 
+**The fail-closed guarantee is scoped to JSON POSTs.** `before_proxy` only inspects requests whose method is `POST` and whose `Content-Type` is `application/json` (or a `*+json` suffix); every other request returns `Continue` and reaches the backend uninspected. Even with the fail-closed defaults, a client can therefore bypass federation entirely by sending the same body with a non-JSON content type (for example `Content-Type: text/plain`) or a different method. `ai_federation` is not an authorization boundary — the backend it fronts must remain independently protected (auth, rate limiting, and any AI gateway policy) regardless of these flags.
+
 **Priority:** 2985
 
 **Supported providers:**
