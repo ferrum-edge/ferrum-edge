@@ -344,6 +344,15 @@ spec:
       port: 443
       targetPort: proxy-https
 ---
+# Optional cluster-internal admin Service. This only works if the gateway binds
+# admin to the pod IP — the Deployment above uses the safe loopback default, so
+# this Service would route to a port where nothing is listening. To use it, add
+# to the Deployment env: FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 plus a protection
+# control (FERRUM_ADMIN_ALLOWED_CIDRS including the consumer ranges, admin TLS,
+# or FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true with a NetworkPolicy), per the
+# "Admin bind address" note above. Otherwise omit this Service and reach admin
+# in-pod (exec health check / `kubectl exec`). Always pair it with a
+# NetworkPolicy restricting access to the admin port.
 apiVersion: v1
 kind: Service
 metadata:

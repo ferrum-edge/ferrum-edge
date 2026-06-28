@@ -220,6 +220,24 @@ fn test_admin_http_exposure_reachable_with_allowlist() {
 }
 
 #[test]
+fn test_admin_http_exposure_catch_all_allowlist_is_unrestricted() {
+    // Codex finding: a catch-all allowlist (a /0 CIDR) matches every source, so
+    // it is no real restriction and must NOT downgrade to ReachableAllowlisted.
+    for cidrs in ["0.0.0.0/0", "::/0", "10.0.0.0/8,0.0.0.0/0", "0.0.0.0/00"] {
+        let config = EnvConfig {
+            admin_bind_address: "0.0.0.0".to_string(),
+            admin_allowed_cidrs: cidrs.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.admin_http_exposure(),
+            AdminHttpExposure::ReachableUnrestricted,
+            "catch-all allowlist {cidrs:?} must be treated as unrestricted"
+        );
+    }
+}
+
+#[test]
 fn test_admin_http_exposure_public_routable_ip_no_allowlist() {
     let config = EnvConfig {
         admin_bind_address: "203.0.113.10".to_string(),
@@ -349,6 +367,22 @@ fn test_allowlist_allows_public_database_startup() {
     assert!(
         config.admin_insecure_plaintext_startup_error().is_none(),
         "an allowlist satisfies the writable-mode guard"
+    );
+}
+
+#[test]
+fn test_catch_all_allowlist_does_not_satisfy_database_guard() {
+    // A /0 allowlist is no protection, so it must NOT permit a public plaintext
+    // admin startup in database mode.
+    let config = EnvConfig {
+        mode: OperatingMode::Database,
+        admin_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: "0.0.0.0/0".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        config.admin_insecure_plaintext_startup_error().is_some(),
+        "a catch-all /0 allowlist must not satisfy the writable-mode guard"
     );
 }
 
