@@ -1144,9 +1144,21 @@ jobs:
           # - this CI workflow and local .github/actions/ image packaging
           # - Docker/runtime packaging metadata and Cargo/proto build inputs
           #   (Cargo.{toml,lock}, build.rs, proto/ are broad catch-alls)
+          # - build configuration that shapes the deployed binary: .cargo/
+          #   (config.toml linker/rustflags) and vendor/ (patched crates wired
+          #   in via [patch.crates-io] in Cargo.toml, compiled into ferrum-edge)
           # - ferrum.conf plus runtime config defaults rendered into the chart
           # - control-plane startup, admin, gRPC, xDS, DNS, TLS, identity,
           #   Kubernetes, and secret paths exercised by the Helm install checks
+          # - Kubernetes translation sources (src/config_sources/k8s/): the CP
+          #   started by the chart runs the Kubernetes controller, which feeds
+          #   CRDs through config_sources::k8s::translate_k8s_objects(), so a
+          #   translation regression can break CP readiness in this smoke
+          # - CP-boot startup helpers reached before /health goes ready:
+          #   src/proxy/client_ip.rs (TrustedProxies::parse_strict on the admin
+          #   CIDR allowlist), src/util/sharding.rs (pool_shard_amount feeding
+          #   DashMap shard sizing), and src/runtime_metrics.rs
+          #   (runtime_metrics::global().configure(...))
           # - logging/redaction (src/logging/): the kind-install steps assert the
           #   CP boot logs never emit the admin/gRPC secrets (`grep -Fq`), and
           #   that secret-redaction assertion is UNIQUE to this job, so a
@@ -1158,11 +1170,19 @@ jobs:
           # log-redaction assertion in the kind-install steps is specific to this
           # job and has no overlapping coverage -- so redaction-relevant paths
           # (e.g. src/logging/) must stay listed to keep the gate fail-safe.
-          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/logging/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/secrets/|src/tls/|src/xds/)'
+          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|\.cargo/|vendor/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/runtime_metrics\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/config_sources/k8s/|src/logging/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/proxy/client_ip\.rs$|src/secrets/|src/tls/|src/util/sharding\.rs$|src/xds/)'
           # Diff captured first so a git error (e.g. a missing base ref) fails
           # closed: it aborts the step loudly under `set -euo pipefail` rather
           # than being swallowed by the match and silently skipping every heavy
           # validation step, including the secret log-redaction assertions.
+          # `--no-renames` is required: with rename detection on (the default),
+          # `git diff --name-only` emits only the destination path for a rename,
+          # so moving a chart template OUT of charts/ (e.g.
+          # `git mv charts/ferrum-mesh/templates/x.yaml docs/x.yaml`) would show
+          # only the unlisted docs/ path and skip the gate even though the chart
+          # lost a template. `--no-renames` reports the rename as a delete + add,
+          # so the old charts/ path is still matched and chart-breaking moves
+          # keep the gate fail-safe.
           # `grep -Ec` reads all input so no SIGPIPE (unlike `grep -q`, which
           # closes the pipe on the first match and could SIGPIPE-kill the
           # upstream `printf` with exit 141). grep's exit codes are distinct:
@@ -1171,7 +1191,7 @@ jobs:
           # true` so a >=2 error fails the step closed rather than being
           # misread as "no match" and silently skipping every heavy validation
           # step, including the secret log-redaction assertions.
-          changed_files="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")"
+          changed_files="$(git diff --no-renames --name-only "origin/${{ github.base_ref }}...HEAD")"
           set +e
           match_count="$(printf '%s\n' "$changed_files" | grep -Ec "$helm_change_regex")"
           grep_rc=$?
@@ -1436,7 +1456,7 @@ jobs:
         run: |
           echo "## Helm Chart" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Skipped: this PR does not touch chart sources, chart test values, CI workflow/actions, Docker or runtime image packaging, Cargo/build.rs/rust-toolchain build inputs, proto, ferrum.conf, runtime config, control-plane startup, admin, gRPC, xDS, DNS, TLS, identity, Kubernetes controller, or secret surfaces." >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch chart sources, chart test values, CI workflow/actions, Docker or runtime image packaging, Cargo/build.rs/rust-toolchain/.cargo/vendor build inputs, proto, ferrum.conf, runtime config, control-plane startup, admin, gRPC, xDS, DNS, TLS, identity, Kubernetes controller, Kubernetes translation (src/config_sources/k8s/), CP-boot startup helpers (client_ip CIDR parser, sharding helper, runtime metrics init), or secret surfaces." >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Tests
