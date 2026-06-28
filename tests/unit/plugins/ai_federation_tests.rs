@@ -896,16 +896,21 @@ fn test_gate_bedrock_rejects_remote_http_image_url() {
 
 #[test]
 fn test_gate_gemini_rejects_remote_http_image_url() {
-    // Gemini/Vertex `fileData` cannot fetch an arbitrary public URL, so the
-    // gate must reject http(s) image URLs rather than emitting a request the
-    // provider rejects (opaque 502).
+    // Gemini/Vertex cannot fetch an arbitrary public `http(s)` URL (only
+    // `gs://` GCS URIs and Files API URIs), so the gate must reject those
+    // rather than emitting a request the provider rejects (opaque 502).
     for provider in ["google_gemini", "google_vertex"] {
-        for url in ["https://example.com/a.png", "http://example.com/a.png"] {
+        for url in [
+            "https://example.com/a.png",
+            "http://example.com/a.png",
+            // A non-files path on the Gemini API host is still not fetchable.
+            "https://generativelanguage.googleapis.com/v1beta/models/x",
+        ] {
             let body = image_part_request(url);
             let err = test_helpers::validate_multimodal_translate_support_test(provider, &body)
                 .unwrap_err();
             assert!(
-                err.contains("data URL"),
+                err.contains("not fetched/inlined"),
                 "{provider} should reject remote URL {url}: {err}"
             );
         }
@@ -937,6 +942,117 @@ fn test_gate_anthropic_accepts_remote_and_data_url_images() {
             "Anthropic should accept image URL {url} at the gate"
         );
     }
+}
+
+#[test]
+fn test_gate_anthropic_rejects_unsupported_data_url_media_type() {
+    // Anthropic only accepts jpeg/png/gif/webp. svg+xml/bmp pass the generic
+    // image/* check but must be rejected at the gate (clean 400) rather than
+    // sent upstream as an opaque 502.
+    for url in [
+        "data:image/svg+xml;base64,aGVsbG8=",
+        "data:image/bmp;base64,aGVsbG8=",
+    ] {
+        let body = image_part_request(url);
+        let err = test_helpers::validate_multimodal_translate_support_test("anthropic", &body)
+            .expect_err("unsupported Anthropic image media type must be rejected at the gate");
+        assert!(
+            err.contains("Anthropic image media type"),
+            "expected an Anthropic media-type error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_gate_anthropic_accepts_supported_data_url_media_types() {
+    for media in ["png", "jpeg", "jpg", "gif", "webp"] {
+        let body = image_part_request(&format!("data:image/{media};base64,aGVsbG8="));
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test("anthropic", &body).is_ok(),
+            "image/{media} data URL should pass the Anthropic gate"
+        );
+    }
+}
+
+#[test]
+fn test_gate_gemini_accepts_gs_and_files_api_uris() {
+    // Gemini/Vertex CAN fetch `gs://` GCS URIs and Files API URIs, so the gate
+    // must preserve them (translated to fileData.fileUri), not reject them.
+    for provider in ["google_gemini", "google_vertex"] {
+        for url in [
+            "gs://my-bucket/cat.png",
+            "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+        ] {
+            let body = image_part_request(url);
+            assert!(
+                test_helpers::validate_multimodal_translate_support_test(provider, &body).is_ok(),
+                "{provider} should accept supported remote URI {url} at the gate"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_gate_rejects_malformed_base64_data_url() {
+    // A data URL with a non-base64 payload must be a clean gate 400 for every
+    // data-URL provider, not an opaque provider 502 after dispatch.
+    for provider in ["aws_bedrock", "google_gemini", "anthropic"] {
+        let body = image_part_request("data:image/png;base64,not@@base64");
+        let err = test_helpers::validate_multimodal_translate_support_test(provider, &body)
+            .expect_err("malformed base64 must be rejected at the gate");
+        assert!(
+            err.contains("invalid base64"),
+            "{provider} should reject malformed base64: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_gate_bedrock_rejects_image_in_assistant_message() {
+    // AWS Converse only allows images on `user` messages. An image in an
+    // assistant message must be a clean gate 400, not a later 502.
+    let body = json!({
+        "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "here you go"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                ]
+            }
+        ]
+    });
+    let err = test_helpers::validate_multimodal_translate_support_test("aws_bedrock", &body)
+        .expect_err("Bedrock image in assistant message must be rejected at the gate");
+    assert!(
+        err.contains("only allows image content in user messages"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gate_anthropic_allows_image_in_assistant_message() {
+    // Anthropic (unlike Bedrock) permits images in assistant messages, so the
+    // user-only restriction must NOT leak to other providers.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "here you go"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                ]
+            }
+        ]
+    });
+    assert!(
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).is_ok(),
+        "Anthropic should accept an image in an assistant message"
+    );
 }
 
 #[test]
@@ -2095,8 +2211,7 @@ async fn text_only_with_warning_sets_metadata() {
     );
 }
 
-#[tokio::test]
-async fn system_developer_multimodal_non_text_is_not_silently_discarded() {
+async fn assert_instruction_role_image_rejected(role: &str) {
     let server = MockServer::start().await;
     let config = json!({
         "providers": [{
@@ -2114,17 +2229,10 @@ async fn system_developer_multimodal_non_text_is_not_silently_discarded() {
         "model": "claude-3-sonnet",
         "messages": [
             {
-                "role": "system",
+                "role": role,
                 "content": [
-                    {"type": "text", "text": "System text"},
-                    {"type": "image_url", "image_url": {"url": "https://example.com/system.png"}}
-                ]
-            },
-            {
-                "role": "developer",
-                "content": [
-                    {"type": "text", "text": "Developer text"},
-                    {"type": "image_url", "image_url": {"url": "https://example.com/dev.png"}}
+                    {"type": "text", "text": "Instruction text"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/instruction.png"}}
                 ]
             },
             {"role": "user", "content": "Hi"}
@@ -2141,14 +2249,26 @@ async fn system_developer_multimodal_non_text_is_not_silently_discarded() {
             assert_eq!(status_code, 400);
             let parsed: Value = serde_json::from_slice(&body).unwrap();
             let message = parsed["error"]["message"].as_str().unwrap();
-            assert!(message.contains("system"), "got: {message}");
-            assert!(message.contains("developer"), "got: {message}");
+            // The gate returns on the FIRST offending part, so the error names
+            // the offending role and content kind — assert only what is
+            // actually reachable for this single-role body.
+            assert!(message.contains(role), "got: {message}");
             assert!(message.contains("image_url"), "got: {message}");
         }
         other => panic!("expected RejectBinary 400, got {other:?}"),
     }
 
     assert_no_provider_requests(&server).await;
+}
+
+#[tokio::test]
+async fn system_multimodal_non_text_is_not_silently_discarded() {
+    assert_instruction_role_image_rejected("system").await;
+}
+
+#[tokio::test]
+async fn developer_multimodal_non_text_is_not_silently_discarded() {
+    assert_instruction_role_image_rejected("developer").await;
 }
 
 #[tokio::test]
@@ -2419,7 +2539,8 @@ fn test_gemini_translate_data_url_to_inline_data() {
 
 #[test]
 fn test_gemini_translate_remote_url_errors_in_translator() {
-    // openai_content_to_gemini_parts: remote URL has no native translation.
+    // openai_content_to_gemini_parts: an arbitrary public http(s) URL has no
+    // native translation (Gemini cannot fetch it and it is not inlined here).
     let body = translate_image_request("gemini-2.0-flash", "https://example.com/x.png");
     let err = test_helpers::translate_request_test(
         "google_gemini",
@@ -2428,10 +2549,7 @@ fn test_gemini_translate_remote_url_errors_in_translator() {
         &translate_cfg(),
     )
     .unwrap_err();
-    assert!(
-        err.contains("Gemini image translation requires an image_url data URL"),
-        "got: {err}"
-    );
+    assert!(err.contains("not fetched/inlined"), "got: {err}");
 }
 
 #[test]
@@ -2524,6 +2642,60 @@ fn test_vertex_translate_data_url_to_inline_data() {
     let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
     let parts = parsed["contents"][0]["parts"].as_array().unwrap();
     assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
+}
+
+#[test]
+fn test_gemini_translate_gs_uri_to_file_data() {
+    // openai_content_to_gemini_parts: a `gs://` GCS URI passes through as
+    // fileData.fileUri (NOT inlineData, NOT a hard error).
+    let body = translate_image_request("gemini-2.0-flash", "gs://my-bucket/cat.png");
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let parts = parsed["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts[1]["fileData"]["fileUri"], "gs://my-bucket/cat.png");
+    assert!(parts[1].get("inlineData").is_none());
+}
+
+#[test]
+fn test_gemini_translate_files_api_uri_to_file_data() {
+    // openai_content_to_gemini_parts: a Files API URI passes through as
+    // fileData.fileUri.
+    let files_uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123";
+    let body = translate_image_request("gemini-2.0-flash", files_uri);
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let parts = parsed["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts[1]["fileData"]["fileUri"], files_uri);
+}
+
+#[test]
+fn test_anthropic_translate_rejects_unsupported_media_type_in_translator() {
+    // openai_content_to_anthropic: defense-in-depth media-type check rejects an
+    // svg data URL even if it reached the translator.
+    let body = translate_image_request("claude-3-sonnet", "data:image/svg+xml;base64,aGVsbG8=");
+    let err = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("unsupported Anthropic image media type"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -2817,6 +2989,52 @@ fn test_gate_anthropic_rejects_data_url_empty_data() {
     let err =
         test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
     assert!(err.contains("empty image data"), "got: {err}");
+}
+
+#[test]
+fn test_gate_anthropic_rejects_data_url_invalid_base64() {
+    // parse_image_data_url: non-base64 payload is rejected at the gate so it is
+    // a clean 400, not an opaque provider 502.
+    let body = image_part_request("data:image/png;base64,not@@base64");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("invalid base64"), "got: {err}");
+}
+
+#[test]
+fn test_gate_strips_parameterized_data_url_media_type() {
+    // parse_image_data_url: a parameterized media type (image/png;charset=utf-8)
+    // is reduced to the bare type so it passes per-provider media-type checks
+    // and providers don't receive a parameterized media_type string.
+    let body = image_part_request("data:image/png;charset=utf-8;base64,aGVsbG8=");
+    assert!(
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).is_ok(),
+        "parameterized image/png data URL should pass the Anthropic gate"
+    );
+    assert!(
+        test_helpers::validate_multimodal_translate_support_test("aws_bedrock", &body).is_ok(),
+        "parameterized image/png data URL should pass the Bedrock gate"
+    );
+}
+
+#[test]
+fn test_translate_strips_parameterized_media_type_for_anthropic() {
+    // openai_content_to_anthropic: the parameterized media type is normalized to
+    // the bare `image/png` in the emitted Anthropic source block.
+    let body = translate_image_request(
+        "claude-3-sonnet",
+        "data:image/png;charset=utf-8;base64,aGVsbG8=",
+    );
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
 }
 
 #[test]

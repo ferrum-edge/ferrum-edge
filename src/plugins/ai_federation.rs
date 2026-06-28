@@ -1346,24 +1346,43 @@ fn validate_multimodal_translate_support(
                 ));
             }
 
+            // Bedrock only allows image (and document) content blocks on
+            // `user` messages — the Converse `Message` API rejects images in
+            // `assistant` messages. Reject here so it is a clean gate 400
+            // instead of an upstream 502 that the default fallback never
+            // retries. (Instruction roles are already rejected above; this
+            // narrows the remaining user/assistant set to user-only.)
+            if provider.provider_type == ProviderType::AwsBedrock && role != "user" {
+                return Err(format!(
+                    "AWS Bedrock Converse only allows image content in user messages, not '{role}' messages"
+                ));
+            }
+
             match provider.provider_type {
                 // Anthropic's Messages API accepts both base64 data URLs and
-                // remote `https`/`http` image sources, so the generic check is
-                // sufficient here.
-                ProviderType::Anthropic => validate_openai_image_url(part)?,
-                // Gemini/Vertex `fileData` only accepts a Files API URI or a
-                // `gs://` GCS URI — NOT an arbitrary public URL — and this
-                // plugin does not fetch/inline remote images. Require a
-                // base64 data URL so the policy gate is the single source of
-                // 400s instead of letting a bad `fileData.fileUri` request
-                // produce an opaque provider rejection (502).
+                // remote `https`/`http` image sources. Validate the data-URL
+                // media type here (jpeg/png/gif/webp only) so an unsupported
+                // type like `image/svg+xml` is a clean gate 400 rather than an
+                // upstream 502 the default fallback never retries; remote URLs
+                // carry no media type, so only their scheme is checked.
+                ProviderType::Anthropic => {
+                    let url = image_url_value(part)?;
+                    if url.starts_with("data:") {
+                        let parsed = parse_image_data_url(url)?;
+                        anthropic_image_media_type(parsed.media_type)?;
+                    } else {
+                        validate_openai_image_url(part)?;
+                    }
+                }
+                // Gemini/Vertex translation accepts a base64 data URL
+                // (`inlineData`) or a provider-fetchable URI — a `gs://` GCS URI
+                // or a Files API URI (`.../v1beta/files/...`) emitted as
+                // `fileData.fileUri`. This plugin does not fetch/inline arbitrary
+                // public `http(s)` URLs, so those are rejected at the gate
+                // instead of producing an opaque provider rejection (502).
                 ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
                     let url = image_url_value(part)?;
-                    parse_image_data_url(url).map_err(|e| {
-                        format!(
-                            "Gemini/Vertex image translation only supports image_url data URLs (remote URLs are not fetched/inlined): {e}"
-                        )
-                    })?;
+                    classify_gemini_image_url(url)?;
                 }
                 ProviderType::AwsBedrock => {
                     let url = image_url_value(part)?;
@@ -1407,6 +1426,25 @@ struct ParsedImageDataUrl<'a> {
     data: &'a str,
 }
 
+/// Decode a base64 image payload from a `data:` URL. Padding is indifferent
+/// (clients sometimes strip trailing `=`); the alphabet is the standard `+/`
+/// set so a URL-safe payload is rejected rather than silently corrupting the
+/// image bytes on the provider side.
+fn decode_image_base64(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    use base64::alphabet;
+    use base64::engine::DecodePaddingMode;
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+
+    const DECODER: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    DECODER.decode(data.as_bytes())
+}
+
 fn parse_image_data_url(url: &str) -> Result<ParsedImageDataUrl<'_>, String> {
     let rest = url
         .strip_prefix("data:")
@@ -1414,9 +1452,15 @@ fn parse_image_data_url(url: &str) -> Result<ParsedImageDataUrl<'_>, String> {
     let (metadata, data) = rest
         .split_once(',')
         .ok_or("image_url data URL missing comma separator")?;
-    let media_type = metadata
+    let metadata = metadata
         .strip_suffix(";base64")
         .ok_or("image_url data URL must be base64 encoded")?;
+
+    // The media type may carry parameters (e.g. `image/png;charset=utf-8`).
+    // Strip them so the bare type is what providers receive and what
+    // per-provider media-type checks see — Anthropic/Bedrock reject an
+    // unexpected parameterized `media_type`/`mimeType` string.
+    let media_type = metadata.split(';').next().unwrap_or(metadata).trim();
 
     if !media_type.starts_with("image/") {
         return Err(format!(
@@ -1426,6 +1470,16 @@ fn parse_image_data_url(url: &str) -> Result<ParsedImageDataUrl<'_>, String> {
     if data.is_empty() {
         return Err("image_url data URL has empty image data".to_string());
     }
+    // Validate the payload is actually base64 so a malformed value
+    // (e.g. `not@@base64`) is a clean policy-gate 400 instead of an opaque
+    // provider 502 — the translators copy `data` verbatim into the provider
+    // request (Anthropic `source.data`, Gemini `inlineData.data`, Bedrock
+    // `source.bytes`), all of which expect valid base64 image bytes. Padding is
+    // indifferent (some clients strip trailing `=`); the alphabet stays
+    // standard (`+/`) so we never silently accept a URL-safe payload that would
+    // corrupt the image on the provider side.
+    decode_image_base64(data)
+        .map_err(|e| format!("image_url data URL has invalid base64 image data: {e}"))?;
 
     Ok(ParsedImageDataUrl { media_type, data })
 }
@@ -1465,11 +1519,15 @@ fn openai_content_to_anthropic(content: &Value, mode: MultimodalMode) -> Result<
                     let parsed = parse_image_data_url(url).map_err(|e| {
                         format!("ai_federation: invalid image_url data URL for Anthropic translation: {e}")
                     })?;
+                    // Defense-in-depth: the policy gate already rejects
+                    // unsupported media types, but re-validate so the translator
+                    // never emits an Anthropic `media_type` the API will reject.
+                    let media_type = anthropic_image_media_type(parsed.media_type)?;
                     out.push(json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": parsed.media_type,
+                            "media_type": media_type,
                             "data": parsed.data
                         }
                     }));
@@ -1526,30 +1584,28 @@ fn openai_content_to_gemini_parts(
             }
             Some("image_url") => {
                 let url = image_url_value(part)?;
-                if url.starts_with("data:") {
-                    let parsed = parse_image_data_url(url).map_err(|e| {
-                        format!(
-                            "ai_federation: invalid image_url data URL for Gemini translation: {e}"
-                        )
-                    })?;
-                    out.push(json!({
-                        "inlineData": {
-                            "mimeType": parsed.media_type,
-                            "data": parsed.data
-                        }
-                    }));
-                } else {
-                    // Gemini `fileData.fileUri` only accepts a Files API URI or
-                    // a `gs://` GCS URI; an arbitrary public `http(s)` URL is
-                    // rejected by the provider. This plugin does not fetch and
-                    // inline remote images, so reject here instead of emitting a
-                    // `fileData` request the provider can't fulfill. The policy
-                    // gate (`validate_multimodal_translate_support`) normally
-                    // catches this first; this keeps the translator honest if
-                    // it is ever called on its own.
-                    return Err(format!(
-                        "ai_federation: Gemini image translation requires an image_url data URL (remote URL '{url}' is not fetched/inlined)"
-                    ));
+                // Data URLs inline as `inlineData`; `gs://` GCS URIs and Files
+                // API URIs pass through as `fileData.fileUri`; arbitrary public
+                // `http(s)` URLs are rejected (Gemini cannot fetch them and this
+                // plugin does not fetch/inline them). The policy gate normally
+                // catches an unsupported URL first; this keeps the translator
+                // honest if it is ever called on its own.
+                match classify_gemini_image_url(url).map_err(|e| format!("ai_federation: {e}"))? {
+                    GeminiImageRef::Inline(parsed) => {
+                        out.push(json!({
+                            "inlineData": {
+                                "mimeType": parsed.media_type,
+                                "data": parsed.data
+                            }
+                        }));
+                    }
+                    GeminiImageRef::FileUri(file_uri) => {
+                        out.push(json!({
+                            "fileData": {
+                                "fileUri": file_uri
+                            }
+                        }));
+                    }
                 }
             }
             Some(other) => {
@@ -1571,6 +1627,52 @@ fn openai_content_to_gemini_parts(
     Ok(out)
 }
 
+/// How a Gemini/Vertex `image_url` should be translated.
+enum GeminiImageRef<'a> {
+    /// `data:` URL → inlined as `inlineData` (base64 bytes).
+    Inline(ParsedImageDataUrl<'a>),
+    /// `gs://` GCS URI or Files API URI → passed through as `fileData.fileUri`.
+    FileUri(&'a str),
+}
+
+/// Classify a Gemini/Vertex `image_url` value. Gemini `generateContent` accepts
+/// base64-inlined images (`inlineData`) and provider-fetchable URIs
+/// (`fileData.fileUri`): a `gs://` GCS URI or a Files API URI
+/// (`https://generativelanguage.googleapis.com/v1beta/files/...`). It does NOT
+/// fetch arbitrary public `http(s)` URLs, and this plugin never fetches/inlines
+/// them either, so those are rejected.
+fn classify_gemini_image_url(url: &str) -> Result<GeminiImageRef<'_>, String> {
+    if url.starts_with("data:") {
+        return parse_image_data_url(url)
+            .map(GeminiImageRef::Inline)
+            .map_err(|e| {
+                format!("Gemini/Vertex image translation: invalid image_url data URL: {e}")
+            });
+    }
+    if url.starts_with("gs://") || is_gemini_files_api_uri(url) {
+        return Ok(GeminiImageRef::FileUri(url));
+    }
+    Err(format!(
+        "Gemini/Vertex image translation only supports image_url data URLs, gs:// GCS URIs, or Files API URIs (arbitrary remote URL '{url}' is not fetched/inlined)"
+    ))
+}
+
+/// True for a Gemini Files API URI, e.g.
+/// `https://generativelanguage.googleapis.com/v1beta/files/abc123`. The host
+/// must be the Generative Language API and the path must reference `/files/`.
+fn is_gemini_files_api_uri(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    if parsed.host_str() != Some("generativelanguage.googleapis.com") {
+        return false;
+    }
+    parsed.path().contains("/files/")
+}
+
 fn bedrock_image_format(media_type: &str) -> Result<&'static str, String> {
     match media_type {
         "image/png" => Ok("png"),
@@ -1579,6 +1681,21 @@ fn bedrock_image_format(media_type: &str) -> Result<&'static str, String> {
         "image/webp" => Ok("webp"),
         other => Err(format!(
             "ai_federation: unsupported Bedrock image media type '{other}'"
+        )),
+    }
+}
+
+/// Anthropic's Messages API only accepts JPEG, PNG, GIF, and WebP image media
+/// types. Returns the canonical `media_type` string to send upstream, or an
+/// error for anything else (e.g. `image/svg+xml`, `image/bmp`).
+fn anthropic_image_media_type(media_type: &str) -> Result<&'static str, String> {
+    match media_type {
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg"),
+        "image/png" => Ok("image/png"),
+        "image/gif" => Ok("image/gif"),
+        "image/webp" => Ok("image/webp"),
+        other => Err(format!(
+            "ai_federation: unsupported Anthropic image media type '{other}' (expected jpeg, png, gif, or webp)"
         )),
     }
 }
