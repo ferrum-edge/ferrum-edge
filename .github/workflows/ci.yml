@@ -264,13 +264,15 @@ jobs:
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
         #
-        # Full test debuginfo makes this archive hundreds of MB larger and is
-        # downloaded by every integration shard. CI still keeps Rust backtraces
-        # and test stdout/stderr, but omits DWARF from this transfer-only build.
+        # Full debuginfo for tests and bundled bin targets makes this archive
+        # hundreds of MB larger and is downloaded by every integration shard.
+        # CI still keeps Rust backtraces and test stdout/stderr, but omits
+        # DWARF from this transfer-only build.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
             --config profile.test.debug=0 \
+            --config profile.dev.debug=0 \
             --test integration_tests \
             --archive-file "$archive_file"
 
@@ -604,13 +606,15 @@ jobs:
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
         #
-        # Full test debuginfo makes this archive hundreds of MB larger and is
-        # downloaded by every functional shard. CI still keeps Rust backtraces
-        # and test stdout/stderr, but omits DWARF from this transfer-only build.
+        # Full debuginfo for tests and bundled bin targets makes this archive
+        # hundreds of MB larger and is downloaded by every functional shard.
+        # CI still keeps Rust backtraces and test stdout/stderr, but omits
+        # DWARF from this transfer-only build.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
             --config profile.test.debug=0 \
+            --config profile.dev.debug=0 \
             --test functional_tests \
             --archive-file "$archive_file"
 
