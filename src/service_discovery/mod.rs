@@ -647,7 +647,7 @@ pub fn filter_discovered_targets(
     upstream_id: &str,
     provider_name: &str,
     targets: Vec<UpstreamTarget>,
-    backend_allow_ips: crate::config::BackendAllowIps,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Vec<UpstreamTarget> {
     targets
         .into_iter()
@@ -668,14 +668,11 @@ pub fn filter_discovered_targets(
 
 fn validate_discovered_target_host(
     host: &str,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     if let Ok(addr) = host.parse::<IpAddr>() {
-        if !crate::config::check_backend_ip_allowed(&addr, backend_allow_ips) {
-            return Err(format!(
-                "IP denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
-                backend_allow_ips
-            ));
+        if let Some(reason) = backend_allow_ips.deny_reason(&addr) {
+            return Err(format!("IP denied by backend egress policy: {reason}"));
         }
         return Ok(());
     }

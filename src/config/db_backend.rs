@@ -215,7 +215,7 @@ pub trait DatabaseBackend: Send + Sync {
     fn set_cert_expiry_warning_days(&mut self, days: u64);
 
     /// Set the backend IP allowlist policy for SSRF protection.
-    fn set_backend_allow_ips(&mut self, policy: crate::config::BackendAllowIps);
+    fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy);
 
     // -----------------------------------------------------------------------
     // Full config loading

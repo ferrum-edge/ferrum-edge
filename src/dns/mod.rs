@@ -106,8 +106,12 @@ pub struct DnsConfig {
     /// tasks system-wide. Prevents unbounded task spawning when many distinct
     /// hostnames go stale simultaneously. Default: 64.
     pub max_concurrent_refreshes: usize,
-    /// Backend IP allowlist policy for SSRF protection.
-    pub backend_allow_ips: crate::config::BackendAllowIps,
+    /// Backend egress policy for SSRF protection. Applied to every freshly
+    /// resolved address before it is cached, on every insertion path (initial
+    /// resolve, stale refresh, background refresh, failed-retry recovery) — so
+    /// a hostname that re-resolves to a now-denied address (DNS rebinding) is
+    /// rejected rather than served from cache.
+    pub backend_allow_ips: crate::config::BackendEgressPolicy,
     /// DashMap shard count for the DNS cache and refresh-tracking maps.
     /// Sourced from `FERRUM_POOL_SHARD_AMOUNT` (same env var as connection
     /// pools) — both surfaces share the workload shape (high cardinality,
@@ -136,7 +140,7 @@ impl Default for DnsConfig {
             num_concurrent_reqs: 3,
             max_active_requests: 512,
             max_concurrent_refreshes: 64,
-            backend_allow_ips: crate::config::BackendAllowIps::Both,
+            backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
             shard_amount: 0,
         }
     }
@@ -223,8 +227,8 @@ pub struct DnsCache {
     resolver_label: Arc<str>,
     /// Maximum number of concurrent DNS resolutions during config warmup.
     warmup_concurrency: usize,
-    /// Backend IP allowlist policy for SSRF protection.
-    backend_allow_ips: crate::config::BackendAllowIps,
+    /// Backend egress policy for SSRF protection.
+    backend_allow_ips: crate::config::BackendEgressPolicy,
     /// Percentage of TTL elapsed before background refresh triggers (1-99).
     refresh_threshold_percent: u8,
     /// Interval for the background task that retries failed DNS lookups.
@@ -241,10 +245,9 @@ impl DnsCache {
     /// arithmetic on the resolution hot path (a reachable panic).
     const MAX_TTL: Duration = Duration::from_secs(86_400);
 
-    /// Expose the configured backend IP allowlist policy for non-DNS
-    /// backend target validation paths (for example, service discovery).
-    /// Cloned because `BackendAllowIps` is no longer `Copy`.
-    pub fn backend_allow_ips(&self) -> crate::config::BackendAllowIps {
+    /// Expose the configured backend egress policy for non-DNS backend target
+    /// validation paths (for example, service discovery).
+    pub fn backend_allow_ips(&self) -> crate::config::BackendEgressPolicy {
         self.backend_allow_ips.clone()
     }
 
@@ -298,12 +301,12 @@ impl DnsCache {
         addr: IpAddr,
         hostname: &str,
     ) -> Result<IpAddr, anyhow::Error> {
-        if !crate::config::check_backend_ip_allowed(&addr, &self.backend_allow_ips) {
+        if let Some(reason) = self.backend_allow_ips.deny_reason(&addr) {
             anyhow::bail!(
-                "Backend IP {} (resolved from '{}') denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                "Backend IP {} (resolved from '{}') denied by backend egress policy: {}",
                 addr,
                 hostname,
-                self.backend_allow_ips
+                reason
             );
         }
         Ok(addr)
@@ -1469,7 +1472,7 @@ mod tests {
     //! re-resolution — two paths that previously called `effective_ttl(_, None)`
     //! and silently downgraded entries to the global TTL override / native TTL.
     use super::*;
-    use crate::config::BackendAllowIps;
+    use crate::config::{BackendAllowIps, BackendEgressPolicy};
     use std::collections::HashMap;
 
     fn config_with_global_override(global_ttl_secs: Option<u64>) -> DnsConfig {
@@ -1497,7 +1500,7 @@ mod tests {
     #[test]
     fn cache_success_entry_rejects_denied_addresses_without_caching() {
         let cache = DnsCache::new(DnsConfig {
-            backend_allow_ips: BackendAllowIps::Public,
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
             ..DnsConfig::default()
         });
 
@@ -1604,7 +1607,7 @@ mod tests {
             .dns_lookup_errors
             .load(std::sync::atomic::Ordering::Relaxed);
         let cache = DnsCache::new(DnsConfig {
-            backend_allow_ips: BackendAllowIps::Public,
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
             ..DnsConfig::default()
         });
 
@@ -1634,7 +1637,7 @@ mod tests {
             .dns_lookup_errors
             .load(std::sync::atomic::Ordering::Relaxed);
         let cache = DnsCache::new(DnsConfig {
-            backend_allow_ips: BackendAllowIps::Public,
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
             ..DnsConfig::default()
         });
 

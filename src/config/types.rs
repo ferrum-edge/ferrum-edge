@@ -6275,7 +6275,7 @@ impl GatewayConfig {
     pub fn validate_all_fields(&self, cert_expiry_warning_days: u64) -> Result<(), Vec<String>> {
         self.validate_all_fields_with_ip_policy(
             cert_expiry_warning_days,
-            &crate::config::BackendAllowIps::Both,
+            &crate::config::BackendEgressPolicy::unrestricted(),
         )
     }
 
@@ -6283,7 +6283,7 @@ impl GatewayConfig {
     pub fn validate_all_fields_with_ip_policy(
         &self,
         cert_expiry_warning_days: u64,
-        backend_allow_ips: &crate::config::BackendAllowIps,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -6323,30 +6323,31 @@ impl GatewayConfig {
             }
         }
 
-        // SSRF: validate literal IP backend_host / upstream target host values
-        if !matches!(backend_allow_ips, crate::config::BackendAllowIps::Both) {
+        // SSRF: validate literal IP backend_host / upstream target host values.
+        // Skipped only when the policy can never deny anything (fully open).
+        if !backend_allow_ips.is_fully_open() {
             for proxy in &self.proxies {
                 if let Ok(ip) = proxy.backend_host.parse::<std::net::IpAddr>()
-                    && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                    && let Some(reason) = backend_allow_ips.deny_reason(&ip)
                 {
                     errors.push(format!(
-                        "Proxy '{}': backend_host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
-                        proxy.id, ip, backend_allow_ips
+                        "Proxy '{}': backend_host IP {} denied by backend egress policy: {}",
+                        proxy.id, ip, reason
                     ));
                 }
                 if let Some(ref dns_override) = proxy.dns_override {
                     match dns_override.parse::<std::net::IpAddr>() {
                         Ok(ip) => {
-                            if !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
+                            if let Some(reason) = backend_allow_ips.deny_reason(&ip) {
                                 errors.push(format!(
-                                    "Proxy '{}': dns_override IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
-                                    proxy.id, ip, backend_allow_ips
+                                    "Proxy '{}': dns_override IP {} denied by backend egress policy: {}",
+                                    proxy.id, ip, reason
                                 ));
                             }
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under FERRUM_BACKEND_ALLOW_IPS={} policy: {}",
+                                "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under the backend egress policy ({}): {}",
                                 proxy.id,
                                 dns_override,
                                 backend_allow_ips,
@@ -6359,11 +6360,11 @@ impl GatewayConfig {
             for upstream in &self.upstreams {
                 for (i, target) in upstream.targets.iter().enumerate() {
                     if let Ok(ip) = target.host.parse::<std::net::IpAddr>()
-                        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
                     {
                         errors.push(format!(
-                            "Upstream '{}': targets[{}].host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
-                            upstream.id, i, ip, backend_allow_ips
+                            "Upstream '{}': targets[{}].host IP {} denied by backend egress policy: {}",
+                            upstream.id, i, ip, reason
                         ));
                     }
                 }
@@ -6384,11 +6385,11 @@ impl GatewayConfig {
                         continue;
                     };
                     if let Ok(ip) = host.parse::<std::net::IpAddr>()
-                        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
                     {
                         errors.push(format!(
-                            "PluginConfig '{}' mesh_route_dispatch.rules[{}].destination.backend_host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
-                            plugin.id, rule_idx, ip, backend_allow_ips
+                            "PluginConfig '{}' mesh_route_dispatch.rules[{}].destination.backend_host IP {} denied by backend egress policy: {}",
+                            plugin.id, rule_idx, ip, reason
                         ));
                     }
                 }

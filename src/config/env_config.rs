@@ -12,6 +12,7 @@
 use super::conf_file::ConfFile;
 use super::db_backend::redact_url;
 use crate::ebpf::NodeAgentProxyMode;
+use crate::util::cidr::CidrSet;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
@@ -297,12 +298,223 @@ fn is_well_known_nat64_private_ip(segments: [u16; 8]) -> bool {
     is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)))
 }
 
-/// Check whether an IP is allowed under the given backend IP policy.
+/// Check whether an IP is allowed under the given backend IP *mode* alone.
+///
+/// This is the legacy `FERRUM_BACKEND_ALLOW_IPS` primitive. It is the mode
+/// component of [`BackendEgressPolicy`] and is still used directly where a
+/// fixed mode is wanted regardless of CIDR overlays or the dangerous-range
+/// baseline (e.g. ACME, which always demands a public IP). New egress
+/// decisions should go through [`BackendEgressPolicy::is_allowed`].
 pub fn check_backend_ip_allowed(addr: &std::net::IpAddr, policy: &BackendAllowIps) -> bool {
     match policy {
         BackendAllowIps::Both => true,
         BackendAllowIps::Private => is_private_ip(addr),
         BackendAllowIps::Public => !is_private_ip(addr),
+    }
+}
+
+/// The "never a legitimate backend" ranges that the egress baseline denies by
+/// default — even under `FERRUM_BACKEND_ALLOW_IPS=both`.
+///
+/// This is deliberately a STRICT SUBSET of [`is_private_ip`]: loopback
+/// (`127.0.0.0/8`, `::1`) and RFC1918 (`10/8`, `172.16/12`, `192.168/16`) and
+/// their IPv6 ULA equivalent (`fc00::/7`) are intentionally NOT here. The
+/// gateway's whole job is to reach private backends — mesh inbound dials
+/// `127.0.0.1:<appPort>`, sidecars and same-host services use loopback, and
+/// internal upstreams use RFC1918 — so blocking those by default would break
+/// normal deployments. What this blocks instead is the set of ranges that are
+/// essentially never a real backend yet are the classic SSRF pivots:
+///
+/// - **Cloud metadata / link-local**: `169.254.0.0/16` (incl. `169.254.169.254`)
+///   and IPv6 `fe80::/10`.
+/// - **Multicast**: `224.0.0.0/4` and `ff00::/8`.
+/// - **Unspecified / "this host"**: `0.0.0.0`, `0.0.0.0/8`, and IPv6 `::`.
+/// - **Limited broadcast**: `255.255.255.255`.
+///
+/// Operators who genuinely need one of these (e.g. an IMDS proxy) re-allow it
+/// explicitly with `FERRUM_BACKEND_ALLOW_CIDRS`.
+pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_link_local()      // 169.254.0.0/16 (cloud metadata)
+            || ip.is_unspecified()  // 0.0.0.0
+            || ip.octets()[0] == 0  // 0.0.0.0/8 ("this host on this network")
+            || ip.is_multicast()    // 224.0.0.0/4
+            || ip.is_broadcast() // 255.255.255.255
+        }
+        std::net::IpAddr::V6(ip) => {
+            // Loopback (`::1`) is explicitly allowed and must NOT be caught by
+            // the IPv4-compat mapping below — `::1`.to_ipv4() is `0.0.0.1`,
+            // which is inside the blocked `0.0.0.0/8`. Guard it first.
+            if ip.is_loopback() {
+                return false;
+            }
+            // Canonicalise an IPv4-mapped (`::ffff:a.b.c.d`) or deprecated
+            // IPv4-compatible (`::a.b.c.d`) address to its v4 form so a
+            // mapped/compat metadata/multicast/unspecified/this-host address is
+            // caught too (parity with `is_private_ip`).
+            if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4()) {
+                return is_always_blocked_range(&std::net::IpAddr::V4(v4));
+            }
+            ip.is_unspecified()                     // ::
+            || (ip.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+            || ip.is_multicast() // ff00::/8
+        }
+    }
+}
+
+/// Resolved backend egress policy: the `FERRUM_BACKEND_ALLOW_IPS` mode plus an
+/// explicit allow/deny CIDR overlay and the dangerous-range baseline.
+///
+/// Evaluation precedence for a resolved IP (first match wins):
+/// 1. `FERRUM_BACKEND_ALLOW_CIDRS` — explicit ALLOW, overrides everything below
+///    (the escape hatch for an operator who truly needs e.g. `169.254.169.254`
+///    or a private host under a `public` mode).
+/// 2. `FERRUM_BACKEND_DENY_CIDRS` — explicit DENY.
+/// 3. Dangerous-range baseline ([`is_always_blocked_range`]) when
+///    `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES` is enabled (the default).
+/// 4. `FERRUM_BACKEND_ALLOW_IPS` mode (`both` allows; `private`/`public` filter
+///    on [`is_private_ip`]).
+///
+/// The whole point of this type is that a *default* gateway (no env vars set)
+/// is `both` + baseline-on: it still reaches loopback/RFC1918 backends, but it
+/// is no longer an unrestricted bridge to cloud-metadata / multicast /
+/// unspecified addresses.
+#[derive(Debug, Clone)]
+pub struct BackendEgressPolicy {
+    allow_ips: BackendAllowIps,
+    allow_cidrs: CidrSet,
+    deny_cidrs: CidrSet,
+    block_dangerous: bool,
+}
+
+impl BackendEgressPolicy {
+    /// A truly unrestricted policy: `both` mode, no CIDR overlays, no baseline.
+    ///
+    /// Used by back-compat helpers and tests that intentionally want *no*
+    /// egress screening (the historical behaviour of `BackendAllowIps::Both`).
+    /// This is NOT the production default — see [`Self::from_env`].
+    pub fn unrestricted() -> Self {
+        Self {
+            allow_ips: BackendAllowIps::Both,
+            allow_cidrs: CidrSet::default(),
+            deny_cidrs: CidrSet::default(),
+            block_dangerous: false,
+        }
+    }
+
+    /// Build a policy from a bare mode with the production dangerous-range
+    /// baseline enabled and no CIDR overlays. Useful for tests and for callers
+    /// that only have a mode in hand.
+    pub fn from_allow_ips(allow_ips: BackendAllowIps) -> Self {
+        Self {
+            allow_ips,
+            allow_cidrs: CidrSet::default(),
+            deny_cidrs: CidrSet::default(),
+            block_dangerous: true,
+        }
+    }
+
+    /// Build the resolved policy from parsed env inputs.
+    pub fn from_env(
+        allow_ips: BackendAllowIps,
+        allow_cidrs_raw: &str,
+        deny_cidrs_raw: &str,
+        block_dangerous: bool,
+    ) -> Result<Self, String> {
+        let allow_cidrs = CidrSet::parse_strict(allow_cidrs_raw)
+            .map_err(|e| format!("FERRUM_BACKEND_ALLOW_CIDRS: {e}"))?;
+        let deny_cidrs = CidrSet::parse_strict(deny_cidrs_raw)
+            .map_err(|e| format!("FERRUM_BACKEND_DENY_CIDRS: {e}"))?;
+        let policy = Self {
+            allow_ips,
+            allow_cidrs,
+            deny_cidrs,
+            block_dangerous,
+        };
+        if policy.is_fully_open() {
+            tracing::warn!(
+                "FERRUM_BACKEND_ALLOW_IPS=both with the dangerous-range baseline disabled \
+                 (FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false) and no FERRUM_BACKEND_DENY_CIDRS: \
+                 backend egress is UNRESTRICTED. The gateway will proxy/forward to ANY resolved \
+                 address including cloud-metadata (169.254.169.254), loopback, and link-local. \
+                 Leave the baseline enabled and/or set FERRUM_BACKEND_ALLOW_IPS=public for \
+                 internet-only backends."
+            );
+        }
+        Ok(policy)
+    }
+
+    /// The underlying allow-ips mode.
+    pub fn allow_ips(&self) -> &BackendAllowIps {
+        &self.allow_ips
+    }
+
+    /// Whether a resolved backend IP is permitted to be dialed.
+    pub fn is_allowed(&self, addr: &std::net::IpAddr) -> bool {
+        self.deny_reason(addr).is_none()
+    }
+
+    /// Returns a short human-readable reason if `addr` is denied, else `None`.
+    /// Used to build actionable errors at config-load and resolution time.
+    pub fn deny_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
+        // 1. Explicit allow overrides every deny below.
+        if self.allow_cidrs.contains(addr) {
+            return None;
+        }
+        // 2. Explicit deny.
+        if self.deny_cidrs.contains(addr) {
+            return Some("listed in FERRUM_BACKEND_DENY_CIDRS");
+        }
+        // 3. Dangerous-range baseline.
+        if self.block_dangerous && is_always_blocked_range(addr) {
+            return Some(
+                "cloud-metadata/link-local/multicast/unspecified range blocked by default \
+                 (set FERRUM_BACKEND_ALLOW_CIDRS to permit, or \
+                 FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false to disable the baseline)",
+            );
+        }
+        // 4. Legacy mode.
+        if check_backend_ip_allowed(addr, &self.allow_ips) {
+            None
+        } else {
+            match self.allow_ips {
+                BackendAllowIps::Public => {
+                    Some("private/reserved IP rejected by FERRUM_BACKEND_ALLOW_IPS=public")
+                }
+                BackendAllowIps::Private => {
+                    Some("public IP rejected by FERRUM_BACKEND_ALLOW_IPS=private")
+                }
+                // `Both` can never reach this arm.
+                BackendAllowIps::Both => None,
+            }
+        }
+    }
+
+    /// True only when the policy can never deny any address — lets callers
+    /// skip literal-IP validation work entirely. Note explicit ALLOW CIDRs do
+    /// not affect this (they only ever permit), so a fully-open policy is
+    /// `both` mode + no deny CIDRs + baseline disabled.
+    pub fn is_fully_open(&self) -> bool {
+        matches!(self.allow_ips, BackendAllowIps::Both)
+            && self.deny_cidrs.is_empty()
+            && !self.block_dangerous
+    }
+}
+
+impl std::fmt::Display for BackendEgressPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "allow_ips={}", self.allow_ips)?;
+        if self.block_dangerous {
+            write!(f, "+block-dangerous-ranges")?;
+        }
+        if !self.deny_cidrs.is_empty() {
+            write!(f, "+deny_cidrs({})", self.deny_cidrs.len())?;
+        }
+        if !self.allow_cidrs.is_empty() {
+            write!(f, "+allow_cidrs({})", self.allow_cidrs.len())?;
+        }
+        Ok(())
     }
 }
 
@@ -1401,9 +1613,13 @@ pub struct EnvConfig {
     /// address is always used (secure default for edge deployments).
     /// Example: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1"
     pub trusted_proxies: String,
-    /// Backend IP allowlist policy for SSRF protection.
-    /// "private" = only private/reserved IPs, "public" = only public IPs, "both" = all (default).
-    pub backend_allow_ips: BackendAllowIps,
+    /// Resolved backend egress policy for SSRF protection: the
+    /// `FERRUM_BACKEND_ALLOW_IPS` mode (`private`/`public`/`both`) composed with
+    /// `FERRUM_BACKEND_ALLOW_CIDRS`, `FERRUM_BACKEND_DENY_CIDRS`, and the
+    /// dangerous-range baseline (`FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES`, on by
+    /// default). See [`BackendEgressPolicy`]. The field name is retained for
+    /// continuity with the many carriers that thread it through.
+    pub backend_allow_ips: BackendEgressPolicy,
     /// When true, add a Via header on both request and response paths per RFC 9110 §7.6.3.
     pub add_via_header: bool,
     /// Pseudonym used in the Via header. Defaults to "ferrum-edge".
@@ -1914,7 +2130,7 @@ impl Default for EnvConfig {
             tls_cert_expiry_warning_days: 30,
             tls_early_data_methods: HashSet::new(),
             trusted_proxies: String::new(),
-            backend_allow_ips: BackendAllowIps::Both,
+            backend_allow_ips: BackendEgressPolicy::unrestricted(),
             add_via_header: true,
             via_pseudonym: "ferrum-edge".into(),
             add_forwarded_header: false,
@@ -2323,6 +2539,9 @@ impl EnvConfig {
             [client_ip]
             trusted_proxies: String = "FERRUM_TRUSTED_PROXIES" => String::new();
             backend_allow_ips: BackendAllowIps = "FERRUM_BACKEND_ALLOW_IPS" => BackendAllowIps::Both;
+            backend_allow_cidrs: String = "FERRUM_BACKEND_ALLOW_CIDRS" => String::new();
+            backend_deny_cidrs: String = "FERRUM_BACKEND_DENY_CIDRS" => String::new();
+            backend_block_dangerous_ranges: bool = "FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES" => true;
             add_via_header: bool = "FERRUM_ADD_VIA_HEADER" => true;
             via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
             add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
@@ -2672,6 +2891,16 @@ impl EnvConfig {
             "FERRUM_TLS_CRL_FILE_PATH",
             tls_crl_file_path,
         );
+
+        // Compose the raw allow-ips mode + CIDR overlays + baseline flag into
+        // the resolved egress policy, shadowing the bare-mode local. Invalid
+        // CIDR entries fail startup loudly rather than silently opening egress.
+        let backend_allow_ips = BackendEgressPolicy::from_env(
+            backend_allow_ips,
+            &backend_allow_cidrs,
+            &backend_deny_cidrs,
+            backend_block_dangerous_ranges,
+        )?;
 
         let mut config = Self {
             mode: mode.clone(),

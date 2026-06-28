@@ -165,7 +165,7 @@ fn parse_http_endpoint_accepts_http_https_host_forms() {
         let (endpoint, host) = parse_http_endpoint(
             &config,
             "batching_logger_endpoint",
-            &ferrum_edge::config::BackendAllowIps::Both,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         )
         .unwrap();
         assert_eq!(endpoint, expected_endpoint);
@@ -187,7 +187,7 @@ fn parse_http_endpoint_rejects_unusable_endpoint_forms() {
             parse_http_endpoint(
                 &config,
                 "batching_logger_endpoint",
-                &ferrum_edge::config::BackendAllowIps::Both,
+                &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
             )
             .is_err(),
             "expected unusable endpoint to be rejected: {config}"

@@ -26,7 +26,7 @@ use tracing::{info, warn};
 pub fn load_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
     namespace: &str,
 ) -> Result<GatewayConfig, anyhow::Error> {
     let file_path = Path::new(path);
@@ -261,7 +261,7 @@ pub fn load_config_from_file(
 pub fn reload_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
     namespace: &str,
 ) -> Result<GatewayConfig, anyhow::Error> {
     info!("Reloading configuration from file: {}", path);

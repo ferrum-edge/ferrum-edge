@@ -13,6 +13,7 @@ use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
+    let policy = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(policy);
     let dns_cache = DnsCache::new(DnsConfig {
         backend_allow_ips: policy.clone(),
         ..DnsConfig::default()
@@ -284,7 +285,7 @@ fn test_semantic_endpoint_rejects_literal_ips_denied_by_backend_policy() {
             panic!("literal internal endpoint should be rejected: {endpoint}");
         };
         assert!(
-            error.contains("denied by FERRUM_BACKEND_ALLOW_IPS=public policy"),
+            error.contains("denied by backend egress policy"),
             "unexpected error for {endpoint}: {error}"
         );
     }

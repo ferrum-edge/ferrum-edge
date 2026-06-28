@@ -365,7 +365,7 @@ fn validate_base_url(
     provider_name: &str,
     base_url: &str,
     allow_plaintext: bool,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let parsed = Url::parse(base_url).map_err(|e| {
         format!("ai_federation: provider '{provider_name}' invalid base_url '{base_url}': {e}")
@@ -400,10 +400,10 @@ fn validate_base_url(
     // If the host is a literal IP, enforce the gateway IP policy at config
     // time. Hostnames are checked at runtime by `DnsCacheResolver`.
     if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+        && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by backend egress policy ({backend_allow_ips})"
         ));
     }
 
@@ -2343,11 +2343,11 @@ pub mod test_helpers {
         allow_plaintext: bool,
         policy: &str,
     ) -> Result<(), String> {
-        use crate::config::BackendAllowIps;
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
         let policy = match policy {
-            "private" => BackendAllowIps::Private,
-            "public" => BackendAllowIps::Public,
-            "both" => BackendAllowIps::Both,
+            "private" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
+            "public" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+            "both" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
             other => return Err(format!("invalid policy '{other}'")),
         };
         validate_base_url(provider_name, base_url, allow_plaintext, &policy)

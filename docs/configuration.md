@@ -624,7 +624,10 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | No | `2` | Maximum active credential entries per type per consumer |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
-| `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend SSRF policy: `both`, `private`, or `public` |
+| `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend egress mode: `both` (any IP), `private` (only private/reserved), or `public` (only public — blocks all private/reserved). Composes with the CIDR lists and the dangerous-range baseline below |
+| `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES` | No | `true` | When `true` (default), backend egress to cloud-metadata/link-local (`169.254.0.0/16`, `fe80::/10`), multicast (`224.0.0.0/4`, `ff00::/8`), and unspecified/this-host (`0.0.0.0/8`, `::`, `255.255.255.255`) is **blocked even under `both`**. Loopback and RFC1918 stay allowed. Set `false` to restore fully-open egress (logs an unrestricted-egress warning) |
+| `FERRUM_BACKEND_ALLOW_CIDRS` | No | — | Comma-separated CIDRs/IPs that are **always allowed** regardless of mode, deny list, or baseline (the escape hatch). E.g. `169.254.169.254/32` to permit a real IMDS proxy, or `10.1.2.0/24` to carve a private subnet out of `public` mode |
+| `FERRUM_BACKEND_DENY_CIDRS` | No | — | Comma-separated CIDRs/IPs that are **denied** (unless also in the allow list). E.g. `10.0.0.0/8` to forbid an internal range while otherwise allowing private backends. Invalid entries fail startup |
 | `FERRUM_ADD_VIA_HEADER` | No | `true` | Add `Via` on request and response paths |
 | `FERRUM_VIA_PSEUDONYM` | No | `ferrum-edge` | Pseudonym used in the `Via` header |
 | `FERRUM_ADD_FORWARDED_HEADER` | No | `false` | Add RFC 7239 `Forwarded` alongside `X-Forwarded-*` |
@@ -744,6 +747,31 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_SO_BUSY_POLL_US` | No | `0` | Linux SO_BUSY_POLL duration for latency-sensitive UDP sockets |
 
 Core environment parsing lives in `src/config/env_config.rs`; early startup/pool settings use the same `FERRUM_*` names via conf-aware helpers.
+
+## Backend Egress / SSRF Protection
+
+The gateway dials backends, upstream targets, service-discovery results, and plugin endpoints (AI providers, log sinks, JWKS/OIDC, webhooks). Every production egress path resolves through the shared DNS cache, and each resolved IP — on **every** fresh resolve and cache insertion, including stale/background refreshes — is screened against the **backend egress policy**. This is what makes DNS rebinding safe: a hostname that re-resolves to a now-denied address is rejected at insertion and never cached or served.
+
+The policy is composed from four `FERRUM_BACKEND_*` env vars and evaluated in this precedence (first match wins) for each resolved IP:
+
+1. **`FERRUM_BACKEND_ALLOW_CIDRS`** — explicit allow; overrides everything below (the escape hatch).
+2. **`FERRUM_BACKEND_DENY_CIDRS`** — explicit deny.
+3. **Dangerous-range baseline** (`FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES`, default `true`) — denies cloud-metadata/link-local, multicast, and unspecified/this-host ranges.
+4. **`FERRUM_BACKEND_ALLOW_IPS`** mode — `both` allows; `private`/`public` filter on whether the IP is private/reserved.
+
+### Default posture (no `FERRUM_BACKEND_*` set)
+
+A fresh gateway runs `both` + baseline-on. It still reaches **loopback and RFC1918 backends** (so mesh sidecars, same-host services, and internal upstreams work out of the box), but it is **not** an unrestricted SSRF bridge: egress to the cloud-metadata endpoint (`169.254.169.254` and the rest of `169.254.0.0/16`/`fe80::/10`), multicast, and `0.0.0.0`/`::` is denied by default. A literal dangerous backend IP is also rejected at config-load time.
+
+### Migration / deployment guidance
+
+- **Internal-service deployments** (the common case): no change needed — loopback and RFC1918 backends keep working. If an internal backend lives in a normally-blocked range (rare), add it with `FERRUM_BACKEND_ALLOW_CIDRS`.
+- **You genuinely need the metadata endpoint as a backend** (e.g. an IMDS proxy): set `FERRUM_BACKEND_ALLOW_CIDRS=169.254.169.254/32`. Prefer the narrowest CIDR.
+- **Lock egress to the public internet** (egress-gateway style): set `FERRUM_BACKEND_ALLOW_IPS=public`. Carve out specific internal services with `FERRUM_BACKEND_ALLOW_CIDRS`.
+- **Forbid a specific internal range** while otherwise allowing private backends: `FERRUM_BACKEND_DENY_CIDRS=10.0.0.0/8`.
+- **Restore the legacy fully-open behaviour** (not recommended): `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`. With `both` + no deny CIDRs this makes egress unrestricted and the gateway logs a startup warning to that effect.
+
+The allow/deny CIDR lists accept comma-separated CIDRs or bare IPs (`10.0.0.0/8, 192.168.1.1, fc00::/7, ::1`); an invalid entry fails startup rather than silently failing open. The same policy is enforced by config validation, the DNS resolver, the connection pool, service discovery, and plugin endpoint screening.
 
 ## Configuration File (`ferrum.conf`)
 

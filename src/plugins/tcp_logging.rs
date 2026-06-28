@@ -662,7 +662,7 @@ mod tests {
             Some(path_str(&ca_path)),
             crl_list.clone(),
             "ferrum",
-            crate::config::BackendAllowIps::Both,
+            crate::config::BackendEgressPolicy::unrestricted(),
             std::sync::Arc::new(Vec::new()),
             0,
         );

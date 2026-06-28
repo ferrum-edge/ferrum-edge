@@ -277,7 +277,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Admin API security headers (X-Content-Type-Options, Cache-Control, X-Frame-Options)
 - HTTP/1.1 header read timeout for slowloris protection (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`)
 - Hop-by-hop header stripping per RFC 9110 §7.6.1 (including Proxy-Authenticate)
-- Backend IP allowlist policy (`FERRUM_BACKEND_ALLOW_IPS`) for SSRF protection with three-layer enforcement (config-time, DNS-resolution-time, connection-time)
+- Backend egress / SSRF policy (`FERRUM_BACKEND_ALLOW_IPS` mode + `FERRUM_BACKEND_ALLOW_CIDRS`/`FERRUM_BACKEND_DENY_CIDRS` + a dangerous-range baseline) with three-layer enforcement (config-time, DNS-resolution-time, connection-time). **Secure by default**: cloud-metadata/link-local, multicast, and unspecified ranges are blocked even under the default `both` (loopback and RFC1918 stay reachable), so a fresh deployment is not an unrestricted SSRF bridge while internal-service backends still work. DNS-rebinding-safe — every fresh resolve and cache insertion is screened. See [docs/configuration.md](docs/configuration.md#backend-egress--ssrf-protection)
 - UDP response amplification protection (`udp_max_response_amplification_factor` per-proxy) with symmetric `on_udp_datagram` plugin hooks (client→backend and backend→client)
 - Per-IP concurrent request limiting (`FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`) with RAII Drop guard for leak-free tracking across 30+ return paths
 - Admin API IP allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`) — TCP-level rejection before TLS handshake or request processing

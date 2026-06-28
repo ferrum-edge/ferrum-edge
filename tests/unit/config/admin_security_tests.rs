@@ -7,7 +7,7 @@
 //! of these fields is covered by env_config_tests.rs; these focus on the
 //! domain model and defaults.
 
-use ferrum_edge::config::{BackendAllowIps, EnvConfig};
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig};
 
 // ── FERRUM_ADMIN_ALLOWED_CIDRS ──────────────────────────────────────────────
 
@@ -65,31 +65,40 @@ fn test_max_concurrent_requests_per_ip_can_be_set() {
 fn test_backend_allow_ips_default_is_both() {
     let config = EnvConfig::default();
     assert_eq!(
-        config.backend_allow_ips,
-        BackendAllowIps::Both,
-        "Default should be Both (no restriction)"
+        config.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Both,
+        "Default mode should be Both"
     );
 }
 
 #[test]
 fn test_backend_allow_ips_variants() {
     let config_private = EnvConfig {
-        backend_allow_ips: BackendAllowIps::Private,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
         ..Default::default()
     };
-    assert_eq!(config_private.backend_allow_ips, BackendAllowIps::Private);
+    assert_eq!(
+        config_private.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Private
+    );
 
     let config_public = EnvConfig {
-        backend_allow_ips: BackendAllowIps::Public,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
         ..Default::default()
     };
-    assert_eq!(config_public.backend_allow_ips, BackendAllowIps::Public);
+    assert_eq!(
+        config_public.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Public
+    );
 
     let config_both = EnvConfig {
-        backend_allow_ips: BackendAllowIps::Both,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
         ..Default::default()
     };
-    assert_eq!(config_both.backend_allow_ips, BackendAllowIps::Both);
+    assert_eq!(
+        config_both.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Both
+    );
 }
 
 #[test]

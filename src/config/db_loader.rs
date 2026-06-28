@@ -353,7 +353,7 @@ pub struct DatabaseStore {
     /// Configurable via `FERRUM_DB_FULL_LOAD_PAGE_SIZE`. Default: 10000.
     full_load_page_size: i64,
     cert_expiry_warning_days: u64,
-    backend_allow_ips: crate::config::BackendAllowIps,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
     /// Set to `true` when the store was created via
     /// [`DatabaseStore::connect_offline_with_pool_config`] — the lazy pool
     /// never ran migrations because the DB was unreachable at startup.
@@ -763,7 +763,7 @@ impl DatabaseStore {
             slow_query_threshold_ms: None,
             full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
-            backend_allow_ips: crate::config::BackendAllowIps::Both,
+            backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -820,7 +820,7 @@ impl DatabaseStore {
             slow_query_threshold_ms: None,
             full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
-            backend_allow_ips: crate::config::BackendAllowIps::Both,
+            backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
@@ -6464,7 +6464,7 @@ impl DatabaseBackend for DatabaseStore {
         self.cert_expiry_warning_days = days;
     }
 
-    fn set_backend_allow_ips(&mut self, policy: crate::config::BackendAllowIps) {
+    fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy) {
         self.backend_allow_ips = policy;
     }
 

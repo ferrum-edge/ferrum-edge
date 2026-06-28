@@ -46,7 +46,7 @@
 //! }
 //! ```
 
-use crate::config::{BackendAllowIps, PoolConfig};
+use crate::config::{BackendEgressPolicy, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::tls::CrlList;
@@ -100,7 +100,7 @@ pub struct PluginHttpClient {
     /// Resolved backend IP policy (`FERRUM_BACKEND_ALLOW_IPS` after CLI/env/conf
     /// precedence). Used by plugins that validate outbound endpoints outside the
     /// proxy backend path.
-    backend_allow_ips: BackendAllowIps,
+    backend_allow_ips: BackendEgressPolicy,
     /// W3C `baggage` key prefixes stripped from outbound requests built by
     /// plugins (e.g., `request_mirror`'s mirror destination). Mirrors the
     /// proxy-path strip controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`
@@ -291,7 +291,7 @@ impl PluginHttpClient {
         tls_ca_bundle_path: Option<&str>,
         tls_crls: CrlList,
         namespace: &str,
-        backend_allow_ips: BackendAllowIps,
+        backend_allow_ips: BackendEgressPolicy,
         mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
         pool_shard_amount: usize,
     ) -> Self {
@@ -443,7 +443,7 @@ impl PluginHttpClient {
             tls_ca_bundle_path: None,
             tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
-            backend_allow_ips: BackendAllowIps::Both,
+            backend_allow_ips: BackendEgressPolicy::unrestricted(),
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
             pool_shard_amount: 0,
@@ -467,9 +467,9 @@ impl PluginHttpClient {
     /// Used for admin plugin-config validation in modes that have no
     /// `ProxyState` (e.g. control plane), so a plugin's endpoint IP-policy
     /// check honors the gateway's configured `FERRUM_BACKEND_ALLOW_IPS` rather
-    /// than defaulting open (`BackendAllowIps::Both`). Without this, a CP could
+    /// than defaulting open (`BackendEgressPolicy::unrestricted()`). Without this, a CP could
     /// accept a literal-IP backend endpoint that data planes later reject.
-    pub fn default_with_backend_allow_ips(backend_allow_ips: BackendAllowIps) -> Self {
+    pub fn default_with_backend_allow_ips(backend_allow_ips: BackendEgressPolicy) -> Self {
         let mut client = Self::from_pool_config(&PoolConfig::default());
         client.backend_allow_ips = backend_allow_ips;
         client
@@ -548,7 +548,7 @@ impl PluginHttpClient {
     ///
     /// This is the gateway-level `FERRUM_BACKEND_ALLOW_IPS` value after the
     /// normal CLI/env/conf/default precedence has been applied.
-    pub fn backend_allow_ips(&self) -> &BackendAllowIps {
+    pub fn backend_allow_ips(&self) -> &BackendEgressPolicy {
         &self.backend_allow_ips
     }
 
@@ -1062,7 +1062,7 @@ mod redirect_tests {
             None,
             Arc::new(Vec::new()),
             crate::config::types::DEFAULT_NAMESPACE,
-            BackendAllowIps::Both,
+            BackendEgressPolicy::unrestricted(),
             Arc::new(Vec::new()),
             0,
         );

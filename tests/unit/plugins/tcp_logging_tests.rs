@@ -23,7 +23,7 @@ fn ensure_crypto_provider() {
 /// `PluginHttpClient::new` only `warn!`s (does not error) on a bad bundle, so
 /// the path flows through to `TcpLogging::new`.
 fn client_with_ca(ca_path: &str) -> PluginHttpClient {
-    use ferrum_edge::config::BackendAllowIps;
+    use ferrum_edge::config::BackendEgressPolicy;
     use ferrum_edge::config::PoolConfig;
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -38,7 +38,7 @@ fn client_with_ca(ca_path: &str) -> PluginHttpClient {
         Some(ca_path),
         std::sync::Arc::new(Vec::new()),
         DEFAULT_NAMESPACE,
-        BackendAllowIps::Both,
+        BackendEgressPolicy::unrestricted(),
         std::sync::Arc::new(Vec::new()),
         0,
     )

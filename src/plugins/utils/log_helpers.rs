@@ -125,7 +125,7 @@ pub fn validate_batch_config(
 pub fn parse_http_endpoint(
     config: &Value,
     plugin_name: &'static str,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(String, String), String> {
     let endpoint_url = config["endpoint_url"]
         .as_str()
@@ -179,12 +179,13 @@ pub fn parse_http_endpoint(
 ///
 /// This mirrors how the gateway screens every other outbound connection: a
 /// **literal-IP** endpoint host is checked with the same
-/// [`check_backend_ip_allowed`](crate::config::check_backend_ip_allowed) used
-/// by the proxy's `DnsCacheResolver`. Under the default `Both` policy nothing
-/// is rejected (internal logging sinks — a local agent or in-cluster collector
-/// reached by IP — are a legitimate common case); operators who set
-/// `FERRUM_BACKEND_ALLOW_IPS=public` to forbid private egress get their log
-/// sinks screened too, closing the SSRF gap consistently across the gateway.
+/// [`BackendEgressPolicy`](crate::config::BackendEgressPolicy) used by the
+/// proxy's `DnsCacheResolver`. Under the default policy, loopback and RFC1918
+/// sinks are still allowed (a local agent or in-cluster collector reached by IP
+/// is a legitimate common case), but cloud-metadata / link-local / multicast /
+/// unspecified targets are rejected by the dangerous-range baseline; operators
+/// who set `FERRUM_BACKEND_ALLOW_IPS=public` get private egress forbidden here
+/// too, closing the SSRF gap consistently across the gateway.
 ///
 /// Only literal-IP hosts are screened here. A `Host::Domain` can still resolve
 /// to an internal address, but construction-time validation cannot know that;
@@ -193,7 +194,7 @@ pub fn parse_http_endpoint(
 fn screen_endpoint_ip_policy(
     plugin_name: &'static str,
     host: &Host<&str>,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let ip = match host {
         Host::Ipv4(address) => std::net::IpAddr::V4(*address),
@@ -202,15 +203,15 @@ fn screen_endpoint_ip_policy(
         Host::Domain(_) => return Ok(()),
     };
 
-    if crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
-        return Ok(());
+    match backend_allow_ips.deny_reason(&ip) {
+        None => Ok(()),
+        Some(reason) => Err(format!(
+            "{plugin_name}: 'endpoint_url' address {ip} is blocked by the backend egress \
+             policy ({reason}); refusing to send log data there. Adjust \
+             FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS or point the sink at an \
+             allowed address."
+        )),
     }
-
-    Err(format!(
-        "{plugin_name}: 'endpoint_url' address {ip} is blocked by the backend IP \
-         policy ({backend_allow_ips}); refusing to send log data there. Adjust \
-         FERRUM_BACKEND_ALLOW_IPS or point the sink at an allowed address."
-    ))
 }
 
 pub fn parse_custom_headers(
@@ -288,23 +289,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::config::BackendAllowIps;
+    use crate::config::{BackendAllowIps, BackendEgressPolicy};
 
     // Screen with the SSRF-hardening policy (forbid private egress).
     fn parse_public(url: &str) -> Result<(String, String), String> {
         parse_http_endpoint(
             &json!({ "endpoint_url": url }),
             "http_logging",
-            &BackendAllowIps::Public,
+            &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
         )
     }
 
-    // Screen with the default policy (no restriction).
+    // Screen with a fully-unrestricted policy (no mode filter, no baseline).
     fn parse_both(url: &str) -> Result<(String, String), String> {
         parse_http_endpoint(
             &json!({ "endpoint_url": url }),
             "http_logging",
-            &BackendAllowIps::Both,
+            &BackendEgressPolicy::unrestricted(),
         )
     }
 
@@ -322,7 +323,7 @@ mod tests {
     fn parse_http_endpoint_public_policy_rejects_loopback_ip() {
         let err = parse_public("http://127.0.0.1:9000/ingest").expect_err("loopback must reject");
         assert!(
-            err.contains("blocked by the backend IP policy"),
+            err.contains("blocked by the backend egress policy"),
             "got: {err}"
         );
         assert!(err.contains("public"), "got: {err}");
@@ -334,7 +335,7 @@ mod tests {
         let err = parse_public("http://169.254.169.254/latest/meta-data/")
             .expect_err("link-local / metadata must reject");
         assert!(
-            err.contains("blocked by the backend IP policy"),
+            err.contains("blocked by the backend egress policy"),
             "got: {err}"
         );
         assert!(err.contains("169.254.169.254"), "got: {err}");
@@ -353,9 +354,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_http_endpoint_default_policy_allows_internal_sink() {
-        // Default `Both` policy preserves the common local-sink case (a local
-        // agent / sidecar reached by loopback or RFC1918 IP).
+    fn parse_http_endpoint_unrestricted_policy_allows_any_sink() {
+        // A fully-unrestricted policy (mode `both`, baseline off) allows every
+        // address, including the local-sink case (a local agent / sidecar
+        // reached by loopback or RFC1918 IP) and even cloud-metadata. NOTE: the
+        // *production* default keeps the dangerous-range baseline ON, so
+        // 169.254.169.254 is rejected by default — see the config unit tests.
         let (url, host) = parse_both("http://127.0.0.1:9000/ingest").expect("loopback allowed");
         assert_eq!(url, "http://127.0.0.1:9000/ingest");
         assert_eq!(host, "127.0.0.1");
@@ -369,11 +373,11 @@ mod tests {
         let err = parse_http_endpoint(
             &json!({ "endpoint_url": "https://93.184.216.34/ingest" }),
             "http_logging",
-            &BackendAllowIps::Private,
+            &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
         )
         .expect_err("public IP must reject under Private policy");
         assert!(
-            err.contains("blocked by the backend IP policy"),
+            err.contains("blocked by the backend egress policy"),
             "got: {err}"
         );
     }

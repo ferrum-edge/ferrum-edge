@@ -1404,7 +1404,7 @@ mod tests {
             None,
             std::sync::Arc::new(Vec::new()),
             namespace,
-            crate::config::BackendAllowIps::Both,
+            crate::config::BackendEgressPolicy::unrestricted(),
             std::sync::Arc::new(Vec::new()),
             0,
         )

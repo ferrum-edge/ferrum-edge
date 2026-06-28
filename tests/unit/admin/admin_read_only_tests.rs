@@ -67,7 +67,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
 
@@ -200,7 +200,7 @@ async fn test_admin_state_mode_field() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -244,7 +244,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -280,7 +280,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -322,7 +322,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -363,7 +363,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -399,7 +399,7 @@ async fn test_db_available_flag_transitions() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
 
     // Initially available

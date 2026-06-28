@@ -1396,7 +1396,7 @@ fn test_base_url_aws_metadata_rejected_under_public_policy() {
         "should mention metadata IP: {err}"
     );
     assert!(
-        err.contains("FERRUM_BACKEND_ALLOW_IPS"),
+        err.contains("backend egress policy"),
         "should reference policy: {err}"
     );
 }
@@ -1796,6 +1796,8 @@ fn create_test_http_client() -> ferrum_edge::plugins::PluginHttpClient {
 fn create_test_http_client_with_backend_allow_ips(
     backend_allow_ips: BackendAllowIps,
 ) -> ferrum_edge::plugins::PluginHttpClient {
+    let backend_allow_ips =
+        ferrum_edge::config::BackendEgressPolicy::from_allow_ips(backend_allow_ips);
     let dns_config = DnsConfig {
         backend_allow_ips: backend_allow_ips.clone(),
         ..Default::default()

@@ -1,4 +1,4 @@
-use crate::config::BackendAllowIps;
+use crate::config::BackendEgressPolicy;
 use crate::config::types::GatewayConfig;
 use tracing::{error, warn};
 
@@ -17,7 +17,7 @@ enum ValidationStep<'a> {
     },
     AllFieldsWithIpPolicy {
         cert_expiry_warning_days: u64,
-        backend_allow_ips: &'a BackendAllowIps,
+        backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     },
     AllFields {
@@ -102,7 +102,7 @@ impl<'a> ValidationPipeline<'a> {
     pub(crate) fn validate_all_fields_with_ip_policy(
         mut self,
         cert_expiry_warning_days: u64,
-        backend_allow_ips: &'a BackendAllowIps,
+        backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     ) -> Self {
         self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
