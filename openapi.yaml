@@ -1259,6 +1259,14 @@ paths:
         Mesh mode adds identity and control-plane telemetry families for
         certificate expiry, rotation failures, CA health, trust-bundle
         versions, config freshness, and mTLS handshake failures.
+        The admin/management-plane connection limiter is always exposed:
+        `ferrum_admin_active_connections` (gauge of admin connections in
+        flight), `ferrum_admin_max_connections` and
+        `ferrum_admin_max_connections_per_ip` (configured caps, `0` =
+        unlimited), and
+        `ferrum_admin_rejected_connections_total{reason}` (admin connections
+        dropped by the cap, with `reason` one of `max_connections` /
+        `max_connections_per_ip`).
       tags: [Metrics]
       security: []
       responses:
@@ -1272,6 +1280,12 @@ paths:
                 # HELP ferrum_requests_total Total number of requests processed
                 # TYPE ferrum_requests_total counter
                 ferrum_requests_total{proxy_id="my-api",method="GET",status_code="200"} 42
+                # HELP ferrum_admin_active_connections Admin/management-plane connections currently in flight.
+                # TYPE ferrum_admin_active_connections gauge
+                ferrum_admin_active_connections 3
+                # HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.
+                # TYPE ferrum_admin_rejected_connections_total counter
+                ferrum_admin_rejected_connections_total{reason="max_connections"} 0
 
   /metrics/runtime:
     get:

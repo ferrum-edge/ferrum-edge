@@ -128,29 +128,51 @@ async fn functional_admin_connection_cap_plaintext_rejects_over_limit() {
     gw.shutdown();
 }
 
+/// Start a file-mode gateway with a TLS admin listener (cap = `max_conns`),
+/// allocating a FRESH `FERRUM_ADMIN_HTTPS_PORT` on each attempt. The
+/// reserve-drop-rebind window lets a parallel test steal the port before the
+/// gateway binds it; rather than reuse the already-stolen port (which the
+/// harness's own retry would do, since the env value is fixed), this retries
+/// with a new port — per the functional-test port-allocation rule. File-mode
+/// startup fails closed when the admin HTTPS port cannot bind (the listener's
+/// readiness signal gates `startup_ready`), so a successful `spawn()` implies
+/// the HTTPS listener is bound.
+async fn start_tls_admin_gateway(max_conns: &str) -> (TestGateway, u16) {
+    for attempt in 1..=5u32 {
+        let https = reserve_port().await.expect("reserve admin https port");
+        let https_port = https.port;
+        drop(https);
+
+        let result = TestGateway::builder()
+            .mode_file(ADMIN_CONFIG)
+            .log_level("warn")
+            // Drive retries here (fresh port per attempt) instead of letting the
+            // harness retry against the fixed FERRUM_ADMIN_HTTPS_PORT.
+            .max_attempts(1)
+            .env("FERRUM_ADMIN_MAX_CONNECTIONS", max_conns)
+            .env("FERRUM_ADMIN_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_ADMIN_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_ADMIN_TLS_KEY_PATH", "tests/certs/server.key")
+            // Idle raw connections stall in the TLS handshake wait, holding permits.
+            .env("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "0")
+            .spawn()
+            .await;
+        match result {
+            Ok(gw) => return (gw, https_port),
+            Err(e) if attempt < 5 => {
+                eprintln!("admin-cap TLS gateway start attempt {attempt} failed: {e}");
+            }
+            Err(e) => panic!("start admin-cap TLS gateway after retries: {e}"),
+        }
+    }
+    unreachable!("loop returns Ok or panics on the final attempt")
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_admin_connection_cap_tls_rejects_over_limit() {
-    let https = reserve_port().await.expect("reserve admin https port");
-    let https_port = https.port;
-    drop(https);
-
-    let mut gw = TestGateway::builder()
-        .mode_file(ADMIN_CONFIG)
-        .log_level("warn")
-        .env("FERRUM_ADMIN_MAX_CONNECTIONS", "2")
-        .env("FERRUM_ADMIN_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_ADMIN_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_ADMIN_TLS_KEY_PATH", "tests/certs/server.key")
-        // Idle raw connections stall in the TLS handshake wait, holding permits.
-        .env("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "0")
-        .spawn()
-        .await
-        .expect("start admin-cap TLS gateway");
     // Health is served on the plaintext admin port; the cap is shared.
-    gw.wait_for_health(Duration::from_secs(30))
-        .await
-        .expect("admin healthy");
+    let (mut gw, https_port) = start_tls_admin_gateway("2").await;
 
     // Hold the full cap (2) with idle TCP connections to the HTTPS port. The
     // permit is acquired before the TLS handshake, so no TLS client is needed.
