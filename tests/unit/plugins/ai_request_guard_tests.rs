@@ -1243,3 +1243,249 @@ async fn plain_json_still_buffered_and_inspected() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
+
+/// Final-hook defensive content-type re-check: a deferred request whose
+/// content-type was relabeled to a non-JSON type by an earlier-phase plugin must
+/// Continue (the JSON policies do not apply), and must NOT record
+/// uninspectable-body bookkeeping. The deferred marker is still consumed.
+#[tokio::test]
+async fn final_hook_non_json_content_type_skips_after_deferral() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    // Content-type is no longer JSON (relabeled), so the guard skips inspection.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = json!({"model": "evil"}).to_string().into_bytes();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body"),
+        "a non-JSON content-type is out of scope, not uninspectable"
+    );
+    // The deferred marker must have been consumed by the hook.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.deferred_compressed_body")
+    );
+}
+
+/// Final-hook defensive content-type re-check: a deferred request relabeled to
+/// framed gRPC (`application/grpc`) must Continue — framed gRPC wire bytes are
+/// never bare JSON, so they are skipped, not rejected.
+#[tokio::test]
+async fn final_hook_framed_grpc_content_type_skips_after_deferral() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    // Even a blocked-model JSON payload Continues — the content-type marks this
+    // as framed gRPC, which is out of scope for JSON policy.
+    let body = json!({"model": "evil"}).to_string().into_bytes();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body")
+    );
+}
+
+/// Final-hook malformed JSON: a deferred body that was decompressed (no
+/// `Content-Encoding`, non-empty) but is not valid JSON fails closed with reason
+/// `malformed_json`, and the serde error detail never leaks to the client body.
+#[tokio::test]
+async fn final_hook_malformed_decompressed_body_fails_closed() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // Decompression "succeeded" (no Content-Encoding) but produced garbage.
+    let body = b"not valid json{{{".to_vec();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("Malformed JSON request body"));
+            // The serde parse error detail is for logs only, never the client.
+            assert!(!body.contains("expected"));
+            assert!(!body.contains("ai_request_guard"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"malformed_json".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"reject".to_string())
+    );
+}
+
+/// Final-hook malformed JSON in compatibility mode
+/// (`fail_on_uninspectable_body: false`): a decompressed-but-malformed body is
+/// forwarded for the backend to handle, recording `action = allow`.
+#[tokio::test]
+async fn final_hook_malformed_decompressed_body_passes_in_compatibility_mode() {
+    let plugin = AiRequestGuard::new(&json!({
+        "blocked_models": ["evil"],
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = b"}{ not json".to_vec();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"malformed_json".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"allow".to_string())
+    );
+}
+
+/// `content-encoding` is tolerant of comma-separated lists: a list containing a
+/// non-identity token (`identity, gzip`) marks the body compressed, so
+/// `before_proxy` defers rather than parsing the compressed bytes.
+#[tokio::test]
+async fn comma_separated_content_encoding_with_compression_deferred() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "identity, gzip".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "32".to_string());
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "identity, gzip".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.deferred_compressed_body"),
+        Some(&"true".to_string()),
+        "a comma-separated encoding list containing gzip must defer"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body")
+    );
+}
+
+/// Comma-separated `content-encoding` in the final hook: a list with a
+/// non-identity token (`gzip, br`) still means the body was never decompressed,
+/// so the final hook fails closed with `compressed_body`.
+#[tokio::test]
+async fn comma_separated_content_encoding_still_encoded_fails_closed_in_final_hook() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    let body = vec![0x1f, 0x8b, 0x08, 0x00];
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"compressed_body".to_string())
+    );
+}
+
+/// A `content-encoding` list whose every token is `identity` is a no-op: the
+/// body is plaintext JSON and `before_proxy` must inspect it (not defer), so a
+/// blocked model is still rejected inline.
+#[tokio::test]
+async fn all_identity_content_encoding_list_is_inspected() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4"}));
+    ctx.headers.insert(
+        "content-encoding".to_string(),
+        "identity, identity".to_string(),
+    );
+    let mut headers = make_post_headers();
+    headers.insert(
+        "content-encoding".to_string(),
+        "identity, identity".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.deferred_compressed_body"),
+        "an all-identity encoding list must not defer"
+    );
+}
+
+/// A long, non-gRPC JSON content-type carrying a `;charset` parameter
+/// (`application/json; charset=utf-8`) is normal JSON: it is neither native gRPC
+/// nor gRPC-Web, so it must be inspected and a blocked model rejected. Exercises
+/// the gRPC-Web prefix-mismatch branch for a content-type at least as long as the
+/// `application/grpc-web` prefix.
+#[tokio::test]
+async fn parameterized_json_content_type_is_inspected() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4"}));
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/json; charset=utf-8".to_string(),
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut headers = make_post_headers();
+    headers.insert(
+        "content-type".to_string(),
+        "application/json; charset=utf-8".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
