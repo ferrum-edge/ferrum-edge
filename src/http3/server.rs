@@ -1365,21 +1365,32 @@ async fn handle_h3_request(
                     return Ok(());
                 };
                 let mut headers = reject.headers;
-                apply_after_proxy_hooks_to_rejection(
+                let mut reject_status = reject.status_code;
+                let mut reject_body = reject.body;
+                // Run after_proxy reject hooks AND the synthetic response-body
+                // guardrail/transform pipeline over 2xx short-circuit bodies so
+                // H3 matches the H1/H2 rejection path. An `on_request_received`
+                // short-circuit (e.g. `request_termination` returning a non-empty
+                // 2xx body) must see the same AI response guard / body hooks as
+                // every other reject phase — keeping the advertised H3 parity from
+                // holding only for `before_proxy` short-circuits.
+                apply_reject_after_proxy_and_synthetic_body_hooks(
                     &plugins,
                     &mut ctx,
-                    reject.status_code,
+                    &mut reject_status,
                     &mut headers,
+                    &mut reject_body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
                 )
                 .await;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let http_status = StatusCode::from_u16(reject.status_code)
+                let http_status = StatusCode::from_u16(reject_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let log_status_code = h3_reject_log_status_and_metadata(
                     &mut ctx,
                     http_flavor,
                     http_status,
-                    &reject.body,
+                    &reject_body,
                     &headers,
                 );
                 // Record the normalized wire status: a gRPC reject is sent as
@@ -1400,7 +1411,7 @@ async fn handle_h3_request(
                     &mut stream,
                     http_flavor,
                     http_status,
-                    &reject.body,
+                    &reject_body,
                     &headers,
                 )
                 .await?;
@@ -1481,11 +1492,31 @@ async fn handle_h3_request(
     )
     .await
     {
-        apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers).await;
+        let mut reject_status = status_code;
+        let mut reject_body = body;
+        // Run after_proxy reject hooks AND the synthetic response-body
+        // guardrail/transform pipeline over 2xx short-circuit bodies so an
+        // authentication-phase short-circuit on H3 sees the same AI response
+        // guard / body hooks as the H1/H2 rejection path and every other H3
+        // reject phase.
+        apply_reject_after_proxy_and_synthetic_body_hooks(
+            &plugins,
+            &mut ctx,
+            &mut reject_status,
+            &mut headers,
+            &mut reject_body,
+            matches!(http_flavor, HttpFlavor::Grpc),
+        )
+        .await;
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-        let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED);
-        let log_status_code =
-            h3_reject_log_status_and_metadata(&mut ctx, http_flavor, http_status, &body, &headers);
+        let http_status = StatusCode::from_u16(reject_status).unwrap_or(StatusCode::UNAUTHORIZED);
+        let log_status_code = h3_reject_log_status_and_metadata(
+            &mut ctx,
+            http_flavor,
+            http_status,
+            &reject_body,
+            &headers,
+        );
         // Record the normalized wire status: gRPC rejects go out as HTTP 200 +
         // grpc-status, so recording the raw `status_code` (e.g. 401/403) here
         // would make /metrics/runtime disagree with the logged and served
@@ -1501,7 +1532,14 @@ async fn handle_h3_request(
             plugin_execution_ns,
         )
         .await;
-        send_h3_reject_flavor_aware(&mut stream, http_flavor, http_status, &body, &headers).await?;
+        send_h3_reject_flavor_aware(
+            &mut stream,
+            http_flavor,
+            http_status,
+            &reject_body,
+            &headers,
+        )
+        .await?;
         return Ok(());
     }
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -1529,21 +1567,30 @@ async fn handle_h3_request(
                         return Ok(());
                     };
                     let mut headers = reject.headers;
-                    apply_after_proxy_hooks_to_rejection(
+                    let mut reject_status = reject.status_code;
+                    let mut reject_body = reject.body;
+                    // Run after_proxy reject hooks AND the synthetic response-body
+                    // guardrail/transform pipeline over 2xx short-circuit bodies so
+                    // an authorization-phase short-circuit on H3 sees the same AI
+                    // response guard / body hooks as the H1/H2 rejection path and
+                    // every other H3 reject phase.
+                    apply_reject_after_proxy_and_synthetic_body_hooks(
                         &plugins,
                         &mut ctx,
-                        reject.status_code,
+                        &mut reject_status,
                         &mut headers,
+                        &mut reject_body,
+                        matches!(http_flavor, HttpFlavor::Grpc),
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     let http_status =
-                        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::FORBIDDEN);
+                        StatusCode::from_u16(reject_status).unwrap_or(StatusCode::FORBIDDEN);
                     let log_status_code = h3_reject_log_status_and_metadata(
                         &mut ctx,
                         http_flavor,
                         http_status,
-                        &reject.body,
+                        &reject_body,
                         &headers,
                     );
                     // Record the normalized wire status (gRPC rejects go out as
@@ -1563,7 +1610,7 @@ async fn handle_h3_request(
                         &mut stream,
                         http_flavor,
                         http_status,
-                        &reject.body,
+                        &reject_body,
                         &headers,
                     )
                     .await?;

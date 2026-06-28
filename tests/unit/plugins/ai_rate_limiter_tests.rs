@@ -1200,3 +1200,125 @@ async fn test_cache_hit_is_not_charged_against_token_budget() {
         "a cache HIT must not consume the token budget (no model call occurred)"
     );
 }
+
+#[tokio::test]
+async fn test_response_caching_hit_is_not_charged_against_token_budget() {
+    // Regression: `response_caching` HITs are served from the generic response
+    // cache and never reach the upstream model. Their synthetic bodies now flow
+    // through `on_response_body` via the `RejectBinary` short-circuit, so without
+    // an exemption an OpenAI-shaped cached body with a `usage` block would be
+    // charged against the window on every cache hit. `response_caching` signals
+    // a hit via the `cache_status` metadata key ("HIT"/"REVALIDATED"), NOT the
+    // `ai_cache_status` key used by `ai_semantic_cache`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    // `response_caching` marks the generic cache hit.
+    ctx.metadata
+        .insert("cache_status".to_string(), "HIT".to_string());
+
+    let body = serde_json::to_vec(&json!({
+        "id": "x",
+        "object": "chat.completion",
+        "usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300}
+    }))
+    .unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "a response_caching HIT must not consume the token budget (no model call occurred)"
+    );
+}
+
+#[tokio::test]
+async fn test_request_deduplication_replay_is_not_charged_against_token_budget() {
+    // Regression: `request_deduplication` replays a stored response for a
+    // repeated idempotency key and stamps the `x-idempotent-replayed: true`
+    // response header. The replayed body never came from the backend, so its
+    // tokens (charged when the response was first produced) must not be charged
+    // again. The replay flows through `on_response_body` via the `RejectBinary`
+    // short-circuit; the exemption is driven by the response header, not by
+    // metadata.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+
+    let mut resp_headers = json_headers();
+    resp_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
+
+    let body = serde_json::to_vec(&json!({
+        "id": "x",
+        "object": "chat.completion",
+        "usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300}
+    }))
+    .unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "a request_deduplication replay must not re-consume the token budget"
+    );
+}
+
+#[tokio::test]
+async fn test_fresh_response_is_still_charged_despite_replay_exemption() {
+    // Guard for the cached/replayed exemption being too broad: a FRESH backend
+    // response (no cache-status metadata, no idempotent-replay header) MUST
+    // still be charged against the window. Only cache-hit / dedup-replay /
+    // semantic-cache synthetic bodies are exempt.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    // A `response_caching` MISS is a fresh response and must be charged — only
+    // HIT/REVALIDATED are exempt.
+    ctx.metadata
+        .insert("cache_status".to_string(), "MISS".to_string());
+
+    let body = openai_response(100, 200);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        300,
+        "a fresh (non-cached, non-replayed) response must still charge tokens"
+    );
+}

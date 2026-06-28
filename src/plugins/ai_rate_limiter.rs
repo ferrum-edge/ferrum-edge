@@ -395,6 +395,52 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         .ok_or_else(|| format!("ai_rate_limiter: '{field}' must be a boolean"))
 }
 
+/// Returns `true` when the response body about to be inspected by
+/// `on_response_body` is a cached or replayed synthetic body that never
+/// triggered an upstream model call, and therefore must NOT be charged against
+/// the token window.
+///
+/// Three producers feed such bodies through the synthetic short-circuit
+/// pipeline (`RejectBinary` → `apply_synthetic_response_body_hooks` →
+/// `on_response_body`):
+///   - `ai_semantic_cache` sets the `ai_cache_status` metadata key to `"HIT"`
+///     on a semantic-cache hit.
+///   - `response_caching` sets the `cache_status` metadata key to `"HIT"` or
+///     `"REVALIDATED"` on a generic cache hit / conditional revalidation (and,
+///     when configured, an `x-cache-status` response header with the same
+///     value).
+///   - `request_deduplication` replays a stored response and stamps the
+///     `x-idempotent-replayed: true` response header.
+///
+/// A fresh backend response carries none of these markers, so it falls through
+/// and is charged normally. Header lookups are case-insensitive because header
+/// casing is not guaranteed to be normalized on every synthetic path.
+fn is_cached_or_replayed_response(
+    metadata: &HashMap<String, String>,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    // `ai_semantic_cache` hit.
+    if metadata
+        .get("ai_cache_status")
+        .is_some_and(|value| value.eq_ignore_ascii_case("HIT"))
+    {
+        return true;
+    }
+
+    // `response_caching` hit / conditional revalidation. Both serve a stored
+    // body (or a 304 with no body) without an upstream model call.
+    if metadata.get("cache_status").is_some_and(|value| {
+        value.eq_ignore_ascii_case("HIT") || value.eq_ignore_ascii_case("REVALIDATED")
+    }) {
+        return true;
+    }
+
+    // `request_deduplication` idempotent replay. Marker is a response header.
+    response_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-idempotent-replayed") && value.eq_ignore_ascii_case("true")
+    })
+}
+
 #[async_trait]
 impl Plugin for AiRateLimiter {
     fn name(&self) -> &str {
@@ -530,21 +576,24 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
-        // Do not charge tokens for `ai_semantic_cache` cache hits. A HIT is
-        // served from cache and never reaches the upstream model, so it
-        // consumes no provider tokens. Synthetic cache-hit bodies now flow
-        // through `on_response_body` (the response-body guardrail path), so
-        // without this guard a cached response would be charged against the
-        // window even though no model call occurred — silently shrinking the
-        // effective budget. `ai_semantic_cache` sets this marker on every hit
-        // (`ai_semantic_cache.rs`); misses set it to "MISS" and are charged
-        // normally.
-        if ctx
-            .metadata
-            .get("ai_cache_status")
-            .is_some_and(|value| value == "HIT")
-        {
-            debug!("ai_rate_limiter: skipping cache HIT (no model tokens consumed)");
+        // Do not charge tokens for any cached or replayed synthetic body. A
+        // cache hit / idempotent replay is served from storage and never
+        // reaches the upstream model, so it consumes no provider tokens. These
+        // synthetic bodies now flow through `on_response_body` (the
+        // response-body guardrail path) via the `RejectBinary` short-circuit, so
+        // without this guard a cached/replayed body that carries a `usage` block
+        // would be charged against the window even though no model call
+        // occurred — silently shrinking the effective budget on cache hits and
+        // retries. A FRESH backend response carries none of these markers and is
+        // still charged normally below.
+        //
+        // Three distinct producers feed replayed/cached bodies here:
+        //   - `ai_semantic_cache`  → `ai_cache_status` metadata = "HIT"
+        //   - `response_caching`   → `cache_status` metadata = "HIT"/"REVALIDATED"
+        //                            (also an `x-cache-status` response header)
+        //   - `request_deduplication` → `x-idempotent-replayed` response header = "true"
+        if is_cached_or_replayed_response(&ctx.metadata, response_headers) {
+            debug!("ai_rate_limiter: skipping cached/replayed response (no model tokens consumed)");
             return PluginResult::Continue;
         }
 
