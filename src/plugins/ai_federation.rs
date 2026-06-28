@@ -638,8 +638,12 @@ impl AiFederation {
 }
 
 fn reject_unsupported_streaming_config(config: &Value, scope: &str) -> Result<(), String> {
-    const UNSUPPORTED_STREAMING_FIELDS: &[&str] =
-        &["streaming", "streaming_enabled", "enable_streaming"];
+    const UNSUPPORTED_STREAMING_FIELDS: &[&str] = &[
+        "stream",
+        "streaming",
+        "streaming_enabled",
+        "enable_streaming",
+    ];
 
     for field in UNSUPPORTED_STREAMING_FIELDS {
         if config.get(*field).is_some() {

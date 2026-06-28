@@ -121,8 +121,15 @@ fn test_streaming_config_fields_rejected() {
     });
 
     for config in [
+        json!({"providers": [valid_provider.clone()], "stream": false}),
         json!({"providers": [valid_provider.clone()], "streaming": true}),
         json!({"providers": [valid_provider.clone()], "streaming_enabled": true}),
+        json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "stream": true
+        }]}),
         json!({"providers": [{
             "name": "openai",
             "provider_type": "openai",
@@ -929,27 +936,18 @@ fn test_normalize_openai_response() {
 }
 
 #[test]
-fn test_sse_provider_responses_are_not_normalized() {
+fn test_sse_provider_response_is_rejected_by_buffered_json_parser() {
     let sse_body = br#"data: {"choices":[{"delta":{"content":"hello"}}]}
 
 data: [DONE]
 
 "#;
 
-    for (provider_type, model) in [
-        ("openai", "gpt-4o"),
-        ("anthropic", "claude-3-sonnet"),
-        ("google_gemini", "gemini-2.0-flash"),
-        ("aws_bedrock", "anthropic.claude-3-sonnet"),
-        ("cohere", "command-r-plus"),
-    ] {
-        let err =
-            test_helpers::normalize_response_test(provider_type, 200, sse_body, model).unwrap_err();
-        assert!(
-            err.contains("failed to parse provider response"),
-            "{provider_type} should not normalize SSE streams through the buffered JSON path, got: {err}"
-        );
-    }
+    let err = test_helpers::normalize_response_test("openai", 200, sse_body, "gpt-4o").unwrap_err();
+    assert!(
+        err.contains("failed to parse provider response"),
+        "SSE should fail at the shared buffered JSON parse before provider-specific normalization, got: {err}"
+    );
 }
 
 #[test]
