@@ -115,6 +115,41 @@ fn test_invalid_config_shapes_rejected() {
 }
 
 #[test]
+fn test_streaming_config_fields_rejected() {
+    let valid_provider = json!({
+        "name": "openai",
+        "provider_type": "openai",
+        "api_key": "sk-test-key"
+    });
+
+    for config in [
+        json!({"providers": [valid_provider.clone()], "stream": false}),
+        json!({"providers": [valid_provider.clone()], "streaming": true}),
+        json!({"providers": [valid_provider.clone()], "streaming_enabled": true}),
+        json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "stream": true
+        }]}),
+        json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "enable_streaming": true
+        }]}),
+    ] {
+        let err = ai_federation::AiFederation::new(&config, create_test_http_client())
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("streaming") && err.contains("unsupported"),
+            "streaming config should be explicitly rejected, got: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_valid_config_multiple_providers() {
     let config = json!({
         "providers": [
@@ -903,6 +938,21 @@ fn test_normalize_openai_response() {
 }
 
 #[test]
+fn test_sse_provider_response_is_rejected_by_buffered_json_parser() {
+    let sse_body = br#"data: {"choices":[{"delta":{"content":"hello"}}]}
+
+data: [DONE]
+
+"#;
+
+    let err = test_helpers::normalize_response_test("openai", 200, sse_body, "gpt-4o").unwrap_err();
+    assert!(
+        err.contains("failed to parse provider response"),
+        "SSE should fail at the shared buffered JSON parse before provider-specific normalization, got: {err}"
+    );
+}
+
+#[test]
 fn test_normalize_anthropic_response() {
     let resp = json!({
         "id": "msg_123",
@@ -1587,6 +1637,79 @@ fn json_headers() -> HashMap<String, String> {
     h
 }
 
+fn streaming_provider_cases() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        (
+            "anthropic",
+            json!({
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test",
+                "model_patterns": ["claude-*"]
+            }),
+            "claude-3-sonnet",
+        ),
+        (
+            "google_gemini",
+            json!({
+                "name": "gemini",
+                "provider_type": "google_gemini",
+                "api_key": "gemini-test",
+                "model_patterns": ["gemini-*"]
+            }),
+            "gemini-2.0-flash",
+        ),
+        (
+            "aws_bedrock",
+            json!({
+                "name": "bedrock",
+                "provider_type": "aws_bedrock",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "test-secret",
+                "model_patterns": ["bedrock-*"],
+                "model_mapping": {
+                    "bedrock-claude": "anthropic.claude-3-sonnet-20240229-v1:0"
+                }
+            }),
+            "bedrock-claude",
+        ),
+        (
+            "cohere",
+            json!({
+                "name": "cohere",
+                "provider_type": "cohere",
+                "api_key": "cohere-test",
+                "model_patterns": ["command-*"]
+            }),
+            "command-r-plus",
+        ),
+    ]
+}
+
+fn assert_streaming_rejected(provider_type: &str, result: PluginResult) {
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(
+                status_code, 501,
+                "{provider_type} streaming must be rejected with 501"
+            );
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "stream");
+            assert_eq!(parsed["error"]["code"], "streaming_not_supported");
+            let msg = parsed["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.to_lowercase().contains("stream"),
+                "{provider_type} error should mention streaming: {msg}"
+            );
+        }
+        other => panic!("{provider_type}: expected RejectBinary 501, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
     let plugin = streaming_plugin();
@@ -1615,6 +1738,24 @@ async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
             );
         }
         other => panic!("expected RejectBinary 501, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_before_proxy_rejects_streaming_request_for_translating_providers() {
+    for (provider_type, provider_config, model) in streaming_provider_cases() {
+        let config = json!({ "providers": [provider_config] });
+        let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": true
+        });
+        let mut ctx = post_json_ctx(&body);
+        let mut headers = json_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_streaming_rejected(provider_type, result);
     }
 }
 
