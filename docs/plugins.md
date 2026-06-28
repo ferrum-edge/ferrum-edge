@@ -3314,6 +3314,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 **The fail-closed guarantee is scoped to JSON POSTs.** `before_proxy` only inspects requests whose method is `POST` and whose `Content-Type` is `application/json` (or a `*+json` suffix); every other request returns `Continue` and reaches the backend uninspected. Even with the fail-closed defaults, a client can therefore bypass federation entirely by sending the same body with a non-JSON content type (for example `Content-Type: text/plain`) or a different method. `ai_federation` is not an authorization boundary — the backend it fronts must remain independently protected (auth, rate limiting, and any AI gateway policy) regardless of these flags.
 
+**Fail-closed defaults make `ai_federation` greedy in the `before_proxy` chain.** With the defaults, an instance now claims every `POST` + `application/json` request on its proxy — the resulting `RejectBinary` from `before_proxy` returns immediately and short-circuits later `before_proxy` plugins (serverless, response_mock, request/response transformers, caching, compression) as well as any second federation/router instance scoped to a different model family. Mixed-traffic proxies that need those other plugins to run on the same JSON POSTs should use the `fail_on_missing_model: false` / `fail_on_no_matching_provider: false` opt-outs, or isolate AI traffic on a dedicated proxy.
+
 **Priority:** 2985
 
 **Supported providers:**
