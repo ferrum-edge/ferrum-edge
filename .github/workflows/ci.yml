@@ -1550,7 +1550,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t bins < <(
-            cargo test --features ebpf --lib --no-run --message-format=json \
+            cargo test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
           )
           if [ "${#bins[@]}" -ne 1 ]; then
@@ -1597,7 +1597,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t bins < <(
-            cargo test --lib --no-run --message-format=json \
+            cargo test --lib --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
           )
           if [ "${#bins[@]}" -ne 1 ]; then
