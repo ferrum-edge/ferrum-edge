@@ -11,7 +11,7 @@ use super::utils::ai_providers::{
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
-    AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome,
+    AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome, ReservationBackend,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
@@ -256,9 +256,18 @@ impl AiRateLimiter {
         key: String,
         reservation_id: Option<u64>,
         reserved_window_index: Option<u64>,
-        delta: i64,
+        reservation_backend: ReservationBackend,
+        actual_tokens: u64,
+        reserved_tokens: u64,
     ) {
-        if delta == 0 {
+        let delta = Self::reservation_delta(actual_tokens, reserved_tokens);
+        // Skip only when there is genuinely nothing to apply on ANY backend:
+        // no actual usage to charge and no reservation to release. `delta == 0`
+        // alone is NOT sufficient — when a backend switch is detected the active
+        // backend charges the FULL `actual_tokens` (not the relative `delta`), so
+        // a request whose `actual == reserved` (`delta == 0`) but `actual > 0`
+        // must still be dispatched so the now-active backend records that usage.
+        if actual_tokens == 0 && delta == 0 {
             return;
         }
         let _ = self
@@ -269,10 +278,32 @@ impl AiRateLimiter {
                 &AiRateLimitOp::AdjustUsage {
                     reservation_id,
                     reserved_window_index,
+                    reservation_backend,
+                    actual_tokens,
                     delta,
                 },
             )
             .await;
+    }
+
+    /// Which backend the original reservation for this request landed on,
+    /// inferred from the markers `before_proxy` stored. A local-mode reservation
+    /// carries a `reservation_id` (and no Redis window index); a Redis-mode
+    /// reservation carries a `reserved_window_index` (and no reservation id).
+    /// When neither marker is present the estimate was 0 tokens (nothing was
+    /// reserved), so the backend is `Unknown` and the normal reconciliation path
+    /// applies (`delta == actual` because `reserved == 0`). This lets the
+    /// reconciliation arm detect a backend switch — Redis recovering, or going
+    /// down, between reserve and reconcile — and avoid corrupting a backend that
+    /// never received the reservation.
+    fn reservation_backend(ctx: &RequestContext) -> ReservationBackend {
+        if Self::reserved_window_index(ctx).is_some() {
+            ReservationBackend::Redis
+        } else if Self::reservation_id(ctx).is_some() {
+            ReservationBackend::Local
+        } else {
+            ReservationBackend::Unknown
+        }
     }
 
     fn reserved_tokens(ctx: &RequestContext) -> u64 {
@@ -395,6 +426,7 @@ impl AiRateLimiter {
         let reserved_tokens = Self::reserved_tokens(ctx);
         let reservation_id = Self::reservation_id(ctx);
         let reserved_window_index = Self::reserved_window_index(ctx);
+        let reservation_backend = Self::reservation_backend(ctx);
 
         if let Some(actual_tokens) = actual_tokens {
             ctx.metadata.insert(
@@ -405,7 +437,9 @@ impl AiRateLimiter {
                 self.rate_key(ctx),
                 reservation_id,
                 reserved_window_index,
-                Self::reservation_delta(actual_tokens, reserved_tokens),
+                reservation_backend,
+                actual_tokens,
+                reserved_tokens,
             )
             .await;
             return PluginResult::Continue;
@@ -416,7 +450,9 @@ impl AiRateLimiter {
                 self.rate_key(ctx),
                 reservation_id,
                 reserved_window_index,
-                Self::reservation_delta(0, reserved_tokens),
+                reservation_backend,
+                0,
+                reserved_tokens,
             )
             .await;
             return PluginResult::Continue;
@@ -461,7 +497,9 @@ impl AiRateLimiter {
                     self.rate_key(ctx),
                     reservation_id,
                     reserved_window_index,
-                    Self::reservation_delta(0, reserved_tokens),
+                    reservation_backend,
+                    0,
+                    reserved_tokens,
                 )
                 .await;
                 warn!(
