@@ -11257,6 +11257,12 @@ pub(crate) async fn log_rejected_request_with_path(
     }
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    // Fold in the reject-path `after_proxy` + synthetic response-body hook time
+    // recorded by `finalize_reject_response_with_after_proxy_hooks` (0 on the H3
+    // path, which times those hooks inline) so synthetic-guardrail latency is
+    // reported as plugin execution rather than gateway overhead.
+    let plugin_execution_ns =
+        plugin_execution_ns + ctx.reject_hook_execution_ns.load(Ordering::Relaxed);
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms =
         ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -11944,6 +11950,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
     let mut response_body = body.to_vec();
+    let hook_start = Instant::now();
     apply_reject_after_proxy_and_synthetic_body_hooks(
         plugins,
         ctx,
@@ -11953,6 +11960,18 @@ async fn finalize_reject_response_with_after_proxy_hooks(
         is_grpc_request,
     )
     .await;
+    // Attribute the reject-path `after_proxy` + synthetic response-body hook time
+    // to plugin execution rather than gateway overhead. The H1/H2/HBONE callers
+    // add their phase `plugin_execution_ns` *before* invoking this finalizer, so
+    // these hooks — which can run `ai_response_guard`/`ai_semantic_firewall` over
+    // a synthetic AI body, including external HTTP calls — would otherwise be
+    // uncounted in `latency_plugin_execution_ms`; `log_rejected_request_with_path`
+    // folds this in. The H3 reject path times these hooks inline and never calls
+    // this finalizer, so its `reject_hook_execution_ns` stays 0 (no double count).
+    ctx.reject_hook_execution_ns.fetch_add(
+        hook_start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
     normalize_reject_response(status, &response_body, &headers, is_grpc_request)
 }
