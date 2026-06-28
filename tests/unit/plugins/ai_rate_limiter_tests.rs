@@ -10,6 +10,15 @@ use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
+/// Mirror of the crate-internal `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`
+/// (which is `pub(crate)` and not reachable from this external test crate). The
+/// proxy sets this metadata key in `ctx.metadata` while replaying a synthetic
+/// short-circuit body through the response-body hooks; `ai_rate_limiter` uses its
+/// presence — NOT any response header — to exempt synthetic bodies from token
+/// charging. Tests that simulate a synthetic body set it directly. Kept in sync
+/// with the source constant (a drift would surface as a failing skip assertion).
+const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
 fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
@@ -1158,6 +1167,77 @@ async fn test_federation_flag_is_scoped_per_limiter_instance() {
 }
 
 #[tokio::test]
+async fn test_two_byte_identical_instances_each_charge_federation_tokens() {
+    // codex finding #2: the federation idempotency flag must be scoped per
+    // PLUGIN INSTANCE, not per budget-config fingerprint. Two `ai_rate_limiter`
+    // instances with byte-for-byte identical budget config can still be
+    // intentionally SEPARATE budgets (e.g. distinct `sync_mode`/`redis_key_prefix`
+    // backends, or simply two local instances). With the OLD config-derived flag
+    // key both shared one flag: the first to run set it and the second SKIPPED
+    // `record_usage`, under-counting its own window on `ai_federation` traffic.
+    // The per-instance id key fixes this — each owns a distinct flag and records
+    // independently. (The existing test above used different `limit_by` values, so
+    // it could not catch the identical-config collision.)
+    let make = || {
+        AiRateLimiter::new(
+            &json!({
+                "token_limit": 10_000,
+                "window_seconds": 60,
+                "limit_by": "ip",
+                "count_mode": "total_tokens",
+                "provider": "auto",
+                "expose_headers": true,
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap()
+    };
+    let limiter_a = make();
+    let limiter_b = make();
+
+    // One request, shared ctx: ai_federation populated provider + token metadata.
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "openai".to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), "500".to_string());
+
+    // Both limiters run after_proxy over the same request (same ctx.metadata),
+    // exactly as two instances on one proxy would.
+    let mut h1 = HashMap::new();
+    assert_continue(limiter_a.after_proxy(&mut ctx, 200, &mut h1).await);
+    let mut h2 = HashMap::new();
+    assert_continue(limiter_b.after_proxy(&mut ctx, 200, &mut h2).await);
+
+    assert_eq!(
+        observed_usage(&limiter_a).await,
+        500,
+        "the first identical-config instance must charge the federation tokens"
+    );
+    assert_eq!(
+        observed_usage(&limiter_b).await,
+        500,
+        "the second identical-config instance must ALSO charge the federation \
+         tokens — its flag is per-instance, so the first instance's flag cannot \
+         suppress it"
+    );
+
+    // Both instances stamped their OWN distinct idempotency flag onto the shared
+    // ctx (two keys, not one), proving the per-instance scoping.
+    let flag_keys: Vec<&String> = ctx
+        .metadata
+        .keys()
+        .filter(|k| k.starts_with("ai_ratelimit_federation_tokens_recorded"))
+        .collect();
+    assert_eq!(
+        flag_keys.len(),
+        2,
+        "each instance must set its own per-instance federation idempotency flag \
+         (got {flag_keys:?})"
+    );
+}
+
+#[tokio::test]
 async fn test_on_response_body_does_not_charge_federation_tokens() {
     // `after_proxy` is the SOLE federation charger. On the synthetic
     // short-circuit reject path the body hooks (`on_response_body`) run FIRST
@@ -1228,9 +1308,10 @@ async fn test_on_response_body_does_not_charge_federation_tokens() {
 async fn test_cache_hit_is_not_charged_against_token_budget() {
     // Regression: ai_semantic_cache cache hits are served from cache and never
     // reach the upstream model, so they consume no provider tokens. Synthetic
-    // cache-hit bodies now flow through on_response_body (the response-body
-    // guardrail path); without a guard the cached body's tokens would be
-    // charged against the window, silently shrinking the effective budget.
+    // cache-hit bodies flow through on_response_body (the response-body guardrail
+    // path) with the internal synthetic short-circuit marker set; without a guard
+    // the cached body's tokens would be charged against the window, silently
+    // shrinking the effective budget.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 10_000,
@@ -1243,13 +1324,19 @@ async fn test_cache_hit_is_not_charged_against_token_budget() {
 
     let mut ctx = create_test_context();
     plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
-    // ai_semantic_cache marks a hit on the request before the synthetic body is
-    // run back through the response hooks.
+    // The proxy stamps the synthetic short-circuit marker before replaying the
+    // cache-hit body through the response hooks. (ai_semantic_cache also sets
+    // `ai_cache_status: HIT`, but the exemption is driven by the unspoofable
+    // synthetic marker, not by that producer-specific metadata.)
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
     ctx.metadata
         .insert("ai_cache_status".to_string(), "HIT".to_string());
 
     // A cached OpenAI-style body that DOES carry a usage block — proving the
-    // skip is driven by the cache-HIT marker, not by an unparseable body.
+    // skip is driven by the synthetic marker, not by an unparseable body.
     let body = serde_json::to_vec(&json!({
         "id": "x",
         "object": "chat.completion",
@@ -1271,12 +1358,11 @@ async fn test_cache_hit_is_not_charged_against_token_budget() {
 #[tokio::test]
 async fn test_response_caching_hit_is_not_charged_against_token_budget() {
     // Regression: `response_caching` HITs are served from the generic response
-    // cache and never reach the upstream model. Their synthetic bodies now flow
-    // through `on_response_body` via the `RejectBinary` short-circuit, so without
-    // an exemption an OpenAI-shaped cached body with a `usage` block would be
-    // charged against the window on every cache hit. `response_caching` signals
-    // a hit via the `cache_status` metadata key ("HIT"/"REVALIDATED"), NOT the
-    // `ai_cache_status` key used by `ai_semantic_cache`.
+    // cache and never reach the upstream model. Their synthetic bodies flow
+    // through `on_response_body` via the `RejectBinary` short-circuit with the
+    // internal synthetic marker set, so without an exemption an OpenAI-shaped
+    // cached body with a `usage` block would be charged against the window on
+    // every cache hit.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 10_000,
@@ -1289,7 +1375,13 @@ async fn test_response_caching_hit_is_not_charged_against_token_budget() {
 
     let mut ctx = create_test_context();
     plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
-    // `response_caching` marks the generic cache hit.
+    // The proxy stamps the synthetic marker before replaying the cached body.
+    // (`response_caching` also sets `cache_status: HIT`, but the exemption is
+    // driven by the unspoofable synthetic marker, not by that metadata.)
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
     ctx.metadata
         .insert("cache_status".to_string(), "HIT".to_string());
 
@@ -1314,12 +1406,13 @@ async fn test_response_caching_hit_is_not_charged_against_token_budget() {
 #[tokio::test]
 async fn test_request_deduplication_replay_is_not_charged_against_token_budget() {
     // Regression: `request_deduplication` replays a stored response for a
-    // repeated idempotency key and stamps the `x-idempotent-replayed: true`
-    // response header. The replayed body never came from the backend, so its
-    // tokens (charged when the response was first produced) must not be charged
-    // again. The replay flows through `on_response_body` via the `RejectBinary`
-    // short-circuit; the exemption is driven by the response header, not by
-    // metadata.
+    // repeated idempotency key. The replayed body never came from the backend, so
+    // its tokens (charged when the response was first produced) must not be
+    // charged again. The replay flows through `on_response_body` via the
+    // `RejectBinary` short-circuit with the internal synthetic marker set; the
+    // exemption is driven by that marker, NOT by the public
+    // `x-idempotent-replayed` response header — a header a backend could spoof to
+    // dodge a real charge (see codex finding #4).
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 10_000,
@@ -1332,7 +1425,14 @@ async fn test_request_deduplication_replay_is_not_charged_against_token_budget()
 
     let mut ctx = create_test_context();
     plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    // The proxy stamps the synthetic marker before replaying the stored body.
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
 
+    // `request_deduplication` also stamps `x-idempotent-replayed: true`, but we
+    // deliberately rely on the marker, not the header, for the exemption.
     let mut resp_headers = json_headers();
     resp_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
 
@@ -1355,14 +1455,105 @@ async fn test_request_deduplication_replay_is_not_charged_against_token_budget()
 }
 
 #[tokio::test]
+async fn test_replay_response_header_alone_does_not_skip_charging() {
+    // codex finding #4: the replay exemption must NOT be satisfied by a public
+    // response header. A FRESH backend (or a `response_transformer` rewrite) that
+    // emits `x-idempotent-replayed: true` (or any cache-status header) on a real
+    // 2xx model response with a `usage` block must STILL be charged — the header
+    // is spoofable, the internal synthetic marker is not. With no synthetic
+    // marker present, the header is ignored and the real response is charged.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+
+    // A genuine backend response that spoofs the replay header — but carries NO
+    // synthetic short-circuit marker.
+    let mut resp_headers = json_headers();
+    resp_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
+
+    let body = openai_response(100, 200);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        300,
+        "a fresh 2xx response that spoofs x-idempotent-replayed (no synthetic \
+         marker) must STILL be charged — the exemption is marker-driven, not \
+         header-driven"
+    );
+}
+
+#[tokio::test]
+async fn test_response_mock_synthetic_body_is_not_charged() {
+    // codex finding #1: a NON-cache synthetic 2xx (e.g. `response_mock`,
+    // `serverless_function`, `request_termination`) can return an OpenAI-shaped
+    // body with a `usage` block. It flows through `on_response_body` carrying the
+    // internal synthetic marker but NO cache/replay marker. The OLD guard only
+    // exempted cache/replay producers, so it fell through and charged tokens for
+    // a request that never reached any model. The marker-driven guard now exempts
+    // it: no upstream model call occurred, so nothing is charged.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    // The proxy stamps the synthetic marker for ANY synthetic short-circuit body,
+    // including `response_mock` — with NO cache/replay metadata or header.
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
+    // A canned OpenAI-style mock body with a usage block.
+    let body = serde_json::to_vec(&json!({
+        "id": "mock",
+        "object": "chat.completion",
+        "usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300}
+    }))
+    .unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "a response_mock / serverless / termination synthetic 2xx must NOT be \
+         charged — no upstream model call occurred"
+    );
+}
+
+#[tokio::test]
 async fn test_fresh_response_is_still_charged_despite_replay_exemption() {
-    // Guard for the cached/replayed exemption being too broad: a FRESH backend
-    // response (no cache-status metadata, no idempotent-replay header) MUST
-    // still be charged against the window. Only cache-hit / dedup-replay /
-    // semantic-cache synthetic bodies are exempt.
+    // Guard for the synthetic exemption being too broad: a FRESH backend response
+    // (no synthetic short-circuit marker) MUST still be charged against the
+    // window. Only synthetic short-circuit bodies are exempt; a real backend
+    // response — even one that happens to carry cache-status metadata such as a
+    // `response_caching` MISS — has no marker and is charged.
     // `expose_headers` is required for `observed_usage` to read the recorded
     // window total back out of `ai_ratelimit_usage` metadata (it is only stored
-    // when headers are exposed). The cache/replay exemption tests above assert a
+    // when headers are exposed). The synthetic exemption tests above assert a
     // usage of 0, which `observed_usage` returns regardless of `expose_headers`,
     // so they do not need it — but this test asserts a NON-zero charge actually
     // landed, so it must expose headers to observe it.
@@ -1379,8 +1570,8 @@ async fn test_fresh_response_is_still_charged_despite_replay_exemption() {
 
     let mut ctx = create_test_context();
     plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
-    // A `response_caching` MISS is a fresh response and must be charged — only
-    // HIT/REVALIDATED are exempt.
+    // A `response_caching` MISS is a fresh response and must be charged — it
+    // carries no synthetic marker, so the cache-status metadata is irrelevant.
     ctx.metadata
         .insert("cache_status".to_string(), "MISS".to_string());
 

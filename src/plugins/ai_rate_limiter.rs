@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -29,6 +30,13 @@ const MAX_STATE_ENTRIES: usize = 100_000;
 const FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX: &str =
     "ai_ratelimit_federation_tokens_recorded";
 
+/// Process-wide monotonic counter used to give every `AiRateLimiter` instance a
+/// unique id. The id is folded into [`AiRateLimiter::federation_flag_key`] so the
+/// per-request federation idempotency flag is scoped to ONE limiter instance,
+/// never to a budget-config fingerprint that two intentionally-separate budgets
+/// could share. Mirrors the `INSTANCE_ID_COUNTER` idiom in `openapi_validator`.
+static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -37,9 +45,11 @@ pub struct AiRateLimiter {
     expose_headers: bool,
     provider: String,
     /// Per-instance metadata key for the federation-tokens-recorded idempotency
-    /// flag. Derived from this limiter's budget-defining configuration so two
-    /// instances with distinct budgets get distinct flags, while instances that
-    /// share the same budget dimension correctly share one.
+    /// flag. Scoped to this limiter instance via a process-unique id so that two
+    /// `ai_rate_limiter` instances — even with byte-identical budget config but
+    /// intentionally separate budgets (distinct `sync_mode`/`redis_key_prefix`,
+    /// or simply two local instances) — never share the flag. Each instance
+    /// records the federation tokens against its own window exactly once.
     federation_flag_key: String,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
 }
@@ -101,27 +111,23 @@ impl AiRateLimiter {
             ));
         }
 
-        // Scope the per-request federation idempotency flag to this limiter's
-        // budget dimension. The key includes every budget-defining field
-        // (limit_by/window/limit/count_mode/provider) so that two instances with
-        // DIFFERENT budgets get DISTINCT keys, and each records the federation
-        // tokens against its own window exactly once even though `after_proxy`
-        // may run more than once on the synthetic short-circuit path.
-        //
-        // Instances that share an identical budget dimension intentionally share
-        // one flag. Note this is a deliberate trade-off, not a perfect-isolation
-        // guarantee: with the default LOCAL backend each instance owns a separate
-        // in-memory window, so two byte-identical limiters technically have
-        // distinct windows yet share this flag — the first to record sets it and
-        // the second skips, under-counting its own window for `ai_federation`
-        // traffic. That only happens under a redundant misconfiguration (two
-        // limiters with the exact same budget on one proxy); realistic
-        // per-consumer + per-IP setups differ in `limit_by` and so get distinct
-        // keys. If strict per-instance correctness is ever required, fold the
-        // plugin `id` into the key.
-        let federation_flag_key = format!(
-            "{FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX}:{limit_by}:{window_seconds}:{token_limit}:{count_mode}:{provider}"
-        );
+        // Scope the per-request federation idempotency flag to THIS limiter
+        // instance via a process-unique id, not to a budget-config fingerprint.
+        // Each instance owns its own token window (a separate in-memory map for
+        // the local backend, or a distinct `redis_key_prefix` for the centralized
+        // backend), so the idempotency flag — which guards against `after_proxy`
+        // running twice for ONE request — must be per instance too. A
+        // config-derived key would be shared by two limiters with identical
+        // budget config that are nonetheless SEPARATE budgets (e.g. different
+        // `sync_mode`/`redis_key_prefix`, or just two local instances): the first
+        // to run would set the flag and the second would skip `record_usage`,
+        // under-counting its own window for `ai_federation` traffic and
+        // contradicting the documented per-instance accounting contract. The id
+        // keeps the within-request, within-instance dedup semantics intact while
+        // never cross-suppressing a sibling instance.
+        let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let federation_flag_key =
+            format!("{FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX}:{instance_id}");
 
         Ok(Self {
             token_limit,
@@ -399,52 +405,6 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         .ok_or_else(|| format!("ai_rate_limiter: '{field}' must be a boolean"))
 }
 
-/// Returns `true` when the response body about to be inspected by
-/// `on_response_body` is a cached or replayed synthetic body that never
-/// triggered an upstream model call, and therefore must NOT be charged against
-/// the token window.
-///
-/// Three producers feed such bodies through the synthetic short-circuit
-/// pipeline (`RejectBinary` → `apply_synthetic_response_body_hooks` →
-/// `on_response_body`):
-///   - `ai_semantic_cache` sets the `ai_cache_status` metadata key to `"HIT"`
-///     on a semantic-cache hit.
-///   - `response_caching` sets the `cache_status` metadata key to `"HIT"` or
-///     `"REVALIDATED"` on a generic cache hit / conditional revalidation (and,
-///     when configured, an `x-cache-status` response header with the same
-///     value).
-///   - `request_deduplication` replays a stored response and stamps the
-///     `x-idempotent-replayed: true` response header.
-///
-/// A fresh backend response carries none of these markers, so it falls through
-/// and is charged normally. Header lookups are case-insensitive because header
-/// casing is not guaranteed to be normalized on every synthetic path.
-fn is_cached_or_replayed_response(
-    metadata: &HashMap<String, String>,
-    response_headers: &HashMap<String, String>,
-) -> bool {
-    // `ai_semantic_cache` hit.
-    if metadata
-        .get("ai_cache_status")
-        .is_some_and(|value| value.eq_ignore_ascii_case("HIT"))
-    {
-        return true;
-    }
-
-    // `response_caching` hit / conditional revalidation. Both serve a stored
-    // body (or a 304 with no body) without an upstream model call.
-    if metadata.get("cache_status").is_some_and(|value| {
-        value.eq_ignore_ascii_case("HIT") || value.eq_ignore_ascii_case("REVALIDATED")
-    }) {
-        return true;
-    }
-
-    // `request_deduplication` idempotent replay. Marker is a response header.
-    response_headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("x-idempotent-replayed") && value.eq_ignore_ascii_case("true")
-    })
-}
-
 #[async_trait]
 impl Plugin for AiRateLimiter {
     fn name(&self) -> &str {
@@ -588,24 +548,34 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
-        // Do not charge tokens for any cached or replayed synthetic body. A
-        // cache hit / idempotent replay is served from storage and never
-        // reaches the upstream model, so it consumes no provider tokens. These
-        // synthetic bodies now flow through `on_response_body` (the
-        // response-body guardrail path) via the `RejectBinary` short-circuit, so
-        // without this guard a cached/replayed body that carries a `usage` block
-        // would be charged against the window even though no model call
-        // occurred — silently shrinking the effective budget on cache hits and
-        // retries. A FRESH backend response carries none of these markers and is
-        // still charged normally below.
-        //
-        // Three distinct producers feed replayed/cached bodies here:
-        //   - `ai_semantic_cache`  → `ai_cache_status` metadata = "HIT"
-        //   - `response_caching`   → `cache_status` metadata = "HIT"/"REVALIDATED"
-        //                            (also an `x-cache-status` response header)
-        //   - `request_deduplication` → `x-idempotent-replayed` response header = "true"
-        if is_cached_or_replayed_response(&ctx.metadata, response_headers) {
-            debug!("ai_rate_limiter: skipping cached/replayed response (no model tokens consumed)");
+        // Do not charge tokens for ANY synthetic short-circuit body. A synthetic
+        // body is a plugin-generated 2xx that never reached the upstream model
+        // (cache hit, dedup replay, `response_mock`, `serverless_function`,
+        // `request_termination`, federation, …). All of them flow through
+        // `on_response_body` via the `RejectBinary` short-circuit, and the proxy
+        // sets `ferrum:synthetic_short_circuit` in `ctx.metadata` for the
+        // duration of that body-hook phase (see
+        // `apply_synthetic_response_body_hooks`). Without this guard a synthetic
+        // body that happens to carry an OpenAI-shaped `usage` block — e.g. a
+        // `response_mock` returning a canned chat-completion — would be charged
+        // against the window even though no provider tokens were consumed,
+        // silently shrinking the user's budget. The synthetic marker is the
+        // correct exemption signal precisely BECAUSE it is internal and
+        // unspoofable: it is set only on the synthetic path and never on a real
+        // backend response, so a backend (or a `response_transformer` rewrite)
+        // emitting a `usage` block, an `x-idempotent-replayed`, or any cache
+        // header on a genuine model response cannot satisfy it. The earlier
+        // cache/replay producers that already charge (or never charge) elsewhere
+        // are a strict subset of this set; federation is handled above by
+        // `after_proxy`. A FRESH backend response carries no synthetic marker and
+        // is charged normally below.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
+            debug!(
+                "ai_rate_limiter: skipping synthetic short-circuit response (no model tokens consumed)"
+            );
             return PluginResult::Continue;
         }
 

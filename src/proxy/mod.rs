@@ -11568,12 +11568,41 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     if !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
     {
+        // KNOWN ORDERING DIVERGENCE (accepted, documented trade-off):
+        //
+        // On the synthetic short-circuit path the response-BODY hooks
+        // (`on_response_body` / `transform_response_body_with_context` /
+        // `on_final_response_body`) run HERE, BEFORE the `after_proxy` reject
+        // hooks below. On the NORMAL backend path the order is reversed —
+        // `after_proxy` runs before the body transforms. So a body transform that
+        // depends on a header/metadata mutation made by an `after_proxy` hook
+        // (e.g. `response_transformer`'s `after_proxy` rewriting `Content-Type`
+        // to `application/json` before its JSON body rules, or `compression`
+        // choosing an encoding) can see a different input on a synthetic 2xx than
+        // it would on an equivalent backend 2xx.
+        //
+        // This is INTENTIONAL and must NOT be "fixed" by moving `after_proxy`
+        // ahead of the body hooks: doing so would re-break the one-shot
+        // `after_proxy` response-state contract that the caller relies on. The
+        // body hooks may REPLACE the response when a guardrail rejects the
+        // synthetic 2xx body (`apply_synthetic_response_body_hooks` rebuilds
+        // headers via `rebuild_plugin_rejection_response_headers`). The
+        // `after_proxy` reject hooks therefore have to run exactly once and LAST,
+        // over the FINAL response, so one-shot state emitted from consumed
+        // metadata — the `oidc_relying_party` rotated session cookie, the
+        // `response_transformer` route override — lands on whatever the client
+        // actually receives instead of being consumed against a synthetic 2xx
+        // that a later body rejection discards (see commit 36de1bf0 and the
+        // function-level doc on `apply_reject_after_proxy_and_synthetic_body_hooks`).
+        // The two requirements directly conflict; we keep the one-shot guarantee
+        // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
     // (the synthetic 2xx or the body-rejection response produced above), so
     // one-shot response state (rotated session cookie, route overrides) is
-    // emitted onto whatever the client actually receives.
+    // emitted onto whatever the client actually receives. Runs LAST by design —
+    // see the divergence note above.
     apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
 }
 
