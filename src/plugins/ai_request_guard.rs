@@ -178,8 +178,12 @@ impl AiRequestGuard {
         if !self.allowed_models.is_empty() || !self.blocked_models.is_empty() {
             match json.get("model") {
                 Some(Value::String(model)) => {
+                    // A present-but-empty/whitespace string is supplied but
+                    // unusable — same shape as a non-string value below, so it
+                    // shares the "present but invalid" title rather than the
+                    // "genuinely absent" one.
                     if self.require_model_for_model_policy && model.trim().is_empty() {
-                        return Err(model_field_rejection("Missing required model field"));
+                        return Err(model_field_rejection(INVALID_MODEL_FIELD_TITLE));
                     }
 
                     let model_lower = model.to_lowercase();
@@ -208,11 +212,14 @@ impl AiRequestGuard {
                         ));
                     }
                 }
+                // Present but wrong-typed (number/bool/array/object/null):
+                // the field exists, so report it as invalid rather than
+                // missing, sharing the title with the empty-string arm above.
                 Some(_) if self.require_model_for_model_policy => {
-                    return Err(model_field_rejection("Invalid model field"));
+                    return Err(model_field_rejection(INVALID_MODEL_FIELD_TITLE));
                 }
                 None if self.require_model_for_model_policy => {
-                    return Err(model_field_rejection("Missing required model field"));
+                    return Err(model_field_rejection(MISSING_MODEL_FIELD_TITLE));
                 }
                 _ => {}
             }
@@ -322,6 +329,16 @@ impl AiRequestGuard {
     }
 }
 
+/// Rejection title for a `model` field that is entirely absent from the body.
+const MISSING_MODEL_FIELD_TITLE: &str = "Missing required model field";
+/// Rejection title for a `model` field that is present but unusable — an empty/
+/// whitespace string or a non-string value. Both arms share this title so the
+/// "present but invalid" responses cannot drift apart.
+const INVALID_MODEL_FIELD_TITLE: &str = "Invalid model field";
+
+/// Build the rejection tuple for a `model` field that violates the required
+/// model policy. `error` is the title; the shared `details` string documents
+/// the constraint for both the missing and present-but-invalid cases.
 fn model_field_rejection(error: &'static str) -> (String, String) {
     (
         error.to_string(),

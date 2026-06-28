@@ -176,15 +176,75 @@ async fn allowed_models_requires_model() {
     let result = plugin.before_proxy(&mut non_string_ctx, &mut headers).await;
     assert_reject_error(result, 400, "Invalid model field");
 
+    // A present-but-empty/whitespace string is "present but invalid", so it
+    // reports the "Invalid model field" title (shared with the non-string arm),
+    // not "Missing required model field".
     let mut empty_ctx = make_post_ctx(&json!({"model": "", "messages": []}));
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut empty_ctx, &mut headers).await;
-    assert_reject_error(result, 400, "Missing required model field");
+    assert_reject_error(result, 400, "Invalid model field");
 
     let mut whitespace_ctx = make_post_ctx(&json!({"model": "   ", "messages": []}));
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut whitespace_ctx, &mut headers).await;
-    assert_reject_error(result, 400, "Missing required model field");
+    assert_reject_error(result, 400, "Invalid model field");
+}
+
+#[tokio::test]
+async fn default_config_rejects_empty_and_whitespace_model() {
+    // Regression guard for the `trim().is_empty()` branch: an empty or
+    // whitespace-only string `model` is present but unusable. With the default
+    // config (require_model_for_model_policy defaults to true) both must fail
+    // closed with the "Invalid model field" title — the same title the
+    // non-string arm uses — not "Missing required model field".
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o"]})).unwrap();
+
+    let mut empty_ctx = make_post_ctx(&json!({"model": "", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut empty_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Invalid model field");
+
+    let mut whitespace_ctx = make_post_ctx(&json!({"model": "   ", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut whitespace_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Invalid model field");
+
+    // A tab/newline-only string is also whitespace and must be rejected.
+    let mut ws_ctx = make_post_ctx(&json!({"model": "\t\n ", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ws_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Invalid model field");
+}
+
+#[tokio::test]
+async fn require_model_false_still_enforces_block_on_present_model() {
+    // The opt-out only relaxes the *presence* requirement. A present, valid
+    // string model that is explicitly blocked must STILL be rejected — the
+    // false path previously only had coverage for a missing model.
+    let plugin = AiRequestGuard::new(&json!({
+        "blocked_models": ["gpt-4"],
+        "require_model_for_model_policy": false
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Model not allowed");
+}
+
+#[tokio::test]
+async fn require_model_false_still_enforces_allowlist_on_present_model() {
+    // Same as above for an allowlist: a present model not on the allowed list
+    // is rejected even with the presence requirement opted out.
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4o"],
+        "require_model_for_model_policy": false
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Model not allowed");
 }
 
 #[tokio::test]
@@ -213,18 +273,10 @@ async fn explicit_require_model_for_model_policy_false_allows_missing_model() {
     assert_continue(result);
 }
 
-#[tokio::test]
-async fn explicit_require_model_for_model_policy_false_still_blocks_present_model() {
-    let plugin = AiRequestGuard::new(&json!({
-        "blocked_models": ["gpt-4"],
-        "require_model_for_model_policy": false
-    }))
-    .unwrap();
-    let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
-    let mut headers = make_post_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_reject(result, Some(400));
-}
+// The `require_model_for_model_policy: false` + present-but-blocked/unlisted
+// model cases are covered by `require_model_false_still_enforces_block_on_present_model`
+// and `require_model_false_still_enforces_allowlist_on_present_model` above,
+// which assert the exact "Model not allowed" rejection title.
 
 #[tokio::test]
 async fn test_blocked_takes_precedence_over_allowed() {
