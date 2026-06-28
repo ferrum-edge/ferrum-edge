@@ -989,6 +989,48 @@ async fn non_strict_schema_keeps_compatibility_for_unknown_json_shapes() {
     assert_continue(result);
 }
 
+#[tokio::test]
+async fn strict_auto_schema_admits_legacy_completions_body() {
+    // Default `supported_schema` is `auto`; strict mode must still admit a
+    // legacy text-completion body (`{"model", "prompt"}`) rather than reject it
+    // as an unsupported schema.
+    let plugin = AiRequestGuard::new(&json!({"strict_schema": true})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "x", "prompt": "hi"}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn strict_auto_schema_admits_tgi_text_generation_body() {
+    // TGI / HuggingFace text-generation shape (`{"inputs", "max_new_tokens"}`)
+    // must also be admitted under strict + auto.
+    let plugin = AiRequestGuard::new(&json!({"strict_schema": true})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"inputs": "hi", "max_new_tokens": 10}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn count_tool_arguments_ignores_non_tool_call_arguments_keys() {
+    // Regression guard for the arbitrary-nesting false positive: an `arguments`
+    // key outside a legitimate tool-call location (here under `metadata`) must
+    // NOT be counted toward `max_prompt_characters`, so a tiny request stays
+    // admitted even though the nested blob is far over the limit.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 20})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {
+            "arguments": "this nested arguments blob is far longer than twenty chars"
+        }
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
 // ─── Non-AI request passthrough ─────────────────────────────────────────
 
 #[tokio::test]

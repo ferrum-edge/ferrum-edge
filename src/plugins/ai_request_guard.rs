@@ -723,26 +723,48 @@ fn count_tool_definition_text(value: Option<&Value>, total: &mut u64) {
     }
 }
 
-fn count_tool_argument_fields(value: &Value, total: &mut u64) {
-    match value {
-        Value::Array(items) => {
+/// Counts assistant tool-call argument payloads, scoped to the *legitimate*
+/// tool-call locations of the supported schemas rather than any `arguments` key
+/// anywhere in the body. Walking the whole tree (the previous behavior) counted
+/// unrelated nested `arguments` keys — e.g. `metadata.arguments` or an embedded
+/// transcript under `documents` — which is the same arbitrary-nesting
+/// false-positive class the system-role scoping (`array_item_has_system_role`)
+/// deliberately avoids. Mirroring that structure, we only inspect items of the
+/// known message arrays and pull arguments from:
+///   * OpenAI Chat Completions: `messages[].tool_calls[].function.arguments`
+///   * OpenAI Responses function-call items: `input[].arguments`
+fn count_tool_argument_fields(json: &Value, total: &mut u64) {
+    for field in ["messages", "input", "contents", "chat_history"] {
+        if let Some(Value::Array(items)) = json.get(field) {
             for item in items {
-                count_tool_argument_fields(item, total);
+                count_item_tool_arguments(item, total);
             }
         }
-        Value::Object(obj) => {
-            for (key, child) in obj {
-                if key == "tools" || key == "functions" {
-                    continue;
-                }
-                if key == "arguments" {
-                    count_argument_value(child, total);
-                } else {
-                    count_tool_argument_fields(child, total);
-                }
+    }
+}
+
+fn count_item_tool_arguments(item: &Value, total: &mut u64) {
+    let Value::Object(obj) = item else {
+        return;
+    };
+
+    // OpenAI Responses function-call item: the call lives at the array-item
+    // level (`{"type": "function_call", "name": ..., "arguments": "..."}`).
+    if let Some(arguments) = obj.get("arguments") {
+        count_argument_value(arguments, total);
+    }
+
+    // OpenAI Chat Completions assistant message: tool calls are nested under
+    // `tool_calls[].function.arguments`.
+    if let Some(Value::Array(tool_calls)) = obj.get("tool_calls") {
+        for call in tool_calls {
+            if let Some(arguments) = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+            {
+                count_argument_value(arguments, total);
             }
         }
-        _ => {}
     }
 }
 
