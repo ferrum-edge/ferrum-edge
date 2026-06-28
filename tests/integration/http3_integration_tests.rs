@@ -145,6 +145,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         admin_tls_cert_path: None,
         admin_tls_key_path: None,
         admin_bind_address: "0.0.0.0".into(),
+        allow_insecure_admin_http: false,
         admin_jwt_secret: Some("test-secret".to_string()),
         db_type: None,
         db_url: None,

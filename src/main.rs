@@ -68,7 +68,7 @@ mod util;
 mod xds;
 
 use clap::Parser;
-use config::{EnvConfig, OperatingMode};
+use config::{AdminHttpExposure, EnvConfig, OperatingMode};
 use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
@@ -457,14 +457,45 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         "Proxy bind address: {}, Admin bind address: {}",
         env_config.proxy_bind_address, env_config.admin_bind_address
     );
-    if admin_bind_requires_cidr_warning(
-        &env_config.admin_bind_address,
-        &env_config.admin_allowed_cidrs,
-    ) {
-        warn!(
-            "Admin API is bound to {} with no FERRUM_ADMIN_ALLOWED_CIDRS; ensure the admin listener is not publicly reachable",
-            env_config.admin_bind_address
-        );
+    // Surface the plaintext admin HTTP listener's network exposure. The
+    // unsafe writable-mode case (database/cp, public, no allowlist, no opt-in)
+    // already aborted in `EnvConfig::validate()`; the warnings below cover the
+    // remaining live postures (allowlisted, read-only modes, or the explicit
+    // dev escape hatch).
+    match env_config.admin_http_exposure() {
+        AdminHttpExposure::Disabled | AdminHttpExposure::LoopbackOrPrivate => {}
+        AdminHttpExposure::PublicAllowlisted => {
+            warn!(
+                "Admin API plaintext HTTP listener (FERRUM_ADMIN_HTTP_PORT={}) is bound to {} \
+                 (reachable beyond loopback). FERRUM_ADMIN_ALLOWED_CIDRS restricts which source \
+                 IPs may connect, but operator bearer tokens still traverse cleartext on this \
+                 port. Prefer admin over TLS (FERRUM_ADMIN_TLS_CERT_PATH / \
+                 FERRUM_ADMIN_TLS_KEY_PATH) and disable plaintext with FERRUM_ADMIN_HTTP_PORT=0.",
+                env_config.admin_http_port, env_config.admin_bind_address
+            );
+        }
+        AdminHttpExposure::PublicUnrestricted => {
+            // database/cp only reach here with FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true
+            // (otherwise `validate()` already aborted startup). Read-only admin
+            // modes (file/dp/mesh) are warned but allowed to start.
+            if env_config.allow_insecure_admin_http {
+                warn!(
+                    "FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true: the plaintext admin HTTP listener is \
+                     bound to {} with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist — the admin API and \
+                     operator bearer tokens are exposed in cleartext on every matching interface. \
+                     Development only; never use this in production.",
+                    env_config.admin_bind_address
+                );
+            } else {
+                warn!(
+                    "Admin API plaintext HTTP listener is bound to {} with no \
+                     FERRUM_ADMIN_ALLOWED_CIDRS allowlist; ensure it is not publicly reachable. \
+                     Prefer FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1, an allowlist, or admin TLS with \
+                     FERRUM_ADMIN_HTTP_PORT=0.",
+                    env_config.admin_bind_address
+                );
+            }
+        }
     }
 
     // Detect IPv6 dual-stack support and log a hint if listeners are IPv4-only
@@ -562,60 +593,4 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     });
 
     gateway_exit_code
-}
-
-fn admin_bind_requires_cidr_warning(admin_bind_address: &str, admin_allowed_cidrs: &str) -> bool {
-    if !admin_allowed_cidrs.trim().is_empty() {
-        return false;
-    }
-
-    admin_bind_address
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| admin_bind_may_be_publicly_reachable(&ip))
-}
-
-fn admin_bind_may_be_publicly_reachable(ip: &std::net::IpAddr) -> bool {
-    if ip.is_unspecified() {
-        return true;
-    }
-
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            !(ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || octets[0] == 0
-                || (octets[0] == 100 && (octets[1] & 0xC0) == 64))
-        }
-        std::net::IpAddr::V6(ip) => {
-            !(ip.is_loopback()
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-                || (ip.segments()[0] & 0xfe00) == 0xfc00)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::admin_bind_requires_cidr_warning;
-
-    #[test]
-    fn admin_bind_warning_covers_unspecified_and_public_addresses() {
-        assert!(admin_bind_requires_cidr_warning("0.0.0.0", ""));
-        assert!(admin_bind_requires_cidr_warning("::", ""));
-        assert!(admin_bind_requires_cidr_warning("8.8.8.8", ""));
-        assert!(admin_bind_requires_cidr_warning("2001:4860:4860::8888", ""));
-    }
-
-    #[test]
-    fn admin_bind_warning_ignores_private_local_and_guarded_addresses() {
-        assert!(!admin_bind_requires_cidr_warning("127.0.0.1", ""));
-        assert!(!admin_bind_requires_cidr_warning("10.0.0.10", ""));
-        assert!(!admin_bind_requires_cidr_warning("192.168.1.10", ""));
-        assert!(!admin_bind_requires_cidr_warning("169.254.1.10", ""));
-        assert!(!admin_bind_requires_cidr_warning("::1", ""));
-        assert!(!admin_bind_requires_cidr_warning("fd00::10", ""));
-        assert!(!admin_bind_requires_cidr_warning("8.8.8.8", "10.0.0.0/8"));
-    }
 }

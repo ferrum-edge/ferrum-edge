@@ -550,8 +550,26 @@ pub struct EnvConfig {
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
     /// Bind address for Admin API listeners (HTTP, HTTPS).
-    /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
+    ///
+    /// Default: `127.0.0.1` (loopback) — the admin API is a management plane and
+    /// is safe-by-default, NOT exposed on the network. Set to `0.0.0.0` (or a
+    /// specific address, or `::` for dual-stack) to expose it, but in the
+    /// writable `database`/`cp` modes a public plaintext bind also requires an
+    /// allowlist, TLS, or the `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` opt-in — see
+    /// [`EnvConfig::admin_insecure_plaintext_startup_error`]. The proxy data
+    /// plane (`FERRUM_PROXY_BIND_ADDRESS`) still defaults to `0.0.0.0`.
     pub admin_bind_address: String,
+
+    /// Dev-only escape hatch: allow the plaintext admin HTTP listener to bind a
+    /// publicly reachable address (e.g. `0.0.0.0`) with no
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist in the writable `database`/`cp`
+    /// modes. Without this, such a posture is a hard startup error (see
+    /// [`EnvConfig::admin_insecure_plaintext_startup_error`]) because the
+    /// writable admin API and operator bearer tokens would be exposed in
+    /// cleartext on all matching interfaces. Default: `false`. Never enable in
+    /// production — bind to loopback, set an allowlist, or serve admin over TLS
+    /// instead.
+    pub allow_insecure_admin_http: bool,
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
@@ -1681,6 +1699,32 @@ pub struct EnvConfig {
     pub so_busy_poll_us: u32,
 }
 
+/// Network-exposure classification of the gateway's **plaintext** admin HTTP
+/// listener (`FERRUM_ADMIN_HTTP_PORT`).
+///
+/// Used to gate startup (writable `database`/`cp` modes hard-fail on
+/// [`AdminHttpExposure::PublicUnrestricted`] unless
+/// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`) and to emit graded startup
+/// warnings. The admin HTTPS listener is a separate port and does not affect
+/// this classification — to serve admin TLS-only, disable plaintext with
+/// `FERRUM_ADMIN_HTTP_PORT=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminHttpExposure {
+    /// `FERRUM_ADMIN_HTTP_PORT=0` — no plaintext admin listener.
+    Disabled,
+    /// Bound to a loopback / private / link-local address — not reachable from
+    /// outside the host or local segment.
+    LoopbackOrPrivate,
+    /// Bound to a publicly reachable address (incl. `0.0.0.0` / `::`) but
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` restricts which source IPs may connect.
+    /// Bearer tokens still traverse cleartext on this port.
+    PublicAllowlisted,
+    /// Bound to a publicly reachable address with no allowlist — the admin API
+    /// and any bearer tokens are exposed in cleartext on every matching
+    /// interface.
+    PublicUnrestricted,
+}
+
 impl Default for EnvConfig {
     fn default() -> Self {
         Self {
@@ -1712,7 +1756,8 @@ impl Default for EnvConfig {
             admin_https_port: 9443,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
-            admin_bind_address: "0.0.0.0".into(),
+            admin_bind_address: "127.0.0.1".into(),
+            allow_insecure_admin_http: false,
             admin_jwt_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
@@ -2039,7 +2084,8 @@ impl EnvConfig {
             admin_https_port: u16 = "FERRUM_ADMIN_HTTPS_PORT" => 9443u16;
             admin_tls_cert_path: Option<String> = "FERRUM_ADMIN_TLS_CERT_PATH";
             admin_tls_key_path: Option<String> = "FERRUM_ADMIN_TLS_KEY_PATH";
-            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "0.0.0.0".to_string();
+            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "127.0.0.1".to_string();
+            allow_insecure_admin_http: bool = "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" => false;
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
                 => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
@@ -2701,6 +2747,7 @@ impl EnvConfig {
             admin_tls_cert_path,
             admin_tls_key_path,
             admin_bind_address,
+            allow_insecure_admin_http,
             admin_jwt_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
@@ -3002,6 +3049,96 @@ impl EnvConfig {
             .parse()
             .expect("admin_bind_address validated at config load");
         std::net::SocketAddr::new(ip, port)
+    }
+
+    /// Whether `ip` could be reachable from outside the host — i.e. NOT
+    /// loopback, RFC1918 private, link-local, CGNAT, or other non-routable
+    /// space. The unspecified addresses `0.0.0.0` / `::` ("bind all
+    /// interfaces") count as publicly reachable.
+    pub(crate) fn admin_bind_may_be_publicly_reachable(ip: &std::net::IpAddr) -> bool {
+        if ip.is_unspecified() {
+            return true;
+        }
+        match ip {
+            std::net::IpAddr::V4(ip) => {
+                let octets = ip.octets();
+                !(ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || octets[0] == 0
+                    || (octets[0] == 100 && (octets[1] & 0xC0) == 64))
+            }
+            std::net::IpAddr::V6(ip) => {
+                !(ip.is_loopback()
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80
+                    || (ip.segments()[0] & 0xfe00) == 0xfc00)
+            }
+        }
+    }
+
+    /// Classify the network exposure of the **plaintext** admin HTTP listener
+    /// (`FERRUM_ADMIN_HTTP_PORT`). This is independent of whether an admin
+    /// HTTPS listener is also configured: a TLS listener on the HTTPS port does
+    /// not protect the separate plaintext HTTP port. To run admin TLS-only, set
+    /// `FERRUM_ADMIN_HTTP_PORT=0`.
+    pub fn admin_http_exposure(&self) -> AdminHttpExposure {
+        if self.admin_http_port == 0 {
+            return AdminHttpExposure::Disabled;
+        }
+        // An unparseable bind address is rejected separately in `validate()`;
+        // treat it as non-exposing here so this method never panics.
+        let Ok(ip) = self.admin_bind_address.parse::<std::net::IpAddr>() else {
+            return AdminHttpExposure::LoopbackOrPrivate;
+        };
+        if !Self::admin_bind_may_be_publicly_reachable(&ip) {
+            return AdminHttpExposure::LoopbackOrPrivate;
+        }
+        if self.admin_allowed_cidrs.trim().is_empty() {
+            AdminHttpExposure::PublicUnrestricted
+        } else {
+            AdminHttpExposure::PublicAllowlisted
+        }
+    }
+
+    /// Hard-fail guard for the writable admin API. Returns `Some(error)` when a
+    /// `database`/`cp`-mode gateway would start a plaintext admin HTTP listener
+    /// reachable beyond loopback with no `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist
+    /// and without the explicit `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
+    ///
+    /// Read-only admin modes (`file`/`dp`/`mesh`) are not gated here — they get
+    /// a high-severity startup warning instead (see `main.rs`). The node-agent
+    /// admin listener has its own safe-by-default loopback fallback.
+    ///
+    /// Pure (reads only `self`), so it is unit-testable without touching the
+    /// process environment.
+    pub fn admin_insecure_plaintext_startup_error(&self) -> Option<String> {
+        if !matches!(
+            self.mode,
+            OperatingMode::Database | OperatingMode::ControlPlane
+        ) {
+            return None;
+        }
+        if self.admin_http_exposure() != AdminHttpExposure::PublicUnrestricted {
+            return None;
+        }
+        if self.allow_insecure_admin_http {
+            return None;
+        }
+        Some(format!(
+            "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
+             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', which is reachable beyond \
+             loopback, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The writable admin API \
+             and any operator bearer tokens would be served in cleartext on every matching \
+             interface. Choose one: \
+             (1) bind admin to loopback — FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1; \
+             (2) restrict callers — FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>; \
+             (3) serve admin over TLS and disable plaintext — set FERRUM_ADMIN_TLS_CERT_PATH \
+             and FERRUM_ADMIN_TLS_KEY_PATH, then FERRUM_ADMIN_HTTP_PORT=0; \
+             or (4) for local development only — FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true.",
+            mode = self.mode,
+            port = self.admin_http_port,
+            bind = self.admin_bind_address,
+        ))
     }
 
     /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
@@ -3834,6 +3971,19 @@ impl EnvConfig {
                 "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
                 self.admin_bind_address
             ));
+        }
+
+        // Safe-by-default management plane. The admin bind defaults to loopback,
+        // so a fresh startup is never exposed. This guard catches the case where
+        // an operator has EXPLICITLY moved the writable (`database`/`cp`) admin
+        // API to a publicly reachable plaintext bind with no IP allowlist:
+        // refuse to start unless they opt in via FERRUM_ALLOW_INSECURE_ADMIN_HTTP,
+        // because the writable admin API and operator bearer tokens would be
+        // served in cleartext on all matching interfaces. Read-only modes
+        // (file/dp/mesh) are warned (not failed) in main.rs; node-agent has its
+        // own loopback fallback.
+        if let Some(err) = self.admin_insecure_plaintext_startup_error() {
+            return Err(err);
         }
 
         // Validate global backend TLS cert/key files exist and are parseable

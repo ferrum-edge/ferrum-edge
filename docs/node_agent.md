@@ -334,7 +334,7 @@ The Helm chart sets `nodeAgent.admin.port` to `19090` by default. The binary def
 - `FERRUM_ADMIN_BIND_ADDRESS` is set explicitly (any value, including `0.0.0.0` if intentional), or
 - `FERRUM_ADMIN_ALLOWED_CIDRS` is set to a non-empty allowlist.
 
-`FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. If either bind signal is set, the configured `FERRUM_ADMIN_BIND_ADDRESS` (default `0.0.0.0`) is honored as-is. When the loopback fallback engages, the gateway emits a `warn!` at startup pointing at the two escape hatches. For node-agent deployments scraped over the cluster network, prefer either an explicit `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist or front the listener with a local sidecar scraper bound to loopback.
+`FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. If either bind signal is set, the configured `FERRUM_ADMIN_BIND_ADDRESS` (which itself defaults to loopback `127.0.0.1`) is honored as-is. When the loopback fallback engages, the gateway emits a `warn!` at startup pointing at the two escape hatches. For node-agent deployments scraped over the cluster network, prefer either an explicit `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist or front the listener with a local sidecar scraper bound to loopback.
 
 When ambient NodeWaypoint and the node agent run on the same host-network nodes, their admin listeners must use distinct `FERRUM_ADMIN_HTTP_PORT` values or one listener must be disabled with port `0`. The Helm chart rejects equal host-network admin ports because Kubernetes can otherwise mark pods Ready even though one Ferrum process failed to bind its admin listener.
 
