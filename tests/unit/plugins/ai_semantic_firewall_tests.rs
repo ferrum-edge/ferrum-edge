@@ -714,6 +714,36 @@ async fn default_response_rules_stream_true_does_not_bypass_in_strict_mode() {
 }
 
 #[tokio::test]
+async fn dry_run_response_rules_stream_true_uses_skip_default() {
+    let mut config = config_with_builtin("response_leakage");
+    config["inspect"] = json!({"request": false, "response": true});
+    config["mode"] = json!("dry_run");
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection_skipped")
+            .map(String::as_str),
+        Some("streaming")
+    );
+}
+
+#[tokio::test]
 async fn response_leakage_is_blocked() {
     let mut config = config_with_builtin("response_leakage");
     config["inspect"] = json!({"request": false, "response": true});

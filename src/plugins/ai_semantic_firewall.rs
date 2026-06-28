@@ -1465,18 +1465,11 @@ impl Plugin for AiSemanticFirewall {
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.enabled
             && ((self.inspect_request && self.has_request_rules)
-                // A non-`skip` streaming policy must read the request body to
-                // detect `stream: true` and act on it (reject, or force the
-                // response to buffer), even for response-only policies (which
-                // otherwise do not buffer the request body).
-                || (self.streaming_response != StreamingResponsePolicy::Skip
-                    && self.inspect_response
-                    && self.has_response_rules)
-                // An explicit `skip` is a production opt-out from response-side
-                // stream enforcement. Read the request body so stream:true skips
-                // are visible in audit metadata instead of silently passing.
-                || (self.streaming_response == StreamingResponsePolicy::Skip
-                    && self.audit_streaming_skip
+                // Response-side stream policies must read the request body to
+                // detect `stream: true`: non-skip policies act on it, while an
+                // explicit skip is audited as a production opt-out.
+                || ((self.streaming_response != StreamingResponsePolicy::Skip
+                    || self.audit_streaming_skip)
                     && self.inspect_response
                     && self.has_response_rules))
     }
