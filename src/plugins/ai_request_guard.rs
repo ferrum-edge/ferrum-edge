@@ -348,6 +348,15 @@ impl AiRequestGuard {
     /// request body from `before_proxy` to `on_final_request_body`. Exposed so
     /// callers (and tests) can observe or simulate the deferral for this exact
     /// instance; two instances always return distinct keys.
+    ///
+    /// Only the external test crate (`tests/unit/plugins/ai_request_guard_tests.rs`)
+    /// calls this — production code reads `self.deferred_compressed_marker`
+    /// directly in `before_proxy` / `on_final_request_body`. The binary crate
+    /// only ever uses `AiRequestGuard` as a `dyn Plugin`, so its dead-code pass
+    /// (which can't see the separate test crate) would otherwise flag this
+    /// accessor. `#[allow(dead_code)]` mirrors the established pattern for
+    /// test-only `pub(crate)` accessors elsewhere in `src/plugins/`.
+    #[allow(dead_code)]
     pub fn deferred_compressed_marker_key(&self) -> &str {
         &self.deferred_compressed_marker
     }
