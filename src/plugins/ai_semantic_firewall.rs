@@ -86,6 +86,14 @@ const STREAMING_WINDOWED_MARKER: &str = "streaming_windowed";
 /// request path; read on the response path.
 const STREAM_BUFFER_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_buffer_requested";
 const STREAM_INSPECT_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_inspect_requested";
+/// Set on the request path when `skip` mode detects a `stream: true` JSON POST
+/// while response inspection is active. `skip` is a fail-open opt-out for the
+/// genuinely STREAMED (SSE) response only: a backend that ignores the flag and
+/// returns a normal JSON response must still be inspected. The marker lets the
+/// pre-header buffering decision keep buffering by default (so content-type
+/// refinement runs) and is consulted on the response path to downgrade ONLY an
+/// `text/event-stream` body back to the uninspected streaming path.
+const STREAM_SKIP_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_skip_requested";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -789,11 +797,14 @@ impl FirewallEngine {
         segments: &[TextSegment],
         plugin_http_call_ns: &AtomicU64,
     ) -> Result<Vec<RuleMatch>, String> {
-        let index = self
-            .rule_embedding_index(provider, plugin_http_call_ns)
-            .await?;
+        // Filter candidate segments BEFORE touching the provider. A request whose
+        // extracted segments have no active semantic rule for this direction (e.g.
+        // a `prompt_injection`-only config that never targets a `ToolDefinition`
+        // segment) has nothing to evaluate, so there is no reason to build the rule
+        // embedding index or embed inputs. This also avoids failing such a request
+        // under `on_error: reject` when the provider is down — no active rule could
+        // have matched the segment anyway.
         let mut candidate_segments = Vec::new();
-
         for segment in segments {
             if segment.direction != direction || segment.text.trim().is_empty() {
                 continue;
@@ -806,6 +817,10 @@ impl FirewallEngine {
         if candidate_segments.is_empty() {
             return Ok(Vec::new());
         }
+
+        let index = self
+            .rule_embedding_index(provider, plugin_http_call_ns)
+            .await?;
 
         let segment_inputs: Vec<String> = candidate_segments
             .iter()
@@ -1564,8 +1579,35 @@ impl Plugin for AiSemanticFirewall {
                         headers: json_headers(),
                     };
                 }
-                // Explicit `skip`, `reject` in dry-run, or no response rules: the
-                // streamed response is not inspected. Record the skip for audit.
+                // EXPLICIT `skip` with response rules active: fail-open opt-out for
+                // the genuinely STREAMED (SSE) response only. Do NOT force the
+                // response onto the streaming path with `ai_request_streaming` — a
+                // backend that ignores `stream: true` and returns a normal JSON
+                // response must still be inspected. Set the skip marker so the
+                // pre-header buffering decision keeps buffering by default;
+                // content-type refinement then downgrades ONLY an
+                // `text/event-stream` body back to the uninspected streaming path
+                // (see `should_buffer_response_body_for_content_type`). The audit
+                // marker records the intended skip for an SSE response.
+                //
+                // Gated on `audit_streaming_skip` (the operator explicitly chose
+                // `skip`) so the implicit `Skip` default — only reached in dry-run
+                // or request-only configs, where the request body is not buffered
+                // and `requires_request_body_before_before_proxy()` is false — keeps
+                // its existing `_`-arm behavior below.
+                StreamingResponsePolicy::Skip
+                    if response_inspectable && self.audit_streaming_skip =>
+                {
+                    ctx.metadata
+                        .insert(STREAM_SKIP_REQUESTED_KEY.to_string(), "true".to_string());
+                    ctx.metadata.insert(
+                        "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                        "streaming".to_string(),
+                    );
+                }
+                // Implicit `skip` default, `reject` in dry-run, or no response
+                // rules: the streamed response is not inspected. Record the skip
+                // for audit.
                 _ => {
                     ctx.metadata
                         .insert("ai_request_streaming".to_string(), "true".to_string());
@@ -1638,7 +1680,16 @@ impl Plugin for AiSemanticFirewall {
         // response then stays buffered and is inspected by `on_response_body`
         // instead of streaming past every check. (Setting `ai_request_streaming`
         // alone is NOT enough — `refine` never upgrades stream→buffer.)
-        if buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx) {
+        //
+        // `skip` mode buffers by default too: the opt-out only bypasses a
+        // genuinely streamed (SSE) response, so the pre-header decision must keep
+        // buffering and let content-type refinement downgrade ONLY the SSE body
+        // back to the uninspected streaming path. A backend that returns JSON
+        // despite `stream: true` is still inspected.
+        if buffer_streaming_marker_set(ctx)
+            || windowed_streaming_marker_set(ctx)
+            || skip_streaming_marker_set(ctx)
+        {
             return true;
         }
         ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
@@ -1667,6 +1718,8 @@ impl Plugin for AiSemanticFirewall {
             // stream — must keep streaming; buffering it would collect until
             // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
             // event stream stays streaming too (the windowed inspector handles it).
+            // A `skip`-marked event stream is the fail-open opt-out's target: it
+            // also keeps streaming (downgrade back to the uninspected path).
             // (Already-buffered bodies are still inspected in `on_response_body`.)
             return self.streaming_response == StreamingResponsePolicy::Buffer
                 && buffer_streaming_marker_set(ctx);
@@ -1678,8 +1731,10 @@ impl Plugin for AiSemanticFirewall {
             // MUST be buffered and inspected via `on_response_body`. Otherwise the
             // `ai_request_streaming` flag keeps it on the streaming path with no
             // windowed inspector (which only attaches for event streams), so
-            // response rules would be bypassed entirely.
-            if windowed_streaming_marker_set(ctx) {
+            // response rules would be bypassed entirely. The same applies to a
+            // `skip`-marked request: skip only opts out of a genuinely streamed
+            // (SSE) response, so a JSON response is still inspected.
+            if windowed_streaming_marker_set(ctx) || skip_streaming_marker_set(ctx) {
                 return true;
             }
             return self.should_buffer_response_body(ctx);
@@ -4095,6 +4150,18 @@ fn buffer_streaming_marker_set(ctx: &RequestContext) -> bool {
 fn windowed_streaming_marker_set(ctx: &RequestContext) -> bool {
     ctx.metadata
         .get(STREAM_INSPECT_REQUESTED_KEY)
+        .map(String::as_str)
+        == Some("true")
+}
+
+/// Whether `skip` mode flagged THIS request (a detected `stream: true` JSON POST
+/// with response inspection active) — see [`STREAM_SKIP_REQUESTED_KEY`]. The skip
+/// opt-out only bypasses a genuinely streamed (SSE) response, so the response
+/// keeps buffering by default and only an `text/event-stream` body is later
+/// downgraded back to the uninspected streaming path.
+fn skip_streaming_marker_set(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get(STREAM_SKIP_REQUESTED_KEY)
         .map(String::as_str)
         == Some("true")
 }

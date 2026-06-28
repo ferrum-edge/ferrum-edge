@@ -1479,8 +1479,12 @@ async fn streaming_response_reject_blocks_stream_requests() {
 
 #[tokio::test]
 async fn streaming_response_skip_records_audit_and_is_explicit_opt_in() {
-    // `skip` is an explicit fail-open opt-out: the stream passes uninspected,
-    // but the skip is recorded for audit and the shared ai_request_streaming flag is set.
+    // `skip` is an explicit fail-open opt-out for a genuinely STREAMED (SSE)
+    // response only: the SSE stream passes uninspected and the skip is recorded
+    // for audit. It must NOT set the shared `ai_request_streaming` flag, because
+    // that flag would also disable inspection of a NON-streaming JSON response
+    // that the backend returns despite `stream: true` (see the JSON assertion
+    // below). Instead it sets a dedicated skip marker.
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "skip",
@@ -1504,10 +1508,28 @@ async fn streaming_response_skip_records_audit_and_is_explicit_opt_in() {
             .map(String::as_str),
         Some("streaming")
     );
-    assert_eq!(
-        ctx.metadata.get("ai_request_streaming").map(String::as_str),
-        Some("true")
+    // Explicit skip must not pin the response onto the uninspected streaming path
+    // via the shared flag — JSON responses still need inspection.
+    assert!(
+        !ctx.metadata.contains_key("ai_request_streaming"),
+        "explicit skip must not set ai_request_streaming (would bypass JSON response inspection)"
     );
+
+    // A genuinely streamed (SSE) response is left streaming = the opt-out target.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+    // But a JSON response (backend ignored `stream: true`) is still buffered and
+    // inspected — the skip opt-out only bypasses genuinely streamed responses.
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[tokio::test]
