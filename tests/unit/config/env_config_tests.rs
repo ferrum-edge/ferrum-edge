@@ -2289,7 +2289,8 @@ fn test_env_config_websocket_idle_timeout_seconds_default() {
         || {
             remove_var("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.websocket_idle_timeout_seconds, 0);
+            // Safe production default: bound idle WebSocket lifetime to 5 minutes.
+            assert_eq!(config.websocket_idle_timeout_seconds, 300);
         },
     );
 }

@@ -140,6 +140,9 @@ pub const MAX_HEALTH_CHECK_INTERVAL: u64 = 3600;
 pub const MAX_UDP_IDLE_TIMEOUT: u64 = 3600;
 /// Maximum TCP idle timeout in seconds (24 hours).
 pub const MAX_TCP_IDLE_TIMEOUT: u64 = 86_400;
+/// Maximum WebSocket idle timeout in seconds (24 hours). WebSocket sessions are
+/// long-lived streams, so the ceiling matches TCP rather than the 1-hour pool cap.
+pub const MAX_WEBSOCKET_IDLE_TIMEOUT: u64 = 86_400;
 /// Maximum pool idle timeout in seconds (1 hour).
 pub const MAX_POOL_IDLE_TIMEOUT: u64 = 3600;
 /// Maximum DNS cache TTL in seconds (24 hours).
@@ -2016,6 +2019,17 @@ pub struct Proxy {
     /// (default: 300s / 5 min). Set to 0 to disable (rely on OS TCP timeouts only).
     #[serde(default)]
     pub tcp_idle_timeout_seconds: Option<u64>,
+    /// WebSocket relay idle timeout in seconds for upgraded sessions on this
+    /// proxy. After this duration with no activity in EITHER direction (frames,
+    /// including Ping/Pong, or transport bytes), the session is closed. Applies
+    /// to both the frame-parsed relay and the raw tunnel-mode relay, and to
+    /// H1/H2/H3 frontends.
+    /// Per-proxy override; when `None`, uses the global
+    /// `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300s / 5 min).
+    /// Set to `0` to disable for this proxy (idle sessions live forever, bounded
+    /// only by `FERRUM_WEBSOCKET_MAX_CONNECTIONS`).
+    #[serde(default)]
+    pub websocket_idle_timeout_seconds: Option<u64>,
     /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
     /// When `None` (default), all methods are allowed. When `Some`, requests
     /// with methods not in the list receive 405 Method Not Allowed.
@@ -4194,6 +4208,16 @@ impl Proxy {
         }
     }
 
+    /// Effective WebSocket relay idle timeout in seconds for this proxy: the
+    /// per-proxy override when set, otherwise the global default
+    /// (`FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS`). `0` means disabled. Mirrors the
+    /// `tcp_idle_timeout_seconds.unwrap_or(global)` resolution used by the TCP relay.
+    #[inline]
+    pub fn effective_websocket_idle_timeout_seconds(&self, global_default: u64) -> u64 {
+        self.websocket_idle_timeout_seconds
+            .unwrap_or(global_default)
+    }
+
     /// Whether the reqwest-backed HTTP backend client for this (effective)
     /// proxy must be restricted to HTTP/1.1 on the wire — i.e. the
     /// DestinationRule `connectionPool.http.h2UpgradePolicy` resolved to
@@ -4513,6 +4537,16 @@ impl Proxy {
             errors.push(format!(
                 "tcp_idle_timeout_seconds must be between 0 and {} (got {})",
                 MAX_TCP_IDLE_TIMEOUT, v
+            ));
+        }
+
+        // WebSocket idle timeout (0 means disabled, so only reject values above the max)
+        if let Some(v) = self.websocket_idle_timeout_seconds
+            && v > MAX_WEBSOCKET_IDLE_TIMEOUT
+        {
+            errors.push(format!(
+                "websocket_idle_timeout_seconds must be between 0 and {} (got {})",
+                MAX_WEBSOCKET_IDLE_TIMEOUT, v
             ));
         }
 

@@ -5860,6 +5860,21 @@ components:
             in either direction, the connection is closed. When omitted, uses the global
             FERRUM_TCP_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to disable.
             Only applicable for tcp/tcp_tls protocols.
+        websocket_idle_timeout_seconds:
+          type: integer
+          format: uint64
+          nullable: true
+          minimum: 0
+          maximum: 86400
+          description: |
+            WebSocket relay idle timeout in seconds for upgraded sessions on this proxy
+            (HTTP-family proxies; applies to H1/H2/H3 frontends and both the frame-parsed
+            and tunnel-mode relays). The session closes only when neither direction
+            produces activity (frames, including Ping/Pong, or transport bytes) within the
+            window; activity from either side keeps it open. When omitted, uses the global
+            FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to
+            disable for this proxy (idle sessions then live forever, bounded only by
+            FERRUM_WEBSOCKET_MAX_CONNECTIONS). Maximum 86400 (24h).
         udp_idle_timeout_seconds:
           type: integer
           format: uint64

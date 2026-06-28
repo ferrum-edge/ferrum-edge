@@ -604,7 +604,9 @@ pub(crate) async fn handle_h3_websocket(
     // under the client framer by `run_websocket_proxy`. `None` disables the
     // idle bound entirely.
     let ws_idle_tracker = crate::proxy::WsIdleTracker::from_timeout_seconds(
-        state.env_config.websocket_idle_timeout_seconds,
+        proxy.effective_websocket_idle_timeout_seconds(
+            state.env_config.websocket_idle_timeout_seconds,
+        ),
     );
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (the inline relay below, until this function returns),

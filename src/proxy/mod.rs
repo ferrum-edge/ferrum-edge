@@ -1185,6 +1185,52 @@ fn warn_if_h3_backend_tls_policy_incompatible(
     }
 }
 
+/// Warn at startup/reload when WebSocket sessions on HTTP-family proxies have no
+/// idle bound. An upgraded WebSocket holds a dedicated backend connection plus a
+/// `websocket_max_connections` slot for its entire lifetime; with the idle
+/// timeout disabled, a silent (non-heartbeating) client can hoard that slot
+/// indefinitely. Activity from either direction — including Ping/Pong — refreshes
+/// the timer, so the disabled state is the only resource-hoarding exposure.
+///
+/// The effective timeout is the per-proxy `websocket_idle_timeout_seconds`
+/// override when set, else the global `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS`.
+/// `0` means disabled. This fires only when an operator has explicitly opted out
+/// (the global default is 300s), so the warning maps one-to-one to a deliberate
+/// opt-out rather than spamming default deployments.
+fn warn_if_websocket_idle_disabled(config: &GatewayConfig, global_ws_idle_timeout_seconds: u64) {
+    let disabled_proxy_ids: Vec<&str> = config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            matches!(
+                proxy.dispatch_kind,
+                DispatchKind::HttpPool | DispatchKind::HttpsPool
+            ) && proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds) == 0
+        })
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    if disabled_proxy_ids.is_empty() {
+        return;
+    }
+
+    let sample = disabled_proxy_ids
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        ws_idle_disabled_proxy_count = disabled_proxy_ids.len(),
+        ws_idle_disabled_proxy_sample = %sample,
+        global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
+        "WebSocket idle timeout is disabled (0) for one or more HTTP-family proxies. \
+         Idle upgraded WebSocket sessions will hold a backend connection and a \
+         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot indefinitely (resource-hoarding risk). \
+         Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
+         websocket_idle_timeout_seconds to a non-zero value to bound idle lifetime."
+    );
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -4047,6 +4093,7 @@ impl ProxyState {
         } else {
             None
         };
+        warn_if_websocket_idle_disabled(&config, env_config.websocket_idle_timeout_seconds);
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
@@ -7354,7 +7401,9 @@ async fn handle_websocket_request_authenticated(
     // under the client framer by `run_websocket_proxy`. `None` disables the
     // idle bound entirely.
     let ws_idle_tracker =
-        WsIdleTracker::from_timeout_seconds(state.env_config.websocket_idle_timeout_seconds);
+        WsIdleTracker::from_timeout_seconds(proxy.effective_websocket_idle_timeout_seconds(
+            state.env_config.websocket_idle_timeout_seconds,
+        ));
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (moved into the spawned task), so this guard's slot is
     // released exactly when the dedicated backend connection closes. Captured
@@ -23638,6 +23687,40 @@ mod tests {
         assert_eq!(
             websocket_dns_resolution_host(&proxy, None),
             "static.example.com"
+        );
+    }
+
+    #[test]
+    fn ws_idle_tracker_from_timeout_seconds_disabled_when_zero() {
+        // 0 must produce no tracker (idle bound disabled).
+        assert!(WsIdleTracker::from_timeout_seconds(0).is_none());
+    }
+
+    #[test]
+    fn ws_idle_tracker_from_timeout_seconds_builds_tracker_when_nonzero() {
+        let tracker = WsIdleTracker::from_timeout_seconds(300)
+            .expect("non-zero timeout must build a tracker");
+        assert_eq!(tracker.timeout, Duration::from_secs(300));
+        // A fresh tracker has its full window remaining.
+        assert!(tracker.remaining().is_some());
+    }
+
+    #[tokio::test]
+    async fn next_websocket_message_no_tracker_never_times_out() {
+        // Disabled idle bound: a pending (silent) stream must park forever, not
+        // resolve to IdleTimeout. We assert it does not complete within a window
+        // that would have elapsed several times over for a 5ms tracker.
+        let mut stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            next_websocket_message(&mut stream, None),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "with idle timeout disabled (None), next_websocket_message must never resolve on a silent stream"
         );
     }
 
