@@ -520,6 +520,23 @@ async fn default_max_tokens_not_injected_when_tgi_already_caps_output() {
 }
 
 #[tokio::test]
+async fn default_max_tokens_not_injected_when_responses_caps_max_output_tokens() {
+    // A Responses-style body (`{"input", "max_output_tokens"}`) routes to the
+    // top-level target. `max_output_tokens` is already the real cap for that
+    // family, so the guard must NOT add a separate (redundant/conflicting)
+    // top-level `max_tokens`.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let body = serde_json::to_vec(&json!({"input": "hi", "max_output_tokens": 16})).unwrap();
+    let result = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await;
+    assert!(
+        result.is_none(),
+        "existing max_output_tokens cap must suppress default max_tokens injection"
+    );
+}
+
+#[tokio::test]
 async fn test_default_max_tokens_injected() {
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     assert!(plugin.modifies_request_body());
@@ -873,6 +890,88 @@ async fn max_prompt_characters_counts_responses_function_call_output() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_titan_input_text_field() {
+    // Amazon Titan text-generation prompts live in top-level `inputText`; the
+    // prompt-character cap must count them so a large prompt cannot bypass the
+    // limit (the body is admitted by `looks_like_legacy_completions`).
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "inputText": "this Titan prompt is well over ten characters",
+        "textGenerationConfig": {"maxTokenCount": 16}
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+
+    // A short `inputText` prompt under the cap still passes.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"inputText": "hi"}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_provider_native_tool_arguments() {
+    // Provider-native tool-call argument payloads must count toward the prompt
+    // budget: Anthropic/Bedrock `messages[].content[]` `tool_use` blocks carry
+    // them in `input`, and Gemini `contents[].parts[]` carry them in
+    // `functionCall.args`. A short visible prompt plus a huge tool-arg payload
+    // must trip the cap.
+    for body in [
+        // Anthropic / Bedrock content-block tool_use.
+        json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {"query": "this provider-native tool argument is far too long"}
+                }]
+            }]
+        }),
+        // Gemini functionCall part.
+        json!({
+            "contents": [{
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "name": "lookup",
+                        "args": {"query": "this gemini tool argument is far too long"}
+                    }
+                }]
+            }]
+        }),
+    ] {
+        let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 20})).unwrap();
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+
+    // A provider-native tool-call whose arguments stay under the cap passes.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 50})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "claude-3-5-sonnet",
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {"q": "hi"}
+            }]
+        }]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 #[tokio::test]
@@ -1231,6 +1330,74 @@ async fn strict_auto_schema_admits_tgi_text_generation_body() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn strict_schema_admits_titan_text_generation_body() {
+    // Amazon Titan text-generation shape (`{"inputText", "textGenerationConfig"}`)
+    // must be admitted under both strict + auto and strict + provider_native, so
+    // the documented `textGenerationConfig.maxTokenCount` reject/clamp logic can
+    // run instead of the body being rejected as an unsupported schema.
+    for supported in ["auto", "provider_native"] {
+        let plugin = AiRequestGuard::new(&json!({
+            "strict_schema": true,
+            "supported_schema": supported
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&json!({
+            "inputText": "hi",
+            "textGenerationConfig": {"maxTokenCount": 16}
+        }));
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+    }
+}
+
+#[tokio::test]
+async fn strict_schema_titan_max_token_count_still_enforced() {
+    // With Titan admitted under strict provider_native, the documented
+    // `textGenerationConfig.maxTokenCount` enforcement (here clamp) must still
+    // run on the admitted body. `before_proxy` both passes the schema gate and
+    // eagerly clamps into `ctx.metadata`, so this exercises admission + clamp
+    // end-to-end (without the Titan markers the body would reject first).
+    let plugin = AiRequestGuard::new(&json!({
+        "strict_schema": true,
+        "supported_schema": "provider_native",
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "inputText": "hi",
+        "textGenerationConfig": {"maxTokenCount": 2000}
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    let updated_body: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(updated_body["textGenerationConfig"]["maxTokenCount"], 100);
+}
+
+#[tokio::test]
+async fn strict_schema_titan_max_token_count_rejected_over_limit() {
+    // Reject mode on the admitted Titan body: `max_requested_tokens` already
+    // reads `textGenerationConfig.maxTokenCount`, so an over-limit Titan body
+    // must be rejected (not admitted) under strict provider_native.
+    let plugin = AiRequestGuard::new(&json!({
+        "strict_schema": true,
+        "supported_schema": "provider_native",
+        "max_tokens_limit": 100
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "inputText": "hi",
+        "textGenerationConfig": {"maxTokenCount": 2000}
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject_error(result, 400, "max_tokens exceeds limit");
 }
 
 #[tokio::test]

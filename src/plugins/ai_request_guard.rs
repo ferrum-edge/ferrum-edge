@@ -46,6 +46,11 @@ const TOP_LEVEL_PROMPT_FIELDS: &[&str] = &[
     // `looks_like_legacy_completions`, so the prompt-character cap must count
     // them too — otherwise `{"inputs": "<huge prompt>"}` bypasses the limit.
     "inputs",
+    // Amazon Titan text-generation carries its prompt in top-level `inputText`
+    // (alongside `textGenerationConfig`). Strict-auto admits these bodies via
+    // `looks_like_legacy_completions`, so the prompt-character cap must count
+    // `inputText` too — otherwise `{"inputText": "<huge prompt>"}` bypasses it.
+    "inputText",
     "instructions",
     "system",
     "systemInstruction",
@@ -436,6 +441,13 @@ fn looks_like_provider_native(json: &Value) -> bool {
         || json.get("documents").is_some()
         || json.get("retrieved_context").is_some()
         || json.get("tool_results").is_some()
+        // Amazon Titan text-generation is provider-native: the prompt lives in
+        // `inputText` and the output cap in `textGenerationConfig.maxTokenCount`
+        // (read by `max_requested_tokens` / `clamp_max_token_fields`). Without
+        // these markers a strict `provider_native` config rejects Titan bodies
+        // before the documented `textGenerationConfig` reject/clamp logic runs.
+        || json.get("inputText").is_some()
+        || json.get("textGenerationConfig").is_some()
         // Anthropic Messages and Cohere v2 can be indistinguishable from
         // OpenAI-style chat when they carry only a `messages` array.
         || json.get("messages").and_then(Value::as_array).is_some()
@@ -443,12 +455,18 @@ fn looks_like_provider_native(json: &Value) -> bool {
 
 /// Recognizes legacy text-completion and text-generation bodies that carry a
 /// single prompt string instead of a message array: OpenAI legacy completions
-/// (`{"model", "prompt"}`) and TGI/HuggingFace text-generation
-/// (`{"inputs", "max_new_tokens"}`). `prompt` is in `TOP_LEVEL_PROMPT_FIELDS`
-/// and `max_new_tokens`/`max_tokens_to_sample` are honored as token fields, so
-/// strict mode must admit these shapes rather than reject them as unsupported.
+/// (`{"model", "prompt"}`), TGI/HuggingFace text-generation
+/// (`{"inputs", "max_new_tokens"}`), and Amazon Titan text-generation
+/// (`{"inputText", "textGenerationConfig"}`). `prompt`/`inputs`/`inputText` are
+/// in `TOP_LEVEL_PROMPT_FIELDS`, `max_new_tokens`/`max_tokens_to_sample` are
+/// honored as token fields, and `textGenerationConfig.maxTokenCount` is read by
+/// `max_requested_tokens` / `clamp_max_token_fields`, so strict mode must admit
+/// these shapes rather than reject them as unsupported.
 fn looks_like_legacy_completions(json: &Value) -> bool {
-    json.get("prompt").is_some() || json.get("inputs").is_some()
+    json.get("prompt").is_some()
+        || json.get("inputs").is_some()
+        || json.get("inputText").is_some()
+        || json.get("textGenerationConfig").is_some()
 }
 
 fn max_requested_tokens(json: &Value) -> Option<u64> {
@@ -504,9 +522,15 @@ fn target_already_caps_output(json: &Value, target: DefaultTokenTarget) -> bool 
             .is_some_and(|v| v.get("maxTokens").is_some()),
         DefaultTokenTarget::TextGeneration => json.get("max_new_tokens").is_some(),
         // OpenAI Chat Completions honors both the legacy `max_tokens` and the
-        // newer `max_completion_tokens`; either is the real cap for this target.
+        // newer `max_completion_tokens`; the OpenAI Responses API (which also
+        // falls through to `TopLevel` for a bare `{"input", ...}` body) caps
+        // output via `max_output_tokens`. Any of these is the real cap for this
+        // target, so injecting a separate `max_tokens` would add a redundant —
+        // and for Responses, conflicting — parameter.
         DefaultTokenTarget::TopLevel => {
-            json.get("max_tokens").is_some() || json.get("max_completion_tokens").is_some()
+            json.get("max_tokens").is_some()
+                || json.get("max_completion_tokens").is_some()
+                || json.get("max_output_tokens").is_some()
         }
     }
 }
@@ -804,6 +828,9 @@ fn count_tool_definition_text(value: Option<&Value>, total: &mut u64) {
 /// known message arrays and pull arguments from:
 ///   * OpenAI Chat Completions: `messages[].tool_calls[].function.arguments`
 ///   * OpenAI Responses function-call items: `input[].arguments`
+///   * Anthropic / Bedrock content blocks: `messages[].content[]` entries of
+///     `type: "tool_use"` carrying an `input` arguments object
+///   * Gemini: `contents[].parts[]` entries carrying `functionCall.args`
 fn count_tool_argument_fields(json: &Value, total: &mut u64) {
     for field in ["messages", "input", "contents", "chat_history"] {
         if let Some(Value::Array(items)) = json.get(field) {
@@ -834,6 +861,34 @@ fn count_item_tool_arguments(item: &Value, total: &mut u64) {
                 .and_then(|function| function.get("arguments"))
             {
                 count_argument_value(arguments, total);
+            }
+        }
+    }
+
+    // Anthropic / Bedrock Converse assistant message: tool calls are typed
+    // content blocks (`content[]` entries of `type: "tool_use"` whose `input`
+    // object is the model-emitted arguments). Scope to the typed block so an
+    // unrelated `input` key elsewhere is not counted.
+    if let Some(Value::Array(blocks)) = obj.get("content") {
+        for block in blocks {
+            if let Value::Object(block_obj) = block
+                && block_obj.get("type").and_then(Value::as_str) == Some("tool_use")
+                && let Some(input) = block_obj.get("input")
+            {
+                count_argument_value(input, total);
+            }
+        }
+    }
+
+    // Gemini: tool calls live in `contents[].parts[]` entries carrying a
+    // `functionCall` object whose `args` is the arguments payload.
+    if let Some(Value::Array(parts)) = obj.get("parts") {
+        for part in parts {
+            if let Some(args) = part
+                .get("functionCall")
+                .and_then(|function_call| function_call.get("args"))
+            {
+                count_argument_value(args, total);
             }
         }
     }
