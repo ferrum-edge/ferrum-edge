@@ -181,8 +181,12 @@ impl AiRequestGuard {
                     // A present-but-empty/whitespace string is supplied but
                     // unusable — same shape as a non-string value below, so it
                     // shares the "present but invalid" title rather than the
-                    // "genuinely absent" one.
-                    if self.require_model_for_model_policy && model.trim().is_empty() {
+                    // "genuinely absent" one. The opt-out
+                    // (`require_model_for_model_policy: false`) only tolerates a
+                    // *genuinely absent* model; a present-but-invalid value is
+                    // still rejected so the allowlist/blocklist can't be bypassed
+                    // by sending a malformed `model`.
+                    if model.trim().is_empty() {
                         return Err(model_field_rejection(INVALID_MODEL_FIELD_TITLE));
                     }
 
@@ -215,13 +219,17 @@ impl AiRequestGuard {
                 // Present but wrong-typed (number/bool/array/object/null):
                 // the field exists, so report it as invalid rather than
                 // missing, sharing the title with the empty-string arm above.
-                Some(_) if self.require_model_for_model_policy => {
+                // This rejects regardless of `require_model_for_model_policy` —
+                // the opt-out only relaxes the *missing-field* case, never a
+                // present-but-malformed value that would otherwise skip the
+                // allowlist/blocklist.
+                Some(_) => {
                     return Err(model_field_rejection(INVALID_MODEL_FIELD_TITLE));
                 }
                 None if self.require_model_for_model_policy => {
                     return Err(model_field_rejection(MISSING_MODEL_FIELD_TITLE));
                 }
-                _ => {}
+                None => {}
             }
         }
 

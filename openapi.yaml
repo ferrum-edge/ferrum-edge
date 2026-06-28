@@ -14332,7 +14332,7 @@ components:
         require_model_for_model_policy:
           type: boolean
           default: true
-          description: Require a non-empty string model field when allowed_models or blocked_models is configured
+          description: Require a non-empty string model field when allowed_models or blocked_models is configured. Setting false only relaxes a genuinely-absent model; a present-but-invalid model (non-string or empty/whitespace) is still rejected with HTTP 400
         require_user_field:
           type: boolean
           default: false

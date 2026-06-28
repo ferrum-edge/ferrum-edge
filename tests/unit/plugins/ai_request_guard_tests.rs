@@ -279,6 +279,65 @@ async fn explicit_require_model_for_model_policy_false_allows_missing_model() {
 // which assert the exact "Model not allowed" rejection title.
 
 #[tokio::test]
+async fn require_model_false_still_rejects_present_non_string_model() {
+    // The opt-out only tolerates a *genuinely absent* model. A present but
+    // non-string `model` (number/bool/array/object/null) must STILL be rejected
+    // even with `require_model_for_model_policy: false` — otherwise a malformed
+    // model value silently bypasses both the allowlist and the blocklist.
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4o"],
+        "require_model_for_model_policy": false
+    }))
+    .unwrap();
+
+    for bad_model in [
+        json!(123),
+        json!(true),
+        json!(["gpt-4o"]),
+        json!({"name": "gpt-4o"}),
+        json!(null),
+    ] {
+        let mut ctx = make_post_ctx(&json!({"model": bad_model, "messages": []}));
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject_error(result, 400, "Invalid model field");
+    }
+}
+
+#[tokio::test]
+async fn require_model_false_still_rejects_present_empty_model() {
+    // A present-but-empty/whitespace string is the same "present but invalid"
+    // shape as a non-string value: it cannot satisfy the configured policy, so
+    // it is rejected even under the presence opt-out. Also locks the shared
+    // `details` message against drift.
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4o"],
+        "require_model_for_model_policy": false
+    }))
+    .unwrap();
+
+    for empty_model in ["", "   ", "\t\n "] {
+        let mut ctx = make_post_ctx(&json!({"model": empty_model, "messages": []}));
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400);
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["error"], "Invalid model field");
+                assert_eq!(
+                    body["details"],
+                    "The 'model' field must be a non-empty string when model policy is configured"
+                );
+            }
+            other => panic!("Expected Reject, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_blocked_takes_precedence_over_allowed() {
     let plugin = AiRequestGuard::new(&json!({
         "allowed_models": ["gpt-4"],
