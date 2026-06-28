@@ -138,7 +138,7 @@ async fn blocked_models_requires_model_or_documented_behavior() {
     let mut non_string_ctx = make_post_ctx(&json!({"model": 4, "messages": []}));
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut non_string_ctx, &mut headers).await;
-    assert_reject_error(result, 400, "Missing required model field");
+    assert_reject_error(result, 400, "Invalid model field");
 }
 
 // ─── Model allowlist ───────────────────────────────────────────────────
@@ -174,6 +174,16 @@ async fn allowed_models_requires_model() {
     let mut non_string_ctx = make_post_ctx(&json!({"model": true, "messages": []}));
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut non_string_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Invalid model field");
+
+    let mut empty_ctx = make_post_ctx(&json!({"model": "", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut empty_ctx, &mut headers).await;
+    assert_reject_error(result, 400, "Missing required model field");
+
+    let mut whitespace_ctx = make_post_ctx(&json!({"model": "   ", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut whitespace_ctx, &mut headers).await;
     assert_reject_error(result, 400, "Missing required model field");
 }
 
@@ -201,6 +211,19 @@ async fn explicit_require_model_for_model_policy_false_allows_missing_model() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn explicit_require_model_for_model_policy_false_still_blocks_present_model() {
+    let plugin = AiRequestGuard::new(&json!({
+        "blocked_models": ["gpt-4"],
+        "require_model_for_model_policy": false
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
 }
 
 #[tokio::test]

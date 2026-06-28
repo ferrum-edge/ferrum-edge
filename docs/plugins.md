@@ -3739,7 +3739,7 @@ config:
 
 Validates and constrains AI/LLM API requests before they reach the backend.
 
-Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured.
+Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured. Model-policy fail-closed checks apply after the plugin can inspect a well-formed buffered JSON body; empty or missing bodies, malformed JSON, and non-JSON content continue to the backend for compatibility and should be guarded separately when the backend must not receive them.
 
 At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1). When `allowed_models` or `blocked_models` is configured, requests must include a non-empty string `model` field by default; missing or non-string model values fail closed with HTTP 400. Set `require_model_for_model_policy: false` only for compatibility with backends that intentionally derive the model outside the request body.
 

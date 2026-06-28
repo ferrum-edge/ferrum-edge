@@ -176,14 +176,10 @@ impl AiRequestGuard {
     fn validate(&self, json: &Value) -> Result<(), (String, String)> {
         // Model blocking/allowlisting
         if !self.allowed_models.is_empty() || !self.blocked_models.is_empty() {
-            match json.get("model").and_then(|v| v.as_str()) {
-                Some(model) => {
+            match json.get("model") {
+                Some(Value::String(model)) => {
                     if self.require_model_for_model_policy && model.trim().is_empty() {
-                        return Err((
-                            "Missing required model field".to_string(),
-                            "The 'model' field must be a non-empty string when model policy is configured"
-                                .to_string(),
-                        ));
+                        return Err(model_field_rejection("Missing required model field"));
                     }
 
                     let model_lower = model.to_lowercase();
@@ -212,14 +208,13 @@ impl AiRequestGuard {
                         ));
                     }
                 }
-                None if self.require_model_for_model_policy => {
-                    return Err((
-                        "Missing required model field".to_string(),
-                        "The 'model' field must be a non-empty string when model policy is configured"
-                            .to_string(),
-                    ));
+                Some(_) if self.require_model_for_model_policy => {
+                    return Err(model_field_rejection("Invalid model field"));
                 }
-                None => {}
+                None if self.require_model_for_model_policy => {
+                    return Err(model_field_rejection("Missing required model field"));
+                }
+                _ => {}
             }
         }
 
@@ -325,6 +320,13 @@ impl AiRequestGuard {
 
         Ok(())
     }
+}
+
+fn model_field_rejection(error: &'static str) -> (String, String) {
+    (
+        error.to_string(),
+        "The 'model' field must be a non-empty string when model policy is configured".to_string(),
+    )
 }
 
 /// Count total characters in a message's content field.
