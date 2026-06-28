@@ -1820,25 +1820,30 @@ jobs:
           changed_files=""
 
           if [ "${EVENT_NAME}" = "pull_request" ]; then
-            git fetch --no-tags --prune origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-            changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD")"
-            run_benchmark=false
-            reason="No performance-sensitive paths changed."
+            if changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null)"; then
+              run_benchmark=false
+              reason="No performance-sensitive paths changed."
 
-            if printf '%s\n' "${changed_files}" | grep -Eq '^(src/|vendor/|tests/performance/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)'; then
+              if grep -Eq '^(src/|custom_plugins/|vendor/|ebpf/|tests/performance/|build\.rs$|ferrum\.conf$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
+                run_benchmark=true
+                reason="Performance-sensitive paths changed."
+              fi
+            else
               run_benchmark=true
-              reason="Performance-sensitive paths changed."
+              reason="Could not diff against origin/${BASE_REF}; running benchmark to be safe."
+              changed_files=""
             fi
           fi
 
-          printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          if [ -n "${changed_files}" ]; then
+            printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          else
+            : > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          fi
 
           {
             echo "run=${run_benchmark}"
             echo "reason=${reason}"
-            echo "changed_files<<EOF"
-            printf '%s\n' "${changed_files}"
-            echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
@@ -1941,7 +1946,7 @@ jobs:
             {
               echo "Skipped expensive benchmark: ${REASON}"
               echo ""
-              echo "Relevant paths: \`src/**\`, \`vendor/**\`, \`tests/performance/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
+              echo "Relevant paths: \`src/**\`, \`custom_plugins/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`ferrum.conf\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
               echo ""
               echo "Changed files:"
               echo '```'

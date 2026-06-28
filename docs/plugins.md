@@ -3297,6 +3297,7 @@ Recent releases tightened config validation for several AI plugins. Operators up
 - **`ai_semantic_firewall`** now defaults enforcement failures closed: provider/evaluation errors default to `on_error: reject`, and `stream: true` requests default to `streaming_response: reject` when response-side rules are active. Restore the old fail-open posture only with explicit `on_error: warn`/`allow` or `streaming_response: skip`.
 - **`ai_rate_limiter`** now rejects unknown `count_mode` and `limit_by` values. Previously these silently fell back to defaults.
 - **`ai_token_metrics`** now rejects negative or non-finite (`NaN`/`Inf`) values for `cost_per_prompt_token` and `cost_per_completion_token`. Negative cost rates would emit nonsensical negative cost metrics that pollute observability and chargeback pipelines; non-finite rates would break Prometheus exporters. Zero is still accepted (e.g., free-tier accounting).
+- **`ai_federation`** now fails closed by default when a JSON POST body cannot be inspected, is missing a top-level string `model` field, or no provider matches that model. Previously these requests continued to the normal backend. Restore that legacy behavior only with explicit `fail_on_missing_model: false` and/or `fail_on_no_matching_provider: false`, and only when the backend path is protected by equivalent AI gateway policy.
 
 Validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
 
@@ -3308,7 +3309,13 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
 
-**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched. There is no streaming opt-in knob; config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation so operators do not get a false sense that provider streaming is enabled.
+**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. There is no streaming opt-in knob; config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation so operators do not get a false sense that provider streaming is enabled.
+
+**Model routing fails closed by default.** JSON POST requests with no buffered body, malformed JSON, or no top-level string `model` field are rejected with an OpenAI-shaped `400`. Requests whose `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required. Pass-through can bypass AI gateway policy enforced by `ai_federation` provider routing, fallback, translation, token metadata, and any downstream assumptions that federation will short-circuit the request.
+
+**The fail-closed guarantee is scoped to JSON POSTs.** `before_proxy` only inspects requests whose method is `POST` and whose `Content-Type` is `application/json` (or a `*+json` suffix); every other request returns `Continue` and reaches the backend uninspected. Even with the fail-closed defaults, a client can therefore bypass federation entirely by sending the same body with a non-JSON content type (for example `Content-Type: text/plain`) or a different method. `ai_federation` is not an authorization boundary — the backend it fronts must remain independently protected (auth, rate limiting, and any AI gateway policy) regardless of these flags.
+
+**Fail-closed defaults make `ai_federation` greedy in the `before_proxy` chain.** With the defaults, an instance now claims every `POST` + `application/json` request on its proxy — the resulting `RejectBinary` from `before_proxy` returns immediately and short-circuits later `before_proxy` plugins (serverless, response_mock, request/response transformers, caching, compression) as well as any second federation/router instance scoped to a different model family. Mixed-traffic proxies that need those other plugins to run on the same JSON POSTs should use the `fail_on_missing_model: false` / `fail_on_no_matching_provider: false` opt-outs, or isolate AI traffic on a dedicated proxy.
 
 **Priority:** 2985
 
@@ -3322,6 +3329,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `fallback_enabled` | Boolean | `true` | Try next provider on failure |
 | `fallback_on_status_codes` | Array | `[429, 500, 502, 503]` | HTTP status codes that trigger fallback |
 | `fallback_on_network_errors` | Boolean | `true` | TCP/TLS failures trigger fallback |
+| `fail_on_missing_model` | Boolean | `true` | Reject JSON POST requests whose body cannot be inspected as JSON or lacks a top-level string `model` field. Set to `false` only to explicitly pass such requests through to the normal backend |
+| `fail_on_no_matching_provider` | Boolean | `true` | Reject requests whose `model` does not match any provider. Set to `false` only to explicitly pass unsupported models through to the normal backend |
 
 **Provider configuration fields:**
 
@@ -3376,7 +3385,27 @@ plugins:
             bedrock-claude: "anthropic.claude-3-sonnet-20240229-v1:0"
       fallback_enabled: true
       fallback_on_status_codes: [429, 500, 502, 503]
+      fail_on_missing_model: true
+      fail_on_no_matching_provider: true
 ```
+
+Legacy pass-through is explicit opt-in:
+
+```yaml
+plugins:
+  - name: ai_federation
+    enabled: true
+    config:
+      fail_on_missing_model: false
+      fail_on_no_matching_provider: false
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: "sk-..."
+          model_patterns: ["gpt-*"]
+```
+
+Use this only when the normal backend has equivalent authentication, model allow-listing, rate limits, prompt/body validation, and logging. Otherwise a request with an uninspectable body, no valid `model`, or an unsupported `model` can avoid the federated provider path entirely.
 
 **Cross-plugin synergy:** Works with all other AI plugins on the same proxy:
 - `ai_prompt_shield` (2925) scans/redacts PII before federation
@@ -3607,6 +3636,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 | `include_model_in_key` | bool | `true` | Include the model name in the cache key (different models get separate cache entries) |
 | `include_params_in_key` | bool | `true` | Include sampling parameters (temperature, top_p, max_tokens) in the cache key. Default `true` because different params produce different responses; set `false` only when cross-parameter reuse is intentional. |
 | `scope_by_consumer` | bool | `true` | Scope cache entries per authenticated consumer. Default `true` because cached responses must not be replayed across consumers; set `false` only for a public LLM proxy with no per-tenant data. |
+| `cache_multimodal` | String | `"exact_only"` | Multimodal request caching mode for non-text content parts: `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. Values are trimmed and case-insensitive; `_` and `-` aliases are accepted. |
 | `semantic_similarity_enabled` | bool | `false` | Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active either way. |
 | `semantic_embedding_provider` | String | `"openai"` | Embedding request/response format. Supports `openai`, `azure_openai`, `mistral`, `voyage` (`anthropic`/`claude` aliases), `cohere`, `google_gemini`, `google_vertex`, `bedrock_titan`, and `bedrock_cohere`; compatibility aliases accepted by the plugin are also listed in `openapi.yaml`. |
 | `semantic_embedding_endpoint` | String (optional) | -- | Embedding endpoint URL. Required when `semantic_similarity_enabled: true`. OpenAI-compatible endpoints use `{"input": "...", "model": "..."}`; other provider values send native provider JSON. |
@@ -3632,15 +3662,16 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 **Behavior:**
 
 - **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
-- **Cache key composition**: The hashed key includes the proxy ID, optionally the authenticated consumer (default on), the model name (default on), optionally sampling params (default on — `temperature`, `top_p`, `max_tokens`), the normalized `messages` array, the Anthropic top-level `system` prompt (string or array-of-content-blocks form), and response-shaping fields including `tools`, `tool_choice`, `response_format`, `seed`, `logit_bias`, `n`, `stop`, penalties, logprobs, reasoning effort, modalities, prediction, service tier, and `stream` when present. Any byte-level change to these fields produces a different cache entry — two requests with different system prompts, tool sets, response formats, seeds, logit biases, or streaming flags will never collide.
+- **Cache key composition**: The hashed key includes the proxy ID, optionally the authenticated consumer (default on), the model name (default on), optionally sampling params (default on — `temperature`, `top_p`, `max_tokens`), the normalized `messages` text, hashed fingerprints for non-text multimodal content parts, the Anthropic top-level `system` prompt (string or array-of-content-blocks form), and response-shaping fields including `tools`, `tool_choice`, `response_format`, `seed`, `logit_bias`, `n`, `stop`, penalties, logprobs, reasoning effort, modalities, prediction, service tier, and `stream` when present. Any byte-level change to these fields produces a different cache entry — two requests with different system prompts, tool sets, response formats, seeds, logit biases, multimodal content, or streaming flags will never collide.
+- **Multimodal content**: Content parts whose `type` is not `text` are fingerprinted with their part type, message role/index, content-part index, field names, scalar metadata, file IDs, URLs, and inline data values. String values are SHA-256 hashed before they are folded into cache keys or semantic scope keys, so raw image/audio URLs, file IDs, and base64 payloads are not stored in cache metadata. User-controlled descriptor labels such as object keys, roles, and `type` values are length-prefixed before hashing so delimiter-like values cannot collide structurally. The default `cache_multimodal: "exact_only"` allows safe exact reuse for identical multimodal content while disabling semantic hits because the configured embedding providers receive text-only input. Note that "non-text content parts" covers more than media: Anthropic-style `tool_use`, `tool_result`, and `thinking` blocks also have a `type` other than `text`, so they are fingerprinted and semantic hits are disabled for those turns under the default `exact_only` — relevant for Claude tool-calling workloads where a turn may contain only tool blocks. Use `cache_multimodal: "reject"` to bypass caching for multimodal requests, or `include_fingerprints` only when text-only semantic reuse is acceptable for requests with the same non-text fingerprint.
 - **Semantic lookup (optional)**: When enabled, the plugin computes an embedding only after exact Redis/local misses. It searches a local immutable HNSW snapshot and returns a cached response when cosine similarity meets `semantic_similarity_threshold`. Exact matching remains the first lookup path. True misses wait for the embedding HTTP call before backend dispatch, so plan for `embedding_latency + backend_latency` p99 and per-miss embedding-provider cost.
 - **Semantic index refresh**: The local HNSW snapshot is immutable and rebuilt in batches by a detached background task that moves snapshot scanning and HNSW construction onto a blocking worker thread. The first semantic entry schedules an immediate rebuild; later semantic inserts/removals mark the snapshot dirty and schedule a rebuild at most once every 30 seconds. Reads also check whether a dirty index is due for refresh before semantic lookup. Very recent entries may therefore exact-hit before they become eligible for semantic hits. Large, write-heavy semantic caches pay periodic full-cache scan/rebuild CPU cost because `instant-distance` indexes are immutable.
 - **Plugin ordering and prompt privacy**: This plugin runs at priority 2980, after request size/rate limiting, `ai_prompt_shield`, WAF, body/OpenAPI validation, and `ai_request_guard`, but before `ai_federation`. Exact cache hits and semantic embedding calls therefore see the backend-visible request body after those admission plugins have accepted or transformed it. The ordering also means exact and semantic cache hits consume request-count rate-limit budget and pass through earlier admission/fault-injection plugins before the cache can short-circuit. Semantic mode still sends prompt text to the configured embedding endpoint; use an approved provider or private/auth-aware embedding proxy for sensitive prompts.
 - **Embedding provider formats**: `openai`, `azure_openai`, and `mistral` use OpenAI-compatible embedding JSON and parse `data[0].embedding`. `voyage` uses Voyage's `input`/`input_type`/`output_dimension` shape and also backs the `anthropic` and `claude` aliases because Claude does not expose a native embedding model. `cohere` and `bedrock_cohere` use `texts`, `input_type`, and `embedding_types: ["float"]`. `google_gemini` sends `content.parts[].text`; `google_vertex` sends `instances[].content`; `bedrock_titan` sends `inputText`. The parser accepts common response shapes including `embedding.values`, `embeddings.float[0]`, `predictions[0].embeddings.values`, and `embeddingsByType.float`.
 - **Embedding authentication**: The plugin sends a single configured API-key header. Direct Google Vertex and Amazon Bedrock endpoints usually require OAuth2 or SigV4; use a provider-side proxy, pre-signed/internal endpoint, or an auth-aware gateway in front of those endpoints unless the configured header is sufficient.
-- **Semantic scoping**: Semantic candidates must match the same proxy, consumer scope, model, sampling params, message role sequence, Anthropic top-level system prompt, exact hashes of OpenAI-style `system`/`developer` message content, tools, response format, seed, logit bias, choice count, stop sequences, penalties, logprob settings, reasoning effort, modalities, prediction, service tier, and stream flag before they can hit. This prevents a similar prompt from crossing tenant, instruction, or response-shape boundaries. The embedded semantic input is still the full conversation text, so long multi-turn conversations with similar context and different final user turns can produce false semantic hits; raise `semantic_similarity_threshold` or disable semantic mode for workflows that require exact final-turn distinctions.
+- **Semantic scoping**: Semantic candidates must match the same proxy, consumer scope, model, sampling params, message role sequence, Anthropic top-level system prompt, exact hashes of OpenAI-style `system`/`developer` message content, multimodal fingerprint when `cache_multimodal: "include_fingerprints"` is configured, tools, response format, seed, logit bias, choice count, stop sequences, penalties, logprob settings, reasoning effort, modalities, prediction, service tier, and stream flag before they can hit. This prevents a similar prompt from crossing tenant, instruction, response-shape, or multimodal-content boundaries. The embedded semantic input is still the full conversation text, so long multi-turn conversations with similar context and different final user turns can produce false semantic hits; raise `semantic_similarity_threshold` or disable semantic mode for workflows that require exact final-turn distinctions.
 - **Embedding failure behavior**: If the embedding endpoint is unavailable, returns a non-2xx status, or emits an invalid vector, the plugin logs at debug level and continues as a normal exact-cache miss. The backend request still proceeds.
-- **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
+- **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored, and `BYPASS` when `cache_multimodal: "reject"` skips a multimodal request.
 - **Semantic hit header**: Semantic hits also include `X-Ai-Cache-Match: semantic`; exact hits omit this header.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
 - **Redis mode**: When `sync_mode: "redis"`, exact cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. The semantic HNSW vector index is local to each gateway process, and embedding vectors/scope keys are not serialized into Redis entries.
@@ -3960,6 +3991,8 @@ plugins:
           priority: 3
           model_patterns: ["gemini-*"]
       fallback_enabled: true
+      fail_on_missing_model: true
+      fail_on_no_matching_provider: true
   - plugin_name: ai_response_guard
     config:
       action: redact
