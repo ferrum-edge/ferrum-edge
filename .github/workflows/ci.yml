@@ -1192,6 +1192,14 @@ jobs:
           #   started by the chart runs the Kubernetes controller, which feeds
           #   CRDs through config_sources::k8s::translate_k8s_objects(), so a
           #   translation regression can break CP readiness in this smoke
+          # - mesh sources (src/modes/mesh/, e.g. config.rs/slice.rs/
+          #   dns_proxy.rs): the Helm examples boot the CP with
+          #   FERRUM_XDS_ENABLED=true and the CP/xDS path depends on these
+          #   modules (src/xds/server.rs reads
+          #   modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
+          #   src/xds/translator.rs and src/grpc/cp_server.rs use
+          #   modes::mesh::{config,slice}), so a mesh-source regression can
+          #   break the deployed control plane this gate validates
           # - CP-boot startup helpers reached before /health goes ready:
           #   src/proxy/client_ip.rs (TrustedProxies::parse_strict on the admin
           #   CIDR allowlist), src/util/sharding.rs (pool_shard_amount feeding
@@ -1208,7 +1216,7 @@ jobs:
           # log-redaction assertion in the kind-install steps is specific to this
           # job and has no overlapping coverage -- so redaction-relevant paths
           # (e.g. src/logging/) must stay listed to keep the gate fail-safe.
-          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|\.cargo/|vendor/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/runtime_metrics\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/config_sources/k8s/|src/logging/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/proxy/client_ip\.rs$|src/secrets/|src/tls/|src/util/sharding\.rs$|src/xds/)'
+          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|\.cargo/|vendor/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/runtime_metrics\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/config_sources/k8s/|src/logging/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/modes/mesh/|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/proxy/client_ip\.rs$|src/secrets/|src/tls/|src/util/sharding\.rs$|src/xds/)'
           # Diff captured first so a git error (e.g. a missing base ref) fails
           # closed: it aborts the step loudly under `set -euo pipefail` rather
           # than being swallowed by the match and silently skipping every heavy
@@ -1494,7 +1502,7 @@ jobs:
         run: |
           echo "## Helm Chart" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Skipped: this PR does not touch chart sources, chart test values, CI workflow/actions, Docker or runtime image packaging, Cargo/build.rs/rust-toolchain/.cargo/vendor build inputs, proto, ferrum.conf, runtime config, control-plane startup, admin, gRPC, xDS, DNS, TLS, identity, Kubernetes controller, Kubernetes translation (src/config_sources/k8s/), CP-boot startup helpers (client_ip CIDR parser, sharding helper, runtime metrics init), or secret surfaces." >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch chart sources, chart test values, CI workflow/actions, Docker or runtime image packaging, Cargo/build.rs/rust-toolchain/.cargo/vendor build inputs, proto, ferrum.conf, runtime config, control-plane startup, admin, gRPC, xDS, DNS, TLS, identity, Kubernetes controller, Kubernetes translation (src/config_sources/k8s/), mesh sources (src/modes/mesh/, consumed by the CP/xDS path), CP-boot startup helpers (client_ip CIDR parser, sharding helper, runtime metrics init), or secret surfaces." >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Tests
