@@ -118,6 +118,14 @@ impl SpecExpose {
                 "spec_expose: 'spec_url' must include a hostname or IP address".to_string(),
             );
         }
+        // Screen a literal-IP spec_url against the egress policy at config-load
+        // (the shared client's DNS-cache screen still applies at fetch time).
+        crate::plugins::utils::log_helpers::screen_url_host_egress(
+            "spec_expose",
+            "spec_url",
+            &parsed,
+            plugin_http_client.backend_allow_ips(),
+        )?;
         let warmup_hostname = Some(spec_url_hostname(&parsed)?);
         let spec_url = parsed.to_string();
 

@@ -77,6 +77,38 @@ fn test_creation_missing_spec_url() {
 }
 
 #[test]
+fn test_creation_rejects_metadata_spec_url_under_default_policy() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    // spec_expose fetches its own URL; a literal metadata spec_url must be
+    // rejected at config-load under the default dangerous-range baseline.
+    let client = PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid"),
+    );
+    let err = SpecExpose::new(
+        &json!({ "spec_url": "http://169.254.169.254/openapi.yaml" }),
+        client,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.contains("169.254.169.254") && err.contains("backend egress policy"),
+        "got: {err}"
+    );
+
+    // A loopback spec_url (in-cluster docs service) still constructs.
+    let client = PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid"),
+    );
+    assert!(
+        SpecExpose::new(
+            &json!({ "spec_url": "http://127.0.0.1:8080/openapi.yaml" }),
+            client
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn test_creation_empty_spec_url() {
     let err = SpecExpose::new(&json!({ "spec_url": "" }), PluginHttpClient::default())
         .err()

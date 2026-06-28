@@ -613,6 +613,15 @@ impl ApiChargebackSink {
         }
 
         let parsed_url = parse_clickhouse_url(&config.clickhouse.url)?;
+        // The ClickHouse sink builds a dedicated client, so screen a literal-IP
+        // clickhouse.url against the egress policy at config-load (the shared
+        // DNS-cache screen still applies at send time).
+        crate::plugins::utils::log_helpers::screen_url_host_egress(
+            PLUGIN_NAME,
+            "clickhouse.url",
+            &parsed_url,
+            http_client.backend_allow_ips(),
+        )?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &config.clickhouse);
         let password = resolve_password_ref(config.clickhouse.password_ref.as_deref())?;

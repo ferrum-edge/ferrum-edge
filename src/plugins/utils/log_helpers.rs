@@ -214,6 +214,34 @@ fn screen_endpoint_ip_policy(
     }
 }
 
+/// Screen the literal-IP host of a parsed config URL against the backend egress
+/// policy, for plugins that build a dedicated client or parse their own URL
+/// rather than dialing through the policy-screened shared client (e.g.
+/// `api_chargeback_sink` ClickHouse, `spec_expose`). Hostnames are screened at
+/// resolution time by the DNS cache; `field` names the config key for the
+/// error message.
+pub fn screen_url_host_egress(
+    plugin_name: &str,
+    field: &str,
+    url: &Url,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    let ip = match url.host() {
+        Some(Host::Ipv4(address)) => std::net::IpAddr::V4(address),
+        Some(Host::Ipv6(address)) => std::net::IpAddr::V6(address),
+        // Domain / no host → screened at resolution time by the DNS cache.
+        _ => return Ok(()),
+    };
+    match backend_allow_ips.deny_reason(&ip) {
+        None => Ok(()),
+        Some(reason) => Err(format!(
+            "{plugin_name}: '{field}' address {ip} is blocked by the backend egress policy \
+             ({reason}); adjust FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS or point \
+             it at an allowed address."
+        )),
+    }
+}
+
 pub fn parse_custom_headers(
     config: &Value,
     plugin_name: &'static str,

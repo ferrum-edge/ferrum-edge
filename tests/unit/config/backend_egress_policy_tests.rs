@@ -137,6 +137,26 @@ fn deny_cidr_blocks_within_an_otherwise_allowed_mode() {
 }
 
 #[test]
+fn deny_cidr_matches_ipv6_embedded_forms() {
+    // A v4 deny rule must also catch a backend that resolves to the IPv6
+    // encoding of that v4 range (rebinding), and the allow-CIDR escape hatch
+    // works on the embedded form too.
+    let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "10.0.0.0/8", true)
+        .expect("valid");
+    assert!(!p.is_allowed(&ip("10.0.0.1"))); // raw v4
+    assert!(!p.is_allowed(&ip("::ffff:10.0.0.1"))); // IPv4-mapped
+    assert!(!p.is_allowed(&ip("64:ff9b::a00:1"))); // NAT64 of 10.0.0.1
+    // No false embedded match: a different range and loopback stay allowed.
+    assert!(p.is_allowed(&ip("11.0.0.1")));
+    assert!(p.is_allowed(&ip("::1")));
+
+    // Allow-CIDR escape hatch also matches the embedded form.
+    let carved = BackendEgressPolicy::from_env(BackendAllowIps::Public, "10.1.2.0/24", "", true)
+        .expect("valid");
+    assert!(carved.is_allowed(&ip("64:ff9b::a01:205"))); // NAT64 of 10.1.2.5
+}
+
+#[test]
 fn allow_cidr_takes_precedence_over_deny_cidr() {
     // Overlapping allow + deny: allow wins (checked first).
     let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "10.0.0.5/32", "10.0.0.0/8", true)

@@ -386,6 +386,36 @@ pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Extract the IPv4 address embedded in an IPv4-mapped (`::ffff:a.b.c.d`),
+/// deprecated IPv4-compatible (`::a.b.c.d`), or NAT64 (`64:ff9b::a.b.c.d`) IPv6
+/// address. Used so operator allow/deny CIDR rules written in IPv4 form also
+/// apply to a backend that resolves to the IPv6 encoding of that address.
+/// Loopback (`::1`) is excluded — its compat form `0.0.0.1` would be a false
+/// embedded match.
+fn embedded_ipv4(addr: &std::net::IpAddr) -> Option<std::net::Ipv4Addr> {
+    let std::net::IpAddr::V6(ip) = addr else {
+        return None;
+    };
+    if ip.is_loopback() {
+        return None;
+    }
+    let segments = ip.segments();
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and deprecated IPv4-compatible (`::a.b.c.d`).
+    ip.to_ipv4_mapped().or_else(|| ip.to_ipv4())
+}
+
 /// Resolved backend egress policy: the `FERRUM_BACKEND_ALLOW_IPS` mode plus an
 /// explicit allow/deny CIDR overlay and the dangerous-range baseline.
 ///
@@ -481,12 +511,21 @@ impl BackendEgressPolicy {
     /// Returns a short human-readable reason if `addr` is denied, else `None`.
     /// Used to build actionable errors at config-load and resolution time.
     pub fn deny_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
+        // Match allow/deny CIDR rules against both the address and the IPv4
+        // embedded in a NAT64 / IPv4-mapped / IPv4-compatible IPv6 address, so a
+        // rule written in IPv4 form (e.g. `FERRUM_BACKEND_DENY_CIDRS=10.0.0.0/8`)
+        // can't be bypassed by a backend that resolves to the IPv6 encoding of
+        // that address (`64:ff9b::0a00:1`, `::ffff:10.0.0.1`, …).
+        let embedded = embedded_ipv4(addr).map(std::net::IpAddr::V4);
+        let cidr_match = |set: &CidrSet| {
+            set.contains(addr) || embedded.as_ref().is_some_and(|e| set.contains(e))
+        };
         // 1. Explicit allow overrides every deny below.
-        if self.allow_cidrs.contains(addr) {
+        if cidr_match(&self.allow_cidrs) {
             return None;
         }
         // 2. Explicit deny.
-        if self.deny_cidrs.contains(addr) {
+        if cidr_match(&self.deny_cidrs) {
             return Some("listed in FERRUM_BACKEND_DENY_CIDRS");
         }
         // 3. Dangerous-range baseline.
