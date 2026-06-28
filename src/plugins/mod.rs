@@ -3280,13 +3280,22 @@ pub fn create_plugin_with_http_client(
     }
 }
 
-/// Validate a plugin configuration by attempting to instantiate the plugin.
+/// Validate a plugin configuration by attempting to instantiate the plugin,
+/// with a default-open egress policy.
 ///
-/// This is a lightweight validation entry point for use by file_loader and db_loader.
-/// The plugin instance is created and immediately dropped — only the config validation
-/// side effects of the plugin's `new()` constructor matter.
+/// The plugin instance is created and immediately dropped — only the config
+/// validation side effects of the plugin's `new()` constructor matter.
+///
+/// Production config-load paths (file/db/admin/spec) use
+/// [`validate_plugin_config_with_policy`] so a plugin's literal-IP endpoints
+/// are screened against the configured backend egress policy. This bare
+/// variant remains a `pub` entrypoint for external test crates that only need
+/// shape validation of endpoint-less plugins (e.g. `cors`,
+/// `transaction_log_schema`). `#[allow(dead_code)]` because the binary target
+/// recompiles the source without those test crates, so it sees no caller.
 ///
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
+#[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
     match create_plugin(name, config)? {
         Some(_) => Ok(()),
