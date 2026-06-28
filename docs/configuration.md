@@ -69,6 +69,8 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to connect to the admin API. Empty permits all |
+| `FERRUM_ADMIN_MAX_CONNECTIONS` | No | `1024` | Max concurrent connections across all admin/management-plane listeners (plaintext + TLS share one cap). Independent of the data-plane `FERRUM_MAX_CONNECTIONS`. Enforced after the admin CIDR allowlist and before the TLS handshake / request parsing; over-limit connections are dropped (TCP RST). `0` = unlimited |
+| `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP` | No | `0` | Max concurrent admin connections per resolved source IP. `0` (default) disables per-IP limiting so a single monitoring/load-balancer source is not capped by accident |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
 | `FERRUM_ADMIN_TLS_CERT_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_ADMIN_TLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |

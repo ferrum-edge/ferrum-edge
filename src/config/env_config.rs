@@ -1451,6 +1451,18 @@ pub struct EnvConfig {
     /// Example: "10.0.100.0/24,10.0.200.5,::1"
     pub admin_allowed_cidrs: String,
 
+    /// Maximum concurrent connections across all admin/management-plane
+    /// listeners (plaintext + TLS share one cap). Independent of the data-plane
+    /// `max_connections` (`FERRUM_MAX_CONNECTIONS`) so proxy traffic and
+    /// management traffic can be sized separately. Enforced after the admin CIDR
+    /// allowlist and before the TLS handshake / request parsing; over-limit
+    /// connections are dropped (TCP RST). Default: 1024. Set to 0 to disable.
+    pub admin_max_connections: usize,
+    /// Maximum concurrent admin connections per resolved source IP. Default: 0
+    /// (disabled) so a single monitoring/load-balancer source IP is not capped
+    /// by accident. When set, over-limit connections from that IP are dropped.
+    pub admin_max_connections_per_ip: usize,
+
     /// Max request body size in MiB for POST /restore (large config backups).
     /// Default: 100 MiB.
     pub admin_restore_max_body_size_mib: usize,
@@ -1925,6 +1937,8 @@ impl Default for EnvConfig {
             plugin_http_retry_delay_ms: 100,
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
+            admin_max_connections: 1024,
+            admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
@@ -2332,6 +2346,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
+            admin_max_connections: usize = "FERRUM_ADMIN_MAX_CONNECTIONS" => 1024usize;
+            admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
@@ -2914,6 +2930,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms,
             tls_crl_file_path,
             admin_allowed_cidrs,
+            admin_max_connections,
+            admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
             migrate_action,

@@ -249,7 +249,13 @@ async fn spawn_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
         let admin_addr: SocketAddr = addr;
-        let _ = start_admin_listener(admin_addr, state_clone, shutdown_rx_clone).await;
+        let _ = start_admin_listener(
+            admin_addr,
+            state_clone,
+            shutdown_rx_clone,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
 
     // Give the listener a moment to accept connections.

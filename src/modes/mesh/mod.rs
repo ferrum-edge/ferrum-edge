@@ -9430,14 +9430,26 @@ fn start_mesh_admin_listeners(
 
     let mut handles = Vec::new();
     let admin_state_for_https = admin_state.clone();
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
 
     if env_config.admin_http_port != 0 {
         let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
         let shutdown = shutdown_tx.subscribe();
+        let admin_http_limiter = admin_conn_limiter.clone();
         handles.push(tokio::spawn(async move {
             info!("Starting mesh admin HTTP listener on {}", admin_http_addr);
-            if let Err(err) =
-                admin::start_admin_listener(admin_http_addr, admin_state, shutdown).await
+            if let Err(err) = admin::start_admin_listener(
+                admin_http_addr,
+                admin_state,
+                shutdown,
+                admin_http_limiter,
+            )
+            .await
             {
                 error!("Mesh admin HTTP listener error: {}", err);
             }
@@ -9475,6 +9487,7 @@ fn start_mesh_admin_listeners(
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
         let shutdown = shutdown_tx.subscribe();
+        let admin_https_limiter = admin_conn_limiter.clone();
         handles.push(tokio::spawn(async move {
             info!("Starting mesh admin HTTPS listener on {}", admin_https_addr);
             let result = if let Some(slot) = admin_tls_slot {
@@ -9483,6 +9496,7 @@ fn start_mesh_admin_listeners(
                     admin_state_for_https,
                     shutdown,
                     slot,
+                    admin_https_limiter,
                 )
                 .await
             } else {
@@ -9491,6 +9505,7 @@ fn start_mesh_admin_listeners(
                     admin_state_for_https,
                     shutdown,
                     Some(admin_tls_config),
+                    admin_https_limiter,
                 )
                 .await
             };
