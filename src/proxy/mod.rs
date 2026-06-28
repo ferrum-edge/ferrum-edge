@@ -11345,14 +11345,21 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// satisfied. Specifically we skip when:
 /// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
 /// - the status is not 2xx,
-/// - the status is 204/304 (a body-emitting transform there is protocol-
-///   incorrect — those responses MUST NOT carry a body),
+/// - the status is 204 (a body-emitting transform there is protocol-incorrect —
+///   `204 No Content` MUST NOT carry a body; 304 is already outside the 2xx
+///   range checked above),
 /// - the synthetic body is empty (nothing to inspect/transform), or
-/// - no active plugin wants to buffer this response (`should_buffer_response_body`
-///   mirrors the per-request decision in [`should_stream_response_body`], whose
-///   `requires_response_body_buffering()` capability acts as the O(1) upper
-///   bound). This keeps preflight/mock-heavy proxies from paying three extra
+/// - no active plugin wants to buffer this response. We mirror the normal
+///   response path's two-tier gate exactly: a plugin's per-request
+///   `should_buffer_response_body(ctx)` is only consulted when that plugin
+///   advertised the config-time `requires_response_body_buffering()` capability
+///   upper bound (the documented precondition on
+///   [`Plugin::should_buffer_response_body`], and the same ordering
+///   [`should_stream_response_body`] uses). This both honors the capability
+///   contract and keeps preflight/mock-heavy proxies from paying three extra
 ///   async plugin sweeps per request.
+///
+/// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
 fn should_apply_synthetic_response_body_hooks(
     status_code: u16,
     is_grpc_request: bool,
@@ -11363,11 +11370,10 @@ fn should_apply_synthetic_response_body_hooks(
     !is_grpc_request
         && (200..300).contains(&status_code)
         && status_code != 204
-        && status_code != 304
         && !response_body.is_empty()
-        && plugins
-            .iter()
-            .any(|plugin| plugin.should_buffer_response_body(ctx))
+        && plugins.iter().any(|plugin| {
+            plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
+        })
 }
 
 async fn apply_synthetic_response_body_hooks(
@@ -11449,6 +11455,35 @@ async fn apply_synthetic_response_body_hooks(
             reject,
         )
         .await;
+    }
+}
+
+/// Run the rejection-response plugin pipeline over a plugin short-circuit:
+/// the `after_proxy` reject hooks (`applies_after_proxy_on_reject()`) followed
+/// by the synthetic response-body guardrail/transform hooks when the gate in
+/// [`should_apply_synthetic_response_body_hooks`] is satisfied.
+///
+/// This is the shared core used by both the H1/H2/HBONE rejection path
+/// ([`finalize_reject_response_with_after_proxy_hooks`]) and the HTTP/3
+/// `before_proxy` rejection path, so AI guardrails (`ai_response_guard` /
+/// `ai_semantic_firewall`) see synthetic 2xx bodies (e.g. `ai_federation` /
+/// `ai_semantic_cache` hits surfaced via `RejectBinary{200}`) identically
+/// across all frontends. It mutates `status`, `headers`, and `body` in place;
+/// any normalization of the final wire form (gRPC trailers, content-length) is
+/// the caller's responsibility.
+pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+    is_grpc_request: bool,
+) {
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
+    if !plugins.is_empty()
+        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
+    {
+        apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
 }
 
@@ -11728,25 +11763,15 @@ async fn finalize_reject_response_with_after_proxy_hooks(
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
     let mut response_body = body.to_vec();
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, response_status, &mut headers).await;
-    if !plugins.is_empty()
-        && should_apply_synthetic_response_body_hooks(
-            response_status,
-            is_grpc_request,
-            &response_body,
-            plugins,
-            ctx,
-        )
-    {
-        apply_synthetic_response_body_hooks(
-            plugins,
-            ctx,
-            &mut response_status,
-            &mut headers,
-            &mut response_body,
-        )
-        .await;
-    }
+    apply_reject_after_proxy_and_synthetic_body_hooks(
+        plugins,
+        ctx,
+        &mut response_status,
+        &mut headers,
+        &mut response_body,
+        is_grpc_request,
+    )
+    .await;
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
     normalize_reject_response(status, &response_body, &headers, is_grpc_request)
 }

@@ -3803,6 +3803,10 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 
 **Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted as they arrive. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
 
+**Cache hits are not charged**: When `ai_semantic_cache` serves a response from its cache (`X-Ai-Cache-Status: HIT`), no upstream model call occurred, so the limiter does not charge the cached body's tokens against the window. Cache misses (which do reach the provider) are charged normally. `ai_federation` synthetic responses, by contrast, *are* charged — they represent a real provider call — and are recorded once per limiter instance via the rejection-path `after_proxy` hook.
+
+**Multiple instances**: A proxy may carry several `ai_rate_limiter` instances with independent budgets (for example a per-consumer and a per-IP limiter). Each instance tracks and charges its own window independently, including for `ai_federation` synthetic responses.
+
 **Local-mode performance**: The sliding window keeps a running sum so each `current_usage()` call is amortised O(stale-evicted) rather than O(n) per request.
 
 ```yaml

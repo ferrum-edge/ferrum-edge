@@ -1069,10 +1069,14 @@ async fn test_federation_tokens_recorded_once_when_after_proxy_runs_twice() {
             .after_proxy(&mut ctx, 200, &mut response_headers)
             .await,
     );
+    // The idempotency flag is now scoped per limiter instance, so its key
+    // carries a budget-derived suffix (prefix:limit_by:window:limit:mode:provider).
+    let recorded_flag = ctx
+        .metadata
+        .iter()
+        .find(|(k, _)| k.starts_with("ai_ratelimit_federation_tokens_recorded"));
     assert_eq!(
-        ctx.metadata
-            .get("ai_ratelimit_federation_tokens_recorded")
-            .map(String::as_str),
+        recorded_flag.map(|(_, v)| v.as_str()),
         Some("true"),
         "first after_proxy run should mark federation tokens as recorded"
     );
@@ -1091,5 +1095,103 @@ async fn test_federation_tokens_recorded_once_when_after_proxy_runs_twice() {
         600,
         "federation tokens must be charged exactly once even when after_proxy \
          runs twice for a blocked synthetic response"
+    );
+}
+
+#[tokio::test]
+async fn test_federation_flag_is_scoped_per_limiter_instance() {
+    // Regression: when a proxy has multiple ai_rate_limiter instances with
+    // distinct budgets (e.g. a per-consumer and a per-IP limiter), a single
+    // global idempotency flag let the first instance's recording suppress the
+    // others, so only the first budget was charged for an ai_federation
+    // response. The flag is now scoped per limiter instance so EACH budget
+    // records the federation tokens exactly once.
+    let consumer_limiter = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "consumer",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let ip_limiter = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // One request, shared ctx: ai_federation populated provider + token metadata.
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "openai".to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), "500".to_string());
+
+    // Both limiters run after_proxy over the same request (same ctx.metadata).
+    let mut h1 = HashMap::new();
+    assert_continue(consumer_limiter.after_proxy(&mut ctx, 200, &mut h1).await);
+    let mut h2 = HashMap::new();
+    assert_continue(ip_limiter.after_proxy(&mut ctx, 200, &mut h2).await);
+
+    // Each independent budget must have recorded the federation tokens once.
+    assert_eq!(
+        observed_usage(&consumer_limiter).await,
+        500,
+        "the consumer-scoped limiter must charge the federation tokens"
+    );
+    assert_eq!(
+        observed_usage(&ip_limiter).await,
+        500,
+        "the ip-scoped limiter must ALSO charge the federation tokens — the \
+         first limiter's idempotency flag must not suppress it"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_hit_is_not_charged_against_token_budget() {
+    // Regression: ai_semantic_cache cache hits are served from cache and never
+    // reach the upstream model, so they consume no provider tokens. Synthetic
+    // cache-hit bodies now flow through on_response_body (the response-body
+    // guardrail path); without a guard the cached body's tokens would be
+    // charged against the window, silently shrinking the effective budget.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    // ai_semantic_cache marks a hit on the request before the synthetic body is
+    // run back through the response hooks.
+    ctx.metadata
+        .insert("ai_cache_status".to_string(), "HIT".to_string());
+
+    // A cached OpenAI-style body that DOES carry a usage block — proving the
+    // skip is driven by the cache-HIT marker, not by an unparseable body.
+    let body = serde_json::to_vec(&json!({
+        "id": "x",
+        "object": "chat.completion",
+        "usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300}
+    }))
+    .unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "a cache HIT must not consume the token budget (no model call occurred)"
     );
 }

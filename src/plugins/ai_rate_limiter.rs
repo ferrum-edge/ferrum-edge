@@ -16,7 +16,14 @@ use super::utils::rate_limit::{
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
-const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
+/// Base prefix for the per-request idempotency flag that marks a federated
+/// synthetic response's tokens as already recorded. The full key is
+/// per-limiter-instance (see [`AiRateLimiter::federation_flag_key`]) so that
+/// multiple `ai_rate_limiter` instances on one proxy (e.g. a per-consumer and a
+/// per-IP budget) each record the federation tokens against their own window
+/// exactly once, instead of the first instance's flag suppressing the others.
+const FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX: &str =
+    "ai_ratelimit_federation_tokens_recorded";
 
 pub struct AiRateLimiter {
     token_limit: u64,
@@ -25,6 +32,11 @@ pub struct AiRateLimiter {
     limit_by: String,
     expose_headers: bool,
     provider: String,
+    /// Per-instance metadata key for the federation-tokens-recorded idempotency
+    /// flag. Derived from this limiter's budget-defining configuration so two
+    /// instances with distinct budgets get distinct flags, while instances that
+    /// share the same budget dimension correctly share one.
+    federation_flag_key: String,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
 }
 
@@ -85,6 +97,16 @@ impl AiRateLimiter {
             ));
         }
 
+        // Scope the per-request federation idempotency flag to this limiter's
+        // budget dimension. Two instances with distinct budgets
+        // (limit_by/window/limit/count_mode/provider) get distinct keys so each
+        // records the federation tokens against its own window exactly once;
+        // instances that share an identical budget share one flag, which is the
+        // correct behavior because they track the same window.
+        let federation_flag_key = format!(
+            "{FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX}:{limit_by}:{window_seconds}:{token_limit}:{count_mode}:{provider}"
+        );
+
         Ok(Self {
             token_limit,
             window_seconds,
@@ -92,6 +114,7 @@ impl AiRateLimiter {
             limit_by,
             expose_headers,
             provider,
+            federation_flag_key,
             limiter: RateLimitBackend::from_plugin_config(
                 "ai_rate_limiter",
                 config,
@@ -447,17 +470,13 @@ impl Plugin for AiRateLimiter {
         // consumer (and could push a *blocked* response over the limit). Skip
         // when the federation-tokens flag is already set and set it only after
         // a successful first recording. `on_response_body` reads the same flag.
-        if !ctx
-            .metadata
-            .contains_key(FEDERATION_TOKENS_RECORDED_METADATA_KEY)
+        if !ctx.metadata.contains_key(&self.federation_flag_key)
             && ctx.metadata.contains_key("ai_federation_provider")
             && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
         {
             self.record_usage(self.rate_key(ctx), tokens).await;
-            ctx.metadata.insert(
-                FEDERATION_TOKENS_RECORDED_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
+            ctx.metadata
+                .insert(self.federation_flag_key.clone(), "true".to_string());
         }
 
         if !self.expose_headers {
@@ -487,9 +506,27 @@ impl Plugin for AiRateLimiter {
     ) -> PluginResult {
         if ctx
             .metadata
-            .get(FEDERATION_TOKENS_RECORDED_METADATA_KEY)
+            .get(&self.federation_flag_key)
             .is_some_and(|value| value == "true")
         {
+            return PluginResult::Continue;
+        }
+
+        // Do not charge tokens for `ai_semantic_cache` cache hits. A HIT is
+        // served from cache and never reaches the upstream model, so it
+        // consumes no provider tokens. Synthetic cache-hit bodies now flow
+        // through `on_response_body` (the response-body guardrail path), so
+        // without this guard a cached response would be charged against the
+        // window even though no model call occurred — silently shrinking the
+        // effective budget. `ai_semantic_cache` sets this marker on every hit
+        // (`ai_semantic_cache.rs`); misses set it to "MISS" and are charged
+        // normally.
+        if ctx
+            .metadata
+            .get("ai_cache_status")
+            .is_some_and(|value| value == "HIT")
+        {
+            debug!("ai_rate_limiter: skipping cache HIT (no model tokens consumed)");
             return PluginResult::Continue;
         }
 
