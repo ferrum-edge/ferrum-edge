@@ -223,6 +223,7 @@ impl StatsdLogging {
             })?
             .to_string();
         let socket_host = parse_socket_host("statsd_logging", "host", &raw_host)?;
+        socket_host.screen_egress_ip("statsd_logging", "host", http_client.backend_allow_ips())?;
         let host = socket_host.dial_host.clone();
 
         let port = match config.get("port") {

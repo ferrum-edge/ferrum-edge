@@ -1463,8 +1463,17 @@ impl AdminResource for PluginConfig {
         self.normalize_fields();
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
-        self.validate_fields().map_err(ValidationError::Fields)
+    fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+        self.validate_fields().map_err(ValidationError::Fields)?;
+        // A mesh_route_dispatch rule can override a matched request's backend to
+        // an arbitrary literal IP; screen those against the egress policy here so
+        // a direct/batch plugin write can't smuggle in a denied (e.g.
+        // cloud-metadata) destination the whole-config loaders reject.
+        if self.plugin_name == "mesh_route_dispatch" {
+            crate::plugins::screen_mesh_route_dispatch_egress(&self.config, ctx.backend_allow_ips)
+                .map_err(ValidationError::Fields)?;
+        }
+        Ok(())
     }
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {

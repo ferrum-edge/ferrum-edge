@@ -6411,24 +6411,12 @@ impl GatewayConfig {
                 if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
                     continue;
                 }
-                let Ok(dispatch_config) =
-                    crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
-                        &plugin.config,
-                    )
-                else {
-                    continue;
-                };
-                for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-                    let Some(host) = rule.destination.backend_host.as_deref() else {
-                        continue;
-                    };
-                    if let Ok(ip) = host.parse::<std::net::IpAddr>()
-                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
-                    {
-                        errors.push(format!(
-                            "PluginConfig '{}' mesh_route_dispatch.rules[{}].destination.backend_host IP {} denied by backend egress policy: {}",
-                            plugin.id, rule_idx, ip, reason
-                        ));
+                if let Err(errs) = crate::plugins::screen_mesh_route_dispatch_egress(
+                    &plugin.config,
+                    backend_allow_ips,
+                ) {
+                    for e in errs {
+                        errors.push(format!("PluginConfig '{}' {}", plugin.id, e));
                     }
                 }
             }

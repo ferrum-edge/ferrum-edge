@@ -79,6 +79,7 @@ impl TcpLogging {
             })?
             .to_string();
         let socket_host = parse_socket_host("tcp_logging", "host", &raw_host)?;
+        socket_host.screen_egress_ip("tcp_logging", "host", http_client.backend_allow_ips())?;
         let host = socket_host.dial_host.clone();
 
         let port = config

@@ -33,6 +33,12 @@ fn default_blocks_cloud_metadata_and_link_local() {
     assert!(!p.is_allowed(&ip("fd00:ec2::254")));
     assert!(p.is_allowed(&ip("fd00:ec2::1")));
     assert!(p.is_allowed(&ip("fd12:3456::1")));
+    // NAT64 well-known prefix (64:ff9b::/96) encoding the IPv4 metadata address
+    // must be blocked too (IPv6-only / NAT64 rebinding), while NAT64 of a public
+    // address stays allowed.
+    assert!(!p.is_allowed(&ip("64:ff9b::a9fe:a9fe"))); // 169.254.169.254
+    assert!(!p.is_allowed(&ip("64:ff9b::e000:1"))); // 224.0.0.1 (multicast)
+    assert!(p.is_allowed(&ip("64:ff9b::808:808"))); // 8.8.8.8
 }
 
 #[test]

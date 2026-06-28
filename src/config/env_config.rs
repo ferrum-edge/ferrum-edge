@@ -356,13 +356,31 @@ pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
             if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4()) {
                 return is_always_blocked_range(&std::net::IpAddr::V4(v4));
             }
+            // NAT64 well-known prefix (64:ff9b::/96): decode the embedded IPv4
+            // and apply the same baseline, so a NAT64-encoded metadata/multicast
+            // address (e.g. 64:ff9b::a9fe:a9fe for 169.254.169.254) cannot bypass
+            // the default block via an IPv6-only / NAT64 DNS answer (rebinding).
+            let segments = ip.segments();
+            if segments[0] == 0x0064
+                && segments[1] == 0xff9b
+                && segments[2] == 0
+                && segments[3] == 0
+                && segments[4] == 0
+                && segments[5] == 0
+            {
+                let [a, b] = segments[6].to_be_bytes();
+                let [c, d] = segments[7].to_be_bytes();
+                return is_always_blocked_range(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    a, b, c, d,
+                )));
+            }
             ip.is_unspecified()                     // ::
             // AWS EC2 IPv6 instance metadata (IMDSv6) lives at fd00:ec2::254,
             // inside the otherwise-allowed ULA range (fc00::/7) — block the
             // exact metadata host so the IPv6 IMDS SSRF pivot is closed by
             // default while ordinary ULA backends stay reachable.
-            || ip.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
-            || (ip.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+            || segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
             || ip.is_multicast() // ff00::/8
         }
     }

@@ -387,3 +387,28 @@ async fn test_tcp_logging_warmup_skips_ip_literals() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_metadata_host_under_default_policy() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    // A socket log sink dials its `host` directly (not via the policy-screened
+    // HTTP client), so the default dangerous-range baseline must reject a
+    // metadata host at config-load time.
+    let client = PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid policy"),
+    );
+    let err = match TcpLogging::new(&json!({"host": "169.254.169.254", "port": 9000}), client) {
+        Ok(_) => panic!("metadata host must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("169.254.169.254") && err.contains("backend egress policy"),
+        "got: {err}"
+    );
+
+    // A loopback sink (local agent) still constructs under the default policy.
+    let client = PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid policy"),
+    );
+    assert!(TcpLogging::new(&json!({"host": "127.0.0.1", "port": 9000}), client).is_ok());
+}

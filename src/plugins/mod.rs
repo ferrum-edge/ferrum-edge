@@ -3307,8 +3307,52 @@ pub fn validate_plugin_config_with_policy(
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
     match create_plugin_with_http_client(name, config, http_client)? {
-        Some(_) => Ok(()),
+        Some(_) => {
+            // The HTTP-endpoint screen above does not cover a plugin's own
+            // literal-IP backend fields that aren't dialed through the shared
+            // client (mesh_route_dispatch route destinations).
+            if name == "mesh_route_dispatch"
+                && let Err(errs) = screen_mesh_route_dispatch_egress(config, backend_allow_ips)
+            {
+                return Err(errs.join("; "));
+            }
+            Ok(())
+        }
         None => Err(format!("Unknown plugin name '{}'", name)),
+    }
+}
+
+/// Screen a `mesh_route_dispatch` plugin's per-rule `destination.backend_host`
+/// literal IPs against the backend egress policy. A route override can point a
+/// matched request at an arbitrary backend, so a denied address (e.g.
+/// `169.254.169.254`) must be rejected at config-admission time — not only in
+/// whole-config validation but on direct/batch admin plugin writes too.
+/// Returns prefix-free messages; no-op for configs that don't parse as
+/// mesh_route_dispatch (shape errors are surfaced by the constructor).
+pub fn screen_mesh_route_dispatch_egress(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), Vec<String>> {
+    let Ok(dispatch_config) =
+        crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(config)
+    else {
+        return Ok(());
+    };
+    let mut errors = Vec::new();
+    for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+        if let Some(host) = rule.destination.backend_host.as_deref()
+            && let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            errors.push(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].destination.backend_host IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 

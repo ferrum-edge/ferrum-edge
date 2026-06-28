@@ -1220,6 +1220,11 @@ async fn validate_bundle(
         if let Err(e) = upstream.validate_operator_provided_fields() {
             upstream_errors.extend(e);
         }
+        // Screen literal-IP targets against the egress policy, same as direct
+        // upstream admin writes and the file/db loaders.
+        if let Err(e) = upstream.validate_backend_egress_ips(&state.backend_allow_ips) {
+            upstream_errors.extend(e);
+        }
         if !upstream_errors.is_empty() {
             failures.push(ValidationFailure {
                 resource_type: "upstream",
@@ -1238,6 +1243,11 @@ async fn validate_bundle(
 
         // validate_fields covers scheme, port, listen_path regex, etc.
         if let Err(e) = proxy.validate_fields() {
+            proxy_errors.extend(e);
+        }
+        // Screen literal-IP backend_host / dns_override against the egress
+        // policy, same as direct proxy admin writes and the file/db loaders.
+        if let Err(e) = proxy.validate_backend_egress_ips(&state.backend_allow_ips) {
             proxy_errors.extend(e);
         }
         // Host entry validation
