@@ -808,8 +808,13 @@ fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bo
         }
     }
 
-    obj.iter()
-        .any(|(key, value)| !value.is_null() && aliases.contains(key.to_lowercase().as_str()))
+    // Default config carries no aliases: the fixed-field check above already
+    // covered the work, so skip the per-key lowercase allocation entirely. Only
+    // when an operator opts into aliases do we pay the case-insensitive scan.
+    !aliases.is_empty()
+        && obj
+            .iter()
+            .any(|(key, value)| !value.is_null() && aliases.contains(key.to_lowercase().as_str()))
 }
 
 /// Checks whether any entry of a message/content array carries a system-prompt
