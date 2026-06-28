@@ -720,6 +720,7 @@ pub(crate) async fn handle_h3_websocket(
             state.max_websocket_frame_size_bytes,
             state.websocket_write_buffer_size,
             ws_idle_tracker.clone(),
+            Some(&state.dns_cache),
         )
         .await
         {

@@ -689,6 +689,34 @@ impl PluginHttpClient {
         let url = request.url().to_string();
         let log_url = log_url_override.unwrap_or(&url).to_string();
         let method = request.method().clone();
+
+        // reqwest skips the custom `DnsCacheResolver` for an IP-literal host
+        // (there is nothing to resolve), so a denied literal endpoint
+        // (`http://169.254.169.254/...`) would otherwise be dialed unscreened.
+        // Enforce the backend egress policy here — the single runtime chokepoint
+        // for every plugin that dials through the shared client. A denied
+        // destination is surfaced to the plugin as a 502 (not dialed).
+        let literal_ip = match request.url().host() {
+            Some(url::Host::Ipv4(addr)) => Some(std::net::IpAddr::V4(addr)),
+            Some(url::Host::Ipv6(addr)) => Some(std::net::IpAddr::V6(addr)),
+            _ => None,
+        };
+        if let Some(ip) = literal_ip
+            && let Some(reason) = self.backend_allow_ips.deny_reason(&ip)
+        {
+            tracing::warn!(
+                plugin = label,
+                url = %log_url,
+                reason,
+                "Plugin egress policy denied literal-IP endpoint; not dialing"
+            );
+            let mut denied = http::Response::new(reqwest::Body::from(
+                r#"{"error":"endpoint blocked by backend egress policy"}"#,
+            ));
+            *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
+            return Ok(reqwest::Response::from(denied));
+        }
+
         let total_start = std::time::Instant::now();
         let retry_template = request.try_clone();
         let can_retry = self.max_retries > 0

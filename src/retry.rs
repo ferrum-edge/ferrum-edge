@@ -520,6 +520,12 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     if is_port_exhaustion_message(error_str) || is_port_exhaustion_message(debug_str) {
         return Some(ErrorClass::PortExhaustion);
     }
+    // Gateway-side egress-policy rejection (e.g. a literal-IP WebSocket backend
+    // blocked before any dial). This is a distinct, non-retryable, backend-
+    // health-neutral dispatch class — not a connect/DNS/TLS transport failure.
+    if error_str.contains("egress policy") {
+        return Some(ErrorClass::DispatchPolicyRejected);
+    }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
         return Some(ErrorClass::ConnectionTimeout);
     }
@@ -1082,6 +1088,23 @@ mod tests {
                  must respect retry_on_methods"
             );
         }
+    }
+
+    #[test]
+    fn egress_policy_denial_classifies_as_dispatch_policy_rejected() {
+        // A gateway-side egress-policy rejection (e.g. a denied literal-IP
+        // WebSocket backend) is surfaced as a boxed error whose message contains
+        // "egress policy". It must classify as the non-retryable, backend-health-
+        // neutral DispatchPolicyRejected class — NOT a connect/DNS/TLS transport
+        // failure that would replay under retry_on_connect_failure.
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            "backend egress policy denied literal-IP WebSocket backend 169.254.169.254: \
+             link-local / cloud metadata range"
+                .into();
+        let class = super::classify_boxed_setup_error(err.as_ref());
+        assert_eq!(class, ErrorClass::DispatchPolicyRejected);
+        // request_reached_wire == true → ws_is_pre_wire == false → no retry.
+        assert!(request_reached_wire(class));
     }
 
     #[test]

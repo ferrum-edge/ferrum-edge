@@ -821,6 +821,11 @@ impl HealthChecker {
         let probe_global_cert = self.global_backend_tls_client_cert_path.clone();
         let probe_global_key = self.global_backend_tls_client_key_path.clone();
         let probe_no_verify = self.global_tls_no_verify;
+        // Screen the probe target against the backend egress policy so active
+        // health checks never dial a denied address (an SSRF/port-scan vector via
+        // the health probe). reqwest skips the resolver for IP literals and the
+        // TCP/UDP/gRPC probes connect directly, so screen the literal here.
+        let probe_egress_policy = self.dns_cache.as_ref().map(|c| c.backend_allow_ips());
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -844,26 +849,46 @@ impl HealthChecker {
                     .clone();
 
                 let probe_start = std::time::Instant::now();
-                let probe_success = match probe_type {
-                    HealthProbeType::Http => {
-                        http_probe(&client, &url, timeout, &healthy_status_codes).await
-                    }
-                    HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
-                    HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
-                    HealthProbeType::Grpc => {
-                        grpc_probe(
-                            &host,
-                            port,
-                            timeout,
-                            use_tls,
-                            &grpc_service_name,
-                            &probe_tls_config,
-                            probe_global_ca.as_deref(),
-                            probe_global_cert.as_deref(),
-                            probe_global_key.as_deref(),
-                            probe_no_verify,
-                        )
-                        .await
+                // A target whose literal IP is denied by the egress policy is
+                // never dialed; treat it as a failed probe (unhealthy) instead.
+                let egress_denied = probe_egress_policy.as_ref().and_then(|policy| {
+                    let bare = host
+                        .strip_prefix('[')
+                        .and_then(|h| h.strip_suffix(']'))
+                        .unwrap_or(host.as_str());
+                    bare.parse::<std::net::IpAddr>()
+                        .ok()
+                        .and_then(|ip| policy.deny_reason(&ip))
+                });
+                let probe_success = if let Some(reason) = egress_denied {
+                    warn!(
+                        target = %host,
+                        reason,
+                        "Health probe target blocked by backend egress policy; marking unhealthy without dialing"
+                    );
+                    false
+                } else {
+                    match probe_type {
+                        HealthProbeType::Http => {
+                            http_probe(&client, &url, timeout, &healthy_status_codes).await
+                        }
+                        HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
+                        HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
+                        HealthProbeType::Grpc => {
+                            grpc_probe(
+                                &host,
+                                port,
+                                timeout,
+                                use_tls,
+                                &grpc_service_name,
+                                &probe_tls_config,
+                                probe_global_ca.as_deref(),
+                                probe_global_cert.as_deref(),
+                                probe_global_key.as_deref(),
+                                probe_no_verify,
+                            )
+                            .await
+                        }
                     }
                 };
 

@@ -4631,6 +4631,38 @@ impl ProxyState {
         );
 
         self.backend_capabilities.retain_keys(&seen);
+
+        // Screen denied-literal probe targets: capability classification dials
+        // backends with reqwest/H2/H3 probes that skip the DnsCacheResolver for
+        // IP literals, so a blocked address (e.g. 169.254.169.254) would be
+        // probed at startup/reload even when a DB-sourced row only warned at
+        // load. Dropping it leaves the target `Unknown`, which routes via
+        // reqwest at dispatch and is rejected there by the same policy.
+        {
+            let egress_policy = &self.env_config.backend_allow_ips;
+            targets.retain(|target| {
+                let bare = target
+                    .host()
+                    .strip_prefix('[')
+                    .and_then(|h| h.strip_suffix(']'))
+                    .unwrap_or(target.host());
+                match bare
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .and_then(|ip| egress_policy.deny_reason(&ip))
+                {
+                    Some(reason) => {
+                        warn!(
+                            host = %target.host(),
+                            reason,
+                            "Skipping capability probe for egress-policy-denied backend"
+                        );
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
         targets
     }
 
@@ -5519,6 +5551,36 @@ impl ProxyState {
                 &mut http_candidates,
                 &mut https_candidates,
             );
+        }
+
+        // Drop any warmup candidate whose backend is a literal IP denied by the
+        // egress policy: startup must never issue a HEAD/capability probe to a
+        // blocked address (e.g. 169.254.169.254) even when a DB-sourced row only
+        // warned at load. Hostname candidates are screened at resolve time by the
+        // DnsCacheResolver plugged into every warmup client.
+        {
+            let egress_policy = &self.env_config.backend_allow_ips;
+            let denied_literal = |candidate: &ReqwestWarmupCandidate| -> bool {
+                let bare = candidate
+                    .host
+                    .strip_prefix('[')
+                    .and_then(|h| h.strip_suffix(']'))
+                    .unwrap_or(candidate.host.as_str());
+                bare.parse::<std::net::IpAddr>()
+                    .ok()
+                    .and_then(|ip| egress_policy.deny_reason(&ip))
+                    .inspect(|reason| {
+                        warn!(
+                            host = %candidate.host,
+                            port = candidate.port,
+                            reason,
+                            "Skipping warmup probe for egress-policy-denied backend"
+                        );
+                    })
+                    .is_some()
+            };
+            http_candidates.retain(|_, candidate| !denied_literal(candidate));
+            https_candidates.retain(|_, candidate| !denied_literal(candidate));
         }
 
         // Phase 1: capability refresh ‖ HTTP-only reqwest warmup. HTTP
@@ -7502,6 +7564,7 @@ async fn handle_websocket_request_authenticated(
                     state.max_websocket_frame_size_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
+                    Some(&state.dns_cache),
                 )
                 .await
                 .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
@@ -7533,6 +7596,13 @@ async fn handle_websocket_request_authenticated(
                 // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // A gateway-side egress-policy rejection (denied literal-IP
+                // backend) never reached a backend: it must be non-retryable AND
+                // neutral to backend health — no circuit-breaker trip and no
+                // backend-admission failure — matching the HTTP/H3
+                // DispatchPolicyRejected dispatch path.
+                let ws_egress_denied =
+                    matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
                 // handshake / port exhaustion). A backend that got the
@@ -7543,6 +7613,7 @@ async fn handle_websocket_request_authenticated(
                     ws_attempt < retry_config.max_retries
                         && retry_config.retry_on_connect_failure
                         && ws_is_pre_wire
+                        && !ws_egress_denied
                 } else {
                     false
                 };
@@ -7686,7 +7757,10 @@ async fn handle_websocket_request_authenticated(
                 // (the default), WS backend connect failures never fed the
                 // breaker at all on H1/H2, and an admitted probe slot leaked
                 // permanently.
-                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
+                if !cb_failure_already_recorded
+                    && !ws_egress_denied
+                    && let Some(cb_config) = &proxy.circuit_breaker
+                {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
@@ -7695,6 +7769,7 @@ async fn handle_websocket_request_authenticated(
                     cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
                 }
                 if !backend_outcome_already_recorded
+                    && !ws_egress_denied
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -8584,6 +8659,11 @@ pub(crate) async fn connect_websocket_backend(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
+    // When `Some`, the backend host is resolved through the gateway DNS cache so
+    // the egress policy is enforced on the *resolved* address (DNS-rebinding
+    // safe) and that exact IP is dialed. `None` (test helpers only) keeps OS
+    // resolution. Literal-IP backends are screened explicitly regardless.
+    dns_cache: Option<&crate::dns::DnsCache>,
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -8642,7 +8722,27 @@ pub(crate) async fn connect_websocket_backend(
         }
     });
     let connect_future = async {
-        let tcp = tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?;
+        // Resolve through the gateway DNS cache when available so the egress
+        // policy is enforced on the resolved address (a hostname that resolves —
+        // or rebinds — to a denied IP such as 169.254.169.254 fails here) and we
+        // dial that exact IP. The TLS connector still derives SNI from
+        // `ws_request` (the hostname), so dialing the IP is transparent.
+        let tcp = match dns_cache {
+            Some(cache) => {
+                let resolved_ip = cache
+                    .resolve(
+                        &dial_host,
+                        proxy.dns_override.as_deref(),
+                        proxy.dns_cache_ttl_seconds,
+                    )
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("WebSocket backend resolution failed for {dial_host}: {e}").into()
+                    })?;
+                tokio::net::TcpStream::connect((resolved_ip, dial_port)).await?
+            }
+            None => tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?,
+        };
         // Without nodelay, 70 KB WS messages hit Nagle + delayed-ACK
         // (~40 ms/msg); keepalive bounds dead-peer detection on idle
         // long-lived sessions.
@@ -17766,6 +17866,14 @@ fn denied_literal_backend_ip(
     host: &str,
     policy: &crate::config::BackendEgressPolicy,
 ) -> Option<&'static str> {
+    // Strip URI brackets: `build_backend_url_with_target` preserves bracketed
+    // IPv6 (`[fd00:ec2::254]`) and reqwest/gRPC/H3 treat that as an IP-literal
+    // authority that skips the DnsCacheResolver, so the bare address must still
+    // be screened.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     host.parse::<std::net::IpAddr>()
         .ok()
         .and_then(|ip| policy.deny_reason(&ip))
