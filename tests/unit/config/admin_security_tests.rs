@@ -131,7 +131,7 @@ fn test_admin_http_exposure_default_is_loopback() {
     // Default 127.0.0.1:9000 is not network-exposed.
     assert_eq!(
         EnvConfig::default().admin_http_exposure(),
-        AdminHttpExposure::LoopbackOrPrivate
+        AdminHttpExposure::Loopback
     );
 }
 
@@ -150,13 +150,31 @@ fn test_admin_http_exposure_disabled_when_port_zero() {
 }
 
 #[test]
-fn test_admin_http_exposure_loopback_and_private_are_safe() {
+fn test_admin_http_exposure_loopback_is_safe() {
+    // Only loopback (127.0.0.0/8, ::1) is reachable solely from within the host.
+    for bind in ["127.0.0.1", "127.0.0.5", "::1"] {
+        let config = EnvConfig {
+            admin_bind_address: bind.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.admin_http_exposure(),
+            AdminHttpExposure::Loopback,
+            "{bind} should classify as loopback"
+        );
+    }
+}
+
+#[test]
+fn test_admin_http_exposure_private_bind_is_reachable_not_safe() {
+    // Codex finding: a private/VPC/link-local interface IP is reachable by other
+    // hosts on that network, so it must NOT be treated as a safe loopback bind.
     for bind in [
-        "127.0.0.1",
-        "::1",
         "10.0.0.5",
         "192.168.1.10",
+        "172.16.0.9",
         "169.254.1.1",
+        "fc00::5",
     ] {
         let config = EnvConfig {
             admin_bind_address: bind.to_string(),
@@ -164,16 +182,16 @@ fn test_admin_http_exposure_loopback_and_private_are_safe() {
         };
         assert_eq!(
             config.admin_http_exposure(),
-            AdminHttpExposure::LoopbackOrPrivate,
-            "{bind} should classify as loopback/private"
+            AdminHttpExposure::ReachableUnrestricted,
+            "{bind} is reachable beyond loopback and must be guarded"
         );
     }
 }
 
 #[test]
-fn test_admin_http_exposure_unspecified_bind_is_public() {
-    // 0.0.0.0 / :: ("all interfaces") with no allowlist is the unrestricted-
-    // public posture the writable-mode guard protects against.
+fn test_admin_http_exposure_unspecified_bind_is_reachable() {
+    // 0.0.0.0 / :: ("all interfaces") with no allowlist is the unrestricted
+    // posture the writable-mode guard protects against.
     for bind in ["0.0.0.0", "::"] {
         let config = EnvConfig {
             admin_bind_address: bind.to_string(),
@@ -181,14 +199,14 @@ fn test_admin_http_exposure_unspecified_bind_is_public() {
         };
         assert_eq!(
             config.admin_http_exposure(),
-            AdminHttpExposure::PublicUnrestricted,
-            "{bind} should classify as unrestricted-public"
+            AdminHttpExposure::ReachableUnrestricted,
+            "{bind} should classify as reachable-unrestricted"
         );
     }
 }
 
 #[test]
-fn test_admin_http_exposure_public_with_allowlist() {
+fn test_admin_http_exposure_reachable_with_allowlist() {
     let config = EnvConfig {
         admin_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: "10.0.0.0/8".to_string(),
@@ -196,8 +214,8 @@ fn test_admin_http_exposure_public_with_allowlist() {
     };
     assert_eq!(
         config.admin_http_exposure(),
-        AdminHttpExposure::PublicAllowlisted,
-        "an allowlist downgrades the public posture"
+        AdminHttpExposure::ReachableAllowlisted,
+        "an allowlist downgrades the reachable posture"
     );
 }
 
@@ -209,7 +227,7 @@ fn test_admin_http_exposure_public_routable_ip_no_allowlist() {
     };
     assert_eq!(
         config.admin_http_exposure(),
-        AdminHttpExposure::PublicUnrestricted
+        AdminHttpExposure::ReachableUnrestricted
     );
 }
 
@@ -224,10 +242,7 @@ fn test_default_database_startup_is_safe() {
         mode: OperatingMode::Database,
         ..Default::default()
     };
-    assert_eq!(
-        config.admin_http_exposure(),
-        AdminHttpExposure::LoopbackOrPrivate
-    );
+    assert_eq!(config.admin_http_exposure(), AdminHttpExposure::Loopback);
     assert!(
         config.admin_insecure_plaintext_startup_error().is_none(),
         "default (loopback) database admin must start without any opt-in"
@@ -276,7 +291,7 @@ fn test_cp_mode_rejects_explicit_public_plaintext_admin() {
 #[test]
 fn test_escape_hatch_allows_public_plaintext_admin() {
     // FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true is the explicit dev opt-in: the
-    // posture is still PublicUnrestricted, but startup is permitted.
+    // posture is still ReachableUnrestricted, but startup is permitted.
     let config = EnvConfig {
         mode: OperatingMode::Database,
         admin_bind_address: "0.0.0.0".to_string(),
@@ -285,12 +300,28 @@ fn test_escape_hatch_allows_public_plaintext_admin() {
     };
     assert_eq!(
         config.admin_http_exposure(),
-        AdminHttpExposure::PublicUnrestricted,
+        AdminHttpExposure::ReachableUnrestricted,
         "escape hatch does not change the exposure classification"
     );
     assert!(
         config.admin_insecure_plaintext_startup_error().is_none(),
         "escape hatch permits startup"
+    );
+}
+
+#[test]
+fn test_database_mode_rejects_private_interface_plaintext_admin() {
+    // Codex finding: binding the writable admin to a private/VPC interface IP
+    // (reachable across the LAN) with no allowlist must be guarded just like a
+    // 0.0.0.0 bind — it is not a safe loopback posture.
+    let config = EnvConfig {
+        mode: OperatingMode::Database,
+        admin_bind_address: "10.0.0.5".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        config.admin_insecure_plaintext_startup_error().is_some(),
+        "private-interface plaintext admin in database mode must hard-fail"
     );
 }
 

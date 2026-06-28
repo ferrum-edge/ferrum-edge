@@ -1703,26 +1703,32 @@ pub struct EnvConfig {
 /// listener (`FERRUM_ADMIN_HTTP_PORT`).
 ///
 /// Used to gate startup (writable `database`/`cp` modes hard-fail on
-/// [`AdminHttpExposure::PublicUnrestricted`] unless
+/// [`AdminHttpExposure::ReachableUnrestricted`] unless
 /// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`) and to emit graded startup
 /// warnings. The admin HTTPS listener is a separate port and does not affect
 /// this classification — to serve admin TLS-only, disable plaintext with
 /// `FERRUM_ADMIN_HTTP_PORT=0`.
+///
+/// The safe boundary is **loopback only**. A private / VPC / link-local
+/// address (e.g. a pod or VM interface IP) is still reachable by other hosts on
+/// that network, so it is treated as exposed — binding the writable admin there
+/// in cleartext without an allowlist is a guarded posture, not a safe one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminHttpExposure {
     /// `FERRUM_ADMIN_HTTP_PORT=0` — no plaintext admin listener.
     Disabled,
-    /// Bound to a loopback / private / link-local address — not reachable from
-    /// outside the host or local segment.
-    LoopbackOrPrivate,
-    /// Bound to a publicly reachable address (incl. `0.0.0.0` / `::`) but
+    /// Bound to a loopback address (`127.0.0.0/8`, `::1`) — reachable only from
+    /// within the host/network namespace.
+    Loopback,
+    /// Bound to a non-loopback address reachable beyond the host (incl.
+    /// `0.0.0.0` / `::`, a public IP, or a private/VPC address) but
     /// `FERRUM_ADMIN_ALLOWED_CIDRS` restricts which source IPs may connect.
     /// Bearer tokens still traverse cleartext on this port.
-    PublicAllowlisted,
-    /// Bound to a publicly reachable address with no allowlist — the admin API
-    /// and any bearer tokens are exposed in cleartext on every matching
-    /// interface.
-    PublicUnrestricted,
+    ReachableAllowlisted,
+    /// Bound to a non-loopback address reachable beyond the host with no
+    /// allowlist — the admin API and any bearer tokens are exposed in cleartext
+    /// to every host that can route to that interface.
+    ReachableUnrestricted,
 }
 
 impl Default for EnvConfig {
@@ -3055,36 +3061,15 @@ impl EnvConfig {
         std::net::SocketAddr::new(ip, port)
     }
 
-    /// Whether `ip` could be reachable from outside the host — i.e. NOT
-    /// loopback, RFC1918 private, link-local, CGNAT, or other non-routable
-    /// space. The unspecified addresses `0.0.0.0` / `::` ("bind all
-    /// interfaces") count as publicly reachable.
-    pub(crate) fn admin_bind_may_be_publicly_reachable(ip: &std::net::IpAddr) -> bool {
-        if ip.is_unspecified() {
-            return true;
-        }
-        match ip {
-            std::net::IpAddr::V4(ip) => {
-                let octets = ip.octets();
-                !(ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || octets[0] == 0
-                    || (octets[0] == 100 && (octets[1] & 0xC0) == 64))
-            }
-            std::net::IpAddr::V6(ip) => {
-                !(ip.is_loopback()
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80
-                    || (ip.segments()[0] & 0xfe00) == 0xfc00)
-            }
-        }
-    }
-
     /// Classify the network exposure of the **plaintext** admin HTTP listener
     /// (`FERRUM_ADMIN_HTTP_PORT`). This is independent of whether an admin
     /// HTTPS listener is also configured: a TLS listener on the HTTPS port does
     /// not protect the separate plaintext HTTP port. To run admin TLS-only, set
     /// `FERRUM_ADMIN_HTTP_PORT=0`.
+    ///
+    /// Only a **loopback** bind is treated as safe. Any other bind — `0.0.0.0` /
+    /// `::`, a public IP, or a private/VPC/link-local interface address — is
+    /// reachable by other hosts on that network and is classified as exposed.
     pub fn admin_http_exposure(&self) -> AdminHttpExposure {
         if self.admin_http_port == 0 {
             return AdminHttpExposure::Disabled;
@@ -3092,15 +3077,18 @@ impl EnvConfig {
         // An unparseable bind address is rejected separately in `validate()`;
         // treat it as non-exposing here so this method never panics.
         let Ok(ip) = self.admin_bind_address.parse::<std::net::IpAddr>() else {
-            return AdminHttpExposure::LoopbackOrPrivate;
+            return AdminHttpExposure::Loopback;
         };
-        if !Self::admin_bind_may_be_publicly_reachable(&ip) {
-            return AdminHttpExposure::LoopbackOrPrivate;
+        // Loopback (127.0.0.0/8, ::1) is the only bind reachable solely from
+        // within the host. Everything else (unspecified/public/private/
+        // link-local) is reachable beyond loopback and must be protected.
+        if ip.is_loopback() {
+            return AdminHttpExposure::Loopback;
         }
         if self.admin_allowed_cidrs.trim().is_empty() {
-            AdminHttpExposure::PublicUnrestricted
+            AdminHttpExposure::ReachableUnrestricted
         } else {
-            AdminHttpExposure::PublicAllowlisted
+            AdminHttpExposure::ReachableAllowlisted
         }
     }
 
@@ -3122,7 +3110,7 @@ impl EnvConfig {
         ) {
             return None;
         }
-        if self.admin_http_exposure() != AdminHttpExposure::PublicUnrestricted {
+        if self.admin_http_exposure() != AdminHttpExposure::ReachableUnrestricted {
             return None;
         }
         if self.allow_insecure_admin_http {
@@ -3130,10 +3118,11 @@ impl EnvConfig {
         }
         Some(format!(
             "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
-             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', which is reachable beyond \
-             loopback, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The writable admin API \
-             and any operator bearer tokens would be served in cleartext on every matching \
-             interface. Choose one: \
+             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', a non-loopback address \
+             reachable beyond this host, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The \
+             writable admin API and any operator bearer tokens would be served in cleartext to \
+             every host that can route to it (a private/VPC interface IP is still LAN-reachable). \
+             Choose one: \
              (1) bind admin to loopback — FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1; \
              (2) restrict callers — FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>; \
              (3) serve admin over TLS and disable plaintext — set FERRUM_ADMIN_TLS_CERT_PATH \

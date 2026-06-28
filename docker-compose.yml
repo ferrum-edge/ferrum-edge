@@ -19,7 +19,7 @@ version: '3.9'
 #       FERRUM_ALLOW_INSECURE_ADMIN_HTTP: "true"    # required in database/cp modes
 #     ports:
 #       - "127.0.0.1:9000:9000"                     # publish to host loopback only
-# The gateway refuses to start a public plaintext admin listener in database/cp
+# The gateway refuses to start a non-loopback plaintext admin listener in database/cp
 # modes without this explicit opt-in. See docs/configuration.md (Admin API).
 services:
   # ============================================================================

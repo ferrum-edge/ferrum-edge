@@ -94,16 +94,19 @@ docker run -d --name ferrum-edge \
   ghcr.io/ferrum-edge/ferrum-edge:latest
 ```
 
-> **Admin API exposure.** The admin API is a management plane. The example binds
-> it to loopback inside the container and does **not** publish port 9000, so it
-> is not reachable from the network. In the writable `database`/`cp` modes the
-> gateway **refuses to start** if the plaintext admin listener is bound to a
-> public address (e.g. `0.0.0.0`) with no `FERRUM_ADMIN_ALLOWED_CIDRS`
-> allowlist. To expose admin, serve it over TLS
-> (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH`, publish `9443`, and
-> set `FERRUM_ADMIN_HTTP_PORT=0` to disable plaintext) or set an allowlist. For
-> throwaway local testing only, set `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` and
-> publish `127.0.0.1:9000:9000`.
+> **Admin API exposure.** The admin API is a management plane. Both admin
+> listeners (HTTP and HTTPS) bind to loopback (`127.0.0.1`) by default, so the
+> example does **not** publish port 9000 and admin is not reachable from the
+> network. In the writable `database`/`cp` modes the gateway **refuses to start**
+> if the plaintext admin listener is bound to a non-loopback address (`0.0.0.0`,
+> a public IP, or a private/VPC interface IP) with no `FERRUM_ADMIN_ALLOWED_CIDRS`
+> allowlist. To make admin reachable from outside the container you must set
+> `FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0` (or `::`) — loopback alone is not reachable
+> through a published port. Then either: (a) serve it over TLS
+> (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH`, publish `9443`, set
+> `FERRUM_ADMIN_HTTP_PORT=0` to disable plaintext) and/or set
+> `FERRUM_ADMIN_ALLOWED_CIDRS`; or (b) for throwaway local testing only, set
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` and publish `127.0.0.1:9000:9000`.
 
 See [docs/docker.md](docs/docker.md) for Docker Compose examples and production deployment.
 

@@ -67,7 +67,8 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 > and is **safe by default**: `FERRUM_ADMIN_BIND_ADDRESS` defaults to loopback
 > (`127.0.0.1`), so admin is not reachable from the network (the proxy
 > data-plane bind, `FERRUM_PROXY_BIND_ADDRESS`, still defaults to `0.0.0.0`). If
-> you move the admin API to a publicly reachable address (e.g. `0.0.0.0`/`::`),
+> you move the admin API to any non-loopback address (`0.0.0.0`/`::`, a public
+> IP, or a private/VPC interface IP — all reachable beyond this host),
 > the writable `database`/`cp` modes **refuse to start** while the plaintext
 > listener (`FERRUM_ADMIN_HTTP_PORT`, non-zero) has no `FERRUM_ADMIN_ALLOWED_CIDRS`
 > allowlist — otherwise the writable admin API and any operator bearer tokens

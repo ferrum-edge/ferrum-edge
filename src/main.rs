@@ -463,8 +463,8 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // remaining live postures (allowlisted, read-only modes, or the explicit
     // dev escape hatch).
     match env_config.admin_http_exposure() {
-        AdminHttpExposure::Disabled | AdminHttpExposure::LoopbackOrPrivate => {}
-        AdminHttpExposure::PublicAllowlisted => {
+        AdminHttpExposure::Disabled | AdminHttpExposure::Loopback => {}
+        AdminHttpExposure::ReachableAllowlisted => {
             warn!(
                 "Admin API plaintext HTTP listener (FERRUM_ADMIN_HTTP_PORT={}) is bound to {} \
                  (reachable beyond loopback). FERRUM_ADMIN_ALLOWED_CIDRS restricts which source \
@@ -474,7 +474,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 env_config.admin_http_port, env_config.admin_bind_address
             );
         }
-        AdminHttpExposure::PublicUnrestricted => {
+        AdminHttpExposure::ReachableUnrestricted => {
             // database/cp only reach here with FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true
             // (otherwise `validate()` already aborted startup). Read-only admin
             // modes (file/dp/mesh) are warned but allowed to start.
