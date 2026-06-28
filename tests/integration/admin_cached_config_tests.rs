@@ -136,6 +136,7 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
+        websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -247,7 +248,14 @@ async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sen
     let state_clone = state.clone();
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
-        let _ = serve_admin_on_listener(listener, state_clone, shutdown_rx_clone, None).await;
+        let _ = serve_admin_on_listener(
+            listener,
+            state_clone,
+            shutdown_rx_clone,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
 
     wait_for_admin_ready(actual_addr).await;

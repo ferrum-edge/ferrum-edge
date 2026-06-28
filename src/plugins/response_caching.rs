@@ -1532,6 +1532,29 @@ impl Plugin for ResponseCaching {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Synthetic short-circuit guard. When a request was short-circuited by a
+        // `before_proxy` plugin (including this plugin's own cache HIT/REVALIDATED
+        // surfaced via `RejectBinary`, an `ai_semantic_cache` hit, a
+        // `fault_injection`/`response_mock`/`serverless` abort, etc.), the
+        // synthetic body now flows back through the response-body hooks (the
+        // generic 2xx short-circuit path). Re-running the entire store path over a
+        // body that never came from the backend would take `accounting_guard()`,
+        // do a full body copy on every hit (a hot-path regression), and needlessly
+        // churn the vary index / uncacheable predictor — and for a served cache
+        // HIT the entry is already cached and unchanged, so there is nothing to
+        // store. `apply_synthetic_response_body_hooks` sets this marker only for
+        // the duration of the synthetic body-hook phase, so its presence is a
+        // precise signal; a genuine backend response (the only legitimate store /
+        // replacement path) never carries it and falls through to store normally.
+        // Mirrors `request_deduplication`'s synthetic short-circuit guard and
+        // `ai_semantic_cache`'s miss-only buffering key.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
+            return PluginResult::Continue;
+        }
+
         let base_key = match ctx.metadata.get(CACHE_BASE_KEY) {
             Some(base_key) => base_key.clone(),
             None => return PluginResult::Continue,
@@ -1790,6 +1813,98 @@ mod tests {
             method.to_string(),
             path.to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_restore_over_served_body() {
+        // Regression: synthetic 2xx short-circuit bodies (cache HITs surfaced
+        // via `RejectBinary{200}`) now flow back through the response-body
+        // hooks. Without the synthetic short-circuit guard in
+        // `on_final_response_body` every fresh hit would re-run the full store
+        // path over the body it just served (a lock + body copy hot-path
+        // regression). This asserts a HIT leaves the cached entry untouched.
+        let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+        // 1) MISS: store an entry.
+        let mut miss_ctx = make_ctx("GET", "/cached");
+        let mut miss_headers = miss_ctx.headers.clone();
+        let miss_result = plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await;
+        assert!(matches!(miss_result, PluginResult::Continue));
+        assert_eq!(
+            miss_ctx.metadata.get(CACHE_STATUS).map(String::as_str),
+            Some("MISS")
+        );
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut miss_ctx, 200, &response_headers, b"cached-A")
+            .await;
+        assert_eq!(plugin.cache.len(), 1, "miss should store exactly one entry");
+        let cache_key = plugin
+            .cache
+            .iter()
+            .next()
+            .map(|e| e.key().clone())
+            .expect("entry stored");
+        let stored_at_before = plugin
+            .cache
+            .get(&cache_key)
+            .map(|e| e.stored_at)
+            .expect("entry present");
+
+        // 2) HIT: a second request short-circuits with the cached body.
+        let mut hit_ctx = make_ctx("GET", "/cached");
+        let mut hit_headers = hit_ctx.headers.clone();
+        let hit_result = plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(
+            matches!(
+                hit_result,
+                PluginResult::RejectBinary {
+                    status_code: 200,
+                    ..
+                }
+            ),
+            "second request should be served from cache"
+        );
+        assert_eq!(
+            hit_ctx.metadata.get(CACHE_STATUS).map(String::as_str),
+            Some("HIT")
+        );
+
+        // 3) The synthetic-response-body path now re-runs on_final_response_body
+        // over the HIT body. In production `apply_synthetic_response_body_hooks`
+        // sets the synthetic short-circuit marker for the duration of this phase;
+        // replicate that here so the guard sees the same precise signal it does at
+        // runtime. Feed a DIFFERENT body to prove the guard prevents a re-store:
+        // if the entry were re-stored it would now hold the tampered body and a
+        // new stored_at.
+        hit_ctx.metadata.insert(
+            crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        let store_result = plugin
+            .on_final_response_body(&mut hit_ctx, 200, &response_headers, b"tampered-B")
+            .await;
+        assert!(matches!(store_result, PluginResult::Continue));
+
+        assert_eq!(
+            plugin.cache.len(),
+            1,
+            "HIT must not create or duplicate cache entries"
+        );
+        let entry = plugin.cache.get(&cache_key).expect("entry still present");
+        assert_eq!(
+            &entry.body[..],
+            b"cached-A".as_slice(),
+            "HIT must not overwrite the cached body"
+        );
+        assert_eq!(
+            entry.stored_at, stored_at_before,
+            "HIT must not advance stored_at (no re-store)"
+        );
     }
 
     #[tokio::test]

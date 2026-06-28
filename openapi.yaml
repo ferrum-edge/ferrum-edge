@@ -1301,6 +1301,14 @@ paths:
         Mesh mode adds identity and control-plane telemetry families for
         certificate expiry, rotation failures, CA health, trust-bundle
         versions, config freshness, and mTLS handshake failures.
+        The admin/management-plane connection limiter is always exposed:
+        `ferrum_admin_active_connections` (gauge of admin connections in
+        flight), `ferrum_admin_max_connections` and
+        `ferrum_admin_max_connections_per_ip` (configured caps, `0` =
+        unlimited), and
+        `ferrum_admin_rejected_connections_total{reason}` (admin connections
+        dropped by the cap, with `reason` one of `max_connections` /
+        `max_connections_per_ip`).
       tags: [Metrics]
       security:
         - bearerAuth: []
@@ -1316,6 +1324,12 @@ paths:
                 # HELP ferrum_requests_total Total number of requests processed
                 # TYPE ferrum_requests_total counter
                 ferrum_requests_total{proxy_id="my-api",method="GET",status_code="200"} 42
+                # HELP ferrum_admin_active_connections Admin/management-plane connections currently in flight.
+                # TYPE ferrum_admin_active_connections gauge
+                ferrum_admin_active_connections 3
+                # HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.
+                # TYPE ferrum_admin_rejected_connections_total counter
+                ferrum_admin_rejected_connections_total{reason="max_connections"} 0
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -5906,6 +5920,26 @@ components:
             in either direction, the connection is closed. When omitted, uses the global
             FERRUM_TCP_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to disable.
             Only applicable for tcp/tcp_tls protocols.
+        websocket_idle_timeout_seconds:
+          type: integer
+          format: uint64
+          nullable: true
+          minimum: 0
+          maximum: 86400
+          description: |
+            WebSocket relay idle timeout in seconds for upgraded sessions on this proxy
+            (HTTP-family proxies; applies to H1/H2/H3 frontends and both the frame-parsed
+            and tunnel-mode relays). The session closes only when neither direction
+            produces activity (frames, including Ping/Pong, or transport bytes) within the
+            window; activity from either side keeps it open. When omitted, uses the global
+            FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to
+            disable for this proxy (idle sessions then live forever, bounded only by
+            FERRUM_WEBSOCKET_MAX_CONNECTIONS). Maximum 86400 (24h).
+            HTTP/3 caveat: on QUIC frontends the transport idle timeout
+            FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies, so an idle H3
+            WebSocket is bounded by min(websocket_idle_timeout_seconds,
+            FERRUM_HTTP3_IDLE_TIMEOUT); raise FERRUM_HTTP3_IDLE_TIMEOUT to honor a
+            longer idle window on H3.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
@@ -13950,8 +13984,7 @@ components:
         on_error:
           type: string
           enum: [warn, allow, reject]
-          default: reject
-          description: Behavior when embedding/evaluation fails. In enforce mode this defaults to reject so required semantic evaluation fails closed; dry_run defaults to warn unless configured.
+          description: "Behavior when embedding/evaluation fails. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode defaults to reject (required semantic evaluation fails closed) while dry_run defaults to warn (provider outages are audited as would_warn, not would_reject). Tooling that materializes OpenAPI defaults must therefore leave this field unset to inherit the mode-appropriate default; sending an explicit reject for a dry_run config would skew rollout/audit telemetry."
         default_action:
           type: string
           enum: [reject, warn]
@@ -13960,8 +13993,7 @@ components:
         streaming_response:
           type: string
           enum: [skip, reject, buffer, inspect]
-          default: reject
-          description: Behavior for stream:true requests when response-side inspection is active. In enforce mode with response-side rules active, omitting this defaults to reject so clients cannot bypass response inspection by streaming; dry_run or request-only configurations default to skip. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject.
+          description: "Behavior for stream:true requests when response-side inspection is active. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode with response-side rules active defaults to reject (clients cannot bypass response inspection by streaming) while dry_run or request-only configurations default to skip. Tooling that materializes OpenAPI defaults must leave this field unset to inherit the correct default — sending an explicit reject for a dry_run/request-only config would flip request-body buffering on (requires_request_body_before_before_proxy) and buffer every JSON POST just to read the stream flag, unlike the omitted-field behavior. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject."
         streaming:
           type: object
           description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
@@ -14220,6 +14252,11 @@ components:
           type: boolean
           default: true
           description: Scope cache entries per consumer (authenticated consumer ID is included in the cache key). Default `true` — different consumers must not see each other's cached responses. Set `false` only on a public LLM proxy with no per-tenant data.
+        cache_multimodal:
+          type: string
+          enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
+          default: exact_only
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The runtime parser trims surrounding whitespace and is case-insensitive (e.g. `"Reject"`, `" exact_only "` are accepted), and `_`/`-` aliases are interchangeable; admin-API config validation runs through this lenient parser, not the schema `enum`. The `enum` lists only canonical/alias forms because JSON Schema cannot express case-insensitivity — strict schema validators may reject mixed-case or padded inputs the gateway itself accepts.
         semantic_similarity_enabled:
           type: boolean
           default: false
@@ -14366,6 +14403,10 @@ components:
           properties:
             block_system_prompts:
               const: true
+        - required: [strict_schema]
+          properties:
+            strict_schema:
+              const: true
         - required: [required_metadata_fields]
           properties:
             required_metadata_fields:
@@ -14373,7 +14414,7 @@ components:
       properties:
         max_tokens_limit:
           type: integer
-          description: Maximum allowed max_tokens value
+          description: Maximum allowed output-token request value across OpenAI and provider-native token fields
         enforce_max_tokens:
           type: string
           enum: [reject, clamp]
@@ -14381,7 +14422,16 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject max_tokens if not present
+          description: Inject a default output-token limit if no supported token field is present
+        supported_schema:
+          type: string
+          enum: [chat_completions, responses, provider_native, auto]
+          default: auto
+          description: Request schema family accepted when strict_schema is true
+        strict_schema:
+          type: boolean
+          default: false
+          description: Reject JSON request bodies that do not match supported_schema coverage
         allowed_models:
           type: array
           items:
@@ -14394,16 +14444,20 @@ components:
             type: string
           default: []
           description: Blacklist of model names (takes precedence over allowed)
+        require_model_for_model_policy:
+          type: boolean
+          default: true
+          description: Require a non-empty string model field when allowed_models or blocked_models is configured. Setting false only relaxes a genuinely-absent model; a present-but-invalid model (non-string or empty/whitespace) is still rejected with HTTP 400
         require_user_field:
           type: boolean
           default: false
           description: Require user field in request body
         max_messages:
           type: integer
-          description: Maximum messages in the messages array
+          description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total characters across messages
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, and document/RAG fields
         temperature_range:
           type: array
           items:
@@ -14415,13 +14469,23 @@ components:
         block_system_prompts:
           type: boolean
           default: false
-          description: "Reject requests with role: system messages"
+          description: Reject system/developer prompt fields and roles, including Responses instructions and provider-native top-level system fields
+        system_prompt_aliases:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Additional message roles or top-level fields treated as system prompts when block_system_prompts is true
         required_metadata_fields:
           type: array
           items:
             type: string
           default: []
           description: Required fields in request body
+        fail_on_uninspectable_body:
+          type: boolean
+          default: true
+          description: Reject JSON POST requests whose body cannot be inspected because the buffered body is missing, empty, non-UTF-8, malformed JSON, or still compressed after request transforms (no compression/decompress_request decoded it). Set false only for compatibility when the backend must handle such uninspectable bodies itself.
 
     AiRateLimiterConfig:
       type: object
@@ -14456,6 +14520,11 @@ components:
           type: string
           default: auto
           description: LLM provider format for token extraction
+        on_unmetered_response:
+          type: string
+          enum: [reject, charge_estimate, warn]
+          default: charge_estimate
+          description: Action for successful responses without usage metadata. charge_estimate keeps the pre-request reservation, reject returns a 502 and keeps the reservation, warn logs and releases the reservation.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -14646,7 +14715,7 @@ components:
 
     AiFederationConfig:
       type: object
-      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing non-streaming responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Streaming Chat Completions (`stream: true`) are intentionally unsupported for matched providers and return 501; there is no provider SSE normalization path. Config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation because they do not enable streaming. Supports priority-ordered fallback across providers. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing non-streaming responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Streaming Chat Completions (`stream: true`) are intentionally unsupported for matched providers and return 501; there is no provider SSE normalization path. Config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation because they do not enable streaming. Supports priority-ordered fallback across providers. Fails closed by default when a JSON POST body cannot be inspected, is missing a top-level string `model`, or no provider matches the requested model; pass-through requires explicit opt-in and can bypass AI gateway policy. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
@@ -14697,6 +14766,13 @@ components:
               default_model:
                 type: string
                 description: Model to send to the provider when no mapping matches.
+              multimodal_mode:
+                type: string
+                enum:
+                  - reject
+                  - translate
+                  - text_only_with_warning
+                description: "How this provider handles OpenAI Chat Completions content parts that are not text. Translated providers default to reject; OpenAI-compatible providers and Cohere default to translate. text_only_with_warning intentionally drops non-text parts and records ai_federation_multimodal_* metadata."
               connect_timeout_seconds:
                 type: integer
                 default: 5
@@ -14753,6 +14829,14 @@ components:
           type: boolean
           default: true
           description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
+        fail_on_missing_model:
+          type: boolean
+          default: true
+          description: Reject JSON POST requests whose body cannot be inspected as JSON or lacks a top-level string `model` field. Set to false only to explicitly pass such requests through to the normal backend.
+        fail_on_no_matching_provider:
+          type: boolean
+          default: true
+          description: Reject requests whose `model` does not match any configured provider. Set to false only to explicitly pass unsupported models through to the normal backend.
 
     A2aGatewayConfig:
       type: object

@@ -116,10 +116,9 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   core artifacts failed.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
-binary are produced by the root `Dockerfile` (also exercised by the
-`gateway-api-conformance` CI job's `docker build .`, and published as the
-`-ebpf` release variant by the `docker-ebpf` job in
-[`.github/workflows/release.yml`](../.github/workflows/release.yml)):
+binary are produced by the root `Dockerfile`'s `docker build .`, and published as
+the `-ebpf` release variant by the `docker-ebpf` job in
+[`.github/workflows/release.yml`](../.github/workflows/release.yml):
 
 - The `ebpf-builder` stage installs nightly + `rust-src` + `bpf-linker` and runs
   `cargo +nightly build -p ferrum-ebpf --target bpfel-unknown-none -Z build-std=core --release`

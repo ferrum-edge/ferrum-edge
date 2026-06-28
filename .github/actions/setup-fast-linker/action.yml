@@ -25,16 +25,39 @@ description: >-
       the LINKER config, so we point at a real binary (`cc` is a symlink
       to the default C compiler on every Linux distro).
 
+inputs:
+  install-linux-packages:
+    description: >-
+      Install mold + clang on Linux before configuring cargo. Set to false
+      when a parent setup action already installed/checks them in a combined
+      apt transaction.
+    required: false
+    default: "true"
+
 runs:
   using: composite
   steps:
     - name: Install mold + clang (Linux)
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && inputs.install-linux-packages == 'true'
       shell: bash
       continue-on-error: true
       run: |
+        set -euo pipefail
+        missing_packages=()
+        if ! command -v mold > /dev/null 2>&1; then
+          missing_packages+=(mold)
+        fi
+        if ! command -v clang > /dev/null 2>&1; then
+          missing_packages+=(clang)
+        fi
+
+        if [ "${#missing_packages[@]}" -eq 0 ]; then
+          echo "mold + clang already available"
+          exit 0
+        fi
+
         sudo apt-get update
-        sudo apt-get install -y mold clang
+        sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
 
     - name: Install lld (macOS)
       if: runner.os == 'macOS'

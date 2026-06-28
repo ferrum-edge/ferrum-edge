@@ -8,6 +8,12 @@ use std::collections::HashMap;
 
 use super::plugin_utils::create_test_context;
 
+// Marker set by the proxy on `ctx.metadata` while the response-body hooks run
+// over a synthetic 2xx plugin short-circuit body (mirrors
+// `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
+// therefore not reachable from this external test crate).
+const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
 fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
@@ -802,4 +808,77 @@ fn test_invalid_config_shapes_rejected() {
         let err = AiTokenMetrics::new(&config).err().unwrap();
         assert!(err.contains(needle), "needle={needle}, got: {err}");
     }
+}
+
+// ─── Synthetic short-circuit accounting guard ───────────────────────────────
+
+// Regression: a synthetic short-circuit 2xx body (an `ai_semantic_cache` hit, a
+// `response_mock` returning a canned chat-completion, a `serverless_function`
+// terminate, an `ai_federation` synthetic response, …) never reached the
+// upstream model, so its token usage must NOT be recorded. Even if the synthetic
+// body carries a provider-shaped `usage` block, charging it would inflate token
+// metrics / logging sinks / chargeback with phantom usage. The proxy sets the
+// synthetic marker for the duration of the response-body-hook phase.
+#[tokio::test]
+async fn synthetic_short_circuit_body_is_not_token_accounted() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    // Emulate the proxy marking the context before running the body hooks.
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let headers = json_headers();
+    // A canned OpenAI-shaped body that WOULD otherwise be accounted.
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150
+        }
+    }))
+    .unwrap();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    assert_continue(result);
+
+    // No token-usage metadata was written for the synthetic body.
+    assert!(
+        !ctx.metadata.contains_key("ai_total_tokens"),
+        "synthetic short-circuit body must not record token usage"
+    );
+    assert!(!ctx.metadata.contains_key("ai_provider"));
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_completion_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_model"));
+}
+
+// Control: a GENUINE backend response (no synthetic marker) with the same
+// provider-shaped body IS accounted. Guards against the synthetic skip
+// accidentally disabling normal token metrics.
+#[tokio::test]
+async fn genuine_response_is_token_accounted_without_synthetic_marker() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = json_headers();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150
+        }
+    }))
+    .unwrap();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "150");
+    assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "openai");
 }
