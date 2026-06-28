@@ -1415,8 +1415,7 @@ fn validate_multimodal_translate_support(
                 // public `http(s)` URLs, so those are rejected at the gate
                 // instead of producing an opaque provider rejection (502).
                 ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
-                    let url = image_url_value(part)?;
-                    classify_gemini_image_url(url)?;
+                    classify_gemini_image_url(part)?;
                 }
                 ProviderType::AwsBedrock => {
                     let url = image_url_value(part)?;
@@ -1617,26 +1616,28 @@ fn openai_content_to_gemini_parts(
                 }
             }
             Some("image_url") => {
-                let url = image_url_value(part)?;
                 // Data URLs inline as `inlineData`; `gs://` GCS URIs and Files
                 // API URIs pass through as `fileData.fileUri`; arbitrary public
                 // `http(s)` URLs are rejected (Gemini cannot fetch them and this
                 // plugin does not fetch/inline them). The policy gate normally
                 // catches an unsupported URL first; this keeps the translator
                 // honest if it is ever called on its own.
-                match classify_gemini_image_url(url).map_err(|e| format!("ai_federation: {e}"))? {
-                    GeminiImageRef::Inline(parsed) => {
+                match classify_gemini_image_url(part).map_err(|e| format!("ai_federation: {e}"))? {
+                    GeminiImageRef::Inline { parsed, mime_type } => {
                         out.push(json!({
                             "inlineData": {
-                                "mimeType": parsed.media_type,
+                                "mimeType": mime_type,
                                 "data": parsed.data
                             }
                         }));
                     }
-                    GeminiImageRef::FileUri(file_uri) => {
+                    GeminiImageRef::FileUri { uri, mime_type } => {
+                        // Google's `FileData` requires `mimeType` whenever
+                        // `fileUri` is set; emit the inferred type alongside it.
                         out.push(json!({
                             "fileData": {
-                                "fileUri": file_uri
+                                "mimeType": mime_type,
+                                "fileUri": uri
                             }
                         }));
                     }
@@ -1663,32 +1664,113 @@ fn openai_content_to_gemini_parts(
 
 /// How a Gemini/Vertex `image_url` should be translated.
 enum GeminiImageRef<'a> {
-    /// `data:` URL → inlined as `inlineData` (base64 bytes).
-    Inline(ParsedImageDataUrl<'a>),
+    /// `data:` URL → inlined as `inlineData` (base64 bytes). Carries the
+    /// validated/canonical Gemini `mimeType`.
+    Inline {
+        parsed: ParsedImageDataUrl<'a>,
+        mime_type: &'static str,
+    },
     /// `gs://` GCS URI or Files API URI → passed through as `fileData.fileUri`.
-    FileUri(&'a str),
+    /// Google's `FileData` requires `mimeType` whenever `fileUri` is set, so we
+    /// infer it from the URI's file extension.
+    FileUri {
+        uri: &'a str,
+        mime_type: &'static str,
+    },
 }
 
-/// Classify a Gemini/Vertex `image_url` value. Gemini `generateContent` accepts
-/// base64-inlined images (`inlineData`) and provider-fetchable URIs
+/// Classify a Gemini/Vertex `image_url` content part. Gemini `generateContent`
+/// accepts base64-inlined images (`inlineData`) and provider-fetchable URIs
 /// (`fileData.fileUri`): a `gs://` GCS URI or a Files API URI
 /// (`https://generativelanguage.googleapis.com/v1beta/files/...`). It does NOT
 /// fetch arbitrary public `http(s)` URLs, and this plugin never fetches/inlines
 /// them either, so those are rejected.
-fn classify_gemini_image_url(url: &str) -> Result<GeminiImageRef<'_>, String> {
+///
+/// For both forms the MIME type is validated/derived here so the gate (a clean
+/// 400) is the single source of truth: an inline data URL with an unsupported
+/// type (e.g. `image/svg+xml`) and a `fileData` URI whose `mimeType` cannot be
+/// determined are rejected before dispatch instead of producing an opaque
+/// upstream 400 the default fallback never retries.
+///
+/// For `fileData` URIs the `mimeType` is resolved from (1) an explicit
+/// `image_url.mime_type` field on the part, else (2) the URI's file extension.
+/// Files API URIs (`files/abc123`) carry no extension, so callers reference them
+/// by adding `mime_type` to the `image_url` object.
+fn classify_gemini_image_url(part: &Value) -> Result<GeminiImageRef<'_>, String> {
+    let url = image_url_value(part)?;
     if url.starts_with("data:") {
-        return parse_image_data_url(url)
-            .map(GeminiImageRef::Inline)
-            .map_err(|e| {
-                format!("Gemini/Vertex image translation: invalid image_url data URL: {e}")
-            });
+        let parsed = parse_image_data_url(url).map_err(|e| {
+            format!("Gemini/Vertex image translation: invalid image_url data URL: {e}")
+        })?;
+        let mime_type = gemini_image_mime_type(parsed.media_type)?;
+        return Ok(GeminiImageRef::Inline { parsed, mime_type });
     }
     if url.starts_with("gs://") || is_gemini_files_api_uri(url) {
-        return Ok(GeminiImageRef::FileUri(url));
+        let mime_type = gemini_file_uri_mime_type(part, url)?;
+        return Ok(GeminiImageRef::FileUri {
+            uri: url,
+            mime_type,
+        });
     }
     Err(format!(
         "Gemini/Vertex image translation only supports image_url data URLs, gs:// GCS URIs, or Files API URIs (arbitrary remote URL '{url}' is not fetched/inlined)"
     ))
+}
+
+/// Gemini's `generateContent` vision input accepts a limited set of image MIME
+/// types. Returns the canonical `mimeType` string to send upstream, or an error
+/// for anything else (e.g. `image/svg+xml`, `image/bmp`, `image/tiff`).
+fn gemini_image_mime_type(media_type: &str) -> Result<&'static str, String> {
+    match media_type {
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg"),
+        "image/png" => Ok("image/png"),
+        "image/webp" => Ok("image/webp"),
+        "image/heic" => Ok("image/heic"),
+        "image/heif" => Ok("image/heif"),
+        other => Err(format!(
+            "ai_federation: unsupported Gemini image media type '{other}' (expected jpeg, png, webp, heic, or heif)"
+        )),
+    }
+}
+
+/// Resolve the Gemini `fileData.mimeType` for a `gs://`/Files API URI. Google's
+/// `FileData` requires `mimeType` whenever `fileUri` is set, but the URI itself
+/// carries no declared type, so it is resolved from an explicit
+/// `image_url.mime_type` field first, then the URI's file extension. When
+/// neither is available (e.g. an extensionless Files API URI without an explicit
+/// `mime_type`) the request is rejected at the gate rather than emitting a
+/// `fileData` block the provider rejects.
+fn gemini_file_uri_mime_type(part: &Value, uri: &str) -> Result<&'static str, String> {
+    if let Some(explicit) = part
+        .get("image_url")
+        .and_then(Value::as_object)
+        .and_then(|image_url| image_url.get("mime_type"))
+        .and_then(Value::as_str)
+    {
+        return gemini_image_mime_type(explicit);
+    }
+
+    // Strip any query/fragment, then take the segment after the last '.'.
+    let path = uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(uri)
+        .trim_end_matches('/');
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.rsplit_once('.').map(|(_, ext)| ext))
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => Ok("image/jpeg"),
+        Some("png") => Ok("image/png"),
+        Some("webp") => Ok("image/webp"),
+        Some("heic") => Ok("image/heic"),
+        Some("heif") => Ok("image/heif"),
+        _ => Err(format!(
+            "Gemini/Vertex image translation: cannot determine a supported image mimeType for fileData URI '{uri}' (add an explicit image_url.mime_type, or use a .jpg/.jpeg/.png/.webp/.heic/.heif extension)"
+        )),
+    }
 }
 
 /// True for a Gemini Files API URI, e.g.

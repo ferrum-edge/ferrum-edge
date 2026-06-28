@@ -1014,16 +1014,89 @@ fn test_gate_anthropic_accepts_supported_data_url_media_types() {
 #[test]
 fn test_gate_gemini_accepts_gs_and_files_api_uris() {
     // Gemini/Vertex CAN fetch `gs://` GCS URIs and Files API URIs, so the gate
-    // must preserve them (translated to fileData.fileUri), not reject them.
+    // must preserve them (translated to fileData.fileUri), not reject them. The
+    // `mimeType` required on `fileData` is resolved from the URI extension
+    // (`cat.png`) or, for an extensionless Files API URI, an explicit
+    // `image_url.mime_type` field.
+    for provider in ["google_gemini", "google_vertex"] {
+        // gs:// URI with an inferrable extension.
+        let body = image_part_request("gs://my-bucket/cat.png");
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test(provider, &body).is_ok(),
+            "{provider} should accept gs:// URI with inferrable extension at the gate"
+        );
+        // Extensionless Files API URI with an explicit mime_type.
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {
+                        "url": "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+                        "mime_type": "image/png"
+                    }}
+                ]
+            }]
+        });
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test(provider, &body).is_ok(),
+            "{provider} should accept Files API URI with explicit mime_type at the gate"
+        );
+    }
+}
+
+#[test]
+fn test_gate_gemini_rejects_file_uri_without_inferrable_mime() {
+    // An extensionless Files API URI with no explicit `image_url.mime_type`
+    // cannot have a `fileData.mimeType` set, and Google requires one whenever
+    // `fileUri` is present. Reject at the gate (clean 400) instead of emitting
+    // an invalid fileData block that the provider rejects (opaque 400).
+    for provider in ["google_gemini", "google_vertex"] {
+        let body =
+            image_part_request("https://generativelanguage.googleapis.com/v1beta/files/abc123");
+        let err = test_helpers::validate_multimodal_translate_support_test(provider, &body)
+            .expect_err(
+                "extensionless Files API URI without mime_type must be rejected at the gate",
+            );
+        assert!(
+            err.contains("cannot determine a supported image mimeType"),
+            "{provider} should reject unknowable fileData mimeType: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_gate_gemini_rejects_unsupported_inline_media_type() {
+    // Gemini only accepts a limited inline image MIME set. svg+xml/bmp/tiff pass
+    // the generic image/* check but must be rejected at the gate (clean 400)
+    // rather than emitted as inlineData and rejected upstream (opaque 400).
     for provider in ["google_gemini", "google_vertex"] {
         for url in [
-            "gs://my-bucket/cat.png",
-            "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+            "data:image/svg+xml;base64,aGVsbG8=",
+            "data:image/bmp;base64,aGVsbG8=",
+            "data:image/tiff;base64,aGVsbG8=",
+            "data:image/gif;base64,aGVsbG8=",
         ] {
             let body = image_part_request(url);
+            let err = test_helpers::validate_multimodal_translate_support_test(provider, &body)
+                .expect_err("unsupported Gemini inline media type must be rejected at the gate");
+            assert!(
+                err.contains("Gemini image media type"),
+                "{provider} should reject inline media type for {url}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_gate_gemini_accepts_supported_inline_media_types() {
+    for provider in ["google_gemini", "google_vertex"] {
+        for media in ["png", "jpeg", "jpg", "webp", "heic", "heif"] {
+            let body = image_part_request(&format!("data:image/{media};base64,aGVsbG8="));
             assert!(
                 test_helpers::validate_multimodal_translate_support_test(provider, &body).is_ok(),
-                "{provider} should accept supported remote URI {url} at the gate"
+                "{provider} should accept inline image/{media} at the gate"
             );
         }
     }
@@ -3256,7 +3329,8 @@ fn test_vertex_translate_data_url_to_inline_data() {
 #[test]
 fn test_gemini_translate_gs_uri_to_file_data() {
     // openai_content_to_gemini_parts: a `gs://` GCS URI passes through as
-    // fileData.fileUri (NOT inlineData, NOT a hard error).
+    // fileData.fileUri (NOT inlineData, NOT a hard error). The required
+    // `mimeType` is inferred from the URI extension (`cat.png` -> image/png).
     let body = translate_image_request("gemini-2.0-flash", "gs://my-bucket/cat.png");
     let (_, _, body_bytes) = test_helpers::translate_request_test(
         "google_gemini",
@@ -3268,15 +3342,30 @@ fn test_gemini_translate_gs_uri_to_file_data() {
     let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
     let parts = parsed["contents"][0]["parts"].as_array().unwrap();
     assert_eq!(parts[1]["fileData"]["fileUri"], "gs://my-bucket/cat.png");
+    // Google requires mimeType whenever fileUri is set.
+    assert_eq!(parts[1]["fileData"]["mimeType"], "image/png");
     assert!(parts[1].get("inlineData").is_none());
 }
 
 #[test]
 fn test_gemini_translate_files_api_uri_to_file_data() {
-    // openai_content_to_gemini_parts: a Files API URI passes through as
-    // fileData.fileUri.
+    // openai_content_to_gemini_parts: an extensionless Files API URI passes
+    // through as fileData.fileUri; the required `mimeType` comes from the
+    // explicit `image_url.mime_type` field (the URI carries no extension).
     let files_uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123";
-    let body = translate_image_request("gemini-2.0-flash", files_uri);
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {
+                    "url": files_uri,
+                    "mime_type": "image/jpeg"
+                }}
+            ]
+        }]
+    });
     let (_, _, body_bytes) = test_helpers::translate_request_test(
         "google_gemini",
         &body,
@@ -3287,6 +3376,7 @@ fn test_gemini_translate_files_api_uri_to_file_data() {
     let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
     let parts = parsed["contents"][0]["parts"].as_array().unwrap();
     assert_eq!(parts[1]["fileData"]["fileUri"], files_uri);
+    assert_eq!(parts[1]["fileData"]["mimeType"], "image/jpeg");
 }
 
 #[test]
