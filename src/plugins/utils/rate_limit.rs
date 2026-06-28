@@ -1615,6 +1615,123 @@ mod tests {
         assert!(!over.allowed);
     }
 
+    #[test]
+    fn ai_token_window_reserve_allows_then_denies_at_limit() {
+        // The `Reserve` op pre-charges the estimate against the window. A
+        // reservation that fits returns `allow` with the reserved usage folded
+        // into `usage`/`remaining`; the next reservation that would cross the
+        // limit must `deny` WITHOUT charging (usage/remaining unchanged from the
+        // pre-deny state) so the window is not corrupted by rejected attempts.
+        let algorithm = AiTokenRateAlgorithm::new(100, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let first = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 60 }, now);
+        assert!(first.allowed);
+        assert_eq!(first.limit, Some(100));
+        assert_eq!(first.window_seconds, Some(60));
+        assert_eq!(first.usage, Some(60));
+        assert_eq!(first.remaining, Some(40));
+
+        // 60 + 60 = 120 > 100 → deny. The deny outcome reports usage as the
+        // already-committed 60 (the new reservation is rejected, not applied).
+        let denied = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 60 }, now);
+        assert!(!denied.allowed);
+        assert_eq!(denied.usage, Some(60));
+        assert_eq!(denied.remaining, Some(40));
+
+        // The rejected reservation must not have been charged: a follow-up
+        // CheckBudget still shows only the committed 60.
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert!(budget.allowed);
+        assert_eq!(budget.usage, Some(60));
+        assert_eq!(budget.remaining, Some(40));
+
+        // A reservation that exactly fits the headroom is allowed.
+        let exact = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 40 }, now);
+        assert!(exact.allowed);
+        assert_eq!(exact.usage, Some(100));
+        assert_eq!(exact.remaining, Some(0));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_positive_delta_charges_more() {
+        // Reconciliation with a positive delta (actual > reserved) must add the
+        // shortfall to the window — exercising the `delta > 0` branch of
+        // `adjust_usage`.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        assert!(reserved.allowed);
+
+        // Actual usage came in 50 higher than the reservation.
+        algorithm.check_local(&mut state, &AiRateLimitOp::AdjustUsage { delta: 50 }, now);
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(150));
+        assert_eq!(budget.remaining, Some(850));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_zero_delta_is_noop() {
+        // A zero delta must leave the committed usage untouched (the
+        // `delta == 0` early-return branch of `adjust_usage`).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 200 }, now)
+                .allowed
+        );
+        algorithm.check_local(&mut state, &AiRateLimitOp::AdjustUsage { delta: 0 }, now);
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(200));
+        assert_eq!(budget.remaining, Some(800));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_partial_release_trims_last_entry() {
+        // A negative delta smaller than the most-recent entry must trim that
+        // entry in place rather than popping it — exercising the
+        // `*tokens > remaining_release` branch of `adjust_usage` (distinct from
+        // the over-release floor and full-entry pop paths).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        // Two separate reservations create two entries in the window.
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 70 }, now)
+                .allowed
+        );
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 80 }, now)
+                .allowed
+        );
+
+        // Release 30 < 80 (the last entry): only the last entry shrinks.
+        algorithm.check_local(&mut state, &AiRateLimitOp::AdjustUsage { delta: -30 }, now);
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(120));
+        assert_eq!(budget.remaining, Some(880));
+
+        // Releasing exactly the remainder of the last entry pops it, then trims
+        // into the first — drives both the pop and the trim branches in one go.
+        algorithm.check_local(&mut state, &AiRateLimitOp::AdjustUsage { delta: -60 }, now);
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(60));
+        assert_eq!(budget.remaining, Some(940));
+    }
+
     #[tokio::test]
     async fn local_http_limiter_denies_after_limit() {
         let limiter = LocalLimiter::new(HttpRateLimitAlgorithm::new(vec![RateLimitWindowSpec {

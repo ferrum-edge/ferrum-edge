@@ -335,6 +335,32 @@ pub struct RedisRateLimitClient {
     tls_ca_bundle_pem: Option<Vec<u8>>,
 }
 
+/// Pure floor-at-zero decision for [`RedisRateLimitClient::incrby_with_expire_floor_zero`].
+///
+/// Given the value observed after the primary `INCRBY`, return the compensating
+/// `INCRBY` delta needed to bring the counter back up to exactly zero, or `None`
+/// when the value is already non-negative (no compensation needed). The
+/// compensation is exactly `-new_total` so the corrective write fails only in
+/// the conservative (over-count) direction if a concurrent increment raced
+/// between our write and read — a rate limiter must never under-count usage.
+///
+/// Extracted as a free function so the floor logic is unit-testable without a
+/// live Redis server (the surrounding method is pure I/O).
+fn floor_zero_compensation(new_total: i64) -> Option<i64> {
+    if new_total >= 0 {
+        None
+    } else {
+        Some(new_total.saturating_neg())
+    }
+}
+
+/// Clamp the post-compensation total so callers never observe a negative usage,
+/// even if a concurrent decrement drove the counter back below zero between the
+/// compensating write and its read-back.
+fn clamp_floored_total(floored: i64) -> i64 {
+    floored.max(0)
+}
+
 impl RedisRateLimitClient {
     /// Create a new Redis rate limit client.
     ///
@@ -858,16 +884,16 @@ impl RedisRateLimitClient {
         ttl_seconds: u64,
     ) -> Result<i64, ()> {
         let new_total = self.incrby_with_expire(key, amount, ttl_seconds).await?;
-        if new_total >= 0 {
+        let Some(compensation) = floor_zero_compensation(new_total) else {
             return Ok(new_total);
-        }
+        };
 
         // Bring the counter back up to exactly zero, preserving the TTL.
         match self
-            .incrby_with_expire(key, new_total.saturating_neg(), ttl_seconds)
+            .incrby_with_expire(key, compensation, ttl_seconds)
             .await
         {
-            Ok(floored) => Ok(floored.max(0)),
+            Ok(floored) => Ok(clamp_floored_total(floored)),
             // The compensating write failed (Redis went away mid-operation).
             // `incrby_with_expire` already marked the client unavailable; report
             // the floored value so callers never observe a negative usage.
@@ -1176,5 +1202,46 @@ impl std::fmt::Debug for RedisRateLimitClient {
             .field("key_prefix", &self.config.key_prefix)
             .field("available", &self.available.load(Ordering::Relaxed))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_floored_total, floor_zero_compensation};
+
+    #[test]
+    fn floor_zero_compensation_skips_non_negative_totals() {
+        // A non-negative post-INCRBY value needs no correction: the floor
+        // helper must return `None` so the wrapper keeps the value as-is.
+        assert_eq!(floor_zero_compensation(0), None);
+        assert_eq!(floor_zero_compensation(1), None);
+        assert_eq!(floor_zero_compensation(i64::MAX), None);
+    }
+
+    #[test]
+    fn floor_zero_compensation_returns_exact_deficit_for_negative_totals() {
+        // A negative value must be compensated by exactly its negation so the
+        // counter returns to zero — never a blind SET that could clobber a
+        // concurrent positive increment.
+        assert_eq!(floor_zero_compensation(-1), Some(1));
+        assert_eq!(floor_zero_compensation(-500), Some(500));
+    }
+
+    #[test]
+    fn floor_zero_compensation_saturates_at_min() {
+        // `-i64::MIN` overflows; the helper must saturate to `i64::MAX` rather
+        // than panic on overflow.
+        assert_eq!(floor_zero_compensation(i64::MIN), Some(i64::MAX));
+    }
+
+    #[test]
+    fn clamp_floored_total_floors_negatives_at_zero() {
+        // After the compensating write, a value that still reads negative (a
+        // concurrent decrement raced the read-back) must clamp to zero so
+        // callers never observe a negative usage; non-negative values pass
+        // through unchanged.
+        assert_eq!(clamp_floored_total(-7), 0);
+        assert_eq!(clamp_floored_total(0), 0);
+        assert_eq!(clamp_floored_total(42), 42);
     }
 }
