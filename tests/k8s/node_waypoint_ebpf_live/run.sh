@@ -897,6 +897,7 @@ install_ferrum() {
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=false \
     --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
+    --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MODE=mesh \

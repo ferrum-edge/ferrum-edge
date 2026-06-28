@@ -107,7 +107,8 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=15 \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE="$CP_NAMESPACE" \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME="$DP_SERVICE_NAME" \
-    --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS"
+    --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS" \
+    --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 
   kubectl -n "$CP_NAMESPACE" rollout status deployment/ferrum-mesh-control-plane --timeout=180s
 }
@@ -151,6 +152,9 @@ spec:
               value: ${DP_GATEWAY_NAMESPACE}
             - name: FERRUM_DP_CP_GRPC_URLS
               value: http://ferrum-mesh-control-plane.${CP_NAMESPACE}.svc.cluster.local:50051
+            # Test harness: CP/DP gRPC config sync runs plaintext in-cluster.
+            - name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT
+              value: "true"
             - name: FERRUM_CP_DP_GRPC_JWT_SECRET
               value: ${JWT_SECRET}
             - name: FERRUM_ADMIN_JWT_SECRET
