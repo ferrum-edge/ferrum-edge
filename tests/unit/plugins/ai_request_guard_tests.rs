@@ -865,9 +865,8 @@ async fn grpc_plus_json_framed_body_skipped() {
     assert_continue(result);
     // No uninspectable-body bookkeeping should be recorded for skipped gRPC.
     assert!(
-        ctx.metadata
-            .get("ai_request_guard.uninspectable_body")
-            .is_none()
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body")
     );
 }
 
@@ -951,9 +950,8 @@ async fn gzip_encoded_body_skipped_not_rejected() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert!(
-        ctx.metadata
-            .get("ai_request_guard.uninspectable_body")
-            .is_none(),
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body"),
         "compressed bodies should be skipped before the uninspectable-body path"
     );
 }
