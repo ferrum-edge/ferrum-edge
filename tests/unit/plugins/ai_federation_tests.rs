@@ -836,6 +836,109 @@ fn test_translate_bedrock_preserves_multimodal_system_and_user_text() {
     assert_eq!(parsed["messages"][0]["content"][0]["text"], "task");
 }
 
+// ---------------------------------------------------------------------------
+// Multimodal `translate`-mode policy gate (the single source of HTTP 400 for
+// unsupported image parts — runs before any provider is dialed).
+// ---------------------------------------------------------------------------
+
+fn image_part_request(url: &str) -> Value {
+    json!({
+        "model": "test-model",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": url}}
+            ]
+        }]
+    })
+}
+
+#[test]
+fn test_gate_bedrock_accepts_supported_data_url_formats() {
+    for media in ["png", "jpeg", "gif", "webp"] {
+        let body = image_part_request(&format!("data:image/{media};base64,aGVsbG8="));
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test("aws_bedrock", &body).is_ok(),
+            "image/{media} data URL should pass the Bedrock gate"
+        );
+    }
+}
+
+#[test]
+fn test_gate_bedrock_rejects_unsupported_image_format() {
+    // svg+xml/bmp/tiff pass the generic `image/*` check but are rejected by
+    // `bedrock_image_format`. Validating at the gate keeps this a clean 400
+    // instead of a 502 from the later translation-error path.
+    for url in [
+        "data:image/svg+xml;base64,aGVsbG8=",
+        "data:image/bmp;base64,aGVsbG8=",
+        "data:image/tiff;base64,aGVsbG8=",
+    ] {
+        let body = image_part_request(url);
+        let err = test_helpers::validate_multimodal_translate_support_test("aws_bedrock", &body)
+            .expect_err("unsupported Bedrock image format must be rejected at the gate");
+        assert!(
+            err.contains("Bedrock image media type"),
+            "expected a Bedrock format error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_gate_bedrock_rejects_remote_http_image_url() {
+    let body = image_part_request("https://example.com/a.png");
+    assert!(
+        test_helpers::validate_multimodal_translate_support_test("aws_bedrock", &body).is_err(),
+        "Bedrock requires data URLs; remote URLs must be rejected at the gate"
+    );
+}
+
+#[test]
+fn test_gate_gemini_rejects_remote_http_image_url() {
+    // Gemini/Vertex `fileData` cannot fetch an arbitrary public URL, so the
+    // gate must reject http(s) image URLs rather than emitting a request the
+    // provider rejects (opaque 502).
+    for provider in ["google_gemini", "google_vertex"] {
+        for url in ["https://example.com/a.png", "http://example.com/a.png"] {
+            let body = image_part_request(url);
+            let err = test_helpers::validate_multimodal_translate_support_test(provider, &body)
+                .unwrap_err();
+            assert!(
+                err.contains("data URL"),
+                "{provider} should reject remote URL {url}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_gate_gemini_accepts_data_url_image() {
+    for provider in ["google_gemini", "google_vertex"] {
+        let body = image_part_request("data:image/png;base64,aGVsbG8=");
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test(provider, &body).is_ok(),
+            "{provider} should accept a base64 data URL image at the gate"
+        );
+    }
+}
+
+#[test]
+fn test_gate_anthropic_accepts_remote_and_data_url_images() {
+    // Anthropic's Messages API accepts both remote URL and data URL sources,
+    // so the gate must NOT reject http(s) for Anthropic.
+    for url in [
+        "https://example.com/a.png",
+        "data:image/png;base64,aGVsbG8=",
+    ] {
+        let body = image_part_request(url);
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test("anthropic", &body).is_ok(),
+            "Anthropic should accept image URL {url} at the gate"
+        );
+    }
+}
+
 #[test]
 fn test_translate_cohere() {
     let body = sample_openai_request();
@@ -1594,6 +1697,19 @@ fn multimodal_image_request(model: &str) -> Value {
     })
 }
 
+fn multimodal_data_url_request(model: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+            ]
+        }]
+    })
+}
+
 async fn mount_gemini_success(server: &MockServer) {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1685,11 +1801,11 @@ async fn translated_provider_rejects_image_url_by_default() {
 }
 
 #[tokio::test]
-async fn gemini_multimodal_translation_preserves_image_when_supported() {
+async fn gemini_multimodal_translation_preserves_data_url_image() {
     let server = MockServer::start().await;
     mount_gemini_success(&server).await;
     let plugin = gemini_plugin(&server, Some("translate"));
-    let body = multimodal_image_request("gemini-2.0-flash");
+    let body = multimodal_data_url_request("gemini-2.0-flash");
     let mut ctx = post_json_ctx(&body);
     let mut headers = json_headers();
 
@@ -1702,8 +1818,154 @@ async fn gemini_multimodal_translation_preserves_image_when_supported() {
     let outbound = first_received_json(&server).await;
     let parts = outbound["contents"][0]["parts"].as_array().unwrap();
     assert_eq!(parts[0]["text"], "What is in this image?");
-    assert_eq!(parts[1]["fileData"]["fileUri"], "https://example.com/a.png");
-    assert_eq!(parts[1]["fileData"]["mimeType"], "image/png");
+    // Data URLs translate to Gemini `inlineData`, not `fileData`.
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+    assert_eq!(parts[1]["inlineData"]["data"], "aGVsbG8=");
+    assert!(parts[1].get("fileData").is_none());
+}
+
+#[tokio::test]
+async fn gemini_multimodal_translate_rejects_remote_http_image_url() {
+    // Gemini `fileData` only accepts a Files API URI or `gs://` GCS URI, and the
+    // plugin does not fetch/inline remote images. A remote HTTP(S) `image_url`
+    // must therefore be rejected at the policy gate (clean 400) instead of
+    // producing a `fileData.fileUri` request the provider cannot fulfill.
+    let server = MockServer::start().await;
+    mount_gemini_success(&server).await;
+    let plugin = gemini_plugin(&server, Some("translate"));
+    let body = multimodal_image_request("gemini-2.0-flash");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            let message = parsed["error"]["message"].as_str().unwrap();
+            assert!(message.contains("data URL"), "got: {message}");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+
+    assert_no_provider_requests(&server).await;
+}
+
+async fn mount_openai_success(server: &MockServer) {
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Served by the fallback provider."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn multimodal_reject_provider_falls_through_to_translate_provider() {
+    // A mixed fallback list: provider1 (anthropic, default `reject`) cannot
+    // accept the image part, but provider2 (openai-compatible, `translate`)
+    // can. The per-provider multimodal rejection must NOT short-circuit the
+    // chain — it should fall through to provider2 exactly like a translation
+    // failure does, so the request is ultimately served.
+    let server = MockServer::start().await;
+    mount_openai_success(&server).await;
+    let config = json!({
+        "providers": [
+            {
+                "name": "anthropic-reject",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test",
+                "model_patterns": ["multi-*"],
+                "priority": 1
+            },
+            {
+                "name": "openai-translate",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "model_patterns": ["multi-*"],
+                "priority": 2,
+                "base_url": server.uri(),
+                "allow_plaintext": true
+            }
+        ]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = multimodal_image_request("multi-model");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(
+                status_code, 200,
+                "fallback provider should serve the multimodal request"
+            );
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["choices"][0]["message"]["content"],
+                "Served by the fallback provider."
+            );
+        }
+        other => panic!("expected fallback provider response (200), got {other:?}"),
+    }
+
+    // The image part was passed through to the openai-compatible provider.
+    let outbound = first_received_json(&server).await;
+    let content = outbound["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["type"], "image_url");
+}
+
+#[tokio::test]
+async fn multimodal_all_reject_providers_return_clean_400() {
+    // When EVERY matching provider declines the multimodal request at the
+    // policy gate and none is ever dialed, the caller receives a clean 400
+    // (not a generic 502).
+    let server = MockServer::start().await;
+    let config = json!({
+        "providers": [
+            {
+                "name": "anthropic-reject-1",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test",
+                "model_patterns": ["multi-*"],
+                "priority": 1
+            },
+            {
+                "name": "anthropic-reject-2",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test-2",
+                "model_patterns": ["multi-*"],
+                "priority": 2
+            }
+        ]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = multimodal_image_request("multi-model");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => {
+            assert_eq!(status_code, 400, "all-reject must surface a clean 400");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+    assert_no_provider_requests(&server).await;
 }
 
 #[tokio::test]

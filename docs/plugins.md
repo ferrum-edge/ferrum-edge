@@ -3319,6 +3319,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 Translated providers default to `reject` unless configured otherwise. OpenAI-compatible providers and Cohere default to `translate` because their outbound request shape preserves OpenAI-style content parts instead of flattening them.
 
+Multimodal capability is provider-specific, so a per-provider multimodal rejection (a `reject`-mode provider, or a `translate`-mode provider that cannot translate a specific part — e.g. AWS Bedrock with an HTTP(S) image URL or an unsupported image format) does **not** abort the fallback chain when `fallback_enabled` is set. The request falls through to the next matching provider exactly like a translation failure does, so a mixed list (e.g. a `reject`-mode provider followed by a `translate`-mode one) can still serve the image from the later provider. If **every** matching provider declines the request at the multimodal policy gate and no provider was ever dialed, the caller receives the final HTTP `400`.
+
 **Priority:** 2985
 
 **Supported providers:**
@@ -3332,9 +3334,9 @@ Translated providers default to `reject` unless configured otherwise. OpenAI-com
 | `openai`, `azure_openai`, `mistral`, `xai`, `deepseek`, `meta_llama`, `hugging_face` | `translate` | Sends OpenAI content parts unchanged; provider/model decides whether each part is supported. |
 | `cohere` | `translate` | Preserves OpenAI-style content parts in the Cohere v2 Chat request; provider/model decides whether each part is supported. |
 | `anthropic` | `reject` | Converts user/assistant `image_url` parts to Anthropic image blocks: HTTP(S) URLs use URL sources and data URLs use base64 sources. Non-text system/developer parts are rejected. |
-| `google_gemini` | `reject` | Converts user/assistant `image_url` parts to Gemini `fileData` for HTTP(S) URLs and `inlineData` for data URLs. Non-text system/developer parts are rejected. |
-| `google_vertex` | `reject` | Same Gemini `generateContent` request shape as `google_gemini`. Non-text system/developer parts are rejected. |
-| `aws_bedrock` | `reject` | Converts user/assistant data URL `image_url` parts to Bedrock Converse image blocks. HTTP(S) image URLs are rejected because Converse requires image bytes. Non-text system/developer parts are rejected. |
+| `google_gemini` | `reject` | Converts user/assistant data URL `image_url` parts to Gemini `inlineData` blocks. HTTP(S) image URLs are rejected with HTTP `400` because Gemini `fileData` only accepts a Files API URI or `gs://` GCS URI, and the plugin does not fetch/inline remote images. Non-text system/developer parts are rejected. |
+| `google_vertex` | `reject` | Same Gemini `generateContent` request shape as `google_gemini`; data URLs only, HTTP(S) image URLs rejected with HTTP `400`. Non-text system/developer parts are rejected. |
+| `aws_bedrock` | `reject` | Converts user/assistant data URL `image_url` parts to Bedrock Converse image blocks; only `png`/`jpeg`/`gif`/`webp` media types are accepted. HTTP(S) image URLs and unsupported formats are rejected with HTTP `400` because Converse requires supported image bytes. Non-text system/developer parts are rejected. |
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

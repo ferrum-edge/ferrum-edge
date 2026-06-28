@@ -1347,14 +1347,35 @@ fn validate_multimodal_translate_support(
             }
 
             match provider.provider_type {
-                ProviderType::Anthropic
-                | ProviderType::GoogleGemini
-                | ProviderType::GoogleVertex => validate_openai_image_url(part)?,
-                ProviderType::AwsBedrock => {
+                // Anthropic's Messages API accepts both base64 data URLs and
+                // remote `https`/`http` image sources, so the generic check is
+                // sufficient here.
+                ProviderType::Anthropic => validate_openai_image_url(part)?,
+                // Gemini/Vertex `fileData` only accepts a Files API URI or a
+                // `gs://` GCS URI — NOT an arbitrary public URL — and this
+                // plugin does not fetch/inline remote images. Require a
+                // base64 data URL so the policy gate is the single source of
+                // 400s instead of letting a bad `fileData.fileUri` request
+                // produce an opaque provider rejection (502).
+                ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
                     let url = image_url_value(part)?;
                     parse_image_data_url(url).map_err(|e| {
+                        format!(
+                            "Gemini/Vertex image translation only supports image_url data URLs (remote URLs are not fetched/inlined): {e}"
+                        )
+                    })?;
+                }
+                ProviderType::AwsBedrock => {
+                    let url = image_url_value(part)?;
+                    let parsed = parse_image_data_url(url).map_err(|e| {
                         format!("AWS Bedrock Converse only supports image_url data URLs: {e}")
                     })?;
+                    // Validate the concrete format here so the gate (a clean
+                    // 400) is the single source of truth — otherwise an
+                    // unsupported format (e.g. svg+xml/bmp/tiff) passes the
+                    // gate and fails later in `openai_content_to_bedrock_blocks`
+                    // via the translation-error path as a 502.
+                    bedrock_image_format(parsed.media_type)?;
                 }
                 _ => {}
             }
@@ -1415,22 +1436,6 @@ fn image_url_value(part: &Value) -> Result<&str, String> {
         .and_then(|image_url| image_url.get("url"))
         .and_then(Value::as_str)
         .ok_or_else(|| "image_url content part must include image_url.url".to_string())
-}
-
-fn guess_image_mime_type_from_url(url: &str) -> &'static str {
-    let path = Url::parse(url)
-        .ok()
-        .map(|u| u.path().to_ascii_lowercase())
-        .unwrap_or_else(|| url.to_ascii_lowercase());
-    if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".webp") {
-        "image/webp"
-    } else if path.ends_with(".gif") {
-        "image/gif"
-    } else {
-        "image/jpeg"
-    }
 }
 
 fn openai_content_to_anthropic(content: &Value, mode: MultimodalMode) -> Result<Value, String> {
@@ -1534,12 +1539,17 @@ fn openai_content_to_gemini_parts(
                         }
                     }));
                 } else {
-                    out.push(json!({
-                        "fileData": {
-                            "mimeType": guess_image_mime_type_from_url(url),
-                            "fileUri": url
-                        }
-                    }));
+                    // Gemini `fileData.fileUri` only accepts a Files API URI or
+                    // a `gs://` GCS URI; an arbitrary public `http(s)` URL is
+                    // rejected by the provider. This plugin does not fetch and
+                    // inline remote images, so reject here instead of emitting a
+                    // `fileData` request the provider can't fulfill. The policy
+                    // gate (`validate_multimodal_translate_support`) normally
+                    // catches this first; this keeps the translator honest if
+                    // it is ever called on its own.
+                    return Err(format!(
+                        "ai_federation: Gemini image translation requires an image_url data URL (remote URL '{url}' is not fetched/inlined)"
+                    ));
                 }
             }
             Some(other) => {
@@ -2447,6 +2457,15 @@ impl Plugin for AiFederation {
         let mut last_error: Option<String> = None;
         let mut last_status: Option<u16> = None;
         let mut last_body: Option<Vec<u8>> = None;
+        // Multimodal capability is provider-SPECIFIC: a reject-mode (or a
+        // translate-mode provider that can't translate this particular part,
+        // e.g. Bedrock + an unsupported image format) provider failing the
+        // policy gate must not abort the whole fallback chain — a later
+        // provider may still serve the request. We record the last such
+        // rejection so that, if EVERY provider is exhausted on policy alone
+        // (no provider was ever dialed), we can return a clean 400 instead of
+        // a generic 502.
+        let mut last_multimodal_rejection: Option<String> = None;
 
         let provider_count = matching_providers.len();
         for (idx, provider) in matching_providers.iter().enumerate() {
@@ -2488,9 +2507,18 @@ impl Plugin for AiFederation {
                     non_text_parts = multimodal_usage.non_text_parts,
                     part_types = %multimodal_usage.types_csv(),
                     roles = %multimodal_usage.roles_csv(),
-                    "ai_federation: rejecting multimodal request"
+                    "ai_federation: provider cannot serve multimodal request, trying fallback"
                 );
-                return self.error_response(400, &message);
+                last_multimodal_rejection = Some(message);
+                // Per-provider policy rejection — fall through to the next
+                // provider exactly like a per-provider translation failure
+                // does, instead of aborting the whole chain. This lets a
+                // mixed list (e.g. a reject-mode provider followed by a
+                // translate-mode one) serve the image from the later provider.
+                if self.fallback_enabled && !is_last_provider {
+                    continue;
+                }
+                break;
             }
 
             if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
@@ -2652,6 +2680,15 @@ impl Plugin for AiFederation {
                 body: Bytes::from(body),
                 headers: resp_headers,
             }
+        } else if last_error.is_none()
+            && let Some(message) = last_multimodal_rejection
+        {
+            // No provider was ever dialed and no wire error occurred — every
+            // matching provider declined the multimodal request at the policy
+            // gate. This is purely a client-input problem, so return a clean
+            // 400 (preserving the single-provider behavior) rather than a
+            // generic 502.
+            self.error_response(400, &message)
         } else {
             self.error_response(
                 502,
@@ -2846,6 +2883,36 @@ pub mod test_helpers {
             url_template,
         };
         translate_request(&provider, openai_body, model)
+    }
+
+    /// Expose the multimodal `translate`-mode policy gate for tests.
+    ///
+    /// This is the single source of the HTTP `400` returned for unsupported
+    /// multimodal parts (e.g. Bedrock with a non-image / unsupported image
+    /// format, or Gemini/Vertex with a remote HTTP(S) image URL). It runs
+    /// before any provider is dialed.
+    pub fn validate_multimodal_translate_support_test(
+        provider_type: &str,
+        openai_body: &Value,
+    ) -> Result<(), String> {
+        let pt = ProviderType::from_str(provider_type)?;
+        let provider = ResolvedProvider {
+            name: "test".to_string(),
+            provider_type: pt,
+            auth: AuthMethod::BearerToken {
+                api_key: "test-key".to_string(),
+            },
+            priority: 1,
+            model_patterns: Vec::new(),
+            model_mapping: HashMap::new(),
+            default_model: None,
+            multimodal_mode: MultimodalMode::Translate,
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(60),
+            base_url: None,
+            url_template: UrlTemplate::Static(Arc::from("https://example.test/")),
+        };
+        validate_multimodal_translate_support(&provider, openai_body)
     }
 
     /// Expose URL building for tests so we can assert the template logic.
