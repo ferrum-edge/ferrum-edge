@@ -15,6 +15,12 @@ use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// Marker set by the proxy on `ctx.metadata` while the response-body hooks run
+// over a synthetic 2xx plugin short-circuit body (mirrors
+// `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
+// therefore not reachable from this external test crate).
+const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
 fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
     let dns_cache = DnsCache::new(DnsConfig {
         backend_allow_ips: policy.clone(),
@@ -539,6 +545,160 @@ async fn test_cache_miss_then_hit() {
             assert_eq!(&body[..], response_body);
         }
         _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
+    }
+}
+
+// Regression: a synthetic short-circuit 2xx body (produced by a LATER
+// before_proxy plugin such as `ai_federation` / `mesh_route_dispatch` /
+// `response_mock` / `serverless_function`, all of which run AFTER this plugin)
+// must NOT be stored under the cache key that this plugin set on its own MISS.
+// Storing it would replay a locally-generated body — that never reached the
+// upstream model — to every future semantically-similar request (cache
+// poisoning). The proxy marks the context with the synthetic short-circuit key
+// for the duration of the response-body-hook phase; emulate that here.
+#[tokio::test]
+async fn synthetic_short_circuit_2xx_is_not_stored_in_semantic_cache() {
+    let config = json!({"ttl_seconds": 300});
+    let plugin = make_plugin(config);
+
+    let body_json = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "What is the capital of France?"}
+        ]
+    });
+    let body_str = serde_json::to_string(&body_json).unwrap();
+
+    // First request — cache MISS. This sets `_ai_cache_key`, which is exactly
+    // what would still be set when a later plugin's synthetic 2xx flows back
+    // through `on_final_response_body`.
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx1.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers1 = HashMap::new();
+    headers1.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx1.metadata.get("ai_cache_status").unwrap(), "MISS");
+    assert!(ctx1.metadata.contains_key("_ai_cache_key"));
+
+    // A later before_proxy plugin short-circuits with a synthetic 2xx body. The
+    // proxy sets the synthetic marker before running the response-body hooks.
+    ctx1.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let synthetic_body = br#"{"choices":[{"message":{"content":"SYNTHETIC"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, synthetic_body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "synthetic body hook must Continue, got {result:?}"
+    );
+
+    // Nothing was stored — the cache is still empty.
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "synthetic short-circuit body must not be written to the semantic cache"
+    );
+
+    // A second, IDENTICAL request must therefore be a MISS (Continue), not a HIT
+    // replaying the synthetic body. (No synthetic marker this time — a genuine
+    // fresh request.)
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx2.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers2 = HashMap::new();
+    headers2.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "request matching a synthetic short-circuit must MISS, not replay a poisoned cache entry; got {result:?}"
+    );
+    assert_eq!(
+        ctx2.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
+}
+
+// Control: a GENUINE backend response (no synthetic marker) on a MISS IS stored
+// and replayed on the next identical request. Guards against the synthetic skip
+// accidentally disabling normal caching.
+#[tokio::test]
+async fn genuine_backend_response_is_still_stored_without_synthetic_marker() {
+    let config = json!({"ttl_seconds": 300});
+    let plugin = make_plugin(config);
+
+    let body_json = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "What is the capital of Spain?"}
+        ]
+    });
+    let body_str = serde_json::to_string(&body_json).unwrap();
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx1.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers1 = HashMap::new();
+    headers1.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx1.metadata.contains_key("_ai_cache_key"));
+
+    // No synthetic marker: a real backend 2xx.
+    let backend_body = br#"{"choices":[{"message":{"content":"Madrid"}}]}"#;
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, backend_body)
+        .await;
+
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(1),
+        "a genuine backend response must be cached normally"
+    );
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx2.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers2 = HashMap::new();
+    headers2.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], backend_body);
+        }
+        _ => panic!("Expected cache HIT for genuine backend response, got {result:?}"),
     }
 }
 

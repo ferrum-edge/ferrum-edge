@@ -153,6 +153,65 @@ async fn test_pii_detection_reject() {
     }
 }
 
+// Marker set by the proxy on `ctx.metadata` while the response-body hooks run
+// over a synthetic 2xx plugin short-circuit body (mirrors
+// `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
+// therefore not reachable from this external test crate).
+const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+// Feature regression guard: the WHOLE POINT of funnelling synthetic
+// short-circuit bodies through the response-body hooks is that response GUARDS
+// finally inspect them. So even when the synthetic marker is set (a cache hit /
+// `response_mock` / federation body), `ai_response_guard` MUST still scan the
+// body and reject a malicious one. This is the counterpart to the
+// storage/accounting plugins (`ai_semantic_cache`, `ai_token_metrics`) that skip
+// synthetic bodies: guards must NOT skip — they must keep inspecting.
+#[tokio::test]
+async fn guard_still_rejects_bad_synthetic_short_circuit_body() {
+    let config = json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    });
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    // The body arrived via a synthetic short-circuit (e.g. a poisoned cache
+    // entry or a `response_mock` leaking PII). The proxy marks the context.
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let body = serde_json::to_vec(&json!({
+        "choices": [{
+            "message": {
+                "content": "Your SSN is 123-45-6789"
+            }
+        }]
+    }))
+    .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("pii:ssn"));
+        }
+        _ => panic!(
+            "guard must still reject a malicious synthetic short-circuit body, got {result:?}"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn test_pii_detection_warn() {
     let config = json!({

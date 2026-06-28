@@ -1797,6 +1797,35 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
+        // Synthetic short-circuit guard. On a semantic-cache MISS this plugin's
+        // `before_proxy` sets `AI_CACHE_KEY_METADATA` so this hook stores the
+        // (real) backend response. But this plugin (priority 2980) runs BEFORE
+        // the later synthetic-2xx producers — `ai_federation` (2985),
+        // `mesh_route_dispatch` (2995), `serverless_function` (3025),
+        // `response_mock` (3030), `request_termination`, and a
+        // `request_deduplication` replay — so when ANY of those short-circuits
+        // with a 2xx body, the generic synthetic body-hook path
+        // (`apply_synthetic_response_body_hooks`) re-runs this
+        // `on_final_response_body` with `AI_CACHE_KEY_METADATA` still set from
+        // the earlier miss. Without this guard that locally-generated synthetic
+        // body — which NEVER reached the upstream model — would be written to the
+        // in-memory + Redis semantic cache under the miss key and replayed to
+        // every future semantically-similar request (cache poisoning). The proxy
+        // sets `ferrum:synthetic_short_circuit` only for the duration of the
+        // synthetic body-hook phase, so its presence is a precise, unspoofable
+        // signal; a genuine backend response (the only legitimate store path)
+        // never carries it and falls through to store normally. Mirrors
+        // `response_caching`'s and `request_deduplication`'s synthetic guards.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
+            debug!(
+                "ai_semantic_cache: skipping store of synthetic short-circuit response (no model tokens / upstream body)"
+            );
+            return PluginResult::Continue;
+        }
+
         let cache_key = match ctx.metadata.get(AI_CACHE_KEY_METADATA) {
             Some(k) => k.clone(),
             None => return PluginResult::Continue,
