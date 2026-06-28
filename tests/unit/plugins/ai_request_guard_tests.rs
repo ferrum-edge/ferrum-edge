@@ -828,3 +828,188 @@ async fn test_required_metadata_fields_missing() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
+
+// ─── Framed gRPC bodies are skipped, not rejected ───────────────────────
+
+/// `application/grpc+json` matches `is_json_content_type` via its `+json`
+/// suffix, but the buffered body is gRPC wire framing (5-byte header + message),
+/// not a bare JSON document. The guard must Continue, not 400 it as malformed.
+#[tokio::test]
+async fn grpc_plus_json_framed_body_skipped() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    // 5-byte gRPC frame prefix (compression flag + 4-byte BE length) followed by
+    // a tiny JSON message. As a whole this is not parseable as a JSON document.
+    let mut framed = vec![0u8, 0, 0, 0, 2];
+    framed.extend_from_slice(b"{}");
+    // The frame happens to be valid UTF-8 here, so it would land in
+    // `request_body`; the old code would have parse-error 400'd it.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8_lossy(&framed).into_owned(),
+    );
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "7".to_string());
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    // No uninspectable-body bookkeeping should be recorded for skipped gRPC.
+    assert!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn bare_grpc_content_type_skipped() {
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 10})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    // `application/grpc` (no `+json`) isn't even JSON, so it Continues at the
+    // first content-type gate, but assert the behavior explicitly.
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn grpc_web_text_is_not_treated_as_native_grpc() {
+    // `application/grpc-web-text+json` is NOT native gRPC; the native-gRPC
+    // classifier rejects the `-web` suffix. It still isn't a plain JSON document
+    // the guard should inspect — but here we just assert the JSON gate still
+    // applies (it ends in `+json`) and the guard inspects normally. The body is
+    // valid JSON to avoid a false uninspectable reject.
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web-text+json".to_string(),
+    );
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({"model": "evil"}).to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web-text+json".to_string(),
+    );
+    // Because it is inspected as JSON and the model is blocked, it rejects.
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn grpc_content_type_not_buffered() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    assert!(!plugin.should_buffer_request_body(&ctx));
+}
+
+// ─── Compressed bodies are skipped, not rejected ────────────────────────
+
+/// A gzipped JSON body is still compressed when `before_proxy` runs (the
+/// `compression` plugin decompresses in the later `transform_request_body`
+/// phase). The compressed bytes are not UTF-8, so the buffer path stores only
+/// `request_body_size_bytes`. The guard must Continue, not 400 as `non_utf8_body`.
+#[tokio::test]
+async fn gzip_encoded_body_skipped_not_rejected() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    // Simulate the buffered-but-non-UTF-8 (still-compressed) body state.
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "42".to_string());
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body")
+            .is_none(),
+        "compressed bodies should be skipped before the uninspectable-body path"
+    );
+}
+
+#[tokio::test]
+async fn brotli_encoded_body_skipped() {
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 5})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "br".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "16".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-encoding".to_string(), "br".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn identity_content_encoding_still_inspected() {
+    // `identity` is a no-op encoding: the body is plaintext JSON and must still
+    // be inspected and rejected on a blocked model.
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4"}));
+    ctx.headers
+        .insert("content-encoding".to_string(), "identity".to_string());
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "identity".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn compressed_body_not_buffered() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+}
+
+#[tokio::test]
+async fn plain_json_still_buffered_and_inspected() {
+    // Guard against over-skipping: an ordinary plain JSON POST must still buffer
+    // and still be inspected/rejected.
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({"model": "gpt-4"}));
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}

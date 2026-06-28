@@ -7,6 +7,23 @@
 //! Supports model blocking/allowlisting, max_tokens enforcement (reject or
 //! clamp), message count limits, prompt character limits, temperature range
 //! validation, system prompt blocking, and required field enforcement.
+//!
+//! ## Inspection scope
+//!
+//! The guard inspects plain HTTP JSON request bodies in the `before_proxy`
+//! phase. Two body shapes are intentionally NOT inspected here and are passed
+//! through unmodified rather than rejected:
+//!
+//! - **Native gRPC bodies** (`application/grpc`, `application/grpc+json`, …):
+//!   these are length-prefixed gRPC wire frames, not bare JSON, so the JSON
+//!   policies do not apply. The guard advertises `HTTP_GRPC_PROTOCOLS`, so it
+//!   must not 400 valid framed gRPC requests on those routes.
+//! - **Compressed request bodies** (`Content-Encoding: gzip|br|…`): request
+//!   decompression (the `compression` plugin's `decompress_request`) runs in the
+//!   later `transform_request_body` phase, so the body is still compressed bytes
+//!   at `before_proxy` time and cannot be parsed as JSON. The guard therefore
+//!   cannot enforce JSON policies on compressed uploads — an accepted
+//!   phase-ordering limitation.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -16,6 +33,43 @@ use tracing::{debug, error};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
+
+/// True when `content-type` is a native gRPC media type (`application/grpc`,
+/// optionally with a `+subtype`/`;param`/OWS suffix), excluding
+/// `application/grpc-web` and bogus suffixes like `application/grpcfoo`.
+///
+/// Native gRPC bodies are length-prefixed wire frames (1-byte compression flag +
+/// 4-byte big-endian length + message), NOT bare JSON documents — even when the
+/// content-type is `application/grpc+json`, which `is_json_content_type` matches
+/// via its `+json` suffix. Parsing that framing as plain JSON always fails, so
+/// the guard must skip framed gRPC bodies rather than reject valid requests.
+///
+/// Delegates to the canonical, delimiter-aware
+/// [`crate::proxy::backend_dispatch::is_native_grpc_content_type`] classifier so
+/// this stays aligned with the H1/H2/H3 dispatch path. Allocation-free.
+fn is_native_grpc_content_type(content_type: &str) -> bool {
+    crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+}
+
+/// True when a `content-encoding` header marks the request body as encoded with
+/// anything other than `identity`.
+///
+/// `ai_request_guard` runs in `before_proxy`, but request-body decompression
+/// (the `compression` plugin's `decompress_request`) only happens later in
+/// `transform_request_body`. At this phase the buffered body is still the
+/// compressed bytes — not UTF-8 JSON — so inspecting it is impossible and
+/// hard-rejecting it would 400 valid compressed AI requests. Treat any
+/// non-`identity` encoding as uninspectable-at-this-phase and let the request
+/// continue (the body never reaches a JSON state the guard could evaluate here).
+/// Allocation-free; tolerant of comma-separated encoding lists.
+fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
+    headers.get("content-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .map(|token| token.trim())
+            .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+    })
+}
 
 /// Action to take when max_tokens exceeds the limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +364,14 @@ impl AiRequestGuard {
         ctx: &mut RequestContext,
         reason: &'static str,
         status_code: u16,
-        details: String,
+        // Lazy so a per-request `format!` (e.g. the serde parse error on the
+        // `malformed_json` path) is only built when a log line that consumes it
+        // actually fires. The detail is for logs only — never returned to the
+        // client (see `client_details` below) — so on a busy AI proxy a client
+        // looping malformed JSON does not pay an allocation per request when the
+        // relevant level is disabled. Honors this module's log-flood / cost
+        // amplification rationale.
+        details: impl FnOnce() -> String,
     ) -> PluginResult {
         let action = if self.fail_on_uninspectable_body {
             "reject"
@@ -339,13 +400,24 @@ impl AiRequestGuard {
         // vector.
         let is_internal_inconsistency = reason == "missing_buffered_body";
 
+        // Materialize the detail string at most once, and only when a log line
+        // will actually consume it: the internal-inconsistency path always logs
+        // at `error!`; the client-caused paths log at `debug!`, so skip the
+        // closure (and its `format!`) entirely when DEBUG is disabled.
+        let detail_str = if is_internal_inconsistency || tracing::enabled!(tracing::Level::DEBUG) {
+            Some(details())
+        } else {
+            None
+        };
+        let detail_display = detail_str.as_deref().unwrap_or("");
+
         if !self.fail_on_uninspectable_body {
             if is_internal_inconsistency {
                 error!(
                     reason,
                     action,
                     status_code,
-                    details = %details,
+                    details = %detail_display,
                     "ai_request_guard: internal inconsistency - uninspectable request body allowed by compatibility mode"
                 );
             } else {
@@ -353,7 +425,7 @@ impl AiRequestGuard {
                     reason,
                     action,
                     status_code,
-                    details = %details,
+                    details = %detail_display,
                     "ai_request_guard: uninspectable request body allowed by compatibility mode"
                 );
             }
@@ -365,7 +437,7 @@ impl AiRequestGuard {
                 reason,
                 action,
                 status_code,
-                details = %details,
+                details = %detail_display,
                 "ai_request_guard: rejecting uninspectable request body due to internal inconsistency"
             );
         } else {
@@ -373,7 +445,7 @@ impl AiRequestGuard {
                 reason,
                 action,
                 status_code,
-                details = %details,
+                details = %detail_display,
                 "ai_request_guard: rejecting uninspectable request body"
             );
         }
@@ -446,12 +518,21 @@ impl Plugin for AiRequestGuard {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.requires_request_body
-            && ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct))
+        if !self.requires_request_body || ctx.method != "POST" {
+            return false;
+        }
+        // Skip bodies the guard cannot inspect in `before_proxy` anyway:
+        //  - native gRPC (`application/grpc*`) carries length-prefixed wire
+        //    frames, not bare JSON — even `application/grpc+json`, which
+        //    `is_json_content_type` matches on its `+json` suffix.
+        //  - compressed bodies (`content-encoding: gzip|br|…`) are not yet
+        //    decompressed at this phase.
+        // Buffering them would only burn memory for a request that
+        // `before_proxy` will Continue past without inspection.
+        ctx.headers
+            .get("content-type")
+            .is_some_and(|ct| is_json_content_type(ct) && !is_native_grpc_content_type(ct))
+            && !has_non_identity_content_encoding(&ctx.headers)
     }
 
     async fn before_proxy(
@@ -464,7 +545,9 @@ impl Plugin for AiRequestGuard {
             return PluginResult::Continue;
         }
 
-        // Check content-type
+        // Check content-type. Read from the `headers` parameter, never
+        // `ctx.headers`: when no plugin modifies request headers the handler
+        // `std::mem::take()`s them out of `ctx.headers` for this phase.
         let content_type = headers
             .get("content-type")
             .map(|s| s.as_str())
@@ -473,19 +556,46 @@ impl Plugin for AiRequestGuard {
             return PluginResult::Continue;
         }
 
+        // Native gRPC bodies (`application/grpc+json`, etc.) match
+        // `is_json_content_type` via their `+json` suffix but carry
+        // length-prefixed gRPC wire frames, not a bare JSON document. Parsing
+        // that framing as JSON always fails; skip inspection so valid framed
+        // gRPC requests reach the backend instead of being 400'd as malformed.
+        // The guard's JSON policies target plain HTTP AI APIs, so this is the
+        // correct scope, not a gap.
+        if is_native_grpc_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+
+        // Compressed request bodies cannot be inspected here: the `compression`
+        // plugin's `decompress_request` runs in the later `transform_request_body`
+        // phase, so at `before_proxy` time the buffered body is still the
+        // compressed (non-UTF-8) bytes. Continue rather than hard-reject a valid
+        // compressed AI request as `non_utf8_body`. (Accepted phase-ordering
+        // limitation: JSON policies are not enforced on compressed uploads — see
+        // the "Inspection scope" section in this module's docs.)
+        if has_non_identity_content_encoding(headers) {
+            return PluginResult::Continue;
+        }
+
         // Get request body from metadata
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
             Some(_) => {
-                return self.handle_uninspectable_body(
-                    ctx,
-                    "empty_body",
-                    400,
-                    "JSON request body is empty and cannot be inspected".to_string(),
-                );
+                return self.handle_uninspectable_body(ctx, "empty_body", 400, || {
+                    "JSON request body is empty and cannot be inspected".to_string()
+                });
             }
             None => {
-                let (reason, status_code, details) =
+                // The `non_utf8_body` (400) vs `missing_buffered_body` (500)
+                // discrimination relies on the exact contract of
+                // `crate::proxy::store_request_body_metadata`: it always records
+                // `request_body_size_bytes` for a buffered body but removes
+                // `request_body` when the bytes are not valid UTF-8, and sets
+                // both for a valid body. Keep this in sync if that helper changes
+                // (e.g. lossy UTF-8 decoding) — otherwise a 400 could silently
+                // flip to a 500 or vice versa.
+                let (reason, status_code, details): (_, _, &'static str) =
                     if ctx.metadata.contains_key("request_body_size_bytes") {
                         (
                             "non_utf8_body",
@@ -502,12 +612,8 @@ impl Plugin for AiRequestGuard {
                             "Buffered request body metadata was unavailable for request inspection",
                         )
                     };
-                return self.handle_uninspectable_body(
-                    ctx,
-                    reason,
-                    status_code,
-                    details.to_string(),
-                );
+                return self
+                    .handle_uninspectable_body(ctx, reason, status_code, || details.to_string());
             }
         };
 
@@ -515,12 +621,9 @@ impl Plugin for AiRequestGuard {
         let mut json: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(err) => {
-                return self.handle_uninspectable_body(
-                    ctx,
-                    "malformed_json",
-                    400,
-                    format!("Malformed JSON request body cannot be inspected: {err}"),
-                );
+                return self.handle_uninspectable_body(ctx, "malformed_json", 400, || {
+                    format!("Malformed JSON request body cannot be inspected: {err}")
+                });
             }
         };
 
