@@ -38,7 +38,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 
 ## CI Evidence
 
-The standalone `gateway-api-conformance.yml` workflow is the single owner that deploys the lab on PRs; the `Gateway API Conformance` job in `ci.yml` only mirrors that run's result. The lab consists of:
+The standalone `gateway-api-conformance.yml` workflow is the single owner that deploys the lab on PRs, and its `gate` job is the authoritative conformance check. The `Gateway API Conformance (CI mirror)` job in `ci.yml` only mirrors that run's result back into the aggregate `Tests` gate. The lab consists of:
 
 - Ferrum control plane/controller with Gateway API watches enabled.
 - A routable Ferrum data-plane deployment and NodePort Service mapped to host ports 80 and 443 in kind.

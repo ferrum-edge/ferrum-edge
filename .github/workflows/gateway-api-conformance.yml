@@ -68,7 +68,24 @@ jobs:
           # lag main on long-lived PRs; diffing against it would pull in files that
           # main changed afterwards and wrongly route the PR through the 90-minute lab.
           base_ref="origin/${{ github.base_ref }}"
-          git fetch --no-tags origin "${{ github.base_ref }}"
+          # Retry the base-ref fetch so a single 403/5xx/network blip does not fail
+          # the changes job (and with it the gate -> mirror chain that the rest of
+          # this PR hardened). Only hard-fail after exhausting the attempts: an
+          # incomplete fetch would diff against a stale/missing base and mis-gate
+          # the lab, so silently swallowing the failure is not safe here.
+          fetched=false
+          for attempt in 1 2 3; do
+            if git fetch --no-tags origin "${{ github.base_ref }}"; then
+              fetched=true
+              break
+            fi
+            echo "git fetch of ${{ github.base_ref }} failed (attempt ${attempt}/3); retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          if [ "$fetched" != true ]; then
+            echo "git fetch of ${{ github.base_ref }} failed after 3 attempts" >&2
+            exit 1
+          fi
           changed_files="$(git diff --name-only "${base_ref}...HEAD")"
 
           # This is the sole PR trigger surface for full Gateway API
