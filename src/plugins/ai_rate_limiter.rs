@@ -437,7 +437,20 @@ impl Plugin for AiRateLimiter {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx.metadata.contains_key("ai_federation_provider")
+        // Idempotency guard: `after_proxy` can run twice for a single
+        // synthetic AI response — once via
+        // `finalize_reject_response_with_after_proxy_hooks` (the initial 2xx
+        // RejectBinary short-circuit) and again via
+        // `apply_after_proxy_hooks_to_rejection` when a response-body
+        // guardrail (e.g. `on_response_body`) rejects the synthetic body.
+        // `record_usage` is additive, so re-running it would double-charge the
+        // consumer (and could push a *blocked* response over the limit). Skip
+        // when the federation-tokens flag is already set and set it only after
+        // a successful first recording. `on_response_body` reads the same flag.
+        if !ctx
+            .metadata
+            .contains_key(FEDERATION_TOKENS_RECORDED_METADATA_KEY)
+            && ctx.metadata.contains_key("ai_federation_provider")
             && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
         {
             self.record_usage(self.rate_key(ctx), tokens).await;

@@ -1030,3 +1030,66 @@ async fn test_unparseable_2xx_json_not_charged() {
         "an unparseable 2xx must not advance the rate-limit window"
     );
 }
+
+// ─── Federation token recording idempotency ──────────────────────────────
+
+#[tokio::test]
+async fn test_federation_tokens_recorded_once_when_after_proxy_runs_twice() {
+    // Regression: when ai_federation emits a synthetic 2xx body and a response
+    // guardrail rejects it, `after_proxy` runs twice for the SAME request —
+    // first via `finalize_reject_response_with_after_proxy_hooks` (the initial
+    // RejectBinary{200} short-circuit) and again via
+    // `apply_after_proxy_hooks_to_rejection` after the synthetic body hook
+    // (`on_response_body`) rejects. `record_usage` is additive, so without the
+    // idempotency guard the consumer would be charged twice for one synthetic
+    // response and could be pushed over the limit by a *blocked* response.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    // Simulate ai_federation having populated provider + token metadata on the
+    // synthetic response (count_mode defaults to total_tokens → ai_total_tokens).
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "openai".to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), "600".to_string());
+
+    // First after_proxy run records the tokens once.
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_ratelimit_federation_tokens_recorded")
+            .map(String::as_str),
+        Some("true"),
+        "first after_proxy run should mark federation tokens as recorded"
+    );
+
+    // Second after_proxy run (response-guardrail rejection re-runs the hooks)
+    // must be a no-op for recording.
+    let mut response_headers2 = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers2)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        600,
+        "federation tokens must be charged exactly once even when after_proxy \
+         runs twice for a blocked synthetic response"
+    );
+}

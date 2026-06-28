@@ -11334,8 +11334,40 @@ pub(crate) async fn apply_plugin_rejection_response(
     reject.body
 }
 
-fn should_apply_synthetic_response_body_hooks(status_code: u16, is_grpc_request: bool) -> bool {
-    !is_grpc_request && (200..300).contains(&status_code)
+/// Decide whether response-body guardrails / transforms should run over a
+/// synthetic 2xx plugin short-circuit body (e.g. `ai_federation` /
+/// `ai_semantic_cache` synthetic responses surfaced via `RejectBinary{200}`).
+///
+/// General rule: these hooks (`on_response_body`,
+/// `transform_response_body_with_context`, `on_final_response_body`) run over a
+/// 2xx short-circuit body **only** when there is a body to inspect and the same
+/// response-body-buffering capability gate the normal response path uses is
+/// satisfied. Specifically we skip when:
+/// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
+/// - the status is not 2xx,
+/// - the status is 204/304 (a body-emitting transform there is protocol-
+///   incorrect — those responses MUST NOT carry a body),
+/// - the synthetic body is empty (nothing to inspect/transform), or
+/// - no active plugin wants to buffer this response (`should_buffer_response_body`
+///   mirrors the per-request decision in [`should_stream_response_body`], whose
+///   `requires_response_body_buffering()` capability acts as the O(1) upper
+///   bound). This keeps preflight/mock-heavy proxies from paying three extra
+///   async plugin sweeps per request.
+fn should_apply_synthetic_response_body_hooks(
+    status_code: u16,
+    is_grpc_request: bool,
+    response_body: &[u8],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> bool {
+    !is_grpc_request
+        && (200..300).contains(&status_code)
+        && status_code != 204
+        && status_code != 304
+        && !response_body.is_empty()
+        && plugins
+            .iter()
+            .any(|plugin| plugin.should_buffer_response_body(ctx))
 }
 
 async fn apply_synthetic_response_body_hooks(
@@ -11697,8 +11729,14 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     let mut response_status = status.as_u16();
     let mut response_body = body.to_vec();
     apply_after_proxy_hooks_to_rejection(plugins, ctx, response_status, &mut headers).await;
-    if should_apply_synthetic_response_body_hooks(response_status, is_grpc_request)
-        && !plugins.is_empty()
+    if !plugins.is_empty()
+        && should_apply_synthetic_response_body_hooks(
+            response_status,
+            is_grpc_request,
+            &response_body,
+            plugins,
+            ctx,
+        )
     {
         apply_synthetic_response_body_hooks(
             plugins,
