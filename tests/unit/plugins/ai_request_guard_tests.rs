@@ -886,12 +886,13 @@ async fn bare_grpc_content_type_skipped() {
 }
 
 #[tokio::test]
-async fn grpc_web_text_is_not_treated_as_native_grpc() {
-    // `application/grpc-web-text+json` is NOT native gRPC; the native-gRPC
-    // classifier rejects the `-web` suffix. It still isn't a plain JSON document
-    // the guard should inspect — but here we just assert the JSON gate still
-    // applies (it ends in `+json`) and the guard inspects normally. The body is
-    // valid JSON to avoid a false uninspectable reject.
+async fn grpc_web_text_framed_body_skipped() {
+    // `application/grpc-web-text+json` matches `is_json_content_type` via its
+    // `+json` suffix, but a real gRPC-Web-text body is base64-encoded,
+    // length-prefixed gRPC framing — not a bare JSON document. Parsing it as JSON
+    // would 400 valid gRPC-Web traffic on a proxy that has `ai_request_guard` but
+    // no `grpc_web` plugin (normally `grpc_web` rewrites the content-type to
+    // native gRPC first). The guard must skip it, not reject it.
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
@@ -899,6 +900,8 @@ async fn grpc_web_text_is_not_treated_as_native_grpc() {
         "content-type".to_string(),
         "application/grpc-web-text+json".to_string(),
     );
+    // Even bare JSON content here must be skipped: the guard cannot tell framed
+    // gRPC-Web from JSON by parsing, so it skips on content-type alone.
     ctx.metadata.insert(
         "request_body".to_string(),
         json!({"model": "evil"}).to_string(),
@@ -908,9 +911,33 @@ async fn grpc_web_text_is_not_treated_as_native_grpc() {
         "content-type".to_string(),
         "application/grpc-web-text+json".to_string(),
     );
-    // Because it is inspected as JSON and the model is blocked, it rejects.
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_reject(result, Some(400));
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body"),
+        "framed gRPC-Web bodies are skipped before the uninspectable-body path"
+    );
+}
+
+#[tokio::test]
+async fn grpc_web_binary_content_type_skipped() {
+    // Bare `application/grpc-web` (no `+json`) isn't JSON, so it Continues at the
+    // first content-type gate; assert it explicitly.
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 10})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 #[tokio::test]
@@ -925,14 +952,16 @@ async fn grpc_content_type_not_buffered() {
     assert!(!plugin.should_buffer_request_body(&ctx));
 }
 
-// ─── Compressed bodies are skipped, not rejected ────────────────────────
+// ─── Compressed bodies are deferred in before_proxy, then fail closed ────
 
 /// A gzipped JSON body is still compressed when `before_proxy` runs (the
 /// `compression` plugin decompresses in the later `transform_request_body`
-/// phase). The compressed bytes are not UTF-8, so the buffer path stores only
-/// `request_body_size_bytes`. The guard must Continue, not 400 as `non_utf8_body`.
+/// phase). `before_proxy` cannot inspect it, so it DEFERS to
+/// `on_final_request_body` by setting the deferred-compressed marker and
+/// Continuing — it must not 400 as `non_utf8_body` here, and must not yet record
+/// uninspectable-body bookkeeping.
 #[tokio::test]
-async fn gzip_encoded_body_skipped_not_rejected() {
+async fn gzip_encoded_body_deferred_in_before_proxy() {
     let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
@@ -952,12 +981,18 @@ async fn gzip_encoded_body_skipped_not_rejected() {
     assert!(
         !ctx.metadata
             .contains_key("ai_request_guard.uninspectable_body"),
-        "compressed bodies should be skipped before the uninspectable-body path"
+        "before_proxy defers compressed bodies; the uninspectable decision is made in on_final_request_body"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.deferred_compressed_body"),
+        Some(&"true".to_string()),
+        "before_proxy must mark the compressed body for deferred inspection"
     );
 }
 
 #[tokio::test]
-async fn brotli_encoded_body_skipped() {
+async fn brotli_encoded_body_deferred_in_before_proxy() {
     let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 5})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
@@ -972,6 +1007,185 @@ async fn brotli_encoded_body_skipped() {
     headers.insert("content-encoding".to_string(), "br".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.deferred_compressed_body"),
+        Some(&"true".to_string())
+    );
+}
+
+/// THE BYPASS GUARD: a caller gzips a blocked-model request on a proxy that has
+/// `ai_request_guard` but no `compression`/`decompress_request`. `before_proxy`
+/// defers; `on_final_request_body` sees the body is STILL `Content-Encoding:
+/// gzip` (nothing decompressed it) and fails closed — the blocked model is NOT
+/// bypassed.
+#[tokio::test]
+async fn compressed_body_still_encoded_fails_closed_in_final_hook() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    // before_proxy already ran and marked the deferral.
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    // Final backend headers still carry the encoding (no compression plugin
+    // stripped it), so the still-compressed bytes are uninspectable.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    // Body is the raw (still-compressed) bytes — never parsed because the
+    // encoding check fires first.
+    let body = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00];
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata.get("ai_request_guard.uninspectable_body"),
+        Some(&"true".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"compressed_body".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"reject".to_string())
+    );
+}
+
+/// Compatibility mode (`fail_on_uninspectable_body: false`) forwards a
+/// still-compressed body rather than rejecting it.
+#[tokio::test]
+async fn compressed_body_still_encoded_passes_in_compatibility_mode() {
+    let plugin = AiRequestGuard::new(&json!({
+        "blocked_models": ["evil"],
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-encoding".to_string(), "br".to_string());
+    let body = vec![0x1b, 0x00, 0x00, 0x00];
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"compressed_body".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"allow".to_string())
+    );
+}
+
+/// When a `compression` plugin decompressed the body, `on_final_request_body`
+/// sees plaintext JSON (no `Content-Encoding`) and enforces the full reject
+/// policy — a blocked model in a previously-gzipped request is now rejected.
+#[tokio::test]
+async fn decompressed_body_validated_and_rejected_in_final_hook() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    // compression's before_proxy stripped Content-Encoding; transform_request_body
+    // produced plaintext JSON, which is what the final hook receives.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = json!({"model": "evil"}).to_string().into_bytes();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_reject(result, Some(400));
+    // A real policy reject, not an uninspectable-body reject.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body"),
+        "a decompressed-and-inspected body that violates policy is a normal reject, not uninspectable"
+    );
+}
+
+/// A previously-gzipped request whose decompressed body is allowed Continues
+/// through the final hook.
+#[tokio::test]
+async fn decompressed_allowed_body_continues_in_final_hook() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = json!({"model": "gpt-4"}).to_string().into_bytes();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result);
+}
+
+/// The final hook is a no-op for the common uncompressed path: without the
+/// deferred marker (set only for compressed bodies), it must Continue without
+/// re-validating, so plain bodies pay no second parse.
+#[tokio::test]
+async fn final_hook_noop_without_deferred_marker() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // Even a blocked-model body Continues here — before_proxy already handled it
+    // on the uncompressed path, and the final hook must not double-validate.
+    let body = json!({"model": "evil"}).to_string().into_bytes();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_request_guard.uninspectable_body")
+    );
+}
+
+/// A decompressed body that turns out to be empty or malformed still fails
+/// closed in the final hook.
+#[tokio::test]
+async fn final_hook_empty_decompressed_body_fails_closed() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "ai_request_guard.deferred_compressed_body".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"")
+        .await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"empty_body".to_string())
+    );
 }
 
 #[tokio::test]
@@ -989,7 +1203,11 @@ async fn identity_content_encoding_still_inspected() {
 }
 
 #[tokio::test]
-async fn compressed_body_not_buffered() {
+async fn compressed_body_buffered_for_final_inspection() {
+    // Compressed JSON bodies are now buffered (not skipped) so the
+    // `on_final_request_body` hook can inspect them after decompression and fail
+    // closed when they are still encoded. This is the fail-closed counterpart to
+    // the old skip-and-pass behavior.
     let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
@@ -997,6 +1215,20 @@ async fn compressed_body_not_buffered() {
         .insert("content-type".to_string(), "application/json".to_string());
     ctx.headers
         .insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+}
+
+#[tokio::test]
+async fn grpc_web_content_type_not_buffered() {
+    // gRPC-Web framed bodies (length-prefixed / base64) are never bare JSON, so
+    // they are skipped from buffering exactly like native gRPC.
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web-text+json".to_string(),
+    );
     assert!(!plugin.should_buffer_request_body(&ctx));
 }
 

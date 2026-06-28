@@ -10,20 +10,53 @@
 //!
 //! ## Inspection scope
 //!
-//! The guard inspects plain HTTP JSON request bodies in the `before_proxy`
-//! phase. Two body shapes are intentionally NOT inspected here and are passed
-//! through unmodified rather than rejected:
+//! The guard inspects plain HTTP JSON request bodies. Bodies that are not bare
+//! JSON wire formats — framed gRPC / gRPC-Web — are passed through unmodified
+//! rather than rejected, because the JSON policies fundamentally do not apply to
+//! length-prefixed (and possibly base64) wire frames:
 //!
 //! - **Native gRPC bodies** (`application/grpc`, `application/grpc+json`, …):
 //!   these are length-prefixed gRPC wire frames, not bare JSON, so the JSON
 //!   policies do not apply. The guard advertises `HTTP_GRPC_PROTOCOLS`, so it
 //!   must not 400 valid framed gRPC requests on those routes.
-//! - **Compressed request bodies** (`Content-Encoding: gzip|br|…`): request
-//!   decompression (the `compression` plugin's `decompress_request`) runs in the
-//!   later `transform_request_body` phase, so the body is still compressed bytes
-//!   at `before_proxy` time and cannot be parsed as JSON. The guard therefore
-//!   cannot enforce JSON policies on compressed uploads — an accepted
-//!   phase-ordering limitation.
+//! - **gRPC-Web bodies** (`application/grpc-web`, `application/grpc-web+json`,
+//!   `application/grpc-web-text+json`, …): these are also length-prefixed (and,
+//!   for the `-text` variants, base64) gRPC frames, not a bare JSON document.
+//!   Normally the `grpc_web` plugin rewrites the content-type to native
+//!   `application/grpc` in `on_request_received` before this runs, so the guard
+//!   sees native gRPC and skips it. On a proxy that has `ai_request_guard` but
+//!   no `grpc_web` plugin the guard would otherwise try to parse the frame as
+//!   JSON and reject valid gRPC-Web traffic; it is skipped for the same scope
+//!   reason as native gRPC.
+//!
+//! ### Compressed request bodies — fail closed
+//!
+//! `ai_request_guard` runs reject-style policy in `before_proxy`, but a
+//! `Content-Encoding: gzip|br|…` body is still the compressed (non-UTF-8) bytes
+//! at that phase — request decompression (the `compression` plugin's
+//! `decompress_request`) only happens in the later `transform_request_body`
+//! phase. The guard therefore cannot evaluate JSON policy on a compressed body
+//! in `before_proxy`, so it defers: it Continues there (without enforcing
+//! policy) and re-runs inspection in `on_final_request_body`, which executes
+//! *after* all `transform_request_body` hooks.
+//!
+//! By `on_final_request_body` time there are two cases:
+//!
+//! - A `compression` plugin with `decompress_request: true` is co-located: the
+//!   body has been decompressed and `Content-Encoding` stripped, so the guard
+//!   inspects the now-plaintext JSON and enforces every policy normally.
+//! - No decompression happened (no `compression` plugin, or it could not decode
+//!   the body): the body is still compressed and `Content-Encoding` is still
+//!   present. The guard treats this as an **uninspectable** body and applies
+//!   `fail_on_uninspectable_body` — rejecting by default (reason
+//!   `compressed_body`). Operators who deliberately forward compressed AI
+//!   uploads uninspected must opt out with `fail_on_uninspectable_body: false`.
+//!
+//! This closes the otherwise trivial bypass where a caller gzips the request
+//! body to skip all reject-style policy (model allow/block, token/prompt limits,
+//! temperature, system-prompt blocking, required fields). To make
+//! `on_final_request_body` run, the guard buffers compressed bodies too (see
+//! `should_buffer_request_body`).
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -33,6 +66,15 @@ use tracing::{debug, error};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Metadata marker set in `before_proxy` when a compressed request body was
+/// deferred to `on_final_request_body` (where the body is inspected after any
+/// `compression` `transform_request_body` decompression has run). Its presence
+/// tells the final-body hook that this request still needs JSON-policy
+/// evaluation; its absence means `before_proxy` already inspected the body, so
+/// the final-body hook must not re-validate (avoids double work on the common,
+/// uncompressed path).
+const DEFERRED_COMPRESSED_MARKER: &str = "ai_request_guard.deferred_compressed_body";
 
 /// True when `content-type` is a native gRPC media type (`application/grpc`,
 /// optionally with a `+subtype`/`;param`/OWS suffix), excluding
@@ -51,17 +93,55 @@ fn is_native_grpc_content_type(content_type: &str) -> bool {
     crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
 }
 
+/// True when `content-type` is a gRPC-Web media type (`application/grpc-web`,
+/// `application/grpc-web+json`, `application/grpc-web-text`,
+/// `application/grpc-web-text+json`, optionally with a `;param`/OWS suffix).
+///
+/// gRPC-Web bodies are length-prefixed gRPC frames (and base64-encoded for the
+/// `-text` variants), NOT bare JSON documents — even when the content-type ends
+/// in `+json`, which `is_json_content_type` matches via its `+json` suffix.
+/// Parsing that framing as plain JSON always fails. In a normal deployment the
+/// `grpc_web` plugin rewrites the content-type to native `application/grpc`
+/// (which `is_native_grpc_content_type` already skips) before this plugin runs;
+/// this check covers the edge config where `ai_request_guard` is present without
+/// `grpc_web`, so real gRPC-Web traffic is skipped rather than 400'd as
+/// malformed JSON. Case-insensitive on the prefix; allocation-free.
+fn is_grpc_web_content_type(content_type: &str) -> bool {
+    const PREFIX: &[u8] = b"application/grpc-web";
+    let bytes = content_type.as_bytes();
+    let Some(prefix) = bytes.get(..PREFIX.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+    // Anything after the `application/grpc-web` prefix is an accepted suffix:
+    // `-text`, `+json`, `-text+json`, `;charset=...`, OWS, or end-of-value.
+    // `application/grpc-website` is the only realistic false positive shape, and
+    // it is not a real media type, so the broad accept is safe here.
+    true
+}
+
+/// True when a JSON-looking `content-type` actually carries framed gRPC or
+/// gRPC-Web wire bytes rather than a bare JSON document. Such bodies are never
+/// inspectable by the JSON policies and must be skipped (passed through), not
+/// rejected. Allocation-free.
+fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    is_native_grpc_content_type(content_type) || is_grpc_web_content_type(content_type)
+}
+
 /// True when a `content-encoding` header marks the request body as encoded with
 /// anything other than `identity`.
 ///
-/// `ai_request_guard` runs in `before_proxy`, but request-body decompression
-/// (the `compression` plugin's `decompress_request`) only happens later in
-/// `transform_request_body`. At this phase the buffered body is still the
-/// compressed bytes — not UTF-8 JSON — so inspecting it is impossible and
-/// hard-rejecting it would 400 valid compressed AI requests. Treat any
-/// non-`identity` encoding as uninspectable-at-this-phase and let the request
-/// continue (the body never reaches a JSON state the guard could evaluate here).
-/// Allocation-free; tolerant of comma-separated encoding lists.
+/// Used in two phases. In `before_proxy` the buffered body is still the
+/// compressed bytes (request-body decompression — the `compression` plugin's
+/// `decompress_request` — only runs later in `transform_request_body`), so a
+/// non-`identity` encoding means the guard must defer inspection rather than
+/// parse the compressed bytes. In `on_final_request_body` the same check against
+/// the final backend headers tells whether decompression actually happened: if
+/// the encoding is still present, the body was never decoded and is
+/// uninspectable (fail closed). Allocation-free; tolerant of comma-separated
+/// encoding lists.
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     headers.get("content-encoding").is_some_and(|value| {
         value
@@ -453,6 +533,7 @@ impl AiRequestGuard {
             "empty_body" => "JSON request body is empty",
             "non_utf8_body" => "JSON request body is not valid UTF-8",
             "malformed_json" => "Malformed JSON request body",
+            "compressed_body" => "Compressed request body could not be inspected",
             _ => "Request body could not be inspected",
         };
         PluginResult::Reject {
@@ -521,18 +602,20 @@ impl Plugin for AiRequestGuard {
         if !self.requires_request_body || ctx.method != "POST" {
             return false;
         }
-        // Skip bodies the guard cannot inspect in `before_proxy` anyway:
-        //  - native gRPC (`application/grpc*`) carries length-prefixed wire
-        //    frames, not bare JSON — even `application/grpc+json`, which
-        //    `is_json_content_type` matches on its `+json` suffix.
-        //  - compressed bodies (`content-encoding: gzip|br|…`) are not yet
-        //    decompressed at this phase.
-        // Buffering them would only burn memory for a request that
-        // `before_proxy` will Continue past without inspection.
+        // Skip framed gRPC / gRPC-Web bodies: `application/grpc*` and
+        // `application/grpc-web*` carry length-prefixed (and, for `-text`,
+        // base64) wire frames, not bare JSON — even the `+json` variants, which
+        // `is_json_content_type` matches on the `+json` suffix. They are never
+        // JSON-inspectable, so buffering them would only burn memory for a
+        // request the guard always passes through.
+        //
+        // Compressed bodies (`content-encoding: gzip|br|…`) ARE buffered: even
+        // though they cannot be inspected in `before_proxy`, the guard re-runs
+        // inspection in `on_final_request_body` (after any `compression`
+        // decompression), and failing closed there requires the buffered body.
         ctx.headers
             .get("content-type")
-            .is_some_and(|ct| is_json_content_type(ct) && !is_native_grpc_content_type(ct))
-            && !has_non_identity_content_encoding(&ctx.headers)
+            .is_some_and(|ct| is_json_content_type(ct) && !is_framed_grpc_content_type(ct))
     }
 
     async fn before_proxy(
@@ -556,25 +639,29 @@ impl Plugin for AiRequestGuard {
             return PluginResult::Continue;
         }
 
-        // Native gRPC bodies (`application/grpc+json`, etc.) match
-        // `is_json_content_type` via their `+json` suffix but carry
-        // length-prefixed gRPC wire frames, not a bare JSON document. Parsing
-        // that framing as JSON always fails; skip inspection so valid framed
-        // gRPC requests reach the backend instead of being 400'd as malformed.
-        // The guard's JSON policies target plain HTTP AI APIs, so this is the
-        // correct scope, not a gap.
-        if is_native_grpc_content_type(content_type) {
+        // Framed gRPC / gRPC-Web bodies (`application/grpc+json`,
+        // `application/grpc-web-text+json`, etc.) match `is_json_content_type`
+        // via their `+json` suffix but carry length-prefixed (and, for `-text`,
+        // base64) wire frames, not a bare JSON document. Parsing that framing as
+        // JSON always fails; skip inspection so valid framed requests reach the
+        // backend instead of being 400'd as malformed. The guard's JSON policies
+        // target plain HTTP AI APIs, so this is the correct scope, not a gap.
+        if is_framed_grpc_content_type(content_type) {
             return PluginResult::Continue;
         }
 
         // Compressed request bodies cannot be inspected here: the `compression`
         // plugin's `decompress_request` runs in the later `transform_request_body`
         // phase, so at `before_proxy` time the buffered body is still the
-        // compressed (non-UTF-8) bytes. Continue rather than hard-reject a valid
-        // compressed AI request as `non_utf8_body`. (Accepted phase-ordering
-        // limitation: JSON policies are not enforced on compressed uploads — see
-        // the "Inspection scope" section in this module's docs.)
+        // compressed (non-UTF-8) bytes. Rather than silently pass (which would
+        // let a caller gzip the body to bypass every reject-style policy), DEFER:
+        // mark the request and re-inspect in `on_final_request_body`, which runs
+        // after decompression. If no decompression happened by then, that hook
+        // fails closed (`compressed_body`). See the "Compressed request bodies"
+        // section in this module's docs.
         if has_non_identity_content_encoding(headers) {
+            ctx.metadata
+                .insert(DEFERRED_COMPRESSED_MARKER.to_string(), "true".to_string());
             return PluginResult::Continue;
         }
 
@@ -676,6 +763,112 @@ impl Plugin for AiRequestGuard {
 
         if body_modified && let Ok(new_body) = serde_json::to_string(&json) {
             ctx.metadata.insert("request_body".to_string(), new_body);
+        }
+
+        PluginResult::Continue
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        // The final-body hook records uninspectable-body bookkeeping in
+        // `ctx.metadata` (and reads the deferred-compressed marker), so it needs
+        // the real mutable context, not the no-op default wrapper.
+        self.requires_request_body
+    }
+
+    /// Re-inspect a deferred compressed request body after all
+    /// `transform_request_body` hooks (including the `compression` plugin's
+    /// `decompress_request`) have run.
+    ///
+    /// `before_proxy` cannot evaluate JSON policy on a still-compressed body, so
+    /// it sets `DEFERRED_COMPRESSED_MARKER` and Continues. This hook closes
+    /// that deferral:
+    ///
+    /// - If the marker is absent, `before_proxy` already inspected the body
+    ///   (plain, uncompressed path) — Continue without re-validating so the
+    ///   common path pays no extra parse.
+    /// - If `Content-Encoding` is still non-identity, decompression did not
+    ///   happen (no `compression` plugin, or it could not decode the body): the
+    ///   body is still compressed and uninspectable — fail closed via
+    ///   `fail_on_uninspectable_body` (reason `compressed_body`).
+    /// - Otherwise the body is now plaintext JSON: parse and run `validate()`,
+    ///   rejecting on malformed JSON or any policy violation.
+    ///
+    /// Note: reject-style policy (model allow/block, token/prompt limits,
+    /// temperature, system-prompt blocking, required fields) is enforced here.
+    /// The `max_tokens` clamp / `default_max_tokens` injection is NOT re-applied
+    /// to compressed bodies — those mutate the body, and the H1/H2 final-body
+    /// hook contract only copies `ctx.metadata` back (body edits are dropped), so
+    /// attempting them here would be inconsistent across protocols. Clamp/inject
+    /// on compressed uploads remains a known limitation; the security-relevant
+    /// reject policies are fully enforced.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        // Only act on bodies `before_proxy` explicitly deferred. The marker is
+        // set only for non-identity `Content-Encoding` requests, so the common
+        // (uncompressed) path skips this hook entirely.
+        if ctx.metadata.remove(DEFERRED_COMPRESSED_MARKER).is_none() {
+            return PluginResult::Continue;
+        }
+
+        // Defensive: a deferred request should still be JSON content-type and
+        // not framed gRPC, but re-check against the final headers in case an
+        // earlier-phase plugin relabeled the content-type. Skipping here matches
+        // the `before_proxy` content-type scope.
+        let content_type = headers
+            .get("content-type")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !is_json_content_type(content_type) || is_framed_grpc_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+
+        // If the body is still encoded, no `transform_request_body` decompressed
+        // it. It cannot be inspected — fail closed (or pass through in
+        // compatibility mode). This is the deliberate-bypass case: a caller that
+        // gzipped the body to skip policy on a proxy without `compression`.
+        if has_non_identity_content_encoding(headers) {
+            return self.handle_uninspectable_body(ctx, "compressed_body", 400, || {
+                "Request body is still compressed after request transforms and cannot be inspected"
+                    .to_string()
+            });
+        }
+
+        // A decompressed-to-empty (or never-populated) body cannot be inspected.
+        if body.is_empty() {
+            return self.handle_uninspectable_body(ctx, "empty_body", 400, || {
+                "Request body is empty after request transforms and cannot be inspected".to_string()
+            });
+        }
+
+        // The body was decompressed (or was never really compressed). Parse and
+        // run the full reject-style policy set.
+        let json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(err) => {
+                return self.handle_uninspectable_body(ctx, "malformed_json", 400, || {
+                    format!("Malformed JSON request body cannot be inspected: {err}")
+                });
+            }
+        };
+
+        if let Err((error, details)) = self.validate(&json) {
+            debug!(
+                "ai_request_guard: validation failed on decompressed body: {} - {}",
+                error, details
+            );
+            return PluginResult::Reject {
+                status_code: 400,
+                body: serde_json::json!({
+                    "error": error,
+                    "details": details,
+                })
+                .to_string(),
+                headers: HashMap::new(),
+            };
         }
 
         PluginResult::Continue

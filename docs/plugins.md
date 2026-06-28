@@ -3741,6 +3741,15 @@ Validates and constrains AI/LLM API requests before they reach the backend.
 
 Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured. By default, configured guard policies fail closed when the body cannot be inspected: malformed JSON, empty JSON bodies, non-UTF-8 buffered bodies, or missing buffered-body metadata are rejected before backend dispatch. Oversized bodies are rejected earlier by the proxy request-body buffer limit. Production AI proxies should keep this default so malformed or unbuffered requests cannot bypass model, token, prompt, or metadata policy; set `fail_on_uninspectable_body: false` only for compatibility when the upstream service must own malformed JSON handling.
 
+**Compressed request bodies fail closed.** A `Content-Encoding: gzip|br|…` body is still compressed (non-UTF-8) when the guard's `before_proxy` phase runs — request decompression (the `compression` plugin's `decompress_request`) only happens in the later `transform_request_body` phase. To keep a caller from gzipping the request body to skip all reject-style policy, the guard defers inspection to its `on_final_request_body` hook, which runs *after* all request-body transforms:
+
+- If a `compression` plugin with `decompress_request: true` is on the same proxy, the body is decompressed and `Content-Encoding` is stripped by then, so the guard inspects the now-plaintext JSON and enforces every policy normally.
+- If nothing decompressed the body (no `compression` plugin, or it could not decode it), the body is still compressed and uninspectable, so it is rejected by default (reason `compressed_body`). Set `fail_on_uninspectable_body: false` to forward compressed AI uploads uninspected.
+
+Reject-style policy (model allow/block, token/prompt limits, temperature, system-prompt blocking, required fields) is enforced on decompressed bodies. The `max_tokens` clamp and `default_max_tokens` injection are **not** re-applied to compressed bodies (those mutate the body, which is not safely supported in the final-body hook across all protocols) — a known limitation that does not affect the reject-style protections.
+
+**Framed gRPC and gRPC-Web bodies are skipped, not rejected.** `application/grpc*` and `application/grpc-web*` content types (including the `+json` variants such as `application/grpc-web-text+json`) carry length-prefixed — and, for `-text`, base64 — gRPC wire frames, not bare JSON documents, so the JSON policies do not apply and the request passes through. In a normal deployment the `grpc_web` plugin rewrites gRPC-Web to native `application/grpc` before this plugin runs; the gRPC-Web skip ensures a proxy that has `ai_request_guard` but no `grpc_web` plugin does not 400 real gRPC-Web traffic.
+
 At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1).
 
 **Priority:** 2975
@@ -3758,7 +3767,7 @@ At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_mo
 | `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for temperature |
 | `block_system_prompts` | Boolean | `false` | Reject requests with `role: "system"` messages |
 | `required_metadata_fields` | String[] | `[]` | Required fields in request body |
-| `fail_on_uninspectable_body` | Boolean | `true` | Reject matching JSON `POST` requests whose body is missing, empty, non-UTF-8, or malformed JSON |
+| `fail_on_uninspectable_body` | Boolean | `true` | Reject matching JSON `POST` requests whose body is missing, empty, non-UTF-8, malformed JSON, or still compressed after request transforms (no `compression`/`decompress_request` decoded it) |
 
 ```yaml
 plugin_name: ai_request_guard
