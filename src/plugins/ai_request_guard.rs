@@ -348,11 +348,17 @@ impl AiRequestGuard {
             details = %details,
             "ai_request_guard: rejecting uninspectable request body"
         );
+        let client_details = match reason {
+            "empty_body" => "JSON request body is empty",
+            "non_utf8_body" => "JSON request body is not valid UTF-8",
+            "malformed_json" => "Malformed JSON request body",
+            _ => "Request body could not be inspected",
+        };
         PluginResult::Reject {
             status_code,
             body: serde_json::json!({
                 "error": "Request body uninspectable",
-                "details": details,
+                "details": client_details,
             })
             .to_string(),
             headers: HashMap::new(),
@@ -446,26 +452,27 @@ impl Plugin for AiRequestGuard {
                     ctx,
                     "empty_body",
                     400,
-                    "JSON request body is empty and cannot be inspected by ai_request_guard"
-                        .to_string(),
+                    "JSON request body is empty and cannot be inspected".to_string(),
                 );
             }
             None => {
-                let status_code = if ctx.metadata.contains_key("request_body_size_bytes") {
-                    400
-                } else {
-                    500
-                };
-                let reason = if status_code == 400 {
-                    "non_utf8_body"
-                } else {
-                    "missing_buffered_body"
-                };
-                let details = if status_code == 400 {
-                    "Request body was buffered but is not valid UTF-8 JSON"
-                } else {
-                    "Buffered request body metadata was unavailable for ai_request_guard inspection"
-                };
+                let (reason, status_code, details) =
+                    if ctx.metadata.contains_key("request_body_size_bytes") {
+                        (
+                            "non_utf8_body",
+                            400,
+                            "Request body was buffered but is not valid UTF-8 JSON",
+                        )
+                    } else {
+                        // For matching POST JSON requests, body buffering should
+                        // always provide metadata before this hook. Missing metadata
+                        // indicates an internal plugin runner inconsistency.
+                        (
+                            "missing_buffered_body",
+                            500,
+                            "Buffered request body metadata was unavailable for request inspection",
+                        )
+                    };
                 return self.handle_uninspectable_body(
                     ctx,
                     reason,
@@ -483,9 +490,7 @@ impl Plugin for AiRequestGuard {
                     ctx,
                     "malformed_json",
                     400,
-                    format!(
-                        "Malformed JSON request body cannot be inspected by ai_request_guard: {err}"
-                    ),
+                    format!("Malformed JSON request body cannot be inspected: {err}"),
                 );
             }
         };

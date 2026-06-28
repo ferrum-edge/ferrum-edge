@@ -1,7 +1,7 @@
 //! Tests for ai_request_guard plugin
 
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, ai_request_guard::AiRequestGuard, priority,
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ai_request_guard::AiRequestGuard, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -642,6 +642,25 @@ async fn empty_buffered_body_rejected_when_policy_requires_body() {
 }
 
 #[tokio::test]
+async fn non_utf8_buffered_body_rejected_when_policy_requires_body() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "12".to_string());
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"non_utf8_body".to_string())
+    );
+}
+
+#[tokio::test]
 async fn malformed_json_rejected_when_fail_on_uninspectable_body() {
     let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
     let mut ctx = create_test_context();
@@ -652,7 +671,17 @@ async fn malformed_json_rejected_when_fail_on_uninspectable_body() {
         .insert("request_body".to_string(), "not valid json{{{".to_string());
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_reject(result, Some(400));
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("Malformed JSON request body"));
+            assert!(!body.contains("ai_request_guard"));
+            assert!(!body.contains("expected ident"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
     assert_eq!(
         ctx.metadata.get("ai_request_guard.uninspectable_body"),
         Some(&"true".to_string())
