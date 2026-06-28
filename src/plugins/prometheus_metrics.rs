@@ -1568,6 +1568,16 @@ impl MetricsRegistry {
                 &ns_label,
             );
             output.push_str(
+                "# HELP ferrum_admin_max_connections_per_ip Configured per-source-IP admin connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_admin_max_connections_per_ip gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_admin_max_connections_per_ip",
+                snapshot.max_connections_per_ip as u64,
+                &ns_label,
+            );
+            output.push_str(
                 "# HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.\n",
             );
             output.push_str("# TYPE ferrum_admin_rejected_connections_total counter\n");

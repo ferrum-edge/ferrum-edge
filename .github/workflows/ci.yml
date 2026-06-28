@@ -663,6 +663,7 @@ jobs:
               functional_ci_shard_coverage_test
           - shard: admin-routing
             filters: |
+              functional_admin_connection_limit_test
               functional_admin_observability_test
               functional_admin_operations_test
               functional_auth_acl_test

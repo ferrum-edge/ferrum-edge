@@ -61,8 +61,6 @@ pub struct AdminConnLimiterSnapshot {
     pub max_connections_per_ip: usize,
     /// Currently held permits (admin connections in flight).
     pub active_connections: u64,
-    /// Total rejections across all reasons.
-    pub rejected_total: u64,
     /// Rejections attributed to the global cap.
     pub rejected_max_connections: u64,
     /// Rejections attributed to the per-IP cap.
@@ -119,15 +117,12 @@ impl AdminConnLimiter {
         }
     }
 
-    /// Convenience constructor for an uncapped limiter (used by tests and any
-    /// caller that wants the gauge without enforcement).
+    /// Convenience constructor for an uncapped limiter. Used by the external
+    /// test crates; `#[allow(dead_code)]` because the binary target compiles
+    /// the module tree separately (alongside the library) and never calls it.
+    #[allow(dead_code)]
     pub fn unlimited() -> Arc<Self> {
         Arc::new(Self::new(0, 0))
-    }
-
-    /// Whether any cap is configured.
-    pub fn is_enforcing(&self) -> bool {
-        self.max_connections > 0 || self.max_connections_per_ip > 0
     }
 
     /// Try to admit one admin connection from `remote_ip`.
@@ -196,8 +191,6 @@ impl AdminConnLimiter {
             max_connections: self.max_connections,
             max_connections_per_ip: self.max_connections_per_ip,
             active_connections: self.active.load(Ordering::Relaxed),
-            rejected_total: rejected_max_connections
-                .saturating_add(rejected_max_connections_per_ip),
             rejected_max_connections,
             rejected_max_connections_per_ip,
         }

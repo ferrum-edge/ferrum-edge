@@ -49,7 +49,7 @@ use crate::util::body_limit::is_length_limit_error;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
-pub use conn_limit::{AdminConnLimiter, AdminConnRejectReason};
+pub use conn_limit::AdminConnLimiter;
 
 /// Cached result of the database health check to avoid hitting the DB on every
 /// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
