@@ -1066,6 +1066,95 @@ async fn unmetered_2xx_is_not_free_in_enforce_mode() {
 }
 
 #[tokio::test]
+async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() {
+    // Codex P2: for a POST JSON request with a non-identity `Content-Encoding`,
+    // `ctx.metadata["request_body"]` still holds the COMPRESSED wire bytes at
+    // `before_proxy` time (request decompression runs later, in
+    // `transform_request_body`). Estimating against those bytes would yield a
+    // wrong/tiny pre-reservation that under-reserves the budget. The plugin must
+    // therefore SKIP the estimate-based pre-reservation for compressed requests
+    // (falling back to the no-reservation `CheckBudget` path) and rely on
+    // reconciliation to charge actual usage afterward.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Control: an identical *uncompressed* request reserves estimated tokens.
+    let mut uncompressed = ai_request_ctx(120, "count this prompt please");
+    let mut uncompressed_headers = json_headers();
+    plugin
+        .before_proxy(&mut uncompressed, &mut uncompressed_headers)
+        .await;
+    assert!(
+        reserved_tokens(&uncompressed) > 0,
+        "an uncompressed JSON POST should still reserve estimated tokens"
+    );
+
+    // Compressed: same body bytes, but a non-identity `Content-Encoding` on the
+    // request. `before_proxy` reads the encoding from the `headers` PARAMETER
+    // (not `ctx.headers`), matching the production phase where the handler may
+    // `mem::take` headers out of `ctx`. No body-derived pre-reservation is made.
+    let mut compressed = ai_request_ctx(120, "count this prompt please");
+    let mut compressed_headers = json_headers();
+    compressed_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let result = plugin
+        .before_proxy(&mut compressed, &mut compressed_headers)
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        reserved_tokens(&compressed),
+        0,
+        "a compressed request must NOT produce a body-derived pre-reservation"
+    );
+    assert!(
+        !compressed
+            .metadata
+            .contains_key("ai_ratelimit_reserved_tokens"),
+        "compressed request should skip pre-reservation entirely (no reserved-tokens marker)"
+    );
+
+    // Reconciliation still charges the ACTUAL provider-reported usage afterward,
+    // so the compressed request is debited correctly even without a reservation.
+    let body = openai_response(40, 15);
+    let reconcile = plugin
+        .on_response_body(&mut compressed, 200, &json_headers(), &body)
+        .await;
+    assert_continue(reconcile);
+    assert_eq!(
+        observed_usage(&plugin).await,
+        55,
+        "reconciliation should charge actual usage (40 + 15) for the compressed request"
+    );
+}
+
+#[tokio::test]
+async fn identity_content_encoding_still_pre_reserves() {
+    // `identity` (and an empty list) is NOT compression — those requests are
+    // estimable and must keep the normal estimate-based pre-reservation. Guards
+    // against `has_non_identity_content_encoding` over-matching.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "count this prompt please");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "identity".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        reserved_tokens(&ctx) > 0,
+        "an `identity` content-encoding is not compressed and must still pre-reserve"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_requests_cannot_oversubscribe_budget() {
     let plugin = AiRateLimiter::new(
         &json!({

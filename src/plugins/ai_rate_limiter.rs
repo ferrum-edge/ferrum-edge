@@ -591,6 +591,29 @@ fn requested_completion_tokens(json: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// True when a `content-encoding` header marks the request body as encoded with
+/// anything other than `identity`.
+///
+/// `ai_rate_limiter` runs in `before_proxy`, but request-body decompression (the
+/// `compression` plugin's `decompress_request`) only happens later in
+/// `transform_request_body`. At this phase `ctx.metadata["request_body"]` still
+/// holds the *compressed wire bytes*, not UTF-8 JSON — so a token estimate
+/// derived from it would parse-fail (estimate 0) or, worse, undercount, letting
+/// compressed AI requests dodge the estimate-based pre-reservation. When this
+/// returns true the caller skips pre-reservation entirely and falls back to the
+/// no-reservation `CheckBudget` path; post-response reconciliation then charges
+/// the actual usage reported by the provider. Mirrors the same phase-ordering
+/// handling `ai_request_guard` uses for compressed bodies (#1919).
+/// Allocation-free; tolerant of comma-separated encoding lists.
+fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
+    headers.get("content-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .map(|token| token.trim())
+            .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+    })
+}
+
 fn estimate_prompt_tokens(json: &Value) -> u64 {
     let chars = prompt_character_count(json);
     if chars == 0 { 0 } else { chars.div_ceil(4) }
@@ -783,10 +806,29 @@ impl Plugin for AiRateLimiter {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         let key = self.rate_key(ctx);
-        let reserved_tokens = self.estimate_request_tokens(ctx);
+        // A compressed request body is not estimable at this phase: request
+        // decompression (the `compression` plugin's `decompress_request`) runs
+        // later in `transform_request_body`, so `ctx.metadata["request_body"]`
+        // still holds the *compressed wire bytes* here. Estimating against those
+        // bytes would parse-fail (estimate 0) or undercount, under-reserving and
+        // letting compressed AI requests oversubscribe the budget. So skip the
+        // estimate-based pre-reservation for any non-identity `Content-Encoding`
+        // and fall back to the no-pre-reservation `CheckBudget` path below;
+        // post-response reconciliation (`reconcile_usage`) is the backstop that
+        // charges the actual provider-reported usage afterward. We do NOT attempt
+        // to decompress here. Read the header from the `headers` parameter, not
+        // `ctx.headers`: when no plugin advertises `modifies_request_headers()`
+        // the handler `mem::take`s headers out of `ctx.headers` for this phase.
+        // See limitation #4 below and docs/plugins.md (compressed requests are
+        // reconciled-only, not pre-reserved). Mirrors `ai_request_guard` (#1919).
+        let reserved_tokens = if has_non_identity_content_encoding(headers) {
+            0
+        } else {
+            self.estimate_request_tokens(ctx)
+        };
         // Pre-reservation vs. fall-back-to-check behavior, and two
         // intentional limitations operators must understand:
         //
@@ -828,6 +870,20 @@ impl Plugin for AiRateLimiter {
         //    transform pipeline twice; reconciliation is the corrective. This is
         //    documented under `count_mode` / `request_transformer` interaction
         //    in docs/plugins.md.
+        //
+        // 4. Compressed request bodies are reconciled-only, never pre-reserved.
+        //    When the inbound request carries a non-identity `Content-Encoding`
+        //    (gzip/br/…) the buffered body is still compressed at this phase
+        //    (decompression runs later in `transform_request_body`), so an
+        //    estimate computed from it would be wrong/tiny. `reserved_tokens` is
+        //    forced to 0 above for these requests, falling through to the
+        //    `CheckBudget` path (which still enforces an already-exhausted
+        //    budget) without a body-derived pre-reservation. Post-response
+        //    reconciliation charges the actual provider-reported usage, so the
+        //    window is debited correctly after the fact. This matches how
+        //    `ai_request_guard` treats compressed bodies (#1919) and is
+        //    documented under `count_mode` / `on_unmetered_response` in
+        //    docs/plugins.md.
         let outcome = if reserved_tokens > 0 {
             self.reserve_usage(key.clone(), reserved_tokens).await
         } else {
