@@ -1106,11 +1106,15 @@ async fn test_federation_flag_is_scoped_per_limiter_instance() {
     // others, so only the first budget was charged for an ai_federation
     // response. The flag is now scoped per limiter instance so EACH budget
     // records the federation tokens exactly once.
+    // `expose_headers` is required for `observed_usage` to read the recorded
+    // window total back out of `ai_ratelimit_usage` metadata (it is only stored
+    // when headers are exposed).
     let consumer_limiter = AiRateLimiter::new(
         &json!({
             "token_limit": 10_000,
             "window_seconds": 60,
             "limit_by": "consumer",
+            "expose_headers": true,
         }),
         PluginHttpClient::default(),
     )
@@ -1120,6 +1124,7 @@ async fn test_federation_flag_is_scoped_per_limiter_instance() {
             "token_limit": 10_000,
             "window_seconds": 60,
             "limit_by": "ip",
+            "expose_headers": true,
         }),
         PluginHttpClient::default(),
     )

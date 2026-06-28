@@ -1532,20 +1532,26 @@ impl Plugin for ResponseCaching {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Served-from-cache guard. When this plugin short-circuited the request
-        // with its own cache HIT/REVALIDATED, the synthetic body now flows back
-        // through the response-body hooks (the generic 2xx short-circuit path),
-        // which would otherwise re-run the entire store path over the body we
-        // just served — taking `accounting_guard()` and doing a full body copy
-        // on every hit (a hot-path regression) and needlessly churning the vary
-        // index / uncacheable predictor. The entry is already cached and the
-        // body is unchanged, so there is nothing to store. Misses/bypasses fall
-        // through and store normally. Mirrors `ai_semantic_cache`'s miss-only
-        // buffering key.
-        if matches!(
-            ctx.metadata.get(CACHE_STATUS).map(String::as_str),
-            Some("HIT") | Some("REVALIDATED")
-        ) {
+        // Synthetic short-circuit guard. When a request was short-circuited by a
+        // `before_proxy` plugin (including this plugin's own cache HIT/REVALIDATED
+        // surfaced via `RejectBinary`, an `ai_semantic_cache` hit, a
+        // `fault_injection`/`response_mock`/`serverless` abort, etc.), the
+        // synthetic body now flows back through the response-body hooks (the
+        // generic 2xx short-circuit path). Re-running the entire store path over a
+        // body that never came from the backend would take `accounting_guard()`,
+        // do a full body copy on every hit (a hot-path regression), and needlessly
+        // churn the vary index / uncacheable predictor — and for a served cache
+        // HIT the entry is already cached and unchanged, so there is nothing to
+        // store. `apply_synthetic_response_body_hooks` sets this marker only for
+        // the duration of the synthetic body-hook phase, so its presence is a
+        // precise signal; a genuine backend response (the only legitimate store /
+        // replacement path) never carries it and falls through to store normally.
+        // Mirrors `request_deduplication`'s synthetic short-circuit guard and
+        // `ai_semantic_cache`'s miss-only buffering key.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
             return PluginResult::Continue;
         }
 
@@ -1813,10 +1819,10 @@ mod tests {
     async fn cache_hit_does_not_restore_over_served_body() {
         // Regression: synthetic 2xx short-circuit bodies (cache HITs surfaced
         // via `RejectBinary{200}`) now flow back through the response-body
-        // hooks. Without the served-from-cache guard in `on_final_response_body`
-        // every fresh hit would re-run the full store path over the body it
-        // just served (a lock + body copy hot-path regression). This asserts a
-        // HIT leaves the cached entry untouched.
+        // hooks. Without the synthetic short-circuit guard in
+        // `on_final_response_body` every fresh hit would re-run the full store
+        // path over the body it just served (a lock + body copy hot-path
+        // regression). This asserts a HIT leaves the cached entry untouched.
         let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
 
         // 1) MISS: store an entry.
@@ -1869,9 +1875,16 @@ mod tests {
         );
 
         // 3) The synthetic-response-body path now re-runs on_final_response_body
-        // over the HIT body. Feed a DIFFERENT body to prove the guard prevents a
-        // re-store: if the entry were re-stored it would now hold the tampered
-        // body and a new stored_at.
+        // over the HIT body. In production `apply_synthetic_response_body_hooks`
+        // sets the synthetic short-circuit marker for the duration of this phase;
+        // replicate that here so the guard sees the same precise signal it does at
+        // runtime. Feed a DIFFERENT body to prove the guard prevents a re-store:
+        // if the entry were re-stored it would now hold the tampered body and a
+        // new stored_at.
+        hit_ctx.metadata.insert(
+            crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
         let store_result = plugin
             .on_final_response_body(&mut hit_ctx, 200, &response_headers, b"tampered-B")
             .await;
