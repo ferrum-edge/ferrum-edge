@@ -11334,9 +11334,23 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     }
 }
 
-pub(crate) async fn apply_plugin_rejection_response(
-    plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
+/// Rebuild `response_status` / `response_headers` for a plugin rejection
+/// **without** running the `after_proxy` reject hooks, returning the rejection
+/// body. This is the header/body half of [`apply_plugin_rejection_response`],
+/// split out so the synthetic-response-body-hook path can replace the response
+/// for a body rejection while deferring the `after_proxy` reject hooks to a
+/// single application point (see
+/// [`apply_reject_after_proxy_and_synthetic_body_hooks`]).
+///
+/// Deferring matters because several reject-path `after_proxy` hooks consume
+/// one-shot state on their first invocation — `oidc_relying_party` does
+/// `ctx.metadata.remove(SESSION_SET_COOKIE_METADATA_KEY)` to stage the rotated
+/// session cookie, and `response_transformer` does
+/// `ctx.route_override_response_transform.take()`. If `after_proxy` ran once
+/// over the synthetic 2xx and then again here (after `response_headers.clear()`),
+/// that one-shot state would already be gone and could not be re-applied to the
+/// rejection response, silently dropping the rotated cookie / route overrides.
+fn rebuild_plugin_rejection_response_headers(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
@@ -11347,8 +11361,19 @@ pub(crate) async fn apply_plugin_rejection_response(
     for (key, value) in reject.headers {
         response_headers.insert(key, value);
     }
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await;
     reject.body
+}
+
+pub(crate) async fn apply_plugin_rejection_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    reject: RejectedResponseParts,
+) -> Vec<u8> {
+    let body = rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await;
+    body
 }
 
 /// Decide whether response-body guardrails / transforms should run over a
@@ -11393,6 +11418,21 @@ fn should_apply_synthetic_response_body_hooks(
         })
 }
 
+/// Run the synthetic 2xx short-circuit response-body hook pipeline
+/// (`on_response_body`, `transform_response_body_with_context`,
+/// `on_final_response_body`) over a plugin-generated body, replacing the
+/// response when a body guardrail rejects it.
+///
+/// A body rejection here rebuilds the response headers via
+/// [`rebuild_plugin_rejection_response_headers`] — it deliberately does **not**
+/// run the `after_proxy` reject hooks. The caller
+/// ([`apply_reject_after_proxy_and_synthetic_body_hooks`]) runs those hooks
+/// exactly once after this function returns, over whatever the final response
+/// turned out to be (the synthetic 2xx or the body-rejection response), so
+/// one-shot `after_proxy` response state (e.g. the `oidc_relying_party` rotated
+/// session cookie, `response_transformer` route overrides) lands on the final
+/// response exactly once instead of being consumed by an earlier pass and lost
+/// when this path replaces the response.
 async fn apply_synthetic_response_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -11430,14 +11470,10 @@ async fn apply_synthetic_response_body_hooks(
         }
     }
     if let Some(reject) = response_body_reject {
-        *response_body = apply_plugin_rejection_response(
-            plugins,
-            ctx,
-            response_status,
-            response_headers,
-            reject,
-        )
-        .await;
+        // Rebuild headers/body only; the after_proxy reject hooks run once in
+        // the caller so one-shot response state survives this replacement.
+        *response_body =
+            rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
     }
 
     let content_type = response_headers.get("content-type").cloned();
@@ -11473,14 +11509,10 @@ async fn apply_synthetic_response_body_hooks(
         }
     }
     if let Some(reject) = response_body_reject {
-        *response_body = apply_plugin_rejection_response(
-            plugins,
-            ctx,
-            response_status,
-            response_headers,
-            reject,
-        )
-        .await;
+        // Rebuild headers/body only; the after_proxy reject hooks run once in
+        // the caller so one-shot response state survives this replacement.
+        *response_body =
+            rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
     }
 
     // Restore the synthetic short-circuit marker to its prior state so it does
@@ -11496,9 +11528,10 @@ async fn apply_synthetic_response_body_hooks(
 }
 
 /// Run the rejection-response plugin pipeline over a plugin short-circuit:
-/// the `after_proxy` reject hooks (`applies_after_proxy_on_reject()`) followed
-/// by the synthetic response-body guardrail/transform hooks when the gate in
-/// [`should_apply_synthetic_response_body_hooks`] is satisfied.
+/// the synthetic response-body guardrail/transform hooks (when the gate in
+/// [`should_apply_synthetic_response_body_hooks`] is satisfied) followed by the
+/// `after_proxy` reject hooks (`applies_after_proxy_on_reject()`), applied
+/// **exactly once** over the final response.
 ///
 /// This is the shared core used by both the H1/H2/HBONE rejection path
 /// ([`finalize_reject_response_with_after_proxy_hooks`]) and the HTTP/3
@@ -11508,6 +11541,22 @@ async fn apply_synthetic_response_body_hooks(
 /// across all frontends. It mutates `status`, `headers`, and `body` in place;
 /// any normalization of the final wire form (gRPC trailers, content-length) is
 /// the caller's responsibility.
+///
+/// Ordering: the synthetic body hooks run first (they may *replace* the
+/// response when `ai_response_guard` / `ai_semantic_firewall` rejects the
+/// synthetic 2xx body — see [`apply_synthetic_response_body_hooks`], which
+/// rebuilds headers via [`rebuild_plugin_rejection_response_headers`] without
+/// running `after_proxy`). The `after_proxy` reject hooks then run a single
+/// time over whatever the FINAL response is (the synthetic 2xx OR the
+/// body-rejection response). Running `after_proxy` exactly once — and last —
+/// preserves one-shot response state that those hooks emit: the
+/// `oidc_relying_party` rotated session cookie and `response_transformer`
+/// route-override headers are staged from metadata that the hook consumes on
+/// first invocation, so they must be applied to the final response, not
+/// consumed against a synthetic 2xx that a later body rejection discards. The
+/// reject-path `after_proxy` hooks are header-only and do not depend on the
+/// body-hook output (`compression::after_proxy` deliberately no-ops on the
+/// rejection path), so deferring them past the body hooks is safe.
 pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -11516,12 +11565,16 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     body: &mut Vec<u8>,
     is_grpc_request: bool,
 ) {
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
     if !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
     {
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
+    // Apply the after_proxy reject hooks exactly once, over the final response
+    // (the synthetic 2xx or the body-rejection response produced above), so
+    // one-shot response state (rotated session cookie, route overrides) is
+    // emitted onto whatever the client actually receives.
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
 }
 
 pub(crate) struct AfterProxyReject {
@@ -23811,6 +23864,47 @@ mod tests {
         }
     }
 
+    /// Metadata key the [`OneShotCookieAfterProxyPlugin`] consumes on its first
+    /// `after_proxy` invocation, mirroring `oidc_relying_party`'s rotated-session
+    /// cookie handoff (`SESSION_SET_COOKIE_METADATA_KEY`).
+    const ONE_SHOT_COOKIE_METADATA_KEY: &str = "test:one_shot_cookie";
+
+    /// Stages a one-shot `Set-Cookie` from metadata onto the response during a
+    /// rejection `after_proxy` pass — modeled on `oidc_relying_party.after_proxy`,
+    /// which `ctx.metadata.remove(...)`s the rotated cookie (so a second pass
+    /// cannot re-emit it) and appends it onto `set-cookie`. Used to prove the
+    /// rotated cookie survives a synthetic-2xx body rejection.
+    struct OneShotCookieAfterProxyPlugin;
+
+    #[async_trait]
+    impl Plugin for OneShotCookieAfterProxyPlugin {
+        fn name(&self) -> &str {
+            "one_shot_cookie_after_proxy"
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            if let Some(cookie) = ctx.metadata.remove(ONE_SHOT_COOKIE_METADATA_KEY) {
+                response_headers
+                    .entry("set-cookie".to_string())
+                    .and_modify(|existing| {
+                        existing.push('\n');
+                        existing.push_str(&cookie);
+                    })
+                    .or_insert(cookie);
+            }
+            PluginResult::Continue
+        }
+    }
+
     fn test_proxy(response_body_mode: ResponseBodyMode) -> Proxy {
         serde_json::from_value(json!({
             "backend_host": "example.com",
@@ -24146,6 +24240,103 @@ mod tests {
                 .map(String::as_str),
             Some("response_leakage")
         );
+    }
+
+    /// Regression: a one-shot `after_proxy` response header staged for a
+    /// synthetic 2xx short-circuit MUST survive a subsequent response-body
+    /// rejection of that synthetic body. Before the fix, the reject `after_proxy`
+    /// hooks ran once over the synthetic 2xx (consuming the one-shot cookie out of
+    /// metadata) and then `apply_plugin_rejection_response` cleared the headers and
+    /// re-ran `after_proxy` over the body-rejection response — but the one-shot
+    /// state was already gone, so the rotated cookie was silently dropped on the
+    /// rejection response. The hooks now run exactly once, last, over the final
+    /// response.
+    #[tokio::test]
+    async fn one_shot_after_proxy_cookie_survives_synthetic_body_rejection() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(OneShotCookieAfterProxyPlugin),
+            Arc::new(response_guard_rejecting_leak_phrase()),
+        ];
+        let mut ctx = request_ctx_with_ai_body(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        // The rotated session cookie staged by `authenticate`, awaiting emission
+        // by the rejection-aware `after_proxy` pass.
+        ctx.metadata.insert(
+            ONE_SHOT_COOKIE_METADATA_KEY.to_string(),
+            "ferrum_session=rotated; HttpOnly".to_string(),
+        );
+
+        // Synthetic 2xx short-circuit (e.g. an `ai_federation` hit) whose body
+        // contains the phrase the response guard blocks.
+        let mut synthetic_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        synthetic_headers.insert("content-length".to_string(), "0".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("Here is DO_NOT_LEAK from the provider.")),
+            headers: synthetic_headers,
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        // The body guard replaced the synthetic 2xx with a 502 rejection...
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&response.body)
+                .contains("AI response blocked by content guard")
+        );
+        // ...and the rotated session cookie still rides on that rejection
+        // response, exactly once.
+        let set_cookie = response
+            .headers
+            .get("set-cookie")
+            .map(String::as_str)
+            .expect("rotated session cookie must survive the body rejection");
+        assert_eq!(set_cookie, "ferrum_session=rotated; HttpOnly");
+        // One-shot state was consumed (no leak past the response build).
+        assert!(!ctx.metadata.contains_key(ONE_SHOT_COOKIE_METADATA_KEY));
+    }
+
+    /// Companion to the rejection case: when the synthetic 2xx body is NOT
+    /// rejected, the one-shot `after_proxy` cookie must still appear on the
+    /// surviving 2xx response exactly once (no loss, no duplication).
+    #[tokio::test]
+    async fn one_shot_after_proxy_cookie_applied_once_on_accepted_synthetic_body() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(OneShotCookieAfterProxyPlugin),
+            Arc::new(response_guard_rejecting_leak_phrase()),
+        ];
+        let mut ctx = request_ctx_with_ai_body(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        ctx.metadata.insert(
+            ONE_SHOT_COOKIE_METADATA_KEY.to_string(),
+            "ferrum_session=rotated; HttpOnly".to_string(),
+        );
+
+        // Synthetic 2xx whose body contains nothing the guard blocks.
+        let mut synthetic_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        synthetic_headers.insert("content-length".to_string(), "0".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("A perfectly benign answer.")),
+            headers: synthetic_headers,
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::OK);
+        let set_cookie = response
+            .headers
+            .get("set-cookie")
+            .map(String::as_str)
+            .expect("rotated session cookie must ride the surviving 2xx response");
+        assert_eq!(set_cookie, "ferrum_session=rotated; HttpOnly");
+        assert!(!ctx.metadata.contains_key(ONE_SHOT_COOKIE_METADATA_KEY));
     }
 
     #[tokio::test]
