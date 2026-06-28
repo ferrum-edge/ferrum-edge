@@ -847,13 +847,13 @@ async fn synthetic_short_circuit_body_is_not_token_accounted() {
 
     // No token-usage metadata was written for the synthetic body.
     assert!(
-        ctx.metadata.get("ai_total_tokens").is_none(),
+        !ctx.metadata.contains_key("ai_total_tokens"),
         "synthetic short-circuit body must not record token usage"
     );
-    assert!(ctx.metadata.get("ai_provider").is_none());
-    assert!(ctx.metadata.get("ai_prompt_tokens").is_none());
-    assert!(ctx.metadata.get("ai_completion_tokens").is_none());
-    assert!(ctx.metadata.get("ai_model").is_none());
+    assert!(!ctx.metadata.contains_key("ai_provider"));
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_completion_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_model"));
 }
 
 // Control: a GENUINE backend response (no synthetic marker) with the same
