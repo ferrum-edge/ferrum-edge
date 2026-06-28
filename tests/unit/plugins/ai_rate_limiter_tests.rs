@@ -1080,6 +1080,9 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
             "token_limit": 1000,
             "window_seconds": 60,
             "limit_by": "ip",
+            // `observed_usage` reads `ai_ratelimit_usage` from metadata, which the
+            // limiter only writes when `expose_headers` is set (see `store_metadata`).
+            "expose_headers": true,
         }),
         PluginHttpClient::default(),
     )
@@ -1135,9 +1138,47 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
 
 #[tokio::test]
 async fn identity_content_encoding_still_pre_reserves() {
-    // `identity` (and an empty list) is NOT compression — those requests are
-    // estimable and must keep the normal estimate-based pre-reservation. Guards
-    // against `has_non_identity_content_encoding` over-matching.
+    // `identity` (and an empty/whitespace list) is NOT compression — those
+    // requests are estimable and must keep the normal estimate-based
+    // pre-reservation. Guards against `has_non_identity_content_encoding`
+    // over-matching on the `is_empty()` / `identity` tokens.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // A single `identity` token is not compression -> still pre-reserves.
+    let mut ctx = ai_request_ctx(120, "count this prompt please");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "identity".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        reserved_tokens(&ctx) > 0,
+        "an `identity` content-encoding is not compressed and must still pre-reserve"
+    );
+
+    // An empty `Content-Encoding` value yields only empty tokens (filtered by
+    // the `!token.is_empty()` guard) -> not treated as compression.
+    let mut empty_ctx = ai_request_ctx(120, "count this prompt please");
+    let mut empty_headers = json_headers();
+    empty_headers.insert("content-encoding".to_string(), "  ,  ".to_string());
+    plugin
+        .before_proxy(&mut empty_ctx, &mut empty_headers)
+        .await;
+    assert!(
+        reserved_tokens(&empty_ctx) > 0,
+        "an empty/whitespace `Content-Encoding` list is not compression and must still pre-reserve"
+    );
+}
+
+#[tokio::test]
+async fn comma_listed_compression_encoding_skips_pre_reservation() {
+    // A comma-separated `Content-Encoding` list whose later token is a real
+    // compression codec (e.g. `identity, gzip`) MUST be treated as compressed:
+    // the body is not estimable at this phase, so pre-reservation is skipped and
+    // reconciliation backstops. Exercises the multi-token branch of
+    // `has_non_identity_content_encoding`.
     let plugin = AiRateLimiter::new(
         &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
         PluginHttpClient::default(),
@@ -1146,11 +1187,17 @@ async fn identity_content_encoding_still_pre_reserves() {
 
     let mut ctx = ai_request_ctx(120, "count this prompt please");
     let mut headers = json_headers();
-    headers.insert("content-encoding".to_string(), "identity".to_string());
-    plugin.before_proxy(&mut ctx, &mut headers).await;
+    headers.insert("content-encoding".to_string(), "identity, gzip".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "a comma-listed compression codec must skip the body-derived pre-reservation"
+    );
     assert!(
-        reserved_tokens(&ctx) > 0,
-        "an `identity` content-encoding is not compressed and must still pre-reserve"
+        !ctx.metadata.contains_key("ai_ratelimit_reserved_tokens"),
+        "comma-listed compression should skip pre-reservation entirely (no reserved-tokens marker)"
     );
 }
 
