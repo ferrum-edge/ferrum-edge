@@ -1087,7 +1087,7 @@ fn count_prompt_characters(json: &Value) -> u64 {
     // Scoped to that exact field (not the whole `parameters` object, which holds
     // non-prompt config such as endpoints/keys/index names) so the cap reflects
     // model-visible text, consistent with how other RAG fields are counted.
-    count_data_source_role_information(json.get("data_sources"), &mut total);
+    count_data_source_role_information(json, &mut total);
 
     count_tool_definition_text(json.get("tools"), &mut total);
     count_tool_definition_text(json.get("functions"), &mut total);
@@ -1273,21 +1273,41 @@ fn count_argument_value(value: &Value, total: &mut u64) {
     }
 }
 
+/// The Azure "On Your Data" data-source array, under either the GA snake_case
+/// `data_sources` or the original extensions-API camelCase `dataSources`. Mirrors
+/// the dual-casing this file already applies to `system_instruction` /
+/// `systemInstruction` and `tool_results` / `toolResults`.
+fn azure_data_sources(json: &Value) -> Option<&Vec<Value>> {
+    json.get("data_sources")
+        .or_else(|| json.get("dataSources"))
+        .and_then(Value::as_array)
+}
+
+/// The per-data-source instruction string under `parameters.role_information`
+/// (GA) or `parameters.roleInformation` (original extensions API). `None` when
+/// absent or non-string. A single string accessor keeps the `block_system_prompts`
+/// and `max_prompt_characters` inspections in agreement on what they look at.
+fn azure_role_information(source: &Value) -> Option<&str> {
+    let parameters = source.get("parameters")?;
+    parameters
+        .get("role_information")
+        .or_else(|| parameters.get("roleInformation"))
+        .and_then(Value::as_str)
+}
+
 /// Counts the model-visible instruction text under Azure "On Your Data"
-/// `data_sources[].parameters.role_information`. Only that string is counted —
+/// `data_sources[].parameters.role_information` (and the camelCase
+/// `dataSources[].parameters.roleInformation`). Only that string is counted —
 /// the rest of `parameters` carries connection/config values (endpoints, keys,
 /// index names, embedding settings) that are not sent to the model as prompt
 /// text, so counting them would inconsistently inflate `max_prompt_characters`.
-fn count_data_source_role_information(value: Option<&Value>, total: &mut u64) {
-    let Some(Value::Array(sources)) = value else {
+fn count_data_source_role_information(json: &Value, total: &mut u64) {
+    let Some(sources) = azure_data_sources(json) else {
         return;
     };
     for source in sources {
-        if let Some(role_information) = source
-            .get("parameters")
-            .and_then(|parameters| parameters.get("role_information"))
-        {
-            count_text_value(Some(role_information), total);
+        if let Some(role_information) = azure_role_information(source) {
+            add_chars(total, role_information);
         }
     }
 }
@@ -1302,28 +1322,29 @@ fn contains_system_prompt(json: &Value, aliases: &HashSet<String>) -> bool {
         || value_has_system_role(json.get("input"), aliases)
         || value_has_system_role(json.get("contents"), aliases)
         || value_has_system_role(json.get("chat_history"), aliases)
-        || data_sources_have_role_information(json.get("data_sources"))
+        || data_sources_have_role_information(json)
 }
 
 /// Azure OpenAI "On Your Data" requests carry a per-data-source instruction in
-/// `data_sources[].parameters.role_information` — a free-text string that tells
-/// the model how to behave. It is a de-facto system prompt: the backend applies
-/// it even when the top-level `messages` carry only ordinary `user` turns, so a
-/// caller could otherwise smuggle disallowed system/developer instructions past
-/// `block_system_prompts`. Treat a non-empty `role_information` on any data
-/// source as a system prompt. Scoped to this exact nested field (mirroring the
-/// targeted `array_item_has_system_role` scoping) to avoid flagging arbitrary
-/// user-supplied nested text.
-fn data_sources_have_role_information(value: Option<&Value>) -> bool {
-    let Some(Value::Array(sources)) = value else {
+/// `data_sources[].parameters.role_information` (or the original extensions-API
+/// camelCase `dataSources[].parameters.roleInformation`) — a free-text string
+/// that tells the model how to behave. It is a de-facto system prompt: the
+/// backend applies it even when the top-level `messages` carry only ordinary
+/// `user` turns, so a caller could otherwise smuggle disallowed system/developer
+/// instructions past `block_system_prompts`. Treat a NON-EMPTY `role_information`
+/// on any data source as a system prompt.
+///
+/// Empty (`""`) is intentionally allowed — a deliberate departure from the
+/// presence-based top-level `object_has_system_prompt_field`: an empty instruction
+/// carries no directive, and Azure clients legitimately include data sources
+/// without one, so blocking those would be a false positive. Scoped to this exact
+/// nested field (both casings) to avoid flagging arbitrary user-supplied text.
+fn data_sources_have_role_information(json: &Value) -> bool {
+    let Some(sources) = azure_data_sources(json) else {
         return false;
     };
     sources.iter().any(|source| {
-        source
-            .get("parameters")
-            .and_then(|parameters| parameters.get("role_information"))
-            .and_then(Value::as_str)
-            .is_some_and(|role_information| !role_information.is_empty())
+        azure_role_information(source).is_some_and(|role_information| !role_information.is_empty())
     })
 }
 
