@@ -135,6 +135,28 @@ impl TrustedProxies {
         self.cidrs.iter().any(|cidr| cidr.matches(ip))
     }
 
+    /// Whether a comma-separated CIDR/IP list permits **every** source address
+    /// of some family — i.e. any entry canonicalizes to a `/0` prefix
+    /// (`0.0.0.0/0`, `::/0`, or an IPv4-mapped spelling like `::ffff:0.0.0.0/96`
+    /// that this parser folds down to an IPv4 `/0`). Such an entry makes the
+    /// filter match all sources, so the allowlist provides no real restriction.
+    ///
+    /// Reuses the same `parse_cidr` canonicalization as the runtime filter (so
+    /// mapped-IPv6 spellings cannot slip past) and is side-effect free (no
+    /// logging) — safe to call from config classification at startup.
+    pub fn cidr_list_permits_all(raw: &str) -> bool {
+        raw.split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    None
+                } else {
+                    Self::parse_cidr(entry)
+                }
+            })
+            .any(|cidr| cidr.prefix_len == 0)
+    }
+
     fn parse_cidr(entry: &str) -> Option<CidrEntry> {
         if let Some((ip_str, prefix_str)) = entry.split_once('/') {
             let ip: IpAddr = ip_str.parse().ok()?;

@@ -223,7 +223,13 @@ fn test_admin_http_exposure_reachable_with_allowlist() {
 fn test_admin_http_exposure_catch_all_allowlist_is_unrestricted() {
     // Codex finding: a catch-all allowlist (a /0 CIDR) matches every source, so
     // it is no real restriction and must NOT downgrade to ReachableAllowlisted.
-    for cidrs in ["0.0.0.0/0", "::/0", "10.0.0.0/8,0.0.0.0/0", "0.0.0.0/00"] {
+    for cidrs in [
+        "0.0.0.0/0",
+        "::/0",
+        "10.0.0.0/8,0.0.0.0/0",
+        "0.0.0.0/00",
+        "::ffff:0.0.0.0/96", // IPv4-mapped form the filter folds to an IPv4 /0
+    ] {
         let config = EnvConfig {
             admin_bind_address: "0.0.0.0".to_string(),
             admin_allowed_cidrs: cidrs.to_string(),

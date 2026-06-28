@@ -58,15 +58,28 @@ docker run -d \
   --name ferrum-edge \
   -p 8000:8000 \
   -p 8443:8443 \
-  -p 9000:9000 \
-  -p 9443:9443 \
+  -p 127.0.0.1:9000:9000 \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=sqlite \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
-  -e FERRUM_ADMIN_JWT_SECRET="your-secret-key" \
+  -e FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32+character-admin-secret" \
+  -e FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
+  -e FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
   -v ferrum_data:/data \
   ferrum-edge:latest
 ```
+
+> **Admin API exposure.** The admin listeners bind to loopback (`127.0.0.1`)
+> inside the container by default — Docker port publishing forwards to the
+> container's network interface, not its loopback, so a published admin port is
+> unreachable until you set `FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0`. The example
+> above does that and publishes admin to **host loopback only**
+> (`127.0.0.1:9000`); because that is a non-loopback **plaintext** admin bind, in
+> `database`/`cp` modes it also requires an opt-in — here the dev-only
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. **For production**, drop the opt-in and
+> instead serve admin over TLS (`FERRUM_ADMIN_TLS_CERT_PATH`/`KEY_PATH`, publish
+> `9443`, set `FERRUM_ADMIN_HTTP_PORT=0`) and/or restrict with
+> `FERRUM_ADMIN_ALLOWED_CIDRS`. Use a 32+ character `FERRUM_ADMIN_JWT_SECRET`.
 
 ### Port Mappings
 

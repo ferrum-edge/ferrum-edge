@@ -156,27 +156,24 @@ At startup, the gateway runs DNS warmup followed by optional connection pool war
 
 ### Default Probe Strategy
 
-Use this when cached config is acceptable and you mainly want to know whether the process and admin listener are alive:
+Use this when cached config is acceptable and you mainly want to know whether the process and admin listener are alive. The probes use the **exec** `ferrum-edge health` check, which connects to `127.0.0.1` inside the pod and therefore works with the safe loopback admin default (an `httpGet` probe targets the pod IP and would miss a loopback-bound listener — see "Admin bind address" above):
 
 ```yaml
 livenessProbe:
-  httpGet:
-    path: /health
-    port: admin-http
+  exec:
+    command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
   initialDelaySeconds: 10
   periodSeconds: 15
 
 readinessProbe:
-  httpGet:
-    path: /health
-    port: admin-http
+  exec:
+    command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
   initialDelaySeconds: 5
   periodSeconds: 10
 
 startupProbe:
-  httpGet:
-    path: /health
-    port: admin-http
+  exec:
+    command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
   failureThreshold: 30
   periodSeconds: 5
 ```

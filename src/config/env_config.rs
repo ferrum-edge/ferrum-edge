@@ -1699,22 +1699,6 @@ pub struct EnvConfig {
     pub so_busy_poll_us: u32,
 }
 
-/// Whether a comma-separated CIDR/IP allowlist permits **every** source address
-/// — i.e. it contains a `/0` CIDR (`0.0.0.0/0`, `::/0`, or any `valid-ip/0`),
-/// which the admin IP filter matches against all sources and which therefore
-/// provides no real restriction. A bare IP (no prefix) is a single `/32`/`/128`
-/// host and does NOT permit all. Pure and side-effect-free (no logging), so it
-/// is safe to call from `admin_http_exposure()` at startup-validation time.
-fn cidr_allowlist_permits_all(list: &str) -> bool {
-    list.split(',').any(|entry| {
-        let Some((addr, prefix)) = entry.trim().rsplit_once('/') else {
-            return false;
-        };
-        addr.trim().parse::<std::net::IpAddr>().is_ok()
-            && prefix.trim().parse::<u8>().is_ok_and(|p| p == 0)
-    })
-}
-
 /// Network-exposure classification of the gateway's **plaintext** admin HTTP
 /// listener (`FERRUM_ADMIN_HTTP_PORT`).
 ///
@@ -3101,11 +3085,15 @@ impl EnvConfig {
         if ip.is_loopback() {
             return AdminHttpExposure::Loopback;
         }
-        // An empty allowlist — or a catch-all one (a `/0` CIDR like `0.0.0.0/0`
-        // or `::/0`, which the admin middleware matches against every source) —
-        // provides no real restriction, so the listener is still unrestricted.
+        // An empty allowlist — or a catch-all one (a `/0` CIDR like `0.0.0.0/0`,
+        // `::/0`, or an IPv4-mapped spelling the filter folds to a `/0`, which
+        // the admin middleware then matches against every source) — provides no
+        // real restriction, so the listener is still unrestricted. Reuse the
+        // runtime filter's own canonicalization via `cidr_list_permits_all`.
         if self.admin_allowed_cidrs.trim().is_empty()
-            || cidr_allowlist_permits_all(&self.admin_allowed_cidrs)
+            || crate::proxy::client_ip::TrustedProxies::cidr_list_permits_all(
+                &self.admin_allowed_cidrs,
+            )
         {
             AdminHttpExposure::ReachableUnrestricted
         } else {
