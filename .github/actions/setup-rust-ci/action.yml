@@ -1,9 +1,9 @@
 name: Setup Rust CI environment
 description: >-
   Installs the stable Rust toolchain (optional components), wires sccache
-  via setup-sccache, optionally installs Linux native build dependencies
-  and a fast linker in one apt transaction, configures setup-fast-linker,
-  sets up the Swatinem rust-cache, and pre-fetches crate dependencies.
+  via setup-sccache, installs Linux native build dependencies and a fast
+  linker in one apt transaction, configures setup-fast-linker, sets up the
+  Swatinem rust-cache, and pre-fetches crate dependencies.
   sccache caches compiler outputs in the GitHub Actions cache backend;
   rust-cache restores Cargo and target directories with isolated shared keys
   so incompatible job/profile/target artifacts do not mix. Centralizes the
@@ -23,20 +23,6 @@ inputs:
       string skips component install — most jobs don't need extras.
     required: false
     default: ""
-  install-native-deps:
-    description: >-
-      Install Linux native build dependencies required by the root workspace
-      build script and current CI compile/test jobs (`protobuf-compiler` for
-      tonic/prost codegen and `libcurl4-openssl-dev` for native headers).
-      Set false only for Rust setup jobs that do not compile this workspace.
-    required: false
-    default: "true"
-  install-fast-linker:
-    description: >-
-      Install/configure the fast linker (`mold` + `clang` on Linux, `lld` on
-      macOS). Set false for jobs that only need cargo/rustup and do not build.
-    required: false
-    default: "true"
 
 runs:
   using: composite
@@ -50,29 +36,28 @@ runs:
     - uses: ./.github/actions/setup-sccache
 
     - name: Install Linux build packages
-      if: runner.os == 'Linux' && (inputs.install-native-deps == 'true' || inputs.install-fast-linker == 'true')
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         set -euo pipefail
 
+        # One apt transaction for the fast linker (mold + clang, paired with
+        # the per-target rustflags in .cargo/config.toml) and the native build
+        # deps the workspace build script needs (protobuf-compiler for
+        # tonic/prost codegen, libcurl4-openssl-dev for native headers).
         missing_packages=()
 
-        if [ "${{ inputs.install-fast-linker }}" = "true" ]; then
-          if ! command -v mold > /dev/null 2>&1; then
-            missing_packages+=(mold)
-          fi
-          if ! command -v clang > /dev/null 2>&1; then
-            missing_packages+=(clang)
-          fi
+        if ! command -v mold > /dev/null 2>&1; then
+          missing_packages+=(mold)
         fi
-
-        if [ "${{ inputs.install-native-deps }}" = "true" ]; then
-          if ! command -v protoc > /dev/null 2>&1; then
-            missing_packages+=(protobuf-compiler)
-          fi
-          if ! dpkg -s libcurl4-openssl-dev > /dev/null 2>&1; then
-            missing_packages+=(libcurl4-openssl-dev)
-          fi
+        if ! command -v clang > /dev/null 2>&1; then
+          missing_packages+=(clang)
+        fi
+        if ! command -v protoc > /dev/null 2>&1; then
+          missing_packages+=(protobuf-compiler)
+        fi
+        if ! dpkg -s libcurl4-openssl-dev > /dev/null 2>&1; then
+          missing_packages+=(libcurl4-openssl-dev)
         fi
 
         if [ "${#missing_packages[@]}" -eq 0 ]; then
@@ -84,7 +69,6 @@ runs:
         sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
 
     - uses: ./.github/actions/setup-fast-linker
-      if: inputs.install-fast-linker == 'true'
       with:
         install-linux-packages: "false"
 
