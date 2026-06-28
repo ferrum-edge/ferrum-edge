@@ -138,5 +138,11 @@ It runs in two modes:
 Diagnostics are recorded under `${ARTIFACT_DIR:-.context/multicluster-federation}`.
 Preflight requires `docker`, `kind`, `kubectl`, `curl`, and `python3` and
 intentionally fails when they are unavailable; do not treat a skipped local run
-as validation evidence. Bundle rotation/removal, endpoint failover, and
-network-partition recovery remain Stage 3 (marked `# STAGE 3:` in `run.sh`).
+as validation evidence. The live mode also runs two Stage-3 failure-injection
+scenarios (gated): peer-trust revocation (drop the federated bundle from the dest
+slice + reload → A→B fails closed → restore → recover) and dest endpoint
+black-hole (scale `svc` to 0 → A→B fails fast → scale up + re-render gateway →
+recover). Network-partition / last-good retention is deferred: it is a
+federation/remote-discovery POLLER property, which this static file-config
+fixture does not run (it needs a separate poller-driven fixture; kind also has no
+NetworkPolicy enforcement for a clean in-cluster partition).

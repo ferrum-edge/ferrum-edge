@@ -13885,8 +13885,8 @@ components:
         on_error:
           type: string
           enum: [warn, allow, reject]
-          default: warn
-          description: Behavior when embedding/evaluation fails.
+          default: reject
+          description: Behavior when embedding/evaluation fails. In enforce mode this defaults to reject so required semantic evaluation fails closed; dry_run defaults to warn unless configured.
         default_action:
           type: string
           enum: [reject, warn]
@@ -13895,8 +13895,8 @@ components:
         streaming_response:
           type: string
           enum: [skip, reject, buffer, inspect]
-          default: skip
-          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed.
+          default: reject
+          description: Behavior for stream:true requests when response-side inspection is active. In enforce mode with response-side rules active, omitting this defaults to reject so clients cannot bypass response inspection by streaming; dry_run or request-only configurations default to skip. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject.
         streaming:
           type: object
           description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
@@ -14586,7 +14586,7 @@ components:
 
     AiFederationConfig:
       type: object
-      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Supports priority-ordered fallback across providers. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing non-streaming responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Streaming Chat Completions (`stream: true`) are intentionally unsupported for matched providers and return 501; there is no provider SSE normalization path. Config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation because they do not enable streaming. Supports priority-ordered fallback across providers. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
