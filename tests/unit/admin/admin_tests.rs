@@ -209,7 +209,14 @@ async fn test_admin_http1_slow_header_timeout_closes_connection() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let server = tokio::spawn(async move {
-        ferrum_edge::admin::serve_admin_on_listener(listener, admin_state, shutdown_rx, None).await
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
     });
 
     let mut stream = tokio::net::TcpStream::connect(addr)

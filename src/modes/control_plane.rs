@@ -815,6 +815,12 @@ pub async fn run(
     let db_available = Arc::new(AtomicBool::new(true));
 
     let reserved_ports = env_config.reserved_gateway_ports();
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -847,10 +853,16 @@ pub async fn run(
 
     // Admin HTTP listener (disabled when port is 0)
     let admin_http_handle = if env_config.admin_http_port != 0 {
+        let admin_http_limiter = admin_conn_limiter.clone();
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) =
-                admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
+            if let Err(e) = admin::start_admin_listener(
+                admin_http_addr,
+                admin_state,
+                admin_shutdown,
+                admin_http_limiter,
+            )
+            .await
             {
                 error!("Admin HTTP listener error: {}", e);
             }
@@ -914,6 +926,7 @@ pub async fn run(
             info!("Frontend TLS live reload enabled for CP admin HTTPS");
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
+        let admin_https_limiter = admin_conn_limiter.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
@@ -923,6 +936,7 @@ pub async fn run(
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    admin_https_limiter,
                 )
                 .await
             } else {
@@ -931,6 +945,7 @@ pub async fn run(
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    admin_https_limiter,
                 )
                 .await
             };
@@ -1978,6 +1993,7 @@ mod tests {
             passthrough: false,
             udp_idle_timeout_seconds: 60,
             tcp_idle_timeout_seconds: Some(300),
+            websocket_idle_timeout_seconds: None,
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,

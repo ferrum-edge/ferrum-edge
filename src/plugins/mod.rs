@@ -510,6 +510,18 @@ pub struct RequestContext {
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
     pub plugin_http_call_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative nanoseconds spent running the reject-path `after_proxy` and
+    /// synthetic response-body hooks inside
+    /// `finalize_reject_response_with_after_proxy_hooks` (H1/H2/HBONE reject
+    /// path). Those H1/H2/HBONE call sites add their phase `plugin_execution_ns`
+    /// *before* invoking the finalizer, so without this the (potentially
+    /// expensive — e.g. `ai_response_guard`/`ai_semantic_firewall` over a
+    /// synthetic AI body) hook time would be misattributed to gateway overhead.
+    /// `log_rejected_request_with_path` folds this into
+    /// `latency_plugin_execution_ms`, matching the H3 reject path, which already
+    /// times these hooks inline. Clone-safe via Arc; stays 0 on the H3 path
+    /// (which never calls the finalizer), so it never double-counts there.
+    pub reject_hook_execution_ns: Arc<std::sync::atomic::AtomicU64>,
     /// Receiver for mirror response metadata from the `request_mirror` plugin.
     /// Set by the plugin in `before_proxy`; collected before building
     /// `TransactionSummary` so all logging plugins receive mirror results.
@@ -719,6 +731,7 @@ impl RequestContext {
             tls_client_cert_chain_der: None,
             peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -785,6 +798,7 @@ impl RequestContext {
             tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
+            reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             mirror_result_rx: None,
             request_body_bytes: None,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),

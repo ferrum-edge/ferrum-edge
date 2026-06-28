@@ -281,6 +281,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - UDP response amplification protection (`udp_max_response_amplification_factor` per-proxy) with symmetric `on_udp_datagram` plugin hooks (client→backend and backend→client)
 - Per-IP concurrent request limiting (`FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`) with RAII Drop guard for leak-free tracking across 30+ return paths
 - Admin API IP allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`) — TCP-level rejection before TLS handshake or request processing
+- Admin API connection cap (`FERRUM_ADMIN_MAX_CONNECTIONS`, default 1024; optional per-IP `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`) — bounds management-plane connections independently of the data-plane `FERRUM_MAX_CONNECTIONS`; enforced after the CIDR allowlist and before the TLS handshake, with `ferrum_admin_active_connections` / `ferrum_admin_rejected_connections_total` metrics
 - Opt-in Via header (RFC 9110 §7.6.3) on request and response paths (`FERRUM_ADD_VIA_HEADER`)
 - Opt-in Forwarded header (RFC 7239) alongside X-Forwarded-* (`FERRUM_ADD_FORWARDED_HEADER`)
 - Certificate Revocation List (CRL) checking across all TLS/DTLS surfaces (`FERRUM_TLS_CRL_FILE_PATH`)
