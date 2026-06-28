@@ -1105,6 +1105,39 @@ fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mu
     }
 }
 
+/// Cheap structural check for whether `body` contains any non-text content
+/// part, mirroring the traversal in [`build_multimodal_fingerprint`] but
+/// short-circuiting on the first match and performing no hashing or
+/// canonicalization. Used by `cache_multimodal: reject` to bypass without
+/// paying the fingerprinting cost for a body that will be discarded.
+fn body_has_multimodal_parts(body: &Value) -> bool {
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array())
+        && messages
+            .iter()
+            .filter_map(|message| message.get("content"))
+            .any(content_has_multimodal_parts)
+    {
+        return true;
+    }
+
+    body.get("system").is_some_and(content_has_multimodal_parts)
+}
+
+/// Returns `true` if a message/system `content` value carries at least one
+/// non-text part. A plain string is always text-only; an array contains a
+/// multimodal part when any element is not a `type: "text"` block; any other
+/// scalar/object form is multimodal unless it is itself a text part. This must
+/// stay aligned with the part-vs-text decisions in
+/// [`append_multimodal_content_fingerprint`].
+fn content_has_multimodal_parts(content: &Value) -> bool {
+    match content {
+        Value::String(_) => false,
+        Value::Array(parts) => parts.iter().any(|part| !is_text_content_part(part)),
+        Value::Null => false,
+        other => !is_text_content_part(other),
+    }
+}
+
 fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
     let mut descriptor = String::new();
     let mut has_part = false;
@@ -1257,8 +1290,17 @@ fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
                 if key == "type"
                     && let Some(part_type) = map.get(key).and_then(|value| value.as_str())
                 {
+                    // Preserve the original case of the content-part `type`.
+                    // Non-text parts are folded into the exact cache key ONLY
+                    // through this fingerprint, so lowercasing here would let a
+                    // request with `"type": "Image"` collapse onto a cached
+                    // response stored for `"type": "image"` (and vice versa).
+                    // Upstream model APIs may treat differently-cased enum
+                    // values as distinct (or reject one), so they must not share
+                    // a cache entry. `is_text_content_part` is likewise
+                    // case-sensitive, keeping the two paths consistent.
                     buffer.push_str("type:");
-                    append_ascii_lowercase_len_prefixed(buffer, part_type);
+                    append_len_prefixed(buffer, part_type);
                 } else if let Some(value) = map.get(key) {
                     append_canonical_multimodal_value(buffer, value);
                 }
@@ -1567,16 +1609,31 @@ impl Plugin for AiSemanticCache {
             Err(_) => return PluginResult::Continue,
         };
 
-        let multimodal_fingerprint = build_multimodal_fingerprint(&json);
-        if multimodal_fingerprint.is_some() && self.cache_multimodal == MultimodalCacheMode::Reject
+        // In reject mode, detect multimodal content with a cheap structural
+        // scan that short-circuits on the first non-text part. Computing the
+        // full SHA-256 fingerprint here would canonicalize and hash every
+        // inline base64 image/audio blob only to discard the result, so the
+        // hashing work is reserved for modes that actually consume it below.
+        if self.cache_multimodal == MultimodalCacheMode::Reject && body_has_multimodal_parts(&json)
         {
             debug!(
                 "ai_semantic_cache: skipping multimodal request because cache_multimodal=reject"
             );
+            // Clear any cache key/embedding/scope a prior `ai_semantic_cache`
+            // instance staged earlier in this request's `before_proxy` chain.
+            // Without this, our `on_final_response_body` would still observe a
+            // staged key and store this multimodal response, violating
+            // `cache_multimodal: reject` whenever another cache instance ran
+            // first on the same request.
+            ctx.metadata.remove(AI_CACHE_KEY_METADATA);
+            ctx.ai_semantic_cache_embedding = None;
+            ctx.ai_semantic_cache_scope_key = None;
             ctx.metadata
                 .insert("ai_cache_status".to_string(), "BYPASS".to_string());
             return PluginResult::Continue;
         }
+
+        let multimodal_fingerprint = build_multimodal_fingerprint(&json);
 
         // Build cache key
         let cache_key = match self.build_cache_key(ctx, &json, multimodal_fingerprint.as_deref()) {
@@ -2154,6 +2211,157 @@ mod tests {
             build_multimodal_fingerprint(&body_a),
             build_multimodal_fingerprint(&body_b),
             "delimiter-bearing roles, keys, and types must not collapse to one fingerprint"
+        );
+    }
+
+    #[test]
+    fn multimodal_fingerprint_preserves_content_part_type_case() {
+        // Two requests identical except for the case of a non-text part's
+        // `type` must NOT collapse to the same fingerprint. Non-text parts are
+        // folded into the exact cache key only through this fingerprint, so a
+        // shared fingerprint would let a cached response for `"image"` be
+        // replayed for `"Image"` (which upstream APIs may treat differently).
+        let lower = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "image_url": {"url": "https://example.com/a.png"}}
+                ]
+            }]
+        });
+        let upper = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "Image", "image_url": {"url": "https://example.com/a.png"}}
+                ]
+            }]
+        });
+        let lower_again = lower.clone();
+
+        assert_ne!(
+            build_multimodal_fingerprint(&lower),
+            build_multimodal_fingerprint(&upper),
+            "differently-cased part types must produce different fingerprints"
+        );
+        assert_eq!(
+            build_multimodal_fingerprint(&lower),
+            build_multimodal_fingerprint(&lower_again),
+            "identical bodies must produce identical fingerprints"
+        );
+    }
+
+    #[test]
+    fn multimodal_detector_agrees_with_fingerprint_presence() {
+        // The cheap reject-mode detector must classify "is multimodal"
+        // identically to the full fingerprint helper, otherwise reject mode
+        // would diverge from the exact/include modes.
+        let text_only = json!({
+            "messages": [{"role": "user", "content": "just text"}]
+        });
+        let text_array = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "still text"}]
+            }]
+        });
+        let multimodal = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "image_url": {"url": "https://example.com/a.png"}}
+                ]
+            }]
+        });
+        let multimodal_system = json!({
+            "system": [{"type": "image", "image_url": {"url": "https://example.com/a.png"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        for body in [&text_only, &text_array, &multimodal, &multimodal_system] {
+            assert_eq!(
+                body_has_multimodal_parts(body),
+                build_multimodal_fingerprint(body).is_some(),
+                "detector must agree with fingerprint presence for {body}"
+            );
+        }
+        assert!(!body_has_multimodal_parts(&text_only));
+        assert!(!body_has_multimodal_parts(&text_array));
+        assert!(body_has_multimodal_parts(&multimodal));
+        assert!(body_has_multimodal_parts(&multimodal_system));
+    }
+
+    #[tokio::test]
+    async fn reject_mode_bypass_clears_staged_cache_keys() {
+        // A prior `ai_semantic_cache` instance in the same `before_proxy` chain
+        // may have staged a cache key/embedding/scope. When a later reject-mode
+        // instance bypasses a multimodal request, it must clear that staged
+        // state so its `on_final_response_body` does not store the multimodal
+        // response under the stale key.
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "cache_multimodal": "reject"}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|err| panic!("test config should be valid: {err}"));
+        assert_eq!(plugin.cache_multimodal, MultimodalCacheMode::Reject);
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image", "image_url": {"url": "https://example.com/a.png"}}
+                ]
+            }]
+        });
+        ctx.metadata
+            .insert("request_body".to_string(), body.to_string());
+        // Simulate staging done by an earlier cache instance.
+        ctx.metadata
+            .insert(AI_CACHE_KEY_METADATA.to_string(), "stale-key".to_string());
+        ctx.ai_semantic_cache_embedding = Some(vec![0.1, 0.2, 0.3]);
+        ctx.ai_semantic_cache_scope_key = Some("stale-scope".to_string());
+
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        // Staged state must be cleared so a stale entry cannot be stored.
+        assert!(
+            !ctx.metadata.contains_key(AI_CACHE_KEY_METADATA),
+            "reject bypass must remove the staged cache key"
+        );
+        assert!(
+            ctx.ai_semantic_cache_embedding.is_none(),
+            "reject bypass must clear the staged embedding"
+        );
+        assert!(
+            ctx.ai_semantic_cache_scope_key.is_none(),
+            "reject bypass must clear the staged scope key"
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_cache_status").map(String::as_str),
+            Some("BYPASS")
+        );
+
+        // And the consume path must therefore store nothing.
+        let response_headers = HashMap::new();
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"{\"ok\":true}")
+            .await;
+        assert!(
+            plugin.cache.is_empty(),
+            "no entry may be stored after a reject-mode bypass"
         );
     }
 
