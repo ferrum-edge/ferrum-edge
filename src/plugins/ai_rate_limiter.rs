@@ -472,16 +472,18 @@ impl Plugin for AiRateLimiter {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Idempotency guard: `after_proxy` can run twice for a single
-        // synthetic AI response — once via
-        // `finalize_reject_response_with_after_proxy_hooks` (the initial 2xx
-        // RejectBinary short-circuit) and again via
-        // `apply_after_proxy_hooks_to_rejection` when a response-body
-        // guardrail (e.g. `on_response_body`) rejects the synthetic body.
-        // `record_usage` is additive, so re-running it would double-charge the
-        // consumer (and could push a *blocked* response over the limit). Skip
-        // when the federation-tokens flag is already set and set it only after
-        // a successful first recording. `on_response_body` reads the same flag.
+        // Idempotency guard: federation tokens for one synthetic AI response can
+        // be reached by BOTH this reject-path `after_proxy` hook and the
+        // response-body hook `on_response_body`. On the normal response path
+        // `after_proxy` runs first; on the synthetic short-circuit reject path
+        // `apply_reject_after_proxy_and_synthetic_body_hooks` runs the body hooks
+        // (`on_response_body`) FIRST and this hook once afterwards. `record_usage`
+        // is additive, so charging the same tokens at both sites would
+        // double-count the consumer (and could push a *blocked* response over the
+        // limit). Both sites share one flag (`federation_flag_key`): whichever
+        // runs first records and sets it, the other skips. Set it only after a
+        // successful first recording here; `on_response_body` reads AND sets the
+        // same flag for the federation case.
         if !ctx.metadata.contains_key(&self.federation_flag_key)
             && ctx.metadata.contains_key("ai_federation_provider")
             && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
@@ -516,6 +518,10 @@ impl Plugin for AiRateLimiter {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Shared idempotency latch with `after_proxy`: if the federation tokens
+        // were already recorded (by `after_proxy` on the normal path, or by an
+        // earlier `on_response_body` pass), skip so the same tokens are charged
+        // exactly once. This site sets the flag below for the federation case.
         if ctx
             .metadata
             .get(&self.federation_flag_key)
@@ -591,6 +597,25 @@ impl Plugin for AiRateLimiter {
         };
 
         self.record_usage(self.rate_key(ctx), tokens).await;
+
+        // Latch the federation-tokens-recorded flag so the `after_proxy` reject
+        // hook does not re-charge the SAME federation tokens. `on_response_body`
+        // and `after_proxy` are two recording sites that share one idempotency
+        // flag (`federation_flag_key`); whichever runs first must record AND set
+        // the flag so the other skips. The synthetic-reject short-circuit path
+        // runs the response-body hooks (`on_response_body`) BEFORE the reject
+        // `after_proxy` hooks (see `apply_reject_after_proxy_and_synthetic_body_hooks`),
+        // while the normal response path runs `after_proxy` first — so this site
+        // must set the flag too, or a federation synthetic response is charged
+        // twice (once here, once in `after_proxy`). Gated on `ai_federation_provider`
+        // because the flag specifically guards the federation double-charge: a
+        // real non-federation backend body is charged only here (the `after_proxy`
+        // federation guard never fires for it), so we leave the flag untouched.
+        if ctx.metadata.contains_key("ai_federation_provider") {
+            ctx.metadata
+                .insert(self.federation_flag_key.clone(), "true".to_string());
+        }
+
         PluginResult::Continue
     }
 }
