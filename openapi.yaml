@@ -5875,6 +5875,11 @@ components:
             FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to
             disable for this proxy (idle sessions then live forever, bounded only by
             FERRUM_WEBSOCKET_MAX_CONNECTIONS). Maximum 86400 (24h).
+            HTTP/3 caveat: on QUIC frontends the transport idle timeout
+            FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies, so an idle H3
+            WebSocket is bounded by min(websocket_idle_timeout_seconds,
+            FERRUM_HTTP3_IDLE_TIMEOUT); raise FERRUM_HTTP3_IDLE_TIMEOUT to honor a
+            longer idle window on H3.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64

@@ -2028,7 +2028,15 @@ pub struct Proxy {
     /// `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300s / 5 min).
     /// Set to `0` to disable for this proxy (idle sessions live forever, bounded
     /// only by `FERRUM_WEBSOCKET_MAX_CONNECTIONS`).
-    #[serde(default)]
+    ///
+    /// HTTP/3 caveat: on QUIC frontends the transport-level idle timeout
+    /// (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) also applies, so the effective
+    /// idle bound for an H3 WebSocket is
+    /// `min(websocket_idle_timeout_seconds, FERRUM_HTTP3_IDLE_TIMEOUT)`. A value
+    /// here larger than the QUIC idle timeout (including `0` = disabled) cannot
+    /// extend an idle H3 session beyond the QUIC bound; raise
+    /// `FERRUM_HTTP3_IDLE_TIMEOUT` to honor a longer WebSocket idle window on H3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<u64>,
     /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
     /// When `None` (default), all methods are allowed. When `Some`, requests

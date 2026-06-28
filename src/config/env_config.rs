@@ -1067,6 +1067,12 @@ pub struct EnvConfig {
     /// open. The per-proxy `websocket_idle_timeout_seconds` overrides this.
     /// `0` = disabled (idle sessions live forever, bounded only by
     /// `websocket_max_connections`). Default: 300 (5 minutes).
+    ///
+    /// HTTP/3 caveat: on QUIC frontends the transport-level idle timeout
+    /// (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) also bounds an idle H3
+    /// WebSocket, so its effective idle window is `min(this value,
+    /// FERRUM_HTTP3_IDLE_TIMEOUT)`. Raise `FERRUM_HTTP3_IDLE_TIMEOUT` to honor a
+    /// longer WebSocket idle window on H3.
     pub websocket_idle_timeout_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
