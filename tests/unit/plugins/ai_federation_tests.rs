@@ -2157,6 +2157,867 @@ async fn test_before_proxy_non_streaming_request_is_not_rejected_as_streaming() 
 }
 
 // ---------------------------------------------------------------------------
+// Multimodal provider-native translation (translate mode) — exercises the
+// per-provider `openai_content_to_*` translators and their error branches
+// directly through `translate_request_test` (no network).
+// ---------------------------------------------------------------------------
+
+/// Build an OpenAI request whose single user message carries a text part plus
+/// one `image_url` part with the given URL, under `multimodal_mode=translate`.
+fn translate_image_request(model: &str, url: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": url}}
+            ]
+        }]
+    })
+}
+
+fn translate_cfg() -> Value {
+    json!({ "multimodal_mode": "translate" })
+}
+
+#[test]
+fn test_anthropic_translate_data_url_image_to_base64_source() {
+    // openai_content_to_anthropic: data URL -> base64 image source block.
+    let body = translate_image_request("claude-3-sonnet", "data:image/png;base64,aGVsbG8=");
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "describe this");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
+}
+
+#[test]
+fn test_anthropic_translate_remote_url_image_to_url_source() {
+    // openai_content_to_anthropic: remote URL -> Anthropic `url` image source.
+    let body = translate_image_request("claude-3-sonnet", "https://example.com/cat.png");
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "url");
+    assert_eq!(content[1]["source"]["url"], "https://example.com/cat.png");
+}
+
+#[test]
+fn test_anthropic_translate_string_content_passthrough() {
+    // openai_content_to_anthropic: plain string content stays a JSON string.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{"role": "user", "content": "just text"}]
+    });
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["messages"][0]["content"], "just text");
+}
+
+#[test]
+fn test_anthropic_translate_text_only_with_warning_flattens_content() {
+    // openai_content_to_anthropic: TextOnlyWithWarning -> flatten to a string.
+    let body = translate_image_request("claude-3-sonnet", "data:image/png;base64,aGVsbG8=");
+    let cfg = json!({ "multimodal_mode": "text_only_with_warning" });
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("anthropic", &body, "claude-3-sonnet", &cfg).unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    // Content collapses to the text part only (the image is dropped).
+    assert_eq!(parsed["messages"][0]["content"], "describe this");
+}
+
+#[test]
+fn test_anthropic_translate_unknown_part_type_errors() {
+    // openai_content_to_anthropic: Some(other) -> hard error.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "input_audio", "input_audio": {"data": "x"}}]
+        }]
+    });
+    let err = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("unsupported multimodal content part 'input_audio'")
+            && err.contains("Anthropic"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_anthropic_translate_part_missing_type_errors() {
+    // openai_content_to_anthropic: None (no `type`) -> hard error.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{"role": "user", "content": [{"text": "no type field"}]}]
+    });
+    let err = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("content part missing 'type'") && err.contains("Anthropic"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_anthropic_translate_invalid_data_url_errors() {
+    // openai_content_to_anthropic: parse_image_data_url failure is wrapped.
+    let body = translate_image_request("claude-3-sonnet", "data:image/png,aGVsbG8=");
+    let err = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("invalid image_url data URL for Anthropic"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gemini_translate_data_url_to_inline_data() {
+    // openai_content_to_gemini_parts: data URL -> inlineData.
+    let body = translate_image_request("gemini-2.0-flash", "data:image/jpeg;base64,QUJD");
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let parts = parsed["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts[0]["text"], "describe this");
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/jpeg");
+    assert_eq!(parts[1]["inlineData"]["data"], "QUJD");
+}
+
+#[test]
+fn test_gemini_translate_remote_url_errors_in_translator() {
+    // openai_content_to_gemini_parts: remote URL has no native translation.
+    let body = translate_image_request("gemini-2.0-flash", "https://example.com/x.png");
+    let err = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Gemini image translation requires an image_url data URL"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gemini_translate_unknown_part_type_errors() {
+    // openai_content_to_gemini_parts: Some(other) -> hard error.
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "messages": [{"role": "user", "content": [{"type": "input_audio"}]}]
+    });
+    let err = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("unsupported multimodal content part 'input_audio'") && err.contains("Gemini"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gemini_translate_part_missing_type_errors() {
+    // openai_content_to_gemini_parts: None (no `type`) -> hard error.
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "messages": [{"role": "user", "content": [{"image_url": {"url": "x"}}]}]
+    });
+    let err = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("content part missing 'type'") && err.contains("Gemini"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gemini_translate_empty_content_array_yields_empty_text() {
+    // openai_content_to_gemini_parts: empty parts array -> a single empty text.
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "messages": [{"role": "user", "content": []}]
+    });
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "google_gemini",
+        &body,
+        "gemini-2.0-flash",
+        &translate_cfg(),
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let parts = parsed["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["text"], "");
+}
+
+#[test]
+fn test_gemini_translate_text_only_with_warning_flattens() {
+    // openai_content_to_gemini_parts: TextOnlyWithWarning -> single text part.
+    let body = translate_image_request("gemini-2.0-flash", "data:image/png;base64,aGVsbG8=");
+    let cfg = json!({ "multimodal_mode": "text_only_with_warning" });
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("google_gemini", &body, "gemini-2.0-flash", &cfg)
+            .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let parts = parsed["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["text"], "describe this");
+    assert!(parts[0].get("inlineData").is_none());
+}
+
+#[test]
+fn test_vertex_translate_data_url_to_inline_data() {
+    // GoogleVertex shares the Gemini translator path.
+    let body = translate_image_request("gemini-2.0-flash", "data:image/webp;base64,QUJD");
+    let cfg = json!({
+        "multimodal_mode": "translate",
+        "google_project_id": "proj",
+        "google_region": "us-central1"
+    });
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("google_vertex", &body, "gemini-2.0-flash", &cfg)
+            .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let parts = parsed["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
+}
+
+#[test]
+fn test_bedrock_translate_data_url_to_image_block() {
+    // openai_content_to_bedrock_blocks: data URL -> Converse image block.
+    let body = translate_image_request(
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "data:image/gif;base64,QUJD",
+    );
+    let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &cfg,
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["text"], "describe this");
+    assert_eq!(content[1]["image"]["format"], "gif");
+    assert_eq!(content[1]["image"]["source"]["bytes"], "QUJD");
+}
+
+#[test]
+fn test_bedrock_translate_all_supported_formats() {
+    // bedrock_image_format: png/jpeg/jpg/gif/webp map to the expected names.
+    for (media, expected) in [
+        ("image/png", "png"),
+        ("image/jpeg", "jpeg"),
+        ("image/jpg", "jpeg"),
+        ("image/gif", "gif"),
+        ("image/webp", "webp"),
+    ] {
+        let body = translate_image_request(
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            &format!("data:{media};base64,QUJD"),
+        );
+        let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+        let (_, _, body_bytes) = test_helpers::translate_request_test(
+            "aws_bedrock",
+            &body,
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            &cfg,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"][1]["image"]["format"], expected,
+            "{media} should map to {expected}"
+        );
+    }
+}
+
+#[test]
+fn test_bedrock_translate_remote_url_errors_in_translator() {
+    // openai_content_to_bedrock_blocks: non-data URL is rejected (data-only).
+    let body = translate_image_request(
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "https://example.com/x.png",
+    );
+    let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+    let err = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("AWS Bedrock Converse image_url translation requires a data URL"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_bedrock_translate_unsupported_format_errors_in_translator() {
+    // openai_content_to_bedrock_blocks: svg passes the generic image check but
+    // bedrock_image_format rejects it.
+    let body = translate_image_request(
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "data:image/svg+xml;base64,QUJD",
+    );
+    let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+    let err = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("unsupported Bedrock image media type 'image/svg+xml'"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_bedrock_translate_unknown_part_type_errors() {
+    // openai_content_to_bedrock_blocks: Some(other) -> hard error.
+    let body = json!({
+        "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "messages": [{"role": "user", "content": [{"type": "input_audio"}]}]
+    });
+    let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+    let err = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("unsupported multimodal content part 'input_audio'")
+            && err.contains("Bedrock"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_bedrock_translate_part_missing_type_errors() {
+    // openai_content_to_bedrock_blocks: None (no `type`) -> hard error.
+    let body = json!({
+        "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "messages": [{"role": "user", "content": [{"image_url": {"url": "x"}}]}]
+    });
+    let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+    let err = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("content part missing 'type'") && err.contains("Bedrock"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_bedrock_translate_empty_content_yields_empty_text() {
+    // openai_content_to_bedrock_blocks: empty parts -> single empty text block.
+    let body = json!({
+        "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "messages": [{"role": "user", "content": []}]
+    });
+    let cfg = json!({ "multimodal_mode": "translate", "aws_region": "us-east-1" });
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &body,
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        &cfg,
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["text"], "");
+}
+
+#[test]
+fn test_image_url_value_missing_url_errors() {
+    // image_url_value: an image_url part with no `image_url.url` is rejected.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{"role": "user", "content": [{"type": "image_url"}]}]
+    });
+    let err = test_helpers::translate_request_test(
+        "anthropic",
+        &body,
+        "claude-3-sonnet",
+        &translate_cfg(),
+    )
+    .unwrap_err();
+    assert!(err.contains("image_url.url"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// text_only_with_warning translation for OpenAI-compatible / Cohere providers
+// (text_only_openai_body) and translate-mode Cohere passthrough.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_openai_text_only_with_warning_flattens_multimodal_content() {
+    // translate_openai_compatible + text_only_openai_body: array content with an
+    // image is flattened to a plain text string before dispatch.
+    let body = translate_image_request("gpt-4o", "data:image/png;base64,aGVsbG8=");
+    let cfg = json!({ "multimodal_mode": "text_only_with_warning" });
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("openai", &body, "gpt-4o", &cfg).unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["messages"][0]["content"], "describe this");
+}
+
+#[test]
+fn test_openai_translate_mode_preserves_multimodal_content() {
+    // translate_openai_compatible (translate/default): array content with an
+    // image is passed through unchanged (OpenAI is natively multimodal).
+    let body = translate_image_request("gpt-4o", "data:image/png;base64,aGVsbG8=");
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("openai", &body, "gpt-4o", &translate_cfg()).unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,aGVsbG8="
+    );
+}
+
+#[test]
+fn test_cohere_text_only_with_warning_flattens_multimodal_content() {
+    // translate_to_cohere + text_only_openai_body: array content flattened.
+    let body = translate_image_request("command-r-plus", "data:image/png;base64,aGVsbG8=");
+    let cfg = json!({ "multimodal_mode": "text_only_with_warning" });
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("cohere", &body, "command-r-plus", &cfg).unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["messages"][0]["content"], "describe this");
+}
+
+#[test]
+fn test_cohere_translate_mode_preserves_multimodal_content() {
+    // Cohere is treated as a passthrough provider by the gate, so translate mode
+    // leaves the OpenAI-style content array intact.
+    let body = translate_image_request("command-r-plus", "data:image/png;base64,aGVsbG8=");
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("cohere", &body, "command-r-plus", &translate_cfg())
+            .unwrap();
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let content = parsed["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["type"], "image_url");
+}
+
+// ---------------------------------------------------------------------------
+// Translate-mode policy gate (validate_multimodal_translate_support) edge cases:
+// scheme validation, malformed data URLs, instruction roles, role gating, and
+// passthrough providers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_gate_anthropic_rejects_unsupported_url_scheme() {
+    // validate_openai_image_url: non-http(s)/data scheme is rejected.
+    let body = image_part_request("ftp://example.com/a.png");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("scheme 'ftp'"), "got: {err}");
+}
+
+#[test]
+fn test_gate_anthropic_rejects_malformed_url() {
+    // validate_openai_image_url: a non-data, unparseable URL is rejected.
+    let body = image_part_request("not a url");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("not a valid URL"), "got: {err}");
+}
+
+#[test]
+fn test_gate_anthropic_rejects_data_url_without_base64() {
+    // parse_image_data_url: data URL must declare ;base64.
+    let body = image_part_request("data:image/png,rawbytes");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("base64 encoded"), "got: {err}");
+}
+
+#[test]
+fn test_gate_anthropic_rejects_data_url_missing_comma() {
+    // parse_image_data_url: data URL must have a comma separator.
+    let body = image_part_request("data:image/png;base64");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("comma separator"), "got: {err}");
+}
+
+#[test]
+fn test_gate_anthropic_rejects_data_url_non_image_media() {
+    // parse_image_data_url: media type must be image/*.
+    let body = image_part_request("data:application/pdf;base64,QUJD");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("is not an image"), "got: {err}");
+}
+
+#[test]
+fn test_gate_anthropic_rejects_data_url_empty_data() {
+    // parse_image_data_url: empty image payload is rejected.
+    let body = image_part_request("data:image/png;base64,");
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("empty image data"), "got: {err}");
+}
+
+#[test]
+fn test_gate_rejects_non_image_part_for_user_role() {
+    // validate_multimodal_translate_support: a non-text, non-image part for a
+    // user role has no native translation.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "input_audio", "input_audio": {"data": "x"}}]
+        }]
+    });
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(
+        err.contains("non-text content part 'input_audio' has no provider-native translation"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gate_rejects_non_text_part_for_unsupported_role() {
+    // validate_multimodal_translate_support: only user/assistant roles may carry
+    // non-text parts (after the instruction-role check).
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{
+            "role": "tool",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]
+        }]
+    });
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("not supported for role 'tool'"), "got: {err}");
+}
+
+#[test]
+fn test_gate_rejects_text_part_missing_text_field() {
+    // validate_multimodal_translate_support: a `text` part with no `text` value.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{"role": "user", "content": [{"type": "text"}]}]
+    });
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(
+        err.contains("text content part missing text field"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_gate_passthrough_providers_accept_anything() {
+    // validate_multimodal_translate_support: openai-compatible + cohere return
+    // Ok early regardless of content (native passthrough).
+    let body = json!({
+        "model": "x",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "input_audio", "input_audio": {"data": "x"}}]
+        }]
+    });
+    for provider in ["openai", "cohere"] {
+        assert!(
+            test_helpers::validate_multimodal_translate_support_test(provider, &body).is_ok(),
+            "{provider} should accept any content at the gate"
+        );
+    }
+}
+
+#[test]
+fn test_gate_missing_messages_array_errors() {
+    // validate_multimodal_translate_support: a non-passthrough provider with no
+    // messages array surfaces an error.
+    let body = json!({ "model": "claude-3-sonnet" });
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("messages"), "got: {err}");
+}
+
+#[test]
+fn test_gate_skips_message_without_array_content() {
+    // validate_multimodal_translate_support: a message whose content is a plain
+    // string (not an array) is skipped and passes the gate.
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{"role": "user", "content": "plain string"}]
+    });
+    assert!(test_helpers::validate_multimodal_translate_support_test("anthropic", &body).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// before_proxy: Anthropic translate-mode image success end-to-end, and the
+// text_only_with_warning fallback-exhaustion (break) path.
+// ---------------------------------------------------------------------------
+
+async fn mount_anthropic_success(server: &MockServer) {
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-sonnet",
+            "content": [{"type": "text", "text": "An image of a cat."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 11, "output_tokens": 6}
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn anthropic_translate_data_url_image_reaches_backend() {
+    let server = MockServer::start().await;
+    mount_anthropic_success(&server).await;
+    let config = json!({
+        "providers": [{
+            "name": "anthropic",
+            "provider_type": "anthropic",
+            "api_key": "sk-ant-test",
+            "model_patterns": ["claude-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true,
+            "multimodal_mode": "translate"
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = translate_image_request("claude-3-sonnet", "data:image/png;base64,aGVsbG8=");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected provider response, got {other:?}"),
+    }
+
+    let outbound = first_received_json(&server).await;
+    let content = outbound["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
+}
+
+#[tokio::test]
+async fn text_only_with_warning_records_multiple_part_types_and_roles() {
+    // analyze_multimodal_usage: multiple non-text part types across multiple
+    // roles are aggregated (sorted CSV) into the dropped-* metadata.
+    let server = MockServer::start().await;
+    mount_anthropic_success(&server).await;
+    let config = json!({
+        "providers": [{
+            "name": "anthropic",
+            "provider_type": "anthropic",
+            "api_key": "sk-ant-test",
+            "model_patterns": ["claude-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true,
+            "multimodal_mode": "text_only_with_warning"
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "prior"},
+                    {"type": "input_audio", "input_audio": {"data": "x"}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "now"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                ]
+            }
+        ]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected provider response, got {other:?}"),
+    }
+
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_dropped_parts"),
+        Some(&"2".to_string())
+    );
+    // BTreeSet ordering -> alphabetical CSV.
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_dropped_types"),
+        Some(&"image_url,input_audio".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_dropped_roles"),
+        Some(&"assistant,user".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_provider"),
+        Some(&"anthropic".to_string())
+    );
+}
+
+#[tokio::test]
+async fn multimodal_reject_with_fallback_disabled_returns_400() {
+    // before_proxy: fallback disabled + a single reject-mode provider -> the
+    // policy gate breaks out of the loop and the exhaustion branch returns 400.
+    let server = MockServer::start().await;
+    let config = json!({
+        "fallback_enabled": false,
+        "providers": [{
+            "name": "anthropic-reject",
+            "provider_type": "anthropic",
+            "api_key": "sk-ant-test",
+            "model_patterns": ["claude-*"]
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = multimodal_image_request("claude-3-sonnet");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            let message = parsed["error"]["message"].as_str().unwrap();
+            assert!(message.contains("reject"), "got: {message}");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+    assert_no_provider_requests(&server).await;
+}
+
+// ---------------------------------------------------------------------------
+// MultimodalMode config defaults / round-trip via provider construction.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_multimodal_mode_accepts_all_valid_values() {
+    for mode in ["reject", "translate", "text_only_with_warning"] {
+        let config = json!({
+            "providers": [{
+                "name": "p",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test",
+                "model_patterns": ["claude-*"],
+                "multimodal_mode": mode
+            }]
+        });
+        assert!(
+            ai_federation::AiFederation::new(&config, create_test_http_client()).is_ok(),
+            "multimodal_mode '{mode}' should be accepted"
+        );
+    }
+}
+
+#[test]
+fn test_multimodal_mode_rejects_unknown_value() {
+    let config = json!({
+        "providers": [{
+            "name": "p",
+            "provider_type": "anthropic",
+            "api_key": "sk-ant-test",
+            "model_patterns": ["claude-*"],
+            "multimodal_mode": "bogus"
+        }]
+    });
+    let err = ai_federation::AiFederation::new(&config, create_test_http_client())
+        .err()
+        .unwrap();
+    assert!(
+        err.contains("unknown multimodal_mode 'bogus'"),
+        "got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
