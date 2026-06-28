@@ -751,6 +751,84 @@ async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
 }
 
 #[tokio::test]
+async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "cache_multimodal": "reject"
+    }));
+
+    let body = multimodal_image_url_body("https://example.com/a.png");
+    let body_str = serde_json::to_string(&body).unwrap();
+    let (mut ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("ai_cache_status").map(String::as_str),
+        Some("BYPASS")
+    );
+    assert!(
+        !ctx.metadata.contains_key("_ai_cache_key"),
+        "reject-mode multimodal bypass must not mark the response for storage"
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"A")
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+
+    let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("ai_cache_status").map(String::as_str),
+        Some("BYPASS")
+    );
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "second identical multimodal request must still bypass instead of hitting stored data"
+    );
+
+    let text_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "What is the capital of France?"}]
+    });
+    let text_body_str = serde_json::to_string(&text_body).unwrap();
+    store_response(&plugin, &text_body_str, None, b"Paris").await;
+
+    let (_, result) = run_before_proxy(&plugin, &text_body_str, None).await;
+    match result {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"Paris"),
+        other => panic!("Expected text-only exact cache HIT under reject mode, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exact_only_multimodal_skips_semantic_embedding_call() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 0).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let body = multimodal_image_url_body("https://example.com/a.png");
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
+    assert!(
+        ctx.ai_semantic_cache_embedding.is_none(),
+        "default exact_only mode must not compute text-only embeddings for multimodal requests"
+    );
+    assert!(
+        ctx.ai_semantic_cache_scope_key.is_none(),
+        "default exact_only mode must not store semantic scope for multimodal requests"
+    );
+}
+
+#[tokio::test]
 async fn test_semantic_similarity_hit_after_exact_miss() {
     let mock_server = MockServer::start().await;
     mount_embedding_mock(&mock_server, 2).await;

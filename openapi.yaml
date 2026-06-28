@@ -14159,7 +14159,7 @@ components:
           type: string
           enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
           default: exact_only
-          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys.
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. Values are trimmed and case-insensitive; `_` and `-` aliases are accepted.
         semantic_similarity_enabled:
           type: boolean
           default: false

@@ -1106,7 +1106,7 @@ fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mu
 }
 
 fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
-    let mut descriptor = String::with_capacity(256);
+    let mut descriptor = String::new();
     let mut has_part = false;
 
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
@@ -1206,7 +1206,7 @@ fn append_multimodal_part_descriptor(
     }
     if let Some(role) = role {
         buffer.push_str(":role:");
-        push_ascii_lowercase(buffer, role);
+        append_ascii_lowercase_len_prefixed(buffer, role);
     }
     if let Some(index) = part_index {
         let _ = write!(buffer, ":part[{index}]");
@@ -1253,12 +1253,14 @@ fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
                 if index > 0 {
                     buffer.push(',');
                 }
-                buffer.push_str(key);
-                buffer.push(':');
+                buffer.push_str("key:");
+                append_len_prefixed(buffer, key);
+                buffer.push('=');
                 if key == "type"
                     && let Some(part_type) = map.get(key).and_then(|value| value.as_str())
                 {
-                    push_ascii_lowercase(buffer, part_type);
+                    buffer.push_str("type:");
+                    append_ascii_lowercase_len_prefixed(buffer, part_type);
                 } else if let Some(value) = map.get(key) {
                     append_canonical_multimodal_value(buffer, value);
                 }
@@ -1266,6 +1268,16 @@ fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
             buffer.push('}');
         }
     }
+}
+
+fn append_len_prefixed(buffer: &mut String, value: &str) {
+    let _ = write!(buffer, "{}:", value.len());
+    buffer.push_str(value);
+}
+
+fn append_ascii_lowercase_len_prefixed(buffer: &mut String, value: &str) {
+    let _ = write!(buffer, "{}:", value.len());
+    push_ascii_lowercase(buffer, value);
 }
 
 fn insert_optional_model(payload: &mut Value, model: &Option<String>) {
@@ -1563,6 +1575,8 @@ impl Plugin for AiSemanticCache {
             debug!(
                 "ai_semantic_cache: skipping multimodal request because cache_multimodal=reject"
             );
+            ctx.metadata
+                .insert("ai_cache_status".to_string(), "BYPASS".to_string());
             return PluginResult::Continue;
         }
 
@@ -2107,6 +2121,42 @@ mod tests {
         );
         assert_eq!(normalize_text(""), "");
         assert_eq!(normalize_text("   "), "");
+    }
+
+    #[test]
+    fn multimodal_fingerprint_is_unambiguous_for_delimiter_like_keys_and_type() {
+        let body_a = json!({
+            "messages": [{
+                "role": "user:part[0]",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {
+                        "type": "image:url",
+                        "image_url": {"url": "https://example.com/a.png"},
+                        "a,b": "c"
+                    }
+                ]
+            }]
+        });
+        let body_b = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {
+                        "type": "image",
+                        "url": {"image_url": "https://example.com/a.png"},
+                        "a": {"b": "c"}
+                    }
+                ]
+            }]
+        });
+
+        assert_ne!(
+            build_multimodal_fingerprint(&body_a),
+            build_multimodal_fingerprint(&body_b),
+            "delimiter-bearing roles, keys, and types must not collapse to one fingerprint"
+        );
     }
 
     #[test]
