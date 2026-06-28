@@ -250,7 +250,10 @@ See [docs/configuration.md](docs/configuration.md) for stream proxy config, serv
 JWT-protected REST API for managing proxies, consumers, plugins, and upstreams at runtime.
 
 ```bash
-# Health check (no auth required)
+# Liveness probe (no auth) — always {"status":"ok"}
+curl http://localhost:9000/live
+
+# Readiness/health (no auth returns status+ready; full diagnostics need auth)
 curl http://localhost:9000/health
 
 # List proxies

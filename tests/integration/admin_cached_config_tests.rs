@@ -298,6 +298,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -348,6 +349,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -393,6 +395,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -440,6 +443,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -482,6 +486,7 @@ async fn test_get_proxy_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -522,6 +527,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -564,6 +570,7 @@ async fn test_get_consumer_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -604,6 +611,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -647,6 +655,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -689,6 +698,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -732,6 +742,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -775,6 +786,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -820,6 +832,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -847,10 +860,15 @@ async fn test_health_endpoint_shows_cached_config_info() {
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
-    // Health endpoint does not require auth
+    // Liveness/readiness are unauthenticated, but the detailed cached_config
+    // diagnostics require auth — present a valid admin token.
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/health", base_url))
+        .header(
+            "authorization",
+            format!("Bearer {}", generate_test_token(&tc)),
+        )
         .send()
         .await
         .unwrap();
@@ -870,6 +888,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -898,6 +917,10 @@ async fn test_health_endpoint_shows_no_cached_config() {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/health", base_url))
+        .header(
+            "authorization",
+            format!("Bearer {}", generate_test_token(&tc)),
+        )
         .send()
         .await
         .unwrap();
@@ -914,6 +937,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config(),
         )))),
@@ -974,6 +998,7 @@ async fn test_cached_config_reflects_live_updates() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(cached.clone()),
         proxy_state: None,
         mode: "test".to_string(),
@@ -1079,6 +1104,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_pagination_test_config(),
         )))),
@@ -1309,6 +1335,7 @@ fn db_admin_state(
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: create_test_jwt_manager(tc),
+        metrics_auth: Default::default(),
         cached_config: cached_config.map(|config| Arc::new(ArcSwap::new(Arc::new(config)))),
         proxy_state: None,
         mode: "database".to_string(),
@@ -1390,6 +1417,7 @@ async fn create_db_admin_state_with_availability(
     let state = AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: create_test_jwt_manager(tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -1530,6 +1558,7 @@ async fn test_batch_create_read_only_rejected() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -1915,6 +1944,7 @@ async fn test_restore_read_only_rejected() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -2090,6 +2120,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config_with_upstreams(),
         )))),
@@ -2140,6 +2171,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config_with_upstreams(),
         )))),
@@ -2182,6 +2214,7 @@ async fn test_get_upstream_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config_with_upstreams(),
         )))),
@@ -2222,6 +2255,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -2265,6 +2299,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -2702,6 +2737,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
             create_test_gateway_config_with_upstreams(),
         )))),
@@ -2751,6 +2787,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -2797,6 +2834,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -2840,6 +2878,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -2929,6 +2968,7 @@ async fn test_cached_config_reflects_upstream_updates() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(cached.clone()),
         proxy_state: None,
         mode: "test".to_string(),
@@ -3330,6 +3370,7 @@ async fn test_health_endpoint_shows_db_availability() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: Some(cached),
         proxy_state: None,
         mode: "database".to_string(),
@@ -3358,6 +3399,10 @@ async fn test_health_endpoint_shows_db_availability() {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/health", base_url))
+        .header(
+            "authorization",
+            format!("Bearer {}", generate_test_token(&tc)),
+        )
         .send()
         .await
         .unwrap();
@@ -3493,6 +3538,7 @@ async fn test_cluster_endpoint_requires_auth() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "cp".to_string(),
@@ -3535,6 +3581,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "cp".to_string(),
@@ -3592,6 +3639,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "cp".to_string(),
@@ -3653,6 +3701,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "cp".to_string(),
@@ -3709,6 +3758,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "dp".to_string(),
@@ -3753,6 +3803,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "dp".to_string(),
@@ -3793,6 +3844,7 @@ async fn test_cluster_endpoint_database_mode() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),

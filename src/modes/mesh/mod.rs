@@ -9389,6 +9389,10 @@ fn start_mesh_admin_listeners(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(&env_config)
+            .map_err(|err| anyhow::anyhow!(err))?,
+    );
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
         Err(err) => {
@@ -9418,6 +9422,7 @@ fn start_mesh_admin_listeners(
         reserved_ports: env_config.reserved_gateway_ports(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs,
+        metrics_auth,
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,

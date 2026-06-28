@@ -102,6 +102,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: make_jwt_manager(),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),

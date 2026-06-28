@@ -59,6 +59,77 @@ pub struct CachedDbHealthResult {
 /// Duration for which a DB health check result is reused.
 const DB_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Authorization policy for the observability scrape surfaces — `/metrics`, and
+/// the *detailed* views of `/health` and `/overload`.
+///
+/// These surfaces are **not** unauthenticated by default. A caller is granted
+/// the detailed/scrape view only when one of the following holds:
+///   1. a valid admin JWT is presented (`Authorization: Bearer <jwt>`), or
+///   2. a dedicated metrics bearer token is configured and matches, or
+///   3. the request originates from an operator-allowlisted CIDR.
+///
+/// When none apply, `/metrics` returns `401` and `/health` / `/overload`
+/// fall back to a minimal, LB-safe projection that reveals no operational
+/// internals. The liveness endpoint `/live` is always unauthenticated and
+/// minimal and does not consult this policy.
+#[derive(Debug, Clone)]
+pub struct MetricsAuthPolicy {
+    /// Source ranges permitted to scrape / see detail without any credential.
+    /// Empty (the default) disables unauthenticated scraping entirely.
+    pub allowed_cidrs: crate::proxy::client_ip::TrustedProxies,
+    /// Dedicated metrics bearer token. When `Some`, a request whose
+    /// `Authorization: Bearer <token>` matches (constant-time) is authorized.
+    /// `None` disables this path.
+    pub bearer_token: Option<String>,
+}
+
+impl Default for MetricsAuthPolicy {
+    fn default() -> Self {
+        // Secure default: no allowlisted CIDRs and no token ⇒ scraping requires
+        // a valid admin JWT.
+        Self {
+            allowed_cidrs: crate::proxy::client_ip::TrustedProxies::none(),
+            bearer_token: None,
+        }
+    }
+}
+
+impl MetricsAuthPolicy {
+    /// Build the policy from environment config, validating any configured CIDR
+    /// list (invalid entries are a hard error, mirroring `admin_allowed_cidrs`).
+    pub fn from_env(env: &crate::config::EnvConfig) -> Result<Self, String> {
+        let allowed_cidrs =
+            crate::proxy::client_ip::TrustedProxies::parse_strict(&env.metrics_allowed_cidrs)
+                .map_err(|e| format!("FERRUM_METRICS_ALLOWED_CIDRS: {e}"))?;
+        let bearer_token = env
+            .metrics_bearer_token
+            .as_ref()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        Ok(Self {
+            allowed_cidrs,
+            bearer_token,
+        })
+    }
+
+    /// True when the request's client IP is in the unauthenticated allowlist.
+    fn ip_allowed(&self, client_ip: &std::net::IpAddr) -> bool {
+        !self.allowed_cidrs.is_empty() && self.allowed_cidrs.contains(client_ip)
+    }
+
+    /// True when a configured bearer token matches the request's
+    /// `Authorization` header (constant-time compare).
+    fn token_matches(&self, auth_header: Option<&str>) -> bool {
+        let Some(expected) = self.bearer_token.as_deref() else {
+            return false;
+        };
+        let Some(provided) = auth_header.and_then(JwtManager::extract_token_from_header) else {
+            return false;
+        };
+        crate::plugins::utils::auth_flow::constant_time_eq(provided.as_bytes(), expected.as_bytes())
+    }
+}
+
 /// Admin API state.
 #[derive(Clone)]
 pub struct AdminState {
@@ -118,6 +189,10 @@ pub struct AdminState {
     /// Parsed admin API IP allowlist. When non-empty, only connections from
     /// matching IPs are accepted. Checked at the TCP level before any processing.
     pub admin_allowed_cidrs: Arc<crate::proxy::client_ip::TrustedProxies>,
+    /// Authorization policy gating the observability scrape surfaces
+    /// (`/metrics` and the detailed `/health` / `/overload` views). See
+    /// [`MetricsAuthPolicy`]. Defaults to "require admin JWT".
+    pub metrics_auth: Arc<MetricsAuthPolicy>,
     /// Cached DB health check result to avoid hitting the database on every
     /// `/health` request. Shared across clones via `Arc<ArcSwap<_>>`.
     pub cached_db_health: Arc<ArcSwap<Option<CachedDbHealthResult>>>,
@@ -432,9 +507,10 @@ async fn handle_admin_tls_connection(
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
     // Use the same HTTP service function
+    let client_ip = remote_addr.ip();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
-        async move { handle_admin_request(req, state).await }
+        async move { handle_admin_request(req, state, client_ip).await }
     });
 
     // Use auto builder to support both HTTP/1.1 and HTTP/2 via ALPN negotiation.
@@ -461,14 +537,15 @@ async fn handle_admin_tls_connection(
 /// Handle a single admin connection.
 async fn handle_admin_connection(
     stream: tokio::net::TcpStream,
-    _remote_addr: SocketAddr,
+    remote_addr: SocketAddr,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
     let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
+    let client_ip = remote_addr.ip();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
-        async move { handle_admin_request(req, state).await }
+        async move { handle_admin_request(req, state, client_ip).await }
     });
 
     let mut builder = http1::Builder::new();
@@ -613,15 +690,66 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
     Ok(ns.to_string())
 }
 
-/// Handle an admin API request.
+/// Whether the caller may see the detailed observability views (`/metrics`
+/// scrape body, full `/health`, full `/overload`). Granted on any of: a valid
+/// admin JWT, a matching metrics bearer token, or an allowlisted source IP.
+///
+/// `/metrics` turns a `false` here into `401`; `/health` and `/overload` turn
+/// it into a minimal, LB-safe projection instead.
+fn observability_detail_allowed(
+    state: &AdminState,
+    auth_header: Option<&str>,
+    client_ip: &std::net::IpAddr,
+) -> bool {
+    state.jwt_manager.verify_request(auth_header).is_ok()
+        || state.metrics_auth.token_matches(auth_header)
+        || state.metrics_auth.ip_allowed(client_ip)
+}
+
+/// `401` response for `/metrics` when the caller is not authorized to scrape.
+/// Advertises the supported credential scheme so well-behaved scrapers can
+/// retry with a token.
+fn metrics_unauthorized_response() -> Response<Full<Bytes>> {
+    let body = serde_json::to_vec(&json!({
+        "error": "Unauthorized: /metrics requires a valid admin JWT or metrics bearer token, \
+    or the client must be in FERRUM_METRICS_ALLOWED_CIDRS"
+    }))
+    .unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("Content-Type", "application/json")
+        .header("WWW-Authenticate", "Bearer")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))))
+}
+
+/// Handle an admin API request. `client_ip` is the peer address of the admin
+/// connection (admin uses the socket peer directly — it never trusts forwarded
+/// headers), used to evaluate [`MetricsAuthPolicy`] CIDR allowlists.
 pub async fn handle_admin_request(
     req: Request<Incoming>,
     state: AdminState,
+    client_ip: std::net::IpAddr,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let pagination = parse_pagination(req.uri());
+    // Extracted once: used both for observability-detail tiering below and the
+    // main admin JWT gate further down.
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Liveness probe — always unauthenticated and minimal. Never reveals any
+    // operational internals; safe to expose to load balancers / orchestrators.
+    if path == "/live" {
+        return Ok(json_response(StatusCode::OK, &json!({"status": "ok"})));
+    }
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
@@ -763,19 +891,35 @@ pub async fn handle_admin_request(
             });
         }
 
-        if !startup_ready {
+        let response_code = if !startup_ready {
             health_status["status"] = json!("starting");
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &health_status,
-            ));
-        }
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        };
 
-        return Ok(json_response(StatusCode::OK, &health_status));
+        // Detailed diagnostics (DB type/pool stats, cached-config proxy/consumer
+        // counts, polling-degradation detail, mesh state) are gated. An
+        // unauthenticated caller — e.g. a load-balancer / orchestrator probe —
+        // receives only liveness + readiness, which is enough to drive health
+        // checks without leaking operational internals. Authorized callers
+        // (admin JWT / metrics token / allowlisted CIDR) get the full body.
+        if observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+            return Ok(json_response(response_code, &health_status));
+        }
+        let minimal = json!({
+            "status": health_status["status"],
+            "ready": health_status["ready"],
+        });
+        return Ok(json_response(response_code, &minimal));
     }
 
-    // Overload status (unauthenticated — for load balancer / monitoring probes)
+    // Overload status. Unauthenticated callers (load balancers / monitoring
+    // probes) get a coarse, LB-safe `{level}` plus the correct status code
+    // (503 at critical); the full pressure/counter snapshot is gated behind
+    // observability auth so resource internals are not exposed by default.
     if path == "/overload" && method == Method::GET {
+        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         if let Some(ref proxy_state) = state.proxy_state {
             let snapshot = proxy_state.overload.snapshot();
             let status = match snapshot.level {
@@ -791,16 +935,26 @@ pub async fn handle_admin_request(
                         .unwrap_or_default(),
                 );
             }
-            return Ok(json_response(status, &snapshot_value));
+            if detailed {
+                return Ok(json_response(status, &snapshot_value));
+            }
+            let level = snapshot_value
+                .get("level")
+                .cloned()
+                .unwrap_or_else(|| json!("normal"));
+            return Ok(json_response(status, &json!({ "level": level })));
         }
-        return Ok(json_response(
-            StatusCode::OK,
-            &json!({"level": "normal", "message": "No proxy state available"}),
-        ));
+        return Ok(json_response(StatusCode::OK, &json!({"level": "normal"})));
     }
 
-    // Prometheus metrics endpoint (unauthenticated for scraping)
+    // Prometheus metrics endpoint. Gated by default — a scraper must present a
+    // valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or originate
+    // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
+    // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
+        if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+            return Ok(metrics_unauthorized_response());
+        }
         let registry = crate::plugins::prometheus_metrics::global_registry();
         let inventory = tls_management::collect_inventory(&state);
         registry.refresh_tls_certificate_inventory(&inventory);
@@ -819,11 +973,7 @@ pub async fn handle_admin_request(
     }
 
     // Authenticate
-    let auth = match state.jwt_manager.verify_request(
-        req.headers()
-            .get("authorization")
-            .and_then(|h| h.to_str().ok()),
-    ) {
+    let auth = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
             Ok(actor) => actor,
             Err(message) => {

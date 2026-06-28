@@ -90,6 +90,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
     let state = AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: make_jwt_manager(tc),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),

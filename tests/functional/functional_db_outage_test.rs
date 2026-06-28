@@ -939,6 +939,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("  Testing health endpoint...");
     let resp = client
         .get(format!("{}/health", harness.admin_base_url))
+        .header("Authorization", &auth)
         .send()
         .await
         .unwrap();
@@ -973,6 +974,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     // Verify health is back to normal
     let resp = client
         .get(format!("{}/health", harness.admin_base_url))
+        .header("Authorization", &auth)
         .send()
         .await
         .unwrap();

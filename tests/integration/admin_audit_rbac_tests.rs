@@ -73,6 +73,7 @@ fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> Admin
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: jwt_manager(),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
