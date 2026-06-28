@@ -521,17 +521,22 @@ fn target_already_caps_output(json: &Value, target: DefaultTokenTarget) -> bool 
             .get("inferenceConfig")
             .is_some_and(|v| v.get("maxTokens").is_some()),
         DefaultTokenTarget::TextGeneration => json.get("max_new_tokens").is_some(),
-        // OpenAI Chat Completions honors both the legacy `max_tokens` and the
-        // newer `max_completion_tokens`; the OpenAI Responses API (which also
-        // falls through to `TopLevel` for a bare `{"input", ...}` body) caps
-        // output via `max_output_tokens`. Any of these is the real cap for this
-        // target, so injecting a separate `max_tokens` would add a redundant —
-        // and for Responses, conflicting — parameter.
-        DefaultTokenTarget::TopLevel => {
-            json.get("max_tokens").is_some()
-                || json.get("max_completion_tokens").is_some()
-                || json.get("max_output_tokens").is_some()
-        }
+        // The `TopLevel` target only injects a top-level `max_tokens`, so any
+        // top-level token-cap field the plugin recognizes (`TOP_LEVEL_TOKEN_FIELDS`)
+        // is the real cap for this target. That covers OpenAI Chat Completions
+        // (`max_tokens` / `max_completion_tokens`), the OpenAI Responses API
+        // (`max_output_tokens`, reached for a bare `{"input", ...}` body), and the
+        // legacy/provider aliases that route here without a marker container —
+        // Anthropic legacy (`max_tokens_to_sample`), `maxTokens`, `maxOutputTokens`,
+        // and `max_new_tokens`. Treating any of them as an existing cap matches
+        // what the reject/clamp logic recognizes and keeps a redundant — and for
+        // Responses, conflicting — `max_tokens` from being injected alongside an
+        // existing cap. Unlike the container-scoped targets, there is no
+        // cross-provider stray-field hazard here: every field checked is itself a
+        // top-level field this plugin already honors.
+        DefaultTokenTarget::TopLevel => TOP_LEVEL_TOKEN_FIELDS
+            .iter()
+            .any(|field| json.get(*field).is_some()),
     }
 }
 

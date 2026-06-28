@@ -537,6 +537,40 @@ async fn default_max_tokens_not_injected_when_responses_caps_max_output_tokens()
 }
 
 #[tokio::test]
+async fn default_max_tokens_not_injected_when_top_level_alias_caps_output() {
+    // A body that routes to the top-level target but caps output via one of the
+    // other supported top-level token aliases (Anthropic legacy
+    // `max_tokens_to_sample`, or a top-level `maxOutputTokens`/`maxTokens` with no
+    // provider marker container) already declares a cap. The guard must NOT add a
+    // redundant top-level `max_tokens` alongside it.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+
+    for (label, body) in [
+        (
+            "max_tokens_to_sample (Anthropic legacy)",
+            json!({"prompt": "Human: hi\n\nAssistant:", "max_tokens_to_sample": 16}),
+        ),
+        (
+            "top-level maxOutputTokens (no generationConfig)",
+            json!({"prompt": "hi", "maxOutputTokens": 16}),
+        ),
+        (
+            "top-level maxTokens (no inferenceConfig)",
+            json!({"prompt": "hi", "maxTokens": 16}),
+        ),
+    ] {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let result = plugin
+            .transform_request_body(&bytes, Some("application/json"), &HashMap::new())
+            .await;
+        assert!(
+            result.is_none(),
+            "existing top-level cap ({label}) must suppress redundant default max_tokens injection"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_default_max_tokens_injected() {
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     assert!(plugin.modifies_request_body());
