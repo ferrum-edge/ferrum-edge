@@ -14391,6 +14391,11 @@ components:
           type: string
           default: auto
           description: LLM provider format for token extraction
+        on_unmetered_response:
+          type: string
+          enum: [reject, charge_estimate, warn]
+          default: charge_estimate
+          description: Action for successful responses without usage metadata. charge_estimate keeps the pre-request reservation, reject returns a 502 and keeps the reservation, warn logs and releases the reservation.
         sync_mode:
           type: string
           enum: [local, redis]

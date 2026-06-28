@@ -16,6 +16,37 @@ use super::utils::rate_limit::{
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
+const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
+const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
+const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
+const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
+const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnUnmeteredResponse {
+    Reject,
+    ChargeEstimate,
+    Warn,
+}
+
+impl OnUnmeteredResponse {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "reject" => Some(Self::Reject),
+            "charge_estimate" => Some(Self::ChargeEstimate),
+            "warn" => Some(Self::Warn),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::ChargeEstimate => "charge_estimate",
+            Self::Warn => "warn",
+        }
+    }
+}
 
 pub struct AiRateLimiter {
     token_limit: u64,
@@ -24,6 +55,7 @@ pub struct AiRateLimiter {
     limit_by: String,
     expose_headers: bool,
     provider: String,
+    on_unmetered_response: OnUnmeteredResponse,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
 }
 
@@ -84,6 +116,20 @@ impl AiRateLimiter {
             ));
         }
 
+        let on_unmetered_response = match optional_string(config, "on_unmetered_response")?
+            .unwrap_or("charge_estimate")
+        {
+            value @ ("reject" | "charge_estimate" | "warn") => {
+                OnUnmeteredResponse::parse(value).unwrap_or(OnUnmeteredResponse::ChargeEstimate)
+            }
+            other => {
+                return Err(format!(
+                    "ai_rate_limiter: unknown 'on_unmetered_response' value '{}' (expected 'reject', 'charge_estimate', or 'warn')",
+                    other
+                ));
+            }
+        };
+
         Ok(Self {
             token_limit,
             window_seconds,
@@ -91,6 +137,7 @@ impl AiRateLimiter {
             limit_by,
             expose_headers,
             provider,
+            on_unmetered_response,
             limiter: RateLimitBackend::from_plugin_config(
                 "ai_rate_limiter",
                 config,
@@ -179,11 +226,155 @@ impl AiRateLimiter {
         }
     }
 
-    async fn record_usage(&self, key: String, tokens: u64) {
+    fn reject_unmetered(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"AI token usage missing","details":"Successful AI response did not include token usage metadata required by ai_rate_limiter"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    async fn reserve_usage(&self, key: String, tokens: u64) -> RateLimitOutcome {
+        self.limiter
+            .check(key.clone(), &key, &AiRateLimitOp::Reserve { tokens })
+            .await
+    }
+
+    async fn adjust_usage(&self, key: String, delta: i64) {
+        if delta == 0 {
+            return;
+        }
         let _ = self
             .limiter
-            .check(key.clone(), &key, &AiRateLimitOp::RecordUsage { tokens })
+            .check(key.clone(), &key, &AiRateLimitOp::AdjustUsage { delta })
             .await;
+    }
+
+    fn reserved_tokens(ctx: &RequestContext) -> u64 {
+        ctx.metadata
+            .get(RESERVED_TOKENS_METADATA_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    fn should_release_gateway_rejection(ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .get(REJECTION_RESPONSE_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+            && Self::reserved_tokens(ctx) > 0
+            && ctx
+                .metadata
+                .get(UNMETERED_ACTION_METADATA_KEY)
+                .map(String::as_str)
+                != Some(OnUnmeteredResponse::Reject.as_str())
+    }
+
+    fn reservation_delta(actual_tokens: u64, reserved_tokens: u64) -> i64 {
+        let delta = i128::from(actual_tokens) - i128::from(reserved_tokens);
+        delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
+    fn estimate_request_tokens(&self, ctx: &RequestContext) -> u64 {
+        let Some(body) = ctx.metadata.get("request_body") else {
+            return 0;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(body) else {
+            return 0;
+        };
+
+        self.estimate_request_tokens_from_json(&json)
+    }
+
+    fn estimate_request_tokens_from_json(&self, json: &Value) -> u64 {
+        let prompt_tokens = estimate_prompt_tokens(json);
+        let completion_tokens = requested_completion_tokens(json);
+        match self.count_mode.as_str() {
+            "prompt_tokens" => prompt_tokens,
+            "completion_tokens" => completion_tokens,
+            _ => prompt_tokens.saturating_add(completion_tokens),
+        }
+    }
+
+    async fn reconcile_usage(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        actual_tokens: Option<u64>,
+        unmetered_detail: &str,
+    ) -> PluginResult {
+        let reserved_tokens = Self::reserved_tokens(ctx);
+
+        if let Some(actual_tokens) = actual_tokens {
+            ctx.metadata.insert(
+                ACTUAL_TOKENS_METADATA_KEY.to_string(),
+                actual_tokens.to_string(),
+            );
+            self.adjust_usage(
+                self.rate_key(ctx),
+                Self::reservation_delta(actual_tokens, reserved_tokens),
+            )
+            .await;
+            return PluginResult::Continue;
+        }
+
+        if !(200..300).contains(&response_status) {
+            self.adjust_usage(
+                self.rate_key(ctx),
+                Self::reservation_delta(0, reserved_tokens),
+            )
+            .await;
+            return PluginResult::Continue;
+        }
+
+        match self.on_unmetered_response {
+            OnUnmeteredResponse::ChargeEstimate => {
+                ctx.metadata.insert(
+                    UNMETERED_ACTION_METADATA_KEY.to_string(),
+                    OnUnmeteredResponse::ChargeEstimate.as_str().to_string(),
+                );
+                warn!(
+                    provider = %self.provider,
+                    count_mode = %self.count_mode,
+                    reserved_tokens,
+                    detail = %unmetered_detail,
+                    "ai_rate_limiter: successful response did not include token usage; keeping pre-request reservation"
+                );
+                PluginResult::Continue
+            }
+            OnUnmeteredResponse::Warn => {
+                ctx.metadata.insert(
+                    UNMETERED_ACTION_METADATA_KEY.to_string(),
+                    OnUnmeteredResponse::Warn.as_str().to_string(),
+                );
+                self.adjust_usage(
+                    self.rate_key(ctx),
+                    Self::reservation_delta(0, reserved_tokens),
+                )
+                .await;
+                warn!(
+                    provider = %self.provider,
+                    count_mode = %self.count_mode,
+                    reserved_tokens,
+                    detail = %unmetered_detail,
+                    "ai_rate_limiter: successful response did not include token usage; releasing reservation because on_unmetered_response=warn"
+                );
+                PluginResult::Continue
+            }
+            OnUnmeteredResponse::Reject => {
+                ctx.metadata.insert(
+                    UNMETERED_ACTION_METADATA_KEY.to_string(),
+                    OnUnmeteredResponse::Reject.as_str().to_string(),
+                );
+                warn!(
+                    provider = %self.provider,
+                    count_mode = %self.count_mode,
+                    reserved_tokens,
+                    detail = %unmetered_detail,
+                    "ai_rate_limiter: rejecting successful response without token usage"
+                );
+                self.reject_unmetered()
+            }
+        }
     }
 
     fn read_tokens_from_metadata(&self, metadata: &HashMap<String, String>) -> Option<u64> {
@@ -318,6 +509,68 @@ impl AiRateLimiter {
     }
 }
 
+fn requested_completion_tokens(json: &Value) -> u64 {
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .filter_map(|field| json.get(*field).and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0)
+}
+
+fn estimate_prompt_tokens(json: &Value) -> u64 {
+    let chars = prompt_character_count(json);
+    if chars == 0 { 0 } else { chars.div_ceil(4) }
+}
+
+fn prompt_character_count(json: &Value) -> u64 {
+    let mut chars = 0_u64;
+
+    if let Some(system) = json.get("system") {
+        chars = chars.saturating_add(string_value_character_count(system));
+    }
+    if let Some(messages) = json.get("messages") {
+        chars = chars.saturating_add(string_value_character_count(messages));
+    }
+    if let Some(prompt) = json.get("prompt") {
+        chars = chars.saturating_add(string_value_character_count(prompt));
+    }
+    if let Some(input) = json.get("input") {
+        chars = chars.saturating_add(string_value_character_count(input));
+    }
+    if let Some(contents) = json.get("contents") {
+        chars = chars.saturating_add(string_value_character_count(contents));
+    }
+    if let Some(tools) = json.get("tools") {
+        chars = chars.saturating_add(string_value_character_count(tools));
+    }
+
+    if chars == 0 {
+        string_value_character_count(json)
+    } else {
+        chars
+    }
+}
+
+fn string_value_character_count(value: &Value) -> u64 {
+    match value {
+        Value::String(value) => value.chars().count() as u64,
+        Value::Array(values) => values.iter().fold(0_u64, |acc, value| {
+            acc.saturating_add(string_value_character_count(value))
+        }),
+        Value::Object(values) => values.iter().fold(0_u64, |acc, (key, value)| {
+            if matches!(
+                key.as_str(),
+                "max_tokens" | "max_completion_tokens" | "max_output_tokens"
+            ) {
+                acc
+            } else {
+                acc.saturating_add(string_value_character_count(value))
+            }
+        }),
+        _ => 0,
+    }
+}
+
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     let Some(value) = config.get(field) else {
         return Ok(None);
@@ -377,6 +630,18 @@ impl Plugin for AiRateLimiter {
         self.expose_headers
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|content_type| is_json_content_type(content_type))
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         self.limiter.warmup_hostname().into_iter().collect()
     }
@@ -403,10 +668,14 @@ impl Plugin for AiRateLimiter {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         let key = self.rate_key(ctx);
-        let outcome = self
-            .limiter
-            .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
-            .await;
+        let reserved_tokens = self.estimate_request_tokens(ctx);
+        let outcome = if reserved_tokens > 0 {
+            self.reserve_usage(key.clone(), reserved_tokens).await
+        } else {
+            self.limiter
+                .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
+                .await
+        };
         // Evict AFTER the check so the current request's key cannot be
         // force-evicted by `enforce_capacity` between insertion and the
         // budget read — that race would let a hot user slip through
@@ -426,6 +695,12 @@ impl Plugin for AiRateLimiter {
             return self.reject(usage);
         }
 
+        if reserved_tokens > 0 {
+            ctx.metadata.insert(
+                RESERVED_TOKENS_METADATA_KEY.to_string(),
+                reserved_tokens.to_string(),
+            );
+        }
         self.store_metadata(ctx, &outcome);
         PluginResult::Continue
     }
@@ -433,13 +708,33 @@ impl Plugin for AiRateLimiter {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx.metadata.contains_key("ai_federation_provider")
-            && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
-        {
-            self.record_usage(self.rate_key(ctx), tokens).await;
+        if ctx.metadata.contains_key("ai_federation_provider") {
+            let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
+            let result = self
+                .reconcile_usage(
+                    ctx,
+                    response_status,
+                    actual_tokens,
+                    "ai_federation_metadata",
+                )
+                .await;
+            if !matches!(result, PluginResult::Continue) {
+                return result;
+            }
+            ctx.metadata.insert(
+                FEDERATION_TOKENS_RECORDED_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        } else if Self::should_release_gateway_rejection(ctx) {
+            let result = self
+                .reconcile_usage(ctx, 500, None, "gateway_rejection")
+                .await;
+            if !matches!(result, PluginResult::Continue) {
+                return result;
+            }
         }
 
         if !self.expose_headers {
@@ -467,12 +762,22 @@ impl Plugin for AiRateLimiter {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if ctx
+            .metadata
+            .get(FEDERATION_TOKENS_RECORDED_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+        {
+            return PluginResult::Continue;
+        }
+
         if !(200..300).contains(&response_status) {
             debug!(
                 "ai_rate_limiter: skipping non-2xx response (status {})",
                 response_status
             );
-            return PluginResult::Continue;
+            return self
+                .reconcile_usage(ctx, response_status, None, "non_2xx_response")
+                .await;
         }
 
         let content_type = response_headers
@@ -480,42 +785,29 @@ impl Plugin for AiRateLimiter {
             .map(String::as_str)
             .unwrap_or("");
 
-        let tokens = self.read_tokens_from_metadata(&ctx.metadata).or_else(|| {
+        let metadata_tokens = self.read_tokens_from_metadata(&ctx.metadata);
+        let mut unmetered_detail = "metadata_without_usage";
+        let tokens = metadata_tokens.or_else(|| {
             if body.is_empty() {
+                unmetered_detail = "empty_body";
                 return None;
             }
 
             if is_event_stream_content_type(content_type) {
+                unmetered_detail = "sse_without_usage";
                 return self.extract_token_count_from_sse(body);
             }
 
             if !is_json_content_type(content_type) {
+                unmetered_detail = "unsupported_content_type";
                 return None;
             }
 
+            unmetered_detail = "json_without_usage";
             self.extract_token_count(body)
         });
 
-        let tokens = match tokens {
-            Some(tokens) => tokens,
-            None => {
-                // Fail-open on accuracy: a 2xx whose token count we cannot
-                // resolve (unrecognized provider/response shape, truncated
-                // SSE, or missing usage block) is not charged to the window.
-                // Surface at warn so operators can detect which providers /
-                // response shapes are being silently missed.
-                warn!(
-                    provider = %self.provider,
-                    content_type = %content_type,
-                    count_mode = %self.count_mode,
-                    "ai_rate_limiter: could not extract token count from 2xx response; \
-                     request not charged to rate-limit window"
-                );
-                return PluginResult::Continue;
-            }
-        };
-
-        self.record_usage(self.rate_key(ctx), tokens).await;
-        PluginResult::Continue
+        self.reconcile_usage(ctx, response_status, tokens, unmetered_detail)
+            .await
     }
 }

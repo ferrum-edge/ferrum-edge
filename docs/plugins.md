@@ -3704,7 +3704,7 @@ config:
 
 ### `ai_token_metrics`
 
-Extracts token usage from LLM JSON response bodies and writes it to request metadata for downstream logging and observability plugins. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream.
+Extracts token usage from LLM JSON response bodies and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream.
 
 **Priority:** 4100
 
@@ -3771,7 +3771,9 @@ config:
 
 ### `ai_rate_limiter`
 
-Rate-limits consumers by LLM token consumption instead of request count. Supports both regular JSON and SSE streaming responses — when `ai_token_metrics` is active, reads tokens from metadata; when used standalone, parses response bodies directly including SSE `data:` lines.
+Rate-limits consumers by LLM token consumption instead of request count. The limiter reserves an estimated token cost before proxying JSON `POST` requests, using the largest configured output cap (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`) plus an estimated prompt-token count according to `count_mode`. The reservation is reconciled after the response: actual usage replaces the estimate when available; otherwise the `on_unmetered_response` policy decides whether to keep the estimate, reject the response, or release the estimate with a warning.
+
+Supports both regular JSON and SSE streaming responses — when `ai_token_metrics` is active, reads tokens from metadata; when used standalone, parses response bodies directly including SSE `data:` lines.
 
 **Priority:** 4200
 
@@ -3783,6 +3785,7 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers |
 | `provider` | String | `"auto"` | LLM provider format for token extraction |
+| `on_unmetered_response` | String | `"charge_estimate"` | Action for successful responses without usage metadata: `charge_estimate` keeps the pre-request reservation, `reject` returns a 502 and keeps the reservation, `warn` logs and releases the reservation |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -3799,7 +3802,7 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
-**Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted as they arrive. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
+**Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted when the final usage signal is available. Configure OpenAI-compatible clients to send `stream_options.include_usage: true` whenever possible. If a streamed 2xx response has no final usage, the default `on_unmetered_response: "charge_estimate"` keeps the pre-request reservation so streaming is not free. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
 
 **Local-mode performance**: The sliding window keeps a running sum so each `current_usage()` call is amortised O(stale-evicted) rather than O(n) per request.
 

@@ -696,6 +696,17 @@ fn test_valid_limit_by_accepted() {
 }
 
 #[test]
+fn test_valid_on_unmetered_response_accepted() {
+    for value in ["reject", "charge_estimate", "warn"] {
+        AiRateLimiter::new(
+            &json!({"token_limit": 100, "on_unmetered_response": value}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|e| panic!("on_unmetered_response '{value}' should be valid: {e}"));
+    }
+}
+
+#[test]
 fn test_invalid_config_shapes_rejected() {
     for (config, needle) in [
         (json!(null), "config must be an object"),
@@ -713,6 +724,10 @@ fn test_invalid_config_shapes_rejected() {
         (
             json!({"token_limit": 100, "provider": "unknown"}),
             "provider",
+        ),
+        (
+            json!({"token_limit": 100, "on_unmetered_response": "ignore"}),
+            "on_unmetered_response",
         ),
         (
             json!({"token_limit": 100, "sync_mode": "database"}),
@@ -910,6 +925,30 @@ fn sse_headers() -> HashMap<String, String> {
     h
 }
 
+fn ai_request_ctx(max_tokens: u64, prompt: &str) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens
+        }))
+        .unwrap(),
+    );
+    ctx
+}
+
+fn reserved_tokens(ctx: &RequestContext) -> u64 {
+    ctx.metadata
+        .get("ai_ratelimit_reserved_tokens")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Read the current-window usage the limiter would charge, by issuing a
 /// follow-up `before_proxy` and reading the exposed `ai_ratelimit_usage`.
 async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
@@ -958,18 +997,12 @@ async fn test_sse_with_usage_block_still_recorded() {
 }
 
 #[tokio::test]
-async fn test_sse_without_usage_block_not_charged() {
-    // #54: when an SSE stream is walked but carries no recognizable usage
-    // block, prompt_tokens/completion_tokens modes must NOT charge a count
-    // (previously they substituted Some(0) and recorded 0 without any
-    // operator signal; now they return None so the caller's warn fires).
-    // Either way the window must be unaffected — assert no usage is charged
-    // and the request is allowed through.
+async fn streaming_without_usage_charged_or_rejected() {
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
             "window_seconds": 60,
-            "count_mode": "prompt_tokens",
+            "count_mode": "total_tokens",
             "limit_by": "ip",
             "expose_headers": true
         }),
@@ -977,9 +1010,11 @@ async fn test_sse_without_usage_block_not_charged() {
     )
     .unwrap();
 
-    let mut ctx = create_test_context();
+    let mut ctx = ai_request_ctx(200, "hello");
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve estimated tokens");
 
     // Content-only deltas, no usage block anywhere.
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n\
@@ -992,16 +1027,13 @@ async fn test_sse_without_usage_block_not_charged() {
 
     assert_eq!(
         observed_usage(&plugin).await,
-        0,
-        "no usage block means nothing is charged to the window"
+        reserved,
+        "default enforce behavior should keep the reservation for unmetered SSE"
     );
 }
 
 #[tokio::test]
-async fn test_unparseable_2xx_json_not_charged() {
-    // #53: a 2xx whose token count cannot be resolved (unrecognized response
-    // shape) must not panic and must not be charged; the request continues.
-    // The fail-open is now surfaced at warn-level for operators.
+async fn unmetered_2xx_is_not_free_in_enforce_mode() {
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
@@ -1013,9 +1045,11 @@ async fn test_unparseable_2xx_json_not_charged() {
     )
     .unwrap();
 
-    let mut ctx = create_test_context();
+    let mut ctx = ai_request_ctx(120, "count this prompt");
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve estimated tokens");
 
     // Valid JSON, but no usage block the extractor understands.
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
@@ -1026,7 +1060,79 @@ async fn test_unparseable_2xx_json_not_charged() {
 
     assert_eq!(
         observed_usage(&plugin).await,
-        0,
-        "an unparseable 2xx must not advance the rate-limit window"
+        reserved,
+        "an unmetered 2xx should keep the estimated reservation by default"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_requests_cannot_oversubscribe_budget() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 150,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx_a = ai_request_ctx(100, "first");
+    let mut ctx_b = ai_request_ctx(100, "second");
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+    assert_eq!(allowed, 1, "only one reservation should fit in the budget");
+    assert_eq!(rejected, 1, "the oversubscribing reservation should reject");
+}
+
+#[tokio::test]
+async fn federation_metadata_still_records_actual_usage() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(300, "federated prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 40);
+
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "primary".to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), "40".to_string());
+    ctx.metadata
+        .insert("ai_prompt_tokens".to_string(), "15".to_string());
+    ctx.metadata
+        .insert("ai_completion_tokens".to_string(), "25".to_string());
+
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        40,
+        "federation actual usage should reconcile the pre-request reservation"
     );
 }

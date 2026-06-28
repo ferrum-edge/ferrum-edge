@@ -907,6 +907,56 @@ impl TokenUsageWindow {
         self.total = self.total.saturating_add(tokens);
     }
 
+    fn reserve(&mut self, now: Instant, tokens: u64) -> RateLimitOutcome {
+        let usage = self.current_usage(now);
+        let reserved_usage = usage.saturating_add(tokens);
+        if reserved_usage > self.limit {
+            return RateLimitOutcome::deny()
+                .with_limit(self.limit)
+                .with_window(self.window_duration.as_secs())
+                .with_usage(usage)
+                .with_remaining(self.limit.saturating_sub(usage));
+        }
+
+        self.record_usage(now, tokens);
+        RateLimitOutcome::allow()
+            .with_limit(self.limit)
+            .with_window(self.window_duration.as_secs())
+            .with_usage(reserved_usage)
+            .with_remaining(self.limit.saturating_sub(reserved_usage))
+    }
+
+    fn adjust_usage(&mut self, now: Instant, delta: i64) {
+        if delta == 0 {
+            self.current_usage(now);
+            return;
+        }
+
+        if delta > 0 {
+            self.record_usage(now, delta as u64);
+            return;
+        }
+
+        self.current_usage(now);
+        let mut remaining_release = delta.unsigned_abs();
+        while remaining_release > 0 {
+            let Some((_, tokens)) = self.entries.back_mut() else {
+                self.total = 0;
+                break;
+            };
+
+            if *tokens > remaining_release {
+                *tokens -= remaining_release;
+                self.total = self.total.saturating_sub(remaining_release);
+                break;
+            }
+
+            remaining_release -= *tokens;
+            self.total = self.total.saturating_sub(*tokens);
+            self.entries.pop_back();
+        }
+    }
+
     fn remaining(&mut self, now: Instant) -> u64 {
         self.limit.saturating_sub(self.current_usage(now))
     }
@@ -921,7 +971,12 @@ impl TokenUsageWindow {
 #[derive(Debug, Clone, Copy)]
 pub enum AiRateLimitOp {
     CheckBudget,
-    RecordUsage { tokens: u64 },
+    Reserve { tokens: u64 },
+    AdjustUsage { delta: i64 },
+}
+
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -972,8 +1027,9 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     .with_usage(usage)
                     .with_remaining(remaining)
             }
-            AiRateLimitOp::RecordUsage { tokens } => {
-                state.record_usage(now, tokens);
+            AiRateLimitOp::Reserve { tokens } => state.reserve(now, tokens),
+            AiRateLimitOp::AdjustUsage { delta } => {
+                state.adjust_usage(now, delta);
                 RateLimitOutcome::allow()
             }
         }
@@ -1007,13 +1063,43 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     .with_usage(usage)
                     .with_remaining(remaining))
             }
-            AiRateLimitOp::RecordUsage { tokens } => {
+            AiRateLimitOp::Reserve { tokens } => {
                 let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
-                let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                let prev_idx = curr_idx.saturating_sub(1);
+                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
                 let ttl = self.window_seconds * 2 + 1;
-                let _ = redis
-                    .incrby_with_expire(&redis_key, tokens as i64, ttl)
-                    .await?;
+                let increment = u64_to_i64_saturating(tokens);
+                let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
+                let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
+                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + new_curr_count as f64;
+                let usage = weighted.max(0.0) as u64;
+                let remaining = self.token_limit.saturating_sub(usage);
+                if weighted > self.token_limit as f64 {
+                    let _ = redis.incrby_with_expire(&curr_key, -increment, ttl).await;
+                    return Ok(RateLimitOutcome::deny()
+                        .with_limit(self.token_limit)
+                        .with_window(self.window_seconds)
+                        .with_usage(usage.saturating_sub(tokens))
+                        .with_remaining(
+                            self.token_limit
+                                .saturating_sub(usage.saturating_sub(tokens)),
+                        ));
+                }
+                Ok(RateLimitOutcome::allow()
+                    .with_limit(self.token_limit)
+                    .with_window(self.window_seconds)
+                    .with_usage(usage)
+                    .with_remaining(remaining))
+            }
+            AiRateLimitOp::AdjustUsage { delta } => {
+                if delta != 0 {
+                    let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                    let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                    let ttl = self.window_seconds * 2 + 1;
+                    let _ = redis.incrby_with_expire(&redis_key, delta, ttl).await?;
+                }
                 Ok(RateLimitOutcome::allow())
             }
         }
