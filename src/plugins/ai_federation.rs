@@ -1898,11 +1898,24 @@ impl Plugin for AiFederation {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct))
+        if ctx.method != "POST" {
+            return false;
+        }
+        let Some(content_type) = ctx.headers.get("content-type") else {
+            return false;
+        };
+        // Mirror the native-gRPC pass-through in `before_proxy`: `is_json_content_type`
+        // accepts the `+json` suffix, so `application/grpc+json` would otherwise be
+        // buffered here — and this predicate is evaluated by the H1/H2 path in
+        // `src/proxy/mod.rs` *before* any `before_proxy` hook runs (via
+        // `requires_request_body_before_before_proxy`). Buffering a native gRPC
+        // request fully drains client-streaming / large bodies even though
+        // `before_proxy` then returns `Continue`, so the gRPC exclusion must apply
+        // to the buffering decision too, not just the hook.
+        if crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+            return false;
+        }
+        is_json_content_type(content_type)
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

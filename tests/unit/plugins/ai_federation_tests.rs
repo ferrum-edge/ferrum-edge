@@ -2018,6 +2018,60 @@ async fn federation_native_grpc_json_body_passes_through_in_strict_mode() {
     );
 }
 
+#[test]
+fn should_buffer_request_body_skips_native_grpc() {
+    // The H1/H2 path buffers the request body *before* `before_proxy` runs when
+    // `requires_request_body_before_before_proxy()` is true, gated per-request by
+    // `should_buffer_request_body`. Because `is_json_content_type` accepts the
+    // `+json` suffix, `application/grpc+json` would otherwise be buffered here and
+    // a client-streaming / large gRPC call fully drained even though
+    // `before_proxy` then passes it through. The native-gRPC exclusion must apply
+    // to the buffering decision too, mirroring the `before_proxy` skip.
+    let plugin = streaming_plugin();
+
+    // Native gRPC content-types must NOT be buffered.
+    let mut grpc_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    grpc_ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&grpc_ctx),
+        "native gRPC (application/grpc+json) request body must not be buffered"
+    );
+
+    let mut grpc_proto_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    grpc_proto_ctx
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&grpc_proto_ctx),
+        "native gRPC (application/grpc) request body must not be buffered"
+    );
+
+    // Plain OpenAI JSON POSTs are still buffered (the plugin needs the body).
+    let mut json_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    json_ctx
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&json_ctx),
+        "OpenAI JSON request body must still be buffered"
+    );
+}
+
 #[tokio::test]
 async fn federation_pass_through_requires_explicit_opt_in() {
     let unknown_model_body = json!({
