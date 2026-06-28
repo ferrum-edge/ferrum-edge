@@ -1075,6 +1075,41 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
     // therefore SKIP the estimate-based pre-reservation for compressed requests
     // (falling back to the no-reservation `CheckBudget` path) and rely on
     // reconciliation to charge actual usage afterward.
+    //
+    // The two concerns below are deliberately split across SEPARATE limiter
+    // instances. `limit_by: "ip"` derives the rate key from the client IP, and
+    // every `create_test_context()` shares `127.0.0.1`, so a single instance
+    // would accumulate the control request's (unreconciled) pre-reservation onto
+    // the same key that the compressed-reconcile assertion reads back via the
+    // cumulative `observed_usage`. A fresh instance gives the 55 assertion its
+    // own zeroed counter, so it reflects ONLY the compressed request's usage.
+
+    // Control concern: an uncompressed JSON POST still reserves estimated tokens.
+    // This is asserted via the PER-REQUEST `ai_ratelimit_reserved_tokens` marker
+    // (which does not accumulate across requests), and on its own limiter so its
+    // reservation can never leak into the reconciliation assertion below.
+    let control_plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut uncompressed = ai_request_ctx(120, "count this prompt please");
+    let mut uncompressed_headers = json_headers();
+    control_plugin
+        .before_proxy(&mut uncompressed, &mut uncompressed_headers)
+        .await;
+    assert!(
+        reserved_tokens(&uncompressed) > 0,
+        "an uncompressed JSON POST should still reserve estimated tokens"
+    );
+
+    // Reconciliation concern: a FRESH limiter instance handles only the
+    // compressed request, so its in-memory counter starts at zero and the
+    // cumulative `observed_usage` reflects exactly the reconciled actual usage.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
@@ -1088,21 +1123,10 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
     )
     .unwrap();
 
-    // Control: an identical *uncompressed* request reserves estimated tokens.
-    let mut uncompressed = ai_request_ctx(120, "count this prompt please");
-    let mut uncompressed_headers = json_headers();
-    plugin
-        .before_proxy(&mut uncompressed, &mut uncompressed_headers)
-        .await;
-    assert!(
-        reserved_tokens(&uncompressed) > 0,
-        "an uncompressed JSON POST should still reserve estimated tokens"
-    );
-
-    // Compressed: same body bytes, but a non-identity `Content-Encoding` on the
-    // request. `before_proxy` reads the encoding from the `headers` PARAMETER
-    // (not `ctx.headers`), matching the production phase where the handler may
-    // `mem::take` headers out of `ctx`. No body-derived pre-reservation is made.
+    // Compressed: a non-identity `Content-Encoding` on the request. `before_proxy`
+    // reads the encoding from the `headers` PARAMETER (not `ctx.headers`),
+    // matching the production phase where the handler may `mem::take` headers out
+    // of `ctx`. No body-derived pre-reservation is made.
     let mut compressed = ai_request_ctx(120, "count this prompt please");
     let mut compressed_headers = json_headers();
     compressed_headers.insert("content-encoding".to_string(), "gzip".to_string());
@@ -1124,6 +1148,7 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
 
     // Reconciliation still charges the ACTUAL provider-reported usage afterward,
     // so the compressed request is debited correctly even without a reservation.
+    // No control traffic touched this instance's key, so cumulative usage == 55.
     let body = openai_response(40, 15);
     let reconcile = plugin
         .on_response_body(&mut compressed, 200, &json_headers(), &body)
