@@ -62,7 +62,14 @@ jobs:
             exit 0
           fi
 
-          changed_files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD")"
+          # Diff against the live base branch ref (triple-dot = merge-base) so the
+          # path filter only sees this PR's changes. github.event.pull_request.base.sha
+          # is the base recorded when the synthetic merge ref was last built and can
+          # lag main on long-lived PRs; diffing against it would pull in files that
+          # main changed afterwards and wrongly route the PR through the 90-minute lab.
+          base_ref="origin/${{ github.base_ref }}"
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          changed_files="$(git diff --name-only "${base_ref}...HEAD")"
 
           # This is the sole PR trigger surface for full Gateway API
           # conformance. Add new Gateway/controller/data-plane/routing/chart
