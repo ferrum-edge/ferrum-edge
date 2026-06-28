@@ -86,13 +86,17 @@ const STREAMING_WINDOWED_MARKER: &str = "streaming_windowed";
 /// request path; read on the response path.
 const STREAM_BUFFER_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_buffer_requested";
 const STREAM_INSPECT_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_inspect_requested";
-/// Set on the request path when `skip` mode detects a `stream: true` JSON POST
-/// while response inspection is active. `skip` is a fail-open opt-out for the
+/// Set on the request path (alongside the shared `ai_request_streaming` marker)
+/// when an EXPLICIT `skip` instance detects a `stream: true` JSON POST while
+/// response inspection is active. `skip` is a fail-open opt-out for the
 /// genuinely STREAMED (SSE) response only: a backend that ignores the flag and
-/// returns a normal JSON response must still be inspected. The marker lets the
-/// pre-header buffering decision keep buffering by default (so content-type
-/// refinement runs) and is consulted on the response path to downgrade ONLY an
-/// `text/event-stream` body back to the uninspected streaming path.
+/// returns a normal JSON response must still be inspected. This dedicated marker
+/// lets THIS plugin override the shared streaming flag for its own JSON-vs-SSE
+/// decision — keeping the pre-header buffering decision buffering by default (so
+/// content-type refinement runs), then downgrading ONLY an `text/event-stream`
+/// body back to the uninspected streaming path. Always read back gated on the
+/// reader's own `self.audit_streaming_skip` so a coexisting implicit-`Skip`
+/// instance is not influenced by a marker another instance set.
 const STREAM_SKIP_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_skip_requested";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1580,24 +1584,34 @@ impl Plugin for AiSemanticFirewall {
                     };
                 }
                 // EXPLICIT `skip` with response rules active: fail-open opt-out for
-                // the genuinely STREAMED (SSE) response only. Do NOT force the
-                // response onto the streaming path with `ai_request_streaming` — a
-                // backend that ignores `stream: true` and returns a normal JSON
-                // response must still be inspected. Set the skip marker so the
-                // pre-header buffering decision keeps buffering by default;
-                // content-type refinement then downgrades ONLY an
-                // `text/event-stream` body back to the uninspected streaming path
-                // (see `should_buffer_response_body_for_content_type`). The audit
-                // marker records the intended skip for an SSE response.
+                // the genuinely STREAMED (SSE) response only. Set the SHARED
+                // `ai_request_streaming` marker — its contract is "the REQUEST asked
+                // for a streamed response", which is true here — so downstream
+                // response plugins (`ai_response_guard`, `ai_token_metrics`) keep
+                // their existing streaming behavior and do NOT buffer an SSE body to
+                // EOF. THIS plugin overrides that shared flag for its own
+                // JSON-vs-SSE decision via the dedicated, per-instance skip marker:
+                // a backend that ignores `stream: true` and returns a normal JSON
+                // response must still be inspected, so the skip marker keeps the
+                // pre-header buffering decision buffering by default; content-type
+                // refinement then downgrades ONLY a `text/event-stream` body back to
+                // the uninspected streaming path (see
+                // `should_buffer_response_body_for_content_type`). The audit marker
+                // records the intended skip for an SSE response.
                 //
                 // Gated on `audit_streaming_skip` (the operator explicitly chose
                 // `skip`) so the implicit `Skip` default — only reached in dry-run
                 // or request-only configs, where the request body is not buffered
                 // and `requires_request_body_before_before_proxy()` is false — keeps
-                // its existing `_`-arm behavior below.
+                // its existing `_`-arm behavior below. The skip marker is also read
+                // back per-instance (gated on `self.audit_streaming_skip`) so a
+                // coexisting implicit-`Skip` instance never buffers a JSON fallback
+                // solely because this instance set the marker.
                 StreamingResponsePolicy::Skip
                     if response_inspectable && self.audit_streaming_skip =>
                 {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
                     ctx.metadata
                         .insert(STREAM_SKIP_REQUESTED_KEY.to_string(), "true".to_string());
                     ctx.metadata.insert(
@@ -1681,14 +1695,17 @@ impl Plugin for AiSemanticFirewall {
         // instead of streaming past every check. (Setting `ai_request_streaming`
         // alone is NOT enough — `refine` never upgrades stream→buffer.)
         //
-        // `skip` mode buffers by default too: the opt-out only bypasses a
+        // EXPLICIT `skip` mode buffers by default too: the opt-out only bypasses a
         // genuinely streamed (SSE) response, so the pre-header decision must keep
         // buffering and let content-type refinement downgrade ONLY the SSE body
         // back to the uninspected streaming path. A backend that returns JSON
-        // despite `stream: true` is still inspected.
+        // despite `stream: true` is still inspected. The skip marker is read back
+        // gated on THIS instance's `audit_streaming_skip` so an implicit-`Skip`
+        // instance coexisting on the same request is not pulled onto the buffered
+        // path by a marker the explicit-skip instance set.
         if buffer_streaming_marker_set(ctx)
             || windowed_streaming_marker_set(ctx)
-            || skip_streaming_marker_set(ctx)
+            || (self.audit_streaming_skip && skip_streaming_marker_set(ctx))
         {
             return true;
         }
@@ -1699,7 +1716,7 @@ impl Plugin for AiSemanticFirewall {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
@@ -1731,11 +1748,24 @@ impl Plugin for AiSemanticFirewall {
             // MUST be buffered and inspected via `on_response_body`. Otherwise the
             // `ai_request_streaming` flag keeps it on the streaming path with no
             // windowed inspector (which only attaches for event streams), so
-            // response rules would be bypassed entirely. The same applies to a
-            // `skip`-marked request: skip only opts out of a genuinely streamed
-            // (SSE) response, so a JSON response is still inspected.
-            if windowed_streaming_marker_set(ctx) || skip_streaming_marker_set(ctx) {
+            // response rules would be bypassed entirely.
+            if windowed_streaming_marker_set(ctx) {
                 return true;
+            }
+            // The same applies to an EXPLICIT-`skip`-marked request: skip only opts
+            // out of a genuinely streamed (SSE) response, so a JSON fallback is
+            // still inspected. Read back gated on THIS instance's
+            // `audit_streaming_skip` so an implicit-`Skip` instance is not pulled
+            // onto the buffered path by another instance's marker. The skip-marked
+            // JSON decision is fully determined here — buffer only for a success
+            // status: `on_response_body` returns early for any status outside
+            // `200..300`, so holding a non-2xx JSON error body would add latency
+            // (and risk the buffered size cap) for data the firewall will never
+            // inspect. Return directly (do NOT fall through to
+            // `should_buffer_response_body`, which would re-buffer it via the skip
+            // marker regardless of status).
+            if self.audit_streaming_skip && skip_streaming_marker_set(ctx) {
+                return (200..300).contains(&response_status);
             }
             return self.should_buffer_response_body(ctx);
         }
