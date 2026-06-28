@@ -1056,23 +1056,32 @@ jobs:
           # prefer the most recent run whose `.pull_requests[]` includes THIS PR
           # number; only when none match (cross-fork PR runs report an empty
           # `.pull_requests`) fall back to the most recent in-window head_sha run
-          # so forked PRs still get a result. The `created_at >= $since` floor is
-          # applied to BOTH paths so a stale same-SHA run cannot satisfy either.
+          # so forked PRs still get a result. The `created_at >= env.SINCE` floor
+          # is applied to BOTH paths so a stale same-SHA run cannot satisfy either.
+          # `gh api --jq` runs gojq, which has no `--arg` flag (that's a flag of
+          # the standalone `jq` binary, not of `gh`). Passing `--arg` makes `gh`
+          # exit non-zero with "unknown flag", and the surrounding
+          # `2>/dev/null || true` would silently swallow it, leaving `run_id`
+          # empty and failing the gate on every PR. Instead, read the values
+          # inside the program via gojq's `env` builtin: `PR_NUMBER` is exported
+          # in the step `env:` block, and `SINCE` is exported here so the jq
+          # program can reference `env.SINCE`.
+          export SINCE="${since}"
           run_id=""
           for _ in $(seq 1 60); do
-            # `$pr` / `$since` below are jq variables bound via `--arg`, not shell
-            # variables, so the jq program is intentionally single-quoted.
+            # `env.PR_NUMBER` / `env.SINCE` below read process env from inside
+            # the jq program, so it is intentionally single-quoted.
             # shellcheck disable=SC2016
             run_id="$(
               gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
                 --jq '
                   [.workflow_runs[]]
-                  | map(select(.created_at >= $since))
+                  | map(select(.created_at >= env.SINCE))
                   | sort_by(.created_at) | reverse
-                  | (map(select(any(.pull_requests[]?; .number == ($pr | tonumber)))) | .[0].id)
+                  | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
                     // (.[0].id)
                     // empty
-                ' --arg pr "${PR_NUMBER}" --arg since "${since}" 2>/dev/null || true
+                ' 2>/dev/null || true
             )"
             if [ -n "$run_id" ]; then
               break
