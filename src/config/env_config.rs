@@ -1078,9 +1078,19 @@ pub struct EnvConfig {
     ///
     /// Default: false (safe, frame-parsed path for all connections)
     pub websocket_tunnel_mode: bool,
-    /// WebSocket relay idle timeout in seconds. When non-zero, an upgraded
-    /// session is closed if neither side produces data for this duration.
-    /// 0 = disabled. Default: 0.
+    /// Global default WebSocket relay idle timeout in seconds. When non-zero, an
+    /// upgraded session is closed if neither side produces data (frames, including
+    /// Ping/Pong, or transport bytes) for this duration. Activity from EITHER
+    /// direction refreshes the shared watermark, so heartbeating clients stay
+    /// open. The per-proxy `websocket_idle_timeout_seconds` overrides this.
+    /// `0` = disabled (idle sessions live forever, bounded only by
+    /// `websocket_max_connections`). Default: 300 (5 minutes).
+    ///
+    /// HTTP/3 caveat: on QUIC frontends the transport-level idle timeout
+    /// (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) also bounds an idle H3
+    /// WebSocket, so its effective idle window is `min(this value,
+    /// FERRUM_HTTP3_IDLE_TIMEOUT)`. Raise `FERRUM_HTTP3_IDLE_TIMEOUT` to honor a
+    /// longer WebSocket idle window on H3.
     pub websocket_idle_timeout_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
@@ -1468,6 +1478,18 @@ pub struct EnvConfig {
     /// non-matching IPs are rejected at the TCP level before any request processing.
     /// Example: "10.0.100.0/24,10.0.200.5,::1"
     pub admin_allowed_cidrs: String,
+
+    /// Maximum concurrent connections across all admin/management-plane
+    /// listeners (plaintext + TLS share one cap). Independent of the data-plane
+    /// `max_connections` (`FERRUM_MAX_CONNECTIONS`) so proxy traffic and
+    /// management traffic can be sized separately. Enforced after the admin CIDR
+    /// allowlist and before the TLS handshake / request parsing; over-limit
+    /// connections are dropped (TCP RST). Default: 1024. Set to 0 to disable.
+    pub admin_max_connections: usize,
+    /// Maximum concurrent admin connections per resolved source IP. Default: 0
+    /// (disabled) so a single monitoring/load-balancer source IP is not capped
+    /// by accident. When set, over-limit connections from that IP are dropped.
+    pub admin_max_connections_per_ip: usize,
 
     /// Max request body size in MiB for POST /restore (large config backups).
     /// Default: 100 MiB.
@@ -1882,7 +1904,7 @@ impl Default for EnvConfig {
             max_websocket_frame_size_bytes: 16_777_216,
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
-            websocket_idle_timeout_seconds: 0,
+            websocket_idle_timeout_seconds: 300,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -1976,6 +1998,8 @@ impl Default for EnvConfig {
             plugin_http_retry_delay_ms: 100,
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
+            admin_max_connections: 1024,
+            admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
@@ -2276,7 +2300,7 @@ impl EnvConfig {
             max_websocket_frame_size_bytes: usize = "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES" => 16_777_216usize;
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
-            websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 0u64;
+            websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -2384,6 +2408,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
+            admin_max_connections: usize = "FERRUM_ADMIN_MAX_CONNECTIONS" => 1024usize;
+            admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
@@ -2971,6 +2997,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms,
             tls_crl_file_path,
             admin_allowed_cidrs,
+            admin_max_connections,
+            admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
             migrate_action,

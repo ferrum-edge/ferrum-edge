@@ -1515,20 +1515,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 47 base columns + `created_at` + `updated_at` = 49.
+    /// 48 base columns + `created_at` + `updated_at` = 50.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 49;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 50;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `udp_max_response_amplification_factor` and `created_at`).
-    /// 49 base + 1 (api_spec_id) = 50.
+    /// 50 base + 1 (api_spec_id) = 51.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 50;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 51;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -1551,13 +1551,13 @@ impl DatabaseStore {
          pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
          pool_http3_connections_per_backend, pool_max_requests_per_connection, \
          listen_port, frontend_tls, passthrough, \
-         udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
+         udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
          upstream_subset, \
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -1659,6 +1659,7 @@ impl DatabaseStore {
             .bind(if proxy.passthrough { 1i32 } else { 0 })
             .bind(proxy.udp_idle_timeout_seconds as i64)
             .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(proxy.websocket_idle_timeout_seconds.map(|v| v as i64))
             .bind(
                 proxy
                     .allowed_methods
@@ -1734,7 +1735,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -1778,6 +1779,7 @@ impl DatabaseStore {
         .bind(if proxy.passthrough { 1i32 } else { 0 })
         .bind(proxy.udp_idle_timeout_seconds as i64)
         .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
+        .bind(proxy.websocket_idle_timeout_seconds.map(|v| v as i64))
         .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
         .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
@@ -4132,6 +4134,7 @@ impl DatabaseStore {
                 .bind(if proxy.passthrough { 1i32 } else { 0 })
                 .bind(proxy.udp_idle_timeout_seconds as i64)
                 .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
+                .bind(proxy.websocket_idle_timeout_seconds.map(|v| v as i64))
                 .bind(
                     proxy
                         .allowed_methods
@@ -5007,12 +5010,12 @@ impl DatabaseStore {
                   pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
                   pool_http3_connections_per_backend, pool_max_requests_per_connection, \
                   listen_port, frontend_tls, passthrough, \
-                  udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
+                  udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
                   api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?)"))
+                         ?, ?, ?, ?, ?, ?)"))
             .bind(&p.id)
             .bind(&p.namespace)
             .bind(&p.name)
@@ -5073,6 +5076,7 @@ impl DatabaseStore {
             .bind(if p.passthrough { 1i32 } else { 0 })
             .bind(p.udp_idle_timeout_seconds as i64)
             .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
             .bind(
                 p.allowed_methods
                     .as_ref()
@@ -5412,6 +5416,7 @@ impl DatabaseStore {
                  pool_max_requests_per_connection = ?, \
                  listen_port = ?, frontend_tls = ?, passthrough = ?, \
                  udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
+                 websocket_idle_timeout_seconds = ?, \
                  allowed_methods = ?, allowed_ws_origins = ?, \
                  udp_max_response_amplification_factor = ?, \
                  api_spec_id = ?, updated_at = ? \
@@ -5475,6 +5480,7 @@ impl DatabaseStore {
             .bind(if p.passthrough { 1i32 } else { 0 })
             .bind(p.udp_idle_timeout_seconds as i64)
             .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
             .bind(
                 p.allowed_methods
                     .as_ref()
@@ -7075,6 +7081,10 @@ fn row_to_proxy(
             .try_get::<i64, _>("tcp_idle_timeout_seconds")
             .ok()
             .map(|v| v.max(0) as u64),
+        websocket_idle_timeout_seconds: row
+            .try_get::<i64, _>("websocket_idle_timeout_seconds")
+            .ok()
+            .map(|v| v.max(0) as u64),
         allowed_methods: match row.try_get::<String, _>("allowed_methods") {
             Ok(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
@@ -7601,7 +7611,7 @@ mod proxy_insert_sql_drift_tests {
         // change there.
         let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?)";
+                                     ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();
         assert_eq!(
             placeholders,

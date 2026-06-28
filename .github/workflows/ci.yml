@@ -663,6 +663,7 @@ jobs:
               functional_ci_shard_coverage_test
           - shard: admin-routing
             filters: |
+              functional_admin_connection_limit_test
               functional_admin_observability_test
               functional_admin_operations_test
               functional_auth_acl_test
@@ -983,94 +984,148 @@ jobs:
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
 
   gateway-api-conformance:
-    name: Gateway API Conformance
+    name: Gateway API Conformance (CI mirror)
     if: github.event_name == 'pull_request'
-    needs: build-gateway-binary
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
-      KIND_VERSION: v0.27.0
-      KUBECTL_VERSION: v1.32.3
-      GATEWAY_API_VERSION: v1.5.1
-      GATEWAY_API_PROFILE: GATEWAY-HTTP
-      GATEWAY_API_SUPPORTED_FEATURES: Gateway,ReferenceGrant,HTTPRoute
+    # Backstop above the in-script poll bounds (discovery <=30 min +
+    # status <=140 min) so the graceful "Timed out" branch is reachable and
+    # the job is never force-killed at GitHub's 360-min default.
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Check for Gateway API conformance changes
-        id: changes
+      - name: Mirror dedicated Gateway API conformance result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: gateway-api-conformance.yml
+          # This CI run's own id, used to derive the floor timestamp below so we
+          # only mirror a dedicated run created for the *current* event.
+          CI_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/(ci|gateway-api-conformance)\.yml|\.github/actions/package-ferrum-runtime-image/|scripts/gateway_api_data_plane_conformance\.sh|Cargo\.(toml|lock)|Dockerfile|charts/ferrum-mesh/|proto/|src/config/env_config\.rs|src/config_sources/k8s/|src/grpc/|src/k8s_controller/|src/modes/(control_plane|data_plane|mesh)/|src/proxy/|src/router_cache\.rs|src/load_balancer\.rs|src/plugins/mesh_route_dispatch\.rs)'; then
-            echo "gateway_api_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "gateway_api_changed=false" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Gateway API Conformance"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # A reused head commit (PR close/reopen, or re-running CI without a new
+          # commit) can surface an OLDER gateway-api-conformance.yml run for this
+          # same head_sha that still matches the PR-number filter. Selecting "the
+          # most recent run for this PR" would then `break` on that stale run and
+          # mirror its old conclusion instead of the current attempt's. To make a
+          # reused-SHA stale run unselectable, floor the search by this CI run's
+          # own trigger time: both this CI run and the dedicated conformance run
+          # are launched by the *same* `pull_request` event, so the dedicated run
+          # we want has `created_at` at/after this CI run's `created_at`. A prior
+          # attempt's run for the same SHA was created on an earlier event and is
+          # always strictly older, so the floor drops it.
+          #
+          # `created_at` (event/trigger time) is shared across workflows for one
+          # event, unlike `run_started_at` (runner pickup time, which varies with
+          # queue depth). Subtract a small skew tolerance so a few seconds of
+          # per-workflow registration jitter on the *same* event never excludes
+          # the run we want; this window is far smaller than the minutes-to-hours
+          # gap to any prior attempt for the same SHA.
+          SKEW_TOLERANCE_SECONDS=120
+          ci_created_at=""
+          for _ in $(seq 1 10); do
+            ci_created_at="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
+                --jq '.created_at // empty' 2>/dev/null || true
+            )"
+            if [ -n "$ci_created_at" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$ci_created_at" ]; then
+            echo "Could not resolve this CI run's created_at to floor the conformance run search." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # GNU date on the ubuntu runner; falls back to BSD date for local use.
+          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || echo "${ci_created_at}")"
+          echo "Only mirroring dedicated runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
+
+          # Among dedicated runs for this head_sha that are at/after the floor,
+          # prefer the most recent run whose `.pull_requests[]` includes THIS PR
+          # number; only when none match (cross-fork PR runs report an empty
+          # `.pull_requests`) fall back to the most recent in-window head_sha run
+          # so forked PRs still get a result. The `created_at >= env.SINCE` floor
+          # is applied to BOTH paths so a stale same-SHA run cannot satisfy either.
+          # `gh api --jq` runs gojq, which has no `--arg` flag (that's a flag of
+          # the standalone `jq` binary, not of `gh`). Passing `--arg` makes `gh`
+          # exit non-zero with "unknown flag", and the surrounding
+          # `2>/dev/null || true` would silently swallow it, leaving `run_id`
+          # empty and failing the gate on every PR. Instead, read the values
+          # inside the program via gojq's `env` builtin: `PR_NUMBER` is exported
+          # in the step `env:` block, and `SINCE` is exported here so the jq
+          # program can reference `env.SINCE`.
+          export SINCE="${since}"
+          run_id=""
+          for _ in $(seq 1 60); do
+            # `env.PR_NUMBER` / `env.SINCE` below read process env from inside
+            # the jq program, so it is intentionally single-quoted.
+            # shellcheck disable=SC2016
+            run_id="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
+                --jq '
+                  [.workflow_runs[]]
+                  | map(select(.created_at >= env.SINCE))
+                  | sort_by(.created_at) | reverse
+                  | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
+                    // (.[0].id)
+                    // empty
+                ' 2>/dev/null || true
+            )"
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 30
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "Dedicated Gateway API conformance workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
-      - name: Set up Go
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
-        with:
-          go-version: "1.25.x"
-          cache: false
+          echo "Mirroring dedicated workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install Kubernetes tools
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          # ~280 polls * 30s ~= 140 min, comfortably under this job's
+          # timeout-minutes cap so the graceful timeout branch is reachable.
+          # The dedicated lab has a 90-min job timeout plus queue time, so a
+          # ~140-min ceiling leaves margin for it to finish and report.
+          for _ in $(seq 1 280); do
+            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
+            if [ -z "$run_json" ]; then
+              sleep 30
+              continue
+            fi
+            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
+            if [ -z "$status" ]; then
+              sleep 30
+              continue
+            fi
+            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Dedicated Gateway API conformance workflow passed." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Dedicated Gateway API conformance workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            sleep 30
+          done
 
-      - name: Download prebuilt gateway binary
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
-          path: target/debug
-
-      - name: Package Ferrum image
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: ./.github/actions/package-ferrum-runtime-image
-        with:
-          binary-path: target/debug/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE }}
-
-      - name: Set up Ferrum Gateway API lab
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh setup
-
-      - name: Run upstream Gateway API conformance
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        id: conformance
-        run: bash scripts/gateway_api_data_plane_conformance.sh upstream
-
-      - name: Run Ferrum Gateway API black-box checks
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
-
-      - name: Collect Gateway API conformance diagnostics
-        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh diagnostics
-
-      - name: Upload Gateway API conformance artifacts
-        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: gateway-api-conformance-${{ env.GATEWAY_API_VERSION }}
-          path: conformance-results/
-
-      - name: Summarize Gateway API conformance skip
-        if: steps.changes.outputs.gateway_api_changed != 'true'
-        run: |
-          echo "## Gateway API Conformance" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Skipped: this PR does not touch Gateway API, controller, data-plane, routing, chart, image, proto, script, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+          echo "Timed out after ~140 min waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
@@ -1166,8 +1221,94 @@ jobs:
       KUBECTL_VERSION: v1.32.3
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for Helm chart changes
+        id: helm_changes
+        run: |
+          set -euo pipefail
+
+          # Curated list of source paths whose changes can affect the Helm
+          # install checks below, which boot the control-plane binary and assert
+          # readiness plus secret log-redaction (a CP-boot smoke test). It runs
+          # for changes that can affect:
+          # - chart sources, dashboards, schemas, and examples under charts/
+          # - this CI workflow and local .github/actions/ image packaging
+          # - Docker/runtime packaging metadata and Cargo/proto build inputs
+          #   (Cargo.{toml,lock}, build.rs, proto/ are broad catch-alls)
+          # - build configuration that shapes the deployed binary: .cargo/
+          #   (config.toml linker/rustflags) and vendor/ (patched crates wired
+          #   in via [patch.crates-io] in Cargo.toml, compiled into ferrum-edge)
+          # - ferrum.conf plus runtime config defaults rendered into the chart
+          # - control-plane startup, admin, gRPC, xDS, DNS, TLS, identity,
+          #   Kubernetes, and secret paths exercised by the Helm install checks
+          # - Kubernetes translation sources (src/config_sources/k8s/): the CP
+          #   started by the chart runs the Kubernetes controller, which feeds
+          #   CRDs through config_sources::k8s::translate_k8s_objects(), so a
+          #   translation regression can break CP readiness in this smoke
+          # - mesh sources (src/modes/mesh/, e.g. config.rs/slice.rs/
+          #   dns_proxy.rs): the Helm examples boot the CP with
+          #   FERRUM_XDS_ENABLED=true and the CP/xDS path depends on these
+          #   modules (src/xds/server.rs reads
+          #   modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
+          #   src/xds/translator.rs and src/grpc/cp_server.rs use
+          #   modes::mesh::{config,slice}), so a mesh-source regression can
+          #   break the deployed control plane this gate validates
+          # - CP-boot startup helpers reached before /health goes ready:
+          #   src/proxy/client_ip.rs (TrustedProxies::parse_strict on the admin
+          #   CIDR allowlist), src/util/sharding.rs (pool_shard_amount feeding
+          #   DashMap shard sizing), and src/runtime_metrics.rs
+          #   (runtime_metrics::global().configure(...))
+          # - logging/redaction (src/logging/): the kind-install steps assert the
+          #   CP boot logs never emit the admin/gRPC secrets (`grep -Fq`), and
+          #   that secret-redaction assertion is UNIQUE to this job, so a
+          #   redaction regression here would otherwise silently skip the gate
+          # - crate root / module wiring (src/lib.rs) and the overload monitor
+          #   (src/overload.rs), both initialized at serving-mode startup
+          # This is a curated allowlist, not exhaustive: the broad functional and
+          # integration jobs cover most omitted paths, but the secret
+          # log-redaction assertion in the kind-install steps is specific to this
+          # job and has no overlapping coverage -- so redaction-relevant paths
+          # (e.g. src/logging/) must stay listed to keep the gate fail-safe.
+          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|\.cargo/|vendor/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/runtime_metrics\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/config_sources/k8s/|src/logging/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/modes/mesh/|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/proxy/client_ip\.rs$|src/secrets/|src/tls/|src/util/sharding\.rs$|src/xds/)'
+          # Diff captured first so a git error (e.g. a missing base ref) fails
+          # closed: it aborts the step loudly under `set -euo pipefail` rather
+          # than being swallowed by the match and silently skipping every heavy
+          # validation step, including the secret log-redaction assertions.
+          # `--no-renames` is required: with rename detection on (the default),
+          # `git diff --name-only` emits only the destination path for a rename,
+          # so moving a chart template OUT of charts/ (e.g.
+          # `git mv charts/ferrum-mesh/templates/x.yaml docs/x.yaml`) would show
+          # only the unlisted docs/ path and skip the gate even though the chart
+          # lost a template. `--no-renames` reports the rename as a delete + add,
+          # so the old charts/ path is still matched and chart-breaking moves
+          # keep the gate fail-safe.
+          # `grep -Ec` reads all input so no SIGPIPE (unlike `grep -q`, which
+          # closes the pipe on the first match and could SIGPIPE-kill the
+          # upstream `printf` with exit 141). grep's exit codes are distinct:
+          # 0 = matched, 1 = no match (normal -> changed=false), >=2 = real
+          # error (bad regex, read failure). We capture the rc instead of `||
+          # true` so a >=2 error fails the step closed rather than being
+          # misread as "no match" and silently skipping every heavy validation
+          # step, including the secret log-redaction assertions.
+          changed_files="$(git diff --no-renames --name-only "origin/${{ github.base_ref }}...HEAD")"
+          set +e
+          match_count="$(printf '%s\n' "$changed_files" | grep -Ec "$helm_change_regex")"
+          grep_rc=$?
+          set -e
+          if [ "$grep_rc" -gt 1 ]; then
+            echo "helm gate: grep failed (rc=$grep_rc)" >&2
+            exit 1
+          fi
+          if [ "${match_count:-0}" -gt 0 ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install Kubernetes tools
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
@@ -1177,6 +1318,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
       - name: Helm static validation
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
@@ -1234,18 +1376,21 @@ jobs:
           done
 
       - name: Download prebuilt gateway binary
+        if: steps.helm_changes.outputs.changed == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
 
       - name: Package Ferrum image
+        if: steps.helm_changes.outputs.changed == 'true'
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
           binary-path: target/debug/ferrum-edge
           image: ${{ env.FERRUM_IMAGE }}
 
       - name: Create kind cluster
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           chmod +x target/debug/ferrum-edge
@@ -1253,6 +1398,7 @@ jobs:
           kind load docker-image "$FERRUM_IMAGE" --name ferrum-helm
 
       - name: Default install renders no unusable control plane
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           kubectl create namespace ferrum-default
@@ -1269,6 +1415,7 @@ jobs:
           fi
 
       - name: Development values become Ready
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           kubectl create namespace ferrum-dev
@@ -1297,6 +1444,7 @@ jobs:
           fi
 
       - name: Existing Secret production-style values become Ready
+        if: steps.helm_changes.outputs.changed == 'true'
         run: |
           set -euo pipefail
           kubectl create namespace ferrum-prod
@@ -1385,7 +1533,7 @@ jobs:
           done
 
       - name: Collect Helm chart diagnostics
-        if: always()
+        if: always() && steps.helm_changes.outputs.changed == 'true'
         run: |
           set +e
           mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
@@ -1397,12 +1545,19 @@ jobs:
           done
 
       - name: Upload Helm chart diagnostics
-        if: always()
+        if: always() && steps.helm_changes.outputs.changed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ferrum-mesh-helm-chart
           path: ${{ runner.temp }}/ferrum-helm-results
           retention-days: 7
+
+      - name: Summarize Helm chart skip
+        if: steps.helm_changes.outputs.changed != 'true'
+        run: |
+          echo "## Helm Chart" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch chart sources, chart test values, CI workflow/actions, Docker or runtime image packaging, Cargo/build.rs/rust-toolchain/.cargo/vendor build inputs, proto, ferrum.conf, runtime config, control-plane startup, admin, gRPC, xDS, DNS, TLS, identity, Kubernetes controller, Kubernetes translation (src/config_sources/k8s/), mesh sources (src/modes/mesh/, consumed by the CP/xDS path), CP-boot startup helpers (client_ip CIDR parser, sharding helper, runtime metrics init), or secret surfaces." >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Tests
@@ -1480,6 +1635,76 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  detect-ebpf-live-changes:
+    name: Detect eBPF/Netns Live Changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect live-kernel-sensitive paths
+        id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
+          changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/ci.yml|\
+              .github/workflows/node-waypoint-ebpf-live.yml|\
+              .github/actions/setup-rust-ci/*|.github/actions/setup-rust-ci/**|\
+              .github/actions/setup-sccache/*|.github/actions/setup-sccache/**|\
+              .github/actions/setup-fast-linker/*|.github/actions/setup-fast-linker/**|\
+              Cargo.toml|Cargo.lock|.cargo/*|.cargo/**|rust-toolchain.toml|build.rs|proto/*|proto/**|\
+              ebpf/*|ebpf/**|\
+              src/capture/*|src/capture/**|\
+              src/ebpf/*|src/ebpf/**|\
+              src/grpc/*|src/grpc/**|\
+              src/identity/*|src/identity/**|\
+              src/k8s_controller/*|src/k8s_controller/**|\
+              src/modes/control_plane.rs|\
+              src/modes/mesh/*|src/modes/mesh/**|\
+              src/modes/node_agent.rs|src/modes/node_agent_cni_server.rs|\
+              src/plugins/mesh/*|src/plugins/mesh/**|src/plugins/prometheus_metrics.rs|\
+              src/proxy/hbone_pool.rs|src/proxy/hbone_proxy.rs|src/proxy/mesh_mtls_pool.rs|\
+              src/proxy/mesh_tcp_egress.rs|src/proxy/mesh_tcp_inbound.rs|\
+              src/proxy/mesh_udp_capture.rs|src/proxy/mesh_udp_frame.rs|src/proxy/mod.rs|\
+              src/proxy/netns_capture.rs|src/proxy/tcp_proxy.rs|src/proxy/udp_batch.rs|\
+              src/router_cache.rs|src/socket_opts.rs|\
+              tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
+              tests/*capture*|tests/*ebpf*|tests/*netns*|tests/*node_waypoint*)
+                changed=true
+                break
+                ;;
+            esac
+          done < "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+          echo "## eBPF/Netns Live Gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$changed" = "true" ]; then
+            echo "Live-kernel-sensitive files changed; CI will run the eBPF live-kernel and netns live checks." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No live-kernel-sensitive files changed; CI will skip the eBPF live-kernel and netns live checks for this PR." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The eBPF userspace compile guard still runs on every PR." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: List changed files for live gate
+        if: always()
+        run: |
+          echo "Changed files considered by the eBPF/netns live gate:"
+          cat "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
   build-ebpf:
     name: Build eBPF Programs
     if: github.event_name == 'pull_request'
@@ -1491,8 +1716,10 @@ jobs:
 
       - name: Check for eBPF changes
         id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q '^ebpf/'; then
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^ebpf/'; then
             echo "ebpf_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "ebpf_changed=false" >> "$GITHUB_OUTPUT"
@@ -1559,7 +1786,10 @@ jobs:
 
   ebpf-live:
     name: eBPF Live-Kernel Test
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # Live kernel validation is high-value for BPF/node-waypoint-sensitive
+    # changes, but it adds several minutes to every PR when run unconditionally.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1618,7 +1848,10 @@ jobs:
 
   netns-capture-live:
     name: Node-Waypoint In-Netns Capture Live Test
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # The netns tests require privileged live-kernel operations; the path gate
+    # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1673,24 +1906,69 @@ jobs:
 
   performance-regression:
     name: Performance Regression Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect performance-sensitive changes
+        id: perf_changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          run_benchmark=true
+          reason="Performance regression checks always run for ${EVENT_NAME} events."
+          changed_files=""
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            if changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null)"; then
+              run_benchmark=false
+              reason="No performance-sensitive paths changed."
+
+              if grep -Eq '^(src/|custom_plugins/|vendor/|ebpf/|tests/performance/|build\.rs$|ferrum\.conf$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
+                run_benchmark=true
+                reason="Performance-sensitive paths changed."
+              fi
+            else
+              run_benchmark=true
+              reason="Could not diff against origin/${BASE_REF}; running benchmark to be safe."
+              changed_files=""
+            fi
+          fi
+
+          if [ -n "${changed_files}" ]; then
+            printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          else
+            : > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          fi
+
+          {
+            echo "run=${run_benchmark}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
+        if: steps.perf_changes.outputs.run == 'true'
         with:
           shared-key: "ci-perf"
 
       - name: Build release binaries
+        if: steps.perf_changes.outputs.run == 'true'
         run: |
           cargo build --profile ci-release --bin ferrum-edge
           cd tests/performance && cargo build --release --bin backend_server
 
       - name: Start backend server
+        if: steps.perf_changes.outputs.run == 'true'
         run: |
           tests/performance/target/release/backend_server > /tmp/backend.log 2>&1 &
-          echo "BACKEND_PID=$!" >> $GITHUB_ENV
+          echo "BACKEND_PID=$!" >> "${GITHUB_ENV}"
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:3001/health > /dev/null 2>&1; then
               echo "Backend ready"
@@ -1705,6 +1983,7 @@ jobs:
           done
 
       - name: Start gateway
+        if: steps.perf_changes.outputs.run == 'true'
         run: |
           FERRUM_MODE=file \
           FERRUM_FILE_CONFIG_PATH="$(pwd)/tests/performance/perf_config.yaml" \
@@ -1716,7 +1995,7 @@ jobs:
           FERRUM_POOL_ENABLE_HTTP2=false \
           FERRUM_POOL_WARMUP_ENABLED=true \
           ./target/ci-release/ferrum-edge run > /tmp/gateway.log 2>&1 &
-          echo "GATEWAY_PID=$!" >> $GITHUB_ENV
+          echo "GATEWAY_PID=$!" >> "${GITHUB_ENV}"
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
               echo "Gateway ready"
@@ -1731,6 +2010,7 @@ jobs:
           done
 
       - name: Run self-relative performance test
+        if: steps.perf_changes.outputs.run == 'true'
         timeout-minutes: 5
         run: |
           mkdir -p tests/performance/ci_results
@@ -1746,13 +2026,13 @@ jobs:
             --output tests/performance/ci_results/overhead_results.json
 
       - name: Stop services
-        if: always()
+        if: always() && steps.perf_changes.outputs.run == 'true'
         run: |
-          kill $BACKEND_PID 2>/dev/null || true
-          kill $GATEWAY_PID 2>/dev/null || true
+          kill "${BACKEND_PID:-}" 2>/dev/null || true
+          kill "${GATEWAY_PID:-}" 2>/dev/null || true
 
       - name: Upload performance results
-        if: always()
+        if: always() && steps.perf_changes.outputs.run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
@@ -1761,16 +2041,41 @@ jobs:
 
       - name: Post performance summary
         if: always()
+        env:
+          RUN: ${{ steps.perf_changes.outputs.run }}
+          REASON: ${{ steps.perf_changes.outputs.reason }}
         run: |
-          echo "## Performance Regression Check" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Performance Regression Check"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${RUN}" != "true" ]; then
+            {
+              echo "Skipped expensive benchmark: ${REASON}"
+              echo ""
+              echo "Relevant paths: \`src/**\`, \`custom_plugins/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`ferrum.conf\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
+              echo ""
+              echo "Changed files:"
+              echo '```'
+              if [ -s "${RUNNER_TEMP}/performance-regression-changed-files.txt" ]; then
+                cat "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+              else
+                echo "(none)"
+              fi
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
           if [ -f tests/performance/ci_results/overhead_results.json ]; then
-            echo '```json' >> $GITHUB_STEP_SUMMARY
-            cat tests/performance/ci_results/overhead_results.json >> $GITHUB_STEP_SUMMARY
-            echo '' >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            {
+              echo '```json'
+              cat tests/performance/ci_results/overhead_results.json
+              echo ''
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
           else
-            echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
+            echo "Performance tests did not produce results." >> "${GITHUB_STEP_SUMMARY}"
           fi
 
   # ── Cross-platform builds ────────────────────────────────────────────────
@@ -1824,6 +2129,40 @@ jobs:
 
       - uses: ./.github/actions/setup-sccache
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        # Required native deps only. mold + clang are an optional fast-linker
+        # optimization, so they are intentionally NOT in this strict transaction
+        # — a transient mirror failure for those linker-only packages must not
+        # fail an otherwise-buildable binary. setup-fast-linker below installs
+        # them best-effort (continue-on-error) and clears the mold rustflags via
+        # its fallback when they are missing, degrading to the default linker.
+        run: |
+          set -euo pipefail
+
+          missing_packages=()
+          if ! command -v protoc > /dev/null 2>&1; then
+            missing_packages+=(protobuf-compiler)
+          fi
+          if ! dpkg -s libcurl4-openssl-dev > /dev/null 2>&1; then
+            missing_packages+=(libcurl4-openssl-dev)
+          fi
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            for package in gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu; do
+              if ! dpkg -s "$package" > /dev/null 2>&1; then
+                missing_packages+=("$package")
+              fi
+            done
+          fi
+
+          if [ "${#missing_packages[@]}" -eq 0 ]; then
+            echo "Required Linux build dependencies already available"
+            exit 0
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+
       - uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
@@ -1841,15 +2180,6 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}"
-
-      - name: Install protoc and build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          fi
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'

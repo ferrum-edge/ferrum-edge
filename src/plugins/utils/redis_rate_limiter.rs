@@ -335,6 +335,32 @@ pub struct RedisRateLimitClient {
     tls_ca_bundle_pem: Option<Vec<u8>>,
 }
 
+/// Pure floor-at-zero decision for [`RedisRateLimitClient::incrby_with_expire_floor_zero`].
+///
+/// Given the value observed after the primary `INCRBY`, return the compensating
+/// `INCRBY` delta needed to bring the counter back up to exactly zero, or `None`
+/// when the value is already non-negative (no compensation needed). The
+/// compensation is exactly `-new_total` so the corrective write fails only in
+/// the conservative (over-count) direction if a concurrent increment raced
+/// between our write and read — a rate limiter must never under-count usage.
+///
+/// Extracted as a free function so the floor logic is unit-testable without a
+/// live Redis server (the surrounding method is pure I/O).
+fn floor_zero_compensation(new_total: i64) -> Option<i64> {
+    if new_total >= 0 {
+        None
+    } else {
+        Some(new_total.saturating_neg())
+    }
+}
+
+/// Clamp the post-compensation total so callers never observe a negative usage,
+/// even if a concurrent decrement drove the counter back below zero between the
+/// compensating write and its read-back.
+fn clamp_floored_total(floored: i64) -> i64 {
+    floored.max(0)
+}
+
 impl RedisRateLimitClient {
     /// Create a new Redis rate limit client.
     ///
@@ -830,6 +856,70 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Increment a counter by `amount`, set expiry, and floor the result at
+    /// zero. Returns the new (floored) total, or `Err(())` if Redis is
+    /// unreachable for *either* the increment or the compensating floor write.
+    ///
+    /// A failed compensating write is reported as `Err(())` (not `Ok(0)`): the
+    /// key may be left negative on the server, and silently reporting success
+    /// would let a recovered Redis read that negative counter as zero usage and
+    /// bypass enforcement. Returning the error makes the caller fall back to the
+    /// local limiter for that operation, which is the conservative choice.
+    ///
+    /// This is the reconciliation-safe variant of [`incrby_with_expire`]. The
+    /// AI token limiter applies reconciliation deltas (`actual - reserved`)
+    /// that are usually *negative* (reserved estimates run high; non-2xx
+    /// responses release the full reservation). A raw `INCRBY` can drive a
+    /// missing or low window counter negative, and a negative counter later
+    /// reads as zero usage — letting a consumer reserve the full limit again
+    /// and bypassing centralized enforcement. The local in-memory path floors
+    /// usage at zero (`TokenUsageWindow::adjust_usage`); this keeps the Redis
+    /// path consistent.
+    ///
+    /// When the post-`INCRBY` value is negative we issue a *compensating*
+    /// `INCRBY` of exactly `-new_total` to bring the key back to zero, rather
+    /// than a blind `SET 0`. A blind `SET` would also discard any concurrent
+    /// positive increment that landed between our write and read (a worse
+    /// under-count); compensating by exactly the observed deficit only fails
+    /// in the conservative direction (a concurrent add during the race can
+    /// leave a transient over-count, which is safe for a rate limiter — it
+    /// never under-counts usage).
+    pub async fn incrby_with_expire_floor_zero(
+        &self,
+        key: &str,
+        amount: i64,
+        ttl_seconds: u64,
+    ) -> Result<i64, ()> {
+        let new_total = self.incrby_with_expire(key, amount, ttl_seconds).await?;
+        let Some(compensation) = floor_zero_compensation(new_total) else {
+            return Ok(new_total);
+        };
+
+        // Bring the counter back up to exactly zero, preserving the TTL.
+        match self
+            .incrby_with_expire(key, compensation, ttl_seconds)
+            .await
+        {
+            Ok(floored) => Ok(clamp_floored_total(floored)),
+            // The compensating write failed (Redis went away mid-operation), so
+            // the key is left *negative* on the server. Do NOT report success:
+            // a negative counter reads as zero usage once Redis recovers within
+            // the key TTL, letting a consumer re-reserve the full budget —
+            // exactly the bypass the floor exists to prevent. `incrby_with_expire`
+            // already marked the client unavailable (triggering local failover);
+            // surface the failure to the caller and log the leaked-floor state so
+            // it is observable rather than silently undercounting.
+            Err(()) => {
+                warn!(
+                    key = %key,
+                    "Redis floor compensation failed after negative INCRBY accepted; \
+                     window counter left negative until TTL — falling back to local rate limiting"
+                );
+                Err(())
+            }
+        }
+    }
+
     /// Increment one counter by 1 and another by a specific amount in a single
     /// pipelined round-trip. Returns `(new_count, new_total)`.
     pub async fn incr_and_incrby_with_expire(
@@ -1131,5 +1221,46 @@ impl std::fmt::Debug for RedisRateLimitClient {
             .field("key_prefix", &self.config.key_prefix)
             .field("available", &self.available.load(Ordering::Relaxed))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_floored_total, floor_zero_compensation};
+
+    #[test]
+    fn floor_zero_compensation_skips_non_negative_totals() {
+        // A non-negative post-INCRBY value needs no correction: the floor
+        // helper must return `None` so the wrapper keeps the value as-is.
+        assert_eq!(floor_zero_compensation(0), None);
+        assert_eq!(floor_zero_compensation(1), None);
+        assert_eq!(floor_zero_compensation(i64::MAX), None);
+    }
+
+    #[test]
+    fn floor_zero_compensation_returns_exact_deficit_for_negative_totals() {
+        // A negative value must be compensated by exactly its negation so the
+        // counter returns to zero — never a blind SET that could clobber a
+        // concurrent positive increment.
+        assert_eq!(floor_zero_compensation(-1), Some(1));
+        assert_eq!(floor_zero_compensation(-500), Some(500));
+    }
+
+    #[test]
+    fn floor_zero_compensation_saturates_at_min() {
+        // `-i64::MIN` overflows; the helper must saturate to `i64::MAX` rather
+        // than panic on overflow.
+        assert_eq!(floor_zero_compensation(i64::MIN), Some(i64::MAX));
+    }
+
+    #[test]
+    fn clamp_floored_total_floors_negatives_at_zero() {
+        // After the compensating write, a value that still reads negative (a
+        // concurrent decrement raced the read-back) must clamp to zero so
+        // callers never observe a negative usage; non-negative values pass
+        // through unchanged.
+        assert_eq!(clamp_floored_total(-7), 0);
+        assert_eq!(clamp_floored_total(0), 0);
+        assert_eq!(clamp_floored_total(42), 42);
     }
 }

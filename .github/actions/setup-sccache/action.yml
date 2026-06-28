@@ -29,6 +29,19 @@ runs:
     - name: Configure sccache
       shell: bash
       run: |
+        # Deliberate security choice: we do NOT propagate the GitHub Actions
+        # cache service env (ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN) into
+        # GITHUB_ENV to force the sccache GHA backend. On GitHub-hosted runners
+        # those vars are exposed to actions/* but not to `run:` steps, so the
+        # daemon below transparently falls back to a local-disk cache. Exporting
+        # ACTIONS_RUNTIME_TOKEN would hand the repository cache credential to
+        # every later cargo build/test step — which execute PR-controlled
+        # build.rs scripts and tests — letting an untrusted fork PR read it and
+        # hit the cache service directly. The local-disk fallback is slower than
+        # a shared GHA cache, but not leaking the token wins. (This is why the
+        # codex "enable sccache GHA backend" suggestion is intentionally not
+        # pursued here.)
+        #
         # Disable the sccache server idle timeout (default 600s). The release
         # build compiles the large `ferrum-edge` lib crate as a single rustc
         # invocation (fat LTO, codegen-units=1) that hovers right around 600s

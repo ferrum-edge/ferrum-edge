@@ -538,13 +538,19 @@ async fn start_node_agent_admin_listeners(
         env_config.admin_http_port,
         &signals,
     )?;
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
     let shutdown = shutdown_tx.subscribe();
     let handle = tokio::spawn(async move {
         info!(
             "Starting node_agent admin HTTP listener on {}",
             admin_http_addr
         );
-        if let Err(err) = admin::start_admin_listener(admin_http_addr, admin_state, shutdown).await
+        if let Err(err) =
+            admin::start_admin_listener(admin_http_addr, admin_state, shutdown, admin_conn_limiter)
+                .await
         {
             error!("Node agent admin HTTP listener error: {}", err);
         }

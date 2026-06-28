@@ -444,6 +444,38 @@ impl Plugin for AiTokenMetrics {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Do not record token usage for ANY synthetic short-circuit body. A
+        // synthetic body is a plugin-generated 2xx that never reached the
+        // upstream model (an `ai_semantic_cache`/`response_caching` hit, a
+        // `request_deduplication` replay, `response_mock`, `serverless_function`,
+        // `request_termination`, an `ai_federation` synthetic response, …). The
+        // feature funnels all of them back through `on_response_body` via the
+        // generic synthetic body-hook path, and the proxy sets
+        // `ferrum:synthetic_short_circuit` in `ctx.metadata` for the duration of
+        // that phase (see `apply_synthetic_response_body_hooks`). Without this
+        // guard a synthetic body that happens to carry a provider-shaped `usage`
+        // block — e.g. a `response_mock` returning a canned chat-completion, or a
+        // cached/replayed model response — would have its token counts and
+        // estimated cost written into `ctx.metadata`, polluting token metrics,
+        // logging sinks, and chargeback accounting with phantom usage for tokens
+        // no provider actually billed. The marker is set only on the synthetic
+        // path and never on a real backend response, so it is the correct,
+        // unspoofable exemption signal (a backend or `response_transformer`
+        // emitting a `usage` block on a genuine model response cannot satisfy
+        // it). This mirrors the sibling `ai_rate_limiter` synthetic guard
+        // (priority 4200, right after this plugin) — both must agree that a
+        // synthetic short-circuit consumed no model tokens. A FRESH backend
+        // response carries no synthetic marker and is accounted normally below.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
+            debug!(
+                "ai_token_metrics: skipping synthetic short-circuit response (no model tokens consumed)"
+            );
+            return PluginResult::Continue;
+        }
+
         // Only record token usage for successful responses. Error bodies
         // (4xx / 5xx) are typically not LLM-shaped JSON and should not
         // pollute token metrics or chargeback accounting.

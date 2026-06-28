@@ -357,6 +357,73 @@ async fn test_first_request_passes_then_replay() {
     }
 }
 
+// Marker set by the proxy on `ctx.metadata` while the response-body hooks run
+// over a synthetic 2xx plugin short-circuit body (mirrors
+// `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
+// therefore not reachable from this external test crate).
+const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+// A FRESH request that this plugin marked in-flight, then short-circuited by a
+// LATER `before_proxy` plugin (e.g. a 2xx `fault_injection` abort / synthetic AI
+// response), must NOT have its synthetic body stored under the idempotency key.
+// A subsequent request with the same key must be treated as a brand-new request
+// (Continue), not replayed from a poisoned cache entry.
+#[tokio::test]
+async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
+    let plugin = make_plugin(json!({}));
+
+    // First request acquires the in-flight marker and a dedup key.
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "key-1".to_string());
+
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx1.metadata.contains_key(DEDUP_KEY_METADATA));
+
+    // A later before_proxy plugin short-circuits with a synthetic 2xx body. The
+    // proxy marks the context before running the response-body hooks; emulate it.
+    ctx1.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Nothing was cached: no completed-response bytes are retained, and the
+    // in-flight marker was released (not left dangling until TTL).
+    assert_eq!(
+        assert_completed_size_exact(&plugin),
+        0,
+        "synthetic short-circuit body must not be stored as a completed response"
+    );
+
+    // A second request with the SAME key is treated as Fresh — it passes
+    // through to the backend rather than replaying the synthetic body.
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "key-1".to_string());
+
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "second request with same key must pass through, not replay a synthetic body; got {result:?}"
+    );
+    assert!(ctx2.metadata.contains_key(DEDUP_KEY_METADATA));
+}
+
 #[tokio::test]
 async fn test_concurrent_duplicate_returns_conflict() {
     let config = json!({});
