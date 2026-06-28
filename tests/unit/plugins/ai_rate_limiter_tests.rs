@@ -705,6 +705,17 @@ fn test_valid_limit_by_accepted() {
 }
 
 #[test]
+fn test_valid_on_unmetered_response_accepted() {
+    for value in ["reject", "charge_estimate", "warn"] {
+        AiRateLimiter::new(
+            &json!({"token_limit": 100, "on_unmetered_response": value}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|e| panic!("on_unmetered_response '{value}' should be valid: {e}"));
+    }
+}
+
+#[test]
 fn test_invalid_config_shapes_rejected() {
     for (config, needle) in [
         (json!(null), "config must be an object"),
@@ -722,6 +733,10 @@ fn test_invalid_config_shapes_rejected() {
         (
             json!({"token_limit": 100, "provider": "unknown"}),
             "provider",
+        ),
+        (
+            json!({"token_limit": 100, "on_unmetered_response": "ignore"}),
+            "on_unmetered_response",
         ),
         (
             json!({"token_limit": 100, "sync_mode": "database"}),
@@ -919,6 +934,30 @@ fn sse_headers() -> HashMap<String, String> {
     h
 }
 
+fn ai_request_ctx(max_tokens: u64, prompt: &str) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens
+        }))
+        .unwrap(),
+    );
+    ctx
+}
+
+fn reserved_tokens(ctx: &RequestContext) -> u64 {
+    ctx.metadata
+        .get("ai_ratelimit_reserved_tokens")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Read the current-window usage the limiter would charge, by issuing a
 /// follow-up `before_proxy` and reading the exposed `ai_ratelimit_usage`.
 async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
@@ -967,18 +1006,12 @@ async fn test_sse_with_usage_block_still_recorded() {
 }
 
 #[tokio::test]
-async fn test_sse_without_usage_block_not_charged() {
-    // #54: when an SSE stream is walked but carries no recognizable usage
-    // block, prompt_tokens/completion_tokens modes must NOT charge a count
-    // (previously they substituted Some(0) and recorded 0 without any
-    // operator signal; now they return None so the caller's warn fires).
-    // Either way the window must be unaffected — assert no usage is charged
-    // and the request is allowed through.
+async fn streaming_without_usage_charged_or_rejected() {
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
             "window_seconds": 60,
-            "count_mode": "prompt_tokens",
+            "count_mode": "total_tokens",
             "limit_by": "ip",
             "expose_headers": true
         }),
@@ -986,9 +1019,11 @@ async fn test_sse_without_usage_block_not_charged() {
     )
     .unwrap();
 
-    let mut ctx = create_test_context();
+    let mut ctx = ai_request_ctx(200, "hello");
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve estimated tokens");
 
     // Content-only deltas, no usage block anywhere.
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n\
@@ -1001,16 +1036,13 @@ async fn test_sse_without_usage_block_not_charged() {
 
     assert_eq!(
         observed_usage(&plugin).await,
-        0,
-        "no usage block means nothing is charged to the window"
+        reserved,
+        "default enforce behavior should keep the reservation for unmetered SSE"
     );
 }
 
 #[tokio::test]
-async fn test_unparseable_2xx_json_not_charged() {
-    // #53: a 2xx whose token count cannot be resolved (unrecognized response
-    // shape) must not panic and must not be charged; the request continues.
-    // The fail-open is now surfaced at warn-level for operators.
+async fn unmetered_2xx_is_not_free_in_enforce_mode() {
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
@@ -1022,9 +1054,11 @@ async fn test_unparseable_2xx_json_not_charged() {
     )
     .unwrap();
 
-    let mut ctx = create_test_context();
+    let mut ctx = ai_request_ctx(120, "count this prompt");
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve estimated tokens");
 
     // Valid JSON, but no usage block the extractor understands.
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
@@ -1035,9 +1069,1323 @@ async fn test_unparseable_2xx_json_not_charged() {
 
     assert_eq!(
         observed_usage(&plugin).await,
-        0,
-        "an unparseable 2xx must not advance the rate-limit window"
+        reserved,
+        "an unmetered 2xx should keep the estimated reservation by default"
     );
+}
+
+#[tokio::test]
+async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() {
+    // Codex P2: for a POST JSON request with a non-identity `Content-Encoding`,
+    // `ctx.metadata["request_body"]` still holds the COMPRESSED wire bytes at
+    // `before_proxy` time (request decompression runs later, in
+    // `transform_request_body`). Estimating against those bytes would yield a
+    // wrong/tiny pre-reservation that under-reserves the budget. The plugin must
+    // therefore SKIP the estimate-based pre-reservation for compressed requests
+    // (falling back to the no-reservation `CheckBudget` path) and rely on
+    // reconciliation to charge actual usage afterward.
+    //
+    // The two concerns below are deliberately split across SEPARATE limiter
+    // instances. `limit_by: "ip"` derives the rate key from the client IP, and
+    // every `create_test_context()` shares `127.0.0.1`, so a single instance
+    // would accumulate the control request's (unreconciled) pre-reservation onto
+    // the same key that the compressed-reconcile assertion reads back via the
+    // cumulative `observed_usage`. A fresh instance gives the 55 assertion its
+    // own zeroed counter, so it reflects ONLY the compressed request's usage.
+
+    // Control concern: an uncompressed JSON POST still reserves estimated tokens.
+    // This is asserted via the PER-REQUEST `ai_ratelimit_reserved_tokens` marker
+    // (which does not accumulate across requests), and on its own limiter so its
+    // reservation can never leak into the reconciliation assertion below.
+    let control_plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut uncompressed = ai_request_ctx(120, "count this prompt please");
+    let mut uncompressed_headers = json_headers();
+    control_plugin
+        .before_proxy(&mut uncompressed, &mut uncompressed_headers)
+        .await;
+    assert!(
+        reserved_tokens(&uncompressed) > 0,
+        "an uncompressed JSON POST should still reserve estimated tokens"
+    );
+
+    // Reconciliation concern: a FRESH limiter instance handles only the
+    // compressed request, so its in-memory counter starts at zero and the
+    // cumulative `observed_usage` reflects exactly the reconciled actual usage.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            // `observed_usage` reads `ai_ratelimit_usage` from metadata, which the
+            // limiter only writes when `expose_headers` is set (see `store_metadata`).
+            "expose_headers": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Compressed: a non-identity `Content-Encoding` on the request. `before_proxy`
+    // reads the encoding from the `headers` PARAMETER (not `ctx.headers`),
+    // matching the production phase where the handler may `mem::take` headers out
+    // of `ctx`. No body-derived pre-reservation is made.
+    let mut compressed = ai_request_ctx(120, "count this prompt please");
+    let mut compressed_headers = json_headers();
+    compressed_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let result = plugin
+        .before_proxy(&mut compressed, &mut compressed_headers)
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        reserved_tokens(&compressed),
+        0,
+        "a compressed request must NOT produce a body-derived pre-reservation"
+    );
+    assert!(
+        !compressed
+            .metadata
+            .contains_key("ai_ratelimit_reserved_tokens"),
+        "compressed request should skip pre-reservation entirely (no reserved-tokens marker)"
+    );
+
+    // Reconciliation still charges the ACTUAL provider-reported usage afterward,
+    // so the compressed request is debited correctly even without a reservation.
+    // No control traffic touched this instance's key, so cumulative usage == 55.
+    let body = openai_response(40, 15);
+    let reconcile = plugin
+        .on_response_body(&mut compressed, 200, &json_headers(), &body)
+        .await;
+    assert_continue(reconcile);
+    assert_eq!(
+        observed_usage(&plugin).await,
+        55,
+        "reconciliation should charge actual usage (40 + 15) for the compressed request"
+    );
+}
+
+#[tokio::test]
+async fn identity_content_encoding_still_pre_reserves() {
+    // `identity` (and an empty/whitespace list) is NOT compression — those
+    // requests are estimable and must keep the normal estimate-based
+    // pre-reservation. Guards against `has_non_identity_content_encoding`
+    // over-matching on the `is_empty()` / `identity` tokens.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // A single `identity` token is not compression -> still pre-reserves.
+    let mut ctx = ai_request_ctx(120, "count this prompt please");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "identity".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        reserved_tokens(&ctx) > 0,
+        "an `identity` content-encoding is not compressed and must still pre-reserve"
+    );
+
+    // An empty `Content-Encoding` value yields only empty tokens (filtered by
+    // the `!token.is_empty()` guard) -> not treated as compression.
+    let mut empty_ctx = ai_request_ctx(120, "count this prompt please");
+    let mut empty_headers = json_headers();
+    empty_headers.insert("content-encoding".to_string(), "  ,  ".to_string());
+    plugin
+        .before_proxy(&mut empty_ctx, &mut empty_headers)
+        .await;
+    assert!(
+        reserved_tokens(&empty_ctx) > 0,
+        "an empty/whitespace `Content-Encoding` list is not compression and must still pre-reserve"
+    );
+}
+
+#[tokio::test]
+async fn comma_listed_compression_encoding_skips_pre_reservation() {
+    // A comma-separated `Content-Encoding` list whose later token is a real
+    // compression codec (e.g. `identity, gzip`) MUST be treated as compressed:
+    // the body is not estimable at this phase, so pre-reservation is skipped and
+    // reconciliation backstops. Exercises the multi-token branch of
+    // `has_non_identity_content_encoding`.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "count this prompt please");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "identity, gzip".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "a comma-listed compression codec must skip the body-derived pre-reservation"
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_reserved_tokens"),
+        "comma-listed compression should skip pre-reservation entirely (no reserved-tokens marker)"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_requests_cannot_oversubscribe_budget() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 150,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx_a = ai_request_ctx(100, "first");
+    let mut ctx_b = ai_request_ctx(100, "second");
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+    assert_eq!(allowed, 1, "only one reservation should fit in the budget");
+    assert_eq!(rejected, 1, "the oversubscribing reservation should reject");
+}
+
+#[tokio::test]
+async fn federation_metadata_still_records_actual_usage() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(300, "federated prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 40);
+
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "primary".to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), "40".to_string());
+    ctx.metadata
+        .insert("ai_prompt_tokens".to_string(), "15".to_string());
+    ctx.metadata
+        .insert("ai_completion_tokens".to_string(), "25".to_string());
+
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        40,
+        "federation actual usage should reconcile the pre-request reservation"
+    );
+}
+
+// ─── Reconciliation of unmetered 2xx by on_unmetered_response mode ──────
+
+#[tokio::test]
+async fn unmetered_2xx_warn_mode_releases_reservation() {
+    // on_unmetered_response = "warn": a 2xx with no resolvable usage must
+    // RELEASE the pre-request reservation (delta = 0 - reserved) so the window
+    // returns to zero. This drives the `OnUnmeteredResponse::Warn` arm of
+    // `reconcile_usage` plus the negative-delta `adjust_usage` plugin path.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "warn",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "warn-mode prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 0, "request should reserve tokens");
+
+    // Valid JSON 2xx with no usage block the extractor understands.
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "warn mode must release the reservation for an unmetered 2xx"
+    );
+}
+
+#[tokio::test]
+async fn unmetered_2xx_reject_mode_returns_502() {
+    // on_unmetered_response = "reject": a 2xx with no resolvable usage must be
+    // rejected with 502. Drives the `OnUnmeteredResponse::Reject` arm of
+    // `reconcile_usage` and the `reject_unmetered()` builder. The reservation
+    // is intentionally KEPT (rejection means the budget stays charged until the
+    // window/TTL expires).
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "reject-mode prompt");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "reject mode keeps the reservation charged"
+    );
+}
+
+#[tokio::test]
+async fn non_ai_2xx_is_not_rejected_in_reject_mode() {
+    // Regression: `on_unmetered_response: "reject"` must NOT turn a non-AI 2xx
+    // into a 502. The plugin forces full response buffering, so `on_response_body`
+    // runs for EVERY buffered 2xx regardless of content type; without gating the
+    // policy on the AI-request marker, a GET / empty-body / non-JSON / non-LLM
+    // request on the same proxy would be rejected with a proxy-wide blast radius.
+    // `before_proxy` sets the `ai_ratelimit_request` marker only when it parsed a
+    // JSON request body and ran the estimate, so a context with no `request_body`
+    // is never marked and must fall straight through.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // No `request_body` metadata => not an AI request, no marker.
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a request with no parseable JSON body must not be marked as an AI call"
+    );
+
+    // An empty-body 200 (e.g. a 204-style success) — the very shape the blast
+    // radius would have rejected — must continue, not 502.
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), b"")
+            .await,
+    );
+
+    // A non-JSON 2xx on the same proxy must also continue.
+    let mut html_headers = HashMap::new();
+    html_headers.insert("content-type".to_string(), "text/html".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &html_headers, b"<html>ok</html>")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn completion_tokens_mode_ai_request_still_subject_to_reject_policy() {
+    // The marker — not `reserved_tokens > 0` — is the gate: `completion_tokens`
+    // mode reserves 0 for a valid AI request that omits an output cap, but it is
+    // still an AI call and must remain subject to `on_unmetered_response: reject`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // AI request body but no max_tokens => completion_tokens estimate is 0.
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "no output cap"}]
+        }))
+        .unwrap(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "completion_tokens mode with no max_* reserves nothing"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a parseable AI request body must be marked even when it reserves 0"
+    );
+
+    // An unmetered 2xx for this AI request must still be rejected per policy.
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn non_2xx_releases_pre_request_reservation() {
+    // A non-2xx response after a reservation must release the full reservation
+    // via `reconcile_usage(.., None, ..)` regardless of on_unmetered_response.
+    // Drives the non-2xx branch of `on_response_body` -> `reconcile_usage` with
+    // a real (non-zero) reservation, exercising the negative-delta release.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(150, "this prompt will 500");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 0, "request should reserve tokens");
+
+    // Backend 500 — even with a usage block present, a non-2xx releases the
+    // reservation and charges nothing.
+    let body = openai_response(500, 500);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "a non-2xx must release the reservation"
+    );
+}
+
+#[tokio::test]
+async fn actual_usage_above_reservation_charges_extra() {
+    // Reconciliation where actual > reserved must charge the positive delta so
+    // the window reflects true consumption. Exercises the `Some(actual_tokens)`
+    // arm of `reconcile_usage` with a positive `reservation_delta` flowing into
+    // the plugin's `adjust_usage`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(50, "short");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    // Actual response reports far more than the estimate.
+    let body = openai_response(400, 600); // 1000 total tokens
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        1000,
+        "actual usage above the reservation must be charged in full"
+    );
+}
+
+#[tokio::test]
+async fn gateway_rejection_releases_reservation_in_after_proxy() {
+    // When a downstream plugin rejects the request after this plugin reserved
+    // tokens, the gateway sets `ferrum:rejection_response=true`. `after_proxy`
+    // must then release the reservation via `should_release_gateway_rejection`
+    // -> `reconcile_usage(.., 500, None, "gateway_rejection")`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "gateway will reject this");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 0, "request should reserve tokens");
+
+    // Simulate a gateway-side rejection of the proxied request.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 500, &mut response_headers)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "a gateway rejection must release the reservation"
+    );
+}
+
+#[tokio::test]
+async fn response_body_plugin_reject_keeps_reservation_after_2xx_backend() {
+    // codex P2: when the backend returned a successful (2xx) response but a
+    // later response-body plugin (e.g. ai_response_guard, priority 4075 < 4200)
+    // rejects the body, `ai_rate_limiter`'s `on_response_body` is skipped and its
+    // `after_proxy` re-runs inside the rejection. The provider call DID consume
+    // tokens, so the reservation must be kept — not released as if it were a
+    // gateway rejection.
+    //
+    // We reproduce the production ordering: a genuine `after_proxy` run with the
+    // 2xx backend status (records the backend status), then the rejection re-run
+    // with `ferrum:rejection_response=true`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "guard will reject the 2xx body");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    // Genuine after_proxy run: backend served 200, no rejection marker yet.
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+
+    // A later response-body plugin rejects: the proxy sets the rejection marker
+    // and re-runs after_proxy with the rejection status.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut reject_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(&mut ctx, 403, &mut reject_headers).await);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "a 2xx backend whose body a later plugin rejected must keep the reservation charged"
+    );
+}
+
+#[tokio::test]
+async fn earlier_after_proxy_plugin_reject_keeps_reservation_after_2xx_backend() {
+    // codex P2 (newest): when a LOWER-priority after_proxy plugin rejects a 2xx
+    // backend response BEFORE `ai_rate_limiter` runs (e.g. `response_size_limiting`
+    // at 3490 < ai_rate_limiter at 4200), this plugin's *genuine* after_proxy pass
+    // never runs, so it cannot record the backend status itself. The proxy's
+    // `run_after_proxy_hooks` records the real backend status into
+    // `ai_ratelimit_backend_status` BEFORE the after_proxy loop, so the rejection
+    // re-run still sees a 2xx backend and KEEPS the reservation (tokens were
+    // consumed by the provider). This reproduces that metadata state: the genuine
+    // pass is intentionally skipped; only the proxy-recorded backend status and
+    // the rejection re-run happen.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "earlier after_proxy plugin will reject the 2xx");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    // `run_after_proxy_hooks` records the genuine backend status before the loop.
+    // (Gated in production on the reservation marker, which is present here.)
+    ctx.metadata
+        .insert("ai_ratelimit_backend_status".to_string(), "200".to_string());
+
+    // A lower-priority after_proxy plugin rejected the 2xx, so ai_rate_limiter's
+    // genuine pass is skipped and it only re-runs inside the rejection. The
+    // proxy sets the rejection marker and re-runs after_proxy with the reject
+    // status (e.g. 413 from response_size_limiting).
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut reject_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(&mut ctx, 413, &mut reject_headers).await);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "a 2xx backend that an EARLIER after_proxy plugin rejected must keep the reservation charged"
+    );
+}
+
+#[tokio::test]
+async fn reject_mode_does_not_release_on_gateway_rejection() {
+    // `should_release_gateway_rejection` must NOT fire when the configured
+    // unmetered action is `reject` (the reservation deliberately stays charged).
+    // Here we record an unmetered-action marker of "reject" and assert the
+    // after_proxy gateway-rejection branch is skipped. Covers the negative arm
+    // of `should_release_gateway_rejection`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "reject keeps the charge");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        "ai_ratelimit_unmetered_action".to_string(),
+        "reject".to_string(),
+    );
+
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 500, &mut response_headers)
+            .await,
+    );
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "reject mode must keep the reservation even on gateway rejection"
+    );
+}
+
+#[tokio::test]
+async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
+    // Regression for the Redis double-release: a non-2xx backend releases the
+    // reservation in `on_response_body`, and then a *later* response-body plugin's
+    // rejection re-runs `after_proxy` in rejection context, where
+    // `should_release_gateway_rejection` fires AGAIN for the same non-2xx backend.
+    // Both paths funnel through `reconcile_usage`, so without an idempotency marker
+    // the reservation is released twice. The local `TokenUsageWindow` self-dedups
+    // via `reservation_id` (the second release finds no matching entry → negative
+    // delta no-op), but the Redis backend has no per-entry id: it just subtracts
+    // `reserved` from the shared window, so a double-release double-subtracts and
+    // under-counts the consumer's own budget, permitting oversubscription.
+    //
+    // `reconcile_usage` now sets `ai_ratelimit_reservation_reconciled` on the first
+    // pass and short-circuits to `Continue` on any later pass, so the reservation
+    // is reconciled EXACTLY ONCE across both backends. This twin exercises the
+    // marker gate on the in-memory limiter; the assertions below would also catch
+    // the Redis double-subtract (which would drive the shared window below the
+    // single-release value).
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "non-2xx then a later plugin rejects");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "the pre-request reservation should be charged to the window"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_ratelimit_reservation_reconciled"),
+        "the reservation must not be marked reconciled before any response phase"
+    );
+
+    // Phase 1 — `on_response_body` with a non-2xx backend releases the full
+    // reservation (RELEASE #1) and marks the reservation reconciled.
+    let body = openai_response(500, 500);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        ctx.metadata
+            .contains_key("ai_ratelimit_reservation_reconciled"),
+        "the non-2xx release must mark the reservation reconciled"
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "the non-2xx response should release the reservation exactly once"
+    );
+
+    // Phase 2 — a later response-body plugin rejected, so the proxy sets the
+    // rejection marker and re-runs `after_proxy`. `should_release_gateway_rejection`
+    // would fire here (non-2xx backend, rejection, reserved > 0, not reject-mode),
+    // but the idempotency marker makes the second `reconcile_usage` a no-op
+    // (RELEASE #2 is suppressed). On Redis this is exactly the double-subtract that
+    // would otherwise corrupt the shared window.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut reject_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(&mut ctx, 500, &mut reject_headers).await);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "the reservation must be released exactly once, not twice"
+    );
+
+    // A fresh request must still see the full budget — the window was debited by
+    // exactly one reservation's worth, never below zero / under-counted (the Redis
+    // double-subtract symptom).
+    let mut next_ctx = ai_request_ctx(200, "follow-up after single release");
+    let mut next_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut next_ctx, &mut next_headers).await);
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved_tokens(&next_ctx),
+        "after a single release the window must reflect only the new reservation, \
+         proving no double-subtract drove the counter below the single-release value"
+    );
+}
+
+#[tokio::test]
+async fn federation_unmetered_reject_returns_502_from_after_proxy_in_isolation() {
+    // DOCUMENTED LIMITATION (codex P1): this asserts only the *isolated* return
+    // value of `after_proxy`. It does NOT prove the reject reaches the client on
+    // the federation path. In production `ai_federation` delivers the provider
+    // response as a `before_proxy` `RejectBinary`, so `ai_rate_limiter`'s
+    // `after_proxy` runs via the proxy's `apply_after_proxy_hooks_to_rejection`
+    // helper, which intentionally *ignores* after-proxy-on-reject `Reject`
+    // results (it is already committed to emitting a rejection response and only
+    // logs a warning). Therefore `on_unmetered_response: "reject"` is effectively
+    // a no-op for federated 2xx responses missing usage metadata — they are still
+    // returned to the client. This is called out in docs/plugins.md; honoring the
+    // reject would require restructuring the proxy rejection pipeline so an
+    // after-proxy hook can replace an in-flight rejection, which is deferred.
+    //
+    // The assertion below pins the *plugin-local* contract (reconciliation
+    // returns a 502 reject) so the policy decision itself stays covered; the
+    // production swallowing is the documented gap, not a bug in this function.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "federated, no usage");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Federation marker set, but no ai_total_tokens metadata.
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "primary".to_string());
+
+    let mut response_headers = HashMap::new();
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+// ─── Pre-request estimation by count_mode and prompt shape ──────────────
+
+#[tokio::test]
+async fn completion_count_mode_estimates_from_max_tokens_only() {
+    // With count_mode = "completion_tokens" the pre-reservation estimate comes
+    // solely from the requested completion budget (max_tokens family), not the
+    // prompt text. A large max_tokens that exceeds the limit must deny up front.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "count_mode": "completion_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Tiny prompt but a max_tokens of 500 > limit 100 → deny on reservation.
+    let mut ctx = ai_request_ctx(500, "hi");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn completion_count_mode_uses_max_output_tokens_field() {
+    // `requested_completion_tokens` takes the max across max_tokens /
+    // max_completion_tokens / max_output_tokens. A request using only
+    // max_output_tokens must still produce a non-zero reservation.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "count_mode": "completion_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "input": "anything",
+            "max_output_tokens": 250
+        }))
+        .unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        250,
+        "completion_tokens mode reserves max_output_tokens"
+    );
+}
+
+// Build a POST JSON request whose ONLY recognized prompt field is a single
+// `prompt` string, so the estimated prompt-character count is exactly the
+// string length (no `messages` key/value recursion to reason about).
+fn ai_prompt_field_ctx(prompt: &str, max_tokens: u64) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "prompt": prompt,
+            "max_tokens": max_tokens
+        }))
+        .unwrap(),
+    );
+    ctx
+}
+
+#[tokio::test]
+async fn prompt_count_mode_estimates_from_prompt_text() {
+    // With count_mode = "prompt_tokens" the estimate is derived from prompt
+    // character count (chars / 4, rounded up) from the recognized prompt
+    // fields, ignoring the max_tokens completion budget. Exercises
+    // `estimate_prompt_tokens` / `prompt_character_count` `prompt` branch.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // 40-char prompt -> ceil(40/4) = 10 prompt tokens. max_tokens is present
+    // but must be ignored in prompt_tokens mode.
+    let prompt = "0123456789012345678901234567890123456789"; // 40 chars
+    let mut ctx = ai_prompt_field_ctx(prompt, 900);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        10,
+        "prompt_tokens mode estimates from prompt chars only"
+    );
+}
+
+#[tokio::test]
+async fn total_count_mode_sums_prompt_and_completion() {
+    // Default total_tokens mode sums the prompt estimate and the requested
+    // completion budget. Covers the `_ =>` arm of
+    // `estimate_request_tokens_from_json`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // 40-char prompt -> 10 prompt tokens; max_tokens 64 completion.
+    let prompt = "0123456789012345678901234567890123456789"; // 40 chars
+    let mut ctx = ai_prompt_field_ctx(prompt, 64);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        74,
+        "total mode sums prompt (10) + completion (64)"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
+    // `prompt_character_count` accumulates across system / messages / prompt /
+    // input / contents / tools fields. Use prompt_tokens mode and a body that
+    // exercises the `system`, `prompt`, `input`, `contents`, and `tools`
+    // branches together so their character counts sum into the reservation.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // 4 chars in each of system/prompt/input/contents + 4 chars inside tools
+    // = 20 chars total -> ceil(20/4) = 5 tokens.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "system": "0123",
+            "prompt": "4567",
+            "input": "89ab",
+            "contents": "cdef",
+            "tools": [{"name": "ghij"}]
+        }))
+        .unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        5,
+        "prompt estimate must sum system+prompt+input+contents+tools chars"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
+    // When none of the recognized prompt fields are present,
+    // `prompt_character_count` falls back to counting the whole JSON body's
+    // string values (minus the max_* keys). Covers the fallback branch.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // No system/messages/prompt/input/contents/tools — only an unrelated string
+    // field. The fallback counts its 8 chars -> ceil(8/4) = 2 tokens.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({"description": "01234567"})).unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        2,
+        "estimate falls back to counting the whole body's string values"
+    );
+}
+
+#[tokio::test]
+async fn large_base64_image_does_not_falsely_deny_vision_request() {
+    // claude #1 / codex multimodal finding: a base64 image embedded in an OpenAI
+    // vision request (`image_url.url` = data URL) must NOT be counted as prompt
+    // characters. Previously a ~1 MB image (~1.37 M base64 chars ≈ 340k "tokens")
+    // would deny the request with a 429 *before* it was proxied — and a pre-proxy
+    // reject never reconciles, so the bogus estimate would never be corrected.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // ~1.4 MB of base64 payload — vastly larger than the 10k token budget if it
+    // were (wrongly) counted as text.
+    let huge_b64 = "A".repeat(1_400_000);
+    let data_url = format!("data:image/jpeg;base64,{huge_b64}");
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
+            }]
+        }))
+        .unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    // Must NOT be denied: the 1.4 MB base64 payload is excluded, so the estimate
+    // stays a tiny function of the surrounding text/marker strings — far below
+    // the 10k budget. (Asserting a bounded estimate rather than an exact count
+    // keeps the test robust to how key/value strings around the image are
+    // tallied; the point is that base64 bytes do not enter the estimate.)
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(
+        reserved > 0 && reserved < 100,
+        "base64 image bytes must be excluded; estimate was {reserved}, expected a small text-only count"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_base64_image_source_excluded_from_estimate() {
+    // Anthropic vision shape: a content part `{"type":"image","source":{"type":
+    // "base64","data":"..."}}`. The `source` subtree (and the base64 `data`)
+    // must be skipped so it can't inflate the estimate.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let huge_b64 = "Z".repeat(900_000);
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "abcd"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": huge_b64}}
+                ]
+            }]
+        }))
+        .unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(
+        reserved > 0 && reserved < 100,
+        "Anthropic base64 image source must be excluded; estimate was {reserved}"
+    );
+}
+
+#[tokio::test]
+async fn inline_data_url_in_text_field_excluded_from_estimate() {
+    // Defense-in-depth: even a `data:` URL embedded directly in a text-bearing
+    // field (not under a known binary key) must count as zero, since it is an
+    // inline binary blob rather than prose.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let data_url = format!("data:image/png;base64,{}", "Q".repeat(500_000));
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({ "prompt": data_url })).unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "a bare data: URL in a text field must not be counted as prompt characters"
+    );
+}
+
+#[tokio::test]
+async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
+    // Regression: `is_data_url` must require real RFC 2397 structure
+    // (`data:[<mediatype>][;base64],<payload>`), not merely a `data:` prefix.
+    // Ordinary prose like "data: my notes" starts with `data:` but has whitespace
+    // in (and no `,` terminating) the header, so it is prose and MUST be counted —
+    // otherwise a chat message that happens to begin with "data:" would silently
+    // drop from the estimate.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // 40-char prose prompt beginning with "data:" — counted, so the estimate is
+    // chars/4 = 10 tokens (> 0). The leading space after the colon and the
+    // absence of a header `,` disqualify it as a data URL.
+    let prose = "data: my notes about the quarterly plan!"; // 40 chars
+    assert_eq!(prose.chars().count(), 40);
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({ "prompt": prose })).unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        10,
+        "prose beginning with 'data:' must be counted as prompt characters"
+    );
+
+    // Sanity: a genuine base64 data URL of the same logical field IS excluded.
+    let data_url = format!("data:image/png;base64,{}", "Q".repeat(500_000));
+    let mut ctx2 = create_test_context();
+    ctx2.method = "POST".to_string();
+    ctx2.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx2.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({ "prompt": data_url })).unwrap(),
+    );
+    let mut headers2 = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
+    assert_eq!(
+        reserved_tokens(&ctx2),
+        0,
+        "a real data:<mediatype>;base64,<payload> URL must still be excluded"
+    );
+}
+
+#[tokio::test]
+async fn no_request_body_metadata_skips_reservation() {
+    // `estimate_request_tokens` returns 0 when there is no buffered
+    // `request_body`, so `before_proxy` falls back to the legacy CheckBudget
+    // path and records no reservation. Covers the early-return guard.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "no request_body metadata means no pre-reservation"
+    );
+}
+
+#[tokio::test]
+async fn invalid_request_body_json_skips_reservation() {
+    // A non-JSON `request_body` makes `estimate_request_tokens` return 0 (the
+    // `serde_json::from_str` failure branch), so no reservation is taken.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), "not valid json {".to_string());
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "invalid request body JSON means no pre-reservation"
+    );
+}
+
+#[tokio::test]
+async fn buffers_request_body_for_json_post_only() {
+    // `should_buffer_request_body` must be true for a JSON POST (so the body is
+    // available for estimation) and false otherwise. Covers the predicate.
+    let plugin =
+        AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default()).unwrap();
+
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.should_buffer_request_body(&ctx_with_content_type("POST", "application/json")));
+    assert!(plugin.should_buffer_request_body(&ctx_with_content_type(
+        "POST",
+        "application/json; charset=utf-8"
+    )));
+    assert!(!plugin.should_buffer_request_body(&ctx_with_content_type("GET", "application/json")));
+    assert!(!plugin.should_buffer_request_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(!plugin.should_buffer_request_body(&ctx_without_content_type("POST")));
 }
 
 // ─── Federation token recording idempotency ──────────────────────────────
