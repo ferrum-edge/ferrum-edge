@@ -36,22 +36,29 @@ const RESERVED_WINDOW_INDEX_METADATA_KEY: &str = "ai_ratelimit_reserved_window_i
 const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
 const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
 const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
-/// Idempotency marker: set the first time this request's reservation is
-/// reconciled or released, then checked at the top of `reconcile_usage` so no
-/// later phase can apply a second correction. A single request can reach
-/// `reconcile_usage` more than once across phases — e.g. a non-2xx backend
-/// releases the reservation in `on_response_body`, and a *later* response-body
-/// plugin's rejection re-runs `after_proxy` (in rejection context), where
-/// `should_release_gateway_rejection` fires again for the same non-2xx backend.
-/// In local mode the per-entry `reservation_id` already makes the second release
-/// a no-op (the entry is gone), but the Redis backend has no per-entry id — it
-/// only subtracts `reserved` from the shared window, so a double-release
-/// double-subtracts and under-counts the consumer's own window, permitting
-/// oversubscription (the exact bypass class this reservation model closes).
-/// This marker makes reconciliation idempotent across BOTH backends, mirroring
-/// the `FEDERATION_TOKENS_RECORDED_METADATA_KEY` dedup. Like that key it is a
-/// plain shared `ctx.metadata` entry (not per-instance) — a single
+/// Idempotency marker for the reservation-RELEASE paths only: set the first time
+/// this request *releases* its reservation (any `reconcile_usage` call with
+/// `actual_tokens == None`), then checked before a later release so no second
+/// release can apply. A single request can reach a release more than once across
+/// phases — e.g. a non-2xx backend releases the reservation in `on_response_body`,
+/// and a *later* response-body plugin's rejection re-runs `after_proxy` (in
+/// rejection context), where `should_release_gateway_rejection` fires again for
+/// the same non-2xx backend. In local mode the per-entry `reservation_id` already
+/// makes the second release a no-op (the entry is gone), but the Redis backend has
+/// no per-entry id — it only subtracts `reserved` from the shared window, so a
+/// double-release double-subtracts and under-counts the consumer's own window,
+/// permitting oversubscription (the exact bypass class this reservation model
+/// closes). This marker makes the *release* idempotent across BOTH backends,
+/// mirroring the `FEDERATION_TOKENS_RECORDED_METADATA_KEY` dedup. Like that key it
+/// is a plain shared `ctx.metadata` entry (not per-instance) — a single
 /// `ai_rate_limiter` instance owns the reservation lifecycle for a request.
+///
+/// Scope is deliberately narrow: the authoritative actual-token *charge* path
+/// (`reconcile_usage` with `Some(actual_tokens)`) does NOT consult or set this
+/// marker. That path runs at most once per request, and `adjust_usage` advances
+/// the sliding window's running-sum/eviction bookkeeping, so gating it would drop
+/// a legitimate usage record. The dedup is exclusively about a duplicate release,
+/// never about charging real usage or about window maintenance.
 const RESERVATION_RECONCILED_METADATA_KEY: &str = "ai_ratelimit_reservation_reconciled";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
@@ -440,34 +447,22 @@ impl AiRateLimiter {
         actual_tokens: Option<u64>,
         unmetered_detail: &str,
     ) -> PluginResult {
-        // Idempotency gate: a request can reach `reconcile_usage` more than once
-        // across phases (e.g. a non-2xx release in `on_response_body` followed by
-        // a gateway-rejection re-run of `after_proxy` for the same non-2xx
-        // backend). The first call owns the reconciliation/release; any later
-        // call must be a clean no-op so the reservation is never released twice.
-        // Without this, the Redis backend — which has no per-entry reservation id
-        // and simply subtracts `reserved` from the shared window — double-subtracts
-        // and under-counts the consumer's own budget, allowing oversubscription.
-        // (Local mode already self-dedups via `reservation_id`; this makes the
-        // guard uniform across both backends.) Set the marker before doing any
-        // window work so an unmetered `reject` (which returns a 502 rather than
-        // `Continue`) is likewise reconciled exactly once.
-        if ctx
-            .metadata
-            .contains_key(RESERVATION_RECONCILED_METADATA_KEY)
-        {
-            return PluginResult::Continue;
-        }
-        ctx.metadata.insert(
-            RESERVATION_RECONCILED_METADATA_KEY.to_string(),
-            "true".to_string(),
-        );
-
         let reserved_tokens = Self::reserved_tokens(ctx);
         let reservation_id = Self::reservation_id(ctx);
         let reserved_window_index = Self::reserved_window_index(ctx);
         let reservation_backend = Self::reservation_backend(ctx);
 
+        // The actual-token charge path (`Some(actual_tokens)`) is the authoritative
+        // reconcile and runs at most once per request in production — it is reached
+        // only from `on_response_body`'s 2xx branch (once) or the federation
+        // `after_proxy` branch (once, itself guarded by
+        // `FEDERATION_TOKENS_RECORDED_METADATA_KEY`), and the two are mutually
+        // exclusive. It must NOT consult or set the release-dedup marker below:
+        // `adjust_usage` advances the sliding window's running-sum/eviction
+        // bookkeeping (via `current_usage`), so suppressing it would silently drop a
+        // legitimate usage record and corrupt the window accounting. The release
+        // dedup is exclusively about the duplicate *release* of a reservation
+        // (`actual_tokens == None`), not about charging real usage.
         if let Some(actual_tokens) = actual_tokens {
             ctx.metadata.insert(
                 ACTUAL_TOKENS_METADATA_KEY.to_string(),
@@ -484,6 +479,33 @@ impl AiRateLimiter {
             .await;
             return PluginResult::Continue;
         }
+
+        // Idempotency gate for the reservation-RELEASE paths only (`actual_tokens
+        // == None`): a request can reach a release more than once across phases —
+        // e.g. a non-2xx release in `on_response_body` followed by a
+        // gateway-rejection re-run of `after_proxy` for the same non-2xx backend,
+        // or an unmetered `warn`/`reject` policy that also releases. The first
+        // release owns the correction; any later one must be a clean no-op so the
+        // reservation is never released twice. Without this, the Redis backend —
+        // which has no per-entry reservation id and simply subtracts `reserved`
+        // from the shared window — double-subtracts and under-counts the consumer's
+        // own budget, allowing oversubscription. (Local mode already self-dedups
+        // via `reservation_id`; this makes the guard uniform across both backends.)
+        // Set the marker before doing any window work so an unmetered `reject`
+        // (which returns a 502 rather than `Continue`) is likewise reconciled
+        // exactly once. This deliberately does NOT gate the `Some(actual_tokens)`
+        // charge path above, so independent usage records and the window-eviction
+        // maintenance they drive are never suppressed.
+        if ctx
+            .metadata
+            .contains_key(RESERVATION_RECONCILED_METADATA_KEY)
+        {
+            return PluginResult::Continue;
+        }
+        ctx.metadata.insert(
+            RESERVATION_RECONCILED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
 
         if !(200..300).contains(&response_status) {
             self.adjust_usage(
