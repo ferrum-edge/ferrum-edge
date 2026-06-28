@@ -20,10 +20,6 @@ enum ValidationStep<'a> {
         backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     },
-    AllFields {
-        cert_expiry_warning_days: u64,
-        action: ValidationAction<'a>,
-    },
     UniqueResourceIds {
         action: ValidationAction<'a>,
     },
@@ -108,18 +104,6 @@ impl<'a> ValidationPipeline<'a> {
         self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
             cert_expiry_warning_days,
             backend_allow_ips,
-            action,
-        });
-        self
-    }
-
-    pub(crate) fn validate_all_fields(
-        mut self,
-        cert_expiry_warning_days: u64,
-        action: ValidationAction<'a>,
-    ) -> Self {
-        self.steps.push(ValidationStep::AllFields {
-            cert_expiry_warning_days,
             action,
         });
         self
@@ -249,14 +233,6 @@ impl<'a> ValidationPipeline<'a> {
                         cert_expiry_warning_days,
                         backend_allow_ips,
                     ) {
-                        handle_validation_errors(action, errors, &mut collected_errors)?;
-                    }
-                }
-                ValidationStep::AllFields {
-                    cert_expiry_warning_days,
-                    action,
-                } => {
-                    if let Err(errors) = config.validate_all_fields(cert_expiry_warning_days) {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }

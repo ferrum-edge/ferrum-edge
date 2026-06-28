@@ -33,19 +33,18 @@
 //! When unset (empty), XFF headers are **ignored** and the socket IP is always
 //! used — which is the secure default for edge deployments.
 
+use crate::util::cidr::CidrSet;
 use std::net::IpAddr;
 use tracing::debug;
 
 /// A parsed set of trusted proxy CIDRs for efficient IP matching.
-#[derive(Debug, Clone)]
+///
+/// A thin wrapper over the shared [`CidrSet`](crate::util::cidr::CidrSet)
+/// primitive, so trusted-proxy matching and the backend egress allow/deny
+/// lists share one implementation and cannot drift.
+#[derive(Debug, Clone, Default)]
 pub struct TrustedProxies {
-    cidrs: Vec<CidrEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct CidrEntry {
-    network: IpAddr,
-    prefix_len: u8,
+    cidrs: CidrSet,
 }
 
 impl TrustedProxies {
@@ -54,20 +53,12 @@ impl TrustedProxies {
     /// Accepts formats like: `10.0.0.0/8`, `192.168.1.1`, `::1`, `fd00::/8`
     /// Whitespace around entries is trimmed. Invalid entries are logged and skipped.
     pub fn parse(raw: &str) -> Self {
-        let mut cidrs = Vec::new();
-        for entry in raw.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            if let Some(cidr) = Self::parse_cidr(entry) {
-                cidrs.push(cidr);
-            } else {
-                tracing::warn!(
-                    "Ignoring invalid trusted proxy entry: {:?}. Expected IP or CIDR notation.",
-                    entry
-                );
-            }
+        let (cidrs, invalid) = CidrSet::parse_lenient(raw);
+        for entry in &invalid {
+            tracing::warn!(
+                "Ignoring invalid trusted proxy entry: {:?}. Expected IP or CIDR notation.",
+                entry
+            );
         }
         if !cidrs.is_empty() {
             tracing::info!(
@@ -84,29 +75,7 @@ impl TrustedProxies {
     /// if the input is non-empty but produces zero valid CIDRs. Used for security-
     /// critical allowlists (e.g., admin API) where a typo must not silently fail open.
     pub fn parse_strict(raw: &str) -> Result<Self, String> {
-        if raw.trim().is_empty() {
-            return Ok(Self { cidrs: Vec::new() });
-        }
-        let mut cidrs = Vec::new();
-        let mut invalid = Vec::new();
-        for entry in raw.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                invalid.push("<empty>".to_string());
-                continue;
-            }
-            if let Some(cidr) = Self::parse_cidr(entry) {
-                cidrs.push(cidr);
-            } else {
-                invalid.push(entry.to_string());
-            }
-        }
-        if !invalid.is_empty() {
-            return Err(format!(
-                "Invalid CIDR/IP entries: {}. Expected formats: 10.0.0.0/8, 192.168.1.1, ::1",
-                invalid.join(", ")
-            ));
-        }
+        let cidrs = CidrSet::parse_strict(raw)?;
         if !cidrs.is_empty() {
             tracing::info!("Configured {} admin allowed CIDR(s)", cidrs.len());
         }
@@ -116,7 +85,9 @@ impl TrustedProxies {
     /// Returns an empty set (no trusted proxies — XFF headers will be ignored).
     #[allow(dead_code)] // Used by tests
     pub fn none() -> Self {
-        Self { cidrs: Vec::new() }
+        Self {
+            cidrs: CidrSet::default(),
+        }
     }
 
     /// Returns the number of configured CIDR entries.
@@ -132,102 +103,8 @@ impl TrustedProxies {
 
     /// Check whether the given IP belongs to any trusted proxy CIDR.
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        self.cidrs.iter().any(|cidr| cidr.matches(ip))
+        self.cidrs.contains(ip)
     }
-
-    fn parse_cidr(entry: &str) -> Option<CidrEntry> {
-        if let Some((ip_str, prefix_str)) = entry.split_once('/') {
-            let ip: IpAddr = ip_str.parse().ok()?;
-            let prefix_len: u8 = prefix_str.parse().ok()?;
-            let (ip, prefix_len) = canonicalize_cidr_network(ip, prefix_len)?;
-            let max_prefix = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            if prefix_len > max_prefix {
-                return None;
-            }
-            Some(CidrEntry {
-                network: ip,
-                prefix_len,
-            })
-        } else {
-            // Bare IP — treat as /32 or /128
-            let ip: IpAddr = entry.parse().ok()?;
-            let ip = canonicalize_ip(ip);
-            let prefix_len = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            Some(CidrEntry {
-                network: ip,
-                prefix_len,
-            })
-        }
-    }
-}
-
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        other => other,
-    }
-}
-
-fn canonicalize_cidr_network(ip: IpAddr, prefix_len: u8) -> Option<(IpAddr, u8)> {
-    match ip {
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                if prefix_len < 96 {
-                    return None;
-                }
-                Some((IpAddr::V4(v4), prefix_len - 96))
-            } else {
-                Some((IpAddr::V6(v6), prefix_len))
-            }
-        }
-        other => Some((other, prefix_len)),
-    }
-}
-
-impl CidrEntry {
-    fn matches(&self, ip: &IpAddr) -> bool {
-        match (&self.network, ip) {
-            (IpAddr::V4(net), IpAddr::V4(addr)) => matches_ipv4(*net, *addr, self.prefix_len),
-            (IpAddr::V4(net), IpAddr::V6(addr)) => {
-                if let Some(v4) = addr.to_ipv4_mapped() {
-                    matches_ipv4(*net, v4, self.prefix_len)
-                } else {
-                    false
-                }
-            }
-            (IpAddr::V6(net), IpAddr::V6(addr)) => matches_ipv6(*net, *addr, self.prefix_len),
-            _ => false, // v4 vs v6 mismatch
-        }
-    }
-}
-
-fn matches_ipv4(network: std::net::Ipv4Addr, addr: std::net::Ipv4Addr, prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let net_bits = u32::from(network);
-    let addr_bits = u32::from(addr);
-    let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
-    (net_bits & mask) == (addr_bits & mask)
-}
-
-fn matches_ipv6(network: std::net::Ipv6Addr, addr: std::net::Ipv6Addr, prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let net_bits = u128::from(network);
-    let addr_bits = u128::from(addr);
-    let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
-    (net_bits & mask) == (addr_bits & mask)
 }
 
 /// Resolve the real client IP from the request context.

@@ -5,18 +5,20 @@
 //! pre-computed `(network, prefix)` entries, then answers `contains()` with
 //! integer bit-masking — no per-call allocation or string work.
 //!
-//! IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are canonicalised to their
-//! embedded IPv4 form on both the rule and the query side, so a `10.0.0.0/8`
-//! rule matches a `::ffff:10.0.0.1` query and vice-versa. This mirrors the
-//! canonicalisation the proxy already applies elsewhere (`is_private_ip`,
-//! `client_ip`), so a dual-stack socket that surfaces a mapped address cannot
-//! slip past a v4 allow/deny rule.
+//! IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) match the equivalent IPv4
+//! rule: rule networks are canonicalised to their embedded v4 form at parse
+//! time, and a mapped *query* is compared against a v4 rule as its embedded v4
+//! address. So a dual-stack socket that surfaces a mapped address cannot slip
+//! past a v4 allow/deny rule. A mapped query is NOT folded into v6 rules — a
+//! `::/0` rule still matches it (it is textually IPv6), but a v4 rule matches
+//! it by its embedded address. This preserves the long-standing
+//! `client_ip::TrustedProxies` matching behaviour.
 //!
-//! NOTE: `proxy::client_ip::TrustedProxies` predates this module and carries
-//! its own equivalent matcher for the X-Forwarded-For hot path. The two are
-//! intentionally not yet unified — consolidating them would touch the
-//! trusted-proxy spoofing path, which is out of scope for the egress-policy
-//! change that introduced this module. See the follow-up note in the PR.
+//! This is the single CIDR-matching primitive in the gateway:
+//! `proxy::client_ip::TrustedProxies` (X-Forwarded-For trusted-proxy matching)
+//! is a thin wrapper over [`CidrSet`], and the backend egress policy
+//! (`BackendEgressPolicy`) uses it for its allow/deny lists — so allow/deny
+//! and trusted-proxy matching cannot drift.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -43,14 +45,44 @@ impl CidrSet {
     /// Accepted forms: `10.0.0.0/8`, `192.168.1.1` (bare IP → `/32`),
     /// `::1` (bare IP → `/128`), `fc00::/7`, `::ffff:10.0.0.0/104`.
     pub fn parse_strict(raw: &str) -> Result<Self, String> {
+        // A wholly empty / whitespace-only list is a valid "no entries"
+        // configuration. A list that contains a comma but an empty segment
+        // (e.g. a trailing or doubled comma) is a typo and is rejected below.
         if raw.trim().is_empty() {
             return Ok(Self::default());
         }
+        let (entries, invalid) = Self::parse_entries(raw, true);
+        if !invalid.is_empty() {
+            return Err(format!(
+                "Invalid CIDR/IP entries: {}. Expected formats: 10.0.0.0/8, 192.168.1.1, ::1, fc00::/7",
+                invalid.join(", ")
+            ));
+        }
+        Ok(Self { entries })
+    }
+
+    /// Parse like [`Self::parse_strict`] but skip invalid entries (including
+    /// empty comma segments) instead of failing, returning the parsed set plus
+    /// the list of rejected non-empty entry strings so the caller can decide
+    /// how to surface them (e.g. log a warning per entry). Used by lenient
+    /// callers like the trusted-proxy list.
+    pub fn parse_lenient(raw: &str) -> (Self, Vec<String>) {
+        let (entries, invalid) = Self::parse_entries(raw, false);
+        (Self { entries }, invalid)
+    }
+
+    /// Shared entry parser: returns `(valid entries, invalid entry strings)`.
+    /// When `reject_empty` is set, an empty comma segment is reported as the
+    /// `<empty>` marker (strict mode); otherwise it is silently skipped.
+    fn parse_entries(raw: &str, reject_empty: bool) -> (Vec<CidrEntry>, Vec<String>) {
         let mut entries = Vec::new();
         let mut invalid = Vec::new();
         for entry in raw.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
+                if reject_empty {
+                    invalid.push("<empty>".to_string());
+                }
                 continue;
             }
             match Self::parse_entry(entry) {
@@ -58,13 +90,7 @@ impl CidrSet {
                 None => invalid.push(entry.to_string()),
             }
         }
-        if !invalid.is_empty() {
-            return Err(format!(
-                "invalid CIDR/IP entries: {}. Expected formats: 10.0.0.0/8, 192.168.1.1, ::1, fc00::/7",
-                invalid.join(", ")
-            ));
-        }
-        Ok(Self { entries })
+        (entries, invalid)
     }
 
     /// Returns true if no entries are configured.
@@ -79,8 +105,7 @@ impl CidrSet {
 
     /// Whether `ip` falls within any configured CIDR.
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        let ip = canonicalize_ip(*ip);
-        self.entries.iter().any(|entry| entry.matches(&ip))
+        self.entries.iter().any(|entry| entry.matches(ip))
     }
 
     fn parse_entry(entry: &str) -> Option<CidrEntry> {
@@ -173,10 +198,16 @@ impl CidrEntry {
     fn matches(&self, ip: &IpAddr) -> bool {
         match (&self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => matches_ipv4(*net, *addr, self.prefix_len),
+            // An IPv4-mapped IPv6 query (`::ffff:a.b.c.d`) is compared against a
+            // v4 rule as its embedded v4 address — a dual-stack socket that
+            // surfaces a mapped address still matches the v4 rule.
+            (IpAddr::V4(net), IpAddr::V6(addr)) => match addr.to_ipv4_mapped() {
+                Some(v4) => matches_ipv4(*net, v4, self.prefix_len),
+                None => false,
+            },
             (IpAddr::V6(net), IpAddr::V6(addr)) => matches_ipv6(*net, *addr, self.prefix_len),
-            // Mixed families never match: both sides are already canonicalised,
-            // so a real v4 address is never compared against a v6 rule.
-            _ => false,
+            // A real v4 query never matches a v6 rule.
+            (IpAddr::V6(_), IpAddr::V4(_)) => false,
         }
     }
 }
@@ -206,10 +237,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_is_empty_set() {
+    fn empty_or_whitespace_input_is_empty_set() {
         assert!(CidrSet::parse_strict("").expect("empty ok").is_empty());
         assert!(CidrSet::parse_strict("   ").expect("ws ok").is_empty());
-        assert!(CidrSet::parse_strict(" , ,").expect("commas ok").is_empty());
+    }
+
+    #[test]
+    fn parse_strict_rejects_empty_comma_segments() {
+        // A stray/trailing comma is a typo in a security list — fail loud
+        // rather than silently parse a partial list (matches the admin
+        // trusted-proxy allowlist semantics).
+        let err = CidrSet::parse_strict("10.0.0.0/8,").unwrap_err();
+        assert!(err.contains("<empty>"), "got: {err}");
+        assert!(CidrSet::parse_strict(",").is_err());
+        assert!(CidrSet::parse_strict("10.0.0.0/8, ,192.168.0.0/24").is_err());
+    }
+
+    #[test]
+    fn parse_lenient_skips_empty_and_reports_only_bad_entries() {
+        let (set, invalid) = CidrSet::parse_lenient("10.0.0.0/8, , bogus, 192.168.0.0/24");
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&ip("10.1.2.3")));
+        assert!(set.contains(&ip("192.168.0.9")));
+        assert_eq!(invalid, vec!["bogus".to_string()]);
     }
 
     #[test]
