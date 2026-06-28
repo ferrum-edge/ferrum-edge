@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
@@ -330,24 +330,53 @@ impl AiRequestGuard {
             action.to_string(),
         );
 
+        // `missing_buffered_body` is an internal plugin-runner inconsistency
+        // (the body should always have been buffered before this hook), not a
+        // client-controllable input. Always surface it at `error!` so a real
+        // plumbing regression cannot hide — even when compatibility mode lets
+        // the request pass through. All other reasons are attacker-influenceable
+        // 400s, so they log at `debug!` to avoid a log-flood / cost amplification
+        // vector.
+        let is_internal_inconsistency = reason == "missing_buffered_body";
+
         if !self.fail_on_uninspectable_body {
+            if is_internal_inconsistency {
+                error!(
+                    reason,
+                    action,
+                    status_code,
+                    details = %details,
+                    "ai_request_guard: internal inconsistency - uninspectable request body allowed by compatibility mode"
+                );
+            } else {
+                debug!(
+                    reason,
+                    action,
+                    status_code,
+                    details = %details,
+                    "ai_request_guard: uninspectable request body allowed by compatibility mode"
+                );
+            }
+            return PluginResult::Continue;
+        }
+
+        if is_internal_inconsistency {
+            error!(
+                reason,
+                action,
+                status_code,
+                details = %details,
+                "ai_request_guard: rejecting uninspectable request body due to internal inconsistency"
+            );
+        } else {
             debug!(
                 reason,
                 action,
                 status_code,
                 details = %details,
-                "ai_request_guard: uninspectable request body allowed by compatibility mode"
+                "ai_request_guard: rejecting uninspectable request body"
             );
-            return PluginResult::Continue;
         }
-
-        warn!(
-            reason,
-            action,
-            status_code,
-            details = %details,
-            "ai_request_guard: rejecting uninspectable request body"
-        );
         let client_details = match reason {
             "empty_body" => "JSON request body is empty",
             "non_utf8_body" => "JSON request body is not valid UTF-8",

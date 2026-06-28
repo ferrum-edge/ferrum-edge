@@ -721,6 +721,94 @@ async fn compatibility_mode_allows_backend_to_handle_malformed_json() {
     );
 }
 
+#[tokio::test]
+async fn compatibility_mode_allows_empty_buffered_body() {
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4"],
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), String::new());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "0".to_string());
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"empty_body".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"allow".to_string())
+    );
+}
+
+#[tokio::test]
+async fn compatibility_mode_allows_non_utf8_buffered_body() {
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4"],
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Body was buffered (size recorded) but no UTF-8 `request_body` is present.
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "12".to_string());
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"non_utf8_body".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"allow".to_string())
+    );
+}
+
+#[tokio::test]
+async fn compatibility_mode_allows_missing_buffered_body() {
+    let plugin = AiRequestGuard::new(&json!({
+        "allowed_models": ["gpt-4"],
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Neither `request_body` nor `request_body_size_bytes` is present: this is
+    // the internal plugin-runner inconsistency path. Compatibility mode still
+    // passes the request through (the error is logged at `error!`).
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_reason"),
+        Some(&"missing_buffered_body".to_string())
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action"),
+        Some(&"allow".to_string())
+    );
+}
+
 // ─── Required metadata fields ───────────────────────────────────────────
 
 #[tokio::test]
