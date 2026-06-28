@@ -188,6 +188,24 @@ pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_r
 /// released as though it were a gateway rejection.
 pub(crate) const BACKEND_STATUS_METADATA_KEY: &str = "ai_ratelimit_backend_status";
 
+/// The token estimate `ai_rate_limiter` reserved for this request in its
+/// `before_proxy` pass. Set only when a body-derived pre-reservation was taken
+/// (non-zero estimate). `run_after_proxy_hooks` reads this to decide whether to
+/// record `BACKEND_STATUS_METADATA_KEY`, and the plugin reads it back during
+/// reconciliation. Shared here (rather than as a private copy in the plugin) so
+/// the proxy-side writer/reader and the plugin-side writer/reader cannot drift.
+pub(crate) const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
+
+/// Marker set by `ai_rate_limiter::before_proxy` whenever it identified the
+/// request as an AI call (a parseable JSON request body it ran the token
+/// estimate over), regardless of whether a non-zero reservation was taken —
+/// `count_mode: "completion_tokens"` legitimately reserves 0 for AI requests
+/// with no output cap. The plugin gates its `on_unmetered_response` policy on
+/// this marker so a non-AI 2xx (GET, empty-body 200/204, non-JSON, etc.) on a
+/// shared proxy is never rejected/charged by that policy. Distinct from
+/// `RESERVED_TOKENS_METADATA_KEY` (which is absent for 0-reservation AI calls).
+pub(crate) const AI_REQUEST_METADATA_KEY: &str = "ai_ratelimit_request";
+
 /// Transient marker set while running `after_proxy` hooks when a later hook may
 /// add `Cache-Control: no-transform`. Compression reads this before committing
 /// `Content-Encoding`, then `run_after_proxy_hooks` clears it before returning.
@@ -11378,12 +11396,12 @@ pub(crate) async fn run_after_proxy_hooks(
     // reservation charged in that case.
     //
     // Gated on the presence of an `ai_rate_limiter` token reservation
-    // ("ai_ratelimit_reserved_tokens", set in its `before_proxy`) so this does
+    // (`RESERVED_TOKENS_METADATA_KEY`, set in its `before_proxy`) so this does
     // not add a metadata entry — and thus a transaction-log field — to every
     // request on non-AI proxies. When no reservation exists the keep/release
     // decision is moot anyway (`should_release_gateway_rejection` requires a
     // non-zero reservation), so the status is only useful when the marker is set.
-    if ctx.metadata.contains_key("ai_ratelimit_reserved_tokens") {
+    if ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
         ctx.metadata.insert(
             BACKEND_STATUS_METADATA_KEY.to_string(),
             response_status.to_string(),

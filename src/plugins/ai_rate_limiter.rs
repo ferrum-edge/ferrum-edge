@@ -17,12 +17,15 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
 /// by this plugin's own genuine `after_proxy` pass — both write the same value.
-/// Reusing the `crate::proxy` constant (instead of a local copy) keeps the
-/// writer and reader from drifting apart. See `should_release_gateway_rejection`.
-use crate::proxy::BACKEND_STATUS_METADATA_KEY;
+/// Reusing the `crate::proxy` constants (instead of local copies) keeps the
+/// proxy-side and plugin-side writers/readers from drifting apart. See
+/// `should_release_gateway_rejection` (`BACKEND_STATUS_METADATA_KEY`) and the
+/// AI-request gate on the unmetered-response policy (`AI_REQUEST_METADATA_KEY`).
+use crate::proxy::{
+    AI_REQUEST_METADATA_KEY, BACKEND_STATUS_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY,
+};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
-const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
 /// Carried back to the reconciliation op so a negative correction debits the
@@ -279,6 +282,20 @@ impl AiRateLimiter {
             .unwrap_or(0)
     }
 
+    /// Whether `before_proxy` identified this request as an AI call (it ran the
+    /// token estimate over a parseable JSON request body). This is the gate for
+    /// the `on_unmetered_response` policy: without it, that policy would apply to
+    /// EVERY buffered 2xx (the plugin forces full response buffering, and
+    /// `on_response_body` runs for all buffered responses regardless of content
+    /// type), so under `reject` a GET, a 204/empty-body 200, a non-JSON 2xx, or a
+    /// non-LLM JSON 2xx on the same proxy would be turned into a 502. The marker —
+    /// not `reserved_tokens > 0` — is the correct signal: `completion_tokens` mode
+    /// legitimately reserves 0 for valid AI requests with no output cap, so those
+    /// must still be subject to the unmetered policy.
+    fn request_was_ai_call(ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(AI_REQUEST_METADATA_KEY)
+    }
+
     fn reservation_id(ctx: &RequestContext) -> Option<u64> {
         ctx.metadata
             .get(RESERVATION_ID_METADATA_KEY)
@@ -340,15 +357,22 @@ impl AiRateLimiter {
         delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 
-    fn estimate_request_tokens(&self, ctx: &RequestContext) -> u64 {
+    /// Estimate the tokens to pre-reserve for this request and report whether it
+    /// looked like an AI call at all. The returned `bool` is `true` exactly when
+    /// the buffered `request_body` parsed as JSON (the precondition for any token
+    /// estimate); the estimate itself may still be 0 for a parseable AI request
+    /// (e.g. `completion_tokens` mode with no `max_*` cap), which is why callers
+    /// must track the AI-request signal separately from `reserved_tokens > 0`.
+    /// Parses the body exactly once.
+    fn estimate_request_tokens(&self, ctx: &RequestContext) -> (bool, u64) {
         let Some(body) = ctx.metadata.get("request_body") else {
-            return 0;
+            return (false, 0);
         };
         let Ok(json) = serde_json::from_str::<Value>(body) else {
-            return 0;
+            return (false, 0);
         };
 
-        self.estimate_request_tokens_from_json(&json)
+        (true, self.estimate_request_tokens_from_json(&json))
     }
 
     fn estimate_request_tokens_from_json(&self, json: &Value) -> u64 {
@@ -395,6 +419,21 @@ impl AiRateLimiter {
                 Self::reservation_delta(0, reserved_tokens),
             )
             .await;
+            return PluginResult::Continue;
+        }
+
+        // The `on_unmetered_response` policy (charge_estimate / warn / reject)
+        // only applies when `before_proxy` identified this as an AI request.
+        // `on_response_body` calls this for EVERY buffered 2xx (the plugin forces
+        // full response buffering), so without this gate a `reject`-mode limiter
+        // would turn a GET, a 204/empty-body 200, a non-JSON 2xx, or a non-LLM
+        // JSON 2xx on the same proxy into a 502 — a proxy-wide blast radius. Gate
+        // on the AI-request marker, NOT `reserved_tokens > 0`: `completion_tokens`
+        // mode reserves 0 for valid AI calls with no output cap, and those must
+        // still be subject to the policy. A non-AI response is left untouched
+        // (no reject, no charge); any reservation it somehow carries is 0, so the
+        // skipped `adjust_usage` is a no-op anyway.
+        if !Self::request_was_ai_call(ctx) {
             return PluginResult::Continue;
         }
 
@@ -704,12 +743,40 @@ fn string_value_character_count(value: &Value) -> u64 {
     }
 }
 
+/// Maximum length of the header portion (`[<mediatype>][;base64]`) of a `data:`
+/// URL we will scan for the mandatory `,` separator. RFC 2397 mediatypes plus
+/// parameters are short; this bounds the prose check so an arbitrarily long
+/// string that merely starts with `data:` is not scanned end-to-end.
+const DATA_URL_MAX_HEADER_LEN: usize = 256;
+
 /// Whether a string is an inline `data:` URL carrying a (typically base64)
-/// binary payload. Case-insensitive on the `data:` scheme per RFC 2397.
+/// binary payload, per RFC 2397: `data:[<mediatype>][;base64],<payload>`.
+///
+/// Requiring the structural `,` separator (and rejecting whitespace/control
+/// chars in the header) avoids treating ordinary prose that merely begins with
+/// `data:` — e.g. `"data: my notes"` — as a 0-char binary blob. A real data URL
+/// has the comma and a whitespace-free header; the prose case has neither.
+/// Case-insensitive on the `data:` scheme; allocation-light (byte scan only).
 fn is_data_url(value: &str) -> bool {
-    value
+    let Some(rest) = value
         .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+        .filter(|prefix| prefix.eq_ignore_ascii_case("data:"))
+        .and_then(|_| value.get(5..))
+    else {
+        return false;
+    };
+
+    // The header (between `data:` and the first `,`) is a mediatype + optional
+    // parameters: ASCII tokens with no whitespace or control characters. Scan up
+    // to a bounded length for the `,`; bail on the first disqualifying byte.
+    for &byte in rest.as_bytes().iter().take(DATA_URL_MAX_HEADER_LEN) {
+        match byte {
+            b',' => return true,
+            b if b.is_ascii_whitespace() || b.is_ascii_control() => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -824,8 +891,12 @@ impl Plugin for AiRateLimiter {
         // the handler `mem::take`s headers out of `ctx.headers` for this phase.
         // See limitation #4 below and docs/plugins.md (compressed requests are
         // reconciled-only, not pre-reserved). Mirrors `ai_request_guard` (#1919).
-        let reserved_tokens = if has_non_identity_content_encoding(headers) {
-            0
+        let (is_ai_request, reserved_tokens) = if has_non_identity_content_encoding(headers) {
+            // Compressed body: not parseable here, so we cannot positively
+            // identify it as an AI call. Leave the marker unset — the request is
+            // reconcile-only and thus exempt from the `on_unmetered_response`
+            // policy, the safe direction (never a false 502).
+            (false, 0)
         } else {
             self.estimate_request_tokens(ctx)
         };
@@ -908,6 +979,16 @@ impl Plugin for AiRateLimiter {
                 "AI token rate limit exceeded"
             );
             return self.reject(usage);
+        }
+
+        // Mark this as an AI request whenever `before_proxy` parsed a JSON body
+        // and ran the token estimate over it — independent of `reserved_tokens`
+        // (`completion_tokens` mode reserves 0 for AI calls with no output cap).
+        // `reconcile_usage` gates its `on_unmetered_response` policy on this
+        // marker so a non-AI 2xx on a shared proxy is never rejected/charged.
+        if is_ai_request {
+            ctx.metadata
+                .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
         }
 
         if reserved_tokens > 0 {

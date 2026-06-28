@@ -1377,6 +1377,104 @@ async fn unmetered_2xx_reject_mode_returns_502() {
 }
 
 #[tokio::test]
+async fn non_ai_2xx_is_not_rejected_in_reject_mode() {
+    // Regression: `on_unmetered_response: "reject"` must NOT turn a non-AI 2xx
+    // into a 502. The plugin forces full response buffering, so `on_response_body`
+    // runs for EVERY buffered 2xx regardless of content type; without gating the
+    // policy on the AI-request marker, a GET / empty-body / non-JSON / non-LLM
+    // request on the same proxy would be rejected with a proxy-wide blast radius.
+    // `before_proxy` sets the `ai_ratelimit_request` marker only when it parsed a
+    // JSON request body and ran the estimate, so a context with no `request_body`
+    // is never marked and must fall straight through.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // No `request_body` metadata => not an AI request, no marker.
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a request with no parseable JSON body must not be marked as an AI call"
+    );
+
+    // An empty-body 200 (e.g. a 204-style success) — the very shape the blast
+    // radius would have rejected — must continue, not 502.
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), b"")
+            .await,
+    );
+
+    // A non-JSON 2xx on the same proxy must also continue.
+    let mut html_headers = HashMap::new();
+    html_headers.insert("content-type".to_string(), "text/html".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &html_headers, b"<html>ok</html>")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn completion_tokens_mode_ai_request_still_subject_to_reject_policy() {
+    // The marker — not `reserved_tokens > 0` — is the gate: `completion_tokens`
+    // mode reserves 0 for a valid AI request that omits an output cap, but it is
+    // still an AI call and must remain subject to `on_unmetered_response: reject`.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // AI request body but no max_tokens => completion_tokens estimate is 0.
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "no output cap"}]
+        }))
+        .unwrap(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "completion_tokens mode with no max_* reserves nothing"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a parseable AI request body must be marked even when it reserves 0"
+    );
+
+    // An unmetered 2xx for this AI request must still be rejected per policy.
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
 async fn non_2xx_releases_pre_request_reservation() {
     // A non-2xx response after a reservation must release the full reservation
     // via `reconcile_usage(.., None, ..)` regardless of on_unmetered_response.
@@ -2047,6 +2145,68 @@ async fn inline_data_url_in_text_field_excluded_from_estimate() {
         reserved_tokens(&ctx),
         0,
         "a bare data: URL in a text field must not be counted as prompt characters"
+    );
+}
+
+#[tokio::test]
+async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
+    // Regression: `is_data_url` must require real RFC 2397 structure
+    // (`data:[<mediatype>][;base64],<payload>`), not merely a `data:` prefix.
+    // Ordinary prose like "data: my notes" starts with `data:` but has whitespace
+    // in (and no `,` terminating) the header, so it is prose and MUST be counted —
+    // otherwise a chat message that happens to begin with "data:" would silently
+    // drop from the estimate.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // 40-char prose prompt beginning with "data:" — counted, so the estimate is
+    // chars/4 = 10 tokens (> 0). The leading space after the colon and the
+    // absence of a header `,` disqualify it as a data URL.
+    let prose = "data: my notes about the quarterly plan!"; // 40 chars
+    assert_eq!(prose.chars().count(), 40);
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({ "prompt": prose })).unwrap(),
+    );
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        10,
+        "prose beginning with 'data:' must be counted as prompt characters"
+    );
+
+    // Sanity: a genuine base64 data URL of the same logical field IS excluded.
+    let data_url = format!("data:image/png;base64,{}", "Q".repeat(500_000));
+    let mut ctx2 = create_test_context();
+    ctx2.method = "POST".to_string();
+    ctx2.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx2.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({ "prompt": data_url })).unwrap(),
+    );
+    let mut headers2 = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
+    assert_eq!(
+        reserved_tokens(&ctx2),
+        0,
+        "a real data:<mediatype>;base64,<payload> URL must still be excluded"
     );
 }
 
