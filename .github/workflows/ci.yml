@@ -1144,7 +1144,15 @@ jobs:
           # - control-plane startup, admin, gRPC, xDS, DNS, TLS, identity,
           #   Kubernetes, and secret paths exercised by the Helm install checks
           helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/(main|startup|cli)\.rs$|src/config/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/secrets/|src/tls/|src/xds/)'
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq "$helm_change_regex"; then
+          # Capture the diff first so a git failure (e.g. a missing base ref)
+          # aborts the step loudly under `set -euo pipefail` (fail-closed) rather
+          # than being swallowed by the `if` and silently skipping every heavy
+          # validation step, including the secret log-redaction assertions.
+          # `grep -q` is avoided here because it closes the pipe early on the
+          # first match and SIGPIPE-kills the upstream `git diff` (exit 141),
+          # which would also land in the fail-open `else`.
+          changed_files="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")"
+          if printf '%s\n' "$changed_files" | grep -Eq "$helm_change_regex"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
