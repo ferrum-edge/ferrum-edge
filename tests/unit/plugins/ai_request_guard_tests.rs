@@ -430,6 +430,65 @@ async fn default_max_tokens_uses_provider_native_containers_when_detected() {
 }
 
 #[tokio::test]
+async fn default_max_tokens_injects_into_target_field_despite_cross_provider_token() {
+    // Regression: the default-injection presence check is provider-aware. A
+    // Gemini- or TGI-native body that carries a stray OpenAI-style top-level
+    // `max_tokens` (which those backends ignore) must still receive the default
+    // cap in the field the backend actually honors -- not have injection
+    // suppressed by the ignored cross-provider field.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+
+    // Gemini-native (routes to generationConfig.maxOutputTokens). The stray
+    // top-level `max_tokens` is ignored by Gemini, so it must not suppress the
+    // default landing in the real field.
+    let gemini = serde_json::to_vec(&json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "max_tokens": 9999
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&gemini, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(
+        modified["generationConfig"]["maxOutputTokens"], 256,
+        "Gemini default cap must be injected even when a stray top-level max_tokens is present"
+    );
+
+    // TGI / HuggingFace (routes to max_new_tokens). Same reasoning.
+    let tgi = serde_json::to_vec(&json!({
+        "inputs": "hello",
+        "max_tokens": 9999
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&tgi, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(
+        modified["max_new_tokens"], 256,
+        "TGI default cap must be injected even when a stray top-level max_tokens is present"
+    );
+
+    // OpenAI behavior is preserved: for a top-level-target body, `max_tokens`
+    // IS the real cap, so injection is correctly suppressed.
+    let openai = serde_json::to_vec(&json!({
+        "model": "gpt-4",
+        "messages": [],
+        "max_tokens": 100
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&openai, Some("application/json"), &HashMap::new())
+        .await;
+    assert!(
+        result.is_none(),
+        "OpenAI bodies that already set the real top-level max_tokens must not be modified"
+    );
+}
+
+#[tokio::test]
 async fn default_max_tokens_routes_tgi_bodies_to_max_new_tokens() {
     // TGI / HuggingFace text-generation bodies cap output via `max_new_tokens`;
     // injecting a top-level `max_tokens` (which the backend ignores) would

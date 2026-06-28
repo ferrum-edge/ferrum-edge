@@ -483,19 +483,32 @@ fn update_max_token(current: &mut Option<u64>, candidate: Option<u64>) {
     }
 }
 
-fn has_any_max_token_field(json: &Value) -> bool {
-    TOP_LEVEL_TOKEN_FIELDS
-        .iter()
-        .any(|field| json.get(field).is_some())
-        || json
+/// Whether the request already caps output tokens for the *specific* provider
+/// that `default_max_tokens` would be injected into.
+///
+/// This is deliberately provider-aware rather than schema-agnostic. A previous
+/// `has_any_max_token_field` check treated any token-looking top-level field as
+/// an existing cap, so a Gemini- or TGI-native body carrying a stray OpenAI
+/// `max_tokens` (which those backends ignore) suppressed injection into the
+/// real field (`generationConfig.maxOutputTokens` / `max_new_tokens`), silently
+/// dropping the documented default cap. We only treat the *target* provider's
+/// own output-token field as an existing cap so injection still lands in the
+/// field the backend actually honors.
+fn target_already_caps_output(json: &Value, target: DefaultTokenTarget) -> bool {
+    match target {
+        DefaultTokenTarget::Gemini => json
             .get("generationConfig")
-            .is_some_and(|v| v.get("maxOutputTokens").is_some())
-        || json
+            .is_some_and(|v| v.get("maxOutputTokens").is_some()),
+        DefaultTokenTarget::Bedrock => json
             .get("inferenceConfig")
-            .is_some_and(|v| v.get("maxTokens").is_some())
-        || json
-            .get("textGenerationConfig")
-            .is_some_and(|v| v.get("maxTokenCount").is_some())
+            .is_some_and(|v| v.get("maxTokens").is_some()),
+        DefaultTokenTarget::TextGeneration => json.get("max_new_tokens").is_some(),
+        // OpenAI Chat Completions honors both the legacy `max_tokens` and the
+        // newer `max_completion_tokens`; either is the real cap for this target.
+        DefaultTokenTarget::TopLevel => {
+            json.get("max_tokens").is_some() || json.get("max_completion_tokens").is_some()
+        }
+    }
 }
 
 fn clamp_max_token_fields(json: &mut Value, limit: u64) -> bool {
@@ -567,10 +580,14 @@ fn default_token_target(json: &Value) -> DefaultTokenTarget {
 }
 
 fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
-    if has_any_max_token_field(json) {
+    let target = default_token_target(json);
+    // Provider-aware: only suppress injection when the *target* provider already
+    // caps output tokens. A token-looking field for a different provider that the
+    // target backend ignores must not block the default from landing in the real
+    // field.
+    if target_already_caps_output(json, target) {
         return false;
     }
-    let target = default_token_target(json);
     let Some(obj) = json.as_object_mut() else {
         return false;
     };
