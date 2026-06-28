@@ -289,17 +289,17 @@ impl AiRequestGuard {
         }
 
         // Message count
-        if let Some(max_msgs) = self.max_messages
-            && count_message_entries(json) > max_msgs
-        {
+        if let Some(max_msgs) = self.max_messages {
             let count = count_message_entries(json);
-            return Err((
-                "Too many messages".to_string(),
-                format!(
-                    "Request contains {} messages, maximum allowed is {}",
-                    count, max_msgs
-                ),
-            ));
+            if count > max_msgs {
+                return Err((
+                    "Too many messages".to_string(),
+                    format!(
+                        "Request contains {} messages, maximum allowed is {}",
+                        count, max_msgs
+                    ),
+                ));
+            }
         }
 
         // Prompt character limit
@@ -373,6 +373,7 @@ fn schema_matches(json: &Value, supported_schema: SupportedSchema) -> bool {
             looks_like_chat_completions(json)
                 || looks_like_responses(json)
                 || looks_like_provider_native(json)
+                || looks_like_legacy_completions(json)
         }
     }
 }
@@ -420,6 +421,16 @@ fn looks_like_provider_native(json: &Value) -> bool {
         // Anthropic Messages and Cohere v2 can be indistinguishable from
         // OpenAI-style chat when they carry only a `messages` array.
         || json.get("messages").and_then(Value::as_array).is_some()
+}
+
+/// Recognizes legacy text-completion and text-generation bodies that carry a
+/// single prompt string instead of a message array: OpenAI legacy completions
+/// (`{"model", "prompt"}`) and TGI/HuggingFace text-generation
+/// (`{"inputs", "max_new_tokens"}`). `prompt` is in `TOP_LEVEL_PROMPT_FIELDS`
+/// and `max_new_tokens`/`max_tokens_to_sample` are honored as token fields, so
+/// strict mode must admit these shapes rather than reject them as unsupported.
+fn looks_like_legacy_completions(json: &Value) -> bool {
+    json.get("prompt").is_some() || json.get("inputs").is_some()
 }
 
 fn max_requested_tokens(json: &Value) -> Option<u64> {
@@ -505,6 +516,16 @@ enum DefaultTokenTarget {
     Bedrock,
 }
 
+/// Picks the container that `default_max_tokens` is injected into.
+///
+/// Routing is driven by provider-native marker containers that are already
+/// present on the body. A Bedrock Converse body is only recognized when it
+/// already carries `inferenceConfig`; a body that omits it — or an Amazon Titan
+/// body (`textGenerationConfig.maxTokenCount`) — falls through to `TopLevel` and
+/// receives a top-level `max_tokens` those providers ignore. A bare,
+/// messages-only Bedrock body is wire-indistinguishable from OpenAI, so this is
+/// inherent: we do not provider-sniff. This limitation is documented in the
+/// schema-coverage matrix in docs/plugins.md.
 fn default_token_target(json: &Value) -> DefaultTokenTarget {
     if json.get("generationConfig").is_some()
         || json.get("contents").is_some()
@@ -679,6 +700,12 @@ fn is_typed_non_text_content_part(obj: &serde_json::Map<String, Value>) -> bool 
         && !obj.contains_key("message")
 }
 
+/// Counts text in tool/function definitions. Only string *values* are counted,
+/// mirroring `count_text_value`: JSON-Schema boilerplate keys (`type`,
+/// `properties`, `description`, `parameters`, `enum`, ...) describe the tool's
+/// structure rather than model-visible prompt text, so counting them would
+/// inconsistently inflate `max_prompt_characters` and push otherwise small
+/// requests over the limit.
 fn count_tool_definition_text(value: Option<&Value>, total: &mut u64) {
     match value {
         Some(Value::String(text)) => add_chars(total, text),
@@ -688,8 +715,7 @@ fn count_tool_definition_text(value: Option<&Value>, total: &mut u64) {
             }
         }
         Some(Value::Object(obj)) => {
-            for (key, value) in obj {
-                add_chars(total, key);
+            for value in obj.values() {
                 count_tool_definition_text(Some(value), total);
             }
         }
@@ -764,25 +790,34 @@ fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bo
         .any(|(key, value)| !value.is_null() && aliases.contains(key.to_lowercase().as_str()))
 }
 
+/// Checks whether any entry of a message/content array carries a system-prompt
+/// role. In every supported schema (OpenAI `messages[]`, Responses `input[]`,
+/// Gemini `contents[]`, Cohere `chat_history[]`) the role lives at the top of
+/// each array item (`role` for OpenAI/Anthropic/Cohere, `author` for some
+/// provider shapes), so we inspect only the item level. Recursing into arbitrary
+/// nested values would flag any user-supplied data that happens to contain a
+/// `role`/`author` key (e.g. an embedded transcript under `metadata`),
+/// producing false-positive system-prompt blocks.
 fn value_has_system_role(value: Option<&Value>, aliases: &HashSet<String>) -> bool {
-    match value {
-        Some(Value::Array(items)) => items
-            .iter()
-            .any(|item| value_has_system_role(Some(item), aliases)),
-        Some(Value::Object(obj)) => {
-            obj.get("role")
-                .and_then(Value::as_str)
-                .is_some_and(|role| is_system_prompt_role(role, aliases))
-                || obj
-                    .get("author")
-                    .and_then(Value::as_str)
-                    .is_some_and(|role| is_system_prompt_role(role, aliases))
-                || obj
-                    .values()
-                    .any(|child| value_has_system_role(Some(child), aliases))
-        }
-        _ => false,
-    }
+    let Some(Value::Array(items)) = value else {
+        return false;
+    };
+    items
+        .iter()
+        .any(|item| array_item_has_system_role(item, aliases))
+}
+
+fn array_item_has_system_role(item: &Value, aliases: &HashSet<String>) -> bool {
+    let Value::Object(obj) = item else {
+        return false;
+    };
+    obj.get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| is_system_prompt_role(role, aliases))
+        || obj
+            .get("author")
+            .and_then(Value::as_str)
+            .is_some_and(|role| is_system_prompt_role(role, aliases))
 }
 
 fn is_system_prompt_role(role: &str, aliases: &HashSet<String>) -> bool {
