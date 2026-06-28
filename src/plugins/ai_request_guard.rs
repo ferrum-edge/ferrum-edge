@@ -1288,19 +1288,19 @@ fn azure_data_source_items(json: &Value) -> impl Iterator<Item = &Value> {
         .flatten()
 }
 
-/// The per-data-source instruction string under `parameters.role_information`
-/// (GA) or `parameters.roleInformation` (original extensions API). Both spellings
-/// are checked for a string value — again without short-circuiting on a present
-/// but non-string first key — so `{role_information: null, roleInformation: "…"}`
-/// can't hide an instruction. `None` when neither is a string. A single string
-/// accessor keeps the `block_system_prompts` and `max_prompt_characters`
-/// inspections in agreement on what they look at.
-fn azure_role_information(source: &Value) -> Option<&str> {
-    let parameters = source.get("parameters")?;
-    parameters
-        .get("role_information")
-        .and_then(Value::as_str)
-        .or_else(|| parameters.get("roleInformation").and_then(Value::as_str))
+/// Every per-data-source instruction string under `parameters.role_information`
+/// (GA) and `parameters.roleInformation` (original extensions API). BOTH inner
+/// keys are yielded — like [`azure_data_source_items`] does for the outer keys —
+/// rather than short-circuiting on the first present one: `as_str` of an empty
+/// string is `Some("")` (not `None`), so an `or_else` chain would let
+/// `{role_information: "", roleInformation: "<jailbreak>"}` hide the populated
+/// camelCase value from both `block_system_prompts` and `max_prompt_characters`.
+/// Keeping a single accessor also keeps those two inspections in agreement.
+fn azure_role_information_values(source: &Value) -> impl Iterator<Item = &str> {
+    let parameters = source.get("parameters");
+    ["role_information", "roleInformation"]
+        .into_iter()
+        .filter_map(move |key| parameters.and_then(|p| p.get(key)).and_then(Value::as_str))
 }
 
 /// Counts the model-visible instruction text under Azure "On Your Data"
@@ -1311,7 +1311,7 @@ fn azure_role_information(source: &Value) -> Option<&str> {
 /// text, so counting them would inconsistently inflate `max_prompt_characters`.
 fn count_data_source_role_information(json: &Value, total: &mut u64) {
     for source in azure_data_source_items(json) {
-        if let Some(role_information) = azure_role_information(source) {
+        for role_information in azure_role_information_values(source) {
             add_chars(total, role_information);
         }
     }
@@ -1346,7 +1346,7 @@ fn contains_system_prompt(json: &Value, aliases: &HashSet<String>) -> bool {
 /// nested field (both casings) to avoid flagging arbitrary user-supplied text.
 fn data_sources_have_role_information(json: &Value) -> bool {
     azure_data_source_items(json)
-        .any(|source| azure_role_information(source).is_some_and(|ri| !ri.is_empty()))
+        .any(|source| azure_role_information_values(source).any(|ri| !ri.is_empty()))
 }
 
 fn object_has_system_prompt_field(json: &Value, aliases: &HashSet<String>) -> bool {
