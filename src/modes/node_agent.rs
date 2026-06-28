@@ -489,7 +489,7 @@ async fn start_node_agent_admin_listeners(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
     let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
+        crate::admin::MetricsAuthPolicy::from_env(env_config).map_err(|e| anyhow::anyhow!(e))?,
     );
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,

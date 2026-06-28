@@ -9390,7 +9390,7 @@ fn start_mesh_admin_listeners(
             .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
     );
     let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(&env_config)
+        crate::admin::MetricsAuthPolicy::from_env(env_config)
             .map_err(|err| anyhow::anyhow!(err))?,
     );
     let jwt_manager = match create_jwt_manager_from_env() {
