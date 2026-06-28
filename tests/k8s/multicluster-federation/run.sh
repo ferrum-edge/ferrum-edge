@@ -911,6 +911,11 @@ drive_request_expect_failclosed() {
       ttot=0
       body=""
       for _ in $(seq 1 20); do
+        # Truncate any prior response body FIRST: on a connection reset/refused
+        # curl writes "000" to -w but does NOT rewrite -o /tmp/body, so a stale
+        # "svc-b" from the earlier positive request could otherwise leak into the
+        # body read and false-fail a correctly fail-closed probe.
+        : >/tmp/body 2>/dev/null || true
         resp="$(curl -s -m 10 -o /tmp/body -w "%{http_code} %{time_total}" \
           -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null)"
         [ -z "$resp" ] && resp="000 0"
@@ -924,7 +929,7 @@ drive_request_expect_failclosed() {
         sleep 2
       done
       printf "%s\t%s\t%s\n" "$out" "$ttot" "$body"
-    ' sh "$host" 2>/dev/null || printf '000\t0\t'
+    ' sh "$host" 2>/dev/null || printf 'EXECFAIL\t0\t'
 }
 
 # Re-render `context`'s dest mesh config (optionally WITHOUT the federated peer
@@ -957,12 +962,14 @@ inject_trust_revocation() {
   ttot="${rest%%$'\t'*}"
   body="${rest#*$'\t'}"
   log "A -> B after revocation: status=$status time=${ttot}s body=$body"
-  if [[ "$status" != "200" && "$body" != *"svc-b"* ]]; then
+  # PASS only if the probe ACTUALLY RAN (status != EXECFAIL) and never served:
+  # a kubectl-exec failure must not masquerade as destination fail-closed.
+  if [[ "$status" != "200" && "$status" != "EXECFAIL" && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.federation.bundle_revoked_rejected pass \
       client svc "revoked-peer-trust-fails-closed-over-window status=$status time=${ttot}s body=$body"
   else
     record_live_assertion multicluster.federation.bundle_revoked_rejected fail \
-      client svc "still-served-after-revocation status=$status time=${ttot}s body=$body"
+      client svc "served-or-probe-did-not-run status=$status time=${ttot}s body=$body"
   fi
 
   log "STAGE 3: restoring cluster-A trust on cluster-B dest; expect A -> B recovers"
@@ -995,15 +1002,16 @@ inject_endpoint_blackhole() {
   ttot="${rest%%$'\t'*}"
   body="${rest#*$'\t'}"
   log "A -> B with dest down: status=$status time=${ttot}s body=$body"
-  # Fail-fast proof: the client must return a REAL upstream error (a 5xx from the
-  # client sidecar — its gateway backend is gone), NOT 000 (which means curl hit
-  # its own -m, i.e. the request HUNG) and NOT 200. A 000 hang fails this claim.
-  if [[ "$status" != "200" && "$status" != "000" && "$body" != *"svc-b"* ]]; then
+  # Fail-fast proof: the client must return a real UPSTREAM error — a 5xx from the
+  # client sidecar because its gateway backend is gone. Strictly 5xx (not merely
+  # "non-200/non-000"): a fast 4xx/route-or-policy regression, a `000` curl-timeout
+  # hang, or an EXECFAIL must NOT satisfy the black-hole gate.
+  if [[ "$status" =~ ^5[0-9][0-9]$ && "$body" != *"svc-b"* ]]; then
     record_live_assertion multicluster.eastwest.endpoint_blackhole_when_dest_down pass \
-      client svc "dest-down-real-error-not-hang status=$status time=${ttot}s body=$body"
+      client svc "dest-down-upstream-5xx status=$status time=${ttot}s body=$body"
   else
     record_live_assertion multicluster.eastwest.endpoint_blackhole_when_dest_down fail \
-      client svc "not-fast-fail-or-served status=$status time=${ttot}s body=$body"
+      client svc "not-upstream-5xx-or-served status=$status time=${ttot}s body=$body"
   fi
 
   log "STAGE 3: scaling cluster-B svc back up + re-rendering gateway; expect recovery"
