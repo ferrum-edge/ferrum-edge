@@ -983,7 +983,7 @@ jobs:
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
 
   gateway-api-conformance:
-    name: Gateway API Conformance
+    name: Gateway API Conformance (CI mirror)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # Backstop above the in-script poll bounds (discovery <=30 min +
