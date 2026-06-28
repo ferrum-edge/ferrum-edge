@@ -14632,6 +14632,13 @@ components:
               default_model:
                 type: string
                 description: Model to send to the provider when no mapping matches.
+              multimodal_mode:
+                type: string
+                enum:
+                  - reject
+                  - translate
+                  - text_only_with_warning
+                description: "How this provider handles OpenAI Chat Completions content parts that are not text. Translated providers default to reject; OpenAI-compatible providers and Cohere default to translate. text_only_with_warning intentionally drops non-text parts and records ai_federation_multimodal_* metadata."
               connect_timeout_seconds:
                 type: integer
                 default: 5

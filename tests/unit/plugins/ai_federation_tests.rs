@@ -7,6 +7,8 @@ use ferrum_edge::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
 // Config validation tests
@@ -106,6 +108,18 @@ fn test_invalid_config_shapes_rejected() {
         json!({"providers": [valid_provider.clone()], "fallback_on_network_errors": "false"}),
         json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": "429"}),
         json!({"providers": [valid_provider.clone()], "fallback_on_status_codes": [429, "500"]}),
+        json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "multimodal_mode": true
+        }]}),
+        json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test-key",
+            "multimodal_mode": "drop_images"
+        }]}),
     ] {
         let result = ai_federation::AiFederation::new(&config, create_test_http_client());
         assert!(result.is_err(), "config should be rejected: {config:?}");
@@ -1565,6 +1579,226 @@ fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
+}
+
+fn multimodal_image_request(model: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]
+        }]
+    })
+}
+
+async fn mount_gemini_success(server: &MockServer) {
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "It is a test image."}],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 19
+            },
+            "modelVersion": "gemini-2.0-flash"
+        })))
+        .mount(server)
+        .await;
+}
+
+fn gemini_plugin(
+    server: &MockServer,
+    multimodal_mode: Option<&str>,
+) -> ai_federation::AiFederation {
+    let mut provider = json!({
+        "name": "gemini",
+        "provider_type": "google_gemini",
+        "api_key": "gemini-test",
+        "model_patterns": ["gemini-*"],
+        "base_url": server.uri(),
+        "allow_plaintext": true
+    });
+    if let Some(mode) = multimodal_mode {
+        provider["multimodal_mode"] = Value::String(mode.to_string());
+    }
+    let config = json!({ "providers": [provider] });
+    ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap()
+}
+
+async fn first_received_json(server: &MockServer) -> Value {
+    for _ in 0..20 {
+        if let Some(requests) = server.received_requests().await
+            && let Some(request) = requests.first()
+        {
+            return request.body_json().expect("provider request body is JSON");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("mock provider did not receive request");
+}
+
+async fn assert_no_provider_requests(server: &MockServer) {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "provider should not have received a request"
+    );
+}
+
+#[tokio::test]
+async fn translated_provider_rejects_image_url_by_default() {
+    let server = MockServer::start().await;
+    let plugin = gemini_plugin(&server, None);
+    let body = multimodal_image_request("gemini-2.0-flash");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "ai_federation_error");
+            let message = parsed["error"]["message"].as_str().unwrap();
+            assert!(message.contains("image_url"), "got: {message}");
+            assert!(message.contains("reject"), "got: {message}");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_federation_multimodal_dropped_parts")
+    );
+    assert_no_provider_requests(&server).await;
+}
+
+#[tokio::test]
+async fn gemini_multimodal_translation_preserves_image_when_supported() {
+    let server = MockServer::start().await;
+    mount_gemini_success(&server).await;
+    let plugin = gemini_plugin(&server, Some("translate"));
+    let body = multimodal_image_request("gemini-2.0-flash");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected provider response, got {other:?}"),
+    }
+
+    let outbound = first_received_json(&server).await;
+    let parts = outbound["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts[0]["text"], "What is in this image?");
+    assert_eq!(parts[1]["fileData"]["fileUri"], "https://example.com/a.png");
+    assert_eq!(parts[1]["fileData"]["mimeType"], "image/png");
+}
+
+#[tokio::test]
+async fn text_only_with_warning_sets_metadata() {
+    let server = MockServer::start().await;
+    mount_gemini_success(&server).await;
+    let plugin = gemini_plugin(&server, Some("text_only_with_warning"));
+    let body = multimodal_image_request("gemini-2.0-flash");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected provider response, got {other:?}"),
+    }
+
+    let outbound = first_received_json(&server).await;
+    let parts = outbound["contents"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["text"], "What is in this image?");
+    assert!(parts[0].get("fileData").is_none());
+
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_mode"),
+        Some(&"text_only_with_warning".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_dropped_parts"),
+        Some(&"1".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_dropped_types"),
+        Some(&"image_url".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_multimodal_dropped_roles"),
+        Some(&"user".to_string())
+    );
+}
+
+#[tokio::test]
+async fn system_developer_multimodal_non_text_is_not_silently_discarded() {
+    let server = MockServer::start().await;
+    let config = json!({
+        "providers": [{
+            "name": "anthropic",
+            "provider_type": "anthropic",
+            "api_key": "sk-ant-test",
+            "model_patterns": ["claude-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true,
+            "multimodal_mode": "translate"
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "System text"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/system.png"}}
+                ]
+            },
+            {
+                "role": "developer",
+                "content": [
+                    {"type": "text", "text": "Developer text"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/dev.png"}}
+                ]
+            },
+            {"role": "user", "content": "Hi"}
+        ]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            let message = parsed["error"]["message"].as_str().unwrap();
+            assert!(message.contains("system"), "got: {message}");
+            assert!(message.contains("developer"), "got: {message}");
+            assert!(message.contains("image_url"), "got: {message}");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+
+    assert_no_provider_requests(&server).await;
 }
 
 #[tokio::test]

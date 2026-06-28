@@ -3309,11 +3309,32 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 **Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched.
 
+**Multimodal content is explicit.** OpenAI Chat Completions content arrays may contain text plus non-text parts such as `image_url`. Provider configs accept `multimodal_mode`:
+
+| Mode | Behavior |
+|---|---|
+| `reject` | Reject matched requests containing non-text content parts with HTTP `400`. |
+| `translate` | Preserve supported non-text parts by converting them to the provider-native request format. Unsupported parts are rejected with HTTP `400`. |
+| `text_only_with_warning` | Intentionally drop non-text parts, send only text, log a warning, and set `ai_federation_multimodal_*` metadata. |
+
+Translated providers default to `reject` unless configured otherwise. OpenAI-compatible providers and Cohere default to `translate` because their outbound request shape preserves OpenAI-style content parts instead of flattening them.
+
 **Priority:** 2985
 
 **Supported providers:**
 - **OpenAI-compatible** (send OpenAI format directly): OpenAI, Mistral, xAI (Grok), DeepSeek, Meta Llama, Hugging Face, Azure OpenAI
 - **Requires translation**: Anthropic (Messages API), Google Gemini, Google Vertex AI (OAuth2), AWS Bedrock (Converse API, SigV4), Cohere v2
+
+**Multimodal support matrix:**
+
+| Provider type | Default mode | `translate` support |
+|---|---|---|
+| `openai`, `azure_openai`, `mistral`, `xai`, `deepseek`, `meta_llama`, `hugging_face` | `translate` | Sends OpenAI content parts unchanged; provider/model decides whether each part is supported. |
+| `cohere` | `translate` | Preserves OpenAI-style content parts in the Cohere v2 Chat request; provider/model decides whether each part is supported. |
+| `anthropic` | `reject` | Converts user/assistant `image_url` parts to Anthropic image blocks: HTTP(S) URLs use URL sources and data URLs use base64 sources. Non-text system/developer parts are rejected. |
+| `google_gemini` | `reject` | Converts user/assistant `image_url` parts to Gemini `fileData` for HTTP(S) URLs and `inlineData` for data URLs. Non-text system/developer parts are rejected. |
+| `google_vertex` | `reject` | Same Gemini `generateContent` request shape as `google_gemini`. Non-text system/developer parts are rejected. |
+| `aws_bedrock` | `reject` | Converts user/assistant data URL `image_url` parts to Bedrock Converse image blocks. HTTP(S) image URLs are rejected because Converse requires image bytes. Non-text system/developer parts are rejected. |
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3333,6 +3354,7 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
 | `model_mapping` | Object | `{}` | Map client model names to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
+| `multimodal_mode` | String | Provider-specific | One of `reject`, `translate`, `text_only_with_warning`; controls handling of non-text OpenAI content parts |
 | `connect_timeout_seconds` | Integer | `5` | Per-provider TCP + TLS handshake timeout for outbound provider calls |
 | `read_timeout_seconds` | Integer | `60` | Overall per-request deadline for outbound provider calls |
 | `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
@@ -3384,7 +3406,7 @@ plugins:
 - `ai_federation` (2985) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
-**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility.
+**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
