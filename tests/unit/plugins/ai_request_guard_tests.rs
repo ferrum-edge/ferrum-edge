@@ -984,8 +984,7 @@ async fn gzip_encoded_body_deferred_in_before_proxy() {
         "before_proxy defers compressed bodies; the uninspectable decision is made in on_final_request_body"
     );
     assert_eq!(
-        ctx.metadata
-            .get("ai_request_guard.deferred_compressed_body"),
+        ctx.metadata.get(plugin.deferred_compressed_marker_key()),
         Some(&"true".to_string()),
         "before_proxy must mark the compressed body for deferred inspection"
     );
@@ -1008,8 +1007,7 @@ async fn brotli_encoded_body_deferred_in_before_proxy() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
-        ctx.metadata
-            .get("ai_request_guard.deferred_compressed_body"),
+        ctx.metadata.get(plugin.deferred_compressed_marker_key()),
         Some(&"true".to_string())
     );
 }
@@ -1026,7 +1024,7 @@ async fn compressed_body_still_encoded_fails_closed_in_final_hook() {
     ctx.method = "POST".to_string();
     // before_proxy already ran and marked the deferral.
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     // Final backend headers still carry the encoding (no compression plugin
@@ -1069,7 +1067,7 @@ async fn compressed_body_still_encoded_passes_in_compatibility_mode() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1101,7 +1099,7 @@ async fn decompressed_body_validated_and_rejected_in_final_hook() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     // compression's before_proxy stripped Content-Encoding; transform_request_body
@@ -1129,7 +1127,7 @@ async fn decompressed_allowed_body_continues_in_final_hook() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1172,7 +1170,7 @@ async fn final_hook_empty_decompressed_body_fails_closed() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1254,7 +1252,7 @@ async fn final_hook_non_json_content_type_skips_after_deferral() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     // Content-type is no longer JSON (relabeled), so the guard skips inspection.
@@ -1273,7 +1271,7 @@ async fn final_hook_non_json_content_type_skips_after_deferral() {
     // The deferred marker must have been consumed by the hook.
     assert!(
         !ctx.metadata
-            .contains_key("ai_request_guard.deferred_compressed_body")
+            .contains_key(plugin.deferred_compressed_marker_key())
     );
 }
 
@@ -1286,7 +1284,7 @@ async fn final_hook_framed_grpc_content_type_skips_after_deferral() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1316,7 +1314,7 @@ async fn final_hook_malformed_decompressed_body_fails_closed() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1363,7 +1361,7 @@ async fn final_hook_malformed_decompressed_body_passes_in_compatibility_mode() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1404,8 +1402,7 @@ async fn comma_separated_content_encoding_with_compression_deferred() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
-        ctx.metadata
-            .get("ai_request_guard.deferred_compressed_body"),
+        ctx.metadata.get(plugin.deferred_compressed_marker_key()),
         Some(&"true".to_string()),
         "a comma-separated encoding list containing gzip must defer"
     );
@@ -1424,7 +1421,7 @@ async fn comma_separated_content_encoding_still_encoded_fails_closed_in_final_ho
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        "ai_request_guard.deferred_compressed_body".to_string(),
+        plugin.deferred_compressed_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -1462,8 +1459,110 @@ async fn all_identity_content_encoding_list_is_inspected() {
     assert_reject(result, Some(400));
     assert!(
         !ctx.metadata
-            .contains_key("ai_request_guard.deferred_compressed_body"),
+            .contains_key(plugin.deferred_compressed_marker_key()),
         "an all-identity encoding list must not defer"
+    );
+}
+
+// ─── Multi-instance deferral markers are instance-specific ───────────────
+
+/// Two `ai_request_guard` instances configured differently on the same proxy
+/// must use DISTINCT deferral marker keys, and `before_proxy` on a compressed
+/// body must leave both markers set on the shared `ctx` — neither instance may
+/// clobber or consume the other's marker.
+#[tokio::test]
+async fn two_instances_use_distinct_deferral_markers() {
+    let guard_a = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let guard_b = AiRequestGuard::new(&json!({"allowed_models": ["claude"]})).unwrap();
+    assert_ne!(
+        guard_a.deferred_compressed_marker_key(),
+        guard_b.deferred_compressed_marker_key(),
+        "co-located instances must have distinct deferral marker keys"
+    );
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "42".to_string());
+
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    // Both instances run before_proxy on the SAME ctx (the plugin chain order).
+    assert_continue(guard_a.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(guard_b.before_proxy(&mut ctx, &mut headers).await);
+
+    // Both markers must be present simultaneously — each deferred its own.
+    assert_eq!(
+        ctx.metadata.get(guard_a.deferred_compressed_marker_key()),
+        Some(&"true".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get(guard_b.deferred_compressed_marker_key()),
+        Some(&"true".to_string())
+    );
+}
+
+/// REGRESSION (instance-specific markers): with two instances on the same proxy,
+/// the first instance's `on_final_request_body` must NOT cause the second to skip
+/// inspection. The decompressed body passes instance A's policy (so A Continues
+/// and clears A's marker), but violates instance B's policy. B must still find
+/// its own marker and reject — proving B's compressed-body policy is not silently
+/// skipped after A consumed its marker.
+#[tokio::test]
+async fn second_instance_still_inspects_after_first_clears_its_marker() {
+    // A allows everything except "evil"; B only allows "claude".
+    let guard_a = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let guard_b = AiRequestGuard::new(&json!({"allowed_models": ["claude"]})).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    // Both instances deferred this compressed request in before_proxy.
+    ctx.metadata.insert(
+        guard_a.deferred_compressed_marker_key().to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        guard_b.deferred_compressed_marker_key().to_string(),
+        "true".to_string(),
+    );
+
+    // A `compression` plugin decompressed the body (Content-Encoding stripped);
+    // the now-plaintext body names a model A allows but B does not.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = json!({"model": "gpt-4"}).to_string().into_bytes();
+
+    // A inspects, allows, and clears ONLY its own marker.
+    let result_a = guard_a
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_continue(result_a);
+    assert!(
+        !ctx.metadata
+            .contains_key(guard_a.deferred_compressed_marker_key()),
+        "A must clear its own marker"
+    );
+    // B's marker must survive A's run.
+    assert!(
+        ctx.metadata
+            .contains_key(guard_b.deferred_compressed_marker_key()),
+        "A must not consume B's marker"
+    );
+
+    // B still inspects the same decompressed body and rejects it (not skipped).
+    let result_b = guard_b
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert_reject(result_b, Some(400));
+    assert!(
+        !ctx.metadata
+            .contains_key(guard_b.deferred_compressed_marker_key()),
+        "B must clear its own marker after inspecting"
     );
 }
 

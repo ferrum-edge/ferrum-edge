@@ -61,20 +61,39 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error};
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
-/// Metadata marker set in `before_proxy` when a compressed request body was
-/// deferred to `on_final_request_body` (where the body is inspected after any
-/// `compression` `transform_request_body` decompression has run). Its presence
-/// tells the final-body hook that this request still needs JSON-policy
-/// evaluation; its absence means `before_proxy` already inspected the body, so
-/// the final-body hook must not re-validate (avoids double work on the common,
-/// uncompressed path).
-const DEFERRED_COMPRESSED_MARKER: &str = "ai_request_guard.deferred_compressed_body";
+/// Prefix for the per-instance metadata marker set in `before_proxy` when a
+/// compressed request body was deferred to `on_final_request_body` (where the
+/// body is inspected after any `compression` `transform_request_body`
+/// decompression has run). Its presence tells the final-body hook that this
+/// request still needs JSON-policy evaluation; its absence means `before_proxy`
+/// already inspected the body, so the final-body hook must not re-validate
+/// (avoids double work on the common, uncompressed path).
+///
+/// The full marker key is `{DEFERRED_COMPRESSED_MARKER_PREFIX}{instance_id}`
+/// (see [`AiRequestGuard::deferred_compressed_marker_key`]). It MUST be
+/// instance-specific: multiple `ai_request_guard` instances can run on the same
+/// proxy (e.g. two proxy/proxy-group configs with different policies, all on the
+/// same request). With a single shared marker the first instance's
+/// `on_final_request_body` would `remove()` the marker and every later instance
+/// would treat the decompressed body as already inspected — silently skipping
+/// its reject-style policy on compressed uploads. Keying by a unique per-instance
+/// id lets each instance defer, inspect, and clear its own marker independently.
+const DEFERRED_COMPRESSED_MARKER_PREFIX: &str = "ai_request_guard.deferred_compressed_body.";
+
+/// Process-wide source of unique per-instance ids for the deferred-compressed
+/// marker. Mirrors the `openapi_validator` `INSTANCE_ID_COUNTER` pattern: a
+/// monotonically increasing counter assigned once at construction guarantees two
+/// `ai_request_guard` instances never collide on the same marker key, regardless
+/// of how they are configured. Starts at 1 so a marker key is never the bare
+/// prefix.
+static DEFERRED_MARKER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// True when `content-type` is a native gRPC media type (`application/grpc`,
 /// optionally with a `+subtype`/`;param`/OWS suffix), excluding
@@ -175,6 +194,12 @@ pub struct AiRequestGuard {
     needs_body_transform: bool,
     /// True when any configured policy needs the request body to be inspected.
     requires_request_body: bool,
+    /// Instance-specific metadata key used to defer a compressed request body
+    /// from `before_proxy` to `on_final_request_body`. Built once at
+    /// construction as `{DEFERRED_COMPRESSED_MARKER_PREFIX}{unique_id}` so that
+    /// co-located `ai_request_guard` instances never consume each other's
+    /// deferral marker. See [`DEFERRED_COMPRESSED_MARKER_PREFIX`].
+    deferred_compressed_marker: String,
 }
 
 impl AiRequestGuard {
@@ -288,6 +313,14 @@ impl AiRequestGuard {
                 .to_string());
         }
 
+        // Assign a unique per-instance deferral-marker key so multiple
+        // `ai_request_guard` instances on the same proxy cannot consume each
+        // other's compressed-body marker (each defers / inspects / clears its
+        // own). See `DEFERRED_COMPRESSED_MARKER_PREFIX`.
+        let instance_id = DEFERRED_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let deferred_compressed_marker =
+            format!("{DEFERRED_COMPRESSED_MARKER_PREFIX}{instance_id}");
+
         Ok(Self {
             max_tokens_limit,
             enforce_max_tokens,
@@ -303,7 +336,16 @@ impl AiRequestGuard {
             fail_on_uninspectable_body,
             needs_body_transform,
             requires_request_body,
+            deferred_compressed_marker,
         })
+    }
+
+    /// The instance-specific metadata key this guard uses to defer a compressed
+    /// request body from `before_proxy` to `on_final_request_body`. Exposed so
+    /// callers (and tests) can observe or simulate the deferral for this exact
+    /// instance; two instances always return distinct keys.
+    pub fn deferred_compressed_marker_key(&self) -> &str {
+        &self.deferred_compressed_marker
     }
 
     /// Validate the request body JSON. Returns Err with a rejection tuple on failure.
@@ -661,7 +703,7 @@ impl Plugin for AiRequestGuard {
         // section in this module's docs.
         if has_non_identity_content_encoding(headers) {
             ctx.metadata
-                .insert(DEFERRED_COMPRESSED_MARKER.to_string(), "true".to_string());
+                .insert(self.deferred_compressed_marker.clone(), "true".to_string());
             return PluginResult::Continue;
         }
 
@@ -780,8 +822,9 @@ impl Plugin for AiRequestGuard {
     /// `decompress_request`) have run.
     ///
     /// `before_proxy` cannot evaluate JSON policy on a still-compressed body, so
-    /// it sets `DEFERRED_COMPRESSED_MARKER` and Continues. This hook closes
-    /// that deferral:
+    /// it sets this instance's deferral marker
+    /// ([`AiRequestGuard::deferred_compressed_marker_key`]) and Continues. This
+    /// hook closes that deferral:
     ///
     /// - If the marker is absent, `before_proxy` already inspected the body
     ///   (plain, uncompressed path) — Continue without re-validating so the
@@ -807,10 +850,17 @@ impl Plugin for AiRequestGuard {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only act on bodies `before_proxy` explicitly deferred. The marker is
+        // Only act on bodies THIS instance deferred. The marker key is
+        // instance-specific (see `DEFERRED_COMPRESSED_MARKER_PREFIX`), so a
+        // sibling `ai_request_guard` instance on the same proxy cannot consume
+        // it — each instance inspects and clears its own deferral. The marker is
         // set only for non-identity `Content-Encoding` requests, so the common
         // (uncompressed) path skips this hook entirely.
-        if ctx.metadata.remove(DEFERRED_COMPRESSED_MARKER).is_none() {
+        if ctx
+            .metadata
+            .remove(&self.deferred_compressed_marker)
+            .is_none()
+        {
             return PluginResult::Continue;
         }
 
