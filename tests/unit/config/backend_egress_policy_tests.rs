@@ -28,6 +28,11 @@ fn default_blocks_cloud_metadata_and_link_local() {
     assert!(!p.is_allowed(&ip("fe80::1")));
     // IPv4-mapped metadata must be caught too.
     assert!(!p.is_allowed(&ip("::ffff:169.254.169.254")));
+    // AWS EC2 IPv6 instance metadata (IMDSv6), inside ULA — blocked, but
+    // ordinary ULA backends stay allowed.
+    assert!(!p.is_allowed(&ip("fd00:ec2::254")));
+    assert!(p.is_allowed(&ip("fd00:ec2::1")));
+    assert!(p.is_allowed(&ip("fd12:3456::1")));
 }
 
 #[test]

@@ -3294,6 +3294,24 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
     }
 }
 
+/// Like [`validate_plugin_config`] but screens any literal-IP plugin endpoint
+/// (AI provider, log sink, webhook) against the configured backend egress
+/// policy, so file/db config-load validation rejects e.g.
+/// `http://169.254.169.254/...` the same way runtime plugin construction does
+/// — instead of accepting (and a CP distributing) a config a data plane later
+/// rejects.
+pub fn validate_plugin_config_with_policy(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
+    match create_plugin_with_http_client(name, config, http_client)? {
+        Some(_) => Ok(()),
+        None => Err(format!("Unknown plugin name '{}'", name)),
+    }
+}
+
 /// Removed built-in plugins that were historically security-sensitive.
 ///
 /// These names are intentionally fail-closed during config load so upgrades

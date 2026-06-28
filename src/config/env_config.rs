@@ -357,6 +357,11 @@ pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
                 return is_always_blocked_range(&std::net::IpAddr::V4(v4));
             }
             ip.is_unspecified()                     // ::
+            // AWS EC2 IPv6 instance metadata (IMDSv6) lives at fd00:ec2::254,
+            // inside the otherwise-allowed ULA range (fc00::/7) — block the
+            // exact metadata host so the IPv6 IMDS SSRF pivot is closed by
+            // default while ordinary ULA backends stay reachable.
+            || ip.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
             || (ip.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
             || ip.is_multicast() // ff00::/8
         }

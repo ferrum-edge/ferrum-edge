@@ -4266,6 +4266,37 @@ impl Proxy {
 }
 
 impl Proxy {
+    /// Screen this proxy's literal-IP backend fields (`backend_host`,
+    /// `dns_override`) against the backend egress policy. Hostnames are not
+    /// resolvable at config time and are screened at DNS-resolution time
+    /// instead. Returns prefix-free messages so each caller can attribute them.
+    pub fn validate_backend_egress_ips(
+        &self,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if let Ok(ip) = self.backend_host.parse::<std::net::IpAddr>()
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            errors.push(format!(
+                "backend_host IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+        if let Some(ref dns_override) = self.dns_override
+            && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            errors.push(format!(
+                "dns_override IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Validate all fields of a proxy for correctness and safe lengths.
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
@@ -5138,6 +5169,30 @@ pub(crate) fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<
 }
 
 impl Upstream {
+    /// Screen this upstream's literal-IP target hosts against the backend
+    /// egress policy. Hostname targets are screened at DNS-resolution time.
+    /// Returns prefix-free messages so each caller can attribute them.
+    pub fn validate_backend_egress_ips(
+        &self,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for (i, target) in self.targets.iter().enumerate() {
+            if let Ok(ip) = target.host.parse::<std::net::IpAddr>()
+                && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+            {
+                errors.push(format!(
+                    "targets[{i}].host IP {ip} denied by backend egress policy: {reason}"
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Normalize upstream fields to their canonical in-memory form.
     pub fn normalize_fields(&mut self) {
         // RFC 1035: DNS names are case-insensitive. Normalize target hosts so
@@ -6327,45 +6382,28 @@ impl GatewayConfig {
         // Skipped only when the policy can never deny anything (fully open).
         if !backend_allow_ips.is_fully_open() {
             for proxy in &self.proxies {
-                if let Ok(ip) = proxy.backend_host.parse::<std::net::IpAddr>()
-                    && let Some(reason) = backend_allow_ips.deny_reason(&ip)
-                {
-                    errors.push(format!(
-                        "Proxy '{}': backend_host IP {} denied by backend egress policy: {}",
-                        proxy.id, ip, reason
-                    ));
-                }
-                if let Some(ref dns_override) = proxy.dns_override {
-                    match dns_override.parse::<std::net::IpAddr>() {
-                        Ok(ip) => {
-                            if let Some(reason) = backend_allow_ips.deny_reason(&ip) {
-                                errors.push(format!(
-                                    "Proxy '{}': dns_override IP {} denied by backend egress policy: {}",
-                                    proxy.id, ip, reason
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under the backend egress policy ({}): {}",
-                                proxy.id,
-                                dns_override,
-                                backend_allow_ips,
-                                e
-                            );
-                        }
+                if let Err(errs) = proxy.validate_backend_egress_ips(backend_allow_ips) {
+                    for e in errs {
+                        errors.push(format!("Proxy '{}': {}", proxy.id, e));
                     }
+                }
+                // A hostname `dns_override` cannot be classified at config time;
+                // it is screened at DNS-resolution time instead.
+                if let Some(ref dns_override) = proxy.dns_override
+                    && dns_override.parse::<std::net::IpAddr>().is_err()
+                {
+                    tracing::warn!(
+                        "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under the backend egress policy ({})",
+                        proxy.id,
+                        dns_override,
+                        backend_allow_ips
+                    );
                 }
             }
             for upstream in &self.upstreams {
-                for (i, target) in upstream.targets.iter().enumerate() {
-                    if let Ok(ip) = target.host.parse::<std::net::IpAddr>()
-                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
-                    {
-                        errors.push(format!(
-                            "Upstream '{}': targets[{}].host IP {} denied by backend egress policy: {}",
-                            upstream.id, i, ip, reason
-                        ));
+                if let Err(errs) = upstream.validate_backend_egress_ips(backend_allow_ips) {
+                    for e in errs {
+                        errors.push(format!("Upstream '{}': {}", upstream.id, e));
                     }
                 }
             }

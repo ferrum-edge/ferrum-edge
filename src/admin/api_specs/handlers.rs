@@ -1284,9 +1284,14 @@ async fn validate_bundle(
             plugin_errors.extend(errs);
         }
 
-        // Plugin-specific config schema validation.
-        if let Err(e) = crate::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
-        {
+        // Plugin-specific config schema validation. Screen literal-IP plugin
+        // endpoints against the configured egress policy (same as direct admin
+        // POSTs and the file/db loaders).
+        if let Err(e) = crate::plugins::validate_plugin_config_with_policy(
+            &plugin.plugin_name,
+            &plugin.config,
+            &state.backend_allow_ips,
+        ) {
             plugin_errors.push(e);
         }
 

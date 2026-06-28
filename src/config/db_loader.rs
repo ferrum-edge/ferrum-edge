@@ -1266,7 +1266,7 @@ impl DatabaseStore {
             .validate_mesh_route_dispatch_references(ValidationAction::FatalStatic(
                 "Database has invalid mesh_route_dispatch upstream reference(s)",
             ))
-            .validate_plugin_configs(ValidationAction::Warn)
+            .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
 

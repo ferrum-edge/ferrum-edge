@@ -57,6 +57,7 @@ enum ValidationStep<'a> {
         action: ValidationAction<'a>,
     },
     PluginConfigs {
+        backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     },
     PluginFileDependencies {
@@ -186,8 +187,15 @@ impl<'a> ValidationPipeline<'a> {
         self
     }
 
-    pub(crate) fn validate_plugin_configs(mut self, action: ValidationAction<'a>) -> Self {
-        self.steps.push(ValidationStep::PluginConfigs { action });
+    pub(crate) fn validate_plugin_configs(
+        mut self,
+        backend_allow_ips: &'a BackendEgressPolicy,
+        action: ValidationAction<'a>,
+    ) -> Self {
+        self.steps.push(ValidationStep::PluginConfigs {
+            backend_allow_ips,
+            action,
+        });
         self
     }
 
@@ -298,15 +306,19 @@ impl<'a> ValidationPipeline<'a> {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }
-                ValidationStep::PluginConfigs { action } => {
+                ValidationStep::PluginConfigs {
+                    backend_allow_ips,
+                    action,
+                } => {
                     let mut errors = Vec::new();
                     for plugin_config in &config.plugin_configs {
                         if !plugin_config.enabled {
                             continue;
                         }
-                        if let Err(err) = crate::plugins::validate_plugin_config(
+                        if let Err(err) = crate::plugins::validate_plugin_config_with_policy(
                             &plugin_config.plugin_name,
                             &plugin_config.config,
+                            backend_allow_ips,
                         ) {
                             let message = format!(
                                 "Plugin '{}' (id={}): {}",
@@ -492,7 +504,10 @@ mod tests {
         };
 
         let errors = ValidationPipeline::new(&mut config)
-            .validate_plugin_configs(ValidationAction::Collect)
+            .validate_plugin_configs(
+                &crate::config::BackendEgressPolicy::unrestricted(),
+                ValidationAction::Collect,
+            )
             .run()
             .expect("collect validation should return accumulated errors");
 

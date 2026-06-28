@@ -2247,6 +2247,45 @@ fn test_validate_backend_ip_policy_default_blocks_metadata_backend_host() {
 }
 
 #[test]
+fn test_proxy_validate_backend_egress_ips_helper() {
+    // The per-resource helper (used by the admin write path) screens
+    // backend_host + dns_override under the default policy.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let metadata = Proxy {
+        backend_host: "169.254.169.254".to_string(),
+        ..make_proxy("m", "/a")
+    };
+    let errs = metadata
+        .validate_backend_egress_ips(&default_policy)
+        .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("backend_host")
+        && e.contains("169.254.169.254")
+        && e.contains("backend egress policy")));
+
+    let rebind = Proxy {
+        backend_host: "example.com".to_string(),
+        dns_override: Some("fd00:ec2::254".to_string()),
+        ..make_proxy("r", "/b")
+    };
+    assert!(
+        rebind
+            .validate_backend_egress_ips(&default_policy)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("dns_override") && e.contains("fd00:ec2::254"))
+    );
+
+    // Loopback / RFC1918 backends still validate.
+    let ok = Proxy {
+        backend_host: "127.0.0.1".to_string(),
+        ..make_proxy("ok", "/c")
+    };
+    assert!(ok.validate_backend_egress_ips(&default_policy).is_ok());
+}
+
+#[test]
 fn test_validate_backend_ip_policy_hostname_skipped() {
     // Hostnames can't be checked at config time — only literal IPs are validated
     let proxy = make_proxy("test", "/api");

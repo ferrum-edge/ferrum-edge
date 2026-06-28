@@ -234,7 +234,9 @@ pub fn load_config_from_file(
         .validate_plugin_references(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid plugin reference(s) found",
         ))
-        .validate_plugin_configs(ValidationAction::FatalCount(
+        .validate_plugin_configs(
+            backend_allow_ips,
+            ValidationAction::FatalCount(
             "Configuration validation failed: {} plugin config error(s) found",
         ))
         .validate_plugin_file_dependencies(ValidationAction::FatalCount(

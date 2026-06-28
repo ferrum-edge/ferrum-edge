@@ -25,6 +25,9 @@ pub(crate) struct ValidationCtx<'a> {
     pub reserved_ports: &'a HashSet<u16>,
     pub stream_bind_address: &'a str,
     pub mode: &'a str,
+    /// Backend egress policy, so per-resource admin writes screen literal-IP
+    /// backend targets the same way the file/db/restore loaders do.
+    pub backend_allow_ips: &'a crate::config::BackendEgressPolicy,
 }
 
 impl<'a> ValidationCtx<'a> {
@@ -33,6 +36,7 @@ impl<'a> ValidationCtx<'a> {
             reserved_ports: &state.reserved_ports,
             stream_bind_address: &state.stream_proxy_bind_address,
             mode: &state.mode,
+            backend_allow_ips: &state.backend_allow_ips,
         }
     }
 }
@@ -1221,7 +1225,7 @@ impl AdminResource for Upstream {
         }
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+    fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
         if self.targets.is_empty() && self.service_discovery.is_none() {
             return Err(ValidationError::Message(
                 "At least one target is required (or configure service_discovery)".to_string(),
@@ -1233,7 +1237,12 @@ impl AdminResource for Upstream {
         // runs on the mesh slice-apply path and would false-error there).
         self.validate_operator_provided_fields()
             .map_err(ValidationError::Fields)?;
-        self.validate_fields().map_err(ValidationError::Fields)
+        self.validate_fields().map_err(ValidationError::Fields)?;
+        // Screen literal-IP targets against the backend egress policy so an
+        // admin write cannot point an upstream at a denied (e.g. cloud-metadata)
+        // address that file/restore loads would reject.
+        self.validate_backend_egress_ips(ctx.backend_allow_ips)
+            .map_err(ValidationError::Fields)
     }
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
@@ -1633,8 +1642,13 @@ impl AdminResource for Proxy {
         self.normalize_fields();
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+    fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
         self.validate_fields().map_err(ValidationError::Fields)?;
+        // Screen literal-IP backend_host / dns_override against the egress
+        // policy so an admin write cannot target a denied (e.g. cloud-metadata)
+        // address that file/restore loads would reject.
+        self.validate_backend_egress_ips(ctx.backend_allow_ips)
+            .map_err(ValidationError::Fields)?;
 
         for host in &self.hosts {
             if let Err(message) = crate::config::types::validate_host_entry(host) {

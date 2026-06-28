@@ -3808,7 +3808,7 @@ async fn handle_restore(
             .validate_listen_path_encodings(ValidationAction::Collect)
             .validate_unique_listen_paths(ValidationAction::Collect)
             .validate_stream_proxies(ValidationAction::Collect)
-            .validate_plugin_configs(ValidationAction::Collect)
+            .validate_plugin_configs(&state.backend_allow_ips, ValidationAction::Collect)
             .validate_upstream_references(ValidationAction::Collect)
             .validate_mesh_route_dispatch_references(ValidationAction::Collect)
             .validate_plugin_references(ValidationAction::Collect)
