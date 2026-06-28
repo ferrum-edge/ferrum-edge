@@ -1396,14 +1396,30 @@ fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
     // truncated, so fallback exhaustion never sends malformed JSON with an
     // application/json content type.
     let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
-    serde_json::json!({
-        "error": {
-            "message": format!("Upstream provider error: {error_text}"),
-            "type": "upstream_error",
-        }
-    })
+    openai_error_body(
+        &format!("Upstream provider error: {error_text}"),
+        "upstream_error",
+        None,
+        Some("upstream_error"),
+    )
     .to_string()
     .into_bytes()
+}
+
+fn openai_error_body(
+    message: &str,
+    error_type: &str,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Value {
+    json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": param,
+            "code": code,
+        }
+    })
 }
 
 /// Normalize a provider response to OpenAI Chat Completions format.
@@ -1418,13 +1434,12 @@ fn normalize_response(
     if status >= 400 {
         let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
         return Ok((
-            json!({
-                "error": {
-                    "message": format!("Upstream provider returned {}: {}", status, error_text),
-                    "type": "upstream_error",
-                    "code": status
-                }
-            }),
+            openai_error_body(
+                &format!("Upstream provider returned {}: {}", status, error_text),
+                "upstream_error",
+                None,
+                Some("upstream_error"),
+            ),
             TokenCounts::default(),
         ));
     }
@@ -1876,7 +1891,19 @@ impl Plugin for AiFederation {
         let body_str = match ctx.metadata.get("request_body") {
             Some(b) => b.as_str(),
             None => {
-                debug!("ai_federation: no request_body in metadata, skipping");
+                if self.fail_on_missing_model {
+                    debug!("ai_federation: rejecting JSON POST without buffered request body");
+                    return self.openai_error_response(
+                        400,
+                        "Request body is required for ai_federation model routing",
+                        "invalid_request_error",
+                        None,
+                        Some("missing_request_body"),
+                    );
+                }
+                debug!(
+                    "ai_federation: no request_body in metadata, passing through by explicit opt-in"
+                );
                 return PluginResult::Continue;
             }
         };
@@ -1884,14 +1911,42 @@ impl Plugin for AiFederation {
         let openai_body: Value = match serde_json::from_str(body_str) {
             Ok(v) => v,
             Err(e) => {
-                debug!("ai_federation: request body is not valid JSON: {e}");
+                if self.fail_on_missing_model {
+                    debug!("ai_federation: rejecting request body that is not valid JSON: {e}");
+                    return self.openai_error_response(
+                        400,
+                        "Request body is not valid JSON",
+                        "invalid_request_error",
+                        None,
+                        Some("invalid_json"),
+                    );
+                }
+                debug!(
+                    "ai_federation: request body is not valid JSON, passing through by explicit opt-in: {e}"
+                );
                 return PluginResult::Continue;
             }
         };
 
         // Extract model from the standard "model" field
-        let model = match openai_body["model"].as_str() {
-            Some(m) => m.to_string(),
+        let model = match openai_body.get("model") {
+            Some(Value::String(m)) => m.to_string(),
+            Some(_) => {
+                if self.fail_on_missing_model {
+                    debug!("ai_federation: rejecting request with non-string 'model' field");
+                    return self.openai_error_response(
+                        400,
+                        "Invalid 'model' field: expected a string",
+                        "invalid_request_error",
+                        Some("model"),
+                        Some("invalid_model"),
+                    );
+                }
+                debug!(
+                    "ai_federation: request has non-string 'model' field, passing through by explicit opt-in"
+                );
+                return PluginResult::Continue;
+            }
             None => {
                 if self.fail_on_missing_model {
                     debug!("ai_federation: rejecting request missing 'model' field");
@@ -1946,9 +2001,12 @@ impl Plugin for AiFederation {
                 model = %model,
                 "ai_federation: rejecting streaming request — streaming responses are not supported"
             );
-            return self.error_response(
+            return self.openai_error_response(
                 501,
                 "Streaming responses (\"stream\": true) are not supported by ai_federation",
+                "invalid_request_error",
+                Some("stream"),
+                Some("streaming_not_supported"),
             );
         }
 
@@ -1981,9 +2039,12 @@ impl Plugin for AiFederation {
                     model = %resolved_model,
                     "ai_federation: rejected request — resolved model contains characters not permitted in URL path"
                 );
-                return self.error_response(
+                return self.openai_error_response(
                     400,
                     "Invalid 'model' field: must contain only alphanumeric characters, dot, hyphen, underscore, or colon",
+                    "invalid_request_error",
+                    Some("model"),
+                    Some("invalid_model"),
                 );
             }
 
@@ -2047,9 +2108,12 @@ impl Plugin for AiFederation {
             let (status, resp_body) = match result {
                 Ok(r) => r,
                 Err(e) => {
-                    return self.error_response(
+                    return self.openai_error_response(
                         502,
                         &format!("Provider '{}' request failed: {e}", provider.name),
+                        "server_error",
+                        None,
+                        Some("provider_request_failed"),
                     );
                 }
             };
@@ -2086,12 +2150,15 @@ impl Plugin for AiFederation {
                                 error = %e,
                                 "ai_federation: failed to serialize normalized response"
                             );
-                            return self.error_response(
+                            return self.openai_error_response(
                                 502,
                                 &format!(
                                     "Provider '{}' response serialization failed: {e}",
                                     provider.name
                                 ),
+                                "server_error",
+                                None,
+                                Some("response_serialization_failed"),
                             );
                         }
                     };
@@ -2110,12 +2177,15 @@ impl Plugin for AiFederation {
                         error = %e,
                         "ai_federation: response normalization failed"
                     );
-                    return self.error_response(
+                    return self.openai_error_response(
                         502,
                         &format!(
                             "Provider '{}' response normalization failed: {e}",
                             provider.name
                         ),
+                        "server_error",
+                        None,
+                        Some("response_normalization_failed"),
                     );
                 }
             }
@@ -2133,13 +2203,16 @@ impl Plugin for AiFederation {
                 headers: resp_headers,
             }
         } else {
-            self.error_response(
+            self.openai_error_response(
                 502,
                 &format!(
                     "All AI providers failed for model '{}': {}",
                     model,
                     last_error.unwrap_or_else(|| "unknown error".to_string())
                 ),
+                "server_error",
+                None,
+                Some("provider_error"),
             )
         }
     }
@@ -2181,24 +2254,6 @@ impl AiFederation {
         );
     }
 
-    /// Build a JSON error response.
-    fn error_response(&self, status: u16, message: &str) -> PluginResult {
-        let body = json!({
-            "error": {
-                "message": message,
-                "type": "ai_federation_error",
-                "code": status
-            }
-        });
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/json".to_string());
-        PluginResult::RejectBinary {
-            status_code: status,
-            body: Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
-            headers,
-        }
-    }
-
     fn openai_error_response(
         &self,
         status: u16,
@@ -2207,19 +2262,27 @@ impl AiFederation {
         param: Option<&str>,
         code: Option<&str>,
     ) -> PluginResult {
-        let body = json!({
-            "error": {
-                "message": message,
-                "type": error_type,
-                "param": param,
-                "code": code,
+        self.json_reject_response(status, openai_error_body(message, error_type, param, code))
+    }
+
+    fn json_reject_response(&self, status: u16, body: Value) -> PluginResult {
+        let response_body = match serde_json::to_vec(&body) {
+            Ok(body) => Bytes::from(body),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "ai_federation: failed to serialize JSON error response"
+                );
+                Bytes::from_static(
+                    br#"{"error":{"message":"Failed to serialize error response","type":"server_error","param":null,"code":"internal_error"}}"#,
+                )
             }
-        });
+        };
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
         PluginResult::RejectBinary {
             status_code: status,
-            body: Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+            body: response_body,
             headers,
         }
     }

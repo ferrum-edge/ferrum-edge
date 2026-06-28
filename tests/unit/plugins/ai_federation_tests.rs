@@ -1071,6 +1071,9 @@ fn test_normalize_error_response() {
             .unwrap()
             .contains("429")
     );
+    assert_eq!(normalized["error"]["type"], "upstream_error");
+    assert!(normalized["error"]["param"].is_null());
+    assert_eq!(normalized["error"]["code"], "upstream_error");
     assert_eq!(prompt, 0);
     assert_eq!(completion, 0);
     assert_eq!(total, 0);
@@ -1119,6 +1122,9 @@ fn test_fallback_error_body_is_capped_before_return() {
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains("XXX"));
     assert!(message.len() <= test_helpers::MAX_UPSTREAM_ERROR_BYTES + 64);
+    assert_eq!(json["error"]["type"], "upstream_error");
+    assert!(json["error"]["param"].is_null());
+    assert_eq!(json["error"]["code"], "upstream_error");
 }
 
 #[test]
@@ -1549,6 +1555,10 @@ fn streaming_plugin() -> ai_federation::AiFederation {
 }
 
 fn post_json_ctx(body: &Value) -> RequestContext {
+    post_json_ctx_with_raw_body(serde_json::to_string(body).unwrap())
+}
+
+fn post_json_ctx_with_raw_body(body: String) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
@@ -1556,10 +1566,18 @@ fn post_json_ctx(body: &Value) -> RequestContext {
     );
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        serde_json::to_string(body).unwrap(),
+    ctx.metadata.insert("request_body".to_string(), body);
+    ctx
+}
+
+fn post_json_ctx_without_body() -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
     );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
     ctx
 }
 
@@ -1587,7 +1605,9 @@ async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
         } => {
             assert_eq!(status_code, 501, "streaming must be rejected with 501");
             let parsed: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(parsed["error"]["type"], "ai_federation_error");
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "stream");
+            assert_eq!(parsed["error"]["code"], "streaming_not_supported");
             let msg = parsed["error"]["message"].as_str().unwrap();
             assert!(
                 msg.to_lowercase().contains("stream"),
@@ -1595,6 +1615,48 @@ async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
             );
         }
         other => panic!("expected RejectBinary 501, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_missing_buffered_body_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let mut ctx = post_json_ctx_without_body();
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert!(parsed["error"]["param"].is_null());
+            assert_eq!(parsed["error"]["code"], "missing_request_body");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_invalid_json_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let mut ctx = post_json_ctx_with_raw_body("{not-json".to_string());
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert!(parsed["error"]["param"].is_null());
+            assert_eq!(parsed["error"]["code"], "invalid_json");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
     }
 }
 
@@ -1617,6 +1679,37 @@ async fn federation_missing_model_rejects_by_default() {
             assert_eq!(parsed["error"]["type"], "invalid_request_error");
             assert_eq!(parsed["error"]["param"], "model");
             assert_eq!(parsed["error"]["code"], "missing_model");
+        }
+        other => panic!("expected RejectBinary 400, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn federation_non_string_model_rejects_by_default() {
+    let plugin = streaming_plugin();
+    let body = json!({
+        "model": 123,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "invalid_request_error");
+            assert_eq!(parsed["error"]["param"], "model");
+            assert_eq!(parsed["error"]["code"], "invalid_model");
+            assert!(
+                parsed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected a string")
+            );
         }
         other => panic!("expected RejectBinary 400, got {other:?}"),
     }
@@ -1683,6 +1776,7 @@ async fn federation_pass_through_requires_explicit_opt_in() {
 
     for body in [
         json!({"messages": [{"role": "user", "content": "Hi"}]}),
+        json!({"model": 123, "messages": [{"role": "user", "content": "Hi"}]}),
         unknown_model_body,
     ] {
         let mut ctx = post_json_ctx(&body);
@@ -1693,6 +1787,26 @@ async fn federation_pass_through_requires_explicit_opt_in() {
             "explicit opt-in pass-through should continue, got {result:?}"
         );
     }
+
+    let mut invalid_json_ctx = post_json_ctx_with_raw_body("{not-json".to_string());
+    let mut invalid_json_headers = json_headers();
+    let invalid_json_result = plugin
+        .before_proxy(&mut invalid_json_ctx, &mut invalid_json_headers)
+        .await;
+    assert!(
+        matches!(invalid_json_result, PluginResult::Continue),
+        "explicit opt-in malformed JSON pass-through should continue, got {invalid_json_result:?}"
+    );
+
+    let mut missing_body_ctx = post_json_ctx_without_body();
+    let mut missing_body_headers = json_headers();
+    let missing_body_result = plugin
+        .before_proxy(&mut missing_body_ctx, &mut missing_body_headers)
+        .await;
+    assert!(
+        matches!(missing_body_result, PluginResult::Continue),
+        "explicit opt-in missing buffered body pass-through should continue, got {missing_body_result:?}"
+    );
 }
 
 #[tokio::test]
