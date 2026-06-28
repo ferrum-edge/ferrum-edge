@@ -17,9 +17,16 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
+const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
 const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
 const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
+/// Backend (pre-rejection) HTTP status observed by `after_proxy` on its genuine
+/// run, before any later response-body plugin can replace the response with a
+/// rejection. Used to tell a real gateway rejection (no successful backend call
+/// → release the reservation) apart from a response that the backend served 2xx
+/// but a later plugin rejected (tokens were consumed → keep the reservation).
+const BACKEND_STATUS_METADATA_KEY: &str = "ai_ratelimit_backend_status";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,13 +242,20 @@ impl AiRateLimiter {
             .await
     }
 
-    async fn adjust_usage(&self, key: String, delta: i64) {
+    async fn adjust_usage(&self, key: String, reservation_id: Option<u64>, delta: i64) {
         if delta == 0 {
             return;
         }
         let _ = self
             .limiter
-            .check(key.clone(), &key, &AiRateLimitOp::AdjustUsage { delta })
+            .check(
+                key.clone(),
+                &key,
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id,
+                    delta,
+                },
+            )
             .await;
     }
 
@@ -252,7 +266,33 @@ impl AiRateLimiter {
             .unwrap_or(0)
     }
 
+    fn reservation_id(ctx: &RequestContext) -> Option<u64> {
+        ctx.metadata
+            .get(RESERVATION_ID_METADATA_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
+    /// The backend status `after_proxy` recorded on its genuine (non-rejection)
+    /// run, if any. Absent when `after_proxy` only ever ran inside a rejection
+    /// (a before-proxy gateway rejection that short-circuited backend dispatch).
+    fn backend_status(ctx: &RequestContext) -> Option<u16> {
+        ctx.metadata
+            .get(BACKEND_STATUS_METADATA_KEY)
+            .and_then(|value| value.parse::<u16>().ok())
+    }
+
     fn should_release_gateway_rejection(ctx: &RequestContext) -> bool {
+        // Only release when this is a genuine gateway rejection that never
+        // produced a successful backend response. If the backend already
+        // returned 2xx and a *later* response-body plugin (e.g. ai_response_guard)
+        // rejected the body, the provider call consumed tokens — keep the
+        // reservation charged rather than making the call free. A recorded
+        // non-2xx backend status, or no recorded backend status at all (a
+        // before-proxy reject that short-circuited dispatch), still releases.
+        if Self::backend_status(ctx).is_some_and(|status| (200..300).contains(&status)) {
+            return false;
+        }
+
         ctx.metadata
             .get(REJECTION_RESPONSE_METADATA_KEY)
             .is_some_and(|value| value == "true")
@@ -298,6 +338,7 @@ impl AiRateLimiter {
         unmetered_detail: &str,
     ) -> PluginResult {
         let reserved_tokens = Self::reserved_tokens(ctx);
+        let reservation_id = Self::reservation_id(ctx);
 
         if let Some(actual_tokens) = actual_tokens {
             ctx.metadata.insert(
@@ -306,6 +347,7 @@ impl AiRateLimiter {
             );
             self.adjust_usage(
                 self.rate_key(ctx),
+                reservation_id,
                 Self::reservation_delta(actual_tokens, reserved_tokens),
             )
             .await;
@@ -315,6 +357,7 @@ impl AiRateLimiter {
         if !(200..300).contains(&response_status) {
             self.adjust_usage(
                 self.rate_key(ctx),
+                reservation_id,
                 Self::reservation_delta(0, reserved_tokens),
             )
             .await;
@@ -343,6 +386,7 @@ impl AiRateLimiter {
                 );
                 self.adjust_usage(
                     self.rate_key(ctx),
+                    reservation_id,
                     Self::reservation_delta(0, reserved_tokens),
                 )
                 .await;
@@ -546,9 +590,44 @@ fn prompt_character_count(json: &Value) -> u64 {
     }
 }
 
+/// Object keys whose values carry binary/non-text payloads (base64 image,
+/// audio, file, or document bytes) in the common multimodal request shapes.
+/// Counting those bytes as prompt characters wildly inflates the estimate — a
+/// 1 MB image is ~1.37 M base64 chars (~340k "tokens" at chars/4), which would
+/// deny a vision request with a `429` *before* it is ever proxied, and a
+/// pre-proxy reject never reconciles, so the bogus estimate is never corrected.
+/// Image/audio inputs actually cost a small fixed number of tokens, not
+/// `bytes/4`, so we skip these subtrees entirely and rely on the text-bearing
+/// parts plus the requested output cap for the estimate.
+///
+/// Covered shapes:
+/// - OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:..."}}`
+/// - OpenAI audio part: `{"type":"input_audio","input_audio":{"data":"..."}}`
+/// - OpenAI file part: `{"type":"file","file":{"file_data":"..."}}`
+/// - Anthropic image/document part: `{"type":"image","source":{"data":"..."}}`
+/// - Google inline data: `{"inline_data":{"data":"..."}}` / `inlineData`
+const BINARY_CONTENT_KEYS: &[&str] = &[
+    "image_url",
+    "input_audio",
+    "source",
+    "inline_data",
+    "inlineData",
+    "file_data",
+];
+
 fn string_value_character_count(value: &Value) -> u64 {
     match value {
-        Value::String(value) => value.chars().count() as u64,
+        // A data URL (`data:<mime>;base64,<payload>`) is an inline binary blob,
+        // not prose — count it as zero so a base64 image embedded directly in a
+        // text field (rather than under a known binary key) still can't inflate
+        // the estimate.
+        Value::String(value) => {
+            if is_data_url(value) {
+                0
+            } else {
+                value.chars().count() as u64
+            }
+        }
         Value::Array(values) => values.iter().fold(0_u64, |acc, value| {
             acc.saturating_add(string_value_character_count(value))
         }),
@@ -556,7 +635,8 @@ fn string_value_character_count(value: &Value) -> u64 {
             if matches!(
                 key.as_str(),
                 "max_tokens" | "max_completion_tokens" | "max_output_tokens"
-            ) {
+            ) || BINARY_CONTENT_KEYS.contains(&key.as_str())
+            {
                 acc
             } else {
                 acc.saturating_add(string_value_character_count(value))
@@ -564,6 +644,14 @@ fn string_value_character_count(value: &Value) -> u64 {
         }),
         _ => 0,
     }
+}
+
+/// Whether a string is an inline `data:` URL carrying a (typically base64)
+/// binary payload. Case-insensitive on the `data:` scheme per RFC 2397.
+fn is_data_url(value: &str) -> bool {
+    value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -690,6 +778,21 @@ impl Plugin for AiRateLimiter {
         //    over-count usage. The window/TTL is the deliberate backstop;
         //    eagerly releasing on every early-abort branch would require
         //    touching broad proxy code and is intentionally out of scope here.
+        //
+        // 3. The estimate reads the *pre-transform* request body
+        //    (`ctx.metadata["request_body"]`, the buffered inbound body). Body
+        //    rules in `request_transformer` run later in the pipeline
+        //    (`transform_request_body`, at dispatch time — after this
+        //    `before_proxy` phase), and the transformed body is a dispatch-local
+        //    value that is never written back into `ctx.metadata`. So a proxy
+        //    that adds/raises `max_tokens` or appends prompt content in a body
+        //    transform reserves against the smaller inbound body; concurrent
+        //    transformed requests can briefly oversubscribe the budget until
+        //    post-response reconciliation charges actual usage. Reserving
+        //    against the final body is not feasible here without running the
+        //    transform pipeline twice; reconciliation is the corrective. This is
+        //    documented under `count_mode` / `request_transformer` interaction
+        //    in docs/plugins.md.
         let outcome = if reserved_tokens > 0 {
             self.reserve_usage(key.clone(), reserved_tokens).await
         } else {
@@ -721,6 +824,16 @@ impl Plugin for AiRateLimiter {
                 RESERVED_TOKENS_METADATA_KEY.to_string(),
                 reserved_tokens.to_string(),
             );
+            // Carry the local-window reservation id so reconciliation releases
+            // the exact entry this request created (correct under concurrent,
+            // out-of-order completions). `None` in Redis mode — harmless, the
+            // Redis reconciliation path ignores it.
+            if let Some(reservation_id) = outcome.reservation_id {
+                ctx.metadata.insert(
+                    RESERVATION_ID_METADATA_KEY.to_string(),
+                    reservation_id.to_string(),
+                );
+            }
         }
         self.store_metadata(ctx, &outcome);
         PluginResult::Continue
@@ -732,6 +845,25 @@ impl Plugin for AiRateLimiter {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Record the backend status on the genuine after_proxy run (not the
+        // re-run inside a rejection, which carries the rejection status). This
+        // lets `should_release_gateway_rejection` distinguish a 2xx backend whose
+        // body a later plugin rejected (keep the reservation — tokens were
+        // consumed) from a real gateway rejection (release). The federation path
+        // delivers the provider response via `RejectBinary`, so its after_proxy
+        // always runs in rejection context and never records here — federation
+        // reconciliation is handled by the `ai_federation_provider` branch below.
+        let in_rejection_context = ctx
+            .metadata
+            .get(REJECTION_RESPONSE_METADATA_KEY)
+            .is_some_and(|value| value == "true");
+        if !in_rejection_context {
+            ctx.metadata.insert(
+                BACKEND_STATUS_METADATA_KEY.to_string(),
+                response_status.to_string(),
+            );
+        }
+
         if ctx.metadata.contains_key("ai_federation_provider") {
             let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
             let result = self

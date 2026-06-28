@@ -857,7 +857,14 @@ impl RedisRateLimitClient {
     }
 
     /// Increment a counter by `amount`, set expiry, and floor the result at
-    /// zero. Returns the new (floored) total.
+    /// zero. Returns the new (floored) total, or `Err(())` if Redis is
+    /// unreachable for *either* the increment or the compensating floor write.
+    ///
+    /// A failed compensating write is reported as `Err(())` (not `Ok(0)`): the
+    /// key may be left negative on the server, and silently reporting success
+    /// would let a recovered Redis read that negative counter as zero usage and
+    /// bypass enforcement. Returning the error makes the caller fall back to the
+    /// local limiter for that operation, which is the conservative choice.
     ///
     /// This is the reconciliation-safe variant of [`incrby_with_expire`]. The
     /// AI token limiter applies reconciliation deltas (`actual - reserved`)
@@ -894,10 +901,22 @@ impl RedisRateLimitClient {
             .await
         {
             Ok(floored) => Ok(clamp_floored_total(floored)),
-            // The compensating write failed (Redis went away mid-operation).
-            // `incrby_with_expire` already marked the client unavailable; report
-            // the floored value so callers never observe a negative usage.
-            Err(()) => Ok(0),
+            // The compensating write failed (Redis went away mid-operation), so
+            // the key is left *negative* on the server. Do NOT report success:
+            // a negative counter reads as zero usage once Redis recovers within
+            // the key TTL, letting a consumer re-reserve the full budget —
+            // exactly the bypass the floor exists to prevent. `incrby_with_expire`
+            // already marked the client unavailable (triggering local failover);
+            // surface the failure to the caller and log the leaked-floor state so
+            // it is observable rather than silently undercounting.
+            Err(()) => {
+                warn!(
+                    key = %key,
+                    "Redis floor compensation failed after negative INCRBY accepted; \
+                     window counter left negative until TTL — falling back to local rate limiting"
+                );
+                Err(())
+            }
         }
     }
 
