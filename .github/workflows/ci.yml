@@ -1639,7 +1639,7 @@ jobs:
               run_benchmark=false
               reason="No performance-sensitive paths changed."
 
-              if grep -Eq '^(src/|vendor/|ebpf/|tests/performance/|build\.rs$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
+              if grep -Eq '^(src/|custom_plugins/|vendor/|ebpf/|tests/performance/|build\.rs$|ferrum\.conf$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
                 run_benchmark=true
                 reason="Performance-sensitive paths changed."
               fi
@@ -1761,7 +1761,7 @@ jobs:
             {
               echo "Skipped expensive benchmark: ${REASON}"
               echo ""
-              echo "Relevant paths: \`src/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
+              echo "Relevant paths: \`src/**\`, \`custom_plugins/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`ferrum.conf\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
               echo ""
               echo "Changed files:"
               echo '```'
