@@ -3679,19 +3679,17 @@ impl EnvConfig {
                                 .into(),
                         );
                     }
-                    if self.mesh_remote_discovery_poll_interval_seconds > 0 {
-                        if self.mesh_remote_discovery_max_stale_seconds == 0 {
-                            return Err(
-                                "FERRUM_MESH_PRODUCTION_MODE=true requires \
-                                 FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
-                                 discovery is enabled; unbounded last-good endpoints are dev/test only"
-                                    .into(),
-                            );
-                        }
-                        // FERRUM_DP_GRPC_TLS_NO_VERIFY is rejected unconditionally
-                        // by validate_cp_dp_grpc_transport_security() — it is not
-                        // honored on the tonic-managed CP/DP gRPC client, so it
-                        // can never silently disable verification here either.
+                    // (FERRUM_DP_GRPC_TLS_NO_VERIFY is rejected unconditionally by
+                    // validate_cp_dp_grpc_transport_security() — it is not honored
+                    // on the tonic-managed CP/DP gRPC client, so it can never
+                    // silently disable verification under remote discovery either.)
+                    if self.mesh_remote_discovery_poll_interval_seconds > 0
+                        && self.mesh_remote_discovery_max_stale_seconds == 0
+                    {
+                        return Err("FERRUM_MESH_PRODUCTION_MODE=true requires \
+                             FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
+                             discovery is enabled; unbounded last-good endpoints are dev/test only"
+                            .into());
                     }
                 }
                 // The running mesh's workload identity comes either from
