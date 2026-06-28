@@ -600,9 +600,15 @@ jobs:
         # explicitly time-boxed in deny.toml fails the PR. License checks are
         # intentionally outside this gate (see deny.toml header). The weekly
         # .github/workflows/dependency-audit.yml re-runs this plus the
-        # advisory-expiry and upstream-patch-status checks.
+        # advisory-patch-status check.
         # Policy: docs/dependency-policy.md.
         run: cargo deny check advisories bans sources
+
+      - name: Advisory-exception expiry
+        # cargo-deny accepts ignores without the repo's [expires:] convention, so
+        # validate it here too: a PR that adds a malformed or already-expired
+        # exception is rejected at PR time, not only by the weekly workflow.
+        run: bash scripts/check_advisory_expiry.sh
 
   build-gateway-binary:
     name: Build Gateway Binary (functional tests)

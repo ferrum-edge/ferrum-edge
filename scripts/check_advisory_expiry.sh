@@ -30,9 +30,16 @@ fail=0
 while IFS= read -r line; do
   id="$(printf '%s' "$line" | grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' | head -n1)"
   [ -z "$id" ] && continue
-  exp="$(printf '%s' "$line" | sed -nE 's/.*\[expires:([0-9]{4}-[0-9]{2}-[0-9]{2})\].*/\1/p')"
+  # The [expires:] token MUST live INSIDE the table entry's `reason = "..."`
+  # string value — never in a TOML comment, and never via the string-ignore
+  # form ("RUSTSEC-...") which has no reason field. Extract the quoted reason
+  # first, then look for the token only within it. This rejects both
+  # `"RUSTSEC-..."` and `"RUSTSEC-...", # [expires:...]` (trailing comment),
+  # which cargo-deny treats as an ignore with no time-boxed rationale.
+  reason="$(printf '%s' "$line" | sed -nE 's/.*reason *= *"([^"]*)".*/\1/p')"
+  exp="$(printf '%s' "$reason" | sed -nE 's/.*\[expires:([0-9]{4}-[0-9]{2}-[0-9]{2})\].*/\1/p')"
   if [ -z "$exp" ]; then
-    echo "::error::deny.toml ignore '$id' is missing an [expires:YYYY-MM-DD] token (use the table form: { id = \"$id\", reason = \"... [expires:YYYY-MM-DD]\" })"
+    echo "::error::deny.toml ignore '$id' has no [expires:YYYY-MM-DD] inside a table reason = \"...\" value (string-form and comment-only expiry are rejected; use { id = \"$id\", reason = \"... [expires:YYYY-MM-DD]\" })"
     fail=1
     continue
   fi

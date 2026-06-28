@@ -35,6 +35,11 @@ yanked = "deny"
 # blocking everywhere, matching the intent of the exceptions enumerated below.
 unmaintained = "all"
 unsound = "all"
+# Fail if an ignore no longer matches any advisory in the current graph, so a
+# fixed/removed vulnerable crate forces deletion of its now-stale exception
+# (default is "warn"). Otherwise a stale ignore could linger and silently
+# re-suppress the same RUSTSEC id if a later dependency reintroduces it.
+unused-ignored-advisory = "deny"
 # Everything not listed here is denied (vulnerabilities, unmaintained, unsound,
 # and notices alike, under advisories schema v2). Each exception is time-boxed.
 ignore = [

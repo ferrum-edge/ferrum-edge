@@ -54,9 +54,12 @@ Each row is the authoritative tracking record. Keep this table, the
 `cargo deny check advisories bans sources` runs on **every PR**
 (`dependency-audit` job in `.github/workflows/ci.yml`) and is **blocking**: any
 RUSTSEC advisory in the resolved tree that is not explicitly time-boxed in
-`deny.toml` fails CI. `bans` (duplicate-version visibility) and `sources`
-(crates.io-only) run alongside. License checking is intentionally **not** in the
-gate yet — see the `deny.toml` header.
+`deny.toml` fails CI. `unmaintained`/`unsound` are set to `all` (not the 0.19
+default of `workspace`) so transitive advisories are blocking too, and
+`unused-ignored-advisory = "deny"` forces a stale exception to be deleted once
+its advisory is fixed/removed. `bans` (duplicate-version visibility) and
+`sources` (crates.io-only) run alongside. License checking is intentionally
+**not** in the gate yet — see the `deny.toml` header.
 
 Run locally:
 
@@ -68,9 +71,12 @@ cargo deny check advisories bans sources   # the gate
 ### 2. Advisory exceptions are time-boxed
 
 Every `[advisories.ignore]` entry in `deny.toml` carries a rationale and an
-`[expires:YYYY-MM-DD]` token. `scripts/check_advisory_expiry.sh` (run weekly)
-fails once any date passes, so an exception cannot silently become permanent —
-a maintainer must re-fix the advisory or consciously extend the window.
+`[expires:YYYY-MM-DD]` token **inside its table `reason` string**.
+`scripts/check_advisory_expiry.sh` (run by the per-PR gate **and** the weekly
+workflow) fails once any date passes — or if an entry uses the string form or a
+comment-only token, both of which would dodge the time-box — so an exception
+cannot silently become permanent. A maintainer must re-fix the advisory or
+consciously extend the window.
 
 Current exceptions are all transitive and either no-fix-available or semver-pinned
 by a transitive parent (e.g. `mongodb` pins `hickory ^0.25`; the old AWS SDK

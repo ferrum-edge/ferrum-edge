@@ -41,9 +41,22 @@ fn repo_root() -> PathBuf {
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).expect("read vendor dir") {
         let path = entry.expect("vendor dir entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
+            // Skip build output from running the documented standalone vendor
+            // tests (`cargo test --manifest-path vendor/.../Cargo.toml`), which
+            // is not part of the vendored patch.
+            if name == "target" {
+                continue;
+            }
             collect_files(&path, out);
         } else if path.is_file() {
+            // Skip crate-local lockfiles that those same standalone test commands
+            // generate; they aren't part of the vendored sources and would
+            // otherwise cause a false drift failure for local developers.
+            if name == "Cargo.lock" {
+                continue;
+            }
             out.push(path);
         }
     }
