@@ -1427,7 +1427,11 @@ fn build_clickhouse_http_client(
 
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(cfg.timeout_ms))
-        .timeout(Duration::from_millis(cfg.timeout_ms));
+        .timeout(Duration::from_millis(cfg.timeout_ms))
+        // Do not follow redirects: a 3xx from an allowed ClickHouse host could
+        // otherwise bounce an export to an egress-policy-denied IP (matches the
+        // shared PluginHttpClient redirect policy).
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = shared.dns_cache().cloned() {
         builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
     }

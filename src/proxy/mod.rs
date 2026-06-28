@@ -8600,6 +8600,24 @@ pub(crate) async fn connect_websocket_backend(
         }
     }
 
+    // Enforce the backend egress policy for a literal-IP WebSocket backend
+    // before dialing (the dial skips the DnsCacheResolver for IP literals).
+    if let Ok(parsed) = url::Url::parse(backend_url) {
+        let literal_ip = match parsed.host() {
+            Some(url::Host::Ipv4(a)) => Some(std::net::IpAddr::V4(a)),
+            Some(url::Host::Ipv6(a)) => Some(std::net::IpAddr::V6(a)),
+            _ => None,
+        };
+        if let Some(ip) = literal_ip
+            && let Some(reason) = env_config.backend_allow_ips.deny_reason(&ip)
+        {
+            return Err(format!(
+                "backend egress policy denied literal-IP WebSocket backend {ip}: {reason}"
+            )
+            .into());
+        }
+    }
+
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     // Dial the TCP stream ourselves (instead of `connect_async_tls_with_config`)
@@ -13322,6 +13340,22 @@ async fn handle_proxy_request_inner(
             resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref());
         let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
         let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
+        // Enforce the backend egress policy for a literal-IP gRPC backend before
+        // dialing (the gRPC pool skips the DnsCacheResolver for IP literals).
+        if let Some(reason) =
+            denied_literal_backend_ip(grpc_effective_host, &state.env_config.backend_allow_ips)
+        {
+            warn!(
+                proxy_id = %proxy.id,
+                backend = %grpc_effective_host,
+                reason,
+                "Backend egress policy denied literal-IP gRPC backend; not dialing"
+            );
+            return Ok(grpc_proxy::build_grpc_error_response(
+                14,
+                "backend address blocked by egress policy",
+            ));
+        }
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
             grpc_dispatch_proxy,
@@ -17718,6 +17752,45 @@ fn buffered_backend_response_from_body_read(
 /// fall-through), and their request-size check lives inside the backend dispatch
 /// function — i.e. after admission. With the adaptive limiter at capacity, an
 /// oversized upload would then be rejected as a concurrency 503 instead of the
+/// The egress-policy enforcement point for **literal-IP** backends.
+///
+/// reqwest and the H2/gRPC/H3 pools skip the `DnsCacheResolver` for a host that
+/// is already an IP literal (there is nothing to resolve), so the resolver-side
+/// screen never runs for them — only *hostname* backends are screened at dial
+/// time. A denied literal `backend_host`/target (for example a row that DB load
+/// only warned about, or any path that treats an IP as already resolved) would
+/// otherwise be dialed. Returns the denial reason when `host` is a literal IP
+/// blocked by the policy; `None` for hostnames (screened by the resolver) and
+/// allowed IPs.
+fn denied_literal_backend_ip(
+    host: &str,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .and_then(|ip| policy.deny_reason(&ip))
+}
+
+/// Build the fail-closed dispatch result for a literal-IP backend blocked by the
+/// egress policy: a 502 that is NOT retried and is neutral to backend health
+/// (the backend was never dialed), via `ErrorClass::DispatchPolicyRejected`.
+fn backend_egress_denied_dispatch_result(host: &str) -> BackendDispatchResult {
+    backend_dispatch_response(
+        retry::BackendResponse {
+            status_code: 502,
+            body: ResponseBody::Buffered(
+                br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+            ),
+            headers: HashMap::new(),
+            connection_error: false,
+            backend_resolved_ip: Some(host.to_string()),
+            error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        },
+        None,
+        None,
+    )
+}
+
 /// deterministic gateway 413, masking a client/gateway policy violation as
 /// upstream pressure. The reqwest/direct-H2 paths already run their size checks
 /// before admitting; this restores the same ordering. Returns the 413 dispatch
@@ -17834,6 +17907,20 @@ async fn proxy_to_backend(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+
+    // Enforce the backend egress policy for a literal-IP backend before dialing
+    // (reqwest/pools skip the DnsCacheResolver for IP literals).
+    if let Some(reason) =
+        denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP backend; not dialing"
+        );
+        return backend_egress_denied_dispatch_result(effective_host);
+    }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
     // This is the same cache reqwest will use internally via DnsCacheResolver,
@@ -21435,6 +21522,31 @@ async fn proxy_to_backend_http3(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // Enforce the backend egress policy for a literal-IP backend before dialing
+    // (the native-H3/reqwest paths skip the DnsCacheResolver for IP literals).
+    if let Some(reason) =
+        denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP H3 backend; not dialing"
+        );
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: Some(effective_host.to_string()),
+                error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            },
+            None,
+        );
+    }
     let resolved_ip = state
         .dns_cache
         .resolve(
@@ -22649,6 +22761,25 @@ mod tests {
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
+
+    #[test]
+    fn denied_literal_backend_ip_screens_only_denied_literals() {
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
+        // Production default: mode `both` + dangerous-range baseline. This is the
+        // dial-time enforcement point for literal-IP backends (reqwest/the pools
+        // skip the DnsCacheResolver for IP literals).
+        let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+        // Denied literal metadata IPs (incl. NAT64 / IPv4-mapped encodings).
+        assert!(denied_literal_backend_ip("169.254.169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip("64:ff9b::a9fe:a9fe", &policy).is_some());
+        assert!(denied_literal_backend_ip("::ffff:169.254.169.254", &policy).is_some());
+        // Allowed literals (loopback / RFC1918) → not blocked.
+        assert!(denied_literal_backend_ip("127.0.0.1", &policy).is_none());
+        assert!(denied_literal_backend_ip("10.0.0.1", &policy).is_none());
+        // Hostnames are screened by the DnsCacheResolver at resolution time, not
+        // here, so this returns None for them.
+        assert!(denied_literal_backend_ip("metadata.example.com", &policy).is_none());
+    }
     use serde_json::json;
 
     fn streaming_dispatch_test_proxy() -> Proxy {

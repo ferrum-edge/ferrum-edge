@@ -184,6 +184,11 @@ impl SpecExpose {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
+            // Do not follow redirects: a 3xx from an allowed spec host could
+            // otherwise bounce the fetch to an egress-policy-denied IP (matches
+            // the shared PluginHttpClient redirect policy). The literal-IP first
+            // hop is screened above; this closes the redirect bypass.
+            .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(tls_no_verify);
 
         if let Some(dns_cache) = plugin_http_client.dns_cache() {
