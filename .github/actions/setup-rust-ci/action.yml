@@ -1,9 +1,10 @@
 name: Setup Rust CI environment
 description: >-
   Installs the stable Rust toolchain (optional components), wires sccache
-  via setup-sccache, installs Linux native build dependencies and a fast
-  linker in one apt transaction, configures setup-fast-linker, sets up the
-  Swatinem rust-cache, and pre-fetches crate dependencies.
+  via setup-sccache, installs the required Linux native build dependencies
+  (strict) and the optional fast linker (best-effort), configures
+  setup-fast-linker, sets up the Swatinem rust-cache, and pre-fetches crate
+  dependencies.
   sccache caches compiler outputs in the GitHub Actions cache backend;
   rust-cache restores Cargo and target directories with isolated shared keys
   so incompatible job/profile/target artifacts do not mix. Centralizes the
@@ -35,38 +36,64 @@ runs:
 
     - uses: ./.github/actions/setup-sccache
 
-    - name: Install Linux build packages
+    - name: Install required Linux build packages
       if: runner.os == 'Linux'
       shell: bash
       run: |
         set -euo pipefail
 
-        # One apt transaction for the fast linker (mold + clang, paired with
-        # the per-target rustflags in .cargo/config.toml) and the native build
-        # deps the workspace build script needs (protobuf-compiler for
-        # tonic/prost codegen, libcurl4-openssl-dev for native headers).
-        missing_packages=()
+        # Native build deps the workspace build script genuinely needs:
+        # protobuf-compiler for tonic/prost codegen, libcurl4-openssl-dev for
+        # native headers. A missing/failed install here is fatal — these are
+        # not optional. The fast linker (mold + clang) is installed separately
+        # below as best-effort, since setup-fast-linker falls back to the
+        # default linker when they are unavailable.
+        required_packages=()
 
-        if ! command -v mold > /dev/null 2>&1; then
-          missing_packages+=(mold)
-        fi
-        if ! command -v clang > /dev/null 2>&1; then
-          missing_packages+=(clang)
-        fi
         if ! command -v protoc > /dev/null 2>&1; then
-          missing_packages+=(protobuf-compiler)
+          required_packages+=(protobuf-compiler)
         fi
         if ! dpkg -s libcurl4-openssl-dev > /dev/null 2>&1; then
-          missing_packages+=(libcurl4-openssl-dev)
+          required_packages+=(libcurl4-openssl-dev)
         fi
 
-        if [ "${#missing_packages[@]}" -eq 0 ]; then
-          echo "Linux build packages already available"
+        if [ "${#required_packages[@]}" -eq 0 ]; then
+          echo "Required Linux build packages already available"
           exit 0
         fi
 
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+        sudo apt-get install -y --no-install-recommends "${required_packages[@]}"
+
+    - name: Install optional fast-linker packages (best-effort)
+      if: runner.os == 'Linux'
+      shell: bash
+      # Non-fatal: mold + clang are only a linker optimization (paired with the
+      # per-target rustflags in .cargo/config.toml). If either package is
+      # transiently unavailable or an apt mirror fails for just these, do NOT
+      # fail the job — setup-fast-linker's "Configure fast linker" step detects
+      # the missing tools and clears the mold rustflags so cargo uses the
+      # default linker. Build still proceeds, just at default link speed.
+      continue-on-error: true
+      run: |
+        set -euo pipefail
+
+        optional_packages=()
+
+        if ! command -v mold > /dev/null 2>&1; then
+          optional_packages+=(mold)
+        fi
+        if ! command -v clang > /dev/null 2>&1; then
+          optional_packages+=(clang)
+        fi
+
+        if [ "${#optional_packages[@]}" -eq 0 ]; then
+          echo "Fast-linker packages already available"
+          exit 0
+        fi
+
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends "${optional_packages[@]}"
 
     - uses: ./.github/actions/setup-fast-linker
       with:

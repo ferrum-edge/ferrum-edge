@@ -6,6 +6,14 @@ on:
       - ".github/workflows/gateway-api-conformance.yml"
       - ".github/workflows/ci.yml"
       - ".github/actions/package-ferrum-runtime-image/**"
+      # This workflow builds the gateway binary via ./.github/actions/setup-rust-ci
+      # (which wraps setup-sccache and setup-fast-linker). A break in any of those
+      # composite actions can fail the conformance build, so trigger conformance
+      # when they change — otherwise the CI placeholder passes while the real lab
+      # never runs.
+      - ".github/actions/setup-rust-ci/**"
+      - ".github/actions/setup-sccache/**"
+      - ".github/actions/setup-fast-linker/**"
       - "scripts/gateway_api_data_plane_conformance.sh"
       - "Dockerfile"
       - "charts/**"

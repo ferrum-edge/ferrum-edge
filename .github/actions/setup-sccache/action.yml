@@ -28,6 +28,23 @@ runs:
       uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       continue-on-error: true
 
+    - name: Export GitHub Actions cache runtime env
+      # On GitHub-hosted runners the cache service env (ACTIONS_RESULTS_URL /
+      # ACTIONS_RUNTIME_TOKEN) is available to actions/* but is NOT exported
+      # into `run:` shell steps. Without this, the bash guard below would read
+      # them as empty and disable sccache on every job, defeating the cache.
+      # github-script runs in the action context where these are populated, so
+      # propagate them to GITHUB_ENV for the subsequent bash step.
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      with:
+        script: |
+          for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+            const value = process.env[name];
+            if (value) {
+              core.exportVariable(name, value);
+            }
+          }
+
     - name: Configure sccache
       shell: bash
       run: |
