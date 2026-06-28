@@ -57,17 +57,33 @@ All gRPC calls are authenticated with JWT HS256 tokens:
 
 ### Transport Security (TLS/mTLS)
 
-The gRPC channel between CP and DP supports three security modes:
+The gRPC channel between CP and DP carries **Data Plane authentication JWTs and
+the full gateway configuration**. In plaintext both are exposed unencrypted and
+unauthenticated against MITM, so Ferrum is **TLS-first and secure-by-default**:
+
+- The CP **refuses to bind a plaintext gRPC listener on a non-loopback address**
+  (e.g. `0.0.0.0:50051`) when no CP gRPC TLS is configured.
+- The DP **refuses a non-loopback `http://` CP URL**.
+
+Both refusals are lifted only by configuring TLS, by using a loopback address
+(`127.0.0.1`/`::1`/`localhost`, intended for local development), or by the
+explicit escape hatch `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`. Even when
+plaintext is explicitly permitted, a high-severity warning is logged on both the
+CP and the DP every time the channel runs in plaintext.
+
+The gRPC channel supports three security modes:
 
 | Mode | CP Configuration | DP Configuration | Use Case |
 |------|-----------------|-----------------|----------|
-| **Plaintext** | No TLS env vars | `http://` URL | Development, trusted networks |
-| **One-way TLS** | `FERRUM_CP_GRPC_TLS_CERT_PATH` + `_KEY_PATH` | `https://` URL + `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | DP verifies CP identity |
-| **Mutual TLS (mTLS)** | Above + `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | Above + `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` + `_KEY_PATH` | Both sides verify identity |
+| **Plaintext** | No TLS env vars (loopback bind, or `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`) | `http://` loopback URL, or `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` | Local development / trusted networks only |
+| **One-way TLS** | `FERRUM_CP_GRPC_TLS_CERT_PATH` + `_KEY_PATH` | `https://` URL + `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | DP verifies CP identity (recommended minimum) |
+| **Mutual TLS (mTLS)** | Above + `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | Above + `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` + `_KEY_PATH` | Both sides verify identity (recommended for production) |
 
-**One-way TLS**: The CP presents a server certificate; the DP verifies it against a trusted CA. This encrypts the channel and prevents MITM attacks on the JWT token and config data.
+**One-way TLS**: The CP presents a server certificate (`FERRUM_CP_GRPC_TLS_CERT_PATH` + `_KEY_PATH`); the DP verifies it against a trusted CA (`FERRUM_DP_GRPC_TLS_CA_CERT_PATH`, or the system roots for a publicly-trusted CP certificate). This encrypts the channel and prevents MITM attacks on the JWT token and config data. With one-way TLS the **bearer JWT is the only factor authenticating a DP to the CP** — the CP logs a high-severity warning when TLS is configured without `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`.
 
-**Mutual TLS**: In addition to server verification, the CP requires a client certificate from the DP, verified against a trusted CA. This provides certificate-based DP identity in addition to JWT authentication.
+**Mutual TLS (recommended for production)**: In addition to server verification, the CP requires a client certificate from the DP (`FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` + `_KEY_PATH`), verified against a trusted CA (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`). This adds certificate-based DP identity on top of JWT authentication, so a leaked JWT secret alone cannot impersonate a DP.
+
+> **`FERRUM_DP_GRPC_TLS_NO_VERIFY` is not supported** and is rejected at startup when `true`: the tonic-managed gRPC client exposes no hook to skip server certificate verification, so the flag only ever provided false confidence. To test against a CP with a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`.
 
 ### Config Sync Flow
 
@@ -160,7 +176,8 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `cp` |
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | Yes | gRPC listen address (e.g., `0.0.0.0:50051`). Set port to `0` to disable the gRPC listener |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | Yes | gRPC listen address (e.g., `0.0.0.0:50051`). Set port to `0` to disable the gRPC listener. A non-loopback **plaintext** bind (no CP gRPC TLS) is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
+| `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | Permit plaintext gRPC config sync on a non-loopback address (default `false`). Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always allowed; even when permitted, plaintext logs a high-severity warning on both CP and DP |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | No | PEM certificate for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
@@ -175,13 +192,14 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `dp` |
-| `FERRUM_DP_CP_GRPC_URLS` | Yes | Comma-separated priority-ordered CP URLs (`http://` or `https://`) |
+| `FERRUM_DP_CP_GRPC_URLS` | Yes | Comma-separated priority-ordered CP URLs (`http://` or `https://`). A non-loopback `http://` (plaintext) URL is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
+| `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | Permit a non-loopback `http://` (plaintext) CP URL (default `false`). Loopback URLs are always allowed; even when permitted, plaintext logs a high-severity warning |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | Retry primary CP interval when on fallback (default: 300) |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | PEM client cert for mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | PEM client key for mTLS |
-| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | Skip TLS verification (testing only) |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | **Not supported — rejected at startup when `true`.** The client cannot skip server verification; pin the CP CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the read-only Admin API |
 | `FERRUM_PROXY_HTTP_PORT` | No | HTTP proxy port (default: 8000). Set to `0` to disable the plaintext HTTP proxy listener |
 | `FERRUM_PROXY_HTTPS_PORT` | No | HTTPS proxy port (default: 8443) |
@@ -192,24 +210,32 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 
 The CP and DP must use the same `FERRUM_CP_DP_GRPC_JWT_SECRET` value. The DP automatically generates short-lived JWTs (59-minute TTL) from this secret on each connection attempt, and the CP validates them with the same secret. No manual JWT generation is required.
 
-### Control Plane (Plaintext)
+### Control Plane (Plaintext — local development only)
+
+Plaintext is permitted only on a loopback bind address. For a networked CP, use
+the TLS/mTLS examples below, or set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` to
+intentionally run plaintext on a non-loopback address (trusted network only).
 
 ```bash
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL=sqlite://ferrum.db \
 FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
-FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
+FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_DB_POLL_INTERVAL=10 \
 ./ferrum-edge run
 ```
 
-### Data Plane (Plaintext)
+### Data Plane (Plaintext — local development only)
+
+The CP URL must be loopback for plaintext. For a remote CP, use the TLS/mTLS
+examples below, or set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` (trusted network
+only).
 
 ```bash
 FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051 \
+FERRUM_DP_CP_GRPC_URLS=http://localhost:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
 FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 FERRUM_PROXY_HTTP_PORT=8000 \

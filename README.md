@@ -150,32 +150,40 @@ FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
 cargo run --release -- run
 ```
 
-### Control Plane + Data Plane
+### Control Plane + Data Plane (local development)
+
+The CP→DP gRPC channel carries Data Plane authentication JWTs and the full
+gateway configuration, so it is **TLS-first and secure-by-default**: the CP
+refuses to bind a plaintext gRPC listener on a non-loopback address, and the DP
+refuses a non-loopback `http://` CP URL, unless TLS is configured (or plaintext
+is explicitly permitted — see below). The loopback quickstart below runs as-is;
+any networked deployment must use TLS.
 
 ```bash
-# Control Plane
+# Control Plane (loopback + plaintext — local development only)
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
 FERRUM_ADMIN_JWT_SECRET="admin-secret" \
-FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
+FERRUM_CP_GRPC_LISTEN_ADDR="127.0.0.1:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release -- run
 
-# Data Plane (single CP)
+# Data Plane (single CP, loopback — local development only)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="http://localhost:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release -- run
 
-# Data Plane (multi-CP failover — connects to primary, fails over to secondary)
+# Data Plane (multi-CP failover over TLS — production shape)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="https://cp1:50051,https://cp2:50051,https://cp3:50051" \
+FERRUM_DP_GRPC_TLS_CA_CERT_PATH="/certs/ca.pem" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release -- run
 ```
 
-For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls). For multi-region high availability, see [docs/multi_region_ha.md](docs/multi_region_ha.md).
+For production CP/DP with TLS/mTLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls). To intentionally run plaintext config sync on a networked address (trusted network, with compensating controls), set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` on both the CP and the DP. For multi-region high availability, see [docs/multi_region_ha.md](docs/multi_region_ha.md).
 
 ## Default Ports
 

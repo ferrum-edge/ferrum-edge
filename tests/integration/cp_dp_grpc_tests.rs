@@ -1815,7 +1815,6 @@ async fn test_dp_connects_to_cp_with_tls() {
         ca_cert_pem: Some(ca_pem),
         client_cert_pem: None,
         client_key_pem: None,
-        no_verify: false,
     };
 
     // See `test_dp_receives_initial_config_from_cp` for why this is
@@ -1910,7 +1909,6 @@ async fn test_dp_connects_to_cp_with_mtls() {
         ca_cert_pem: Some(ca_pem),
         client_cert_pem: Some(client_cert_pem),
         client_key_pem: Some(client_key_pem),
-        no_verify: false,
     };
 
     // See `test_dp_receives_initial_config_from_cp` for why this is
@@ -1981,7 +1979,6 @@ async fn test_dp_rejects_untrusted_cp_server_cert() {
         ca_cert_pem: Some(different_ca_pem),
         client_cert_pem: None,
         client_key_pem: None,
-        no_verify: false,
     };
 
     let result = timeout(

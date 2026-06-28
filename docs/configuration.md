@@ -246,8 +246,9 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP, DP & mesh modes | — | Shared JWT secret for CP/DP/mesh gRPC auth (DP/mesh clients generate short-lived JWTs, CP validates). Must be at least 32 characters |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC. **Secure-by-default:** binding a non-loopback address in plaintext (no CP gRPC TLS) is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
+| `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | `false` | Permit plaintext (non-TLS) CP/DP gRPC config sync on a non-loopback address. When `false`, the CP refuses to bind a non-loopback plaintext gRPC listener and the DP refuses a non-loopback `http://` CP URL — the channel carries DP authentication JWTs and the full gateway config, which plaintext exposes unencrypted and unauthenticated against MITM. Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always permitted for local development. Set `true` only on a trusted network with compensating controls; a high-severity warning is logged whenever plaintext is used (CP and DP) |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP, DP & mesh modes | — | Shared JWT secret for CP/DP/mesh gRPC auth (DP/mesh clients generate short-lived JWTs, CP validates). Must be at least 32 characters. This is the only DP authentication factor unless CP gRPC mTLS (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`) is configured |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate. File/provider/Kubernetes-backed sources are watched in CP mode; new handshakes use rotated material after validation |
 | `FERRUM_CP_GRPC_TLS_CERT_SOURCE` | If CP gRPC TLS and set | — | Source override for `FERRUM_CP_GRPC_TLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key. File/provider/Kubernetes-backed sources are watched with the cert and optional client CA |
@@ -268,7 +269,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_SOURCE` | No | — | Source override for `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | — | DP client private key for CP mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_SOURCE` | No | — | Source override for `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |
-| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | Skip DP gRPC TLS verification (testing only). Refused when `FERRUM_MESH_PRODUCTION_MODE=true` and remote-cluster discovery is enabled |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | **Not supported — rejected at startup when `true`.** The tonic-managed CP/DP gRPC client exposes no hook to skip server certificate verification, so the flag only ever offered false confidence. To connect to a CP presenting a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` (one-way TLS) or supply `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`/`KEY_PATH` (mTLS) |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
 

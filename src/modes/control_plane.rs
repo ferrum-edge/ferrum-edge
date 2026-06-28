@@ -948,12 +948,13 @@ pub async fn run(
         );
     }
 
-    // gRPC listener (with optional TLS/mTLS, disabled when port is 0)
-    let grpc_addr: SocketAddr = if let Some(ref addr) = env_config.cp_grpc_listen_addr {
-        addr.parse()?
-    } else {
-        env_config.admin_socket_addr(50051)
-    };
+    // gRPC listener (with optional TLS/mTLS, disabled when port is 0).
+    // Resolution is shared with EnvConfig::validate() so the secure-by-default
+    // plaintext gate (validate_cp_dp_grpc_transport_security) reasons about the
+    // exact address this binds.
+    let grpc_addr: SocketAddr = env_config
+        .cp_grpc_socket_addr()
+        .map_err(anyhow::Error::msg)?;
 
     let grpc_handle = if grpc_addr.port() != 0 {
         let grpc_tls_slot = if let (Some(_cert_path), Some(_key_path)) = (
@@ -980,8 +981,11 @@ pub async fn run(
             if env_config.cp_grpc_tls_client_ca_path.is_some() {
                 info!("CP gRPC TLS configured with mTLS; new handshakes use the active TLS slot");
             } else {
-                info!(
-                    "CP gRPC TLS configured without client certificate verification; new handshakes use the active TLS slot"
+                warn!(
+                    "SECURITY: CP gRPC TLS is configured WITHOUT client certificate verification \
+                     (no FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH) — the only thing authenticating a Data \
+                     Plane is its bearer JWT. Configure FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH to require \
+                     DP client certificates (mTLS) for certificate-based DP identity in production."
                 );
             }
             Some(reload_handles.slot)
@@ -991,7 +995,27 @@ pub async fn run(
                     "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH is set but cert/key are missing — ignoring client CA"
                 );
             }
-            info!("CP gRPC server running in plaintext mode (no TLS configured)");
+            // EnvConfig::validate() has already refused a non-loopback plaintext
+            // bind unless FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true, so reaching here
+            // means either a loopback bind or an explicit operator opt-in. Either
+            // way, surface a high-severity warning — DP JWTs and the full gateway
+            // config travel unencrypted.
+            if grpc_addr.ip().is_loopback() {
+                warn!(
+                    "SECURITY: CP gRPC config sync is running in PLAINTEXT on loopback {grpc_addr} \
+                     — acceptable for local development only. DP authentication JWTs and the full \
+                     gateway configuration are unencrypted. Configure FERRUM_CP_GRPC_TLS_CERT_PATH \
+                     + FERRUM_CP_GRPC_TLS_KEY_PATH before exposing this CP off-host."
+                );
+            } else {
+                warn!(
+                    "SECURITY: CP gRPC config sync is running in PLAINTEXT on non-loopback \
+                     {grpc_addr} because FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true is set. DP \
+                     authentication JWTs and the full gateway configuration are exposed UNENCRYPTED \
+                     to the network and unprotected against MITM. Use TLS \
+                     (FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH) in production."
+                );
+            }
             None
         };
 

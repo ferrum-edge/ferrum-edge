@@ -122,10 +122,6 @@ pub struct DpGrpcTlsConfig {
     pub client_cert_pem: Option<Vec<u8>>,
     /// Client private key PEM bytes for mTLS.
     pub client_key_pem: Option<Vec<u8>>,
-    /// Skip server certificate verification (testing only).
-    /// When true and no `ca_cert_pem` is set, the client accepts any server cert.
-    #[allow(dead_code)]
-    pub no_verify: bool,
 }
 
 pub struct DpGrpcTlsReload {
@@ -161,7 +157,6 @@ pub fn build_dp_grpc_tls_config(
 ) -> Result<Option<DpGrpcTlsConfig>, anyhow::Error> {
     let has_tls = env_config.dp_grpc_tls_ca_cert_path.is_some()
         || env_config.dp_grpc_tls_client_cert_path.is_some()
-        || env_config.dp_grpc_tls_no_verify
         || cp_urls.iter().any(|u| u.starts_with("https://"));
 
     if !has_tls {
@@ -216,8 +211,6 @@ pub fn build_dp_grpc_tls_config(
         info!("{label} gRPC TLS configured with mTLS (CA cert + client cert)");
     } else if ca_cert_pem.is_some() {
         info!("{label} gRPC TLS configured with server verification (CA cert)");
-    } else if env_config.dp_grpc_tls_no_verify {
-        warn!("{label} gRPC TLS configured with server verification DISABLED (testing mode)");
     } else {
         info!("{label} gRPC TLS configured (https URL, system roots)");
     }
@@ -226,7 +219,6 @@ pub fn build_dp_grpc_tls_config(
         ca_cert_pem,
         client_cert_pem,
         client_key_pem,
-        no_verify: env_config.dp_grpc_tls_no_verify,
     }))
 }
 
