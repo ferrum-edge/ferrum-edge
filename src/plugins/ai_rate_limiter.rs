@@ -828,32 +828,49 @@ fn requested_completion_tokens(json: &Value) -> u64 {
     top_level.max(nested)
 }
 
-/// Top-level fields that mark a JSON body as an LLM/AI request across the provider
-/// shapes this plugin understands (OpenAI chat/completions/Responses/embeddings,
-/// Anthropic, Gemini/Vertex, Cohere, Amazon Titan, TGI/HuggingFace). Used to gate
-/// the AI-request marker so an ordinary non-LLM JSON `POST` sharing a proxy with
-/// an AI route is not subjected to the `on_unmetered_response` policy.
-const AI_REQUEST_MARKER_FIELDS: &[&str] = &[
-    "messages",     // OpenAI / Anthropic / Mistral chat
-    "prompt",       // legacy completions
-    "input",        // OpenAI Responses / embeddings
+/// Strong, LLM-idiomatic top-level fields — each marks an AI request on its own.
+/// These (chat message arrays, Gemini `contents`, Cohere `chat_history`, TGI/Titan
+/// inputs, the legacy completions `prompt`) do not appear in ordinary non-LLM JSON,
+/// so classifying on them does not risk a false `on_unmetered_response` rejection.
+/// `system` is intentionally absent: an Anthropic body always carries `messages`,
+/// so a bare top-level `system` (a common generic word) is never the sole signal.
+const AI_REQUEST_STRONG_MARKERS: &[&str] = &[
+    "messages",     // OpenAI / Anthropic / Mistral chat (array)
+    "contents",     // Google Gemini / Vertex (array)
+    "chat_history", // Cohere history (array)
     "inputs",       // TGI / HuggingFace
     "inputText",    // Amazon Titan
-    "contents",     // Google Gemini / Vertex
-    "system",       // Anthropic system prompt
-    "chat_history", // Cohere history
-    "message",      // Cohere current turn
+    "prompt",       // legacy completions
+    "input",        // OpenAI Responses / embeddings
 ];
 
-/// Whether a parsed request body looks like an LLM/AI call (carries at least one
-/// recognized request field). A JSON object that has none of these is treated as
-/// non-AI traffic and left out of the token-budget / unmetered-response path.
+/// Generic words that ALSO appear in ordinary non-LLM JSON (e.g. `{"message":
+/// "contact me"}`). They mark an AI request only when corroborated by a top-level
+/// `model` field — which real LLM requests (Cohere v2 chat) carry — so a bare
+/// `{"message": "..."}` on a shared proxy is NOT classified as AI and is never
+/// turned into a false 502 under `reject`. (`input` stays strong: as a top-level
+/// request field it is LLM-idiomatic — OpenAI Responses/embeddings — and Codex
+/// flagged only the much more generic `message`.)
+const AI_REQUEST_WEAK_MARKERS: &[&str] = &["message"];
+
+/// Whether a parsed request body looks like an LLM/AI call. A strong marker alone
+/// qualifies; a generic weak marker qualifies only alongside a top-level `model`.
+/// A JSON object matching neither is treated as non-AI traffic and left out of the
+/// token-budget / unmetered-response path.
 fn json_looks_like_ai_request(json: &Value) -> bool {
-    json.as_object().is_some_and(|obj| {
-        AI_REQUEST_MARKER_FIELDS
+    let Some(obj) = json.as_object() else {
+        return false;
+    };
+    if AI_REQUEST_STRONG_MARKERS
+        .iter()
+        .any(|field| obj.contains_key(*field))
+    {
+        return true;
+    }
+    obj.contains_key("model")
+        && AI_REQUEST_WEAK_MARKERS
             .iter()
             .any(|field| obj.contains_key(*field))
-    })
 }
 
 /// True when a `content-encoding` header marks the request body as encoded with
@@ -942,23 +959,21 @@ const BINARY_CONTENT_KEYS: &[&str] = &[
     "file_data",
 ];
 
-/// Whether an Anthropic-style `source` block carries TEXT (prose to count toward
-/// the estimate) rather than a binary image/PDF blob (base64, to skip). A text
-/// document block declares `type:"text"` or a `text/*` media type; every other
-/// shape (`base64`, `url`, `file`, …) is treated as binary. Keeping this narrow
-/// means a real image source still can't inflate the estimate while a document's
-/// prose — which the provider bills as input tokens — is no longer dropped.
+/// Whether an Anthropic-style `source` block carries TEXT prose to count toward
+/// the estimate, rather than a binary blob to skip. Only an explicit
+/// `type:"text"` source (the Anthropic text-document shape
+/// `source:{type:"text",media_type:"text/plain",data:"<prose>"}`) qualifies. We
+/// deliberately do NOT key off `media_type` alone: a base64 source can declare
+/// `media_type:"text/plain"` (`type:"base64"`) while its `data` is encoded bytes,
+/// and counting those would charge the ~33%-inflated base64 payload as prompt
+/// text — the exact over-count `BINARY_CONTENT_KEYS` exists to prevent. Every
+/// non-`text` shape (`base64`, `url`, `file`, …) is treated as binary and skipped.
 fn source_is_text_document(value: &Value) -> bool {
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    if obj.get("type").and_then(Value::as_str) == Some("text") {
-        return true;
-    }
-    obj.get("media_type")
-        .or_else(|| obj.get("mediaType"))
+    value
+        .as_object()
+        .and_then(|obj| obj.get("type"))
         .and_then(Value::as_str)
-        .is_some_and(|media_type| media_type.starts_with("text/"))
+        == Some("text")
 }
 
 fn string_value_character_count(value: &Value) -> u64 {

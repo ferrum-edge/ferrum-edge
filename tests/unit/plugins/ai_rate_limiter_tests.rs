@@ -2080,8 +2080,8 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
     // When an LLM-shaped body uses none of the prompt fields
     // `prompt_character_count` recognizes (system/messages/prompt/input/
     // contents/tools), the estimate falls back to counting the whole JSON body's
-    // string values (minus the max_* keys). A Cohere-native body (`message` — an
-    // AI-request marker, but not one of the counted prompt fields) exercises that
+    // string values (minus the max_* keys). A TGI body (`inputs` — a strong
+    // AI-request marker, but not one of the itemized prompt fields) exercises that
     // fallback branch while still passing the LLM-shape gate.
     let plugin = AiRateLimiter::new(
         &json!({
@@ -2099,12 +2099,12 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    // Cohere-native `message` is an AI-request marker but is NOT among the fields
+    // TGI `inputs` is a strong AI-request marker but is NOT among the fields
     // `prompt_character_count` sums, so the estimate falls back to counting the
-    // whole body's string values (minus the max_* keys): 8 chars -> ceil(8/4) = 2.
+    // whole body's string values (minus the max_* keys): 7 chars -> ceil(7/4) = 2.
     ctx.metadata.insert(
         "request_body".to_string(),
-        serde_json::to_string(&json!({"message": "01234567"})).unwrap(),
+        serde_json::to_string(&json!({"inputs": "yyyyyyy"})).unwrap(),
     );
 
     let mut headers = HashMap::new();
@@ -3062,6 +3062,37 @@ async fn prompt_mode_counts_text_document_source_but_skips_binary() {
         "binary image source must not be counted as prompt text (got {})",
         reserved_tokens(&ctx_bin)
     );
+
+    // A base64 source that merely declares a `text/*` media type is still encoded
+    // bytes, not prose — it must be skipped (counting it would charge the inflated
+    // base64 payload as prompt text). Only an explicit `type:"text"` source counts.
+    let big_b64_text = "A".repeat(4000);
+    let plugin_b64 = AiRateLimiter::new(
+        &json!({"token_limit": 100_000, "window_seconds": 60, "count_mode": "prompt_tokens", "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx_b64 = create_test_context();
+    ctx_b64.method = "POST".to_string();
+    ctx_b64
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx_b64.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": big_b64_text}}
+            ]}]
+        }))
+        .unwrap(),
+    );
+    let mut h_b64 = HashMap::new();
+    assert_continue(plugin_b64.before_proxy(&mut ctx_b64, &mut h_b64).await);
+    assert!(
+        reserved_tokens(&ctx_b64) < 100,
+        "a base64 source with a text/* media type must NOT be counted (got {})",
+        reserved_tokens(&ctx_b64)
+    );
 }
 
 #[tokio::test]
@@ -3106,6 +3137,45 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
+    );
+
+    // A bare generic `message` (no `model`) is NOT an LLM request — the exact
+    // common shape that must not be turned into a 502 on a shared proxy.
+    let mut msg_ctx = create_test_context();
+    msg_ctx.method = "POST".to_string();
+    msg_ctx
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    msg_ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({"message": "contact me"})).unwrap(),
+    );
+    let mut msg_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut msg_ctx, &mut msg_headers).await);
+    assert!(
+        !msg_ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a bare `message` without `model` must not be marked as an AI request"
+    );
+
+    // But the same generic field WITH a `model` (Cohere v2) IS an AI request.
+    let mut cohere_ctx = create_test_context();
+    cohere_ctx.method = "POST".to_string();
+    cohere_ctx
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    cohere_ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({"model": "command-r", "message": "hi"})).unwrap(),
+    );
+    let mut cohere_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .before_proxy(&mut cohere_ctx, &mut cohere_headers)
+            .await,
+    );
+    assert!(
+        cohere_ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a `message` corroborated by `model` must be marked as an AI request"
     );
 
     // Contrast: an LLM-shaped request with a usage-less 2xx IS rejected.
