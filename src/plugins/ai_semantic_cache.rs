@@ -1249,7 +1249,16 @@ fn append_multimodal_part_descriptor(
 }
 
 fn is_text_content_part(part: &Value) -> bool {
+    // A part counts as "text" only when it has `type: "text"` AND a string
+    // `text` field — exactly the shape `extract_message_content` folds into the
+    // message text. Without the string-`text` requirement a malformed part like
+    // `{"type": "text"}` (no usable `text`) would be skipped here yet also
+    // skipped by `extract_message_content`, contributing to neither half of the
+    // cache key, so two requests differing only in such a part would collide.
+    // Requiring a string `text` makes the text/non-text partition exhaustive:
+    // such malformed parts fall through to fingerprinting instead.
     part.get("type").and_then(|t| t.as_str()) == Some("text")
+        && part.get("text").and_then(|t| t.as_str()).is_some()
 }
 
 fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {

@@ -14159,7 +14159,7 @@ components:
           type: string
           enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
           default: exact_only
-          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. Values are trimmed and case-insensitive; `_` and `-` aliases are accepted.
+          description: Multimodal request caching mode for non-text content parts. `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. The runtime parser trims surrounding whitespace and is case-insensitive (e.g. `"Reject"`, `" exact_only "` are accepted), and `_`/`-` aliases are interchangeable; admin-API config validation runs through this lenient parser, not the schema `enum`. The `enum` lists only canonical/alias forms because JSON Schema cannot express case-insensitivity — strict schema validators may reject mixed-case or padded inputs the gateway itself accepts.
         semantic_similarity_enabled:
           type: boolean
           default: false

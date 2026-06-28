@@ -713,6 +713,60 @@ async fn exact_cache_key_treats_mixed_case_text_type_as_non_text() {
 }
 
 #[tokio::test]
+async fn exact_cache_key_treats_text_type_without_string_text_as_non_text() {
+    // A part typed "text" but lacking a usable string `text` field (e.g.
+    // `{"type": "text", "text": 123}`) is NOT folded into the message text by
+    // `extract_message_content`, so it must also be treated as non-text by the
+    // fingerprint and folded into the exact key. Otherwise such parts land in a
+    // seam (skipped by both halves) and two requests differing only in that
+    // part would collide. Here the two bodies differ ONLY in the non-string
+    // `text` value of that malformed part, so the difference can ONLY surface
+    // through the multimodal fingerprint.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body_a = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe it"},
+                {"type": "text", "text": 123}
+            ]
+        }]
+    });
+    let body_b = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe it"},
+                {"type": "text", "text": 456}
+            ]
+        }]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_a).unwrap(),
+        None,
+        b"A",
+    )
+    .await;
+
+    let (ctx_b, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a \"text\"-typed part without a string `text` must be fingerprinted, so a differing non-string value is an exact MISS"
+    );
+    assert_eq!(
+        ctx_b.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS"),
+        "bodies differing only in a malformed text part's value must not collide"
+    );
+}
+
+#[tokio::test]
 async fn semantic_cache_scope_differs_for_different_image_url() {
     let mock_server = MockServer::start().await;
     mount_embedding_mock(&mock_server, 2).await;
