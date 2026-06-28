@@ -1930,6 +1930,94 @@ async fn multimodal_reject_provider_falls_through_to_translate_provider() {
 }
 
 #[tokio::test]
+async fn text_only_with_warning_drop_metadata_not_written_on_failover() {
+    // Regression: the `ai_federation_multimodal_*` drop metadata must reflect
+    // the provider that actually SERVED the request, not a `text_only` provider
+    // that was tried first and failed over. Provider1 (text_only_with_warning)
+    // returns a fallback-eligible 500; provider2 (translate) then serves the
+    // request with the image PRESERVED. The transaction log must NOT claim parts
+    // were dropped, because the serving provider kept them.
+    let drop_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": {"message": "upstream down"}
+        })))
+        .mount(&drop_server)
+        .await;
+
+    let serve_server = MockServer::start().await;
+    mount_anthropic_success(&serve_server).await;
+
+    let config = json!({
+        "providers": [
+            {
+                "name": "openai-text-only",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "model_patterns": ["multi-*"],
+                "priority": 1,
+                "base_url": drop_server.uri(),
+                "allow_plaintext": true,
+                "multimodal_mode": "text_only_with_warning"
+            },
+            {
+                "name": "anthropic-translate",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant-test",
+                "model_patterns": ["multi-*"],
+                "priority": 2,
+                "base_url": serve_server.uri(),
+                "allow_plaintext": true,
+                "multimodal_mode": "translate"
+            }
+        ]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    // Data URL so the translate-mode provider can actually serve the image.
+    let body = translate_image_request("multi-model", "data:image/png;base64,aGVsbG8=");
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(
+            status_code, 200,
+            "the translate provider should serve after failover"
+        ),
+        other => panic!("expected fallback provider response (200), got {other:?}"),
+    }
+
+    // The serving (translate) provider preserved the image as a real image
+    // block — it was NOT dropped.
+    let outbound = first_received_json(&serve_server).await;
+    let content = outbound["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[1]["type"], "image");
+
+    // No drop metadata may be present: the serving provider kept the image, so
+    // claiming parts were dropped (and naming the first provider) would be a
+    // false audit/chargeback record.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_federation_multimodal_dropped_parts"),
+        "drop metadata must not be written when the serving provider preserved the image"
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_federation_multimodal_mode"),
+        "multimodal mode metadata must reflect the serving provider, not the failed text_only one"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_federation_multimodal_provider"),
+        "multimodal provider metadata must not name the failed text_only provider"
+    );
+    // The committed provider is recorded via the normal token-metadata path.
+    assert_eq!(
+        ctx.metadata.get("ai_federation_provider"),
+        Some(&"anthropic-translate".to_string())
+    );
+}
+
+#[tokio::test]
 async fn multimodal_all_reject_providers_return_clean_400() {
     // When EVERY matching provider declines the multimodal request at the
     // policy gate and none is ever dialed, the caller receives a clean 400

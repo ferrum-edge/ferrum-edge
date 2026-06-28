@@ -2524,7 +2524,12 @@ impl Plugin for AiFederation {
             if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
                 && !multimodal_usage.is_empty()
             {
-                self.write_multimodal_text_only_metadata(ctx, provider, &multimodal_usage);
+                // Per-attempt warning only. The `ai_federation_multimodal_*`
+                // audit/chargeback metadata is written at COMMIT time (next to
+                // `write_token_metadata`, once this provider actually serves the
+                // request) — not here. If this provider later fails over to a
+                // `translate`-mode provider that preserves the image, writing the
+                // "dropped" metadata now would misreport the serving provider.
                 warn!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
@@ -2612,6 +2617,19 @@ impl Plugin for AiFederation {
                         &provider.name,
                         &resolved_model,
                     );
+
+                    // Record the multimodal-drop audit/chargeback metadata only
+                    // now that THIS provider has committed to serving the
+                    // request. Writing it pre-dispatch would leave stale "parts
+                    // dropped" keys (naming the wrong provider) in the
+                    // transaction log if a `text_only_with_warning` provider
+                    // failed over to a later `translate` provider that preserved
+                    // the image.
+                    if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                        && !multimodal_usage.is_empty()
+                    {
+                        self.write_multimodal_text_only_metadata(ctx, provider, &multimodal_usage);
+                    }
 
                     info!(
                         provider = %provider.name,
