@@ -461,9 +461,9 @@ pub struct RequestContext {
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
-    pub ai_semantic_cache_embedding: Option<Vec<f32>>,
+    pub(crate) ai_semantic_cache_embedding: Option<Vec<f32>>,
     /// Semantic-cache scope key paired with `ai_semantic_cache_embedding`.
-    pub ai_semantic_cache_scope_key: Option<String>,
+    pub(crate) ai_semantic_cache_scope_key: Option<String>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.

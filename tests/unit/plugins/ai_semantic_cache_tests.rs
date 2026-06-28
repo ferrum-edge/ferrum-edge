@@ -1,4 +1,7 @@
-use ferrum_edge::_test_support::rebuild_ai_semantic_cache_vector_index;
+use ferrum_edge::_test_support::{
+    ai_semantic_cache_embedding, ai_semantic_cache_scope_key,
+    rebuild_ai_semantic_cache_vector_index,
+};
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -710,7 +713,7 @@ async fn cache_does_not_store_raw_multimodal_url_in_metadata() {
             );
         }
     }
-    if let Some(scope_key) = &ctx.ai_semantic_cache_scope_key {
+    if let Some(scope_key) = ai_semantic_cache_scope_key(&ctx) {
         assert!(!scope_key.contains(url));
         assert!(!scope_key.contains("private-image.png"));
     }
@@ -819,11 +822,11 @@ async fn exact_only_multimodal_skips_semantic_embedding_call() {
         Some("MISS")
     );
     assert!(
-        ctx.ai_semantic_cache_embedding.is_none(),
+        ai_semantic_cache_embedding(&ctx).is_none(),
         "default exact_only mode must not compute text-only embeddings for multimodal requests"
     );
     assert!(
-        ctx.ai_semantic_cache_scope_key.is_none(),
+        ai_semantic_cache_scope_key(&ctx).is_none(),
         "default exact_only mode must not store semantic scope for multimodal requests"
     );
 }
