@@ -983,94 +983,148 @@ jobs:
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
 
   gateway-api-conformance:
-    name: Gateway API Conformance
+    name: Gateway API Conformance (CI mirror)
     if: github.event_name == 'pull_request'
-    needs: build-gateway-binary
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
-      KIND_VERSION: v0.27.0
-      KUBECTL_VERSION: v1.32.3
-      GATEWAY_API_VERSION: v1.5.1
-      GATEWAY_API_PROFILE: GATEWAY-HTTP
-      GATEWAY_API_SUPPORTED_FEATURES: Gateway,ReferenceGrant,HTTPRoute
+    # Backstop above the in-script poll bounds (discovery <=30 min +
+    # status <=140 min) so the graceful "Timed out" branch is reachable and
+    # the job is never force-killed at GitHub's 360-min default.
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Check for Gateway API conformance changes
-        id: changes
+      - name: Mirror dedicated Gateway API conformance result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: gateway-api-conformance.yml
+          # This CI run's own id, used to derive the floor timestamp below so we
+          # only mirror a dedicated run created for the *current* event.
+          CI_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/(ci|gateway-api-conformance)\.yml|\.github/actions/package-ferrum-runtime-image/|scripts/gateway_api_data_plane_conformance\.sh|Cargo\.(toml|lock)|Dockerfile|charts/ferrum-mesh/|proto/|src/config/env_config\.rs|src/config_sources/k8s/|src/grpc/|src/k8s_controller/|src/modes/(control_plane|data_plane|mesh)/|src/proxy/|src/router_cache\.rs|src/load_balancer\.rs|src/plugins/mesh_route_dispatch\.rs)'; then
-            echo "gateway_api_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "gateway_api_changed=false" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Gateway API Conformance"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # A reused head commit (PR close/reopen, or re-running CI without a new
+          # commit) can surface an OLDER gateway-api-conformance.yml run for this
+          # same head_sha that still matches the PR-number filter. Selecting "the
+          # most recent run for this PR" would then `break` on that stale run and
+          # mirror its old conclusion instead of the current attempt's. To make a
+          # reused-SHA stale run unselectable, floor the search by this CI run's
+          # own trigger time: both this CI run and the dedicated conformance run
+          # are launched by the *same* `pull_request` event, so the dedicated run
+          # we want has `created_at` at/after this CI run's `created_at`. A prior
+          # attempt's run for the same SHA was created on an earlier event and is
+          # always strictly older, so the floor drops it.
+          #
+          # `created_at` (event/trigger time) is shared across workflows for one
+          # event, unlike `run_started_at` (runner pickup time, which varies with
+          # queue depth). Subtract a small skew tolerance so a few seconds of
+          # per-workflow registration jitter on the *same* event never excludes
+          # the run we want; this window is far smaller than the minutes-to-hours
+          # gap to any prior attempt for the same SHA.
+          SKEW_TOLERANCE_SECONDS=120
+          ci_created_at=""
+          for _ in $(seq 1 10); do
+            ci_created_at="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
+                --jq '.created_at // empty' 2>/dev/null || true
+            )"
+            if [ -n "$ci_created_at" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$ci_created_at" ]; then
+            echo "Could not resolve this CI run's created_at to floor the conformance run search." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # GNU date on the ubuntu runner; falls back to BSD date for local use.
+          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || echo "${ci_created_at}")"
+          echo "Only mirroring dedicated runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
+
+          # Among dedicated runs for this head_sha that are at/after the floor,
+          # prefer the most recent run whose `.pull_requests[]` includes THIS PR
+          # number; only when none match (cross-fork PR runs report an empty
+          # `.pull_requests`) fall back to the most recent in-window head_sha run
+          # so forked PRs still get a result. The `created_at >= env.SINCE` floor
+          # is applied to BOTH paths so a stale same-SHA run cannot satisfy either.
+          # `gh api --jq` runs gojq, which has no `--arg` flag (that's a flag of
+          # the standalone `jq` binary, not of `gh`). Passing `--arg` makes `gh`
+          # exit non-zero with "unknown flag", and the surrounding
+          # `2>/dev/null || true` would silently swallow it, leaving `run_id`
+          # empty and failing the gate on every PR. Instead, read the values
+          # inside the program via gojq's `env` builtin: `PR_NUMBER` is exported
+          # in the step `env:` block, and `SINCE` is exported here so the jq
+          # program can reference `env.SINCE`.
+          export SINCE="${since}"
+          run_id=""
+          for _ in $(seq 1 60); do
+            # `env.PR_NUMBER` / `env.SINCE` below read process env from inside
+            # the jq program, so it is intentionally single-quoted.
+            # shellcheck disable=SC2016
+            run_id="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
+                --jq '
+                  [.workflow_runs[]]
+                  | map(select(.created_at >= env.SINCE))
+                  | sort_by(.created_at) | reverse
+                  | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
+                    // (.[0].id)
+                    // empty
+                ' 2>/dev/null || true
+            )"
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 30
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "Dedicated Gateway API conformance workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
-      - name: Set up Go
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
-        with:
-          go-version: "1.25.x"
-          cache: false
+          echo "Mirroring dedicated workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install Kubernetes tools
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          # ~280 polls * 30s ~= 140 min, comfortably under this job's
+          # timeout-minutes cap so the graceful timeout branch is reachable.
+          # The dedicated lab has a 90-min job timeout plus queue time, so a
+          # ~140-min ceiling leaves margin for it to finish and report.
+          for _ in $(seq 1 280); do
+            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
+            if [ -z "$run_json" ]; then
+              sleep 30
+              continue
+            fi
+            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
+            if [ -z "$status" ]; then
+              sleep 30
+              continue
+            fi
+            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Dedicated Gateway API conformance workflow passed." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Dedicated Gateway API conformance workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            sleep 30
+          done
 
-      - name: Download prebuilt gateway binary
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
-          path: target/debug
-
-      - name: Package Ferrum image
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: ./.github/actions/package-ferrum-runtime-image
-        with:
-          binary-path: target/debug/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE }}
-
-      - name: Set up Ferrum Gateway API lab
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh setup
-
-      - name: Run upstream Gateway API conformance
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        id: conformance
-        run: bash scripts/gateway_api_data_plane_conformance.sh upstream
-
-      - name: Run Ferrum Gateway API black-box checks
-        if: steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
-
-      - name: Collect Gateway API conformance diagnostics
-        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
-        run: bash scripts/gateway_api_data_plane_conformance.sh diagnostics
-
-      - name: Upload Gateway API conformance artifacts
-        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: gateway-api-conformance-${{ env.GATEWAY_API_VERSION }}
-          path: conformance-results/
-
-      - name: Summarize Gateway API conformance skip
-        if: steps.changes.outputs.gateway_api_changed != 'true'
-        run: |
-          echo "## Gateway API Conformance" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Skipped: this PR does not touch Gateway API, controller, data-plane, routing, chart, image, proto, script, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+          echo "Timed out after ~140 min waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
@@ -1580,6 +1634,76 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  detect-ebpf-live-changes:
+    name: Detect eBPF/Netns Live Changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect live-kernel-sensitive paths
+        id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
+          changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/ci.yml|\
+              .github/workflows/node-waypoint-ebpf-live.yml|\
+              .github/actions/setup-rust-ci/*|.github/actions/setup-rust-ci/**|\
+              .github/actions/setup-sccache/*|.github/actions/setup-sccache/**|\
+              .github/actions/setup-fast-linker/*|.github/actions/setup-fast-linker/**|\
+              Cargo.toml|Cargo.lock|.cargo/*|.cargo/**|rust-toolchain.toml|build.rs|proto/*|proto/**|\
+              ebpf/*|ebpf/**|\
+              src/capture/*|src/capture/**|\
+              src/ebpf/*|src/ebpf/**|\
+              src/grpc/*|src/grpc/**|\
+              src/identity/*|src/identity/**|\
+              src/k8s_controller/*|src/k8s_controller/**|\
+              src/modes/control_plane.rs|\
+              src/modes/mesh/*|src/modes/mesh/**|\
+              src/modes/node_agent.rs|src/modes/node_agent_cni_server.rs|\
+              src/plugins/mesh/*|src/plugins/mesh/**|src/plugins/prometheus_metrics.rs|\
+              src/proxy/hbone_pool.rs|src/proxy/hbone_proxy.rs|src/proxy/mesh_mtls_pool.rs|\
+              src/proxy/mesh_tcp_egress.rs|src/proxy/mesh_tcp_inbound.rs|\
+              src/proxy/mesh_udp_capture.rs|src/proxy/mesh_udp_frame.rs|src/proxy/mod.rs|\
+              src/proxy/netns_capture.rs|src/proxy/tcp_proxy.rs|src/proxy/udp_batch.rs|\
+              src/router_cache.rs|src/socket_opts.rs|\
+              tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
+              tests/*capture*|tests/*ebpf*|tests/*netns*|tests/*node_waypoint*)
+                changed=true
+                break
+                ;;
+            esac
+          done < "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+          echo "## eBPF/Netns Live Gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$changed" = "true" ]; then
+            echo "Live-kernel-sensitive files changed; CI will run the eBPF live-kernel and netns live checks." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No live-kernel-sensitive files changed; CI will skip the eBPF live-kernel and netns live checks for this PR." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The eBPF userspace compile guard still runs on every PR." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: List changed files for live gate
+        if: always()
+        run: |
+          echo "Changed files considered by the eBPF/netns live gate:"
+          cat "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+
   build-ebpf:
     name: Build eBPF Programs
     if: github.event_name == 'pull_request'
@@ -1591,8 +1715,10 @@ jobs:
 
       - name: Check for eBPF changes
         id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q '^ebpf/'; then
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^ebpf/'; then
             echo "ebpf_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "ebpf_changed=false" >> "$GITHUB_OUTPUT"
@@ -1659,7 +1785,10 @@ jobs:
 
   ebpf-live:
     name: eBPF Live-Kernel Test
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # Live kernel validation is high-value for BPF/node-waypoint-sensitive
+    # changes, but it adds several minutes to every PR when run unconditionally.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1718,7 +1847,10 @@ jobs:
 
   netns-capture-live:
     name: Node-Waypoint In-Netns Capture Live Test
-    if: github.event_name == 'pull_request'
+    needs: detect-ebpf-live-changes
+    # The netns tests require privileged live-kernel operations; the path gate
+    # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
+    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1996,6 +2128,40 @@ jobs:
 
       - uses: ./.github/actions/setup-sccache
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        # Required native deps only. mold + clang are an optional fast-linker
+        # optimization, so they are intentionally NOT in this strict transaction
+        # — a transient mirror failure for those linker-only packages must not
+        # fail an otherwise-buildable binary. setup-fast-linker below installs
+        # them best-effort (continue-on-error) and clears the mold rustflags via
+        # its fallback when they are missing, degrading to the default linker.
+        run: |
+          set -euo pipefail
+
+          missing_packages=()
+          if ! command -v protoc > /dev/null 2>&1; then
+            missing_packages+=(protobuf-compiler)
+          fi
+          if ! dpkg -s libcurl4-openssl-dev > /dev/null 2>&1; then
+            missing_packages+=(libcurl4-openssl-dev)
+          fi
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            for package in gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu; do
+              if ! dpkg -s "$package" > /dev/null 2>&1; then
+                missing_packages+=("$package")
+              fi
+            done
+          fi
+
+          if [ "${#missing_packages[@]}" -eq 0 ]; then
+            echo "Required Linux build dependencies already available"
+            exit 0
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+
       - uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
@@ -2013,15 +2179,6 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}"
-
-      - name: Install protoc and build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          fi
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'

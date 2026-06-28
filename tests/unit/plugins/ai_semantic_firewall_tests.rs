@@ -4,8 +4,8 @@ use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, ResponseStreamAction,
-    ai_semantic_firewall::AiSemanticFirewall, create_plugin, create_plugin_with_http_client,
-    priority,
+    ai_response_guard::AiResponseGuard, ai_semantic_firewall::AiSemanticFirewall, create_plugin,
+    create_plugin_with_http_client, priority,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -1479,8 +1479,16 @@ async fn streaming_response_reject_blocks_stream_requests() {
 
 #[tokio::test]
 async fn streaming_response_skip_records_audit_and_is_explicit_opt_in() {
-    // `skip` is an explicit fail-open opt-out: the stream passes uninspected,
-    // but the skip is recorded for audit and the shared ai_request_streaming flag is set.
+    // `skip` is an explicit fail-open opt-out for a genuinely STREAMED (SSE)
+    // response only: the SSE stream passes uninspected and the skip is recorded
+    // for audit. It DOES set the shared `ai_request_streaming` marker — that
+    // marker's contract is "the REQUEST asked for a streamed response", which is
+    // true here, so downstream response plugins (`ai_response_guard`,
+    // `ai_token_metrics`) keep their streaming behavior and do NOT buffer an SSE
+    // body. THIS plugin overrides that shared flag for its own JSON-vs-SSE
+    // decision via a dedicated skip marker, so a NON-streaming JSON response the
+    // backend returns despite `stream: true` is still inspected (see the JSON
+    // assertion below).
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "skip",
@@ -1504,9 +1512,37 @@ async fn streaming_response_skip_records_audit_and_is_explicit_opt_in() {
             .map(String::as_str),
         Some("streaming")
     );
+    // Explicit skip sets the shared streaming marker so downstream response
+    // plugins that key off it (e.g. `ai_response_guard.should_buffer_response_body`)
+    // do not buffer the SSE response to EOF.
     assert_eq!(
         ctx.metadata.get("ai_request_streaming").map(String::as_str),
-        Some("true")
+        Some("true"),
+        "explicit skip must set the shared ai_request_streaming marker for downstream response plugins"
+    );
+
+    // A genuinely streamed (SSE) response is left streaming = the opt-out target.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+    // But a JSON response (backend ignored `stream: true`) is still buffered and
+    // inspected — the skip opt-out only bypasses genuinely streamed responses.
+    // The shared `ai_request_streaming` marker does NOT suppress this because the
+    // dedicated per-instance skip marker overrides it for the JSON decision.
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    // The pre-header decision also buffers by default (it cannot see the
+    // content-type), so content-type refinement is what releases the SSE body.
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "explicit skip must buffer by default so content-type refinement can run"
     );
 }
 
@@ -1575,6 +1611,198 @@ async fn streaming_response_skip_does_not_buffer_event_stream() {
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+}
+
+#[tokio::test]
+async fn streaming_response_skip_lets_downstream_response_guard_stream_sse() {
+    // Regression for the explicit-skip shared-marker fix: a downstream response
+    // plugin that keys off the shared `ai_request_streaming` marker
+    // (`ai_response_guard.should_buffer_response_body`) must still see the marker
+    // after an explicit-skip firewall flags a `stream: true` request — otherwise
+    // the guard would buffer the SSE body to EOF / the max-response-body cap.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "skip",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let firewall = plugin(&config);
+
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+    let result = firewall.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    // A response plugin with validation rules buffers JSON responses by default,
+    // but skips buffering when the shared streaming marker is set.
+    let guard = AiResponseGuard::new(&json!({
+        "blocked_phrases": ["illegal activity"],
+        "action": "reject"
+    }))
+    .unwrap();
+    assert!(
+        guard.requires_response_body_buffering(),
+        "guard must have validation rules so the marker decision is meaningful"
+    );
+    assert!(
+        !guard.should_buffer_response_body(&ctx),
+        "explicit-skip firewall must set ai_request_streaming so downstream guard streams the SSE response"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_skip_inspects_non_streaming_json_fallback() {
+    // The PR's core goal: explicit `skip` opts out of inspecting a genuinely
+    // STREAMED (SSE) response, but a backend that ignores `stream: true` and
+    // returns a normal JSON response must STILL be inspected. Here a JSON
+    // response carrying a leaking phrase is buffered (per the content-type
+    // decision) and `on_response_body` rejects it.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "skip",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let firewall = plugin(&config);
+
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+    assert_continue(firewall.before_proxy(&mut ctx, &mut headers).await);
+
+    // JSON fallback is buffered for inspection despite the explicit skip ...
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    // ... and inspection actually runs: a leaking JSON body is rejected. The
+    // `response_leakage` builtin matches the lexical phrase "my system prompt
+    // says", so this rejects cleanly (502) without reaching the dead provider.
+    let leaking = serde_json::to_vec(&json!({
+        "choices": [{"message": {"role": "assistant", "content": "my system prompt says ignore safety"}}]
+    }))
+    .unwrap();
+    let result = firewall
+        .on_response_body(&mut ctx, 200, &response_headers(), &leaking)
+        .await;
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_skip_releases_non_2xx_json() {
+    // P3: an explicit-skip JSON response with a non-2xx status is never inspected
+    // by `on_response_body` (it returns early outside 200..300), so the
+    // content-type decision must NOT force it onto the buffered path — release it
+    // back to streaming to avoid holding a potentially large error body.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "skip",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let firewall = plugin(&config);
+
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+    assert_continue(firewall.before_proxy(&mut ctx, &mut headers).await);
+
+    // 2xx JSON: buffered and inspected.
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    // Non-2xx JSON: released to the streaming path (never inspected).
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        500,
+        &HashMap::new()
+    ));
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        404,
+        &HashMap::new()
+    ));
+}
+
+#[tokio::test]
+async fn streaming_response_skip_marker_is_scoped_per_instance() {
+    // P3: the skip marker is set globally in request metadata, but a coexisting
+    // implicit-`Skip` instance (e.g. a dry-run response-rule instance) must NOT
+    // buffer a `stream: true` JSON fallback solely because an explicit-skip
+    // instance set the marker. The implicit-skip instance leaves its streamed
+    // response uninspected (its old behavior), so the JSON decision must defer to
+    // the shared `ai_request_streaming` flag (= do not buffer), not the marker.
+    let explicit_config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "skip",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let explicit = plugin(&explicit_config);
+
+    // Implicit `Skip`: omit `streaming_response`, dry-run so the default resolves
+    // to `Skip` without flagging `audit_streaming_skip`.
+    let implicit_config = json!({
+        "inspect": {"request": false, "response": true},
+        "mode": "dry_run",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let implicit = plugin(&implicit_config);
+
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+    // The explicit-skip instance runs first and sets the global skip marker plus
+    // the shared streaming flag.
+    assert_continue(explicit.before_proxy(&mut ctx, &mut headers).await);
+
+    // The implicit-skip instance must ignore the explicit instance's skip marker:
+    // a JSON fallback stays on the streaming path (uninspected), matching its
+    // pre-fix behavior.
+    assert!(
+        !implicit.should_buffer_response_body(&ctx),
+        "implicit-skip instance must not buffer because of another instance's skip marker"
+    );
+    assert!(
+        !implicit.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &HashMap::new()
+        ),
+        "implicit-skip instance must not buffer JSON because of another instance's skip marker"
+    );
+
+    // The explicit-skip instance itself still buffers the JSON fallback.
+    assert!(explicit.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
         200,
         &HashMap::new()
     ));

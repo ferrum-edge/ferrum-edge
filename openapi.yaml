@@ -13885,8 +13885,7 @@ components:
         on_error:
           type: string
           enum: [warn, allow, reject]
-          default: reject
-          description: Behavior when embedding/evaluation fails. In enforce mode this defaults to reject so required semantic evaluation fails closed; dry_run defaults to warn unless configured.
+          description: "Behavior when embedding/evaluation fails. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode defaults to reject (required semantic evaluation fails closed) while dry_run defaults to warn (provider outages are audited as would_warn, not would_reject). Tooling that materializes OpenAPI defaults must therefore leave this field unset to inherit the mode-appropriate default; sending an explicit reject for a dry_run config would skew rollout/audit telemetry."
         default_action:
           type: string
           enum: [reject, warn]
@@ -13895,8 +13894,7 @@ components:
         streaming_response:
           type: string
           enum: [skip, reject, buffer, inspect]
-          default: reject
-          description: Behavior for stream:true requests when response-side inspection is active. In enforce mode with response-side rules active, omitting this defaults to reject so clients cannot bypass response inspection by streaming; dry_run or request-only configurations default to skip. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject.
+          description: "Behavior for stream:true requests when response-side inspection is active. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode with response-side rules active defaults to reject (clients cannot bypass response inspection by streaming) while dry_run or request-only configurations default to skip. Tooling that materializes OpenAPI defaults must leave this field unset to inherit the correct default — sending an explicit reject for a dry_run/request-only config would flip request-body buffering on (requires_request_body_before_before_proxy) and buffer every JSON POST just to read the stream flag, unlike the omitted-field behavior. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject."
         streaming:
           type: object
           description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
@@ -14306,6 +14304,10 @@ components:
           properties:
             block_system_prompts:
               const: true
+        - required: [strict_schema]
+          properties:
+            strict_schema:
+              const: true
         - required: [required_metadata_fields]
           properties:
             required_metadata_fields:
@@ -14313,7 +14315,7 @@ components:
       properties:
         max_tokens_limit:
           type: integer
-          description: Maximum allowed max_tokens value
+          description: Maximum allowed output-token request value across OpenAI and provider-native token fields
         enforce_max_tokens:
           type: string
           enum: [reject, clamp]
@@ -14321,7 +14323,16 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject max_tokens if not present
+          description: Inject a default output-token limit if no supported token field is present
+        supported_schema:
+          type: string
+          enum: [chat_completions, responses, provider_native, auto]
+          default: auto
+          description: Request schema family accepted when strict_schema is true
+        strict_schema:
+          type: boolean
+          default: false
+          description: Reject JSON request bodies that do not match supported_schema coverage
         allowed_models:
           type: array
           items:
@@ -14344,10 +14355,10 @@ components:
           description: Require user field in request body
         max_messages:
           type: integer
-          description: Maximum messages in the messages array
+          description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total characters across messages
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, and document/RAG fields
         temperature_range:
           type: array
           items:
@@ -14359,7 +14370,13 @@ components:
         block_system_prompts:
           type: boolean
           default: false
-          description: "Reject requests with role: system messages"
+          description: Reject system/developer prompt fields and roles, including Responses instructions and provider-native top-level system fields
+        system_prompt_aliases:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Additional message roles or top-level fields treated as system prompts when block_system_prompts is true
         required_metadata_fields:
           type: array
           items:
@@ -14645,6 +14662,13 @@ components:
               default_model:
                 type: string
                 description: Model to send to the provider when no mapping matches.
+              multimodal_mode:
+                type: string
+                enum:
+                  - reject
+                  - translate
+                  - text_only_with_warning
+                description: "How this provider handles OpenAI Chat Completions content parts that are not text. Translated providers default to reject; OpenAI-compatible providers and Cohere default to translate. text_only_with_warning intentionally drops non-text parts and records ai_federation_multimodal_* metadata."
               connect_timeout_seconds:
                 type: integer
                 default: 5
