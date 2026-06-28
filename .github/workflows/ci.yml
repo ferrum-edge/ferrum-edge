@@ -572,6 +572,14 @@ jobs:
     name: Dependency Audit (cargo-deny)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # cargo-deny only runs `cargo metadata` (no compilation), so this job does
+    # not install sccache. Clear the checked-in sccache rustc-wrapper
+    # (.cargo/config.toml `[build] rustc-wrapper = "sccache"`) — same fallback
+    # the setup-sccache action uses — so `cargo metadata` doesn't try to exec a
+    # binary that isn't on PATH.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
