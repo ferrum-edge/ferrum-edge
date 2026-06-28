@@ -744,6 +744,41 @@ async fn dry_run_response_rules_stream_true_uses_skip_default() {
 }
 
 #[tokio::test]
+async fn disabled_firewall_resolves_skip_default_and_is_a_no_op() {
+    // A disabled firewall short-circuits in the constructor before rules are
+    // resolved: an omitted `streaming_response` falls back to the `skip`
+    // default (without flagging the explicit-skip audit), and the plugin must
+    // neither force request-body buffering nor act on a `stream: true` request.
+    let mut config = config_with_builtin("response_leakage");
+    config["inspect"] = json!({"request": false, "response": true});
+    config["enabled"] = json!(false);
+    let plugin = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut headers = json_headers();
+
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_continue(result);
+    // A disabled firewall does not touch request metadata at all.
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(String::as_str),
+        None
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection_skipped")
+            .map(String::as_str),
+        None
+    );
+}
+
+#[tokio::test]
 async fn response_leakage_is_blocked() {
     let mut config = config_with_builtin("response_leakage");
     config["inspect"] = json!({"request": false, "response": true});
