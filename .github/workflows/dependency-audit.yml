@@ -1,0 +1,80 @@
+name: Dependency Audit
+
+# Scheduled supply-chain governance for the dependency tree and the vendored,
+# patched crates (reqwest / h3 / tungstenite / tokio-tungstenite). The blocking
+# advisories gate also runs per-PR in ci.yml; this workflow re-checks against the
+# latest advisory database WITHOUT a PR (so a newly-published RUSTSEC advisory is
+# caught within a week even on a quiet repo) and adds two time-sensitive checks
+# that only make sense on a schedule: advisory-exception expiry and upstream
+# patch-merge status.
+#
+# Full policy: docs/dependency-policy.md.
+
+on:
+  schedule:
+    # Mondays 05:30 UTC — sits between the Sunday coverage/prune crons and the
+    # Monday 07:00 conformance cron so the weekly maintenance ticks don't stack.
+    - cron: "30 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  advisories:
+    name: Advisories & exception expiry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        with:
+          # cargo-deny pinned to the validated schema version; cargo-audit is a
+          # non-blocking second opinion, so it tracks latest.
+          tool: cargo-deny@0.19.9,cargo-audit
+
+      - name: cargo-deny (advisories, bans, sources)
+        # Same blocking policy as the per-PR gate, re-evaluated against the
+        # freshly-fetched advisory DB. A new advisory not time-boxed in
+        # deny.toml fails here even when no PR has opened.
+        run: cargo deny check advisories bans sources
+
+      - name: Advisory-exception expiry
+        # Fails once any deny.toml [expires:] date has passed, so a time-boxed
+        # exception can never silently become permanent.
+        if: always()
+        run: bash scripts/check_advisory_expiry.sh
+
+      - name: cargo-audit (second opinion)
+        # Belt-and-suspenders: cargo-audit's advisory matching occasionally
+        # differs from cargo-deny's. Informational — the blocking signal is the
+        # cargo-deny step above.
+        if: always()
+        run: cargo audit || true
+
+  upstream-patch-status:
+    name: Vendored patch upstream status
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - name: Check upstream status of vendored patches
+        # Reports each vendored patch's upstream PR state + latest crates.io
+        # release. Fails (red scheduled run) when an upstream PR has merged, so
+        # a retireable vendor copy can't be missed. See docs/dependency-policy.md.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check_vendored_patch_status.sh
