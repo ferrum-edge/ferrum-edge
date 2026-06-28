@@ -1147,21 +1147,39 @@ jobs:
           # - ferrum.conf plus runtime config defaults rendered into the chart
           # - control-plane startup, admin, gRPC, xDS, DNS, TLS, identity,
           #   Kubernetes, and secret paths exercised by the Helm install checks
+          # - logging/redaction (src/logging/): the kind-install steps assert the
+          #   CP boot logs never emit the admin/gRPC secrets (`grep -Fq`), and
+          #   that secret-redaction assertion is UNIQUE to this job, so a
+          #   redaction regression here would otherwise silently skip the gate
           # - crate root / module wiring (src/lib.rs) and the overload monitor
           #   (src/overload.rs), both initialized at serving-mode startup
           # This is a curated allowlist, not exhaustive: the broad functional and
-          # integration jobs provide overlapping coverage for paths omitted here.
-          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/secrets/|src/tls/|src/xds/)'
+          # integration jobs cover most omitted paths, but the secret
+          # log-redaction assertion in the kind-install steps is specific to this
+          # job and has no overlapping coverage -- so redaction-relevant paths
+          # (e.g. src/logging/) must stay listed to keep the gate fail-safe.
+          helm_change_regex='^(charts/|\.github/workflows/ci\.yml$|\.github/actions/|Dockerfile(\..*)?$|\.dockerignore$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|proto/|ferrum\.conf$|src/lib\.rs$|src/overload\.rs$|src/(main|startup|cli)\.rs$|src/config/|src/logging/|src/modes/(control_plane|database|migrate|mod|tls_reload|grpc_tls_reload|db_tls_reload)\.rs$|src/admin/|src/dns/|src/grpc/|src/identity/|src/k8s_controller/|src/secrets/|src/tls/|src/xds/)'
           # Diff captured first so a git error (e.g. a missing base ref) fails
           # closed: it aborts the step loudly under `set -euo pipefail` rather
           # than being swallowed by the match and silently skipping every heavy
           # validation step, including the secret log-redaction assertions.
           # `grep -Ec` reads all input so no SIGPIPE (unlike `grep -q`, which
           # closes the pipe on the first match and could SIGPIPE-kill the
-          # upstream `printf` with exit 141); `|| true` absorbs grep's
-          # exit-1-on-no-match so it does not trip `set -e`.
+          # upstream `printf` with exit 141). grep's exit codes are distinct:
+          # 0 = matched, 1 = no match (normal -> changed=false), >=2 = real
+          # error (bad regex, read failure). We capture the rc instead of `||
+          # true` so a >=2 error fails the step closed rather than being
+          # misread as "no match" and silently skipping every heavy validation
+          # step, including the secret log-redaction assertions.
           changed_files="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")"
-          match_count="$(printf '%s\n' "$changed_files" | grep -Ec "$helm_change_regex" || true)"
+          set +e
+          match_count="$(printf '%s\n' "$changed_files" | grep -Ec "$helm_change_regex")"
+          grep_rc=$?
+          set -e
+          if [ "$grep_rc" -gt 1 ]; then
+            echo "helm gate: grep failed (rc=$grep_rc)" >&2
+            exit 1
+          fi
           if [ "${match_count:-0}" -gt 0 ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
