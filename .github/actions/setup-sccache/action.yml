@@ -1,18 +1,16 @@
 name: Setup sccache
 description: >-
   Installs sccache via mozilla-actions/sccache-action and wires it as the
-  cargo rustc wrapper. CI uses sccache for compiler-output caching through the
-  GitHub Actions backend; Swatinem/rust-cache remains responsible for restoring
-  Cargo registry/git data and target directories using per-job/per-target keys.
-  The checked-in `.cargo/config.toml` hardcodes `[build] rustc-wrapper =
-  "sccache"` so local developers get caching for free once sccache is on PATH;
-  this action provides the CI half of that contract.
+  cargo rustc wrapper. The checked-in `.cargo/config.toml` hardcodes
+  `[build] rustc-wrapper = "sccache"` so local developers get caching for
+  free once sccache is on PATH; this action provides the CI half of that
+  contract.
 
-  If sccache install fails, the GitHub Actions cache service env is unavailable,
-  or the server cannot start, the action sets `RUSTC_WRAPPER=` and
-  `CARGO_BUILD_RUSTC_WRAPPER=` to clear the config-file value so cargo doesn't
-  try to exec an unusable wrapper. Build still proceeds, just without the
-  cache.
+  If sccache install fails (network blip, runner without the GH Actions
+  cache, unsupported platform), the action sets `RUSTC_WRAPPER=` and
+  `CARGO_BUILD_RUSTC_WRAPPER=` to clear the config-file value so cargo
+  doesn't try to exec a binary that isn't installed. Build still proceeds,
+  just without the cache.
 
   The server idle timeout is disabled (`SCCACHE_IDLE_TIMEOUT=0`). The release
   build compiles the large `ferrum-edge` crate as one long rustc invocation
@@ -28,48 +26,22 @@ runs:
       uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
       continue-on-error: true
 
-    - name: Export GitHub Actions cache runtime env
-      # On GitHub-hosted runners the cache service env (ACTIONS_RESULTS_URL /
-      # ACTIONS_RUNTIME_TOKEN) is available to actions/* but is NOT exported
-      # into `run:` shell steps. Without this, the bash guard below would read
-      # them as empty and disable sccache on every job, defeating the cache.
-      # github-script runs in the action context where these are populated, so
-      # propagate them to GITHUB_ENV for the subsequent bash step.
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
-      with:
-        script: |
-          for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
-            const value = process.env[name];
-            if (value) {
-              core.exportVariable(name, value);
-            }
-          }
-
     - name: Configure sccache
       shell: bash
       run: |
-        set -euo pipefail
-
-        if ! command -v sccache &> /dev/null; then
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "sccache unavailable — cleared rustc-wrapper so cargo falls back to default"
-          exit 0
-        fi
-
-        if [ -z "${ACTIONS_RESULTS_URL:-}" ] || [ -z "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "::warning::GitHub Actions cache service env is unavailable; sccache disabled to avoid local-disk-only wrapper overhead"
-          exit 0
-        fi
-
-        # sccache reads backend selection when the daemon starts. Export these
-        # before `--start-server`; writing them only to GITHUB_ENV would make
-        # later steps see the variables while the already-running daemon keeps
-        # using its default local-disk backend.
-        export RUSTC_WRAPPER=sccache
-        export SCCACHE_GHA_ENABLED=true
+        # Deliberate security choice: we do NOT propagate the GitHub Actions
+        # cache service env (ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN) into
+        # GITHUB_ENV to force the sccache GHA backend. On GitHub-hosted runners
+        # those vars are exposed to actions/* but not to `run:` steps, so the
+        # daemon below transparently falls back to a local-disk cache. Exporting
+        # ACTIONS_RUNTIME_TOKEN would hand the repository cache credential to
+        # every later cargo build/test step — which execute PR-controlled
+        # build.rs scripts and tests — letting an untrusted fork PR read it and
+        # hit the cache service directly. The local-disk fallback is slower than
+        # a shared GHA cache, but not leaking the token wins. (This is why the
+        # codex "enable sccache GHA backend" suggestion is intentionally not
+        # pursued here.)
+        #
         # Disable the sccache server idle timeout (default 600s). The release
         # build compiles the large `ferrum-edge` lib crate as a single rustc
         # invocation (fat LTO, codegen-units=1) that hovers right around 600s
@@ -79,23 +51,14 @@ runs:
         # until the ephemeral runner is torn down.
         export SCCACHE_IDLE_TIMEOUT=0
         # Restart any server a prior step started so it adopts the timeout above
-        # and the GHA backend (a server that's already running keeps the values
-        # it started with).
-        sccache --stop-server > /dev/null 2>&1 || true
-        if sccache --start-server 2>/dev/null; then
+        # (a server that's already running keeps the value it started with).
+        command -v sccache &> /dev/null && sccache --stop-server > /dev/null 2>&1 || true
+        if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
           # Persist for build steps in case sccache lazily re-spawns a server.
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
-          echo "sccache enabled with GitHub Actions backend (idle timeout disabled)"
-          sccache --version
-          if [ -n "${RUSTC_WRAPPER:-}" ]; then
-            echo "RUSTC_WRAPPER is set"
-          else
-            echo "RUSTC_WRAPPER is not set"
-          fi
-          env | awk -F= '/^SCCACHE_/ { print $1"=<set>" }' | sort
-          sccache --show-stats || true
+          echo "sccache enabled (idle timeout disabled)"
         else
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"
