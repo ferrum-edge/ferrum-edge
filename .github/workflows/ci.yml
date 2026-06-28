@@ -70,10 +70,27 @@ jobs:
       - name: Run cache accounting and reload safety regressions
         run: |
           set -euo pipefail
-          cargo test --test unit_tests test_concurrent_stores_keep_size_bounded_and_non_wrapping
-          cargo test --test unit_tests test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache
-          cargo test --test unit_tests test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache
-          cargo test --test unit_tests test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+          hardening_tests=(
+            unit::plugins::response_caching_tests::test_concurrent_stores_keep_size_bounded_and_non_wrapping
+            unit::plugins::plugin_cache_tests::test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache
+            unit::plugins::plugin_cache_tests::test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache
+            unit::plugins::plugin_cache_tests::test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache
+          )
+
+          set +e
+          test_output="$(cargo test --test unit_tests -- --exact "${hardening_tests[@]}" 2>&1)"
+          test_status=$?
+          set -e
+
+          printf '%s\n' "$test_output"
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+
+          if ! printf '%s\n' "$test_output" | grep -qE '^test result: ok\. 4 passed; 0 failed; 0 ignored;'; then
+            echo "::error::expected exactly 4 plugin hardening unit regressions to run and pass"
+            exit 1
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -254,15 +271,25 @@ jobs:
         # used to build the archive. Keep archive builders and shard runners on
         # matching OS/arch + checkout layout, or update this artifact/path with
         # any future runner/workspace/target-dir change.
-        run: cargo build --bin ferrum-cni
+        #
+        # This binary is transferred to every integration shard. Keep full
+        # local dev debuginfo intact, but avoid carrying it in the CI artifact.
+        run: cargo build --config profile.dev.debug=0 --bin ferrum-cni
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
+        #
+        # Full debuginfo for tests and bundled bin targets makes this archive
+        # hundreds of MB larger and is downloaded by every integration shard.
+        # CI still keeps Rust backtraces and test stdout/stderr, but omits
+        # DWARF from this transfer-only build.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
+            --config profile.test.debug=0 \
+            --config profile.dev.debug=0 \
             --test integration_tests \
             --archive-file "$archive_file"
 
@@ -595,9 +622,16 @@ jobs:
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Future non-Linux shards must build and
         # download their matching archive instead of sharing this Linux one.
+        #
+        # Full debuginfo for tests and bundled bin targets makes this archive
+        # hundreds of MB larger and is downloaded by every functional shard.
+        # CI still keeps Rust backtraces and test stdout/stderr, but omits
+        # DWARF from this transfer-only build.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
+            --config profile.test.debug=0 \
+            --config profile.dev.debug=0 \
             --test functional_tests \
             --archive-file "$archive_file"
 
@@ -978,9 +1012,10 @@ jobs:
 
       - name: Set up Go
         if: steps.changes.outputs.gateway_api_changed == 'true'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: "1.25.x"
+          cache: false
 
       - name: Install Kubernetes tools
         if: steps.changes.outputs.gateway_api_changed == 'true'
@@ -1051,6 +1086,9 @@ jobs:
       FERRUM_SKIP_IMAGE_BUILD: "1"
       FERRUM_IMAGE_REPOSITORY: ferrum-edge
       FERRUM_IMAGE_TAG: multicluster-federation
+      # This deploy-only smoke creates and destroys disposable kind clusters in
+      # CI; acknowledge run.sh's preflight guard (the live workflow sets the same).
+      FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1064,7 +1102,7 @@ jobs:
             echo "mesh_federation_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/ci\.yml|\.github/actions/package-ferrum-runtime-image/|tests/k8s/multicluster-federation/|docs/(mesh|mesh_multicluster_federation_runbook|spire_deployment)\.md|docs/configuration\.md|ferrum\.conf|openapi\.yaml|charts/ferrum-mesh/|proto/|src/admin/(mesh_remote_clusters|mod)\.rs|src/config/env_config\.rs|src/grpc/|src/identity/|src/modes/mesh/|src/proxy/|src/tls/|Cargo\.(toml|lock))'; then
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/ci\.yml|\.github/actions/package-ferrum-runtime-image/|tests/k8s/multicluster-federation/|docs/(mesh|mesh_multicluster_federation_runbook|spire_deployment)\.md|docs/configuration\.md|ferrum\.conf|openapi\.yaml|proto/|src/admin/(mesh_remote_clusters|mod)\.rs|src/config/env_config\.rs|src/grpc/|src/identity/|src/modes/mesh/|src/proxy/|src/tls/|Cargo\.(toml|lock))'; then
             echo "mesh_federation_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "mesh_federation_changed=false" >> "$GITHUB_OUTPUT"
@@ -1634,8 +1672,22 @@ jobs:
       - name: Build BPF programs (kernel object)
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
 
-      - name: Build live-kernel test binary (--features ebpf)
-        run: cargo test --features ebpf --lib --no-run
+      - name: Build and locate live-kernel test binary (--features ebpf)
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          mapfile -t bins < <(
+            cargo test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          BIN="${bins[0]}"
+          echo "Live-kernel test binary: $BIN"
+          echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
       - name: Ensure bpffs is mounted
         run: sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
@@ -1649,9 +1701,7 @@ jobs:
         # never runs as root against the user-owned target dir.
         run: |
           set -euo pipefail
-          BIN=$(cargo test --features ebpf --lib --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
-            | tail -n1)
+          BIN="${{ steps.build_test_bin.outputs.test_bin }}"
           echo "Live-kernel test binary: $BIN"
           sudo -E "FERRUM_NODE_AGENT_BPF_ELF_PATH=$GITHUB_WORKSPACE/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf" \
             "$BIN" ebpf::loader::live_kernel_tests --ignored --nocapture --test-threads=1
@@ -1669,8 +1719,22 @@ jobs:
         with:
           shared-key: "ci-netns-capture-live"
 
-      - name: Build live test binary
-        run: cargo test --lib --no-run
+      - name: Build and locate live test binary
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          mapfile -t bins < <(
+            cargo test --lib --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          BIN="${bins[0]}"
+          echo "In-netns live test binary: $BIN"
+          echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
       - name: Run in-netns capture live tests as root
         # Privileged functional tests for the per-pod-netns outbound capture
@@ -1693,9 +1757,7 @@ jobs:
         # root against the user-owned target.
         run: |
           set -euo pipefail
-          BIN=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
-            | tail -n1)
+          BIN="${{ steps.build_test_bin.outputs.test_bin }}"
           echo "In-netns live test binary: $BIN"
           sudo -E "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests proxy::mesh_udp_capture::live_netns_tests --ignored --nocapture --test-threads=1
         env:
@@ -1703,24 +1765,69 @@ jobs:
 
   performance-regression:
     name: Performance Regression Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect performance-sensitive changes
+        id: perf_changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          run_benchmark=true
+          reason="Performance regression checks always run for ${EVENT_NAME} events."
+          changed_files=""
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            if changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null)"; then
+              run_benchmark=false
+              reason="No performance-sensitive paths changed."
+
+              if grep -Eq '^(src/|custom_plugins/|vendor/|ebpf/|tests/performance/|build\.rs$|ferrum\.conf$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
+                run_benchmark=true
+                reason="Performance-sensitive paths changed."
+              fi
+            else
+              run_benchmark=true
+              reason="Could not diff against origin/${BASE_REF}; running benchmark to be safe."
+              changed_files=""
+            fi
+          fi
+
+          if [ -n "${changed_files}" ]; then
+            printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          else
+            : > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+          fi
+
+          {
+            echo "run=${run_benchmark}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
+        if: steps.perf_changes.outputs.run == 'true'
         with:
           shared-key: "ci-perf"
 
       - name: Build release binaries
+        if: steps.perf_changes.outputs.run == 'true'
         run: |
           cargo build --profile ci-release --bin ferrum-edge
           cd tests/performance && cargo build --release --bin backend_server
 
       - name: Start backend server
+        if: steps.perf_changes.outputs.run == 'true'
         run: |
           tests/performance/target/release/backend_server > /tmp/backend.log 2>&1 &
-          echo "BACKEND_PID=$!" >> $GITHUB_ENV
+          echo "BACKEND_PID=$!" >> "${GITHUB_ENV}"
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:3001/health > /dev/null 2>&1; then
               echo "Backend ready"
@@ -1735,6 +1842,7 @@ jobs:
           done
 
       - name: Start gateway
+        if: steps.perf_changes.outputs.run == 'true'
         run: |
           FERRUM_MODE=file \
           FERRUM_FILE_CONFIG_PATH="$(pwd)/tests/performance/perf_config.yaml" \
@@ -1746,7 +1854,7 @@ jobs:
           FERRUM_POOL_ENABLE_HTTP2=false \
           FERRUM_POOL_WARMUP_ENABLED=true \
           ./target/ci-release/ferrum-edge run > /tmp/gateway.log 2>&1 &
-          echo "GATEWAY_PID=$!" >> $GITHUB_ENV
+          echo "GATEWAY_PID=$!" >> "${GITHUB_ENV}"
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
               echo "Gateway ready"
@@ -1761,6 +1869,7 @@ jobs:
           done
 
       - name: Run self-relative performance test
+        if: steps.perf_changes.outputs.run == 'true'
         timeout-minutes: 5
         run: |
           mkdir -p tests/performance/ci_results
@@ -1776,13 +1885,13 @@ jobs:
             --output tests/performance/ci_results/overhead_results.json
 
       - name: Stop services
-        if: always()
+        if: always() && steps.perf_changes.outputs.run == 'true'
         run: |
-          kill $BACKEND_PID 2>/dev/null || true
-          kill $GATEWAY_PID 2>/dev/null || true
+          kill "${BACKEND_PID:-}" 2>/dev/null || true
+          kill "${GATEWAY_PID:-}" 2>/dev/null || true
 
       - name: Upload performance results
-        if: always()
+        if: always() && steps.perf_changes.outputs.run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
@@ -1791,16 +1900,41 @@ jobs:
 
       - name: Post performance summary
         if: always()
+        env:
+          RUN: ${{ steps.perf_changes.outputs.run }}
+          REASON: ${{ steps.perf_changes.outputs.reason }}
         run: |
-          echo "## Performance Regression Check" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Performance Regression Check"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${RUN}" != "true" ]; then
+            {
+              echo "Skipped expensive benchmark: ${REASON}"
+              echo ""
+              echo "Relevant paths: \`src/**\`, \`custom_plugins/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`ferrum.conf\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
+              echo ""
+              echo "Changed files:"
+              echo '```'
+              if [ -s "${RUNNER_TEMP}/performance-regression-changed-files.txt" ]; then
+                cat "${RUNNER_TEMP}/performance-regression-changed-files.txt"
+              else
+                echo "(none)"
+              fi
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
           if [ -f tests/performance/ci_results/overhead_results.json ]; then
-            echo '```json' >> $GITHUB_STEP_SUMMARY
-            cat tests/performance/ci_results/overhead_results.json >> $GITHUB_STEP_SUMMARY
-            echo '' >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            {
+              echo '```json'
+              cat tests/performance/ci_results/overhead_results.json
+              echo ''
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
           else
-            echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
+            echo "Performance tests did not produce results." >> "${GITHUB_STEP_SUMMARY}"
           fi
 
   # ── Cross-platform builds ────────────────────────────────────────────────

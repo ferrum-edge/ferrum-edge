@@ -8,6 +8,10 @@ FERRUM_SPIRE_SERVER_IMAGE="${FERRUM_SPIRE_SERVER_IMAGE:-ghcr.io/spiffe/spire-ser
 FERRUM_SPIRE_AGENT_IMAGE="${FERRUM_SPIRE_AGENT_IMAGE:-ghcr.io/spiffe/spire-agent:1.12.4}"
 FERRUM_SPIRE_SERVER_HEALTH_PORT="${FERRUM_SPIRE_SERVER_HEALTH_PORT:-8080}"
 FERRUM_SPIRE_AGENT_HEALTH_PORT="${FERRUM_SPIRE_AGENT_HEALTH_PORT:-8082}"
+# SPIFFE bundle-endpoint port exposed by each SPIRE server (federation). Live
+# fixtures bootstrap the cross-cluster bundle exchange manually over kubectl, so
+# this endpoint is an identity declaration, not a hard dependency.
+FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT="${FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT:-8443}"
 
 ferrum_spire_require_tools() {
   command -v kubectl >/dev/null 2>&1 || {
@@ -99,6 +103,27 @@ data:
       trust_domain = "$trust_domain"
       data_dir = "/run/spire/data"
       log_level = "INFO"
+      federation {
+        # Expose a SPIFFE bundle-endpoint identity so this server CAN serve its
+        # trust bundle to peers. \`federation\` is a \`server{}\` option in the
+        # spire-server schema (NOT a top-level config block), so it lives INSIDE
+        # this server block. Cross-cluster bundle exchange in the live
+        # multicluster-federation fixture is bootstrapped MANUALLY via
+        # \`spire-server bundle show | bundle set\` (see ferrum_spire_federate_bundles)
+        # rather than live https_spiffe polling — there is intentionally NO
+        # \`federates_with\` block here, so a server with no peer bundle set yet
+        # never spins on an unreachable endpoint. The endpoint stays available
+        # for operators who prefer live polling.
+        bundle_endpoint {
+          address = "0.0.0.0"
+          port = "$FERRUM_SPIRE_BUNDLE_ENDPOINT_PORT"
+          # SPIRE 1.12.4 DEFAULTS an unset profile to https_spiffe with a
+          # deprecation warning ("will be fatal in a future release") — it does
+          # NOT reject the config (the live jobs run green without this). Set it
+          # explicitly to silence the warning and stay forward-compatible.
+          profile "https_spiffe" {}
+        }
+      }
     }
     plugins {
       DataStore "sql" {
@@ -454,4 +479,138 @@ ferrum_spire_collect_diagnostics() {
   kubectl --context "$context" -n "$namespace" logs daemonset/spire-agent --all-containers --tail=1000 > "$artifact_dir/spire-agent.log" 2>&1 || true
   ferrum_spire_server_exec "$context" "$namespace" agent list > "$artifact_dir/spire-agents.txt" 2>&1 || true
   ferrum_spire_server_exec "$context" "$namespace" entry show > "$artifact_dir/spire-entries.txt" 2>&1 || true
+  ferrum_spire_server_exec "$context" "$namespace" bundle list > "$artifact_dir/spire-bundles.txt" 2>&1 || true
+}
+
+# ── Trust-domain federation (two-cluster bundle exchange) ────────────────────
+#
+# The helpers below extend the single-cluster fixture above to a FEDERATED
+# two-cluster posture: each cluster runs its own SPIRE server in its own trust
+# domain, and each server is loaded with the OTHER cluster's trust bundle so
+# SVIDs issued in `cluster-a.test` cross-verify SVIDs from `cluster-b.test` (and
+# vice versa). Bundle exchange is bootstrapped MANUALLY over `kubectl exec`
+# (`bundle show` on one side piped into `bundle set` on the other) rather than
+# live https_spiffe bundle-endpoint polling: the manual path is synchronous,
+# needs no cross-cluster network reachability, and avoids the chicken-and-egg of
+# both endpoints having to be up and SVID-serving before either can poll.
+
+# Like ferrum_spire_server_exec but pipes this process's stdin into the exec'd
+# command. Used for `bundle set`, which reads the bundle document on stdin.
+ferrum_spire_server_exec_stdin() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+  shift 2
+
+  local pod
+  pod="$(ferrum_spire_server_pod "$context" "$namespace")"
+  if [[ -z "$pod" ]]; then
+    printf 'no spire-server pod found in namespace %s\n' "$namespace" >&2
+    return 1
+  fi
+
+  kubectl --context "$context" -n "$namespace" exec -i "$pod" -- \
+    /opt/spire/bin/spire-server "$@" -socketPath /run/spire/server.sock
+}
+
+# Bidirectionally exchange trust bundles between two clusters' SPIRE servers.
+# After this returns, server A holds a federated bundle for trust domain B and
+# server B holds one for trust domain A. Uses the SPIFFE bundle format
+# (`-format spiffe`) so X.509 + JWT authorities both transfer.
+ferrum_spire_federate_bundles() {
+  local context_a="${1:?cluster A kube context is required}"
+  local trust_domain_a="${2:?cluster A trust domain is required}"
+  local context_b="${3:?cluster B kube context is required}"
+  local trust_domain_b="${4:?cluster B trust domain is required}"
+  local namespace="${5:-$FERRUM_SPIRE_NAMESPACE}"
+
+  ferrum_spire_require_tools
+
+  local bundle_a bundle_b
+  if ! bundle_a="$(ferrum_spire_server_exec "$context_a" "$namespace" bundle show -format spiffe 2>/dev/null)"; then
+    printf 'failed to export trust bundle from cluster A (%s)\n' "$trust_domain_a" >&2
+    return 1
+  fi
+  if ! bundle_b="$(ferrum_spire_server_exec "$context_b" "$namespace" bundle show -format spiffe 2>/dev/null)"; then
+    printf 'failed to export trust bundle from cluster B (%s)\n' "$trust_domain_b" >&2
+    return 1
+  fi
+
+  # A's bundle → set on B as the federated bundle for trust domain A.
+  if ! printf '%s' "$bundle_a" | ferrum_spire_server_exec_stdin "$context_b" "$namespace" \
+    bundle set -format spiffe -id "spiffe://$trust_domain_a"; then
+    printf 'failed to set cluster A bundle on cluster B\n' >&2
+    return 1
+  fi
+  # B's bundle → set on A as the federated bundle for trust domain B.
+  if ! printf '%s' "$bundle_b" | ferrum_spire_server_exec_stdin "$context_a" "$namespace" \
+    bundle set -format spiffe -id "spiffe://$trust_domain_b"; then
+    printf 'failed to set cluster B bundle on cluster A\n' >&2
+    return 1
+  fi
+}
+
+# Return 0 iff `context`'s SPIRE server holds a federated bundle for `peer_td`.
+#
+# NOTE: `spire-server bundle show` prints only the server's OWN trust-domain
+# bundle and does NOT accept `-id`; a federated PEER bundle is read with
+# `spire-server bundle list -id spiffe://<td>` (per the SPIRE command
+# reference). Calling `bundle show -id ...` fails at CLI arg-parsing (the error
+# is swallowed by the redirect), which would record a SUCCESSFUL federation as
+# failed even after `bundle set` (BatchSetFederatedBundle) succeeded.
+ferrum_spire_assert_federated_bundle_present() {
+  local context="${1:?kube context is required}"
+  local namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+  local peer_td="${3:?peer trust domain is required}"
+
+  local listing
+  if ! listing="$(ferrum_spire_server_exec "$context" "$namespace" \
+    bundle list -id "spiffe://$peer_td" -format spiffe 2>/dev/null)"; then
+    return 1
+  fi
+  # `bundle list -id <absent-td>` exits non-zero, but guard against a future CLI
+  # that exits 0 with empty output: a present bundle prints a non-empty document.
+  [[ -n "$listing" ]]
+}
+
+# Register a k8s workload entry that FEDERATES WITH a peer trust domain, so the
+# issued SVID carries the peer's trust bundle and the workload's mesh proxy can
+# verify cross-cluster peers. Wraps ferrum_spire_register_k8s_workload's args
+# plus `-federatesWith spiffe://<peer-td>`.
+ferrum_spire_register_k8s_workload_federated() {
+  local context="${1:?kube context is required}"
+  local spire_namespace="${2:-$FERRUM_SPIRE_NAMESPACE}"
+  local spiffe_id="${3:?workload SPIFFE ID is required}"
+  local parent_id="${4:?parent SPIFFE ID is required}"
+  local workload_namespace="${5:?workload namespace is required}"
+  local service_account="${6:?service account is required}"
+  local peer_trust_domain="${7:?peer trust domain is required}"
+  shift 7
+
+  local -a selectors=(
+    "k8s:ns:$workload_namespace"
+    "k8s:sa:$service_account"
+  )
+  local selector
+  for selector in "$@"; do
+    selectors+=("$selector")
+  done
+
+  local federates_with="spiffe://$peer_trust_domain"
+  local existing=""
+  if existing="$(ferrum_spire_server_exec "$context" "$spire_namespace" entry show -spiffeID "$spiffe_id" -parentID "$parent_id" 2>/dev/null)" &&
+    ferrum_spire_entry_has_selectors "$existing" "${selectors[@]}" &&
+    grep -q "FederatesWith[[:space:]]*:[[:space:]]*$federates_with" <<<"$existing"; then
+    return 0
+  fi
+
+  local -a args=(
+    entry create
+    -spiffeID "$spiffe_id"
+    -parentID "$parent_id"
+    -federatesWith "$federates_with"
+  )
+  for selector in "${selectors[@]}"; do
+    args+=(-selector "$selector")
+  done
+  ferrum_spire_server_exec "$context" "$spire_namespace" "${args[@]}"
 }
