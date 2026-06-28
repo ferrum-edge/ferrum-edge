@@ -16,6 +16,7 @@ use super::utils::rate_limit::{
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
+const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
 
 pub struct AiRateLimiter {
     token_limit: u64,
@@ -440,6 +441,10 @@ impl Plugin for AiRateLimiter {
             && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
         {
             self.record_usage(self.rate_key(ctx), tokens).await;
+            ctx.metadata.insert(
+                FEDERATION_TOKENS_RECORDED_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
         }
 
         if !self.expose_headers {
@@ -467,6 +472,14 @@ impl Plugin for AiRateLimiter {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if ctx
+            .metadata
+            .get(FEDERATION_TOKENS_RECORDED_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+        {
+            return PluginResult::Continue;
+        }
+
         if !(200..300).contains(&response_status) {
             debug!(
                 "ai_rate_limiter: skipping non-2xx response (status {})",

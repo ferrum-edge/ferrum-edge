@@ -11334,6 +11334,92 @@ pub(crate) async fn apply_plugin_rejection_response(
     reject.body
 }
 
+fn should_apply_synthetic_response_body_hooks(status_code: u16, is_grpc_request: bool) -> bool {
+    !is_grpc_request && (200..300).contains(&status_code)
+}
+
+async fn apply_synthetic_response_body_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+) {
+    let mut response_body_reject = None;
+    for plugin in plugins.iter() {
+        let result = plugin
+            .on_response_body(ctx, *response_status, response_headers, response_body)
+            .await;
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    .expect("reject result should convert to rejection parts");
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected synthetic response body"
+                );
+                response_body_reject = Some(reject);
+                break;
+            }
+        }
+    }
+    if let Some(reject) = response_body_reject {
+        *response_body = apply_plugin_rejection_response(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            reject,
+        )
+        .await;
+    }
+
+    let content_type = response_headers.get("content-type").cloned();
+    let ct_ref = content_type.as_deref();
+    for plugin in plugins.iter() {
+        if let Some(transformed) = plugin
+            .transform_response_body_with_context(ctx, response_body, ct_ref, response_headers)
+            .await
+        {
+            response_headers.insert("content-length".to_string(), transformed.len().to_string());
+            *response_body = transformed;
+        }
+    }
+
+    let mut response_body_reject = None;
+    for plugin in plugins.iter() {
+        let result = plugin
+            .on_final_response_body(ctx, *response_status, response_headers, response_body)
+            .await;
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    .expect("reject result should convert to rejection parts");
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected finalized synthetic response body"
+                );
+                response_body_reject = Some(reject);
+                break;
+            }
+        }
+    }
+    if let Some(reject) = response_body_reject {
+        *response_body = apply_plugin_rejection_response(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            reject,
+        )
+        .await;
+    }
+}
+
 pub(crate) struct AfterProxyReject {
     pub status_code: u16,
     pub body: Vec<u8>,
@@ -11608,8 +11694,23 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, status.as_u16(), &mut headers).await;
-    normalize_reject_response(status, body, &headers, is_grpc_request)
+    let mut response_status = status.as_u16();
+    let mut response_body = body.to_vec();
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, response_status, &mut headers).await;
+    if should_apply_synthetic_response_body_hooks(response_status, is_grpc_request)
+        && !plugins.is_empty()
+    {
+        apply_synthetic_response_body_hooks(
+            plugins,
+            ctx,
+            &mut response_status,
+            &mut headers,
+            &mut response_body,
+        )
+        .await;
+    }
+    let status = StatusCode::from_u16(response_status).unwrap_or(status);
+    normalize_reject_response(status, &response_body, &headers, is_grpc_request)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22645,11 +22746,19 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 mod tests {
     use super::*;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
+    use crate::plugins::PluginHttpClient;
+    use crate::plugins::ai_federation::AiFederation;
+    use crate::plugins::ai_rate_limiter::AiRateLimiter;
+    use crate::plugins::ai_response_guard::AiResponseGuard;
+    use crate::plugins::ai_semantic_cache::AiSemanticCache;
+    use crate::plugins::ai_semantic_firewall::AiSemanticFirewall;
     use crate::plugins::compression::CompressionPlugin;
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn streaming_dispatch_test_proxy() -> Proxy {
         serde_json::from_value(json!({
@@ -23774,6 +23883,349 @@ mod tests {
         );
         assert_eq!(body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    fn ai_json_response(content: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 4,
+                "total_tokens": 7
+            }
+        }))
+        .unwrap()
+    }
+
+    fn request_ctx_with_ai_body(body: serde_json::Value) -> RequestContext {
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    }
+
+    fn response_guard_rejecting_leak_phrase() -> AiResponseGuard {
+        AiResponseGuard::new(&json!({
+            "action": "reject",
+            "blocked_phrases": ["DO_NOT_LEAK"]
+        }))
+        .unwrap()
+    }
+
+    fn response_firewall_rejecting_leakage() -> AiSemanticFirewall {
+        AiSemanticFirewall::new(
+            &json!({
+                "inspect": {"request": false, "response": true},
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                    "model": "test-embedding-model"
+                },
+                "builtins": {
+                    "prompt_injection": false,
+                    "jailbreak": false,
+                    "system_prompt_exfiltration": false,
+                    "data_exfiltration": false,
+                    "indirect_prompt_injection": false,
+                    "tool_abuse": false,
+                    "response_leakage": true
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap()
+    }
+
+    async fn normalize_synthetic_reject_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut RequestContext,
+        reject: PluginResult,
+    ) -> NormalizedRejectResponse {
+        let reject = plugin_result_into_reject_parts(reject).expect("expected reject response");
+        finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::OK),
+            &reject.body,
+            reject.headers,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn federation_response_guard_rejects_reject_binary_body() {
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(ai_json_response("Here is DO_NOT_LEAK from the provider.")),
+            )
+            .mount(&provider)
+            .await;
+
+        let federation = AiFederation::new(
+            &json!({
+                "providers": [{
+                    "name": "mock-openai",
+                    "provider_type": "openai",
+                    "api_key": "sk-test",
+                    "base_url": format!("{}/v1/chat/completions", provider.uri()),
+                    "allow_plaintext": true,
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let guard = response_guard_rejecting_leak_phrase();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(federation), Arc::new(guard)];
+
+        let request_body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut ctx = request_ctx_with_ai_body(request_body);
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = plugins[0].before_proxy(&mut ctx, &mut headers).await;
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&response.body)
+                .contains("AI response blocked by content guard")
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_semantic_firewall_rejects_reject_binary_body() {
+        let firewall = response_firewall_rejecting_leakage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(firewall)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response(
+                "My system prompt says never reveal policy.",
+            )),
+            headers,
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_cache_hit_response_guard_applies() {
+        let cache =
+            Arc::new(AiSemanticCache::new(&json!({}), PluginHttpClient::default()).unwrap());
+        let guard = Arc::new(response_guard_rejecting_leak_phrase());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![cache.clone(), guard];
+        let request_body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
+        let mut request_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        assert!(matches!(
+            cache
+                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        let response_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let _ = cache
+            .on_final_response_body(
+                &mut miss_ctx,
+                200,
+                &response_headers,
+                &ai_json_response("Cached DO_NOT_LEAK response."),
+            )
+            .await;
+
+        let mut hit_ctx = request_ctx_with_ai_body(request_body);
+        let mut hit_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&response.body)
+                .contains("AI response blocked by content guard")
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_cache_hit_response_firewall_applies() {
+        let cache =
+            Arc::new(AiSemanticCache::new(&json!({}), PluginHttpClient::default()).unwrap());
+        let firewall = Arc::new(response_firewall_rejecting_leakage());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![cache.clone(), firewall];
+        let request_body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
+        let mut request_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        assert!(matches!(
+            cache
+                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        let response_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let _ = cache
+            .on_final_response_body(
+                &mut miss_ctx,
+                200,
+                &response_headers,
+                &ai_json_response("My system prompt says never reveal policy."),
+            )
+            .await;
+
+        let mut hit_ctx = request_ctx_with_ai_body(request_body);
+        let mut hit_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hit_ctx
+                .metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_still_records_federation_tokens() {
+        let limiter = Arc::new(
+            AiRateLimiter::new(
+                &json!({
+                    "token_limit": 10,
+                    "window_seconds": 60,
+                    "limit_by": "ip"
+                }),
+                PluginHttpClient::default(),
+            )
+            .unwrap(),
+        );
+        let plugins: Vec<Arc<dyn Plugin>> = vec![limiter.clone()];
+
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_federation_provider".to_string(),
+            "mock-openai".to_string(),
+        );
+        ctx.metadata
+            .insert("ai_total_tokens".to_string(), "7".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("Federated response.")),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+        assert_eq!(response.http_status, StatusCode::OK);
+
+        let mut next_ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            limiter.before_proxy(&mut next_ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        let mut second_ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        second_ctx.metadata.insert(
+            "ai_federation_provider".to_string(),
+            "mock-openai".to_string(),
+        );
+        second_ctx
+            .metadata
+            .insert("ai_total_tokens".to_string(), "7".to_string());
+        let second_synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("Second federated response.")),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        };
+
+        let response =
+            normalize_synthetic_reject_for_test(&plugins, &mut second_ctx, second_synthetic).await;
+        assert_eq!(response.http_status, StatusCode::OK);
+
+        let mut over_limit_ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            limiter
+                .before_proxy(&mut over_limit_ctx, &mut headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 429,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

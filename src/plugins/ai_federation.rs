@@ -27,8 +27,11 @@
 //! logging plugins see all metadata
 //! ```
 //!
-//! Since `RejectBinary` bypasses `on_response_body`, this plugin writes token
-//! metadata directly into `ctx.metadata` using the same keys as `ai_token_metrics`.
+//! Successful synthetic responses pass through response-side guardrail hooks
+//! before the client receives them. This plugin also writes token metadata
+//! directly into `ctx.metadata` using the same keys as `ai_token_metrics`, so
+//! federation token accounting works even though normal backend dispatch is
+//! skipped.
 
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
