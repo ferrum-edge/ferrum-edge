@@ -40,6 +40,14 @@ Recommended pattern:
 >    enforced by a `NetworkPolicy` — the explicit `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`
 >    opt-in. Otherwise the gateway refuses to start. Always pair a `0.0.0.0` admin
 >    bind with a `NetworkPolicy` restricting access to the admin port.
+>    >
+>    > **Allowlist + exec probe.** If you set `FERRUM_ADMIN_ALLOWED_CIDRS`, it
+>    > **must also include `127.0.0.1` and `::1`**: the exec `ferrum-edge health`
+>    > probe connects from loopback inside the pod, and the admin IP filter
+>    > (checked before `/health` is served) drops any source outside the
+>    > allowlist — so an allowlist scoped only to pod/scrape ranges would fail the
+>    > probe and leave the pod permanently `NotReady`. Loopback alone is never
+>    > network-reachable, so allowing it does not widen exposure.
 
 ## Ferrum Mesh Helm Chart Contract
 
@@ -431,6 +439,16 @@ env:
 
 For CP/DP mode, keep the Control Plane private and expose only the Data Plane proxy service.
 
+> **Admin bind for CP/DP admin Services.** The admin Services below publish ports
+> `9000`/`9443`, but admin binds to loopback by default (see "Admin bind address"
+> above), so these Services only work if the pod sets
+> `FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0`. The Control Plane is a **writable** admin
+> (`cp` mode), so a non-loopback plaintext bind also needs `FERRUM_ADMIN_ALLOWED_CIDRS`
+> (including `127.0.0.1`/`::1` for the exec probe), admin TLS, or
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` + a `NetworkPolicy` — both shown below.
+> Omit the admin Service entirely if you only need in-pod (`kubectl exec`) admin
+> access; the gRPC Service (`50051`) is independent.
+
 ### Control Plane
 
 - Container ports: `9000`, `9443`, `50051`
@@ -453,6 +471,14 @@ env:
       secretKeyRef:
         name: ferrum-edge-secrets
         key: admin-jwt-secret
+  # Bind admin to the pod IP so the ferrum-edge-cp ClusterIP Service can reach it
+  # (admin defaults to loopback). cp is writable, so a non-loopback plaintext
+  # admin bind also requires the allowlist below (or admin TLS / the insecure
+  # opt-in). Include 127.0.0.1/::1 so the exec health probe is not dropped.
+  - name: FERRUM_ADMIN_BIND_ADDRESS
+    value: "0.0.0.0"
+  - name: FERRUM_ADMIN_ALLOWED_CIDRS
+    value: "127.0.0.1/32,::1/128,10.0.0.0/8" # replace 10.0.0.0/8 with your scrape/CP-admin source ranges
   - name: FERRUM_CP_GRPC_LISTEN_ADDR
     value: 0.0.0.0:50051
   - name: FERRUM_CP_DP_GRPC_JWT_SECRET
@@ -511,6 +537,13 @@ env:
       secretKeyRef:
         name: ferrum-edge-secrets
         key: admin-jwt-secret
+  # Bind admin to the pod IP so the private admin Service can reach it (admin
+  # defaults to loopback). dp admin is read-only, so a non-loopback plaintext
+  # bind only warns (no hard error), but still pair it with a NetworkPolicy — and
+  # if you also set FERRUM_ADMIN_ALLOWED_CIDRS, include 127.0.0.1/::1 for the exec
+  # health probe. Omit this and the admin Service to keep admin in-pod only.
+  - name: FERRUM_ADMIN_BIND_ADDRESS
+    value: "0.0.0.0"
 ```
 
 For multi-region Kubernetes deployments with CP failover across clusters, see [multi_region_ha.md](multi_region_ha.md).

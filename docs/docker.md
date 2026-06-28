@@ -141,7 +141,7 @@ docker-compose up ferrum-sqlite
 
 **Environment**:
 - HTTP: http://localhost:8000
-- Admin API: http://localhost:9000
+- Admin API: bound to loopback inside the container and **not published** by default, so it is not reachable from the host. To enable host access (dev) or serve it over TLS (prod), follow the admin-exposure note at the top of `docker-compose.yml`.
 
 **Data**:
 - SQLite database stored in `ferrum_data` volume
@@ -166,7 +166,7 @@ docker-compose --profile postgres up ferrum-postgres
 
 **Environment**:
 - HTTP: http://localhost:8001
-- Admin API: http://localhost:9001
+- Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
 - PostgreSQL: localhost:5432
 
 **Database Initialization**:
@@ -212,7 +212,7 @@ docker-compose --profile cp-dp up
 
 **Port Mappings**:
 - **Control Plane**:
-  - Admin API: http://localhost:9002
+  - Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
   - gRPC: localhost:50051
 
 - **Data Plane 1**:
