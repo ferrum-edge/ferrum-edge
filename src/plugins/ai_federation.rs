@@ -7,6 +7,9 @@
 //! 2985, makes its own HTTP call to the matched AI provider via a per-provider
 //! `reqwest::Client`, and returns `PluginResult::RejectBinary` with the
 //! normalized response. The normal proxy dispatch is skipped entirely.
+//! Streaming Chat Completions are intentionally unsupported by this buffered
+//! execution path: matched requests with `"stream": true` are rejected with a
+//! clear 501 error instead of being forwarded to an unimplemented SSE path.
 //!
 //! ## Supported Providers
 //!
@@ -550,6 +553,8 @@ impl AiFederation {
             return Err("ai_federation: config must be an object".to_string());
         }
 
+        reject_unsupported_streaming_config(config, "config")?;
+
         let providers_val = config
             .get("providers")
             .and_then(|v| v.as_array())
@@ -570,6 +575,8 @@ impl AiFederation {
                 .as_str()
                 .ok_or(format!("ai_federation: provider[{i}] missing 'name'"))?
                 .to_string();
+
+            reject_unsupported_streaming_config(pv, &format!("provider '{name}'"))?;
 
             let provider_type_str = pv["provider_type"].as_str().ok_or(format!(
                 "ai_federation: provider '{name}' missing 'provider_type'"
@@ -676,6 +683,25 @@ impl AiFederation {
             http_client,
         })
     }
+}
+
+fn reject_unsupported_streaming_config(config: &Value, scope: &str) -> Result<(), String> {
+    const UNSUPPORTED_STREAMING_FIELDS: &[&str] = &[
+        "stream",
+        "streaming",
+        "streaming_enabled",
+        "enable_streaming",
+    ];
+
+    for field in UNSUPPORTED_STREAMING_FIELDS {
+        if config.get(*field).is_some() {
+            return Err(format!(
+                "ai_federation: {scope} field '{field}' is unsupported; ai_federation does not implement provider response streaming and rejects matched OpenAI Chat Completions requests with \"stream\": true"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, String> {
@@ -1088,9 +1114,9 @@ type TranslatedRequest = (String, Vec<(String, String)>, Vec<u8>);
 ///     (`translate_openai_compatible` clones the body) and reply with an SSE
 ///     `text/event-stream`, which is not a single JSON document — normalization
 ///     fails and the client gets an opaque 502.
-///   - The translating providers (Anthropic/Gemini/Bedrock/Cohere) silently
-///     drop the flag, so the client asked for a stream but receives one
-///     buffered JSON object instead.
+///   - Provider-specific paths either build non-streaming provider calls
+///     (Anthropic/Gemini/Bedrock) or can still request provider streaming
+///     without a relay/normalization path (Cohere).
 ///
 /// Rather than break either way, `before_proxy` rejects streaming requests it
 /// would otherwise intercept with a clear, OpenAI-shaped error. We only treat
