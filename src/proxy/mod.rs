@@ -176,6 +176,18 @@ pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform
 /// the origin's strong validator.
 pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_response";
 
+/// The ORIGINAL backend HTTP status, captured at the start of
+/// `run_after_proxy_hooks` before any `after_proxy` hook can reject the response
+/// and replace it with a rejection. Plugins whose `after_proxy` runs at a higher
+/// priority than a rejecting hook (so their own genuine pass is skipped) read
+/// this to recover the real backend status during the subsequent
+/// `apply_after_proxy_hooks_to_rejection` re-run. `ai_rate_limiter` uses it to
+/// keep a token reservation charged when the backend served 2xx but a later
+/// after_proxy plugin (e.g. `response_size_limiting`) rejected the body — the
+/// provider call already consumed tokens, so the reservation must not be
+/// released as though it were a gateway rejection.
+pub(crate) const BACKEND_STATUS_METADATA_KEY: &str = "ai_ratelimit_backend_status";
+
 /// Transient marker set while running `after_proxy` hooks when a later hook may
 /// add `Cache-Control: no-transform`. Compression reads this before committing
 /// `Content-Encoding`, then `run_after_proxy_hooks` clears it before returning.
@@ -11299,10 +11311,20 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
                 status_code: reject_status,
                 ..
             } => {
+                // The gateway is already committed to emitting this rejection
+                // response (the status/body are fixed by the time after-proxy-on-
+                // reject hooks run), so a hook cannot replace it here — it is
+                // ignored and only logged. Known consequence: `ai_rate_limiter`'s
+                // `on_unmetered_response: "reject"` is best-effort for synthetic
+                // `before_proxy` responses such as `ai_federation`'s — a federated
+                // 2xx missing usage metadata is still returned to the client. See
+                // docs/plugins.md (ai_rate_limiter federation limitation).
                 warn!(
-                    "after_proxy plugin '{}' returned Reject (status {}) during rejection handling; ignoring",
-                    plugin.name(),
-                    reject_status,
+                    rejecting_plugin = plugin.name(),
+                    attempted_reject_status = reject_status,
+                    committed_status = status_code,
+                    "after_proxy plugin returned Reject during rejection handling; \
+                     ignoring (response already committed)"
                 );
             }
             PluginResult::Continue => {}
@@ -11346,6 +11368,28 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    // Capture the genuine backend status BEFORE any after_proxy hook can reject
+    // and replace the response. If a hook at a lower priority rejects a 2xx
+    // backend response (e.g. `response_size_limiting` at 3490 rejecting an
+    // oversized 200), a higher-priority hook's genuine pass is skipped and only
+    // re-runs inside `apply_after_proxy_hooks_to_rejection`; without this it
+    // could not tell a rejected-but-served backend response apart from a real
+    // gateway rejection. `ai_rate_limiter` reads this key to keep its token
+    // reservation charged in that case.
+    //
+    // Gated on the presence of an `ai_rate_limiter` token reservation
+    // ("ai_ratelimit_reserved_tokens", set in its `before_proxy`) so this does
+    // not add a metadata entry — and thus a transaction-log field — to every
+    // request on non-AI proxies. When no reservation exists the keep/release
+    // decision is moot anyway (`should_release_gateway_rejection` requires a
+    // non-zero reservation), so the status is only useful when the marker is set.
+    if ctx.metadata.contains_key("ai_ratelimit_reserved_tokens") {
+        ctx.metadata.insert(
+            BACKEND_STATUS_METADATA_KEY.to_string(),
+            response_status.to_string(),
+        );
+    }
+
     for (index, plugin) in plugins.iter().enumerate() {
         if plugin.needs_later_response_cache_control_no_transform()
             || plugin.needs_later_response_strong_etag()

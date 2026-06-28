@@ -14,19 +14,25 @@ use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+/// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
+/// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
+/// by this plugin's own genuine `after_proxy` pass — both write the same value.
+/// Reusing the `crate::proxy` constant (instead of a local copy) keeps the
+/// writer and reader from drifting apart. See `should_release_gateway_rejection`.
+use crate::proxy::BACKEND_STATUS_METADATA_KEY;
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
+/// Redis sliding-window index the reservation credited (centralized mode only).
+/// Carried back to the reconciliation op so a negative correction debits the
+/// same window even when the request straddles a window rollover. Absent in
+/// local mode (the in-memory window pins the correction via the entry's
+/// timestamp).
+const RESERVED_WINDOW_INDEX_METADATA_KEY: &str = "ai_ratelimit_reserved_window_index";
 const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
 const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
 const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
-/// Backend (pre-rejection) HTTP status observed by `after_proxy` on its genuine
-/// run, before any later response-body plugin can replace the response with a
-/// rejection. Used to tell a real gateway rejection (no successful backend call
-/// → release the reservation) apart from a response that the backend served 2xx
-/// but a later plugin rejected (tokens were consumed → keep the reservation).
-const BACKEND_STATUS_METADATA_KEY: &str = "ai_ratelimit_backend_status";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +248,13 @@ impl AiRateLimiter {
             .await
     }
 
-    async fn adjust_usage(&self, key: String, reservation_id: Option<u64>, delta: i64) {
+    async fn adjust_usage(
+        &self,
+        key: String,
+        reservation_id: Option<u64>,
+        reserved_window_index: Option<u64>,
+        delta: i64,
+    ) {
         if delta == 0 {
             return;
         }
@@ -253,6 +265,7 @@ impl AiRateLimiter {
                 &key,
                 &AiRateLimitOp::AdjustUsage {
                     reservation_id,
+                    reserved_window_index,
                     delta,
                 },
             )
@@ -272,9 +285,22 @@ impl AiRateLimiter {
             .and_then(|value| value.parse::<u64>().ok())
     }
 
-    /// The backend status `after_proxy` recorded on its genuine (non-rejection)
-    /// run, if any. Absent when `after_proxy` only ever ran inside a rejection
-    /// (a before-proxy gateway rejection that short-circuited backend dispatch).
+    fn reserved_window_index(ctx: &RequestContext) -> Option<u64> {
+        ctx.metadata
+            .get(RESERVED_WINDOW_INDEX_METADATA_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
+    /// The original backend status, if a backend response was produced. Recorded
+    /// in two complementary places so it survives every after-proxy ordering:
+    /// (1) this plugin's own genuine `after_proxy` pass, and (2) the proxy's
+    /// `run_after_proxy_hooks`, *before* the after_proxy loop — the latter covers
+    /// the case where a lower-priority after_proxy plugin (e.g.
+    /// `response_size_limiting` at 3490 < this plugin's 4200) rejects a 2xx so
+    /// this plugin's genuine pass never runs. Absent only when no backend
+    /// response existed at all (a before-proxy gateway rejection that
+    /// short-circuited dispatch, or the federation synthetic-response path, which
+    /// reconciles via its own branch).
     fn backend_status(ctx: &RequestContext) -> Option<u16> {
         ctx.metadata
             .get(BACKEND_STATUS_METADATA_KEY)
@@ -284,11 +310,16 @@ impl AiRateLimiter {
     fn should_release_gateway_rejection(ctx: &RequestContext) -> bool {
         // Only release when this is a genuine gateway rejection that never
         // produced a successful backend response. If the backend already
-        // returned 2xx and a *later* response-body plugin (e.g. ai_response_guard)
-        // rejected the body, the provider call consumed tokens — keep the
-        // reservation charged rather than making the call free. A recorded
-        // non-2xx backend status, or no recorded backend status at all (a
-        // before-proxy reject that short-circuited dispatch), still releases.
+        // returned 2xx and a *later* plugin rejected it — either a response-body
+        // plugin (e.g. ai_response_guard via on_response_body) or a
+        // lower-priority after_proxy plugin (e.g. response_size_limiting at 3490,
+        // which makes this plugin's genuine after_proxy pass at 4200 never run) —
+        // the provider call consumed tokens, so keep the reservation charged
+        // rather than making the call free. The 2xx backend status is recorded by
+        // `run_after_proxy_hooks` before the after_proxy loop, so it is present
+        // even when this plugin's own pass is skipped. A recorded non-2xx backend
+        // status, or no recorded backend status at all (a before-proxy reject that
+        // short-circuited dispatch), still releases.
         if Self::backend_status(ctx).is_some_and(|status| (200..300).contains(&status)) {
             return false;
         }
@@ -339,6 +370,7 @@ impl AiRateLimiter {
     ) -> PluginResult {
         let reserved_tokens = Self::reserved_tokens(ctx);
         let reservation_id = Self::reservation_id(ctx);
+        let reserved_window_index = Self::reserved_window_index(ctx);
 
         if let Some(actual_tokens) = actual_tokens {
             ctx.metadata.insert(
@@ -348,6 +380,7 @@ impl AiRateLimiter {
             self.adjust_usage(
                 self.rate_key(ctx),
                 reservation_id,
+                reserved_window_index,
                 Self::reservation_delta(actual_tokens, reserved_tokens),
             )
             .await;
@@ -358,6 +391,7 @@ impl AiRateLimiter {
             self.adjust_usage(
                 self.rate_key(ctx),
                 reservation_id,
+                reserved_window_index,
                 Self::reservation_delta(0, reserved_tokens),
             )
             .await;
@@ -387,6 +421,7 @@ impl AiRateLimiter {
                 self.adjust_usage(
                     self.rate_key(ctx),
                     reservation_id,
+                    reserved_window_index,
                     Self::reservation_delta(0, reserved_tokens),
                 )
                 .await;
@@ -832,6 +867,16 @@ impl Plugin for AiRateLimiter {
                 ctx.metadata.insert(
                     RESERVATION_ID_METADATA_KEY.to_string(),
                     reservation_id.to_string(),
+                );
+            }
+            // Carry the Redis window this reservation credited so reconciliation
+            // debits the SAME window even across a rollover (centralized mode).
+            // `None` in local mode — the in-memory window pins the correction via
+            // the matched entry's timestamp instead.
+            if let Some(reserved_window_index) = outcome.reserved_window_index {
+                ctx.metadata.insert(
+                    RESERVED_WINDOW_INDEX_METADATA_KEY.to_string(),
+                    reserved_window_index.to_string(),
                 );
             }
         }

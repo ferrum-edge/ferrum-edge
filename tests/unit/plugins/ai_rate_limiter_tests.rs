@@ -1383,6 +1383,56 @@ async fn response_body_plugin_reject_keeps_reservation_after_2xx_backend() {
 }
 
 #[tokio::test]
+async fn earlier_after_proxy_plugin_reject_keeps_reservation_after_2xx_backend() {
+    // codex P2 (newest): when a LOWER-priority after_proxy plugin rejects a 2xx
+    // backend response BEFORE `ai_rate_limiter` runs (e.g. `response_size_limiting`
+    // at 3490 < ai_rate_limiter at 4200), this plugin's *genuine* after_proxy pass
+    // never runs, so it cannot record the backend status itself. The proxy's
+    // `run_after_proxy_hooks` records the real backend status into
+    // `ai_ratelimit_backend_status` BEFORE the after_proxy loop, so the rejection
+    // re-run still sees a 2xx backend and KEEPS the reservation (tokens were
+    // consumed by the provider). This reproduces that metadata state: the genuine
+    // pass is intentionally skipped; only the proxy-recorded backend status and
+    // the rejection re-run happen.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "earlier after_proxy plugin will reject the 2xx");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    // `run_after_proxy_hooks` records the genuine backend status before the loop.
+    // (Gated in production on the reservation marker, which is present here.)
+    ctx.metadata
+        .insert("ai_ratelimit_backend_status".to_string(), "200".to_string());
+
+    // A lower-priority after_proxy plugin rejected the 2xx, so ai_rate_limiter's
+    // genuine pass is skipped and it only re-runs inside the rejection. The
+    // proxy sets the rejection marker and re-runs after_proxy with the reject
+    // status (e.g. 413 from response_size_limiting).
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    let mut reject_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(&mut ctx, 413, &mut reject_headers).await);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "a 2xx backend that an EARLIER after_proxy plugin rejected must keep the reservation charged"
+    );
+}
+
+#[tokio::test]
 async fn reject_mode_does_not_release_on_gateway_rejection() {
     // `should_release_gateway_rejection` must NOT fire when the configured
     // unmetered action is `reject` (the reservation deliberately stays charged).
