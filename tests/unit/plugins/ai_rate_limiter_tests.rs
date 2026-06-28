@@ -1158,6 +1158,73 @@ async fn test_federation_flag_is_scoped_per_limiter_instance() {
 }
 
 #[tokio::test]
+async fn test_on_response_body_does_not_charge_federation_tokens() {
+    // `after_proxy` is the SOLE federation charger. On the synthetic
+    // short-circuit reject path the body hooks (`on_response_body`) run FIRST
+    // and the reject `after_proxy` hook runs once afterwards. If
+    // `on_response_body` also charged the federation tokens, the consumer would
+    // be double-charged for one synthetic response. This test exercises that
+    // production order: `on_response_body` must record NOTHING for a federation
+    // response, and the subsequent `after_proxy` must record the tokens exactly
+    // once. `expose_headers` is required for `observed_usage` to read the window.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    // ai_federation populated provider + token metadata on the synthetic 2xx.
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "openai".to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), "300".to_string());
+
+    // The synthetic body even carries a usage block that WOULD be charged for a
+    // non-federation response — proving the skip is driven by the federation
+    // marker, not by an unparseable body.
+    let body = openai_response(100, 200);
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "on_response_body must NOT charge federation tokens — after_proxy is the \
+         sole federation charger"
+    );
+    // The federation idempotency flag must NOT be set yet: `on_response_body`
+    // no longer touches it, so `after_proxy` is free to do the one recording.
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|k| k.starts_with("ai_ratelimit_federation_tokens_recorded")),
+        "on_response_body must not set the federation idempotency flag"
+    );
+
+    // Now the reject `after_proxy` hook runs (as it does last on the synthetic
+    // path) and records the federation tokens exactly once.
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        300,
+        "after_proxy must charge the federation tokens exactly once"
+    );
+}
+
+#[tokio::test]
 async fn test_cache_hit_is_not_charged_against_token_budget() {
     // Regression: ai_semantic_cache cache hits are served from cache and never
     // reach the upstream model, so they consume no provider tokens. Synthetic
@@ -1293,11 +1360,18 @@ async fn test_fresh_response_is_still_charged_despite_replay_exemption() {
     // response (no cache-status metadata, no idempotent-replay header) MUST
     // still be charged against the window. Only cache-hit / dedup-replay /
     // semantic-cache synthetic bodies are exempt.
+    // `expose_headers` is required for `observed_usage` to read the recorded
+    // window total back out of `ai_ratelimit_usage` metadata (it is only stored
+    // when headers are exposed). The cache/replay exemption tests above assert a
+    // usage of 0, which `observed_usage` returns regardless of `expose_headers`,
+    // so they do not need it — but this test asserts a NON-zero charge actually
+    // landed, so it must expose headers to observe it.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 10_000,
             "window_seconds": 60,
             "limit_by": "ip",
+            "expose_headers": true,
         }),
         PluginHttpClient::default(),
     )
