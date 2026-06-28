@@ -1792,3 +1792,274 @@ async fn parameterized_json_content_type_is_inspected() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
+
+// ─── Uninspectable-body debug logging (lazy detail materialization) ──────
+//
+// `handle_uninspectable_body` builds its log-only `details` string lazily: for
+// client-caused reasons (`empty_body` / `non_utf8_body` / `malformed_json` /
+// `compressed_body`) the `details()` closure is invoked only when
+// `tracing::enabled!(DEBUG)` is true, so it never allocates on a busy proxy with
+// DEBUG disabled. The tests above all run with no subscriber installed, so that
+// branch — and the per-call-site `format!` / `.to_string()` closures, plus the
+// `debug!` reject arm — is never exercised. The tests below install a
+// DEBUG-level subscriber so `tracing::enabled!(DEBUG)` returns true, forcing the
+// lazy detail string (and the closures that build it) to run, and assert the
+// log-only detail never leaks to the client body.
+
+#[derive(Clone, Default)]
+struct DebugLogCapture {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl DebugLogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+struct DebugLogWriter {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for DebugLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DebugLogCapture {
+    type Writer = DebugLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DebugLogWriter {
+            buffer: std::sync::Arc::clone(&self.buffer),
+        }
+    }
+}
+
+/// Install a DEBUG-level `fmt` subscriber as the thread-local default and return
+/// the capture buffer + drop guard. `set_default` is thread-local, so callers
+/// must run on a single-thread runtime (`flavor = "current_thread"`) so the
+/// `debug!` calls land on the same thread the subscriber is bound to.
+fn debug_capture() -> (DebugLogCapture, tracing::subscriber::DefaultGuard) {
+    let capture = DebugLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(capture.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (capture, guard)
+}
+
+/// With DEBUG enabled, a `malformed_json` reject in `before_proxy` materializes
+/// the lazy detail string (the `format!("...: {err}")` closure runs), logs at
+/// DEBUG, and rejects 400 — without leaking the serde parse detail to the client
+/// body. Exercises the `Some(details())` branch + the `before_proxy`
+/// `malformed_json` closure + the `debug!` reject arm.
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_json_reject_logs_detail_at_debug() {
+    let (logs, guard) = debug_capture();
+
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), "not valid json{{{".to_string());
+    let mut headers = make_post_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    drop(guard);
+
+    // Client body carries only the generic message, never the serde detail.
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("Malformed JSON request body"));
+            assert!(!body.contains("expected ident"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+
+    // The lazily-built detail (with the serde error) reaches the DEBUG log.
+    let captured = logs.contents();
+    assert!(
+        captured.contains("ai_request_guard: rejecting uninspectable request body"),
+        "expected debug reject log, got: {captured:?}"
+    );
+    assert!(
+        captured.contains("Malformed JSON request body cannot be inspected:"),
+        "expected lazily-materialized detail in log, got: {captured:?}"
+    );
+}
+
+/// With DEBUG enabled, an `empty_body` reject in `before_proxy` runs its
+/// (different) detail closure and logs at DEBUG. Exercises the `before_proxy`
+/// `empty_body` closure body under the `Some(details())` branch.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_body_reject_logs_detail_at_debug() {
+    let (logs, guard) = debug_capture();
+
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Present-but-empty buffered body → `empty_body` (not `missing_buffered_body`).
+    ctx.metadata
+        .insert("request_body".to_string(), String::new());
+    let mut headers = make_post_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    drop(guard);
+
+    assert_reject(result, Some(400));
+    let captured = logs.contents();
+    assert!(
+        captured.contains("JSON request body is empty and cannot be inspected"),
+        "expected empty-body detail in log, got: {captured:?}"
+    );
+}
+
+/// With DEBUG enabled and compatibility mode on, a `malformed_json` body
+/// Continues but still logs the lazily-built detail at DEBUG. Exercises the
+/// `debug!` compatibility-mode arm together with `Some(details())`.
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_json_compatibility_mode_logs_detail_at_debug() {
+    let (logs, guard) = debug_capture();
+
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 1000,
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), "not valid json{{{".to_string());
+    let mut headers = make_post_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    drop(guard);
+
+    assert_continue(result);
+    let captured = logs.contents();
+    assert!(
+        captured
+            .contains("ai_request_guard: uninspectable request body allowed by compatibility mode"),
+        "expected debug compatibility-mode log, got: {captured:?}"
+    );
+    assert!(
+        captured.contains("Malformed JSON request body cannot be inspected:"),
+        "expected lazily-materialized detail in compatibility-mode log, got: {captured:?}"
+    );
+}
+
+/// With DEBUG enabled, the final-hook `compressed_body` reject runs its detail
+/// closure (the still-encoded-after-transforms message) and logs at DEBUG.
+/// Exercises the final-hook `compressed_body` closure under `Some(details())`.
+#[tokio::test(flavor = "current_thread")]
+async fn final_hook_compressed_body_reject_logs_detail_at_debug() {
+    let (logs, guard) = debug_capture();
+
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        plugin.deferred_compressed_marker_key().to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let body = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00];
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    drop(guard);
+
+    assert_reject(result, Some(400));
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Request body is still compressed after request transforms"),
+        "expected compressed-body detail in log, got: {captured:?}"
+    );
+}
+
+/// With DEBUG enabled, the final-hook `empty_body` reject (body decompressed to
+/// empty) runs its detail closure and logs at DEBUG. Exercises the final-hook
+/// `empty_body` closure under `Some(details())`.
+#[tokio::test(flavor = "current_thread")]
+async fn final_hook_empty_body_reject_logs_detail_at_debug() {
+    let (logs, guard) = debug_capture();
+
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        plugin.deferred_compressed_marker_key().to_string(),
+        "true".to_string(),
+    );
+    // Decompressed (Content-Encoding stripped) but empty body.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body: Vec<u8> = Vec::new();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    drop(guard);
+
+    assert_reject(result, Some(400));
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Request body is empty after request transforms"),
+        "expected final-hook empty-body detail in log, got: {captured:?}"
+    );
+}
+
+/// With DEBUG enabled, the final-hook `malformed_json` reject runs its
+/// `format!`-based detail closure and logs at DEBUG. Exercises the final-hook
+/// `malformed_json` closure under `Some(details())`.
+#[tokio::test(flavor = "current_thread")]
+async fn final_hook_malformed_json_reject_logs_detail_at_debug() {
+    let (logs, guard) = debug_capture();
+
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        plugin.deferred_compressed_marker_key().to_string(),
+        "true".to_string(),
+    );
+    // Decompressed but not valid JSON.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = b"not json{{{".to_vec();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    drop(guard);
+
+    assert_reject(result, Some(400));
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Malformed JSON request body cannot be inspected:"),
+        "expected final-hook malformed-json detail in log, got: {captured:?}"
+    );
+}
