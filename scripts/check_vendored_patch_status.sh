@@ -24,6 +24,7 @@ PATCHES=(
 )
 
 retire_signal=0
+query_failed=0
 echo "## Vendored patch upstream status"
 echo ""
 
@@ -44,7 +45,8 @@ for row in "${PATCHES[@]}"; do
   else
     st="$(gh pr view "$pr" --repo "$repo" --json state --jq '.state' 2>/dev/null || echo "")"
     if [ -z "$st" ]; then
-      echo "- upstream PR ${repo}#${pr}: could not query (network/auth?)"
+      echo "  ::warning::could not query upstream PR ${repo}#${pr} (network/auth/rate-limit?) — failing closed so a merged patch isn't missed."
+      query_failed=1
     else
       echo "- upstream PR ${repo}#${pr}: state=${st}"
       if [ "$st" = "MERGED" ]; then
@@ -60,6 +62,10 @@ done
 
 if [ "$retire_signal" -ne 0 ]; then
   echo "::error::One or more vendored patches merged upstream and should be retired. See docs/dependency-policy.md."
+  exit 1
+fi
+if [ "$query_failed" -ne 0 ]; then
+  echo "::error::One or more upstream PR statuses could not be queried; failing closed so a merged patch cannot slip through unseen. Re-run after confirming gh auth / network."
   exit 1
 fi
 echo "No vendored patch has merged upstream yet; nothing to retire."

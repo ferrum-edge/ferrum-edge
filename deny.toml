@@ -29,6 +29,12 @@ all-features = true
 version = 2
 # Reject crates whose current version has been yanked from the registry.
 yanked = "deny"
+# Audit the FULL graph, not just direct workspace members. In cargo-deny 0.19
+# these default to "workspace", which — even with [graph].all-features — would
+# let a transitive unmaintained/unsound advisory pass silently. "all" makes them
+# blocking everywhere, matching the intent of the exceptions enumerated below.
+unmaintained = "all"
+unsound = "all"
 # Everything not listed here is denied (vulnerabilities, unmaintained, unsound,
 # and notices alike, under advisories schema v2). Each exception is time-boxed.
 ignore = [
@@ -67,11 +73,13 @@ ignore = [
 # (rustls 0.21+0.23, hyper 0.14+1.x, hickory 0.25+0.26, tungstenite 0.28+0.29).
 # Surface them as warnings for visibility without blocking PRs.
 multiple-versions = "warn"
-# `allow`, not `deny`: the only "wildcard" req is the in-repo workspace path dep
-# `ferrum-ebpf-common = { path = "ebpf/..." }`, which cargo-deny flags because a
-# public crate's path dep carries no version. That is benign; all registry deps
-# in Cargo.toml use pinned requirements ("1", "0.13", ...), not `*`.
-wildcards = "allow"
+# Block `*` registry version requirements (an unpinned-dependency supply-chain
+# risk). The only wildcard in the tree is the in-repo workspace path dep
+# `ferrum-ebpf-common = { path = "ebpf/..." }`. `allow-wildcard-paths` exempts
+# path deps of *private* crates, and the workspace crate is marked
+# `publish = false` in Cargo.toml so that exemption applies to it.
+wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 # Crates must come from crates.io. Vendored patches are local path deps under

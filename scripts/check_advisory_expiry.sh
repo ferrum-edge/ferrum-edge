@@ -21,13 +21,18 @@ today="$(date -u +%Y-%m-%d)"
 today_cmp="${today//-/}"
 fail=0
 
-# Each ignore is a single line: { id = "RUSTSEC-...", reason = "... [expires:YYYY-MM-DD]" }
+# Match every RUSTSEC id in the ignore list, in EITHER cargo-deny form:
+#   table:  { id = "RUSTSEC-YYYY-NNNN", reason = "... [expires:YYYY-MM-DD]" }
+#   string: "RUSTSEC-YYYY-NNNN"
+# Comment lines are skipped. Each id must carry an [expires:] token, so a
+# string-form ignore (which has nowhere to put one) is correctly rejected —
+# that form would otherwise bypass the time-boxing control entirely.
 while IFS= read -r line; do
-  id="$(printf '%s' "$line" | sed -nE 's/.*id = "([^"]+)".*/\1/p')"
-  exp="$(printf '%s' "$line" | sed -nE 's/.*\[expires:([0-9]{4}-[0-9]{2}-[0-9]{2})\].*/\1/p')"
+  id="$(printf '%s' "$line" | grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' | head -n1)"
   [ -z "$id" ] && continue
+  exp="$(printf '%s' "$line" | sed -nE 's/.*\[expires:([0-9]{4}-[0-9]{2}-[0-9]{2})\].*/\1/p')"
   if [ -z "$exp" ]; then
-    echo "::error::deny.toml ignore '$id' is missing an [expires:YYYY-MM-DD] token"
+    echo "::error::deny.toml ignore '$id' is missing an [expires:YYYY-MM-DD] token (use the table form: { id = \"$id\", reason = \"... [expires:YYYY-MM-DD]\" })"
     fail=1
     continue
   fi
@@ -38,7 +43,7 @@ while IFS= read -r line; do
   else
     echo "ok: $id valid through $exp"
   fi
-done < <(grep -E 'id = "RUSTSEC' "$DENY_TOML" || true)
+done < <(grep -E 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$DENY_TOML" | grep -vE '^[[:space:]]*#' || true)
 
 if [ "$fail" -ne 0 ]; then
   echo ""
