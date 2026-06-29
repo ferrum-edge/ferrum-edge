@@ -173,6 +173,22 @@ fn deny_cidr_matches_ipv6_embedded_forms() {
 }
 
 #[test]
+fn deny_cidr_matches_both_local_use_nat64_layouts() {
+    // A NAT64 local-use prefix (64:ff9b:1::/48) can embed the IPv4 contiguously
+    // OR in the RFC 6052 /48 u-byte-split layout. With a /24 deny the two
+    // decodings of the same address diverge, so both must be checked:
+    //   64:ff9b:1:a01:205::    = 10.1.2.5 contiguous
+    //   64:ff9b:1:a01:2:500::  = 10.1.2.5 under RFC 6052 (10.1.0.2 contiguous)
+    let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "10.1.2.0/24", true)
+        .expect("valid");
+    assert!(!p.is_allowed(&ip("10.1.2.5"))); // raw v4
+    assert!(!p.is_allowed(&ip("64:ff9b:1:a01:205::"))); // contiguous layout
+    assert!(!p.is_allowed(&ip("64:ff9b:1:a01:2:500::"))); // RFC 6052 /48 layout
+    // Neither layout of this address lands in 10.1.2.0/24 → stays allowed.
+    assert!(p.is_allowed(&ip("64:ff9b:1:a02:2:500::")));
+}
+
+#[test]
 fn allow_cidr_takes_precedence_over_deny_cidr() {
     // Overlapping allow + deny: allow wins (checked first).
     let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "10.0.0.5/32", "10.0.0.0/8", true)

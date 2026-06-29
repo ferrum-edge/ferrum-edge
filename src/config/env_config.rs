@@ -492,6 +492,29 @@ fn embedded_ipv4(addr: &std::net::IpAddr) -> Option<std::net::Ipv4Addr> {
     ip.to_ipv4_mapped().or_else(|| ip.to_ipv4())
 }
 
+/// The IPv4 embedded in a NAT64 *local-use* prefix (`64:ff9b:1::/48`, RFC 8215)
+/// under the RFC 6052 /48 layout, where the low two octets are split around the
+/// reserved `u` byte (bits 64-71): IPv4 = `[s3.hi, s3.lo, s4.lo, s5.hi]`.
+/// [`embedded_ipv4`] returns the contiguous-layout candidate (`[s3.hi, s3.lo,
+/// s4.hi, s4.lo]`); CIDR-list matching checks BOTH so neither DNS64 octet layout
+/// can evade a narrow deny CIDR (e.g. `64:ff9b:1:a01:2:500::` is `10.1.2.5` here
+/// but `10.1.0.2` contiguously). `None` for any address outside the local-use
+/// prefix. (The dangerous-range baseline decodes both inline in
+/// [`is_always_blocked_range`].)
+fn embedded_ipv4_local_use_rfc6052(addr: &std::net::IpAddr) -> Option<std::net::Ipv4Addr> {
+    let std::net::IpAddr::V6(ip) = addr else {
+        return None;
+    };
+    let segments = ip.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        let [a, b] = segments[3].to_be_bytes();
+        let [_u, c] = segments[4].to_be_bytes();
+        let [d, _] = segments[5].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
 /// Resolved backend egress policy: the `FERRUM_BACKEND_ALLOW_IPS` mode plus an
 /// explicit allow/deny CIDR overlay and the dangerous-range baseline.
 ///
@@ -593,8 +616,15 @@ impl BackendEgressPolicy {
         // can't be bypassed by a backend that resolves to the IPv6 encoding of
         // that address (`64:ff9b::0a00:1`, `::ffff:10.0.0.1`, …).
         let embedded = embedded_ipv4(addr).map(std::net::IpAddr::V4);
+        // A NAT64 local-use prefix can embed the IPv4 in either the contiguous
+        // layout (covered by `embedded` above) or the RFC 6052 /48 u-byte-split
+        // layout — check the split candidate too so neither DNS64 layout evades a
+        // deny/allow CIDR rule written in IPv4 form.
+        let embedded_rfc6052 = embedded_ipv4_local_use_rfc6052(addr).map(std::net::IpAddr::V4);
         let cidr_match = |set: &CidrSet| {
-            set.contains(addr) || embedded.as_ref().is_some_and(|e| set.contains(e))
+            set.contains(addr)
+                || embedded.as_ref().is_some_and(|e| set.contains(e))
+                || embedded_rfc6052.as_ref().is_some_and(|e| set.contains(e))
         };
         // 1. Explicit allow overrides every deny below.
         if cidr_match(&self.allow_cidrs) {
