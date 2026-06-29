@@ -438,6 +438,77 @@ fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
 }
 
 #[test]
+fn validate_plugin_config_with_policy_screens_denied_ldap_and_kafka_endpoints() {
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    // ldap_auth (ldap3 crate) and kafka_logging (librdkafka) dial their OWN
+    // resolver, outside the shared PluginHttpClient + DnsCache — so a literal
+    // metadata endpoint that constructs fine must still be rejected at config
+    // load under the default policy (mode `both` + dangerous-range baseline).
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let ldap_denied = json!({
+        "ldap_url": "ldap://169.254.169.254:389",
+        "bind_dn_template": "uid={username},dc=example,dc=com"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ldap_auth", &ldap_denied, &default_policy).is_err(),
+        "metadata ldap_url must be rejected under the default policy"
+    );
+
+    let ldap_loopback = json!({
+        "ldap_url": "ldap://127.0.0.1:389",
+        "bind_dn_template": "uid={username},dc=example,dc=com"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ldap_auth", &ldap_loopback, &default_policy).is_ok(),
+        "loopback ldap_url must remain valid by default"
+    );
+
+    // A comma-separated broker_list with a denied broker (alongside an allowed
+    // RFC1918 one) is rejected — the screen checks every entry.
+    let kafka_denied = json!({
+        "broker_list": "10.0.0.1:9092,169.254.169.254:9092",
+        "topic": "logs"
+    });
+    assert!(
+        validate_plugin_config_with_policy("kafka_logging", &kafka_denied, &default_policy)
+            .is_err(),
+        "a metadata broker in broker_list must be rejected under the default policy"
+    );
+
+    let kafka_loopback = json!({
+        "broker_list": "127.0.0.1:9092",
+        "topic": "logs"
+    });
+    assert!(
+        validate_plugin_config_with_policy("kafka_logging", &kafka_loopback, &default_policy)
+            .is_ok(),
+        "loopback kafka broker must remain valid by default"
+    );
+
+    // The fully-unrestricted policy accepts both (legacy posture).
+    assert!(
+        validate_plugin_config_with_policy(
+            "ldap_auth",
+            &ldap_denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_plugin_config_with_policy(
+            "kafka_logging",
+            &kafka_denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn test_requires_response_body_buffering() {
     let config = json!({});
     let plugin = make_plugin(config);

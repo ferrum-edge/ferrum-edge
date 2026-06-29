@@ -3345,6 +3345,10 @@ pub fn validate_plugin_config_with_policy(
             // / falls back to the hostname on a DNS denial — so a denied literal
             // endpoint must be rejected here at config-load.
             screen_redis_endpoint_egress(config, backend_allow_ips)?;
+            // `ldap_auth` / `kafka_logging` dial their own resolver (ldap3 /
+            // librdkafka), outside the shared client + DnsCache — screen their
+            // literal endpoints here too.
+            screen_direct_client_endpoint_egress(name, config, backend_allow_ips)?;
             Ok(())
         }
         None => Err(format!("Unknown plugin name '{}'", name)),
@@ -3385,6 +3389,62 @@ pub(crate) fn screen_redis_endpoint_egress(
                 "redis_url IP {ip} denied by backend egress policy: {reason}"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Screen the literal-IP endpoints of plugins that dial OUTSIDE the shared
+/// `PluginHttpClient` / `DnsCache`: `ldap_auth` (`ldap_url`, via the `ldap3`
+/// crate) and `kafka_logging` (`broker_list`, via librdkafka). Both perform
+/// their own DNS resolution and connect, so the HTTP-endpoint screen in
+/// [`validate_plugin_config_with_policy`] never sees them — a literal denied
+/// endpoint (`ldap://169.254.169.254:389`, `broker_list=169.254.169.254:9092`)
+/// would otherwise pass file/admin validation and reach the metadata service at
+/// runtime under the default baseline. Reject the literal at config-load.
+///
+/// Hostname endpoints that later rebind to a denied address are an accepted
+/// limitation (the client resolves outside `DnsCache`), mirroring the
+/// `rediss://`-hostname case documented in `redis_rate_limiter`.
+pub(crate) fn screen_direct_client_endpoint_egress(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    match name {
+        // ldap_url is a single ldap:// / ldaps:// URL.
+        "ldap_auth" => {
+            if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())
+                && let Ok(parsed) = url::Url::parse(url.trim())
+                && let Some(host) = parsed.host_str()
+                && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+            {
+                return Err(format!(
+                    "ldap_url IP {ip} denied by backend egress policy: {reason}"
+                ));
+            }
+        }
+        // broker_list is a comma-separated list of `host:port` (or `[v6]:port`,
+        // or a bare host/IP) entries with no scheme.
+        "kafka_logging" => {
+            if let Some(brokers) = config.get("broker_list").and_then(|v| v.as_str()) {
+                for entry in brokers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let literal = entry
+                        .parse::<std::net::SocketAddr>()
+                        .map(|sa| sa.ip())
+                        .ok()
+                        .or_else(|| crate::config::types::egress_literal_ip(entry));
+                    if let Some(ip) = literal
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                    {
+                        return Err(format!(
+                            "broker_list IP {ip} denied by backend egress policy: {reason}"
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

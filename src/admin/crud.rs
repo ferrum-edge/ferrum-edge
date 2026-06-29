@@ -1479,6 +1479,15 @@ impl AdminResource for PluginConfig {
         // writes too, matching the policy-aware whole-config / API-spec paths.
         crate::plugins::screen_redis_endpoint_egress(&self.config, ctx.backend_allow_ips)
             .map_err(|e| ValidationError::Fields(vec![e]))?;
+        // ldap_auth (ldap_url) / kafka_logging (broker_list) dial their own
+        // resolver outside the shared client + DnsCache; screen their literal
+        // endpoints on direct/batch admin writes too.
+        crate::plugins::screen_direct_client_endpoint_egress(
+            &self.plugin_name,
+            &self.config,
+            ctx.backend_allow_ips,
+        )
+        .map_err(|e| ValidationError::Fields(vec![e]))?;
         Ok(())
     }
 
