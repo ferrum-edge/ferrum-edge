@@ -3041,6 +3041,18 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
+    // Fail CLOSED *before* constructing plugins that dial their OWN resolver —
+    // ldap_auth (ldap3), kafka_logging (librdkafka), ws_logging (tungstenite).
+    // These never go through this `PluginHttpClient` + `DnsCache`, and their
+    // constructors spawn the dial task immediately, so a denied literal endpoint
+    // must be rejected here, not merely warned at config-load. Because the
+    // production `PluginCache` is built with the real-policy client
+    // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
+    // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
+    // the plugin instead of letting its background loop reach the metadata service
+    // (warn-only validation can't stop that — there is no runtime egress backstop
+    // for these clients, unlike proxy/Redis dispatch).
+    screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "transaction_log_schema" => Ok(Some(Arc::new(
@@ -3345,10 +3357,10 @@ pub fn validate_plugin_config_with_policy(
             // / falls back to the hostname on a DNS denial — so a denied literal
             // endpoint must be rejected here at config-load.
             screen_redis_endpoint_egress(config, backend_allow_ips)?;
-            // `ldap_auth` / `kafka_logging` dial their own resolver (ldap3 /
-            // librdkafka), outside the shared client + DnsCache — screen their
-            // literal endpoints here too.
-            screen_direct_client_endpoint_egress(name, config, backend_allow_ips)?;
+            // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
+            // screened *inside* `create_plugin_with_http_client` above (before the
+            // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
+            // call is needed here — that path already failed closed on a denial.
             Ok(())
         }
         None => Err(format!("Unknown plugin name '{}'", name)),
@@ -3442,6 +3454,20 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                         ));
                     }
                 }
+            }
+        }
+        // endpoint_url is a single ws:// / wss:// URL; ws_logging dials it via
+        // tokio_tungstenite outside the shared client + DnsCache.
+        "ws_logging" => {
+            if let Some(url) = config.get("endpoint_url").and_then(|v| v.as_str())
+                && let Ok(parsed) = url::Url::parse(url.trim())
+                && let Some(host) = parsed.host_str()
+                && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+            {
+                return Err(format!(
+                    "endpoint_url IP {ip} denied by backend egress policy: {reason}"
+                ));
             }
         }
         _ => {}

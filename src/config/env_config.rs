@@ -476,6 +476,18 @@ fn embedded_ipv4(addr: &std::net::IpAddr) -> Option<std::net::Ipv4Addr> {
         let [c, d] = segments[7].to_be_bytes();
         return Some(std::net::Ipv4Addr::new(a, b, c, d));
     }
+    // NAT64 local-use prefix `64:ff9b:1::/48` (RFC 8215): the embedded IPv4
+    // follows the /48 contiguously in `segments[3..=4]` (e.g. `64:ff9b:1:a00:1::`
+    // = 10.0.0.1), so a deny CIDR written in IPv4 form (e.g. `10.0.0.0/8`) is
+    // matched by the decoded address instead of being bypassed by the IPv6
+    // encoding. `is_always_blocked_range` additionally decodes the RFC 6052 /48
+    // u-byte-split form for the dangerous baseline; the contiguous form is the
+    // realistic DNS64 encoding for CIDR-list matching.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        let [a, b] = segments[3].to_be_bytes();
+        let [c, d] = segments[4].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
     // IPv4-mapped (`::ffff:a.b.c.d`) and deprecated IPv4-compatible (`::a.b.c.d`).
     ip.to_ipv4_mapped().or_else(|| ip.to_ipv4())
 }

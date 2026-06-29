@@ -159,9 +159,11 @@ fn deny_cidr_matches_ipv6_embedded_forms() {
         .expect("valid");
     assert!(!p.is_allowed(&ip("10.0.0.1"))); // raw v4
     assert!(!p.is_allowed(&ip("::ffff:10.0.0.1"))); // IPv4-mapped
-    assert!(!p.is_allowed(&ip("64:ff9b::a00:1"))); // NAT64 of 10.0.0.1
+    assert!(!p.is_allowed(&ip("64:ff9b::a00:1"))); // well-known NAT64 of 10.0.0.1
+    assert!(!p.is_allowed(&ip("64:ff9b:1:a00:1::"))); // local-use NAT64 of 10.0.0.1
     // No false embedded match: a different range and loopback stay allowed.
     assert!(p.is_allowed(&ip("11.0.0.1")));
+    assert!(p.is_allowed(&ip("64:ff9b:1:b00:1::"))); // local-use NAT64 of 11.0.0.1
     assert!(p.is_allowed(&ip("::1")));
 
     // Allow-CIDR escape hatch also matches the embedded form.

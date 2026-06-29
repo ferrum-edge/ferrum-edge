@@ -440,7 +440,7 @@ fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
 // `#[tokio::test]` because kafka_logging's constructor spawns a background
 // batching-flush task, which requires a Tokio reactor.
 #[tokio::test]
-async fn validate_plugin_config_with_policy_screens_denied_ldap_and_kafka_endpoints() {
+async fn validate_plugin_config_with_policy_screens_denied_direct_client_endpoints() {
     use ferrum_edge::config::BackendEgressPolicy;
     use ferrum_edge::plugins::validate_plugin_config_with_policy;
 
@@ -491,7 +491,29 @@ async fn validate_plugin_config_with_policy_screens_denied_ldap_and_kafka_endpoi
         "loopback kafka broker must remain valid by default"
     );
 
-    // The fully-unrestricted policy accepts both (legacy posture).
+    // ws_logging dials its endpoint_url via tungstenite (outside the shared
+    // client); a literal metadata endpoint must be rejected before the flush
+    // loop spawns.
+    let ws_denied = json!({ "endpoint_url": "ws://169.254.169.254/logs" });
+    assert!(
+        validate_plugin_config_with_policy("ws_logging", &ws_denied, &default_policy).is_err(),
+        "metadata ws_logging endpoint_url must be rejected under the default policy"
+    );
+    let ws_loopback = json!({ "endpoint_url": "ws://127.0.0.1:9000/logs" });
+    assert!(
+        validate_plugin_config_with_policy("ws_logging", &ws_loopback, &default_policy).is_ok(),
+        "loopback ws_logging endpoint must remain valid by default"
+    );
+
+    // The fully-unrestricted policy accepts all (legacy posture).
+    assert!(
+        validate_plugin_config_with_policy(
+            "ws_logging",
+            &ws_denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
     assert!(
         validate_plugin_config_with_policy(
             "ldap_auth",
