@@ -325,6 +325,23 @@ fn parse_optional_u64(
 /// Redis is unreachable and recovers when connectivity is restored.
 ///
 /// When a `DnsCache` is provided, Redis hostnames are resolved through the
+/// Outcome of screening + resolving the Redis endpoint through the gateway DNS
+/// cache. The client NEVER dials an address the egress policy hasn't cleared, so
+/// any screen failure fails closed to the in-memory limiter rather than handing
+/// an unscreened host to the Redis crate's own resolver.
+enum RedisEndpoint {
+    /// A policy-screened URL to dial.
+    Url(String),
+    /// Host blocked by the backend egress policy. Fail closed and do NOT start
+    /// the recovery checker — this is configuration, not a transient outage, so a
+    /// config change (which rebuilds the client) is the only recovery.
+    EgressDenied,
+    /// The DNS cache could not resolve the host (resolver outage / misconfigured
+    /// gateway DNS). Fail closed rather than dialing an unscreened address, but
+    /// the background recovery checker may re-screen successfully later.
+    ResolveFailed,
+}
+
 /// gateway's shared DNS cache. On connection failure, the connection is cleared
 /// so the next attempt re-resolves DNS (handling IP changes gracefully).
 pub struct RedisRateLimitClient {
@@ -437,32 +454,34 @@ impl RedisRateLimitClient {
     /// when the host is blocked by the backend egress policy so the caller fails
     /// CLOSED (in-memory limiter) instead of dialing a denied address. A generic
     /// DNS failure still falls back to the hostname (the existing behavior).
-    async fn resolve_url(&self) -> Option<String> {
+    async fn resolve_url(&self) -> RedisEndpoint {
         if let Some(ref dns_cache) = self.dns_cache
             && let Some(hostname) = self.config.hostname()
         {
             match dns_cache.resolve(&hostname, None, None).await {
                 Ok(ip) => {
-                    return Some(self.config.url_with_resolved_ip(ip));
+                    return RedisEndpoint::Url(self.config.url_with_resolved_ip(ip));
                 }
                 Err(e) => {
-                    // Fail CLOSED on a backend-egress-policy denial: do NOT fall
-                    // back to dialing the hostname (which would let a rebound host
-                    // reach a denied address). The caller treats `None` as
-                    // unavailable and uses the in-memory limiter.
                     if crate::dns::is_egress_policy_denial(&e) {
                         warn!(
                             hostname = %hostname,
                             error = %e,
                             "Redis host blocked by backend egress policy — failing closed (in-memory fallback)"
                         );
-                        return None;
+                        return RedisEndpoint::EgressDenied;
                     }
+                    // Fail CLOSED on ANY screen failure (resolver outage /
+                    // misconfigured gateway DNS), NOT just policy denials: handing
+                    // the unscreened hostname to the Redis client would let it
+                    // re-resolve outside the egress policy and possibly dial a
+                    // denied address. The recovery checker re-screens later.
                     warn!(
                         hostname = %hostname,
                         error = %e,
-                        "DNS cache resolution failed for Redis host — using hostname directly"
+                        "DNS cache resolution failed for Redis host — failing closed (in-memory fallback, will retry)"
                     );
+                    return RedisEndpoint::ResolveFailed;
                 }
             }
         }
@@ -479,9 +498,9 @@ impl RedisRateLimitClient {
                 reason,
                 "Redis literal host blocked by backend egress policy — failing closed (in-memory fallback)"
             );
-            return None;
+            return RedisEndpoint::EgressDenied;
         }
-        Some(self.config.effective_url())
+        RedisEndpoint::Url(self.config.effective_url())
     }
 
     /// Build a Redis client with proper TLS configuration.
@@ -569,14 +588,22 @@ impl RedisRateLimitClient {
         }
         drop(guard);
 
-        let Some(url) = self.resolve_url().await else {
-            // Egress policy blocked the Redis host: fail closed to the in-memory
-            // limiter. Do NOT start the recovery health-checker — it would
-            // re-resolve and, on a generic DNS error, fall back to dialing the
-            // denied host every interval. A policy denial is config, not a
-            // transient outage; a config change rebuilds the client.
-            self.mark_unavailable();
-            return None;
+        let url = match self.resolve_url().await {
+            RedisEndpoint::Url(url) => url,
+            RedisEndpoint::EgressDenied => {
+                // Policy denial: fail closed to the in-memory limiter with NO
+                // recovery checker — it would re-screen and stay denied every
+                // interval. A config change rebuilds the client.
+                self.mark_unavailable();
+                return None;
+            }
+            RedisEndpoint::ResolveFailed => {
+                // Transient DNS failure: fail closed (never dial an unscreened
+                // host), but let the recovery checker re-screen later.
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                return None;
+            }
         };
         let client = match self.build_client(&url) {
             Ok(c) => c,
@@ -637,14 +664,22 @@ impl RedisRateLimitClient {
     /// because another command sequence on that same manager can interleave `UNWATCH` or
     /// `EXEC` and break the optimistic transaction boundary.
     async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
-        let Some(url) = self.resolve_url().await else {
-            // Egress policy blocked the Redis host: fail closed to the in-memory
-            // limiter. Do NOT start the recovery health-checker — it would
-            // re-resolve and, on a generic DNS error, fall back to dialing the
-            // denied host every interval. A policy denial is config, not a
-            // transient outage; a config change rebuilds the client.
-            self.mark_unavailable();
-            return None;
+        let url = match self.resolve_url().await {
+            RedisEndpoint::Url(url) => url,
+            RedisEndpoint::EgressDenied => {
+                // Policy denial: fail closed to the in-memory limiter with NO
+                // recovery checker — it would re-screen and stay denied every
+                // interval. A config change rebuilds the client.
+                self.mark_unavailable();
+                return None;
+            }
+            RedisEndpoint::ResolveFailed => {
+                // Transient DNS failure: fail closed (never dial an unscreened
+                // host), but let the recovery checker re-screen later.
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                return None;
+            }
         };
         let client = match self.build_client(&url) {
             Ok(client) => client,

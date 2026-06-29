@@ -2066,9 +2066,11 @@ async fn handle_h3_request(
     // client could still dial a denied literal (e.g. a DB row load only warned
     // about) that H1/H2 clients are already blocked from. Hostname backends are
     // screened by the resolver at dial time on every H3 dispatch path.
-    if let Some(reason) =
-        crate::proxy::denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
-    {
+    if let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
+        effective_host,
+        &proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,

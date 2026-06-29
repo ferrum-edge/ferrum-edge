@@ -13924,9 +13924,11 @@ async fn handle_proxy_request_inner(
         let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
         // Enforce the backend egress policy for a literal-IP gRPC backend before
         // dialing (the gRPC pool skips the DnsCacheResolver for IP literals).
-        if let Some(reason) =
-            denied_literal_backend_ip(grpc_effective_host, &state.env_config.backend_allow_ips)
-        {
+        if let Some(reason) = denied_literal_backend_or_dns_override(
+            grpc_effective_host,
+            grpc_dispatch_proxy,
+            &state.env_config.backend_allow_ips,
+        ) {
             warn!(
                 proxy_id = %proxy.id,
                 backend = %grpc_effective_host,
@@ -18410,6 +18412,26 @@ pub(crate) fn denied_literal_backend_ip(
         .and_then(|ip| policy.deny_reason(&ip))
 }
 
+/// Like [`denied_literal_backend_ip`] but also screens the proxy's `dns_override`
+/// literal IP: a `dns_override` pins resolution to a fixed address, so a denied
+/// literal there must be rejected at dispatch too. Without this, a DB/CP-loaded
+/// proxy (load only warns) with `dns_override` = a denied literal reaches the
+/// connection-pool builder, which `bail!`s a generic `ConnectionPoolError`
+/// (`connection_error=true`) that the retry loop replays and charges to passive
+/// health / the breaker even though no backend was dialed.
+pub(crate) fn denied_literal_backend_or_dns_override(
+    host: &str,
+    proxy: &Proxy,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    denied_literal_backend_ip(host, policy).or_else(|| {
+        proxy
+            .dns_override
+            .as_deref()
+            .and_then(|ovr| denied_literal_backend_ip(ovr, policy))
+    })
+}
+
 /// Build the fail-closed `BackendResponse` for a literal-IP backend blocked by
 /// the egress policy: a 502 that is NOT retried and is neutral to backend health
 /// (the backend was never dialed), via `ErrorClass::DispatchPolicyRejected`.
@@ -18551,9 +18573,11 @@ async fn proxy_to_backend(
 
     // Enforce the backend egress policy for a literal-IP backend before dialing
     // (reqwest/pools skip the DnsCacheResolver for IP literals).
-    if let Some(reason) =
-        denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
-    {
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,
@@ -22165,9 +22189,11 @@ async fn proxy_to_backend_http3(
         .unwrap_or(&proxy.backend_host);
     // Enforce the backend egress policy for a literal-IP backend before dialing
     // (the native-H3/reqwest paths skip the DnsCacheResolver for IP literals).
-    if let Some(reason) =
-        denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
-    {
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
         warn!(
             proxy_id = %proxy.id,
             backend = %effective_host,

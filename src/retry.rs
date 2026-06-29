@@ -260,6 +260,17 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
     use crate::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
 
+    // A DnsCacheResolver egress-policy denial (a gRPC backend hostname or
+    // dns_override that resolves — or rebinds — to a blocked IP) surfaces as a
+    // BackendUnavailable{DnsResolution} whose message carries "...denied by
+    // backend egress policy...". Classify it as the non-retryable, backend-
+    // health-neutral DispatchPolicyRejected before the DnsResolution kind below
+    // maps it to DnsLookupError (which the retry loop would replay and charge to
+    // backend health even though no backend was dialed).
+    if format!("{e:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     match e {
         GrpcProxyError::BackendTimeout { kind, .. } => match kind {
             GrpcTimeoutKind::Connect => ErrorClass::ConnectionTimeout,
