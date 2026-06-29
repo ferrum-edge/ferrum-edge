@@ -2294,6 +2294,459 @@ where
 // gRPC flavor — HTTP/2 gRPC pool + streaming response + trailers
 // ---------------------------------------------------------------------------
 
+/// Build the backend-facing header map for an H3→gRPC dispatch. Mirrors the
+/// H1/H2 gRPC path in `src/proxy/mod.rs::proxy_grpc_request_core` so gRPC
+/// backends behind an H3 frontend see the same forwarding metadata
+/// (X-Forwarded-For, -Proto, -Host, Via, Forwarded) as they would over H1/H2.
+/// Hop-by-hop headers (RFC 9110 §7.6.1) plus client-supplied forwarding headers
+/// are stripped before the canonical forwarding set is re-synthesized. Shared
+/// by the buffered (`dispatch_grpc`) and streaming (`dispatch_grpc_streaming`)
+/// request paths so they cannot drift.
+///
+/// Hot-path note: the HOST and X-FORWARDED-FOR lookups use the hyper
+/// pre-interned HeaderName constants when we know the key — but here the source
+/// is a `HashMap<String, String>` so we use `.get()` on the lowercase literal
+/// (single string compare, no alloc). Forwarding header *insertion* below uses
+/// the pre-interned constants to skip the name-parse on the hot path.
+fn build_h3_grpc_backend_headers(
+    state: &ProxyState,
+    proxy_headers: &HashMap<String, String>,
+    client_ip: &str,
+    xff_append_ip: &str,
+    is_early_data: bool,
+) -> HeaderMap {
+    let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
+    let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
+    // Pre-size the HeaderMap — each source entry produces at most one output
+    // and we add up to 5 forwarding headers; `HeaderMap::with_capacity`
+    // clamps to the power-of-two bucket count so extra slack is cheap.
+    let mut hmap = HeaderMap::with_capacity(proxy_headers.len() + 5);
+    for (k, v) in proxy_headers {
+        if should_skip_cross_protocol_backend_header(k.as_str()) {
+            continue;
+        }
+        // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
+        // forwarded the request over 0-RTT, never by the originating
+        // client. Strip any client-supplied value and let the
+        // `is_early_data` injection below produce the canonical form.
+        if k.as_str() == "early-data" {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            hmap.append(name, val);
+        }
+    }
+    let xff_val = crate::proxy::build_xff_value(
+        original_xff,
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
+    if let Ok(val) = HeaderValue::from_str(&xff_val) {
+        hmap.insert("x-forwarded-for", val);
+    }
+    // `x-forwarded-proto=https` is identical across H3 requests (H3 is
+    // always TLS) — use `from_static` to skip the header-value parse.
+    hmap.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    if let Some(host) = original_host_header
+        && let Ok(val) = HeaderValue::from_str(host)
+    {
+        hmap.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http3
+        && let Ok(val) = HeaderValue::from_str(via)
+    {
+        hmap.insert(hyper::header::VIA, val);
+    }
+    if state.add_forwarded_header {
+        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", original_host_header);
+        if let Ok(val) = HeaderValue::from_str(&fwd) {
+            hmap.insert(hyper::header::FORWARDED, val);
+        }
+    }
+    // RFC 8470 §5.2: signal to the origin that this request was carried
+    // over TLS 1.3 0-RTT so the gRPC backend can apply its own
+    // replay-safety policy (e.g. reject with `UNAVAILABLE` on a
+    // non-idempotent unary call). The gateway has already gated by
+    // `state.early_data_methods`; the backend may apply additional policy.
+    if is_early_data {
+        hmap.insert("early-data", HeaderValue::from_static("1"));
+    }
+    hmap
+}
+
+/// Extract the gateway-trusted consumer-identity headers (`x-consumer-username`
+/// / `x-consumer-custom-id`) from the materialised `proxy_headers` into a
+/// minimal map.
+///
+/// The H3 gRPC dispatch builds its backend header set up-front
+/// ([`build_h3_grpc_backend_headers`]) and passes empty `proxy_headers` to the
+/// gRPC core so the canonical forwarding headers it synthesised
+/// (`x-forwarded-*`, `via`, `forwarded`) are not re-merged. But the core's
+/// `merge_proxy_headers_and_strip_for_grpc` strips reserved identity headers
+/// from the base map and re-adds them ONLY from its `proxy_headers` arg (so a
+/// client cannot forge a principal). An empty arg therefore drops the
+/// gateway-verified `x-consumer-*` that `build_h3_grpc_backend_headers` copied
+/// in, hiding the authenticated principal from the backend. Passing this minimal
+/// map preserves the trusted identity while still keeping the forwarding headers
+/// from being re-merged. Empty when no principal was resolved — the merge then
+/// strips any client-forged value and adds nothing, preserving the spoof
+/// protection (codex P2).
+fn trusted_identity_proxy_headers(
+    proxy_headers: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut identity = HashMap::new();
+    // The H3 server injects these post-auth as `X-Consumer-Username` /
+    // `X-Consumer-Custom-Id` (capitalised — see `src/http3/server.rs`), so match
+    // CASE-INSENSITIVELY: a case-sensitive lowercase lookup would miss them and
+    // still drop the authenticated principal (codex P2). Stored lowercase — the
+    // gRPC core's merge re-parses the name via `HeaderName` (which lowercases)
+    // regardless. The reserved set mirrors
+    // `proxy::headers::strip_reserved_consumer_identity_headers`.
+    for (key, value) in proxy_headers {
+        if key.eq_ignore_ascii_case("x-consumer-username")
+            || key.eq_ignore_ascii_case("x-consumer-custom-id")
+        {
+            identity.insert(key.to_ascii_lowercase(), value.clone());
+        }
+    }
+    identity
+}
+
+/// Stream a live gRPC backend response (`GrpcResponseKind::Streaming`) onto an
+/// H3 send half: run `after_proxy` + sticky-cookie on the headers, send the
+/// response head, stream the body frame-by-frame through the coalescer, then
+/// strip + forward the gRPC trailers — recording the backend / admission
+/// outcome from the `grpc-status` trailer. Shared by the buffered-request
+/// (`dispatch_grpc`, full bidi stream) and streaming-request
+/// (`dispatch_grpc_streaming`, split send half) paths so the trailer handling
+/// and health accounting cannot drift. Bounded `S: SendStream<Bytes>` so it
+/// accepts both the full `RequestStream` and a `split()` send half.
+#[allow(clippy::too_many_arguments)]
+async fn handle_h3_grpc_streaming_response<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    mut streaming: grpc_proxy::GrpcStreamingResponse,
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&Arc<UpstreamTarget>>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_start: Instant,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    sticky_cookie_needed: bool,
+    bytes_sent: u64,
+    backend_target_url: &str,
+    final_backend_resolved_ip: Option<String>,
+    // Set by the streaming-request pump when the H3 client resets its upload; used
+    // to classify a resulting response-body error as a CLIENT abort rather than a
+    // backend fault (codex P2). `None` on the buffered-request path (no pump).
+    frontend_upload_failed: Option<&Arc<AtomicBool>>,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: SendStream<Bytes>,
+{
+    let current_target_ref: Option<&UpstreamTarget> = current_target.map(|t| t.as_ref());
+    // Pre-head late-overflow guard (codex P2): if the client upload already tripped
+    // `max_grpc_recv_size_bytes` by the time the backend response is ready — e.g. a
+    // trailers-only success whose `grpc-status` rides the HEADER block — do NOT
+    // forward that success: emit RESOURCE_EXHAUSTED before any response head reaches
+    // the client. The post-body check further down covers overflows that trip while
+    // the response body streams; a success already delivered in the header block
+    // before the overflow trips cannot be retracted (accepted narrow-race limit).
+    if streaming
+        .request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        record_backend_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target_ref,
+            current_cb_target_key,
+            200,
+            false,
+            Some(ErrorClass::RequestBodyTooLarge),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        record_cross_protocol_backend_admission_outcome(
+            backend_admission_permits,
+            200,
+            false,
+            Some(ErrorClass::RequestBodyTooLarge),
+            backend_admission_start.elapsed(),
+        );
+        let mut outcome = write_grpc_error_send(
+            stream,
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Request payload exceeded backend limit",
+            backend_start,
+            bytes_sent,
+        )
+        .await?;
+        outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+        outcome.error_class = Some(ErrorClass::RequestBodyTooLarge);
+        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        return Ok(outcome);
+    }
+    // Streaming variant: pool returned a live hyper Incoming. Run
+    // after_proxy + sticky cookie on headers BEFORE streaming
+    // begins — body-level hooks (`on_response_body`,
+    // `on_final_response_body`) cannot run on streaming gRPC
+    // responses because we don't hold the full body; the main
+    // proxy path has the same limitation.
+    if !plugins.is_empty()
+        && let Some(reject) = crate::proxy::run_after_proxy_hooks(
+            plugins,
+            ctx,
+            streaming.status,
+            &mut streaming.headers,
+        )
+        .await
+    {
+        let reject_status = reject.status_code;
+        let mut outcome = match write_final_grpc_body_reject_send(
+            stream,
+            plugins,
+            ctx,
+            PluginResult::RejectBinary {
+                status_code: reject.status_code,
+                body: Bytes::from(reject.body),
+                headers: reject.headers,
+            },
+            backend_start,
+            bytes_sent,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                debug!(
+                    "cross-protocol H3 gRPC streaming after_proxy reject header write failed: {error}"
+                );
+                record_cross_protocol_header_write_disconnect(
+                    state,
+                    proxy,
+                    epoch,
+                    upstream_balancer,
+                    current_target,
+                    current_cb_target_key,
+                    reject_status,
+                    streaming.status,
+                    cb_is_half_open_probe,
+                    backend_start,
+                    backend_admission_permits,
+                    backend_admission_start.elapsed(),
+                );
+                return Ok(cross_protocol_header_write_disconnect_outcome(
+                    reject_status,
+                    bytes_sent,
+                    backend_start,
+                    Some(strip_query_from_backend_url(backend_target_url)),
+                    final_backend_resolved_ip.clone(),
+                ));
+            }
+        };
+        record_backend_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target_ref,
+            current_cb_target_key,
+            outcome.response_status,
+            false,
+            None,
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        // Backend status, not the gateway policy reject (see the buffered
+        // reject path above): a locally-rejected response must not train the
+        // limiter as a backend failure.
+        record_cross_protocol_backend_admission_outcome(
+            backend_admission_permits,
+            streaming.status,
+            false,
+            None,
+            backend_admission_start.elapsed(),
+        );
+        outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        return Ok(outcome);
+    }
+    crate::http3::server::inject_sticky_cookie(
+        epoch,
+        proxy,
+        current_target_ref,
+        sticky_cookie_needed,
+        &mut streaming.headers,
+    );
+
+    if let Err(error) = send_response_headers(stream, streaming.status, &streaming.headers).await {
+        debug!("cross-protocol H3 gRPC streaming response header write failed: {error}");
+        record_cross_protocol_header_write_disconnect(
+            state,
+            proxy,
+            epoch,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            streaming.status,
+            streaming.status,
+            cb_is_half_open_probe,
+            backend_start,
+            backend_admission_permits,
+            backend_admission_start.elapsed(),
+        );
+        return Ok(cross_protocol_header_write_disconnect_outcome(
+            streaming.status,
+            bytes_sent,
+            backend_start,
+            Some(strip_query_from_backend_url(backend_target_url)),
+            final_backend_resolved_ip.clone(),
+        ));
+    }
+    let coalesce = CoalesceConfig::from_state(state);
+    let max_resp_bytes = state.max_response_body_size_bytes;
+    let (bytes_streamed, body_completed, client_disconnected, body_error_class, trailers) =
+        stream_hyper_incoming(stream, streaming.body, coalesce, max_resp_bytes).await;
+
+    let mut final_body_completed = body_completed;
+    let mut final_client_disconnected = client_disconnected;
+    // Late client-upload overflow (codex P2): on a bidi/early-response RPC the
+    // channel body can trip `max_grpc_recv_size_bytes` AFTER the response headers
+    // were forwarded, so `proxy_grpc_request_streaming_channel` could not surface
+    // it. An oversized upload must NOT be delivered to the client as a successful
+    // gRPC response: when the flag tripped, RST the H3 response (withholding the
+    // backend's possibly-`grpc-status: 0` trailer) so the client observes an
+    // aborted RPC rather than success. HEADERS/DATA already on the wire cannot be
+    // unsent, but the success status is suppressed. Metrics below reclassify the
+    // overrun as a client-side `RequestBodyTooLarge` (neutral for backend health
+    // and adaptive concurrency, even if the backend finished first). No-op for the
+    // buffered-request path, which size-checks before dispatch.
+    let request_overflowed_late = streaming
+        .request_body_exceeded
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire));
+    // Capture the backend gRPC outcome from the trailers before they are
+    // stripped/forwarded, so the admission sample below reflects a backend
+    // gRPC failure (e.g. 14 -> 503) instead of the HTTP 200 status line.
+    let mut grpc_trailer_status: Option<u32> = None;
+    if request_overflowed_late {
+        // Suppress the (possibly successful) backend status on an oversized upload.
+        crate::http3::stream_util::abort_response_stream(stream);
+        final_body_completed = false;
+    } else if body_completed && let Some(mut trailers) = trailers {
+        grpc_trailer_status = trailers
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
+        // the backend gRPC trailers before forwarding to the H3 client,
+        // via the shared helper so this site, the buffered path
+        // (collect_buffered_grpc_trailers), and the H2 streaming wrapper
+        // (body::StripHopByHopTrailers) cannot drift. Otherwise a
+        // misbehaving/malicious backend can leak `trailer` /
+        // `proxy-authenticate` / `connection` / `keep-alive` etc. to the
+        // client through the TRAILERS frame.
+        let had_trailers = !trailers.is_empty();
+        strip_response_hop_by_hop_trailers(&mut trailers);
+        if !trailers.is_empty() {
+            if let Err(e) = stream.send_trailers(trailers).await {
+                warn!("H3 gRPC streaming send_trailers failed: {}", e);
+                final_client_disconnected = true;
+                final_body_completed = false;
+            }
+        } else if had_trailers && let Err(e) = stream.finish().await {
+            // Every trailer was hop-by-hop and got stripped to empty. The
+            // map was non-empty on return, so stream_hyper_incoming left
+            // the QUIC stream open for the caller to finalize (its
+            // contract: it only finish()es when it returns None/empty
+            // trailers). FIN it here — mirroring the buffered path's
+            // `else { finish() }` above — so the stream is cleanly closed
+            // instead of left open until the client times out (only RESET
+            // on drop). The had_trailers guard avoids a double-finish when
+            // the backend sent an already-empty trailer frame that
+            // stream_hyper_incoming already finished.
+            debug!("H3 gRPC streaming finish after trailer strip failed: {}", e);
+            final_client_disconnected = true;
+            final_body_completed = false;
+        }
+    }
+
+    // A client upload reset (recv-half error) makes the pump set
+    // `frontend_upload_failed`; the backend then sees an RST and the response body
+    // surfaces a hyper error here. That is a CLIENT abort, not a backend fault — so
+    // classify it as ClientDisconnect (neutral for backend health / adaptive
+    // concurrency) rather than the protocol/timeout class hyper reports (codex P2).
+    let frontend_aborted = frontend_upload_failed.is_some_and(|flag| flag.load(Ordering::Acquire));
+    let outcome_error_class = if request_overflowed_late {
+        Some(ErrorClass::RequestBodyTooLarge)
+    } else if frontend_aborted && body_error_class.is_some() {
+        Some(ErrorClass::ClientDisconnect)
+    } else {
+        body_error_class
+    };
+    // The backend-health sample (circuit breaker / passive health / least-latency)
+    // must reflect the TRUE gRPC outcome, not just the HTTP 200 status line
+    // (codex P2): a non-OK `grpc-status` trailer or a mid-stream body error is a
+    // backend failure, while a client-side terminal (disconnect / oversized upload)
+    // is neutral. Response headers already arrived here, so `connection_error` is
+    // always false (no pre-wire connect failure) — the failure signal rides the
+    // mapped status + error class. The adaptive-concurrency sample uses the same
+    // triple so circuit-breaker / passive-health and admission cannot drift.
+    let outcome_status = match grpc_trailer_status {
+        Some(code) if code != 0 => crate::proxy::grpc_proxy::grpc_status_to_http_status(code),
+        _ => streaming.status,
+    };
+    record_backend_outcome(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target_ref,
+        current_cb_target_key,
+        outcome_status,
+        false,
+        outcome_error_class,
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        outcome_status,
+        false,
+        outcome_error_class,
+        backend_admission_start.elapsed(),
+    );
+    Ok(CrossProtocolOutcome {
+        response_status: streaming.status,
+        bytes_streamed,
+        bytes_sent,
+        backend_target: Some(strip_query_from_backend_url(backend_target_url)),
+        backend_resolved_ip: final_backend_resolved_ip.clone(),
+        body_completed: final_body_completed,
+        client_disconnected: final_client_disconnected,
+        connection_error: false,
+        error_class: None,
+        body_error_class: outcome_error_class,
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_grpc<S>(
     state: &ProxyState,
@@ -2400,79 +2853,16 @@ where
         body.len() as u64
     };
 
-    // Build the backend-facing header map. Mirrors the H1/H2 gRPC path in
-    // `src/proxy/mod.rs::proxy_grpc_request_core` so gRPC backends behind
-    // an H3 frontend see the same forwarding metadata (X-Forwarded-For,
-    // -Proto, -Host, Via, Forwarded) as they would over H1/H2. Hop-by-hop
-    // headers (RFC 9110 §7.6.1) plus client-supplied forwarding headers
-    // are stripped before we re-synthesize the canonical forwarding set.
-    //
-    // Hot-path note: the HOST and X-FORWARDED-FOR lookups use the hyper
-    // pre-interned HeaderName constants when we know the key — but here
-    // the source is a `HashMap<String, String>` so we use `.get()` on the
-    // lowercase literal (single string compare, no alloc). Forwarding
-    // header *insertion* below uses the pre-interned constants to skip
-    // the name-parse on the hot path.
-    let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
-    let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
-    // Pre-size the HeaderMap — each source entry produces at most one output
-    // and we add up to 5 forwarding headers; `HeaderMap::with_capacity`
-    // clamps to the power-of-two bucket count so extra slack is cheap.
-    let mut hmap = HeaderMap::with_capacity(proxy_headers.len() + 5);
-    for (k, v) in proxy_headers {
-        if should_skip_cross_protocol_backend_header(k.as_str()) {
-            continue;
-        }
-        // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
-        // forwarded the request over 0-RTT, never by the originating
-        // client. Strip any client-supplied value and let the
-        // `is_early_data` injection below produce the canonical form.
-        if k.as_str() == "early-data" {
-            continue;
-        }
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            hmap.append(name, val);
-        }
-    }
-    let xff_val = crate::proxy::build_xff_value(
-        original_xff,
+    // Build the backend-facing header map (X-Forwarded-*, Via, Forwarded,
+    // Early-Data) via the shared helper so the buffered and streaming H3 gRPC
+    // paths cannot drift on forwarding-header synthesis.
+    let hmap = build_h3_grpc_backend_headers(
+        state,
+        proxy_headers,
         client_ip,
         xff_append_ip,
-        &state.trusted_proxies,
+        ctx.is_early_data,
     );
-    if let Ok(val) = HeaderValue::from_str(&xff_val) {
-        hmap.insert("x-forwarded-for", val);
-    }
-    // `x-forwarded-proto=https` is identical across H3 requests (H3 is
-    // always TLS) — use `from_static` to skip the header-value parse.
-    hmap.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-    if let Some(host) = original_host_header
-        && let Ok(val) = HeaderValue::from_str(host)
-    {
-        hmap.insert("x-forwarded-host", val);
-    }
-    if let Some(ref via) = state.via_header_http3
-        && let Ok(val) = HeaderValue::from_str(via)
-    {
-        hmap.insert(hyper::header::VIA, val);
-    }
-    if state.add_forwarded_header {
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", original_host_header);
-        if let Ok(val) = HeaderValue::from_str(&fwd) {
-            hmap.insert(hyper::header::FORWARDED, val);
-        }
-    }
-    // RFC 8470 §5.2: signal to the origin that this request was carried
-    // over TLS 1.3 0-RTT so the gRPC backend can apply its own
-    // replay-safety policy (e.g. reject with `UNAVAILABLE` on a
-    // non-idempotent unary call). The gateway has already gated by
-    // `state.early_data_methods`; the backend may apply additional policy.
-    if ctx.is_early_data {
-        hmap.insert("early-data", HeaderValue::from_static("1"));
-    }
 
     // Stream the response whenever the per-request streaming policy
     // permits it. The previous `!grpc_has_retry &&` gate forced buffering
@@ -2530,8 +2920,11 @@ where
     // (plugin-transformed end-to-end headers + canonical forwarding
     // headers synthesized by this bridge). Passing the original
     // `proxy_headers` again would let the shared gRPC core overwrite
-    // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`).
-    let empty_proxy_headers: HashMap<String, String> = HashMap::new();
+    // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`), so
+    // pass ONLY the gateway-trusted consumer identity: the core's merge strips
+    // reserved `x-consumer-*` from `hmap` and re-adds them solely from this arg,
+    // so an empty map would drop the authenticated principal (codex P2).
+    let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
         initial_hmap,
@@ -2540,7 +2933,7 @@ where
         &current_url,
         &state.grpc_pool,
         &state.dns_cache,
-        &empty_proxy_headers,
+        &identity_proxy_headers,
         stream_grpc_response,
         state.max_response_body_size_bytes,
     )
@@ -2677,7 +3070,7 @@ where
                 &current_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                &empty_proxy_headers,
+                &identity_proxy_headers,
                 stream_grpc_response,
                 state.max_response_body_size_bytes,
             )
@@ -3071,225 +3464,31 @@ where
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             })
         }
-        Ok(GrpcResponseKind::Streaming(mut streaming)) => {
-            // Streaming variant: pool returned a live hyper Incoming. Run
-            // after_proxy + sticky cookie on headers BEFORE streaming
-            // begins — body-level hooks (`on_response_body`,
-            // `on_final_response_body`) cannot run on streaming gRPC
-            // responses because we don't hold the full body; the main
-            // proxy path has the same limitation.
-            if !plugins.is_empty()
-                && let Some(reject) = crate::proxy::run_after_proxy_hooks(
-                    plugins,
-                    ctx,
-                    streaming.status,
-                    &mut streaming.headers,
-                )
-                .await
-            {
-                let reject_status = reject.status_code;
-                let mut outcome = match write_final_body_reject(
-                    stream,
-                    HttpFlavor::Grpc,
-                    plugins,
-                    ctx,
-                    PluginResult::RejectBinary {
-                        status_code: reject.status_code,
-                        body: Bytes::from(reject.body),
-                        headers: reject.headers,
-                    },
-                    backend_start,
-                    bytes_sent,
-                )
-                .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        debug!(
-                            "cross-protocol H3 gRPC streaming after_proxy reject header write failed: {error}"
-                        );
-                        record_cross_protocol_header_write_disconnect(
-                            state,
-                            proxy,
-                            epoch,
-                            upstream_balancer,
-                            current_target.as_ref(),
-                            current_cb_target_key.as_deref(),
-                            reject_status,
-                            streaming.status,
-                            cb_retry_probe_slot_available,
-                            backend_start,
-                            &mut backend_admission_permits,
-                            backend_admission_start.elapsed(),
-                        );
-                        return Ok(cross_protocol_header_write_disconnect_outcome(
-                            reject_status,
-                            bytes_sent,
-                            backend_start,
-                            Some(strip_query_from_backend_url(&current_url)),
-                            final_backend_resolved_ip.clone(),
-                        ));
-                    }
-                };
-                record_backend_outcome(
-                    state,
-                    proxy,
-                    &epoch.load_balancer,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    outcome.response_status,
-                    false,
-                    None,
-                    cb_retry_probe_slot_available,
-                    false,
-                    backend_start.elapsed(),
-                );
-                // Backend status, not the gateway policy reject (see the buffered
-                // reject path above): a locally-rejected response must not train the
-                // limiter as a backend failure.
-                record_cross_protocol_backend_admission_outcome(
-                    &mut backend_admission_permits,
-                    streaming.status,
-                    false,
-                    None,
-                    backend_admission_start.elapsed(),
-                );
-                outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
-                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
-                return Ok(outcome);
-            }
-            crate::http3::server::inject_sticky_cookie(
+        Ok(GrpcResponseKind::Streaming(streaming)) => {
+            handle_h3_grpc_streaming_response(
+                stream,
+                streaming,
+                state,
                 epoch,
                 proxy,
-                current_target.as_deref(),
-                sticky_cookie_needed,
-                &mut streaming.headers,
-            );
-
-            if let Err(error) =
-                send_response_headers(stream, streaming.status, &streaming.headers).await
-            {
-                debug!("cross-protocol H3 gRPC streaming response header write failed: {error}");
-                record_cross_protocol_header_write_disconnect(
-                    state,
-                    proxy,
-                    epoch,
-                    upstream_balancer,
-                    current_target.as_ref(),
-                    current_cb_target_key.as_deref(),
-                    streaming.status,
-                    streaming.status,
-                    cb_retry_probe_slot_available,
-                    backend_start,
-                    &mut backend_admission_permits,
-                    backend_admission_start.elapsed(),
-                );
-                return Ok(cross_protocol_header_write_disconnect_outcome(
-                    streaming.status,
-                    bytes_sent,
-                    backend_start,
-                    Some(strip_query_from_backend_url(&current_url)),
-                    final_backend_resolved_ip.clone(),
-                ));
-            }
-            let coalesce = CoalesceConfig::from_state(state);
-            let max_resp_bytes = state.max_response_body_size_bytes;
-            let (bytes_streamed, body_completed, client_disconnected, body_error_class, trailers) =
-                stream_hyper_incoming(stream, streaming.body, coalesce, max_resp_bytes).await;
-
-            let mut final_body_completed = body_completed;
-            let mut final_client_disconnected = client_disconnected;
-            // Capture the backend gRPC outcome from the trailers before they are
-            // stripped/forwarded, so the admission sample below reflects a backend
-            // gRPC failure (e.g. 14 -> 503) instead of the HTTP 200 status line.
-            let mut grpc_trailer_status: Option<u32> = None;
-            if body_completed && let Some(mut trailers) = trailers {
-                grpc_trailer_status = trailers
-                    .get("grpc-status")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u32>().ok());
-                // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
-                // the backend gRPC trailers before forwarding to the H3 client,
-                // via the shared helper so this site, the buffered path
-                // (collect_buffered_grpc_trailers), and the H2 streaming wrapper
-                // (body::StripHopByHopTrailers) cannot drift. Otherwise a
-                // misbehaving/malicious backend can leak `trailer` /
-                // `proxy-authenticate` / `connection` / `keep-alive` etc. to the
-                // client through the TRAILERS frame.
-                let had_trailers = !trailers.is_empty();
-                strip_response_hop_by_hop_trailers(&mut trailers);
-                if !trailers.is_empty() {
-                    if let Err(e) = stream.send_trailers(trailers).await {
-                        warn!("H3 gRPC streaming send_trailers failed: {}", e);
-                        final_client_disconnected = true;
-                        final_body_completed = false;
-                    }
-                } else if had_trailers && let Err(e) = stream.finish().await {
-                    // Every trailer was hop-by-hop and got stripped to empty. The
-                    // map was non-empty on return, so stream_hyper_incoming left
-                    // the QUIC stream open for the caller to finalize (its
-                    // contract: it only finish()es when it returns None/empty
-                    // trailers). FIN it here — mirroring the buffered path's
-                    // `else { finish() }` above — so the stream is cleanly closed
-                    // instead of left open until the client times out (only RESET
-                    // on drop). The had_trailers guard avoids a double-finish when
-                    // the backend sent an already-empty trailer frame that
-                    // stream_hyper_incoming already finished.
-                    debug!("H3 gRPC streaming finish after trailer strip failed: {}", e);
-                    final_client_disconnected = true;
-                    final_body_completed = false;
-                }
-            }
-
-            record_backend_outcome(
-                state,
-                proxy,
-                &epoch.load_balancer,
                 upstream_balancer,
-                current_target.as_deref(),
+                current_target.as_ref(),
                 current_cb_target_key.as_deref(),
-                streaming.status,
-                false,
-                None,
                 cb_retry_probe_slot_available,
-                false,
-                backend_start.elapsed(),
-            );
-            let backend_admission_connection_error = match body_error_class {
-                Some(ErrorClass::ClientDisconnect) => false,
-                Some(_) => true,
-                None => false,
-            };
-            // On a clean completion the backend health rides in the grpc-status
-            // trailer (HTTP 200) — map a non-OK status to 5xx so the limiter shrinks;
-            // a mid-stream body error already drives `connection_error`/error_class.
-            let admission_status = match grpc_trailer_status {
-                Some(code) if code != 0 => {
-                    crate::proxy::grpc_proxy::grpc_status_to_http_status(code)
-                }
-                _ => streaming.status,
-            };
-            record_cross_protocol_backend_admission_outcome(
+                backend_start,
                 &mut backend_admission_permits,
-                admission_status,
-                backend_admission_connection_error,
-                body_error_class,
-                backend_admission_start.elapsed(),
-            );
-            Ok(CrossProtocolOutcome {
-                response_status: streaming.status,
-                bytes_streamed,
+                backend_admission_start,
+                plugins,
+                ctx,
+                sticky_cookie_needed,
                 bytes_sent,
-                backend_target: Some(strip_query_from_backend_url(&current_url)),
-                backend_resolved_ip: final_backend_resolved_ip.clone(),
-                body_completed: final_body_completed,
-                client_disconnected: final_client_disconnected,
-                connection_error: false,
-                error_class: None,
-                body_error_class,
-                backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
-            })
+                &current_url,
+                final_backend_resolved_ip.clone(),
+                // Buffered-request path: the body was fully drained + size-checked
+                // before dispatch, so there is no streaming pump / client-abort flag.
+                None,
+            )
+            .await
         }
         Err(err) => {
             // Preserve DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / INTERNAL
@@ -3372,6 +3571,383 @@ where
             Ok(outcome)
         }
     }
+}
+
+/// HTTP/3 → non-H3 gRPC backend with a STREAMING request body.
+///
+/// The streaming-safe counterpart to [`dispatch_grpc`] (which buffers the H3
+/// request body before dispatch via `drain_h3_body`). Taken when the request is
+/// gRPC and `can_stream_request_body` holds (no retry, no request/response body
+/// buffering, no pre-buffered body — see `src/http3/server.rs`), so true
+/// client-streaming / bidi RPCs forward request DATA to the backend
+/// incrementally instead of waiting for the client half-close.
+///
+/// Owns the concrete `RequestStream` so it can `split()` into independent
+/// send/recv halves (mirrors the H3 WebSocket bridge): a spawned pump owns the
+/// recv half and feeds request DATA into a bounded channel that backs a
+/// [`grpc_proxy::GrpcBody::Channel`] (hyper drives the upload from the channel
+/// in the background), while this task streams the backend response onto the
+/// send half. There is NO retry path — the request body is consumed on the wire
+/// and cannot be replayed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_grpc_streaming(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    method: &str,
+    proxy_headers: &HashMap<String, String>,
+    backend_url: &str,
+    upstream_target: Option<&UpstreamTarget>,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    backend_start: Instant,
+    ctx: &mut RequestContext,
+    plugins: &[Arc<dyn Plugin>],
+    backend_admission_plugins: &[Arc<dyn Plugin>],
+    sticky_cookie_needed: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error> {
+    let mut stream = stream;
+    let current_target = upstream_target.cloned().map(Arc::new);
+    let current_cb_target_key = cb_target_key.map(str::to_owned);
+
+    let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            return write_grpc_error(
+                &mut stream,
+                grpc_proxy::grpc_status::UNIMPLEMENTED,
+                "Method Not Allowed",
+                backend_start,
+                0,
+            )
+            .await;
+        }
+    };
+
+    // Forwarding headers — shared with the buffered path so an `https` proxy
+    // forwards identical metadata regardless of the request-body mode.
+    let hmap = build_h3_grpc_backend_headers(
+        state,
+        proxy_headers,
+        client_ip,
+        xff_append_ip,
+        ctx.is_early_data,
+    );
+
+    // Backend admission runs on the FULL stream (a reject write needs the send
+    // half and a clean recv halt) BEFORE we split — mirrors `dispatch_grpc`.
+    // `bytes_sent` is 0 here; the true request-byte count is tracked by the pump
+    // and read when the response completes.
+    let backend_admission_start = Instant::now();
+    let mut backend_admission_permits = match run_cross_protocol_backend_admission_or_reject(
+        backend_admission_plugins,
+        plugins,
+        ctx,
+        proxy,
+        current_target.as_deref(),
+        HttpFlavor::Grpc,
+        &mut stream,
+        backend_start,
+        0,
+        state,
+        current_cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+        None,
+    )
+    .await?
+    {
+        Ok(permits) => permits,
+        // Probe release happens inside the helper, before the reject write.
+        Err(outcome) => return Ok(outcome),
+    };
+    record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
+
+    // Split the QUIC stream so request DATA (recv half) and response DATA (send
+    // half) flow concurrently — required for bidi, where the backend responds
+    // before the client half-closes.
+    let (mut send_half, mut recv_half) = stream.split();
+
+    // Bounded channel bridges the H3 recv half to the gRPC pool's streaming
+    // body. The capacity provides upload backpressure (same env knob the plain
+    // bridge uses). `Err(())` signals a frontend upload failure so the backend
+    // is RST rather than handed a truncated-but-clean END_STREAM.
+    let capacity = state.env_config.http3_request_body_channel_capacity.max(1);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, ()>>(capacity);
+    let request_bytes_seen = Arc::new(AtomicU64::new(0));
+    let pump_bytes = Arc::clone(&request_bytes_seen);
+    // Set by the pump when the H3 recv half errors (the client reset its upload).
+    // The resulting backend RST must be recorded as a CLIENT abort, not a backend
+    // fault (codex P2) — read in the dispatch Err arm below.
+    let frontend_upload_failed = Arc::new(AtomicBool::new(false));
+    let pump_frontend_failed = Arc::clone(&frontend_upload_failed);
+    // Lets the response side terminate the pump promptly once the RPC is over
+    // (e.g. a bidi server that sends its status before the client half-closes),
+    // so the recv half is closed via STOP_SENDING(H3_NO_ERROR) instead of
+    // lingering parked on `recv_data()`.
+    let pump_shutdown = Arc::new(tokio::sync::Notify::new());
+    let pump_shutdown_signal = Arc::clone(&pump_shutdown);
+    let pump = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = pump_shutdown_signal.notified() => break,
+                recv = recv_half.recv_data() => {
+                    match recv {
+                        Ok(Some(mut chunk)) => {
+                            let len = chunk.remaining();
+                            if len == 0 {
+                                continue;
+                            }
+                            // `Buf::copy_to_bytes` is zero-copy when the buffer is
+                            // already `bytes::Bytes` (always true with h3-quinn).
+                            let body_bytes = chunk.copy_to_bytes(len);
+                            pump_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                            // The send MUST stay cancellable (codex P1): on
+                            // bounded-channel backpressure, a bidi backend that
+                            // finished its response and stopped polling the request
+                            // body would otherwise park us forever inside
+                            // `tx.send(...).await`, and the post-response
+                            // `pump_shutdown.notify_one()` (observed only by this
+                            // select) could never unblock the awaited `pump`.
+                            let send_result = tokio::select! {
+                                biased;
+                                _ = pump_shutdown_signal.notified() => break,
+                                res = tx.send(Ok(body_bytes)) => res,
+                            };
+                            if send_result.is_err() {
+                                // Backend dropped the request body (RPC done / RST):
+                                // nothing left to feed.
+                                break;
+                            }
+                        }
+                        // Clean client half-close: drop `tx` so the channel body
+                        // observes END_STREAM and forwards the FIN to the backend.
+                        Ok(None) => break,
+                        Err(_e) => {
+                            // Frontend upload failure: flag it (so the dispatch Err
+                            // arm records a client abort, not a backend fault) and
+                            // best-effort signal the channel body to RST the backend
+                            // instead of sending a clean END_STREAM. The send stays
+                            // cancellable for the same reason as the data send above.
+                            pump_frontend_failed.store(true, Ordering::Release);
+                            tokio::select! {
+                                biased;
+                                _ = pump_shutdown_signal.notified() => {}
+                                _ = tx.send(Err(())) => {}
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // STOP_SENDING(H3_NO_ERROR): a bare recv-half drop surfaces as
+        // RESET_STREAM(0x0) and makes clients log a spurious "Remote reset".
+        crate::http3::stream_util::halt_request_body(&mut recv_half);
+    });
+
+    // Dispatch with the channel-backed streaming body. No retry: the request
+    // body is consumed on the wire. `hmap` already carries the canonical
+    // forwarding headers, so don't re-pass the full `proxy_headers` (the core
+    // would re-merge and overwrite them) — pass only the gateway-trusted consumer
+    // identity, since the core's merge strips reserved `x-consumer-*` from `hmap`
+    // and re-adds them solely from this arg, so an empty map would drop the
+    // authenticated principal (codex P2).
+    let body_size_exceeded = Arc::new(AtomicBool::new(false));
+    let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
+    let result = grpc_proxy::proxy_grpc_request_streaming_channel(
+        hyper_method,
+        hmap,
+        rx,
+        proxy,
+        backend_url,
+        &state.grpc_pool,
+        &identity_proxy_headers,
+        state.max_grpc_recv_size_bytes,
+        Arc::clone(&body_size_exceeded),
+        None,
+    )
+    .await;
+
+    let final_backend_resolved_ip =
+        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
+
+    let outcome_result: Result<CrossProtocolOutcome, anyhow::Error> = match result {
+        Ok(GrpcResponseKind::Streaming(streaming)) => {
+            let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+            handle_h3_grpc_streaming_response(
+                &mut send_half,
+                streaming,
+                state,
+                epoch,
+                proxy,
+                upstream_balancer,
+                current_target.as_ref(),
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+                backend_start,
+                &mut backend_admission_permits,
+                backend_admission_start,
+                plugins,
+                ctx,
+                sticky_cookie_needed,
+                bytes_sent,
+                backend_url,
+                final_backend_resolved_ip.clone(),
+                Some(&frontend_upload_failed),
+            )
+            .await
+        }
+        // The channel entry always streams the response; a Buffered result is
+        // unreachable, but handle it as an internal error rather than panicking.
+        Ok(GrpcResponseKind::Buffered(_)) => {
+            let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+            record_backend_outcome(
+                state,
+                proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                500,
+                false,
+                Some(ErrorClass::ProtocolError),
+                cb_is_half_open_probe,
+                false,
+                backend_start.elapsed(),
+            );
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                500,
+                false,
+                Some(ErrorClass::ProtocolError),
+                backend_admission_start.elapsed(),
+            );
+            write_grpc_error_send(
+                &mut send_half,
+                grpc_proxy::grpc_status::INTERNAL,
+                "Internal gateway error",
+                backend_start,
+                bytes_sent,
+            )
+            .await
+            .map(|mut outcome| {
+                outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
+                outcome.error_class = Some(ErrorClass::ProtocolError);
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome
+            })
+        }
+        Err(err) => {
+            let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+            let (grpc_status_code, grpc_message): (u32, &str) = match &err {
+                grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Backend deadline exceeded",
+                ),
+                grpc_proxy::GrpcProxyError::ResourceExhausted(_) => (
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request payload exceeded backend limit",
+                ),
+                grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Response payload exceeded limit",
+                ),
+                grpc_proxy::GrpcProxyError::Internal(_) => {
+                    (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
+                }
+                grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
+                    (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
+                }
+            };
+            // Two pre-headers failures on this path are CLIENT/gateway-side, not
+            // backend faults, and must train neither backend health nor adaptive
+            // concurrency (both neutralized by `client_side_no_backend_signal`):
+            //   * `ResourceExhausted` — the gateway rejected an oversized client
+            //     upload (the channel body tripped `max_grpc_recv_size_bytes`).
+            //   * a frontend upload abort — the H3 recv half errored, so the pump
+            //     set `frontend_upload_failed` and RST the backend; the resulting
+            //     `BackendUnavailable` is a consequence of the client reset.
+            // Both mirror the buffered H3 path, which releases the probe without
+            // training backend health (codex P2). Every other error keeps the
+            // wire-boundary derivation so a real backend failure still trains the
+            // limiter.
+            let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
+            let frontend_aborted = frontend_upload_failed.load(Ordering::Acquire);
+            let error_class = if request_overflow {
+                ErrorClass::RequestBodyTooLarge
+            } else if frontend_aborted {
+                ErrorClass::ClientDisconnect
+            } else {
+                crate::retry::classify_grpc_proxy_error(&err)
+            };
+            let connection_error = !request_overflow
+                && !frontend_aborted
+                && !crate::retry::request_reached_wire(error_class);
+            warn!(
+                proxy_id = %proxy.id,
+                error = %err,
+                class = ?error_class,
+                grpc_status = grpc_status_code,
+                connection_error,
+                "cross-protocol H3→gRPC streaming backend call failed"
+            );
+            record_backend_outcome(
+                state,
+                proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                502,
+                connection_error,
+                Some(error_class),
+                cb_is_half_open_probe,
+                false,
+                backend_start.elapsed(),
+            );
+            record_cross_protocol_backend_admission_outcome(
+                &mut backend_admission_permits,
+                502,
+                connection_error,
+                Some(error_class),
+                backend_admission_start.elapsed(),
+            );
+            write_grpc_error_send(
+                &mut send_half,
+                grpc_status_code,
+                grpc_message,
+                backend_start,
+                bytes_sent,
+            )
+            .await
+            .map(|mut outcome| {
+                outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
+                outcome.connection_error = connection_error;
+                outcome.error_class = Some(error_class);
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome
+            })
+        }
+    };
+
+    // Pump cleanup ALWAYS runs — even if the response / error write above failed
+    // (the `?` is deferred until after this). `notify_one` stores a permit so
+    // there is no lost wakeup, and the pump's data/abort sends are cancellable
+    // (codex P1), so the join cannot hang on a full channel.
+    pump_shutdown.notify_one();
+    let _ = pump.await;
+
+    let mut outcome = outcome_result?;
+    // Final upload byte count (codex P2): in bidi/client-streaming the pump can
+    // forward request DATA while the response is streaming, so re-read after the
+    // pump terminates rather than trusting the header-time snapshot.
+    outcome.bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
+    Ok(outcome)
 }
 
 async fn apply_buffered_plain_plugin_reject(
@@ -3756,7 +4332,11 @@ async fn stream_hyper_incoming<S>(
     max_response_body_size_bytes: usize,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>)
 where
-    S: RecvStream + SendStream<Bytes>,
+    // Send-only: this loop writes the response (`send_data` / `finish` /
+    // `abort_response_stream`) and never reads the request half, so it accepts
+    // both the full bidi `RequestStream` (buffered-request gRPC path) and a
+    // `split()` send half (streaming-request gRPC path).
+    S: SendStream<Bytes>,
 {
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
@@ -3996,7 +4576,9 @@ async fn send_response_headers<S>(
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    // Send-only: emits `send_response` and nothing on the recv half, so it
+    // accepts both the full bidi stream and a `split()` send half.
+    S: SendStream<Bytes>,
 {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status_code);
@@ -4239,6 +4821,27 @@ async fn write_normalized_grpc_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    let outcome =
+        write_normalized_grpc_reject_send(stream, reject, backend_start, bytes_sent).await?;
+    // Full-stream caller: STOP_SENDING the recv half. The send-only streaming
+    // path halts the recv half from its pump instead.
+    crate::http3::stream_util::halt_request_body(stream);
+    Ok(outcome)
+}
+
+/// Send-only core of [`write_normalized_grpc_reject`]: writes the trailers-only
+/// gRPC reject and FINs the send half WITHOUT touching the recv half. Bounded
+/// `S: SendStream<Bytes>` so it accepts both the full `RequestStream` and a
+/// `split()` send half.
+async fn write_normalized_grpc_reject_send<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    reject: &crate::proxy::NormalizedRejectResponse,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: SendStream<Bytes>,
+{
     debug_assert!(
         reject.body.is_empty(),
         "normalized gRPC rejects should be trailers-only"
@@ -4267,7 +4870,6 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
-    crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: reject.http_status.as_u16(),
         bytes_streamed: 0,
@@ -4281,6 +4883,48 @@ where
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+/// Send-only gRPC variant of [`write_final_body_reject`]: normalize a plugin
+/// reject (`after_proxy` on streaming gRPC response headers) into a
+/// trailers-only gRPC error and write it on the send half WITHOUT halting the
+/// recv half. Used by [`handle_h3_grpc_streaming_response`] so it works on both
+/// the full `RequestStream` (buffered-request path) and a `split()` send half
+/// (streaming-request path). gRPC-only because that helper is gRPC-only.
+async fn write_final_grpc_body_reject_send<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    reject: PluginResult,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: SendStream<Bytes>,
+{
+    let Some(parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+        warn!("final body reject helper received a non-reject plugin result");
+        return write_grpc_error_send(
+            stream,
+            grpc_proxy::h3_http_reject_status_to_grpc_status(StatusCode::BAD_GATEWAY),
+            "Plugin rejection normalization failed",
+            backend_start,
+            bytes_sent,
+        )
+        .await;
+    };
+    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    let mut headers = parts.headers;
+    crate::proxy::apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        http_status.as_u16(),
+        &mut headers,
+    )
+    .await;
+    let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
+    apply_h3_grpc_reject_metadata(ctx, &normalized);
+    write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent).await
 }
 
 /// Borrow the `content-type` value for body-transform plugin dispatch
@@ -4338,6 +4982,30 @@ async fn write_grpc_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    let outcome =
+        write_grpc_error_send(stream, grpc_status, grpc_message, backend_start, bytes_sent).await?;
+    // Full-stream caller: STOP_SENDING the recv half so a bare drop is not seen
+    // as RESET_STREAM(0x0). The send-only streaming-request path
+    // (`dispatch_grpc_streaming`) calls `write_grpc_error_send` directly because
+    // its spawned pump owns and halts the recv half.
+    crate::http3::stream_util::halt_request_body(stream);
+    Ok(outcome)
+}
+
+/// Send-only core of [`write_grpc_error`]: writes the trailers-only gRPC error
+/// (HTTP 200 + `grpc-status` / `grpc-message`) and FINs the send half WITHOUT
+/// touching the recv half. Bounded `S: SendStream<Bytes>` so it accepts both
+/// the full `RequestStream` and a `split()` send half.
+async fn write_grpc_error_send<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: SendStream<Bytes>,
+{
     let grpc_message = sanitize_h3_grpc_message_for_header(grpc_message);
     let mut resp_builder = Response::builder()
         .status(StatusCode::OK)
@@ -4351,7 +5019,6 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
-    crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: 200,
         bytes_streamed: 0,
@@ -5602,6 +6269,203 @@ mod tests {
         assert!(
             !src.contains(&forbidden_retry_hmap) && !src.contains(&forbidden_retry_body),
             "H3 gRPC retry replay buffers must not use panic-based extraction"
+        );
+    }
+
+    /// Regression guard: the streaming-request gRPC bridge must forward the H3
+    /// request body to the backend via the channel-backed streaming entry
+    /// (`proxy_grpc_request_streaming_channel`) over a `split()` send/recv pair
+    /// — NOT buffer it first via `drain_h3_body`. Request buffering is exactly
+    /// the gap this path closes: client-streaming / bidi RPCs need the request
+    /// DATA to reach the backend before the client half-closes.
+    #[test]
+    fn h3_grpc_streaming_dispatch_uses_channel_not_drain() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("pub(crate) async fn dispatch_grpc_streaming")
+            .expect("dispatch_grpc_streaming not found");
+        let tail = &src[start..];
+        // Bound the search to the function body (up to the next free fn).
+        let end = tail
+            .find("\nasync fn apply_buffered_plain_plugin_reject")
+            .expect("end of dispatch_grpc_streaming not found");
+        let body = &tail[..end];
+
+        assert!(
+            body.contains("proxy_grpc_request_streaming_channel("),
+            "dispatch_grpc_streaming must dispatch via the channel-backed streaming entry"
+        );
+        assert!(
+            body.contains("stream.split()"),
+            "dispatch_grpc_streaming must split the QUIC stream for concurrent upload + response"
+        );
+        assert!(
+            !body.contains("drain_h3_body"),
+            "regression: dispatch_grpc_streaming must NOT buffer the request via drain_h3_body — \
+             that reintroduces the client-streaming/bidi stall this path fixes"
+        );
+        assert!(
+            !body.contains("proxy_grpc_request_from_bytes"),
+            "regression: the streaming path must not fall back to the buffered-bytes dispatch"
+        );
+    }
+
+    /// Regression guard (codex P2): an oversized CLIENT upload on the streaming
+    /// path must be recorded as a client-side terminal (`RequestBodyTooLarge`),
+    /// not a synthetic backend 502, so it can never trip the circuit breaker or
+    /// shrink adaptive concurrency for a healthy backend.
+    #[test]
+    fn h3_grpc_streaming_request_overflow_is_client_side_not_backend_fault() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("pub(crate) async fn dispatch_grpc_streaming")
+            .expect("dispatch_grpc_streaming not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\nasync fn apply_buffered_plain_plugin_reject")
+            .expect("end of dispatch_grpc_streaming not found");
+        let body = &tail[..end];
+        assert!(
+            body.contains("ErrorClass::RequestBodyTooLarge"),
+            "request-size overflow on the streaming path must classify as \
+             RequestBodyTooLarge (client-side, neutralized by client_side_no_backend_signal) \
+             so it trains neither backend health nor adaptive concurrency"
+        );
+        // A frontend upload abort must be recorded as a client disconnect, not a
+        // backend fault (codex P2).
+        assert!(
+            body.contains("ErrorClass::ClientDisconnect"),
+            "a frontend upload abort on the streaming path must classify as \
+             ClientDisconnect so a client reset cannot poison backend health"
+        );
+    }
+
+    /// Regression guard (codex P1): the request-body pump's channel send must be
+    /// cancellable via the shutdown signal. A bare `tx.send(...).await` outside
+    /// the `select!` lets a bidi backend that stops polling the request body while
+    /// the bounded channel is full hang `pump.await` (and the request task) forever.
+    #[test]
+    fn h3_grpc_streaming_pump_send_is_shutdown_cancellable() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("pub(crate) async fn dispatch_grpc_streaming")
+            .expect("dispatch_grpc_streaming not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\nasync fn apply_buffered_plain_plugin_reject")
+            .expect("end of dispatch_grpc_streaming not found");
+        let body = &tail[..end];
+        assert!(
+            !body.contains("tx.send(Ok(body_bytes)).await"),
+            "regression: the pump's data send is a bare await — it must be cancellable \
+             via pump_shutdown or `pump.await` can hang on a full channel"
+        );
+        assert!(
+            body.contains("res = tx.send(Ok(body_bytes)) => res"),
+            "the pump's data send must be a cancellable select arm racing pump_shutdown"
+        );
+    }
+
+    /// Regression guard (codex P2): the H3 gRPC dispatch must forward the
+    /// gateway-trusted consumer identity (`x-consumer-*`) to the backend. The
+    /// shared gRPC core's `merge_proxy_headers_and_strip_for_grpc` strips reserved
+    /// identity headers from the pre-built header map and re-adds them ONLY from
+    /// its proxy_headers arg, so passing an empty map drops the authenticated
+    /// principal. Both the buffered and streaming H3 gRPC paths must pass the
+    /// trusted-identity map instead.
+    #[test]
+    fn h3_grpc_dispatch_preserves_trusted_consumer_identity() {
+        let src = include_str!("cross_protocol.rs");
+        assert!(
+            src.contains("fn trusted_identity_proxy_headers"),
+            "the trusted-identity extraction helper must exist"
+        );
+        // Build the forbidden pattern from parts so this assertion's own source
+        // text does not trip the `include_str!` self-scan.
+        let forbidden_empty = ["let empty", "_proxy_headers"].concat();
+        assert!(
+            !src.contains(&forbidden_empty),
+            "regression: an H3 gRPC dispatch declares an empty proxy_headers map for the \
+             gRPC core, whose merge would then DROP the authenticated x-consumer-* \
+             identity — pass trusted_identity_proxy_headers(proxy_headers) instead"
+        );
+    }
+
+    /// The H3 server injects the trusted principal as `X-Consumer-Username` /
+    /// `X-Consumer-Custom-Id` (capitalised), so the extraction must match
+    /// case-insensitively — a case-sensitive lowercase lookup would silently drop
+    /// the authenticated identity for every H3 gRPC request (codex P2).
+    #[test]
+    fn trusted_identity_proxy_headers_matches_case_insensitively() {
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("X-Consumer-Username".to_string(), "alice".to_string());
+        proxy_headers.insert("X-Consumer-Custom-Id".to_string(), "cid-1".to_string());
+        proxy_headers.insert("x-forwarded-for".to_string(), "1.2.3.4".to_string());
+
+        let identity = super::trusted_identity_proxy_headers(&proxy_headers);
+
+        assert_eq!(
+            identity.get("x-consumer-username").map(String::as_str),
+            Some("alice"),
+            "capitalised X-Consumer-Username must be matched case-insensitively"
+        );
+        assert_eq!(
+            identity.get("x-consumer-custom-id").map(String::as_str),
+            Some("cid-1")
+        );
+        assert!(
+            !identity.contains_key("x-forwarded-for"),
+            "only the reserved identity headers are extracted"
+        );
+        assert_eq!(identity.len(), 2);
+    }
+
+    #[test]
+    fn trusted_identity_proxy_headers_empty_without_principal() {
+        // No resolved principal: the merge then strips any client-forged value and
+        // re-adds nothing, preserving the spoof protection.
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("host".to_string(), "example.test".to_string());
+        assert!(super::trusted_identity_proxy_headers(&proxy_headers).is_empty());
+    }
+
+    /// Regression guard (codex P2): a late client-upload overflow on the streaming
+    /// path must abort the H3 response rather than forward the backend's
+    /// (possibly successful) gRPC status to the client.
+    #[test]
+    fn h3_grpc_streaming_late_overflow_aborts_response() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("async fn handle_h3_grpc_streaming_response")
+            .expect("handle_h3_grpc_streaming_response not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>")
+            .expect("end of handle_h3_grpc_streaming_response not found");
+        let body = &tail[..end];
+        assert!(
+            body.contains("if request_overflowed_late {")
+                && body.contains("abort_response_stream(stream)"),
+            "a late request overflow must RST the response (abort_response_stream) \
+             instead of forwarding the backend's success trailer"
+        );
+    }
+
+    /// Regression guard: the H3 server must route streaming-safe gRPC requests
+    /// (gRPC flavor + `can_stream_request_body`) to the streaming-request bridge
+    /// rather than the buffering `cross_protocol::run`. `can_stream_request_body`
+    /// already excludes retry / request-body plugins / response buffering / a
+    /// pre-buffered body, so this gate is exactly the streaming-safe set.
+    #[test]
+    fn h3_server_routes_streaming_safe_grpc_to_streaming_dispatch() {
+        let src = include_str!("server.rs");
+        assert!(
+            src.contains("if matches!(http_flavor, HttpFlavor::Grpc) && can_stream_request_body"),
+            "H3 server must gate the streaming gRPC bridge on flavor + can_stream_request_body"
+        );
+        assert!(
+            src.contains("cross_protocol::dispatch_grpc_streaming("),
+            "H3 server must dispatch streaming-safe gRPC through dispatch_grpc_streaming"
         );
     }
 }

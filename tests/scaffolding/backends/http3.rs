@@ -79,9 +79,13 @@ pub enum H3Step {
     /// Send a chunk of response body.
     RespondData(Bytes),
     /// Send an H3 trailers (HEADERS) frame with the given `(name, value)`
-    /// pairs after the response body, then finish the stream. Pseudo-headers
-    /// are rejected — trailers carry only regular header fields. Used to
-    /// exercise backend-trailer forwarding to H1/H2 downstream clients.
+    /// pairs after the response body (e.g. `grpc-status` / `grpc-message`),
+    /// then FIN the stream. Pseudo-headers are rejected — trailers carry only
+    /// regular header fields. `finish()` is sent immediately so the trailers +
+    /// FIN flush together; follow with a `StallFor` to keep the connection open
+    /// until the gateway has read the complete trailered response. Used to
+    /// exercise backend-trailer forwarding to H1/H2 and native-H3 (gRPC)
+    /// downstream clients.
     RespondTrailers(Vec<(&'static str, String)>),
     /// Send `RESET_STREAM` with the given application error code, then
     /// end the script.
@@ -584,8 +588,10 @@ async fn run_h3_script(
                     .await
                     .map_err(|e| format!("send_trailers: {e}"))?;
                 // `send_trailers` writes only the trailers HEADERS frame — h3
-                // requires `finish()` to send the stream FIN. Send it NOW (not
-                // at end-of-script) so the trailers + FIN flush together; a
+                // requires `finish()` to send the stream FIN so the client's
+                // `recv_trailers()` sees EOS (otherwise it blocks until the
+                // trailer timeout and observes no `grpc-status`). Send it NOW
+                // (not at end-of-script) so the trailers + FIN flush together; a
                 // following `StallFor` then keeps the QUIC connection open past
                 // them so the gateway reads the complete trailered response
                 // BEFORE the implicit end-of-script connection drop. Deferring

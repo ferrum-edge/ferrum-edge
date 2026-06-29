@@ -295,10 +295,23 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
+    // in the same functional shard never contend on the default admin ports
+    // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
+    // would otherwise surface here as a spurious "gateway did not start" when an
+    // unrelated parallel test holds the default port. These tests never use the
+    // admin API.
+    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
@@ -546,13 +559,25 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 }
 
 /// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+///
+/// The deadline is generous (60s) because the TLS/HTTP3 gateway cold-start
+/// (jemalloc + rustls + config/cert load + QUIC socket setup + DNS/pool warmup)
+/// can exceed a tight budget on a loaded CI runner — the previous 15s caused
+/// intermittent "Gateway did not start" failures in the H3 WebSocket tests even
+/// across the 3 retry attempts. This does not slow the happy path: the loop
+/// returns as soon as the port accepts a TCP connection (polled every 300ms), so
+/// a fast start still finishes in a few seconds; the deadline only bounds a
+/// genuinely stuck start.
 async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+    const STARTUP_TIMEOUT_SECS: u64 = 60;
+    let deadline = std::time::SystemTime::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
     let addr = format!("127.0.0.1:{}", gateway_port);
 
     loop {
         if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 15 seconds".into());
+            return Err(
+                format!("Gateway did not start within {STARTUP_TIMEOUT_SECS} seconds").into(),
+            );
         }
         match tokio::net::TcpStream::connect(&addr).await {
             Ok(_) => return Ok(()),
@@ -1895,4 +1920,215 @@ async fn test_h3_websocket_env_disabled_rejects_connect_but_plain_h3_works() {
     let _ = gateway.wait();
     echo_handle.abort();
     http_handle.abort();
+}
+
+// ============================================================================
+// WebSocket idle timeout (FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS + per-proxy)
+// ============================================================================
+
+/// Read frames until the relay terminates (Close frame, stream end, or transport
+/// error) or `deadline` elapses. Non-terminal frames (Pong, echo replies) are
+/// ignored. Returns `true` if the gateway closed the session within `deadline`.
+async fn ws_session_closed_within<S>(ws: &mut S, deadline: Duration) -> bool
+where
+    S: futures_util::Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    let start = tokio::time::Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return false;
+        }
+        match tokio::time::timeout(deadline - elapsed, ws.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) => return true,
+            Ok(Some(Ok(_))) => continue, // ignore Pong / echo / other frames
+            Ok(Some(Err(_))) => return true, // transport error => relay torn down
+            Ok(None) => return true,     // stream ended => relay torn down
+            Err(_) => return false,      // deadline elapsed with no termination
+        }
+    }
+}
+
+/// Default-bounded deployments must close a silent WebSocket session once the
+/// idle window elapses (frame-parsed relay path).
+#[ignore]
+#[tokio::test]
+async fn test_websocket_idle_timeout_closes_idle_session() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "2")],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    // Session is live: a round-trip succeeds before we go idle.
+    ws.send(Message::Text("hello".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws.next().await.expect("No reply").expect("Error reading");
+    assert_eq!(reply, Message::Text("Echo: hello".into()));
+
+    // Now stay idle. The 2s idle bound must tear the session down; 10s is a
+    // generous ceiling (the watchdog fires within a few seconds of inactivity).
+    assert!(
+        ws_session_closed_within(&mut ws, Duration::from_secs(10)).await,
+        "idle WebSocket session should be closed by the gateway within the idle window"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Explicit `0` must preserve the legacy "never time out" behavior so operators
+/// can intentionally opt out for genuinely long-lived silent streams.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_idle_timeout_disabled_keeps_session_open() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "0")],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    // Stay idle well past any reasonable window — must NOT be closed.
+    assert!(
+        !ws_session_closed_within(&mut ws, Duration::from_secs(5)).await,
+        "with idle timeout disabled (0) the session must stay open while idle"
+    );
+
+    // And it is still usable: a round-trip succeeds after the idle period.
+    ws.send(Message::Text("still-here".into()))
+        .await
+        .expect("send after idle should succeed when timeout disabled");
+    let reply = ws.next().await.expect("No reply").expect("Error reading");
+    assert_eq!(reply, Message::Text("Echo: still-here".into()));
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Data-frame activity from either direction must refresh the shared idle
+/// watermark, keeping a busy session alive past the window; once activity stops
+/// the session then closes.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_idle_timeout_activity_refreshes_then_closes() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "3")],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    // Exchange a frame every ~1s for ~6s (twice the 3s window). Each round-trip
+    // refreshes the watermark, so the session must remain open the whole time.
+    for i in 0..6 {
+        ws.send(Message::Text(format!("beat-{i}").into()))
+            .await
+            .expect("send during activity window should succeed");
+        let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("echo should arrive while session is kept alive")
+            .expect("stream open")
+            .expect("no transport error");
+        assert_eq!(reply, Message::Text(format!("Echo: beat-{i}").into()));
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    // Activity stops: the session must now close within the idle window.
+    assert!(
+        ws_session_closed_within(&mut ws, Duration::from_secs(10)).await,
+        "session should close once activity stops and the idle window elapses"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Tunnel mode (raw bidirectional copy) must enforce the same idle bound as the
+/// frame-parsed relay, so the two modes behave consistently.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_idle_timeout_tunnel_mode_closes_idle_session() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[
+            ("FERRUM_WEBSOCKET_TUNNEL_MODE", "true"),
+            ("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "2"),
+        ],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    // Confirm the tunnel relay is live before idling.
+    ws.send(Message::Text("tunnel-hello".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws.next().await.expect("No reply").expect("Error reading");
+    assert_eq!(reply, Message::Text("Echo: tunnel-hello".into()));
+
+    assert!(
+        ws_session_closed_within(&mut ws, Duration::from_secs(10)).await,
+        "tunnel-mode idle WebSocket session should be closed within the idle window"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }

@@ -186,6 +186,41 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Classify a DP CP gRPC URL for the secure-by-default plaintext gate.
+///
+/// Returns `Ok(true)` when the URL is plaintext (`http://`/`grpc://`) AND its
+/// host is non-loopback — the only case the gate blocks without an explicit
+/// opt-in. Returns `Ok(false)` for TLS URLs (`https://`/`grpcs://`) and for
+/// loopback plaintext (`127.0.0.1`, `::1`, `localhost`, `*.localhost`). A URL
+/// that does not parse, or that carries an unsupported scheme, is an `Err` so
+/// the misconfiguration surfaces at startup rather than at first dial.
+fn cp_dp_grpc_url_is_nonloopback_plaintext(url: &str) -> Result<bool, String> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is not a valid URL: {e}"))?;
+    let plaintext = match parsed.scheme() {
+        "https" | "grpcs" => return Ok(false),
+        "http" | "grpc" => true,
+        other => {
+            return Err(format!(
+                "FERRUM_DP_CP_GRPC_URLS entry '{url}' has unsupported scheme '{other}://' \
+                 (expected http:// or https://)"
+            ));
+        }
+    };
+    let host = parsed
+        .host()
+        .ok_or_else(|| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is missing a host"))?;
+    let is_loopback = match host {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(d) => {
+            let d = d.to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+    };
+    Ok(plaintext && !is_loopback)
+}
+
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
@@ -550,8 +585,26 @@ pub struct EnvConfig {
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
     /// Bind address for Admin API listeners (HTTP, HTTPS).
-    /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
+    ///
+    /// Default: `127.0.0.1` (loopback) — the admin API is a management plane and
+    /// is safe-by-default, NOT exposed on the network. Set to `0.0.0.0` (or a
+    /// specific address, or `::` for dual-stack) to expose it, but in the
+    /// writable `database`/`cp` modes a public plaintext bind also requires an
+    /// allowlist, TLS, or the `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` opt-in — see
+    /// [`EnvConfig::admin_insecure_plaintext_startup_error`]. The proxy data
+    /// plane (`FERRUM_PROXY_BIND_ADDRESS`) still defaults to `0.0.0.0`.
     pub admin_bind_address: String,
+
+    /// Dev-only escape hatch: allow the plaintext admin HTTP listener to bind a
+    /// publicly reachable address (e.g. `0.0.0.0`) with no
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist in the writable `database`/`cp`
+    /// modes. Without this, such a posture is a hard startup error (see
+    /// [`EnvConfig::admin_insecure_plaintext_startup_error`]) because the
+    /// writable admin API and operator bearer tokens would be exposed in
+    /// cleartext on all matching interfaces. Default: `false`. Never enable in
+    /// production — bind to loopback, set an allowlist, or serve admin over TLS
+    /// instead.
+    pub allow_insecure_admin_http: bool,
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
@@ -691,6 +744,16 @@ pub struct EnvConfig {
     /// How often (in seconds) the DP retries the primary (first) CP URL while
     /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
     pub dp_cp_failover_primary_retry_secs: u64,
+    /// Allow plaintext (non-TLS) CP/DP gRPC config sync on a non-loopback
+    /// address. Off by default (secure-by-default): the CP gRPC listener refuses
+    /// to bind a non-loopback address without TLS, and the DP rejects a
+    /// non-loopback `http://` CP URL, unless this is `true`. Loopback
+    /// (`127.0.0.1`/`::1`/`localhost`) plaintext is always permitted for local
+    /// development. Even when permitted, plaintext config sync emits a
+    /// high-severity startup warning — the DP authentication JWT and the full
+    /// gateway configuration travel unencrypted and unauthenticated against MITM.
+    /// `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`.
+    pub cp_dp_grpc_allow_plaintext: bool,
 
     // CP gRPC TLS (server-side)
     /// Path to PEM certificate for the CP gRPC server. When set (with key),
@@ -1060,9 +1123,19 @@ pub struct EnvConfig {
     ///
     /// Default: false (safe, frame-parsed path for all connections)
     pub websocket_tunnel_mode: bool,
-    /// WebSocket relay idle timeout in seconds. When non-zero, an upgraded
-    /// session is closed if neither side produces data for this duration.
-    /// 0 = disabled. Default: 0.
+    /// Global default WebSocket relay idle timeout in seconds. When non-zero, an
+    /// upgraded session is closed if neither side produces data (frames, including
+    /// Ping/Pong, or transport bytes) for this duration. Activity from EITHER
+    /// direction refreshes the shared watermark, so heartbeating clients stay
+    /// open. The per-proxy `websocket_idle_timeout_seconds` overrides this.
+    /// `0` = disabled (idle sessions live forever, bounded only by
+    /// `websocket_max_connections`). Default: 300 (5 minutes).
+    ///
+    /// HTTP/3 caveat: on QUIC frontends the transport-level idle timeout
+    /// (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) also bounds an idle H3
+    /// WebSocket, so its effective idle window is `min(this value,
+    /// FERRUM_HTTP3_IDLE_TIMEOUT)`. Raise `FERRUM_HTTP3_IDLE_TIMEOUT` to honor a
+    /// longer WebSocket idle window on H3.
     pub websocket_idle_timeout_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
@@ -1451,6 +1524,34 @@ pub struct EnvConfig {
     /// Example: "10.0.100.0/24,10.0.200.5,::1"
     pub admin_allowed_cidrs: String,
 
+    /// Comma-separated CIDRs/IPs allowed to scrape `/metrics` (and the detailed
+    /// `/health` / `/overload` views) WITHOUT a JWT or metrics bearer token.
+    /// Empty (default) means unauthenticated scraping is disabled — `/metrics`
+    /// returns 401 unless the caller presents a valid admin JWT or
+    /// `FERRUM_METRICS_BEARER_TOKEN`. Set this to opt the listed source ranges
+    /// (e.g. a Prometheus subnet) back into unauthenticated scraping.
+    /// Example: "10.0.0.0/8,127.0.0.1,::1"
+    pub metrics_allowed_cidrs: String,
+
+    /// Dedicated bearer token that authorizes `/metrics` scraping (and the
+    /// detailed `/health` / `/overload` views) without a full admin JWT.
+    /// When set, a request whose `Authorization: Bearer <token>` matches this
+    /// value (constant-time compare) is allowed. Empty/unset disables this path.
+    /// Use this for Prometheus deployments that cannot mint admin JWTs.
+    pub metrics_bearer_token: Option<String>,
+
+    /// Maximum concurrent connections across all admin/management-plane
+    /// listeners (plaintext + TLS share one cap). Independent of the data-plane
+    /// `max_connections` (`FERRUM_MAX_CONNECTIONS`) so proxy traffic and
+    /// management traffic can be sized separately. Enforced after the admin CIDR
+    /// allowlist and before the TLS handshake / request parsing; over-limit
+    /// connections are dropped (TCP RST). Default: 1024. Set to 0 to disable.
+    pub admin_max_connections: usize,
+    /// Maximum concurrent admin connections per resolved source IP. Default: 0
+    /// (disabled) so a single monitoring/load-balancer source IP is not capped
+    /// by accident. When set, over-limit connections from that IP are dropped.
+    pub admin_max_connections_per_ip: usize,
+
     /// Max request body size in MiB for POST /restore (large config backups).
     /// Default: 100 MiB.
     pub admin_restore_max_body_size_mib: usize,
@@ -1681,6 +1782,38 @@ pub struct EnvConfig {
     pub so_busy_poll_us: u32,
 }
 
+/// Network-exposure classification of the gateway's **plaintext** admin HTTP
+/// listener (`FERRUM_ADMIN_HTTP_PORT`).
+///
+/// Used to gate startup (writable `database`/`cp` modes hard-fail on
+/// [`AdminHttpExposure::ReachableUnrestricted`] unless
+/// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`) and to emit graded startup
+/// warnings. The admin HTTPS listener is a separate port and does not affect
+/// this classification — to serve admin TLS-only, disable plaintext with
+/// `FERRUM_ADMIN_HTTP_PORT=0`.
+///
+/// The safe boundary is **loopback only**. A private / VPC / link-local
+/// address (e.g. a pod or VM interface IP) is still reachable by other hosts on
+/// that network, so it is treated as exposed — binding the writable admin there
+/// in cleartext without an allowlist is a guarded posture, not a safe one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminHttpExposure {
+    /// `FERRUM_ADMIN_HTTP_PORT=0` — no plaintext admin listener.
+    Disabled,
+    /// Bound to a loopback address (`127.0.0.0/8`, `::1`) — reachable only from
+    /// within the host/network namespace.
+    Loopback,
+    /// Bound to a non-loopback address reachable beyond the host (incl.
+    /// `0.0.0.0` / `::`, a public IP, or a private/VPC address) but
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` restricts which source IPs may connect.
+    /// Bearer tokens still traverse cleartext on this port.
+    ReachableAllowlisted,
+    /// Bound to a non-loopback address reachable beyond the host with no
+    /// allowlist — the admin API and any bearer tokens are exposed in cleartext
+    /// to every host that can route to that interface.
+    ReachableUnrestricted,
+}
+
 impl Default for EnvConfig {
     fn default() -> Self {
         Self {
@@ -1712,7 +1845,8 @@ impl Default for EnvConfig {
             admin_https_port: 9443,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
-            admin_bind_address: "0.0.0.0".into(),
+            admin_bind_address: "127.0.0.1".into(),
+            allow_insecure_admin_http: false,
             admin_jwt_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
@@ -1752,6 +1886,7 @@ impl Default for EnvConfig {
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
+            cp_dp_grpc_allow_plaintext: false,
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
@@ -1831,7 +1966,7 @@ impl Default for EnvConfig {
             max_websocket_frame_size_bytes: 16_777_216,
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
-            websocket_idle_timeout_seconds: 0,
+            websocket_idle_timeout_seconds: 300,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -1925,6 +2060,10 @@ impl Default for EnvConfig {
             plugin_http_retry_delay_ms: 100,
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
+            metrics_allowed_cidrs: String::new(),
+            metrics_bearer_token: None,
+            admin_max_connections: 1024,
+            admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
@@ -2039,7 +2178,8 @@ impl EnvConfig {
             admin_https_port: u16 = "FERRUM_ADMIN_HTTPS_PORT" => 9443u16;
             admin_tls_cert_path: Option<String> = "FERRUM_ADMIN_TLS_CERT_PATH";
             admin_tls_key_path: Option<String> = "FERRUM_ADMIN_TLS_KEY_PATH";
-            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "0.0.0.0".to_string();
+            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "127.0.0.1".to_string();
+            allow_insecure_admin_http: bool = "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" => false;
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
                 => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
@@ -2129,6 +2269,7 @@ impl EnvConfig {
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
+            cp_dp_grpc_allow_plaintext: bool = "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" => false;
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
@@ -2224,7 +2365,7 @@ impl EnvConfig {
             max_websocket_frame_size_bytes: usize = "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES" => 16_777_216usize;
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
-            websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 0u64;
+            websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -2332,6 +2473,10 @@ impl EnvConfig {
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
+            metrics_allowed_cidrs: String = "FERRUM_METRICS_ALLOWED_CIDRS" => String::new();
+            metrics_bearer_token: Option<String> = "FERRUM_METRICS_BEARER_TOKEN";
+            admin_max_connections: usize = "FERRUM_ADMIN_MAX_CONNECTIONS" => 1024usize;
+            admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
@@ -2380,14 +2525,18 @@ impl EnvConfig {
             so_busy_poll_us: u32 = "FERRUM_SO_BUSY_POLL_US" => 0u32;
         }
 
-        // Keep this hand-written: the CP gRPC listener inherits the admin bind
-        // address when unset, so the default depends on another parsed field.
+        // The CP gRPC listener is a JWT-authenticated config-distribution server
+        // that data planes connect to over the network, so it defaults to
+        // 0.0.0.0 (all interfaces) — deliberately NOT coupled to the admin bind,
+        // which is loopback-by-default. Inheriting the loopback admin default
+        // here would make a fresh CP unreachable by remote DPs. Operators narrow
+        // it (or go TLS-only with port 0) via an explicit FERRUM_CP_GRPC_LISTEN_ADDR.
         let cp_grpc_listen_addr =
             match env_config_macro::resolve_optional::<String>(conf, "FERRUM_CP_GRPC_LISTEN_ADDR")?
             {
                 Some(addr) => Some(addr),
                 None if matches!(mode, OperatingMode::ControlPlane) => {
-                    Some(format!("{}:50051", admin_bind_address))
+                    Some("0.0.0.0:50051".to_string())
                 }
                 None => None,
             };
@@ -2701,6 +2850,7 @@ impl EnvConfig {
             admin_tls_cert_path,
             admin_tls_key_path,
             admin_bind_address,
+            allow_insecure_admin_http,
             admin_jwt_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
@@ -2740,6 +2890,7 @@ impl EnvConfig {
             cp_dp_grpc_jwt_issuer,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
+            cp_dp_grpc_allow_plaintext,
             cp_grpc_tls_cert_path,
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
@@ -2914,6 +3065,10 @@ impl EnvConfig {
             plugin_http_retry_delay_ms,
             tls_crl_file_path,
             admin_allowed_cidrs,
+            metrics_allowed_cidrs,
+            metrics_bearer_token,
+            admin_max_connections,
+            admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
             migrate_action,
@@ -3002,6 +3157,98 @@ impl EnvConfig {
             .parse()
             .expect("admin_bind_address validated at config load");
         std::net::SocketAddr::new(ip, port)
+    }
+
+    /// Classify the network exposure of the **plaintext** admin HTTP listener
+    /// (`FERRUM_ADMIN_HTTP_PORT`). This is independent of whether an admin
+    /// HTTPS listener is also configured: a TLS listener on the HTTPS port does
+    /// not protect the separate plaintext HTTP port. To run admin TLS-only, set
+    /// `FERRUM_ADMIN_HTTP_PORT=0`.
+    ///
+    /// Only a **loopback** bind is treated as safe. Any other bind — `0.0.0.0` /
+    /// `::`, a public IP, or a private/VPC/link-local interface address — is
+    /// reachable by other hosts on that network and is classified as exposed.
+    pub fn admin_http_exposure(&self) -> AdminHttpExposure {
+        if self.admin_http_port == 0 {
+            return AdminHttpExposure::Disabled;
+        }
+        // An unparseable bind address is rejected separately in `validate()`;
+        // treat it as non-exposing here so this method never panics.
+        let Ok(ip) = self.admin_bind_address.parse::<std::net::IpAddr>() else {
+            return AdminHttpExposure::Loopback;
+        };
+        // Loopback (127.0.0.0/8, ::1) is the only bind reachable solely from
+        // within the host. Everything else (unspecified/public/private/
+        // link-local) is reachable beyond loopback and must be protected.
+        if ip.is_loopback() {
+            return AdminHttpExposure::Loopback;
+        }
+        // An empty allowlist — or a catch-all one (a `/0` CIDR like `0.0.0.0/0`,
+        // `::/0`, or an IPv4-mapped spelling the filter folds to a `/0`, which
+        // the admin middleware then matches against every source) — provides no
+        // real restriction, so the listener is still unrestricted. Reuse the
+        // runtime filter's own canonicalization via `cidr_list_permits_all`.
+        if self.admin_allowed_cidrs.trim().is_empty()
+            || crate::proxy::client_ip::TrustedProxies::cidr_list_permits_all(
+                &self.admin_allowed_cidrs,
+            )
+        {
+            AdminHttpExposure::ReachableUnrestricted
+        } else {
+            AdminHttpExposure::ReachableAllowlisted
+        }
+    }
+
+    /// Hard-fail guard for the **writable** admin API. Returns `Some(error)`
+    /// when a `database`/`cp`-mode gateway would start a plaintext admin HTTP
+    /// listener reachable beyond loopback with no (effective)
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist and without the explicit
+    /// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
+    ///
+    /// The hard error is reserved for the elevated risk of an unauthenticated-
+    /// network-exposed *writable* admin surface. Read-only admin surfaces get a
+    /// high-severity startup warning instead (see `main.rs`): the read-only
+    /// modes (`file`/`dp`/`mesh`), and also `database`/`cp` when
+    /// `FERRUM_ADMIN_READ_ONLY=true` blocks mutations — in that case the
+    /// remaining plaintext-token risk matches the read-only modes, so it warns
+    /// rather than forcing an allowlist/opt-in just to start. The node-agent
+    /// admin listener has its own safe-by-default loopback fallback.
+    ///
+    /// Pure (reads only `self`), so it is unit-testable without touching the
+    /// process environment.
+    pub fn admin_insecure_plaintext_startup_error(&self) -> Option<String> {
+        if !matches!(
+            self.mode,
+            OperatingMode::Database | OperatingMode::ControlPlane
+        ) {
+            return None;
+        }
+        // A read-only db/cp admin is not a writable surface — warn, don't fail.
+        if self.admin_read_only {
+            return None;
+        }
+        if self.admin_http_exposure() != AdminHttpExposure::ReachableUnrestricted {
+            return None;
+        }
+        if self.allow_insecure_admin_http {
+            return None;
+        }
+        Some(format!(
+            "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
+             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', a non-loopback address \
+             reachable beyond this host, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The \
+             writable admin API and any operator bearer tokens would be served in cleartext to \
+             every host that can route to it (a private/VPC interface IP is still LAN-reachable). \
+             Choose one: \
+             (1) bind admin to loopback — FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1; \
+             (2) restrict callers — FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>; \
+             (3) serve admin over TLS and disable plaintext — set FERRUM_ADMIN_TLS_CERT_PATH \
+             and FERRUM_ADMIN_TLS_KEY_PATH, then FERRUM_ADMIN_HTTP_PORT=0; \
+             or (4) for local development only — FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true.",
+            mode = self.mode,
+            port = self.admin_http_port,
+            bind = self.admin_bind_address,
+        ))
     }
 
     /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
@@ -3603,23 +3850,17 @@ impl EnvConfig {
                                 .into(),
                         );
                     }
-                    if self.mesh_remote_discovery_poll_interval_seconds > 0 {
-                        if self.mesh_remote_discovery_max_stale_seconds == 0 {
-                            return Err(
-                                "FERRUM_MESH_PRODUCTION_MODE=true requires \
-                                 FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
-                                 discovery is enabled; unbounded last-good endpoints are dev/test only"
-                                    .into(),
-                            );
-                        }
-                        if self.dp_grpc_tls_no_verify {
-                            return Err(
-                                "FERRUM_MESH_PRODUCTION_MODE=true forbids \
-                                 FERRUM_DP_GRPC_TLS_NO_VERIFY=true when remote-cluster discovery is \
-                                 enabled; remote control-plane TLS must verify server identity"
-                                    .into(),
-                            );
-                        }
+                    // (FERRUM_DP_GRPC_TLS_NO_VERIFY is rejected unconditionally by
+                    // validate_cp_dp_grpc_transport_security() — it is not honored
+                    // on the tonic-managed CP/DP gRPC client, so it can never
+                    // silently disable verification under remote discovery either.)
+                    if self.mesh_remote_discovery_poll_interval_seconds > 0
+                        && self.mesh_remote_discovery_max_stale_seconds == 0
+                    {
+                        return Err("FERRUM_MESH_PRODUCTION_MODE=true requires \
+                             FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
+                             discovery is enabled; unbounded last-good endpoints are dev/test only"
+                            .into());
                     }
                 }
                 // The running mesh's workload identity comes either from
@@ -3836,6 +4077,19 @@ impl EnvConfig {
             ));
         }
 
+        // Safe-by-default management plane. The admin bind defaults to loopback,
+        // so a fresh startup is never exposed. This guard catches the case where
+        // an operator has EXPLICITLY moved the writable (`database`/`cp`) admin
+        // API to a publicly reachable plaintext bind with no IP allowlist:
+        // refuse to start unless they opt in via FERRUM_ALLOW_INSECURE_ADMIN_HTTP,
+        // because the writable admin API and operator bearer tokens would be
+        // served in cleartext on all matching interfaces. Read-only modes
+        // (file/dp/mesh) are warned (not failed) in main.rs; node-agent has its
+        // own loopback fallback.
+        if let Some(err) = self.admin_insecure_plaintext_startup_error() {
+            return Err(err);
+        }
+
         // Validate global backend TLS cert/key files exist and are parseable
         match (
             &self.backend_tls_client_cert_path,
@@ -3966,10 +4220,105 @@ impl EnvConfig {
                 "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
             );
         }
+
+        // Secure-by-default CP/DP gRPC transport: refuse non-loopback plaintext
+        // config sync (and reject the non-functional no-verify flag) unless the
+        // operator made an explicit, auditable choice to permit it.
+        self.validate_cp_dp_grpc_transport_security()?;
+
+        Ok(())
+    }
+
+    /// Resolve the CP gRPC listen address: an explicit
+    /// `FERRUM_CP_GRPC_LISTEN_ADDR`, else the hardcoded `0.0.0.0:50051` default.
+    /// The default is deliberately NOT derived from `admin_bind_address` (which
+    /// defaults to loopback) — a Data Plane in another pod/host must be able to
+    /// reach the CP gRPC listener. `from_env_with_conf` already populates this
+    /// to `Some("0.0.0.0:50051")` for CP mode; the fallback keeps hand-built
+    /// configs (tests) consistent with that default. Returns `Err` for a
+    /// malformed explicit address so startup (and `ferrum-edge validate`) fail
+    /// with a clear message instead of an `expect()` panic at bind time.
+    pub fn cp_grpc_socket_addr(&self) -> Result<std::net::SocketAddr, String> {
+        if let Some(addr) = &self.cp_grpc_listen_addr {
+            addr.parse().map_err(|e| {
+                format!("FERRUM_CP_GRPC_LISTEN_ADDR '{addr}' is not a valid socket address: {e}")
+            })
+        } else {
+            Ok(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                50051,
+            ))
+        }
+    }
+
+    /// Enforce the secure-by-default CP/DP gRPC transport policy.
+    ///
+    /// 1. `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected outright: the
+    ///    tonic-managed CP/DP gRPC client exposes no hook to skip server
+    ///    verification, so the flag never actually disabled it — keeping it
+    ///    would only grant false confidence. Pin the CP CA via
+    ///    `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead.
+    /// 2. In CP mode, a plaintext gRPC listener bound to a non-loopback address
+    ///    is refused unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`.
+    /// 3. In DP mode, a non-loopback `http://` CP URL is refused unless the same
+    ///    escape hatch is set. (Mesh mode reaches a CP over the same URLs but has
+    ///    its own `FERRUM_MESH_PRODUCTION_MODE` TLS posture, so it is not gated
+    ///    here.)
+    ///
+    /// Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always permitted so
+    /// the local-dev quickstart keeps working without the flag.
+    fn validate_cp_dp_grpc_transport_security(&self) -> Result<(), String> {
         if self.dp_grpc_tls_no_verify {
-            tracing::warn!(
-                "WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production."
+            return Err(
+                "FERRUM_DP_GRPC_TLS_NO_VERIFY=true is not supported: the CP/DP gRPC client cannot \
+                 skip server certificate verification, so the flag offers only false confidence. \
+                 To connect to a CP with a self-signed certificate, pin its CA via \
+                 FERRUM_DP_GRPC_TLS_CA_CERT_PATH (one-way TLS) or supply the full \
+                 FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH/KEY_PATH (mTLS)."
+                    .into(),
             );
+        }
+
+        // CP server side: a plaintext listener on a non-loopback address leaks
+        // DP JWTs and the full gateway config to anyone on the network.
+        if matches!(self.mode, OperatingMode::ControlPlane) {
+            let grpc_addr = self.cp_grpc_socket_addr()?;
+            // Port 0 disables the plaintext listener entirely (TLS-only or off),
+            // so there is no plaintext surface to guard.
+            let tls_configured =
+                self.cp_grpc_tls_cert_path.is_some() && self.cp_grpc_tls_key_path.is_some();
+            if grpc_addr.port() != 0
+                && !tls_configured
+                && !grpc_addr.ip().is_loopback()
+                && !self.cp_dp_grpc_allow_plaintext
+            {
+                return Err(format!(
+                    "CP gRPC config sync would bind PLAINTEXT on non-loopback address {grpc_addr} \
+                     with no TLS configured — DP authentication JWTs and the full gateway \
+                     configuration would be exposed to the network. Configure \
+                     FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH, bind a loopback \
+                     address (e.g. 127.0.0.1:50051), or set FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
+                     to explicitly permit plaintext config sync."
+                ));
+            }
+        }
+
+        // DP client side: each CP URL must be https:// (TLS) or loopback http://.
+        // Scoped to DP mode — mesh mode dials a CP over the same URLs but governs
+        // plaintext through FERRUM_MESH_PRODUCTION_MODE instead.
+        if matches!(self.mode, OperatingMode::DataPlane) {
+            for url in &self.dp_cp_grpc_urls {
+                if cp_dp_grpc_url_is_nonloopback_plaintext(url)? && !self.cp_dp_grpc_allow_plaintext
+                {
+                    return Err(format!(
+                        "DP CP URL '{url}' is PLAINTEXT to a non-loopback host — the DP \
+                         authentication JWT and config data would be exposed to the network. Use \
+                         an https:// URL with FERRUM_DP_GRPC_TLS_CA_CERT_PATH, target a loopback \
+                         host, or set FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true to explicitly permit \
+                         plaintext config sync."
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -4046,6 +4395,194 @@ mod tests {
             file_config_path: Some("/tmp/dummy.yaml".into()),
             ..Default::default()
         }
+    }
+
+    fn cp_mode_config() -> EnvConfig {
+        EnvConfig {
+            mode: OperatingMode::ControlPlane,
+            ..Default::default()
+        }
+    }
+
+    fn dp_mode_config() -> EnvConfig {
+        EnvConfig {
+            mode: OperatingMode::DataPlane,
+            ..Default::default()
+        }
+    }
+
+    // --- CP/DP gRPC transport security (secure-by-default plaintext gate) ---
+
+    #[test]
+    fn cp_default_bind_plaintext_is_rejected_without_allow_flag() {
+        // Default CP gRPC bind resolves to 0.0.0.0:50051 (hardcoded, NOT derived
+        // from admin_bind_address) — non-loopback + no TLS, so it must be refused.
+        let config = cp_mode_config();
+        let err = config
+            .validate_cp_dp_grpc_transport_security()
+            .expect_err("non-loopback plaintext CP must be rejected by default");
+        assert!(err.contains("PLAINTEXT"), "unexpected error: {err}");
+        assert!(err.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"));
+    }
+
+    #[test]
+    fn cp_explicit_nonloopback_plaintext_is_rejected_without_allow_flag() {
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:50051".into()),
+            ..cp_mode_config()
+        };
+        assert!(config.validate_cp_dp_grpc_transport_security().is_err());
+    }
+
+    #[test]
+    fn cp_nonloopback_plaintext_allowed_with_explicit_flag() {
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:50051".into()),
+            cp_dp_grpc_allow_plaintext: true,
+            ..cp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("explicit opt-in must permit non-loopback plaintext CP");
+    }
+
+    #[test]
+    fn cp_nonloopback_with_tls_is_allowed() {
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:50051".into()),
+            cp_grpc_tls_cert_path: Some("/certs/server.pem".into()),
+            cp_grpc_tls_key_path: Some("/certs/server-key.pem".into()),
+            ..cp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("TLS-configured CP must be allowed on any address");
+    }
+
+    #[test]
+    fn cp_loopback_plaintext_is_allowed_for_dev() {
+        for addr in ["127.0.0.1:50051", "[::1]:50051"] {
+            let config = EnvConfig {
+                cp_grpc_listen_addr: Some(addr.into()),
+                ..cp_mode_config()
+            };
+            config
+                .validate_cp_dp_grpc_transport_security()
+                .unwrap_or_else(|e| panic!("loopback plaintext CP {addr} must be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn cp_disabled_listener_port_zero_skips_plaintext_gate() {
+        // Port 0 disables the plaintext listener, so there is no surface to guard
+        // even on a non-loopback bind address.
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:0".into()),
+            ..cp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("port 0 disables the plaintext listener");
+    }
+
+    #[test]
+    fn dp_nonloopback_http_url_is_rejected_without_allow_flag() {
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec!["http://cp-host:50051".into()],
+            ..dp_mode_config()
+        };
+        let err = config
+            .validate_cp_dp_grpc_transport_security()
+            .expect_err("non-loopback http:// CP URL must be rejected by default");
+        assert!(err.contains("PLAINTEXT"), "unexpected error: {err}");
+        assert!(err.contains("cp-host"));
+    }
+
+    #[test]
+    fn dp_nonloopback_http_url_allowed_with_explicit_flag() {
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec!["http://cp-host:50051".into()],
+            cp_dp_grpc_allow_plaintext: true,
+            ..dp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("explicit opt-in must permit non-loopback http:// CP URL");
+    }
+
+    #[test]
+    fn dp_https_url_is_allowed() {
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec!["https://cp-host:50051".into()],
+            ..dp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("https:// CP URL must always be allowed");
+    }
+
+    #[test]
+    fn dp_loopback_http_urls_are_allowed_for_dev() {
+        for url in [
+            "http://localhost:50051",
+            "http://127.0.0.1:50051",
+            "http://[::1]:50051",
+        ] {
+            let config = EnvConfig {
+                dp_cp_grpc_urls: vec![url.into()],
+                ..dp_mode_config()
+            };
+            config
+                .validate_cp_dp_grpc_transport_security()
+                .unwrap_or_else(|e| panic!("loopback dev URL {url} must be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn dp_mixed_url_list_rejects_the_nonloopback_plaintext_entry() {
+        // One secure + one loopback-plaintext + one non-loopback-plaintext: the
+        // last must trip the gate even though the list is partly safe.
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec![
+                "https://cp1:50051".into(),
+                "http://localhost:50051".into(),
+                "http://cp3:50051".into(),
+            ],
+            ..dp_mode_config()
+        };
+        assert!(config.validate_cp_dp_grpc_transport_security().is_err());
+    }
+
+    #[test]
+    fn dp_grpc_tls_no_verify_is_rejected() {
+        // The flag is not honored by the tonic-managed client, so it must fail
+        // closed rather than provide false confidence — in any mode.
+        let config = EnvConfig {
+            dp_grpc_tls_no_verify: true,
+            ..file_mode_config()
+        };
+        let err = config
+            .validate_cp_dp_grpc_transport_security()
+            .expect_err("FERRUM_DP_GRPC_TLS_NO_VERIFY=true must be rejected");
+        assert!(err.contains("FERRUM_DP_GRPC_TLS_NO_VERIFY"));
+        assert!(err.contains("FERRUM_DP_GRPC_TLS_CA_CERT_PATH"));
+    }
+
+    #[test]
+    fn cp_dp_grpc_url_classifier_distinguishes_secure_loopback_and_exposed() {
+        // Non-loopback plaintext → blocked (true).
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("http://cp-host:50051").unwrap());
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("http://10.0.0.5:50051").unwrap());
+        // TLS → not blocked (false).
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("https://cp-host:50051").unwrap());
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("grpcs://cp-host:50051").unwrap());
+        // Loopback plaintext → not blocked (false).
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("http://localhost:50051").unwrap());
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("http://127.0.0.1:50051").unwrap());
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("http://[::1]:50051").unwrap());
+        // Malformed / unsupported → error.
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("not a url").is_err());
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("ftp://cp-host:50051").is_err());
     }
 
     #[test]

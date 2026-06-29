@@ -88,6 +88,28 @@ When security vulnerabilities are fixed, we will:
 2. Publish a security advisory on GitHub
 3. Update this document with details (after coordinated disclosure)
 
+## Dependency & Supply-Chain Security
+
+Ferrum Edge gates its dependency tree and the vendored, patched upstream crates
+it carries in `vendor/**` (reqwest, h3, tungstenite, tokio-tungstenite). The
+full policy — vendored-patch inventory, owners, retirement triggers, the blocking
+advisory gate, time-boxed exception expiry, the vendor drift guard, and the
+**emergency security-update process for vendored crates** — lives in
+[docs/dependency-policy.md](docs/dependency-policy.md).
+
+Key controls:
+
+- **Blocking advisory gate.** `cargo deny check advisories bans sources` runs on
+  every PR (`.github/workflows/ci.yml`). A RUSTSEC advisory not explicitly
+  time-boxed in `deny.toml` fails the build.
+- **Weekly re-check.** `.github/workflows/dependency-audit.yml` re-runs the gate
+  against the latest advisory database, fails on expired exceptions, and reports
+  when a vendored patch has merged upstream so it can be retired. This is why a
+  fix in the reqwest/h3 lineage cannot be missed silently.
+- **Vendor integrity.** `tests/integration/vendor_integrity_tests.rs` pins every
+  vendored file to `vendor/VENDOR_INTEGRITY.sha256`; drift beyond the documented
+  patches fails CI.
+
 ## Acknowledgments
 
 We thank the following security researchers who have responsibly disclosed vulnerabilities:

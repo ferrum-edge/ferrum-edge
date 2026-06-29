@@ -1,5 +1,29 @@
 version: '3.9'
 
+# =============================================================================
+# Admin API exposure (read before publishing the admin port)
+# =============================================================================
+# The admin API is a management plane and is SAFE BY DEFAULT: the gateway binds
+# its admin listener to loopback (127.0.0.1) inside the container, so it is NOT
+# reachable from the network and the plaintext admin HTTP port is intentionally
+# NOT published below. The proxy data-plane ports (8000/8443) are published as
+# usual.
+#
+# To serve admin over TLS (recommended), set FERRUM_ADMIN_BIND_ADDRESS: 0.0.0.0
+# (the admin listeners — HTTP and HTTPS — bind loopback by default, and Docker
+# port publishing forwards to the container network address, not loopback, so
+# the bind is required to reach a published admin port), set
+# FERRUM_ADMIN_TLS_CERT_PATH / FERRUM_ADMIN_TLS_KEY_PATH, publish the 9443
+# admin-HTTPS port, and set FERRUM_ADMIN_HTTP_PORT=0 to disable plaintext.
+#
+# For LOCAL-DEVELOPMENT host access to the plaintext admin API, add to a service:
+#     environment:
+#       FERRUM_ADMIN_BIND_ADDRESS: 0.0.0.0          # bind beyond container loopback
+#       FERRUM_ALLOW_INSECURE_ADMIN_HTTP: "true"    # required in database/cp modes
+#     ports:
+#       - "127.0.0.1:9000:9000"                     # publish to host loopback only
+# The gateway refuses to start a non-loopback plaintext admin listener in database/cp
+# modes without this explicit opt-in. See docs/configuration.md (Admin API).
 services:
   # ============================================================================
   # Single-Node Database Mode with SQLite
@@ -15,8 +39,7 @@ services:
     ports:
       - "8000:8000"     # HTTP proxy
       - "8443:8443"     # HTTPS proxy
-      - "9000:9000"     # Admin API HTTP
-      - "9443:9443"     # Admin API HTTPS
+      - "9443:9443"     # Admin API HTTPS (set FERRUM_ADMIN_TLS_* to serve; admin is loopback-only by default)
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: sqlite
@@ -70,8 +93,7 @@ services:
     ports:
       - "8001:8000"     # HTTP proxy
       - "8444:8443"     # HTTPS proxy
-      - "9001:9000"     # Admin API HTTP
-      - "9444:9443"     # Admin API HTTPS
+      - "9444:9443"     # Admin API HTTPS (set FERRUM_ADMIN_TLS_* to serve; admin is loopback-only by default)
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: postgres
@@ -128,8 +150,7 @@ services:
     ports:
       - "8002:8000"     # HTTP proxy
       - "8445:8443"     # HTTPS proxy
-      - "9002:9000"     # Admin API HTTP
-      - "9445:9443"     # Admin API HTTPS
+      - "9445:9443"     # Admin API HTTPS (set FERRUM_ADMIN_TLS_* to serve; admin is loopback-only by default)
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: mongodb
@@ -164,8 +185,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "9002:9000"     # Admin API HTTP
-      - "9445:9443"     # Admin API HTTPS
+      - "9445:9443"     # Admin API HTTPS (set FERRUM_ADMIN_TLS_* to serve; admin is loopback-only by default)
       - "50051:50051"   # gRPC config distribution
     environment:
       FERRUM_MODE: cp
@@ -173,6 +193,9 @@ services:
       FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}@postgres:5432/ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_CP_GRPC_LISTEN_ADDR: 0.0.0.0:50051
+      # Local demo runs CP/DP gRPC config sync in plaintext on the compose network.
+      # Production must use TLS (FERRUM_CP_GRPC_TLS_CERT_PATH/KEY_PATH) instead of this flag.
+      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
@@ -202,10 +225,12 @@ services:
     ports:
       - "8002:8000"     # HTTP proxy
       - "8445:8443"     # HTTPS proxy
-      - "9003:9000"     # Read-only Admin API HTTP
+      # Read-only admin API binds to loopback by default and is not published.
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
+      # Local demo: plaintext CP/DP gRPC on the compose network (use TLS in production).
+      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
@@ -234,10 +259,12 @@ services:
     ports:
       - "8003:8000"     # HTTP proxy
       - "8446:8443"     # HTTPS proxy
-      - "9004:9000"     # Read-only Admin API HTTP
+      # Read-only admin API binds to loopback by default and is not published.
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
+      # Local demo: plaintext CP/DP gRPC on the compose network (use TLS in production).
+      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:

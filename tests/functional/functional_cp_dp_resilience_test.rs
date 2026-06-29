@@ -121,6 +121,7 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
+        websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -188,6 +189,7 @@ fn build_cp_admin_state(
         reserved_ports: HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".into(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        metrics_auth: Default::default(),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: Some(registry),
         mesh_registry: None,
@@ -225,6 +227,7 @@ fn build_dp_admin_state(
         reserved_ports: HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".into(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        metrics_auth: Default::default(),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,
@@ -249,7 +252,13 @@ async fn spawn_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
         let admin_addr: SocketAddr = addr;
-        let _ = start_admin_listener(admin_addr, state_clone, shutdown_rx_clone).await;
+        let _ = start_admin_listener(
+            admin_addr,
+            state_clone,
+            shutdown_rx_clone,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
 
     // Give the listener a moment to accept connections.

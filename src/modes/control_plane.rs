@@ -802,6 +802,9 @@ pub async fn run(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
@@ -815,6 +818,12 @@ pub async fn run(
     let db_available = Arc::new(AtomicBool::new(true));
 
     let reserved_ports = env_config.reserved_gateway_ports();
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -830,6 +839,7 @@ pub async fn run(
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+        metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: Some(dp_registry.clone()),
         mesh_registry: Some(mesh_registry.clone()),
@@ -847,10 +857,16 @@ pub async fn run(
 
     // Admin HTTP listener (disabled when port is 0)
     let admin_http_handle = if env_config.admin_http_port != 0 {
+        let admin_http_limiter = admin_conn_limiter.clone();
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) =
-                admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
+            if let Err(e) = admin::start_admin_listener(
+                admin_http_addr,
+                admin_state,
+                admin_shutdown,
+                admin_http_limiter,
+            )
+            .await
             {
                 error!("Admin HTTP listener error: {}", e);
             }
@@ -914,6 +930,7 @@ pub async fn run(
             info!("Frontend TLS live reload enabled for CP admin HTTPS");
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
+        let admin_https_limiter = admin_conn_limiter.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
@@ -923,6 +940,7 @@ pub async fn run(
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    admin_https_limiter,
                 )
                 .await
             } else {
@@ -931,6 +949,7 @@ pub async fn run(
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    admin_https_limiter,
                 )
                 .await
             };
@@ -948,12 +967,13 @@ pub async fn run(
         );
     }
 
-    // gRPC listener (with optional TLS/mTLS, disabled when port is 0)
-    let grpc_addr: SocketAddr = if let Some(ref addr) = env_config.cp_grpc_listen_addr {
-        addr.parse()?
-    } else {
-        env_config.admin_socket_addr(50051)
-    };
+    // gRPC listener (with optional TLS/mTLS, disabled when port is 0).
+    // Resolution is shared with EnvConfig::validate() so the secure-by-default
+    // plaintext gate (validate_cp_dp_grpc_transport_security) reasons about the
+    // exact address this binds.
+    let grpc_addr: SocketAddr = env_config
+        .cp_grpc_socket_addr()
+        .map_err(anyhow::Error::msg)?;
 
     let grpc_handle = if grpc_addr.port() != 0 {
         let grpc_tls_slot = if let (Some(_cert_path), Some(_key_path)) = (
@@ -980,8 +1000,11 @@ pub async fn run(
             if env_config.cp_grpc_tls_client_ca_path.is_some() {
                 info!("CP gRPC TLS configured with mTLS; new handshakes use the active TLS slot");
             } else {
-                info!(
-                    "CP gRPC TLS configured without client certificate verification; new handshakes use the active TLS slot"
+                warn!(
+                    "SECURITY: CP gRPC TLS is configured WITHOUT client certificate verification \
+                     (no FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH) — the only thing authenticating a Data \
+                     Plane is its bearer JWT. Configure FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH to require \
+                     DP client certificates (mTLS) for certificate-based DP identity in production."
                 );
             }
             Some(reload_handles.slot)
@@ -991,7 +1014,27 @@ pub async fn run(
                     "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH is set but cert/key are missing — ignoring client CA"
                 );
             }
-            info!("CP gRPC server running in plaintext mode (no TLS configured)");
+            // EnvConfig::validate() has already refused a non-loopback plaintext
+            // bind unless FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true, so reaching here
+            // means either a loopback bind or an explicit operator opt-in. Either
+            // way, surface a high-severity warning — DP JWTs and the full gateway
+            // config travel unencrypted.
+            if grpc_addr.ip().is_loopback() {
+                warn!(
+                    "SECURITY: CP gRPC config sync is running in PLAINTEXT on loopback {grpc_addr} \
+                     — acceptable for local development only. DP authentication JWTs and the full \
+                     gateway configuration are unencrypted. Configure FERRUM_CP_GRPC_TLS_CERT_PATH \
+                     + FERRUM_CP_GRPC_TLS_KEY_PATH before exposing this CP off-host."
+                );
+            } else {
+                warn!(
+                    "SECURITY: CP gRPC config sync is running in PLAINTEXT on non-loopback \
+                     {grpc_addr} because FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true is set. DP \
+                     authentication JWTs and the full gateway configuration are exposed UNENCRYPTED \
+                     to the network and unprotected against MITM. Use TLS \
+                     (FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH) in production."
+                );
+            }
             None
         };
 
@@ -1954,6 +1997,7 @@ mod tests {
             passthrough: false,
             udp_idle_timeout_seconds: 60,
             tcp_idle_timeout_seconds: Some(300),
+            websocket_idle_timeout_seconds: None,
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,

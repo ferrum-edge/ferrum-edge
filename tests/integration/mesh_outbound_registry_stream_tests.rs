@@ -117,6 +117,7 @@ fn tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
         tcp_idle_timeout_seconds: Some(0),
+        websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         api_spec_id: None,

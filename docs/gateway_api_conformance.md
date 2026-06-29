@@ -38,7 +38,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 
 ## CI Evidence
 
-The Gateway API conformance workflows now deploy the same lab:
+The standalone `gateway-api-conformance.yml` workflow is the single owner that deploys the lab on PRs, and its `gate` job is the authoritative conformance check. The `Gateway API Conformance (CI mirror)` job in `ci.yml` only mirrors that run's result back into the aggregate `Tests` gate. The lab consists of:
 
 - Ferrum control plane/controller with Gateway API watches enabled.
 - A routable Ferrum data-plane deployment and NodePort Service mapped to host ports 80 and 443 in kind.
@@ -48,4 +48,4 @@ The Gateway API conformance workflows now deploy the same lab:
 
 Direct black-box checks cover hostname, path, method, headers, weighted backend selection, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion. Diagnostics and the upstream standard conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 
-The standalone Gateway API conformance workflow is also PR-gated for changes to routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, and related CI files. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.
+The standalone Gateway API conformance workflow triggers on every PR, but a lightweight `changes` job gates the heavy lab job internally: it runs the conformance suite only when the PR diff touches routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, or related CI files, and otherwise skips it. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.

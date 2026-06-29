@@ -1125,6 +1125,9 @@ pub async fn run(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
@@ -1544,6 +1547,13 @@ pub async fn run(
     crate::plugins::prometheus_metrics::global_registry()
         .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
 
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -1559,6 +1569,7 @@ pub async fn run(
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+        metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,
@@ -1577,6 +1588,7 @@ pub async fn run(
     // Admin HTTP listener (disabled when port is 0)
     if env_config.admin_http_port != 0 {
         let (admin_started_tx, admin_started_rx) = tokio::sync::oneshot::channel();
+        let admin_http_limiter = admin_conn_limiter.clone();
         let admin_http_handle = tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
             admin::start_admin_listener_with_tls_and_signal(
@@ -1585,6 +1597,7 @@ pub async fn run(
                 admin_shutdown,
                 None,
                 Some(admin_started_tx),
+                admin_http_limiter,
             )
             .await
             .context("Admin HTTP listener failed")
@@ -1672,6 +1685,7 @@ pub async fn run(
             let admin_tls_slot = admin_reload_handles.slot.clone();
 
             let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+            let admin_https_limiter = admin_conn_limiter.clone();
             let admin_https_handle = tokio::spawn(async move {
                 info!("Starting Admin HTTPS listener on {}", admin_https_addr);
                 let result = if let Some(slot) = admin_tls_slot {
@@ -1681,6 +1695,7 @@ pub async fn run(
                         admin_https_shutdown,
                         slot,
                         Some(admin_https_started_tx),
+                        admin_https_limiter,
                     )
                     .await
                 } else {
@@ -1690,6 +1705,7 @@ pub async fn run(
                         admin_https_shutdown,
                         Some(admin_tls_config),
                         Some(admin_https_started_tx),
+                        admin_https_limiter,
                     )
                     .await
                 };

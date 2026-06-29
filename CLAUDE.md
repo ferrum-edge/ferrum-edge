@@ -20,6 +20,7 @@ Ferrum Edge is in active build-out. Do not add schema DB migrations for new sche
 - TLS/secrets/security: `docs/frontend_tls.md`, `docs/backend_mtls.md`, `src/tls/`, `src/secrets/`, `.claude/rules/tls-security.md`
 - Tests and perf: `tests/`, `tests/performance/multi_protocol/`, `.claude/rules/testing.md`
 - Coverage: `docs/coverage.md`, `.github/workflows/coverage.yml`, `scripts/coverage.sh`
+- Dependencies/vendored patches: `deny.toml`, `vendor/`, `docs/dependency-policy.md`, `.claude/rules/dependencies.md`
 
 ## Core Commands
 
@@ -100,6 +101,7 @@ Graceful shutdown: stop accept loops, set `OverloadState.draining=true`, add `Co
 
 - Port `0` on proxy/admin HTTP ports or inside `FERRUM_CP_GRPC_LISTEN_ADDR` disables plaintext and is excluded from `reserved_gateway_ports()`.
 - Admin API validates JWTs but never mints them. DB/CP require `FERRUM_ADMIN_JWT_SECRET` >= 32 chars; file mode generates a random read-only secret at startup.
+- Observability endpoints are tiered by default: `/live` is always unauthenticated and minimal (`{"status":"ok"}`); `/health`+`/status` return only `status`+`ready` unauthenticated and full diagnostics only when authenticated; `/overload` returns a coarse `{level}` unauthenticated and the full snapshot only when authenticated; `/metrics` returns `401` unless authenticated. "Authenticated" = valid admin JWT OR matching `FERRUM_METRICS_BEARER_TOKEN` OR a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (`MetricsAuthPolicy` / `observability_detail_allowed` in `src/admin/mod.rs`). Do not regress these surfaces back to unauthenticated detail.
 - `/health` DB check remains cached 15s via lock-free `ArcSwap`; do not expose the DB pool to unauthenticated floods.
 - `/metrics/runtime` JSON remains JWT-authenticated and cached via lock-free `ArcSwap`.
 - `GET /cluster` is JWT-authenticated: CP returns connected DPs; DP returns CP connection state.

@@ -11,6 +11,7 @@ mod admin_mesh_remote_clusters_tests;
 mod admin_mesh_runtime_overlay_tests;
 mod admin_mesh_service_graph_tests;
 mod admin_node_waypoint_identities_tests;
+mod admin_observability_auth_tests;
 mod admin_runtime_metrics_tests;
 mod api_chargeback_sink_tests;
 mod apply_incremental_outcome_tests;
@@ -67,4 +68,5 @@ mod mesh_topology_hbone_tests;
 mod scripted_backend_smoke_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
+mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

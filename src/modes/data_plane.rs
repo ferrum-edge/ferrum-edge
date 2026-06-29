@@ -66,6 +66,9 @@ pub async fn run(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     // Start with empty config; CP will push the real one via gRPC.
     // The empty initial config means `start_with_shutdown` spawns no
@@ -159,6 +162,26 @@ pub async fn run(
     // Build DP gRPC TLS config if any TLS settings are provided.
     let dp_grpc_tls =
         crate::grpc::dp_client::build_dp_grpc_tls_config(&env_config, &cp_urls, "DP")?;
+
+    // Secure-by-default: EnvConfig::validate() already refused a non-loopback
+    // http:// CP URL unless FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true. Any plaintext
+    // CP URL that reaches here is therefore loopback (dev) or an explicit opt-in;
+    // surface a high-severity warning either way — the minted DP JWT and the
+    // gateway config travel unencrypted and unauthenticated against MITM.
+    let plaintext_cp_urls: Vec<&str> = cp_urls
+        .iter()
+        .filter(|u| u.starts_with("http://") || u.starts_with("grpc://"))
+        .map(String::as_str)
+        .collect();
+    if !plaintext_cp_urls.is_empty() {
+        warn!(
+            "SECURITY: DP config sync will use PLAINTEXT gRPC for CP URL(s): {} — the DP \
+             authentication JWT and gateway configuration travel unencrypted and unauthenticated \
+             against MITM. Use https:// CP URLs with FERRUM_DP_GRPC_TLS_CA_CERT_PATH in production.",
+            plaintext_cp_urls.join(", ")
+        );
+    }
+
     let dp_grpc_tls_reload_handle = crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
         Arc::new(env_config.clone()),
         Arc::new(cp_urls.clone()),
@@ -478,6 +501,12 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
     let reserved_ports = env_config.reserved_gateway_ports();
     let startup_ready = Arc::new(AtomicBool::new(false));
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
     let admin_state = AdminState {
         db: None, // DP has no direct DB access
         jwt_manager,
@@ -493,6 +522,7 @@ pub async fn run(
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+        metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,
@@ -510,10 +540,16 @@ pub async fn run(
 
     // Admin HTTP listener (disabled when port is 0)
     if env_config.admin_http_port != 0 {
+        let admin_http_limiter = admin_conn_limiter.clone();
         let admin_http_handle = tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) =
-                admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
+            if let Err(e) = admin::start_admin_listener(
+                admin_http_addr,
+                admin_state,
+                admin_shutdown,
+                admin_http_limiter,
+            )
+            .await
             {
                 error!("Admin HTTP listener error: {}", e);
             }
@@ -577,6 +613,7 @@ pub async fn run(
             info!("Frontend TLS live reload enabled for admin HTTPS");
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
+        let admin_https_limiter = admin_conn_limiter.clone();
 
         let admin_https_handle = tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
@@ -586,6 +623,7 @@ pub async fn run(
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    admin_https_limiter,
                 )
                 .await
             } else {
@@ -594,6 +632,7 @@ pub async fn run(
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    admin_https_limiter,
                 )
                 .await
             };

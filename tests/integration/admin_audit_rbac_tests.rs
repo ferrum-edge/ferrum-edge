@@ -73,6 +73,7 @@ fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> Admin
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: jwt_manager(),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -106,7 +107,14 @@ async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = serve_admin_on_listener(listener, state, shutdown_rx, None).await;
+        let _ = serve_admin_on_listener(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(actual).await.is_ok() {

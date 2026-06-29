@@ -116,10 +116,9 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   core artifacts failed.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
-binary are produced by the root `Dockerfile` (also exercised by the
-`gateway-api-conformance` CI job's `docker build .`, and published as the
-`-ebpf` release variant by the `docker-ebpf` job in
-[`.github/workflows/release.yml`](../.github/workflows/release.yml)):
+binary are produced by the root `Dockerfile`'s `docker build .`, and published as
+the `-ebpf` release variant by the `docker-ebpf` job in
+[`.github/workflows/release.yml`](../.github/workflows/release.yml):
 
 - The `ebpf-builder` stage installs nightly + `rust-src` + `bpf-linker` and runs
   `cargo +nightly build -p ferrum-ebpf --target bpfel-unknown-none -Z build-std=core --release`
@@ -334,7 +333,9 @@ The Helm chart sets `nodeAgent.admin.port` to `19090` by default. The binary def
 - `FERRUM_ADMIN_BIND_ADDRESS` is set explicitly (any value, including `0.0.0.0` if intentional), or
 - `FERRUM_ADMIN_ALLOWED_CIDRS` is set to a non-empty allowlist.
 
-`FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. If either bind signal is set, the configured `FERRUM_ADMIN_BIND_ADDRESS` (default `0.0.0.0`) is honored as-is. When the loopback fallback engages, the gateway emits a `warn!` at startup pointing at the two escape hatches. For node-agent deployments scraped over the cluster network, prefer either an explicit `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist or front the listener with a local sidecar scraper bound to loopback.
+`FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. The two signals resolve as follows: an explicit `FERRUM_ADMIN_BIND_ADDRESS` is honored verbatim; an `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist with no explicit bind binds the listener to `0.0.0.0` (restricted by that allowlist) so cluster scraping can reach `/metrics` — because the bind now defaults to loopback, the allowlist alone would otherwise leave the listener unreachable. When neither signal is set, the listener stays on `127.0.0.1` and the gateway emits a `warn!` at startup pointing at the two opt-ins. For node-agent deployments scraped over the cluster network, prefer the `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist (which must include the scrape source ranges) or front the listener with a local sidecar scraper bound to loopback.
+
+> **Helm chart users:** the allowlist-only `0.0.0.0` behavior above applies to the **raw env** contract. The `charts/ferrum-mesh` node-agent DaemonSet always renders `FERRUM_ADMIN_BIND_ADDRESS` from `nodeAgent.admin.bindAddress` (default `127.0.0.1`) whenever node-agent admin is enabled, so the bind is always an explicit signal and the allowlist-only branch never engages through the chart. To expose `/metrics` for cluster scraping via Helm, set **`nodeAgent.admin.bindAddress=0.0.0.0`** (and `nodeAgent.admin.allowedCidrs` to the scrape source ranges); setting only the allowlist leaves a loopback listener and scraping fails.
 
 When ambient NodeWaypoint and the node agent run on the same host-network nodes, their admin listeners must use distinct `FERRUM_ADMIN_HTTP_PORT` values or one listener must be disabled with port `0`. The Helm chart rejects equal host-network admin ports because Kubernetes can otherwise mark pods Ready even though one Ferrum process failed to bind its admin listener.
 

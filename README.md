@@ -84,14 +84,29 @@ ferrum-edge version
 docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
 
 docker run -d --name ferrum-edge \
-  -p 8000:8000 -p 9000:9000 \
+  -p 8000:8000 \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=sqlite \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
-  -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
+  -e FERRUM_ADMIN_JWT_SECRET="please-change-me-to-a-32+character-secret" \
+  -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
   -v ferrum_data:/data \
   ghcr.io/ferrum-edge/ferrum-edge:latest
 ```
+
+> **Admin API exposure.** The admin API is a management plane. Both admin
+> listeners (HTTP and HTTPS) bind to loopback (`127.0.0.1`) by default, so the
+> example does **not** publish port 9000 and admin is not reachable from the
+> network. In the writable `database`/`cp` modes the gateway **refuses to start**
+> if the plaintext admin listener is bound to a non-loopback address (`0.0.0.0`,
+> a public IP, or a private/VPC interface IP) with no `FERRUM_ADMIN_ALLOWED_CIDRS`
+> allowlist. To make admin reachable from outside the container you must set
+> `FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0` (or `::`) — loopback alone is not reachable
+> through a published port. Then either: (a) serve it over TLS
+> (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH`, publish `9443`, set
+> `FERRUM_ADMIN_HTTP_PORT=0` to disable plaintext) and/or set
+> `FERRUM_ADMIN_ALLOWED_CIDRS`; or (b) for throwaway local testing only, set
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` and publish `127.0.0.1:9000:9000`.
 
 See [docs/docker.md](docs/docker.md) for Docker Compose examples and production deployment.
 
@@ -124,7 +139,8 @@ See [docs/cli.md](docs/cli.md) for the full CLI reference.
 FERRUM_MODE=database \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
-FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
+FERRUM_ADMIN_JWT_SECRET="change-me-dev-admin-secret-min-32-chars" \
+FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
 FERRUM_LOG_LEVEL=info \
 cargo run --release -- run
 ```
@@ -135,7 +151,8 @@ cargo run --release -- run
 FERRUM_MODE=database \
 FERRUM_DB_TYPE=postgres \
 FERRUM_DB_URL="postgres://user:pass@localhost/ferrum" \
-FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
+FERRUM_ADMIN_JWT_SECRET="change-me-dev-admin-secret-min-32-chars" \
+FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
 cargo run --release -- run
 ```
 
@@ -146,36 +163,45 @@ FERRUM_MODE=database \
 FERRUM_DB_TYPE=mongodb \
 FERRUM_DB_URL="mongodb://user:pass@localhost:27017/ferrum?authSource=admin" \
 FERRUM_MONGO_DATABASE=ferrum \
-FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
+FERRUM_ADMIN_JWT_SECRET="change-me-dev-admin-secret-min-32-chars" \
+FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
 cargo run --release -- run
 ```
 
-### Control Plane + Data Plane
+### Control Plane + Data Plane (local development)
+
+The CP→DP gRPC channel carries Data Plane authentication JWTs and the full
+gateway configuration, so it is **TLS-first and secure-by-default**: the CP
+refuses to bind a plaintext gRPC listener on a non-loopback address, and the DP
+refuses a non-loopback `http://` CP URL, unless TLS is configured (or plaintext
+is explicitly permitted — see below). The loopback quickstart below runs as-is;
+any networked deployment must use TLS.
 
 ```bash
-# Control Plane
+# Control Plane (loopback + plaintext — local development only; secrets must be 32+ chars)
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
-FERRUM_ADMIN_JWT_SECRET="admin-secret" \
-FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
-FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
+FERRUM_ADMIN_JWT_SECRET="change-me-dev-admin-secret-min-32-chars" \
+FERRUM_CP_GRPC_LISTEN_ADDR="127.0.0.1:50051" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-dev-cp-dp-secret-min-32-chars" \
 cargo run --release -- run
 
-# Data Plane (single CP)
+# Data Plane (single CP, loopback — local development only)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="http://localhost:50051" \
-FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-dev-cp-dp-secret-min-32-chars" \
 cargo run --release -- run
 
-# Data Plane (multi-CP failover — connects to primary, fails over to secondary)
+# Data Plane (multi-CP failover over TLS — production shape)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="https://cp1:50051,https://cp2:50051,https://cp3:50051" \
-FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
+FERRUM_DP_GRPC_TLS_CA_CERT_PATH="/certs/ca.pem" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-dev-cp-dp-secret-min-32-chars" \
 cargo run --release -- run
 ```
 
-For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls). For multi-region high availability, see [docs/multi_region_ha.md](docs/multi_region_ha.md).
+For production CP/DP with TLS/mTLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls). To intentionally run plaintext config sync on a networked address (trusted network, with compensating controls), set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` on both the CP and the DP. For multi-region high availability, see [docs/multi_region_ha.md](docs/multi_region_ha.md).
 
 ## Default Ports
 
@@ -249,8 +275,20 @@ See [docs/configuration.md](docs/configuration.md) for stream proxy config, serv
 
 JWT-protected REST API for managing proxies, consumers, plugins, and upstreams at runtime.
 
+> The examples below use `http://localhost:9000`, matching the local quick-start
+> (admin bound to loopback, plaintext). In production, serve the admin API over
+> **HTTPS** (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH`, then
+> `https://host:9443`) and disable plaintext with `FERRUM_ADMIN_HTTP_PORT=0`, or
+> restrict callers with `FERRUM_ADMIN_ALLOWED_CIDRS`. Bearer tokens sent over
+> plaintext `http://` traverse the network in the clear. In `database`/`cp`
+> modes the gateway refuses to start a public plaintext admin listener without
+> an allowlist (see [docs/configuration.md](docs/configuration.md#admin-api)).
+
 ```bash
-# Health check (no auth required)
+# Liveness probe (no auth) — always {"status":"ok"}
+curl http://localhost:9000/live
+
+# Readiness/health (no auth returns status+ready; full diagnostics need auth)
 curl http://localhost:9000/health
 
 # List proxies
@@ -294,14 +332,14 @@ See [docs/plugins.md](docs/plugins.md) for detailed configuration of each plugin
 
 Nine plugins for AI and agent gateway use cases — cost visibility, budget enforcement, semantic policy, request policy, PII protection, output guardrails, multi-provider routing, MCP tool routing, and response caching:
 
-- **`ai_token_metrics`** — Extract token usage from LLM responses for observability (SSE metrics require explicit buffered opt-in)
+- **`ai_token_metrics`** — Extract token usage from LLM responses for observability only (SSE metrics require explicit buffered opt-in)
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
-- **`ai_rate_limiter`** — Rate-limit by token consumption instead of request count (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
+- **`ai_rate_limiter`** — Enforce token budgets with pre-request reservation and response reconciliation (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
 - **`ai_semantic_firewall`** — Semantic prompt/response firewall for prompt injection, jailbreaks, data exfiltration intent, tool abuse, and topic allow/deny policy
 - **`ai_semantic_cache`** — LLM response caching with normalized exact-match keys, optional embedding-based semantic similarity, and local or Redis exact-response storage
 - **`ai_response_guard`** — Output-side content guardrails: PII detection, blocked phrases, response format validation
-- **`ai_federation`** — Universal AI gateway routing requests to 11+ providers with model-based routing and priority fallback
+- **`ai_federation`** — Universal AI gateway routing non-streaming Chat Completions requests to 11+ providers with model-based routing and priority fallback; matched `"stream": true` requests return `501`
 - **`mcp_gateway`** — MCP / Agent Tool Gateway for HTTP JSON-RPC MCP traffic: transparent proxying, aggregate discovery, namespaced tool/resource/prompt routing, session mediation, tool argument validation, and `mcp.*` metadata for downstream Ferrum plugins
 - **`a2a_gateway`** — Transparent Agent-to-Agent gateway for HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs traffic: method detection, lightweight method policy, HTTP Agent Card URL rewriting, streaming-safe pass-through, and `a2a.*` metadata
 

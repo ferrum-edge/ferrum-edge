@@ -702,6 +702,9 @@ pub async fn serve(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     let (proxy_state, health_check_handles) = ProxyState::new_with_reserved_gateway_ports(
         config,
@@ -948,6 +951,7 @@ pub async fn serve(
         reserved_ports,
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+        metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,
@@ -957,6 +961,13 @@ pub async fn serve(
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
+
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
 
     let admin_https_enabled = prebound.admin_https.is_some() || env_config.admin_https_port != 0;
     let admin_tls_runtime = if admin_https_enabled
@@ -1023,8 +1034,9 @@ pub async fn serve(
         bound.admin_http = listener.local_addr().ok();
         let st = admin_state.clone();
         let sh = shutdown_tx.subscribe();
+        let lim = admin_conn_limiter.clone();
         let h = tokio::spawn(async move {
-            admin::serve_admin_on_listener(listener, st, sh, None)
+            admin::serve_admin_on_listener(listener, st, sh, None, lim)
                 .await
                 .context("Admin HTTP listener failed")
         });
@@ -1034,6 +1046,7 @@ pub async fn serve(
         bound.admin_http = Some(admin_http_addr);
         let st = admin_state.clone();
         let sh = shutdown_tx.subscribe();
+        let lim = admin_conn_limiter.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let h = tokio::spawn(async move {
             info!("Starting admin HTTP listener on {}", admin_http_addr);
@@ -1043,6 +1056,7 @@ pub async fn serve(
                 sh,
                 None,
                 Some(started_tx),
+                lim,
             )
             .await
             .context("Admin HTTP listener failed")
@@ -1060,8 +1074,9 @@ pub async fn serve(
             let st = admin_state.clone();
             let sh = shutdown_tx.subscribe();
             let cfg = Some(admin_tls_config);
+            let lim = admin_conn_limiter.clone();
             let h = tokio::spawn(async move {
-                admin::serve_admin_on_listener(listener, st, sh, cfg)
+                admin::serve_admin_on_listener(listener, st, sh, cfg, lim)
                     .await
                     .context("Admin HTTPS listener failed")
             });
@@ -1073,6 +1088,7 @@ pub async fn serve(
             let st = admin_state.clone();
             let sh = shutdown_tx.subscribe();
             let cfg = Some(admin_tls_config);
+            let lim = admin_conn_limiter.clone();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let h = tokio::spawn(async move {
                 info!("Starting admin HTTPS listener on {}", admin_https_addr);
@@ -1083,6 +1099,7 @@ pub async fn serve(
                         sh,
                         slot,
                         Some(started_tx),
+                        lim,
                     )
                     .await
                 } else {
@@ -1092,6 +1109,7 @@ pub async fn serve(
                         sh,
                         cfg,
                         Some(started_tx),
+                        lim,
                     )
                     .await
                 };

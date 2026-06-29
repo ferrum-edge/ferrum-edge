@@ -76,6 +76,9 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         .env("FERRUM_NODE_AGENT_FALLBACK_MODE", "iptables")
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+        // /metrics is gated by default; allowlist the loopback scrape (node_agent
+        // generates a random admin JWT secret, so a token can't be minted here).
+        .env("FERRUM_METRICS_ALLOWED_CIDRS", "127.0.0.1/32,::1")
         .env("FERRUM_LOG_LEVEL", "debug")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

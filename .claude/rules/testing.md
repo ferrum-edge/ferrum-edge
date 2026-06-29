@@ -75,7 +75,7 @@ paths:
 
 ## CI Expectations
 
-- PR CI runs format, tests in parallel, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64.
+- PR CI runs format, tests in parallel, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The perf-regression job is path-gated on PRs (runs only for performance-sensitive changes) and always runs on pushes to `main` and on manual `workflow_dispatch`.
 - Push to main overwrites the `latest` release and publishes multi-arch Docker images to Docker Hub and GHCR.
 - Tags `v*` create versioned releases and Docker tags.
 - Required secrets are `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.

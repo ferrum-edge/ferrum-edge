@@ -46,6 +46,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -179,6 +180,7 @@ async fn test_admin_state_mode_field() {
     let admin_state_prod = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "production".to_string(),
@@ -223,6 +225,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -259,6 +262,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -301,6 +305,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -342,6 +347,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "file".to_string(),
@@ -378,6 +384,7 @@ async fn test_db_available_flag_transitions() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),

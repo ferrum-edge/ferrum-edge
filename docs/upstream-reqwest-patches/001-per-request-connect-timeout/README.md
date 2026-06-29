@@ -1,5 +1,9 @@
 # Vendored reqwest patch: per-request `connect_timeout`
 
+> Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
+> Any change to `vendor/reqwest-0.13.3-ferrum-patched/` must regenerate the drift
+> manifest (`scripts/update_vendor_integrity.sh`).
+
 ## What this patches
 
 Adds `RequestBuilder::connect_timeout(Duration)` to reqwest, letting each

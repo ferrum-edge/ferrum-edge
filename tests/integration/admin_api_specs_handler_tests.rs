@@ -102,6 +102,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
     AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: make_jwt_manager(),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "database".to_string(),
@@ -137,7 +138,14 @@ async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
     let state_clone = state.clone();
     let rx_clone = rx.clone();
     tokio::spawn(async move {
-        let _ = serve_admin_on_listener(listener, state_clone, rx_clone, None).await;
+        let _ = serve_admin_on_listener(
+            listener,
+            state_clone,
+            rx_clone,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
     // Wait until the listener is ready
     for _ in 0..200 {
