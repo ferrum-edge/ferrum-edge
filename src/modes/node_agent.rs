@@ -590,14 +590,20 @@ impl AdminBindSignals {
 
 /// Pure helper: pick the admin listener bind address for node-agent mode.
 ///
-/// When the operator opts in to the node-agent admin listener but has NOT
-/// configured either network-exposure signal (`FERRUM_ADMIN_BIND_ADDRESS` or
-/// `FERRUM_ADMIN_ALLOWED_CIDRS`) AND the resolved bind address is the
-/// unspecified-default `0.0.0.0`, override it to `127.0.0.1` and emit a
-/// `warn!` pointing operators at the escape hatches. This prevents accidentally
-/// exposing unauthenticated `/metrics` and `/health` to the network when the
-/// operator just flips
-/// `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` without further config.
+/// The admin bind defaults to loopback (`127.0.0.1`), keeping unauthenticated
+/// `/metrics` and `/health` off the network unless the operator opts in. Two
+/// opt-in signals are honored:
+///
+/// - An explicit `FERRUM_ADMIN_BIND_ADDRESS` is used verbatim.
+/// - `FERRUM_ADMIN_ALLOWED_CIDRS` with no explicit bind binds to `0.0.0.0` so
+///   cluster scraping can reach the listener — restricted by that allowlist.
+///   Because the bind now defaults to loopback, an allowlist alone could not
+///   otherwise make `/metrics` reachable, so this restores that documented
+///   contract.
+///
+/// With neither signal the listener is pinned to `127.0.0.1` (with a `warn!`
+/// pointing operators at the opt-ins) even if a stale `0.0.0.0`/`::` is passed,
+/// so it is never silently exposed.
 fn decide_admin_bind_address(
     configured_bind: &str,
     port: u16,
@@ -610,20 +616,41 @@ fn decide_admin_bind_address(
         )
     })?;
 
-    let any_signal_present = signals.bind_address_explicit || signals.allowed_cidrs_set;
-    let is_default_unspecified = !signals.bind_address_explicit
-        && (configured_ip.is_unspecified() || configured_bind == "0.0.0.0");
+    // An explicit bind address always wins.
+    if signals.bind_address_explicit {
+        return Ok(std::net::SocketAddr::new(configured_ip, port));
+    }
 
-    if !any_signal_present && is_default_unspecified {
+    // Allowlist-only opt-in: bind to all interfaces (restricted by the
+    // allowlist) so cluster scraping reaches /metrics and /health. The bind
+    // otherwise defaults to loopback, which the allowlist alone cannot override.
+    if signals.allowed_cidrs_set {
+        warn!(
+            "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with FERRUM_ADMIN_ALLOWED_CIDRS and no explicit \
+             FERRUM_ADMIN_BIND_ADDRESS; binding node-agent admin to 0.0.0.0:{port} (restricted by the \
+             allowlist) so unauthenticated /metrics and /health are reachable for cluster scraping. \
+             Set FERRUM_ADMIN_BIND_ADDRESS to pin a specific address."
+        );
+        return Ok(std::net::SocketAddr::new(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            port,
+        ));
+    }
+
+    // No opt-in signal: keep the safe loopback default, pinning 127.0.0.1 even
+    // if a non-loopback bind was passed without a signal so /metrics is never
+    // silently exposed.
+    if !configured_ip.is_loopback() {
         warn!(
             "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no allowlist or explicit bind address configured; \
              defaulting node-agent admin listener to 127.0.0.1:{port} so unauthenticated /metrics and /health \
-             are not exposed on the network. To bind elsewhere, set one of: \
-             FERRUM_ADMIN_BIND_ADDRESS=<address> (e.g. 0.0.0.0 if intentional), \
-             or FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>"
+             are not exposed on the network. To expose it, set FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list> \
+             or FERRUM_ADMIN_BIND_ADDRESS=<address>."
         );
-        let loopback: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
-        return Ok(std::net::SocketAddr::new(loopback, port));
+        return Ok(std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            port,
+        ));
     }
 
     Ok(std::net::SocketAddr::new(configured_ip, port))
@@ -8884,6 +8911,21 @@ mod tests {
         assert_eq!(
             addr,
             std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000)
+        );
+    }
+
+    #[test]
+    fn decide_admin_bind_allowlist_only_binds_unspecified_over_loopback_default() {
+        // Codex finding: with the admin bind defaulting to loopback, an
+        // allowlist-only opt-in (no explicit FERRUM_ADMIN_BIND_ADDRESS) must
+        // still expose /metrics by binding 0.0.0.0 (restricted by the allowlist),
+        // not stay on the loopback default.
+        let addr = decide_admin_bind_address("127.0.0.1", 9000, &signals(false, true))
+            .expect("loopback default + allowlist should be valid");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9000),
+            "allowlist opt-in must bind 0.0.0.0 even when the configured bind is the loopback default"
         );
     }
 

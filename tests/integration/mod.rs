@@ -68,4 +68,5 @@ mod mesh_topology_hbone_tests;
 mod scripted_backend_smoke_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
+mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

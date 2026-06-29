@@ -135,6 +135,52 @@ impl TrustedProxies {
         self.cidrs.iter().any(|cidr| cidr.matches(ip))
     }
 
+    /// Whether a comma-separated CIDR/IP list permits **every** source address
+    /// of some family — i.e. the entries together cover all of IPv4 or all of
+    /// IPv6. This catches both a literal `/0` (`0.0.0.0/0`, `::/0`, or an
+    /// IPv4-mapped spelling like `::ffff:0.0.0.0/96` the parser folds to an IPv4
+    /// `/0`) AND a UNION that covers the whole space with no single `/0` entry
+    /// (e.g. `0.0.0.0/1,128.0.0.0/1`). Such an allowlist makes the filter match
+    /// every source, so it provides no real restriction.
+    ///
+    /// Reuses the same `parse_cidr` canonicalization as the runtime filter (so
+    /// mapped-IPv6 spellings cannot slip past) and is side-effect free (no
+    /// logging) — safe to call from config classification at startup.
+    pub fn cidr_list_permits_all(raw: &str) -> bool {
+        let mut v4: Vec<(u128, u128)> = Vec::new();
+        let mut v6: Vec<(u128, u128)> = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some(cidr) = Self::parse_cidr(entry) else {
+                continue;
+            };
+            match cidr.network {
+                IpAddr::V4(net) => {
+                    // prefix ∈ [0,32]; `32 - prefix` ∈ [0,32] shifts safely in u128.
+                    let prefix = u32::from(cidr.prefix_len).min(32);
+                    let host = (1u128 << (32 - prefix)) - 1;
+                    let start = u128::from(u32::from(net)) & !host;
+                    v4.push((start, start | host));
+                }
+                IpAddr::V6(net) => {
+                    let prefix = u32::from(cidr.prefix_len).min(128);
+                    let (start, end) = if prefix == 0 {
+                        (0u128, u128::MAX) // avoid the UB of shifting a u128 by 128
+                    } else {
+                        let host = (1u128 << (128 - prefix)) - 1;
+                        let start = u128::from(net) & !host;
+                        (start, start | host)
+                    };
+                    v6.push((start, end));
+                }
+            }
+        }
+        ranges_cover_full(&mut v4, u128::from(u32::MAX)) || ranges_cover_full(&mut v6, u128::MAX)
+    }
+
     fn parse_cidr(entry: &str) -> Option<CidrEntry> {
         if let Some((ip_str, prefix_str)) = entry.split_once('/') {
             let ip: IpAddr = ip_str.parse().ok()?;
@@ -165,6 +211,37 @@ impl TrustedProxies {
             })
         }
     }
+}
+
+/// Whether the inclusive `[start, end]` ranges cover the entire `[0, max]`
+/// interval once sorted and merged. Used by `cidr_list_permits_all` to detect a
+/// CIDR allowlist whose union admits every address of a family. `max` is
+/// `u32::MAX` for the IPv4 set and `u128::MAX` for the IPv6 set (IPv4 ranges are
+/// widened to `u128` for a single implementation).
+fn ranges_cover_full(ranges: &mut [(u128, u128)], max: u128) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    ranges.sort_unstable();
+    // Coverage must begin at 0; otherwise the low addresses are unprotected.
+    if ranges[0].0 != 0 {
+        return false;
+    }
+    let mut covered = ranges[0].1;
+    for &(start, end) in ranges.iter().skip(1) {
+        if covered >= max {
+            return true;
+        }
+        // A gap exists if the next range starts beyond the next uncovered
+        // address (`covered + 1`). `saturating_add` avoids overflow at u128::MAX.
+        if start > covered.saturating_add(1) {
+            return false;
+        }
+        if end > covered {
+            covered = end;
+        }
+    }
+    covered >= max
 }
 
 fn canonicalize_ip(ip: IpAddr) -> IpAddr {

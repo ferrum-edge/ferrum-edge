@@ -58,15 +58,28 @@ docker run -d \
   --name ferrum-edge \
   -p 8000:8000 \
   -p 8443:8443 \
-  -p 9000:9000 \
-  -p 9443:9443 \
+  -p 127.0.0.1:9000:9000 \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=sqlite \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
-  -e FERRUM_ADMIN_JWT_SECRET="your-secret-key" \
+  -e FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32+character-admin-secret" \
+  -e FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
+  -e FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
   -v ferrum_data:/data \
   ferrum-edge:latest
 ```
+
+> **Admin API exposure.** The admin listeners bind to loopback (`127.0.0.1`)
+> inside the container by default — Docker port publishing forwards to the
+> container's network interface, not its loopback, so a published admin port is
+> unreachable until you set `FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0`. The example
+> above does that and publishes admin to **host loopback only**
+> (`127.0.0.1:9000`); because that is a non-loopback **plaintext** admin bind, in
+> `database`/`cp` modes it also requires an opt-in — here the dev-only
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. **For production**, drop the opt-in and
+> instead serve admin over TLS (`FERRUM_ADMIN_TLS_CERT_PATH`/`KEY_PATH`, publish
+> `9443`, set `FERRUM_ADMIN_HTTP_PORT=0`) and/or restrict with
+> `FERRUM_ADMIN_ALLOWED_CIDRS`. Use a 32+ character `FERRUM_ADMIN_JWT_SECRET`.
 
 ### Port Mappings
 
@@ -128,7 +141,7 @@ docker-compose up ferrum-sqlite
 
 **Environment**:
 - HTTP: http://localhost:8000
-- Admin API: http://localhost:9000
+- Admin API: bound to loopback inside the container and **not published** by default, so it is not reachable from the host. To enable host access (dev) or serve it over TLS (prod), follow the admin-exposure note at the top of `docker-compose.yml`.
 
 **Data**:
 - SQLite database stored in `ferrum_data` volume
@@ -153,7 +166,7 @@ docker-compose --profile postgres up ferrum-postgres
 
 **Environment**:
 - HTTP: http://localhost:8001
-- Admin API: http://localhost:9001
+- Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
 - PostgreSQL: localhost:5432
 
 **Database Initialization**:
@@ -166,8 +179,9 @@ docker-compose --profile postgres up ferrum-postgres
 # Start services
 docker compose --profile mongodb up -d
 
-# Verify
-curl http://localhost:9002/health
+# Verify (the container's built-in HEALTHCHECK runs `ferrum-edge health` on
+# loopback inside the pod; the admin port is not published to the host by default)
+docker compose ps   # STATUS column shows healthy/unhealthy
 ```
 
 Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
@@ -199,7 +213,7 @@ docker-compose --profile cp-dp up
 
 **Port Mappings**:
 - **Control Plane**:
-  - Admin API: http://localhost:9002
+  - Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
   - gRPC: localhost:50051
 
 - **Data Plane 1**:
@@ -380,7 +394,8 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/admin/metrics
 docker ps
 # HEALTHCHECK shows status
 
-# Manual health endpoint (from host)
+# Manual health endpoint (only when the admin port is published to the host;
+# admin binds loopback by default — see the admin-exposure note in docker-compose.yml)
 curl http://localhost:9000/health
 # {"status": "ok"}
 ```
@@ -523,8 +538,8 @@ docker-compose restart ferrum-edge
 # Scale service (for DP mode)
 docker-compose up -d --scale ferrum-dp=5
 
-# Check health from host
-curl http://localhost:9000/health
+# Check health (container HEALTHCHECK; admin port is not published by default)
+docker-compose ps
 
 # View resource usage
 docker stats
@@ -558,10 +573,12 @@ sudo chown -R 65532:65532 /path/to/volume
 ### Health Check Failing
 
 ```bash
-# Debug health endpoint (from host — no curl available inside distroless)
+# Debug health endpoint (only when the admin port is published to the host —
+# admin binds loopback by default; distroless has no in-container curl, so use
+# `docker compose ps` / the built-in HEALTHCHECK to check health otherwise)
 curl -v http://localhost:9000/health
 
-# Check Admin API JWT (from host)
+# Check Admin API JWT (only when the admin port is published to the host)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 
 # Check Docker health status

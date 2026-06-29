@@ -423,6 +423,7 @@ jobs:
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
               integration::db_offline_bootstrap_tests
+              integration::vendor_integrity_tests
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
@@ -567,6 +568,48 @@ jobs:
           path: target/conformance/
           retention-days: 14
           if-no-files-found: ignore
+
+  dependency-audit:
+    name: Dependency Audit (cargo-deny)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # cargo-deny only runs `cargo metadata` (no compilation), so this job does
+    # not install sccache. Clear the checked-in sccache rustc-wrapper
+    # (.cargo/config.toml `[build] rustc-wrapper = "sccache"`) — same fallback
+    # the setup-sccache action uses — so `cargo metadata` doesn't try to exec a
+    # binary that isn't on PATH.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        with:
+          # Pinned to the version the deny.toml schema was validated against, so
+          # a future cargo-deny release can't silently change gate behavior.
+          tool: cargo-deny@0.19.9
+
+      - name: cargo-deny (advisories, bans, sources)
+        # BLOCKING dependency-security gate. A new RUSTSEC advisory not
+        # explicitly time-boxed in deny.toml fails the PR. License checks are
+        # intentionally outside this gate (see deny.toml header). The weekly
+        # .github/workflows/dependency-audit.yml re-runs this plus the
+        # advisory-patch-status check.
+        # Policy: docs/dependency-policy.md.
+        run: cargo deny check advisories bans sources
+
+      - name: Advisory-exception expiry
+        # cargo-deny accepts ignores without the repo's [expires:] convention, so
+        # validate it here too: a PR that adds a malformed or already-expired
+        # exception is rejected at PR time, not only by the weekly workflow.
+        run: bash scripts/check_advisory_expiry.sh
 
   build-gateway-binary:
     name: Build Gateway Binary (functional tests)

@@ -50,6 +50,7 @@ fn create_test_env_config() -> EnvConfig {
         admin_tls_cert_path: None,
         admin_tls_key_path: None,
         admin_bind_address: "0.0.0.0".into(),
+        allow_insecure_admin_http: false,
         admin_jwt_secret: Some(ADMIN_JWT_SECRET.into()),
         db_type: Some("sqlite".into()),
         db_url: None,

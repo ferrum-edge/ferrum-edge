@@ -20,6 +20,7 @@ Ferrum Edge is in active build-out. Do not add schema DB migrations for new sche
 - TLS/secrets/security: `docs/frontend_tls.md`, `docs/backend_mtls.md`, `src/tls/`, `src/secrets/`, `.claude/rules/tls-security.md`
 - Tests and perf: `tests/`, `tests/performance/multi_protocol/`, `.claude/rules/testing.md`
 - Coverage: `docs/coverage.md`, `.github/workflows/coverage.yml`, `scripts/coverage.sh`
+- Dependencies/vendored patches: `deny.toml`, `vendor/`, `docs/dependency-policy.md`, `.claude/rules/dependencies.md`
 
 ## Core Commands
 

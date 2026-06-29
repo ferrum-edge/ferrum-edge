@@ -63,14 +63,32 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 
 ### Admin API
 
+> **Security — plaintext admin exposure.** The admin API is a management plane
+> and is **safe by default**: `FERRUM_ADMIN_BIND_ADDRESS` defaults to loopback
+> (`127.0.0.1`), so admin is not reachable from the network (the proxy
+> data-plane bind, `FERRUM_PROXY_BIND_ADDRESS`, still defaults to `0.0.0.0`). If
+> you move the admin API to any non-loopback address (`0.0.0.0`/`::`, a public
+> IP, or a private/VPC interface IP — all reachable beyond this host),
+> the writable `database`/`cp` modes **refuse to start** while the plaintext
+> listener (`FERRUM_ADMIN_HTTP_PORT`, non-zero) has no `FERRUM_ADMIN_ALLOWED_CIDRS`
+> allowlist — otherwise the writable admin API and any operator bearer tokens
+> would be served in cleartext on every interface. To expose admin, do one of:
+> set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin over TLS and
+> disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
+> `FERRUM_ADMIN_HTTP_PORT=0`), or — for local development only — set
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. Read-only modes (`file`/`dp`/`mesh`)
+> emit a high-severity warning instead of failing; the `node_agent` admin
+> listener also defaults to loopback.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port. Set to `0` to disable the plaintext admin HTTP listener (TLS-only operation) |
+| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port. Set to `0` to disable the plaintext admin HTTP listener (TLS-only operation; recommended for production) |
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
-| `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
+| `FERRUM_ADMIN_BIND_ADDRESS` | No | `127.0.0.1` | Bind address for admin listeners (HTTP, HTTPS). Loopback by default (safe — admin not network-exposed). Set to `0.0.0.0`/`::` to expose; in `database`/`cp` modes a public plaintext bind also needs an allowlist, TLS, or `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` (see the security note above) |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to connect to the admin API. Empty permits all |
 | `FERRUM_METRICS_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to scrape `/metrics` (and see detailed `/health` / `/overload`) **without** a credential. Empty (default) requires an admin JWT or `FERRUM_METRICS_BEARER_TOKEN`; set this to opt a Prometheus subnet into unauthenticated scraping |
 | `FERRUM_METRICS_BEARER_TOKEN` | No | — | Dedicated bearer token that authorizes `/metrics` scraping (and detailed `/health` / `/overload`) without a full admin JWT. Empty (default) disables this path. Use for Prometheus deployments that cannot mint admin JWTs |
+| `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` | No | `false` | Dev-only escape hatch. When `true`, downgrades the writable `database`/`cp` public-plaintext-admin startup guard from a hard error to a warning. Never enable in production |
 | `FERRUM_ADMIN_MAX_CONNECTIONS` | No | `1024` | Max concurrent connections across all admin/management-plane listeners (plaintext + TLS share one cap). Independent of the data-plane `FERRUM_MAX_CONNECTIONS`. Enforced after the admin CIDR allowlist and before the TLS handshake / request parsing; over-limit connections are dropped (TCP RST). `0` = unlimited |
 | `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP` | No | `0` | Max concurrent admin connections per resolved source IP. `0` (default) disables per-IP limiting so a single monitoring/load-balancer source is not capped by accident |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |

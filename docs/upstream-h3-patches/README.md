@@ -1,5 +1,9 @@
 # Upstream h3 patches
 
+> Governance: tracked in [docs/dependency-policy.md](../dependency-policy.md). Any
+> change to `vendor/h3-0.0.8-ferrum-patched/` must regenerate the drift manifest
+> (`scripts/update_vendor_integrity.sh`).
+
 Tracks fixes we've drafted for [hyperium/h3](https://github.com/hyperium/h3) that address bugs surfacing in our HTTP/3 backend dispatch path. Each numbered subdirectory is a self-contained patch with the issue draft, PR description, unified diff, and a lifecycle README explaining how to file the upstream artifacts and how to retire the patch when it merges.
 
 ## Active patches
