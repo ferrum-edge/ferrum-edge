@@ -3162,7 +3162,8 @@ impl EnvConfig {
             "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
              (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', a non-loopback address \
              reachable beyond this host, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The \
-             writable admin API and any operator bearer tokens would be served in cleartext to \
+             admin API (read endpoints still serve sensitive management-plane data, e.g. \
+             unredacted backups) and any operator bearer tokens would be served in cleartext to \
              every host that can route to it (a private/VPC interface IP is still LAN-reachable). \
              Choose one: \
              (1) bind admin to loopback — FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1; \
