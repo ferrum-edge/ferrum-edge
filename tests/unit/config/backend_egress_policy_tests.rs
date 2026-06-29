@@ -39,6 +39,14 @@ fn default_blocks_cloud_metadata_and_link_local() {
     assert!(!p.is_allowed(&ip("64:ff9b::a9fe:a9fe"))); // 169.254.169.254
     assert!(!p.is_allowed(&ip("64:ff9b::e000:1"))); // 224.0.0.1 (multicast)
     assert!(p.is_allowed(&ip("64:ff9b::808:808"))); // 8.8.8.8
+    // Alibaba Cloud / ENS IMDS host (100.100.100.200) sits in CGNAT, not
+    // link-local — block the EXACT host while leaving the rest of CGNAT allowed,
+    // including the IPv4-mapped and NAT64 encodings (IPv6-only / rebinding).
+    assert!(!p.is_allowed(&ip("100.100.100.200")));
+    assert!(!p.is_allowed(&ip("::ffff:100.100.100.200")));
+    assert!(!p.is_allowed(&ip("64:ff9b::6464:64c8"))); // 100.100.100.200
+    assert!(p.is_allowed(&ip("100.100.100.201"))); // adjacent CGNAT host stays allowed
+    assert!(p.is_allowed(&ip("100.64.0.1"))); // ordinary CGNAT backend stays allowed
 }
 
 #[test]

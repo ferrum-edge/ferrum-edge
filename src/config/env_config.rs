@@ -325,8 +325,9 @@ pub fn check_backend_ip_allowed(addr: &std::net::IpAddr, policy: &BackendAllowIp
 /// normal deployments. What this blocks instead is the set of ranges that are
 /// essentially never a real backend yet are the classic SSRF pivots:
 ///
-/// - **Cloud metadata / link-local**: `169.254.0.0/16` (incl. `169.254.169.254`)
-///   and IPv6 `fe80::/10`.
+/// - **Cloud metadata / link-local**: `169.254.0.0/16` (incl. `169.254.169.254`,
+///   the AWS/GCP/Azure IMDS) and IPv6 `fe80::/10`, plus the Alibaba Cloud / ENS
+///   IMDS host `100.100.100.200` (which sits in CGNAT, not link-local).
 /// - **Multicast**: `224.0.0.0/4` and `ff00::/8`.
 /// - **Unspecified / "this host"**: `0.0.0.0`, `0.0.0.0/8`, and IPv6 `::`.
 /// - **Limited broadcast**: `255.255.255.255`.
@@ -341,6 +342,12 @@ pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
             || ip.octets()[0] == 0  // 0.0.0.0/8 ("this host on this network")
             || ip.is_multicast()    // 224.0.0.0/4
             || ip.is_broadcast() // 255.255.255.255
+            // Alibaba Cloud / ENS instance metadata service. Unlike AWS/GCP/Azure
+            // (all on 169.254.169.254), Alibaba's IMDS lives at 100.100.100.200,
+            // which sits inside CGNAT (100.64.0.0/10) and is otherwise NOT
+            // link-local — so block the EXACT host (not the whole /10, which can
+            // carry legitimate CGNAT backends). Re-allow with FERRUM_BACKEND_ALLOW_CIDRS.
+            || ip.octets() == [100, 100, 100, 200]
         }
         std::net::IpAddr::V6(ip) => {
             // Loopback (`::1`) is explicitly allowed and must NOT be caught by

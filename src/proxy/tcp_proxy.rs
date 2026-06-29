@@ -2084,7 +2084,16 @@ async fn handle_tcp_connection_inner(
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    // A gateway-side egress-policy denial (literal / dns_override /
+                    // rebound passthrough host blocked) dialed no backend, so it
+                    // must NOT trip the breaker as a connect failure — release any
+                    // HALF_OPEN probe slot NEUTRALLY (mirrors the non-passthrough
+                    // TCP/UDP paths). Genuine DNS/transport failures still count.
+                    if crate::dns::is_egress_policy_denial(&e) {
+                        cb.record_neutral(cb_info.is_half_open_probe);
+                    } else {
+                        cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    }
                 }
                 return Err(anyhow::anyhow!(
                     "DNS resolution failed for {}: {}",

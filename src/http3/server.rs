@@ -3994,6 +3994,40 @@ async fn handle_h3_request(
                     current_target = Some(next);
                 }
 
+                // Re-screen the rotated retry target BEFORE admission/dispatch:
+                // the native-H3 pool's `resolve_backend_addr_cached` fast-path
+                // returns IP literals without going through `DnsCache`, so a
+                // rotated denied literal / `dns_override` target (e.g. a warn-only
+                // DB/DP config carrying `169.254.169.254`) would otherwise be
+                // admitted and dialed here, bypassing the pre-loop screen that only
+                // covered the first target. Break with a synthetic
+                // `DispatchPolicyRejected` result so no backend is dialed and the
+                // post-loop `record_backend_outcome` (which skips the
+                // adaptive-concurrency / passive-health charge for that class via
+                // `client_side_no_backend_signal`) stays health/breaker-neutral.
+                if let Some(reason) = current_target.as_deref().and_then(|t| {
+                    crate::proxy::denied_literal_backend_or_dns_override(
+                        &t.host,
+                        &proxy,
+                        &state.env_config.backend_allow_ips,
+                    )
+                }) {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        reason,
+                        "Backend egress policy denied rotated H3 retry target; not dialing"
+                    );
+                    result = H3BufferedDispatchResult {
+                        status: 502,
+                        body: br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+                        headers: HashMap::new(),
+                        trailers: None,
+                        error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
+                    };
+                    break;
+                }
+
                 backend_admission_start = std::time::Instant::now();
                 backend_admission_permits = match run_h3_backend_admission_or_send_reject(
                     backend_admission_plugins.as_ref(),
