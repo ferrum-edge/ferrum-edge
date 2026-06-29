@@ -7,9 +7,10 @@ use ferrum_edge::config::types::{
     MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
     MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_POOL_SQL_INTEGER_VALUE, MAX_SD_STRING_LENGTH,
-    MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE,
-    MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy,
-    RetryConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
+    MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MAX_WEBSOCKET_IDLE_TIMEOUT,
+    MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck,
+    PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig, Upstream,
+    UpstreamTarget,
 };
 use std::collections::HashMap;
 
@@ -68,6 +69,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
+        websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -2400,4 +2402,63 @@ fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
             && e.contains("169.254.169.254")
             && e.contains("backend egress policy")
     }));
+}
+
+// ── WebSocket idle timeout: per-proxy override + validation ──────────────────
+
+#[test]
+fn test_proxy_websocket_idle_timeout_none_passes() {
+    // None = inherit the global default; always valid.
+    let mut proxy = make_proxy("ws", "/ws");
+    proxy.websocket_idle_timeout_seconds = None;
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_websocket_idle_timeout_zero_passes() {
+    // Explicit 0 = disabled for this proxy; a deliberate opt-out, not an error.
+    let mut proxy = make_proxy("ws", "/ws");
+    proxy.websocket_idle_timeout_seconds = Some(0);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_websocket_idle_timeout_within_range_passes() {
+    let mut proxy = make_proxy("ws", "/ws");
+    proxy.websocket_idle_timeout_seconds = Some(600);
+    assert!(proxy.validate_fields().is_ok());
+
+    proxy.websocket_idle_timeout_seconds = Some(MAX_WEBSOCKET_IDLE_TIMEOUT);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_websocket_idle_timeout_too_large_rejected() {
+    let mut proxy = make_proxy("ws", "/ws");
+    proxy.websocket_idle_timeout_seconds = Some(MAX_WEBSOCKET_IDLE_TIMEOUT + 1);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("websocket_idle_timeout_seconds") && e.contains("between 0 and")),
+        "expected a websocket_idle_timeout_seconds range error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_effective_websocket_idle_timeout_resolution() {
+    let mut proxy = make_proxy("ws", "/ws");
+
+    // None -> inherit the global default.
+    proxy.websocket_idle_timeout_seconds = None;
+    assert_eq!(proxy.effective_websocket_idle_timeout_seconds(300), 300);
+    assert_eq!(proxy.effective_websocket_idle_timeout_seconds(0), 0);
+
+    // Some(0) -> explicitly disabled regardless of the global value.
+    proxy.websocket_idle_timeout_seconds = Some(0);
+    assert_eq!(proxy.effective_websocket_idle_timeout_seconds(300), 0);
+
+    // Some(n) -> per-proxy override wins over the global value.
+    proxy.websocket_idle_timeout_seconds = Some(45);
+    assert_eq!(proxy.effective_websocket_idle_timeout_seconds(300), 45);
+    assert_eq!(proxy.effective_websocket_idle_timeout_seconds(0), 45);
 }

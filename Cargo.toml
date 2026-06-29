@@ -4,6 +4,11 @@ version = "0.9.0"
 edition = "2024"
 description = "A high-performance edge proxy built in Rust"
 license = "PolyForm-Noncommercial-1.0.0"
+# Not published to crates.io: this is a noncommercial gateway binary shipped as
+# release artifacts / container images, not a library. Marking it private also
+# lets cargo-deny's `allow-wildcard-paths` exempt the internal
+# `ferrum-ebpf-common` path dependency (see deny.toml [bans]).
+publish = false
 
 # The vendored h3 crate lives at `vendor/h3-0.0.8-ferrum-patched/` and is
 # patched in via `[patch.crates-io]` below. Cargo treats vendored deps under

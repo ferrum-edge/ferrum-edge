@@ -28,7 +28,7 @@ pub(crate) mod validation_pipeline;
 pub use env_config::AutoBool;
 #[allow(unused_imports)] // DbTlsMode is used by unit tests and public config consumers
 pub use env_config::{
-    BackendAllowIps, BackendEgressPolicy, DbTlsMode, EnvConfig, OperatingMode,
+    AdminHttpExposure, BackendAllowIps, BackendEgressPolicy, DbTlsMode, EnvConfig, OperatingMode,
     check_backend_ip_allowed,
 };
 #[allow(unused_imports)] // Used by unit tests

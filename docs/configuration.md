@@ -63,12 +63,32 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 
 ### Admin API
 
+> **Security — plaintext admin exposure.** The admin API is a management plane
+> and is **safe by default**: `FERRUM_ADMIN_BIND_ADDRESS` defaults to loopback
+> (`127.0.0.1`), so admin is not reachable from the network (the proxy
+> data-plane bind, `FERRUM_PROXY_BIND_ADDRESS`, still defaults to `0.0.0.0`). If
+> you move the admin API to any non-loopback address (`0.0.0.0`/`::`, a public
+> IP, or a private/VPC interface IP — all reachable beyond this host),
+> the writable `database`/`cp` modes **refuse to start** while the plaintext
+> listener (`FERRUM_ADMIN_HTTP_PORT`, non-zero) has no `FERRUM_ADMIN_ALLOWED_CIDRS`
+> allowlist — otherwise the writable admin API and any operator bearer tokens
+> would be served in cleartext on every interface. To expose admin, do one of:
+> set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin over TLS and
+> disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
+> `FERRUM_ADMIN_HTTP_PORT=0`), or — for local development only — set
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. Read-only modes (`file`/`dp`/`mesh`)
+> emit a high-severity warning instead of failing; the `node_agent` admin
+> listener also defaults to loopback.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port. Set to `0` to disable the plaintext admin HTTP listener (TLS-only operation) |
+| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port. Set to `0` to disable the plaintext admin HTTP listener (TLS-only operation; recommended for production) |
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
-| `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
+| `FERRUM_ADMIN_BIND_ADDRESS` | No | `127.0.0.1` | Bind address for admin listeners (HTTP, HTTPS). Loopback by default (safe — admin not network-exposed). Set to `0.0.0.0`/`::` to expose; in `database`/`cp` modes a public plaintext bind also needs an allowlist, TLS, or `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` (see the security note above) |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to connect to the admin API. Empty permits all |
+| `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` | No | `false` | Dev-only escape hatch. When `true`, downgrades the writable `database`/`cp` public-plaintext-admin startup guard from a hard error to a warning. Never enable in production |
+| `FERRUM_ADMIN_MAX_CONNECTIONS` | No | `1024` | Max concurrent connections across all admin/management-plane listeners (plaintext + TLS share one cap). Independent of the data-plane `FERRUM_MAX_CONNECTIONS`. Enforced after the admin CIDR allowlist and before the TLS handshake / request parsing; over-limit connections are dropped (TCP RST). `0` = unlimited |
+| `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP` | No | `0` | Max concurrent admin connections per resolved source IP. `0` (default) disables per-IP limiting so a single monitoring/load-balancer source is not capped by accident |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
 | `FERRUM_ADMIN_TLS_CERT_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_ADMIN_TLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
@@ -501,7 +521,7 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | No | `131072` | WebSocket write buffer size (128 KB). Increase for large WS frames (1 MB+). Only applies when frame-level plugins are active |
 | `FERRUM_WEBSOCKET_TUNNEL_MODE` | No | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Significantly improves throughput for large payloads (9 MB: 25→110 RPS). `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is not enforced in tunnel mode (no DoS risk — data streams through a fixed-size copy buffer). Backend bytes that arrive in the same read as the backend `101 Switching Protocols` response are recovered and forwarded to the client before the raw relay starts, preserving push-first backends without parsing frames. Attach a frame-level plugin or disable tunnel mode when frame inspection, per-frame limits, or frame counters are required |
-| `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` | No | `0` | Connection-wide WebSocket idle timeout in seconds for frame-parsed and tunnel-mode sessions. The session closes only when neither direction produces traffic within the window; activity from either side keeps it open. Tracked at the transport byte level in both modes, so a partially received large/fragmented message counts as activity while its bytes are still arriving. `0` disables |
+| `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` | No | `300` | Global default connection-wide WebSocket idle timeout in seconds for frame-parsed and tunnel-mode sessions. The session closes only when neither direction produces traffic within the window; activity from either side — including Ping/Pong heartbeats — keeps it open. Tracked at the transport byte level in both modes, so a partially received large/fragmented message counts as activity while its bytes are still arriving. The per-proxy `websocket_idle_timeout_seconds` overrides this. Recommended production values: `300` (5 min) for typical apps, `600`+ for sparse server-push streams that heartbeat infrequently. Most production clients (browsers, Socket.IO, gRPC-over-WS) ping more often than every 5 minutes and stay open indefinitely; raise the value or set `0` for protocols that legitimately go silent for longer than the window without a heartbeat. `0` disables the bound — idle sessions then live forever, bounded only by `FERRUM_WEBSOCKET_MAX_CONNECTIONS` (resource-hoarding risk; a startup warning is logged). **HTTP/3 caveat:** on QUIC frontends the transport idle timeout `FERRUM_HTTP3_IDLE_TIMEOUT` (default 30s) also applies, so an idle H3 WebSocket is bounded by `min(websocket_idle_timeout, FERRUM_HTTP3_IDLE_TIMEOUT)` — a larger WebSocket value (or `0`) cannot extend an idle H3 session past the QUIC bound; raise `FERRUM_HTTP3_IDLE_TIMEOUT` to honor a longer window on H3 |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | No | `10` | HTTP/1.1 header read timeout; `0` disables |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.

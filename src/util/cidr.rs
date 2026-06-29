@@ -108,6 +108,41 @@ impl CidrSet {
         self.entries.iter().any(|entry| entry.matches(ip))
     }
 
+    /// Whether these entries together cover **every** address of IPv4 or IPv6 —
+    /// a literal `/0` (`0.0.0.0/0`, `::/0`, or an IPv4-mapped spelling like
+    /// `::ffff:0.0.0.0/96` the parser folds to an IPv4 `/0`) OR a UNION that
+    /// spans the whole family with no single `/0` entry (e.g.
+    /// `0.0.0.0/1,128.0.0.0/1`). Such an allowlist imposes no real restriction.
+    /// Entries are already canonicalized + masked at parse time, so the runtime
+    /// filter and this check agree on mapped-IPv6 spellings.
+    pub fn permits_all_family(&self) -> bool {
+        let mut v4: Vec<(u128, u128)> = Vec::new();
+        let mut v6: Vec<(u128, u128)> = Vec::new();
+        for entry in &self.entries {
+            match entry.network {
+                IpAddr::V4(net) => {
+                    // prefix ∈ [0,32]; `32 - prefix` ∈ [0,32] shifts safely in u128.
+                    let prefix = u32::from(entry.prefix_len).min(32);
+                    let host = (1u128 << (32 - prefix)) - 1;
+                    let start = u128::from(u32::from(net)) & !host;
+                    v4.push((start, start | host));
+                }
+                IpAddr::V6(net) => {
+                    let prefix = u32::from(entry.prefix_len).min(128);
+                    let (start, end) = if prefix == 0 {
+                        (0u128, u128::MAX) // avoid the UB of shifting a u128 by 128
+                    } else {
+                        let host = (1u128 << (128 - prefix)) - 1;
+                        let start = u128::from(net) & !host;
+                        (start, start | host)
+                    };
+                    v6.push((start, end));
+                }
+            }
+        }
+        ranges_cover_full(&mut v4, u128::from(u32::MAX)) || ranges_cover_full(&mut v6, u128::MAX)
+    }
+
     fn parse_entry(entry: &str) -> Option<CidrEntry> {
         if let Some((network_str, prefix_str)) = entry.split_once('/') {
             let ip: IpAddr = network_str.trim().parse().ok()?;
@@ -137,6 +172,37 @@ impl CidrSet {
             })
         }
     }
+}
+
+/// Whether the inclusive `[start, end]` ranges cover the entire `[0, max]`
+/// interval once sorted and merged. Used by [`CidrSet::permits_all_family`] to
+/// detect a CIDR allowlist whose union admits every address of a family. `max`
+/// is `u32::MAX` for the IPv4 set and `u128::MAX` for the IPv6 set (IPv4 ranges
+/// are widened to `u128` for a single implementation).
+fn ranges_cover_full(ranges: &mut [(u128, u128)], max: u128) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    ranges.sort_unstable();
+    // Coverage must begin at 0; otherwise the low addresses are unprotected.
+    if ranges[0].0 != 0 {
+        return false;
+    }
+    let mut covered = ranges[0].1;
+    for &(start, end) in ranges.iter().skip(1) {
+        if covered >= max {
+            return true;
+        }
+        // A gap exists if the next range starts beyond the next uncovered
+        // address (`covered + 1`). `saturating_add` avoids overflow at u128::MAX.
+        if start > covered.saturating_add(1) {
+            return false;
+        }
+        if end > covered {
+            covered = end;
+        }
+    }
+    covered >= max
 }
 
 /// Collapse an IPv4-mapped IPv6 address to its embedded IPv4 form so that v4

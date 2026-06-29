@@ -138,6 +138,7 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &
         // Per-proxy fast-path opt-in: paired with the global flag in
         // `TcpListenerConfig` below.
         tcp_idle_timeout_seconds: Some(0),
+        websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,

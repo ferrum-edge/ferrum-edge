@@ -3,6 +3,7 @@
 pub mod api_specs;
 pub mod audit;
 mod backup;
+pub mod conn_limit;
 pub(crate) mod crud;
 pub mod jwt_auth;
 pub mod mesh_config_drift;
@@ -47,6 +48,8 @@ use crate::tls::managed::ManagedTlsMaterialKind;
 use crate::util::body_limit::is_length_limit_error;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+
+pub use conn_limit::AdminConnLimiter;
 
 /// Cached result of the database health check to avoid hitting the DB on every
 /// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
@@ -173,8 +176,9 @@ pub async fn start_admin_listener(
     addr: SocketAddr,
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None).await
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None, conn_limiter).await
 }
 
 /// Start the Admin API listener with optional TLS support.
@@ -183,8 +187,10 @@ pub async fn start_admin_listener_with_tls(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
+    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None, conn_limiter)
+        .await
 }
 
 /// Start the Admin API listener with optional TLS support and signal readiness
@@ -195,13 +201,14 @@ pub async fn start_admin_listener_with_tls_and_signal(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
     }
-    serve_admin_on_listener(listener, state, shutdown, tls_config).await
+    serve_admin_on_listener(listener, state, shutdown, tls_config, conn_limiter).await
 }
 
 /// Start the Admin API HTTPS listener with a hot-swappable frontend TLS
@@ -215,8 +222,17 @@ pub async fn start_admin_listener_with_dynamic_tls(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_dynamic_tls_and_signal(addr, state, shutdown, tls_slot, None).await
+    start_admin_listener_with_dynamic_tls_and_signal(
+        addr,
+        state,
+        shutdown,
+        tls_slot,
+        None,
+        conn_limiter,
+    )
+    .await
 }
 
 /// Start the Admin API HTTPS listener with a hot-swappable frontend TLS slot
@@ -227,13 +243,15 @@ pub async fn start_admin_listener_with_dynamic_tls_and_signal(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
     }
-    serve_admin_on_listener_with_dynamic_tls(listener, state, shutdown, tls_slot).await
+    serve_admin_on_listener_with_dynamic_tls(listener, state, shutdown, tls_slot, conn_limiter)
+        .await
 }
 
 /// Run the Admin API accept loop on a pre-bound `TcpListener`.
@@ -253,10 +271,15 @@ pub async fn serve_admin_on_listener(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
+    // Publish the limiter so `/metrics` can render its gauge/counters.
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_admin_conn_metrics(conn_limiter.clone());
     let mut shutdown_rx = shutdown;
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let mut reject_log = crate::util::accept_backoff::LogRateLimiter::new();
 
     loop {
         tokio::select! {
@@ -277,10 +300,34 @@ pub async fn serve_admin_on_listener(
                             continue;
                         }
 
+                        // Admin connection cap: acquire a permit before spawning
+                        // a per-connection task. Over-limit connections are
+                        // dropped (TCP RST) with zero task/TLS-handshake overhead.
+                        let conn_permit = match conn_limiter.try_acquire(remote_addr.ip()) {
+                            Ok(permit) => permit,
+                            Err(reason) => {
+                                if let Some(suppressed) =
+                                    reject_log.on_event(crate::socket_opts::monotonic_now_ms())
+                                {
+                                    warn!(
+                                        suppressed,
+                                        remote_addr = %remote_addr.ip(),
+                                        reason = reason.as_label(),
+                                        "Admin connection rejected: connection limit reached"
+                                    );
+                                }
+                                drop(stream);
+                                continue;
+                            }
+                        };
+
                         let state = state.clone();
                         let tls_config = tls_config.clone();
 
                         tokio::spawn(async move {
+                            // Hold the permit for the connection lifetime; it is
+                            // released on every exit path when this drops.
+                            let _conn_permit = conn_permit;
                             let result = if let Some(tls_config) = tls_config {
                                 // Handle TLS connection
                                 handle_admin_tls_connection(stream, remote_addr, state, tls_config).await
@@ -337,10 +384,15 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
+    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
 ) -> Result<(), anyhow::Error> {
+    // Publish the limiter so `/metrics` can render its gauge/counters.
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_admin_conn_metrics(conn_limiter.clone());
     let mut shutdown_rx = shutdown;
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let mut reject_log = crate::util::accept_backoff::LogRateLimiter::new();
 
     loop {
         tokio::select! {
@@ -359,10 +411,32 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
                             continue;
                         }
 
+                        // Admin connection cap (see `serve_admin_on_listener`):
+                        // acquire before spawning / before the TLS handshake.
+                        let conn_permit = match conn_limiter.try_acquire(remote_addr.ip()) {
+                            Ok(permit) => permit,
+                            Err(reason) => {
+                                if let Some(suppressed) =
+                                    reject_log.on_event(crate::socket_opts::monotonic_now_ms())
+                                {
+                                    warn!(
+                                        suppressed,
+                                        remote_addr = %remote_addr.ip(),
+                                        reason = reason.as_label(),
+                                        "Admin connection rejected: connection limit reached"
+                                    );
+                                }
+                                drop(stream);
+                                continue;
+                            }
+                        };
+
                         let tls_config = tls_slot.load().as_ref().clone();
                         let state = state.clone();
 
                         tokio::spawn(async move {
+                            // Hold the permit for the connection lifetime.
+                            let _conn_permit = conn_permit;
                             let Some(tls_config) = tls_config else {
                                 debug!(
                                     remote_addr = %remote_addr.ip(),

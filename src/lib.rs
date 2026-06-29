@@ -577,6 +577,21 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx)
     }
 
+    // ── plugins/ai_semantic_cache staging fields ─────────────────────────────
+    //
+    // `RequestContext::ai_semantic_cache_embedding` / `..._scope_key` are
+    // `pub(crate)` so the high-dimensional embedding vector and scope key cannot
+    // leak into transaction logs. The read-only accessors below let external
+    // unit tests assert that `exact_only` mode never stages either field for
+    // multimodal requests, without widening the fields to `pub`.
+    pub fn ai_semantic_cache_embedding(ctx: &crate::plugins::RequestContext) -> Option<&Vec<f32>> {
+        ctx.ai_semantic_cache_embedding.as_ref()
+    }
+
+    pub fn ai_semantic_cache_scope_key(ctx: &crate::plugins::RequestContext) -> Option<&str> {
+        ctx.ai_semantic_cache_scope_key.as_deref()
+    }
+
     // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────
     //
     // Tunnel mode bypasses WebSocket frame parsing and does raw TCP bidirectional

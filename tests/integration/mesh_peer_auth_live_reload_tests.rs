@@ -259,6 +259,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
+        websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,

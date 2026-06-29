@@ -1544,6 +1544,13 @@ pub async fn run(
     crate::plugins::prometheus_metrics::global_registry()
         .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
 
+    // Shared admin connection limiter (plaintext + HTTPS listeners share one
+    // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+        env_config.admin_max_connections,
+        env_config.admin_max_connections_per_ip,
+    ));
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -1577,6 +1584,7 @@ pub async fn run(
     // Admin HTTP listener (disabled when port is 0)
     if env_config.admin_http_port != 0 {
         let (admin_started_tx, admin_started_rx) = tokio::sync::oneshot::channel();
+        let admin_http_limiter = admin_conn_limiter.clone();
         let admin_http_handle = tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
             admin::start_admin_listener_with_tls_and_signal(
@@ -1585,6 +1593,7 @@ pub async fn run(
                 admin_shutdown,
                 None,
                 Some(admin_started_tx),
+                admin_http_limiter,
             )
             .await
             .context("Admin HTTP listener failed")
@@ -1672,6 +1681,7 @@ pub async fn run(
             let admin_tls_slot = admin_reload_handles.slot.clone();
 
             let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+            let admin_https_limiter = admin_conn_limiter.clone();
             let admin_https_handle = tokio::spawn(async move {
                 info!("Starting Admin HTTPS listener on {}", admin_https_addr);
                 let result = if let Some(slot) = admin_tls_slot {
@@ -1681,6 +1691,7 @@ pub async fn run(
                         admin_https_shutdown,
                         slot,
                         Some(admin_https_started_tx),
+                        admin_https_limiter,
                     )
                     .await
                 } else {
@@ -1690,6 +1701,7 @@ pub async fn run(
                         admin_https_shutdown,
                         Some(admin_tls_config),
                         Some(admin_https_started_tx),
+                        admin_https_limiter,
                     )
                     .await
                 };

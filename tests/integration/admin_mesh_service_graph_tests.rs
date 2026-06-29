@@ -109,7 +109,14 @@ async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sen
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = serve_admin_on_listener(listener, state, shutdown_rx, None).await;
+        let _ = serve_admin_on_listener(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(actual_addr).await.is_ok() {

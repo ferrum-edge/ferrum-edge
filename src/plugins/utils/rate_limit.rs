@@ -21,6 +21,21 @@ pub struct RateLimitOutcome {
     pub window_seconds: Option<u64>,
     pub usage: Option<u64>,
     pub metric: Option<&'static str>,
+    /// Identifier of the reservation created by an `AiRateLimitOp::Reserve` in
+    /// the local (in-memory) `TokenUsageWindow`. The reconciliation op carries
+    /// it back so a negative correction releases the *matching* reservation
+    /// rather than the newest entry — see `TokenUsageWindow::adjust_usage`.
+    /// `None` for every other algorithm/op and for the Redis path (whose
+    /// counter is aggregate and has no per-entry identity).
+    pub reservation_id: Option<u64>,
+    /// Redis sliding-window index that an `AiRateLimitOp::Reserve` credited in
+    /// the centralized (Redis) path. Carried back on the reconciliation op so a
+    /// negative correction debits the SAME window the reservation landed in,
+    /// even when the request straddles a window rollover before reconciling —
+    /// see the Redis `AdjustUsage` arm. `None` for the local path (whose
+    /// per-entry timestamp already pins the correction to the right window) and
+    /// for every other algorithm/op.
+    pub reserved_window_index: Option<u64>,
 }
 
 impl RateLimitOutcome {
@@ -60,6 +75,16 @@ impl RateLimitOutcome {
 
     pub fn with_metric(mut self, metric: &'static str) -> Self {
         self.metric = Some(metric);
+        self
+    }
+
+    pub fn with_reservation_id(mut self, reservation_id: u64) -> Self {
+        self.reservation_id = Some(reservation_id);
+        self
+    }
+
+    pub fn with_reserved_window_index(mut self, reserved_window_index: u64) -> Self {
+        self.reserved_window_index = Some(reserved_window_index);
         self
     }
 }
@@ -870,12 +895,26 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
     }
 }
 
+/// A single token reservation/charge within the sliding window. The `id`
+/// uniquely identifies a `reserve()` so that a later out-of-order
+/// reconciliation can release *its own* reservation instead of whichever entry
+/// happens to be newest.
+#[derive(Debug, Clone, Copy)]
+struct TokenEntry {
+    at: Instant,
+    id: u64,
+    tokens: u64,
+}
+
 #[derive(Debug)]
 pub struct TokenUsageWindow {
-    entries: VecDeque<(Instant, u64)>,
+    entries: VecDeque<TokenEntry>,
     window_duration: Duration,
     limit: u64,
     total: u64,
+    /// Monotonic per-window source of reservation ids. `0` is reserved as the
+    /// "no reservation" sentinel, so ids handed out start at `1`.
+    next_reservation_id: u64,
 }
 
 impl TokenUsageWindow {
@@ -885,14 +924,15 @@ impl TokenUsageWindow {
             window_duration,
             limit,
             total: 0,
+            next_reservation_id: 1,
         }
     }
 
     fn current_usage(&mut self, now: Instant) -> u64 {
         let cutoff = now - self.window_duration;
-        while let Some((timestamp, tokens)) = self.entries.front() {
-            if *timestamp < cutoff {
-                let expired = *tokens;
+        while let Some(entry) = self.entries.front() {
+            if entry.at < cutoff {
+                let expired = entry.tokens;
                 self.entries.pop_front();
                 self.total = self.total.saturating_sub(expired);
             } else {
@@ -902,9 +942,150 @@ impl TokenUsageWindow {
         self.total
     }
 
-    fn record_usage(&mut self, now: Instant, tokens: u64) {
-        self.entries.push_back((now, tokens));
+    /// Record a charge with no caller-tracked reservation id (positive
+    /// reconciliation deltas and any anonymous usage). Returns the id assigned.
+    fn record_usage(&mut self, now: Instant, tokens: u64) -> u64 {
+        let id = self.allocate_id();
+        self.entries.push_back(TokenEntry {
+            at: now,
+            id,
+            tokens,
+        });
         self.total = self.total.saturating_add(tokens);
+        id
+    }
+
+    fn allocate_id(&mut self) -> u64 {
+        let id = self.next_reservation_id;
+        // Wrap past u64::MAX back to 1 (never 0, the sentinel). Collisions
+        // after 2^64 reservations in a single window are not a practical
+        // concern, and a stale collision only degrades to the back-pop
+        // fallback, never an over-count.
+        self.next_reservation_id = self.next_reservation_id.checked_add(1).unwrap_or(1);
+        id
+    }
+
+    fn reserve(&mut self, now: Instant, tokens: u64) -> RateLimitOutcome {
+        let usage = self.current_usage(now);
+        let reserved_usage = usage.saturating_add(tokens);
+        if reserved_usage > self.limit {
+            return RateLimitOutcome::deny()
+                .with_limit(self.limit)
+                .with_window(self.window_duration.as_secs())
+                .with_usage(usage)
+                .with_remaining(self.limit.saturating_sub(usage));
+        }
+
+        let reservation_id = self.record_usage(now, tokens);
+        RateLimitOutcome::allow()
+            .with_limit(self.limit)
+            .with_window(self.window_duration.as_secs())
+            .with_usage(reserved_usage)
+            .with_remaining(self.limit.saturating_sub(reserved_usage))
+            .with_reservation_id(reservation_id)
+    }
+
+    /// Apply a reconciliation `delta` to the window.
+    ///
+    /// When `reservation_id` matches a live entry, the correction is applied to
+    /// *that* entry (its token count becomes `tokens + delta`, floored at zero,
+    /// removed when it reaches zero). This keeps accounting correct under
+    /// concurrency: an older request's negative reconciliation no longer steals
+    /// a newer request's reservation off the back of the queue. The entry's
+    /// timestamp is preserved, so its usage still expires on the original
+    /// reservation's schedule.
+    ///
+    /// When a non-zero `reservation_id` is supplied but no matching entry
+    /// remains (the reservation already aged out of the window, or a non-2xx
+    /// release already removed it and a later final-body rejection re-runs
+    /// reconciliation), the outcome depends on the delta sign:
+    ///
+    /// - **Negative delta → no-op.** The reservation this correction targets is
+    ///   already gone, so there is nothing of *this request's* to release.
+    ///   Falling through to the back-of-queue release here would pop tokens from
+    ///   an unrelated, still-live reservation for the same key and under-count
+    ///   the budget (the bug a stale/duplicate reconciliation would otherwise
+    ///   cause). The expired reservation's own usage was already dropped by the
+    ///   window/TTL or the earlier release, so dropping the delta is correct.
+    /// - **Positive delta → append a fresh entry.** Actual usage exceeded the
+    ///   (now-expired) reservation; recording the extra consumption never
+    ///   under-counts, so it is safe to add it back as new usage.
+    ///
+    /// When `reservation_id` is `None` (the legacy / anonymous path with no
+    /// per-entry identity), positive deltas append a fresh entry and negative
+    /// deltas release from the back of the queue, floored at zero.
+    fn adjust_usage(&mut self, now: Instant, reservation_id: Option<u64>, delta: i64) {
+        if delta == 0 {
+            self.current_usage(now);
+            return;
+        }
+
+        self.current_usage(now);
+
+        if let Some(id) = reservation_id.filter(|id| *id != 0) {
+            // PERF: linear scan (and the `retain` below on full release) over the
+            // window's entries while the caller holds the per-key shard
+            // write-lock. O(n) in live entries for this key (n ≈
+            // window_seconds × RPS for a hot consumer/IP). This runs at most once
+            // per request (reconciliation is idempotent) and off the
+            // request-admission hot path, so it is acceptable today; if a single
+            // hot key with a long window makes this scan dominate, replace the
+            // VecDeque + scan with an id→index map (kept consistent across
+            // record_usage / retain / pop_back / window eviction) for O(1)
+            // lookup. Documented in docs/plugins.md (Local-mode performance).
+            if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+                let new_tokens = if delta >= 0 {
+                    entry.tokens.saturating_add(delta as u64)
+                } else {
+                    entry.tokens.saturating_sub(delta.unsigned_abs())
+                };
+                let previous = entry.tokens;
+                entry.tokens = new_tokens;
+                if new_tokens >= previous {
+                    self.total = self.total.saturating_add(new_tokens - previous);
+                } else {
+                    self.total = self.total.saturating_sub(previous - new_tokens);
+                }
+                if new_tokens == 0 {
+                    self.entries.retain(|entry| entry.id != id);
+                }
+                return;
+            }
+
+            // A reservation id was supplied but the entry is gone. Do NOT fall
+            // through to the anonymous back-of-queue release: that would steal a
+            // different in-flight reservation's tokens. Only a positive delta
+            // (extra usage above an expired reservation) is recorded; a negative
+            // delta is a no-op because the reservation it targeted is already
+            // released/expired.
+            if delta > 0 {
+                self.record_usage(now, delta as u64);
+            }
+            return;
+        }
+
+        if delta > 0 {
+            self.record_usage(now, delta as u64);
+            return;
+        }
+
+        let mut remaining_release = delta.unsigned_abs();
+        while remaining_release > 0 {
+            let Some(entry) = self.entries.back_mut() else {
+                self.total = 0;
+                break;
+            };
+
+            if entry.tokens > remaining_release {
+                entry.tokens -= remaining_release;
+                self.total = self.total.saturating_sub(remaining_release);
+                break;
+            }
+
+            remaining_release -= entry.tokens;
+            self.total = self.total.saturating_sub(entry.tokens);
+            self.entries.pop_back();
+        }
     }
 
     fn remaining(&mut self, now: Instant) -> u64 {
@@ -914,14 +1095,73 @@ impl TokenUsageWindow {
     fn has_recent_activity(&self, now: Instant) -> bool {
         self.entries
             .back()
-            .is_some_and(|(timestamp, _)| now.duration_since(*timestamp) < self.window_duration)
+            .is_some_and(|entry| now.duration_since(entry.at) < self.window_duration)
     }
+}
+
+/// Which backend the original `Reserve` for a reconciliation actually landed
+/// on. Carried on `AiRateLimitOp::AdjustUsage` so the reconciliation arm that
+/// ends up running (which is always the *currently* healthy backend) can detect
+/// a backend switch — Redis recovering, or going down, between the reservation
+/// and the reconciliation — and avoid corrupting a backend that never received
+/// the reservation. See the `AdjustUsage` arms of `check_local` / `check_redis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationBackend {
+    /// The reservation was made in the in-memory `TokenUsageWindow` (Redis was
+    /// down at reserve time, or no Redis is configured). Identified by the
+    /// outcome carrying a `reservation_id` and no `reserved_window_index`.
+    Local,
+    /// The reservation was made on the centralized Redis counter. Identified by
+    /// the outcome carrying a `reserved_window_index` and no `reservation_id`.
+    Redis,
+    /// The reservation backend is unknown — the caller stored no reservation
+    /// markers (e.g. the estimate was 0 tokens, so nothing was charged). In this
+    /// case `delta == actual_tokens` already (`reserved == 0`), so the normal
+    /// path is correct and no switch handling is needed.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum AiRateLimitOp {
     CheckBudget,
-    RecordUsage { tokens: u64 },
+    Reserve {
+        tokens: u64,
+    },
+    AdjustUsage {
+        /// Id returned by the `Reserve` outcome, so the local window can release
+        /// the exact reservation this reconciliation belongs to. `None` (or `0`)
+        /// falls back to back-of-queue release. Ignored by the Redis path, whose
+        /// counter is aggregate.
+        reservation_id: Option<u64>,
+        /// Redis window index the `Reserve` credited (from the outcome's
+        /// `reserved_window_index`). The Redis path debits THIS window so a
+        /// correction for a request that straddled a rollover lands on the
+        /// window that received the reservation, not the window current at
+        /// reconcile time. `None` falls back to the current window (legacy
+        /// behavior). Ignored by the local path, whose per-entry timestamp
+        /// already pins the window.
+        reserved_window_index: Option<u64>,
+        /// Backend the original reservation landed on. The reconciliation arm
+        /// that runs is always the currently healthy backend; when it differs
+        /// from this value the reservation lives on a *different* backend, so the
+        /// stale `reserved` must NOT be subtracted here (it was never charged to
+        /// this backend) and the full `actual_tokens` is charged instead. See the
+        /// `AdjustUsage` arms below.
+        reservation_backend: ReservationBackend,
+        /// Actual tokens the request consumed (`0` for a full release, e.g. a
+        /// non-2xx response or `on_unmetered_response=warn`). Used to charge the
+        /// FULL usage to the now-active backend when a backend switch is detected,
+        /// instead of the relative `delta` (which subtracts a `reserved` that the
+        /// active backend never received).
+        actual_tokens: u64,
+        /// `actual_tokens - reserved_tokens`, the normal same-backend correction
+        /// applied when no backend switch occurred.
+        delta: i64,
+    },
+}
+
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -972,8 +1212,39 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     .with_usage(usage)
                     .with_remaining(remaining)
             }
-            AiRateLimitOp::RecordUsage { tokens } => {
-                state.record_usage(now, tokens);
+            AiRateLimitOp::Reserve { tokens } => state.reserve(now, tokens),
+            AiRateLimitOp::AdjustUsage {
+                reservation_id,
+                // The local window pins the correction to the right window via
+                // the matched entry's preserved timestamp, so the Redis window
+                // index is not needed here.
+                reserved_window_index: _,
+                reservation_backend,
+                actual_tokens,
+                delta,
+            } => {
+                if reservation_backend == ReservationBackend::Redis {
+                    // Backend switch: the reservation was charged to the Redis
+                    // counter, but Redis went down between reserve and reconcile
+                    // so this correction is now running against the LOCAL window.
+                    // The `reserved` was never charged here, so applying the
+                    // relative `delta` (which subtracts that `reserved`) would
+                    // pop tokens off an unrelated local reservation and
+                    // under-count the budget. Charge the FULL actual usage as
+                    // fresh local usage instead; the stale Redis reservation is
+                    // left to expire via its window TTL. (`reservation_id` is
+                    // `None` for a Redis-origin reservation anyway.)
+                    if actual_tokens > 0 {
+                        state.record_usage(now, actual_tokens);
+                    } else {
+                        // Keep the window's expiry bookkeeping current even when
+                        // there is nothing to charge (full release of a remote
+                        // reservation).
+                        state.current_usage(now);
+                    }
+                    return RateLimitOutcome::allow();
+                }
+                state.adjust_usage(now, reservation_id, delta);
                 RateLimitOutcome::allow()
             }
         }
@@ -1007,13 +1278,117 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     .with_usage(usage)
                     .with_remaining(remaining))
             }
-            AiRateLimitOp::RecordUsage { tokens } => {
+            AiRateLimitOp::Reserve { tokens } => {
                 let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
-                let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                let prev_idx = curr_idx.saturating_sub(1);
+                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
                 let ttl = self.window_seconds * 2 + 1;
-                let _ = redis
-                    .incrby_with_expire(&redis_key, tokens as i64, ttl)
-                    .await?;
+                let increment = u64_to_i64_saturating(tokens);
+                let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
+                let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
+                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + new_curr_count as f64;
+                let usage = weighted.max(0.0) as u64;
+                let remaining = self.token_limit.saturating_sub(usage);
+                if weighted > self.token_limit as f64 {
+                    // Roll back the speculative reservation we just added. Use
+                    // the floor-at-zero variant (not a raw negative INCRBY): a
+                    // concurrent reconciliation racing this rollback on the same
+                    // window key could otherwise drive the counter negative,
+                    // which later reads as zero usage and lets a consumer
+                    // re-reserve the full limit — the exact bypass class the
+                    // floor closes for the reconciliation path. Surface a failed
+                    // rollback (Redis blip) so a leaked reservation is
+                    // observable rather than silently charged until TTL.
+                    if let Err(()) = redis
+                        .incrby_with_expire_floor_zero(&curr_key, -increment, ttl)
+                        .await
+                    {
+                        warn!(
+                            key = %curr_key,
+                            "ai_rate_limiter: failed to roll back denied Redis token reservation; \
+                             estimate stays charged until the window TTL expires"
+                        );
+                    }
+                    return Ok(RateLimitOutcome::deny()
+                        .with_limit(self.token_limit)
+                        .with_window(self.window_seconds)
+                        .with_usage(usage.saturating_sub(tokens))
+                        .with_remaining(
+                            self.token_limit
+                                .saturating_sub(usage.saturating_sub(tokens)),
+                        ));
+                }
+                Ok(RateLimitOutcome::allow()
+                    .with_limit(self.token_limit)
+                    .with_window(self.window_seconds)
+                    .with_usage(usage)
+                    .with_remaining(remaining)
+                    // Carry the window this reservation credited so the
+                    // reconciliation debits the SAME window even after a
+                    // rollover. See the `AdjustUsage` arm below.
+                    .with_reserved_window_index(curr_idx))
+            }
+            AiRateLimitOp::AdjustUsage {
+                reservation_id: _,
+                reserved_window_index,
+                reservation_backend,
+                actual_tokens,
+                delta,
+            } => {
+                // `reservation_id` identifies the matching entry only in the
+                // local in-memory window; the Redis counter is aggregate, so it
+                // is intentionally ignored here.
+                if reservation_backend == ReservationBackend::Local {
+                    // Backend switch: the reservation was charged to the LOCAL
+                    // in-memory window (Redis was down at reserve time) but Redis
+                    // recovered before this reconciliation, so we are now running
+                    // against the centralized counter. The `reserved` was never
+                    // credited to Redis, so applying the relative `delta` here is
+                    // wrong both ways: a negative delta would subtract from an
+                    // unrelated, still-live request's Redis usage (corrupting its
+                    // accounting), and a positive delta would only add
+                    // `actual - reserved`, under-charging the centralized budget
+                    // by the un-credited `reserved`. Charge the FULL actual usage
+                    // to the current window instead; the stale local reservation
+                    // is left to expire from the in-memory window on its own
+                    // schedule. No `reserved_window_index` exists for a
+                    // local-origin reservation, so the current window is correct.
+                    if actual_tokens > 0 {
+                        let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                        let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                        let ttl = self.window_seconds * 2 + 1;
+                        let increment = u64_to_i64_saturating(actual_tokens);
+                        let _ = redis.incrby_with_expire(&redis_key, increment, ttl).await?;
+                    }
+                    // `actual_tokens == 0` (full release of a local reservation)
+                    // is a no-op against Redis — there is nothing on this backend
+                    // to release, and the local reservation expires on its own.
+                    return Ok(RateLimitOutcome::allow());
+                }
+                if delta != 0 {
+                    // Debit the window the reservation actually credited (carried
+                    // back from the `Reserve` outcome) so a request that
+                    // straddles a window rollover corrects the right counter. If
+                    // the reserved window is unknown (e.g. an `Unknown`-origin
+                    // reservation with no markers), fall back to the current
+                    // window — the floor below still prevents a budget-bypass.
+                    let target_idx = reserved_window_index
+                        .unwrap_or_else(|| RedisRateLimitClient::window_index(self.window_seconds));
+                    let redis_key = redis.make_key(&[key, &target_idx.to_string()]);
+                    let ttl = self.window_seconds * 2 + 1;
+                    // Floor the per-window counter at zero. Reconciliation
+                    // deltas are usually negative (reserved ≫ actual; non-2xx
+                    // releases the full reservation); a raw INCRBY could drive
+                    // the counter negative, which later reads as zero usage and
+                    // lets the consumer reserve the full limit again — defeating
+                    // centralized enforcement. Matches the floor-at-zero in the
+                    // local `TokenUsageWindow::adjust_usage` path.
+                    let _ = redis
+                        .incrby_with_expire_floor_zero(&redis_key, delta, ttl)
+                        .await?;
+                }
                 Ok(RateLimitOutcome::allow())
             }
         }
@@ -1473,6 +1848,565 @@ mod tests {
         let mut bucket = TokenBucket::from_window(1, Duration::from_secs(1));
         bucket.consume(2);
         assert_eq!(bucket.remaining(), 0);
+    }
+
+    #[test]
+    fn ai_token_window_over_release_floors_at_zero() {
+        // In-memory equivalent of the Redis reconciliation bypass: a
+        // reconciliation delta more negative than the outstanding usage must
+        // floor the window at zero, not leave it negative. A negative counter
+        // would later read as zero usage and let the consumer reserve the full
+        // limit again, defeating budget enforcement. The Redis path mirrors
+        // this via `RedisRateLimitClient::incrby_with_expire_floor_zero`
+        // (regression for the centralized path requires a live Redis server and
+        // is covered by functional/ignored tests).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        // Reserve 100 tokens, then over-release by reconciling -500 (e.g. a
+        // full reservation release stacked on a low actual count).
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        assert!(reserved.allowed);
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -500,
+            },
+            now,
+        );
+
+        // Usage must be floored at zero, and the full limit must remain
+        // available — never more than the limit (which a negative counter would
+        // wrongly imply by reading as zero usage while extra capacity leaks).
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert!(budget.allowed);
+        assert_eq!(budget.usage, Some(0));
+        assert_eq!(budget.remaining, Some(1000));
+
+        // A fresh full-limit reservation should succeed exactly once and then
+        // deny — proving the counter is at zero, not negative.
+        let full = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 1000 }, now);
+        assert!(full.allowed);
+        let over = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 1 }, now);
+        assert!(!over.allowed);
+    }
+
+    #[test]
+    fn ai_token_window_local_reserve_has_no_redis_window_index() {
+        // codex P2 (reserved-window targeting): `reserved_window_index` is a
+        // Redis-only concept. The local path must leave it `None` (the in-memory
+        // window pins the correction via the matched entry's timestamp), so a
+        // local-mode reservation never carries a stray Redis window index into
+        // reconciliation.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        assert!(reserved.allowed);
+        assert!(
+            reserved.reserved_window_index.is_none(),
+            "local-mode reserve must not carry a Redis window index"
+        );
+        assert!(
+            reserved.reservation_id.is_some(),
+            "local-mode reserve must carry a per-entry reservation id"
+        );
+    }
+
+    #[test]
+    fn ai_token_window_local_adjust_ignores_reserved_window_index() {
+        // A `reserved_window_index` carried on the op (e.g. a request that began
+        // in Redis mode then fell back to local) must be harmlessly ignored by
+        // the local path — accounting stays correct and pinned by reservation id.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 200 }, now);
+        let id = reserved.reservation_id.expect("reserve returns an id");
+
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(id),
+                // A non-None Redis window index must not affect the local path.
+                reserved_window_index: Some(123_456),
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -50,
+            },
+            now,
+        );
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(150),
+            "local adjust must shrink the matched reservation regardless of the Redis window index"
+        );
+    }
+
+    #[test]
+    fn ai_token_window_local_reconcile_of_redis_origin_reservation_charges_full_actual() {
+        // codex P2 (backend switch — Redis recovery/outage between reserve and
+        // reconcile): the original reservation was charged to the centralized
+        // REDIS counter (`reservation_backend == Redis`), but the reconciliation
+        // is now running against the LOCAL window (Redis went down before the
+        // response landed). The `reserved` was never charged to this local
+        // window, so the reconciliation must NOT apply the relative `delta`
+        // (which subtracts that `reserved`) — that would pop tokens off an
+        // unrelated, still-live local reservation and under-count the budget.
+        // Instead it charges the FULL actual usage to the local window as fresh
+        // usage; the stale Redis reservation is left to expire via its TTL.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        // An unrelated, still-live LOCAL reservation for the same key. The
+        // backend-switch reconciliation must leave this completely untouched.
+        let live = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 200 }, now);
+        let live_id = live.reservation_id.expect("local reserve returns an id");
+        assert!(live.allowed);
+
+        // Reconcile a request that reserved 100 tokens ON REDIS and actually used
+        // 40. The relative delta (40 - 100 = -60) is what the SAME-backend path
+        // would apply; it must be IGNORED here. `reservation_id` is `None`
+        // (Redis-origin reservations carry only a window index) and
+        // `reserved_window_index` is `Some` on the wire — neither is consulted on
+        // the switch path.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: Some(7),
+                reservation_backend: ReservationBackend::Redis,
+                actual_tokens: 40,
+                delta: -60,
+            },
+            now,
+        );
+
+        // Local usage must be the live 200 PLUS the full 40 actual charged for
+        // the switched request — never 200 - 60 = 140 (which the corrupting
+        // relative-delta path would produce by stealing from the live entry).
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(240),
+            "backend switch must charge the full actual (40) on top of the live 200, not subtract the stale Redis reserved"
+        );
+
+        // The live reservation is intact and still releasable by its own id.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(live_id),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -200,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(40),
+            "releasing the untouched live reservation leaves only the switched request's 40"
+        );
+    }
+
+    #[test]
+    fn ai_token_window_local_reconcile_of_redis_origin_full_release_is_local_noop() {
+        // The release variant of the backend switch: a Redis-origin reservation
+        // (`reservation_backend == Redis`) reconciled on the LOCAL window with
+        // `actual_tokens == 0` (a non-2xx response or `on_unmetered_response=warn`
+        // released the full reservation). There is nothing of this request's on
+        // the local window, so the reconciliation must be a no-op locally — it
+        // must not subtract the stale Redis `reserved` from an unrelated live
+        // local reservation.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let live = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 150 }, now);
+        assert!(live.allowed);
+
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: Some(3),
+                reservation_backend: ReservationBackend::Redis,
+                actual_tokens: 0,
+                // Full release of a 120-token Redis reservation (0 - 120).
+                delta: -120,
+            },
+            now,
+        );
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(150),
+            "a full-release reconciliation for a Redis-origin reservation must not touch local usage"
+        );
+    }
+
+    // The mirror direction — a LOCAL-origin reservation reconciled on the REDIS
+    // counter after Redis recovered (`check_redis` AdjustUsage arm with
+    // `reservation_backend == Local`) — charges the full actual to the current
+    // Redis window and never subtracts the un-credited local `reserved`. It is
+    // exercised against a live Redis server in the functional/ignored suite,
+    // matching the existing centralized floor-at-zero coverage note above; the
+    // in-memory half of the same invariant is asserted by the two tests above.
+
+    #[test]
+    fn ai_token_window_reserve_allows_then_denies_at_limit() {
+        // The `Reserve` op pre-charges the estimate against the window. A
+        // reservation that fits returns `allow` with the reserved usage folded
+        // into `usage`/`remaining`; the next reservation that would cross the
+        // limit must `deny` WITHOUT charging (usage/remaining unchanged from the
+        // pre-deny state) so the window is not corrupted by rejected attempts.
+        let algorithm = AiTokenRateAlgorithm::new(100, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let first = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 60 }, now);
+        assert!(first.allowed);
+        assert_eq!(first.limit, Some(100));
+        assert_eq!(first.window_seconds, Some(60));
+        assert_eq!(first.usage, Some(60));
+        assert_eq!(first.remaining, Some(40));
+
+        // 60 + 60 = 120 > 100 → deny. The deny outcome reports usage as the
+        // already-committed 60 (the new reservation is rejected, not applied).
+        let denied = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 60 }, now);
+        assert!(!denied.allowed);
+        assert_eq!(denied.usage, Some(60));
+        assert_eq!(denied.remaining, Some(40));
+
+        // The rejected reservation must not have been charged: a follow-up
+        // CheckBudget still shows only the committed 60.
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert!(budget.allowed);
+        assert_eq!(budget.usage, Some(60));
+        assert_eq!(budget.remaining, Some(40));
+
+        // A reservation that exactly fits the headroom is allowed.
+        let exact = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 40 }, now);
+        assert!(exact.allowed);
+        assert_eq!(exact.usage, Some(100));
+        assert_eq!(exact.remaining, Some(0));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_positive_delta_charges_more() {
+        // Reconciliation with a positive delta (actual > reserved) must add the
+        // shortfall to the window — exercising the `delta > 0` branch of
+        // `adjust_usage`.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        assert!(reserved.allowed);
+
+        // Actual usage came in 50 higher than the reservation.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 50,
+                delta: 50,
+            },
+            now,
+        );
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(150));
+        assert_eq!(budget.remaining, Some(850));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_zero_delta_is_noop() {
+        // A zero delta must leave the committed usage untouched (the
+        // `delta == 0` early-return branch of `adjust_usage`).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 200 }, now)
+                .allowed
+        );
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: 0,
+            },
+            now,
+        );
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(200));
+        assert_eq!(budget.remaining, Some(800));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_partial_release_trims_last_entry() {
+        // A negative delta smaller than the most-recent entry must trim that
+        // entry in place rather than popping it — exercising the
+        // `*tokens > remaining_release` branch of `adjust_usage` (distinct from
+        // the over-release floor and full-entry pop paths).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        // Two separate reservations create two entries in the window.
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 70 }, now)
+                .allowed
+        );
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 80 }, now)
+                .allowed
+        );
+
+        // Release 30 < 80 (the last entry): only the last entry shrinks.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -30,
+            },
+            now,
+        );
+
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(120));
+        assert_eq!(budget.remaining, Some(880));
+
+        // Releasing exactly the remainder of the last entry pops it, then trims
+        // into the first — drives both the pop and the trim branches in one go.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -60,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(budget.usage, Some(60));
+        assert_eq!(budget.remaining, Some(940));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_releases_matching_reservation() {
+        // codex P2: a negative reconciliation carrying a reservation id must
+        // release THAT reservation, not whichever entry is newest. Reproduce
+        // out-of-order completion: reserve A (older) then B (newer), then
+        // reconcile A's reservation downward; B's entry must be untouched.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let a = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        let b = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 300 }, now);
+        let id_a = a.reservation_id.expect("reserve returns an id");
+        let id_b = b.reservation_id.expect("reserve returns an id");
+        assert_ne!(id_a, id_b, "each reservation gets a distinct id");
+
+        // A's actual usage was 40 (delta = 40 - 100 = -60). Reconcile A.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(id_a),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -60,
+            },
+            now,
+        );
+
+        // Total must be A(40) + B(300) = 340 — B's reservation is intact.
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(340),
+            "reconciling A must shrink A to 40 and leave B's 300 untouched"
+        );
+
+        // Now fully release B by its id (delta = 0 - 300). A must remain at 40.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(id_b),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -300,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(40),
+            "releasing B by id removes only B; A's 40 survives"
+        );
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_unknown_reservation_id_negative_delta_is_noop() {
+        // codex P1: a negative reconciliation whose reservation id no longer
+        // matches a live entry (the reservation already aged out of the window,
+        // or was already released by a non-2xx response and a later final-body
+        // rejection re-runs reconciliation) must be a NO-OP. It must NOT fall
+        // back to back-of-queue release, which would steal tokens from a
+        // different, still-live reservation for the same key and under-count the
+        // budget.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        // A genuine, still-live reservation for the same key.
+        let live = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 200 }, now);
+        let live_id = live.reservation_id.expect("reserve returns an id");
+        assert!(live.allowed);
+
+        // Id 99_999 was never handed out (or already expired). A negative delta
+        // must leave the live 200 untouched.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(99_999),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -50,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(200),
+            "an unknown reservation id with a negative delta must NOT release another reservation's usage"
+        );
+
+        // The live reservation can still be released by its own id afterwards.
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(live_id),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -200,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(0),
+            "releasing the live reservation by its own id still works"
+        );
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_unknown_reservation_id_positive_delta_records_extra() {
+        // A positive reconciliation whose reservation id has expired still
+        // represents genuine extra usage above the (now-gone) reservation, so it
+        // is recorded as fresh usage — never under-counting. This keeps the
+        // budget conservative even when actual usage lands after the window
+        // dropped the reservation.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let live = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        assert!(live.allowed);
+
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(99_999),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 30,
+                delta: 30,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(130),
+            "a positive delta for an expired reservation is recorded as extra usage"
+        );
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_anonymous_negative_delta_releases_from_back() {
+        // The anonymous path (reservation_id = None) retains the legacy
+        // back-of-queue release used by callers without per-entry identity
+        // (e.g. the Redis fallback or positive reconciliations with no target).
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        assert!(
+            algorithm
+                .check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 200 }, now)
+                .allowed
+        );
+
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: None,
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 0,
+                delta: -50,
+            },
+            now,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, now);
+        assert_eq!(
+            budget.usage,
+            Some(150),
+            "anonymous negative delta trims the back entry by 50"
+        );
     }
 
     #[tokio::test]

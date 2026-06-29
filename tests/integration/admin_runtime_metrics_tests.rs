@@ -146,7 +146,14 @@ async fn start_test_admin(state: AdminState) -> (String, tokio::sync::watch::Sen
     let state_clone = state.clone();
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
-        let _ = serve_admin_on_listener(listener, state_clone, shutdown_rx_clone, None).await;
+        let _ = serve_admin_on_listener(
+            listener,
+            state_clone,
+            shutdown_rx_clone,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
     });
 
     wait_for_admin_ready(actual_addr).await;

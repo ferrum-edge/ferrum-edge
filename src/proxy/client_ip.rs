@@ -105,6 +105,19 @@ impl TrustedProxies {
     pub fn contains(&self, ip: &IpAddr) -> bool {
         self.cidrs.contains(ip)
     }
+
+    /// Whether a comma-separated CIDR/IP list permits **every** source address
+    /// of some family — a literal `/0` or a union spanning the whole family
+    /// (e.g. `0.0.0.0/1,128.0.0.0/1`). Such an allowlist makes the XFF
+    /// trusted-proxy filter match every source, so it provides no real
+    /// restriction. Delegates to the shared `CidrSet` so the canonicalization
+    /// matches the runtime filter; side-effect free, safe for config
+    /// classification at startup.
+    pub fn cidr_list_permits_all(raw: &str) -> bool {
+        crate::util::cidr::CidrSet::parse_lenient(raw)
+            .0
+            .permits_all_family()
+    }
 }
 
 /// Resolve the real client IP from the request context.
