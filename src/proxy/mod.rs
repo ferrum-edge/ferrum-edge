@@ -18393,7 +18393,7 @@ fn buffered_backend_response_from_body_read(
 /// otherwise be dialed. Returns the denial reason when `host` is a literal IP
 /// blocked by the policy; `None` for hostnames (screened by the resolver) and
 /// allowed IPs.
-fn denied_literal_backend_ip(
+pub(crate) fn denied_literal_backend_ip(
     host: &str,
     policy: &crate::config::BackendEgressPolicy,
 ) -> Option<&'static str> {
@@ -22396,8 +22396,15 @@ async fn proxy_to_backend_http3(
                             // ANDing the class here would silently skip
                             // `retry_on_connect_failure` for those cases.
                             // Trust the pool's typed signal.
-                            let is_conn_error = !e.request_on_wire();
                             let (error_kind, error_class) = classify_h3_pool_error(&e);
+                            // A gateway-side egress denial (DispatchPolicyRejected)
+                            // dialed no backend — override the pre-wire signal to
+                            // keep it non-retryable + backend-health-neutral.
+                            let is_conn_error = !e.request_on_wire()
+                                && !matches!(
+                                    error_class,
+                                    retry::ErrorClass::DispatchPolicyRejected
+                                );
                             record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
@@ -22612,8 +22619,14 @@ async fn proxy_to_backend_http3(
                 // Trust the pool's body-on-wire signal — see the
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
-                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                // A gateway-side egress denial (DispatchPolicyRejected) dialed no
+                // backend, so override the pool's pre-wire signal to keep it
+                // non-retryable + backend-health-neutral. This is the ONE class
+                // safe to AND with the typed `request_on_wire` signal — it is a
+                // gateway rejection, not a transport class that could disagree.
+                let is_conn_error = !e.request_on_wire()
+                    && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
@@ -22736,8 +22749,14 @@ async fn proxy_to_backend_http3(
                 }
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
-                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                // A gateway-side egress denial (DispatchPolicyRejected) dialed no
+                // backend, so override the pool's pre-wire signal to keep it
+                // non-retryable + backend-health-neutral. This is the ONE class
+                // safe to AND with the typed `request_on_wire` signal — it is a
+                // gateway rejection, not a transport class that could disagree.
+                let is_conn_error = !e.request_on_wire()
+                    && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
@@ -23002,6 +23021,16 @@ pub(crate) fn record_port_exhaustion_if_class(
 fn classify_h3_pool_error(
     e: &crate::http3::client::H3PoolError,
 ) -> (&'static str, retry::ErrorClass) {
+    // A DnsCacheResolver egress-policy denial (hostname resolving/rebinding to a
+    // blocked IP) surfaces in the pool error message as "...denied by backend
+    // egress policy...". Classify it as the non-retryable, health-neutral
+    // DispatchPolicyRejected — the dispatch sites pair this with a
+    // `request_on_wire`-based `is_conn_error` override so it is neither retried
+    // nor charged to backend health (no backend was dialed).
+    if format!("{e:?}").contains("egress policy") {
+        let class = retry::ErrorClass::DispatchPolicyRejected;
+        return (retry::error_class_log_kind(class), class);
+    }
     if e.is_graceful_close() {
         let class = retry::ErrorClass::GracefulRemoteClose;
         return (retry::error_class_log_kind(class), class);
@@ -23248,8 +23277,14 @@ async fn proxy_to_backend_http3_retry(
                     );
                     return h3_read_timeout_backend_response(resolved_ip);
                 }
-                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                // A gateway-side egress denial (DispatchPolicyRejected) dialed no
+                // backend, so override the pool's pre-wire signal to keep it
+                // non-retryable + backend-health-neutral. This is the ONE class
+                // safe to AND with the typed `request_on_wire` signal — it is a
+                // gateway rejection, not a transport class that could disagree.
+                let is_conn_error = !e.request_on_wire()
+                    && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,

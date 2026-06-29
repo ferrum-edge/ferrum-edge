@@ -1210,7 +1210,14 @@ async fn grpc_probe(
     } else if use_tls {
         // SNI / cert hostname stays the original `host` even though we dial the
         // pre-screened IP via `dial_addr`, so backend cert validation is unchanged.
-        let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(host);
+        // rustls/tonic want a BARE SNI host, not a URI-bracketed IPv6 literal
+        // (`[fd00::1]`), so strip brackets here — the `origin`/authority above
+        // keeps the bracketed form because a URI authority requires it.
+        let sni_host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(sni_host);
 
         // Load CA certs (upstream → global → system roots)
         if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {

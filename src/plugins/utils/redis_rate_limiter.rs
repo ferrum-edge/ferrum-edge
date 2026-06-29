@@ -419,15 +419,31 @@ impl RedisRateLimitClient {
     /// Resolve the Redis hostname via the gateway's DNS cache and build the
     /// connection URL with the resolved IP (for non-TLS) or the original
     /// hostname (for TLS, to preserve SNI).
-    async fn resolve_url(&self) -> String {
+    /// Resolve the Redis endpoint URL through the DNS cache, returning `None`
+    /// when the host is blocked by the backend egress policy so the caller fails
+    /// CLOSED (in-memory limiter) instead of dialing a denied address. A generic
+    /// DNS failure still falls back to the hostname (the existing behavior).
+    async fn resolve_url(&self) -> Option<String> {
         if let Some(ref dns_cache) = self.dns_cache
             && let Some(hostname) = self.config.hostname()
         {
             match dns_cache.resolve(&hostname, None, None).await {
                 Ok(ip) => {
-                    return self.config.url_with_resolved_ip(ip);
+                    return Some(self.config.url_with_resolved_ip(ip));
                 }
                 Err(e) => {
+                    // Fail CLOSED on a backend-egress-policy denial: do NOT fall
+                    // back to dialing the hostname (which would let a rebound host
+                    // reach a denied address). The caller treats `None` as
+                    // unavailable and uses the in-memory limiter.
+                    if crate::dns::is_egress_policy_denial(&e) {
+                        warn!(
+                            hostname = %hostname,
+                            error = %e,
+                            "Redis host blocked by backend egress policy — failing closed (in-memory fallback)"
+                        );
+                        return None;
+                    }
                     warn!(
                         hostname = %hostname,
                         error = %e,
@@ -436,7 +452,7 @@ impl RedisRateLimitClient {
                 }
             }
         }
-        self.config.effective_url()
+        Some(self.config.effective_url())
     }
 
     /// Build a Redis client with proper TLS configuration.
@@ -524,7 +540,13 @@ impl RedisRateLimitClient {
         }
         drop(guard);
 
-        let url = self.resolve_url().await;
+        let Some(url) = self.resolve_url().await else {
+            // Egress policy blocked the Redis host: fail closed to the in-memory
+            // limiter rather than dialing a denied address.
+            self.mark_unavailable();
+            self.start_health_checker_if_needed();
+            return None;
+        };
         let client = match self.build_client(&url) {
             Ok(c) => c,
             Err(e) => {
@@ -584,7 +606,13 @@ impl RedisRateLimitClient {
     /// because another command sequence on that same manager can interleave `UNWATCH` or
     /// `EXEC` and break the optimistic transaction boundary.
     async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
-        let url = self.resolve_url().await;
+        let Some(url) = self.resolve_url().await else {
+            // Egress policy blocked the Redis host: fail closed to the in-memory
+            // limiter rather than dialing a denied address.
+            self.mark_unavailable();
+            self.start_health_checker_if_needed();
+            return None;
+        };
         let client = match self.build_client(&url) {
             Ok(client) => client,
             Err(e) => {

@@ -3339,6 +3339,12 @@ pub fn validate_plugin_config_with_policy(
             {
                 return Err(errs.join("; "));
             }
+            // Redis-backed plugins (rate_limit / request_deduplication /
+            // ai_semantic_cache with sync_mode=redis) build their client from
+            // `redis_url` WITHOUT the egress policy, and the client skips literals
+            // / falls back to the hostname on a DNS denial — so a denied literal
+            // endpoint must be rejected here at config-load.
+            screen_redis_endpoint_egress(config, backend_allow_ips)?;
             Ok(())
         }
         None => Err(format!("Unknown plugin name '{}'", name)),
@@ -3349,6 +3355,40 @@ pub fn validate_plugin_config_with_policy(
 /// literal IPs against the backend egress policy. A route override can point a
 /// matched request at an arbitrary backend, so a denied address (e.g.
 /// `169.254.169.254`) must be rejected at config-admission time — not only in
+/// Screen a Redis-backed plugin's `redis_url` literal-IP host against the egress
+/// policy at config-load. Redis-backed plugins (`rate_limit`,
+/// `request_deduplication`, `ai_semantic_cache` with `sync_mode=redis`) build
+/// their client from `redis_url` WITHOUT the policy, and the client skips IP
+/// literals / falls back to the hostname on a DNS denial — so a denied literal
+/// endpoint (`redis://169.254.169.254:6379`) would otherwise be dialed. No-op
+/// when there is no `redis_url`, it's a hostname (screened at resolve), or it
+/// doesn't parse (shape errors are surfaced by the constructor).
+fn screen_redis_endpoint_egress(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    let Some(redis_url) = config.get("redis_url").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Ok(parsed) = url::Url::parse(redis_url) else {
+        return Ok(());
+    };
+    if let Some(host) = parsed.host_str() {
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>()
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            return Err(format!(
+                "redis_url IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// whole-config validation but on direct/batch admin plugin writes too.
 /// Returns prefix-free messages; no-op for configs that don't parse as
 /// mesh_route_dispatch (shape errors are surfaced by the constructor).

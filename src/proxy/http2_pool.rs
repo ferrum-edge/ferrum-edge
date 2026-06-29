@@ -863,6 +863,17 @@ fn thread_id_mix() -> u64 {
 pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
 
+    // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
+    // rebinds — to a blocked IP) surfaces here inside a `BackendUnavailable`
+    // whose message carries "...denied by backend egress policy...". Classify it
+    // as the non-retryable, backend-health-neutral DispatchPolicyRejected BEFORE
+    // the `Dns` marker below maps it to DnsLookupError (retryable,
+    // connection_error=true), which would retry it and charge passive health /
+    // adaptive concurrency even though no backend was dialed.
+    if format!("{err:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     // 0. `BackendSelectedHttp1` is an intentional signal to the dispatcher
     //    — the backend negotiated h1.1 via ALPN and the caller should route
     //    via reqwest. Classify as ProtocolError so operators see this in

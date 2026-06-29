@@ -2059,6 +2059,43 @@ async fn handle_h3_request(
         .as_ref()
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+
+    // Enforce the backend egress policy for a literal-IP H3 backend BEFORE any
+    // dispatch. This sits ahead of the native-H3 / cross-protocol branch, both
+    // of which skip the DnsCacheResolver for an IP literal — so without it an H3
+    // client could still dial a denied literal (e.g. a DB row load only warned
+    // about) that H1/H2 clients are already blocked from. Hostname backends are
+    // screened by the resolver at dial time on every H3 dispatch path.
+    if let Some(reason) =
+        crate::proxy::denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP H3 backend; not dialing"
+        );
+        // Release any HALF_OPEN probe slot the circuit-breaker check above
+        // admitted so the breaker doesn't wedge (mirrors the WS-origin reject).
+        crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        record_request(&state, 502);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"backend address blocked by egress policy"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+            "backend address blocked by egress policy",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let backend_resolved_ip = state
         .dns_cache
         .resolve(
