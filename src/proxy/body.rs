@@ -2580,6 +2580,7 @@ pub(crate) fn coalescing_h3_body(
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     let source = H3FrameSource::new(recv_stream, method, status, content_length);
     let buffer_capacity = coalesce_max_bytes.clamp(
@@ -2595,7 +2596,11 @@ pub(crate) fn coalescing_h3_body(
         content_length,
         Some(flush_interval),
     );
-    ProxyBody::streaming(Box::pin(body))
+    if read_timeout_ms > 0 {
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
+    } else {
+        ProxyBody::streaming(Box::pin(body))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2608,6 +2613,7 @@ pub(crate) fn size_limited_streaming_h3_body(
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     let source = H3FrameSource::new(recv_stream, method, status, content_length);
     let limited = SizeLimitedFrameSource::new(source, max_bytes);
@@ -2624,7 +2630,11 @@ pub(crate) fn size_limited_streaming_h3_body(
         content_length,
         Some(flush_interval),
     );
-    ProxyBody::streaming(Box::pin(body))
+    if read_timeout_ms > 0 {
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
+    } else {
+        ProxyBody::streaming(Box::pin(body))
+    }
 }
 
 pub(crate) fn direct_streaming_h3_body(
@@ -2632,12 +2642,17 @@ pub(crate) fn direct_streaming_h3_body(
     method: Arc<str>,
     status: u16,
     content_length: Option<u64>,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     let body = DirectH3Body {
         source: H3FrameSource::new(recv_stream, method, status, content_length),
         content_length,
     };
-    ProxyBody::streaming(Box::pin(body))
+    if read_timeout_ms > 0 {
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
+    } else {
+        ProxyBody::streaming(Box::pin(body))
+    }
 }
 
 #[cfg(test)]

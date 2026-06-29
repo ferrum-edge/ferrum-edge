@@ -15819,31 +15819,38 @@ async fn handle_proxy_request_inner(
     // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
     // without being polled, so deferring it would be misread as a client
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
-    let streaming_h2_body_ended = match &response_body {
+    let streaming_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
+        // Native H3 exposes a recv stream rather than a `Body` at this point,
+        // so rely on `streaming_dispatch_should_defer`'s HEAD/no-body/status
+        // gates for eager outcomes. Empty H3 bodies that still go through the
+        // streaming body complete on the first poll and record success there.
+        ResponseBody::StreamingH3(_) => false,
         _ => false,
     };
-    let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
-        && streaming_dispatch_should_defer(
+    let defer_streaming_dispatch = matches!(
+        &response_body,
+        ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+    ) && streaming_dispatch_should_defer(
+        &proxy,
+        response_status,
+        streaming_body_ended,
+        // HEAD responses suppress the body, so a deferred outcome would be
+        // misread as a client disconnect (#1649 R7 finding 1).
+        method.eq_ignore_ascii_case("HEAD"),
+        streaming_response_status_is_passively_unhealthy(
+            &epoch.load_balancer,
             &proxy,
+            upstream_target.as_deref(),
             response_status,
-            streaming_h2_body_ended,
-            // HEAD responses suppress the body, so a deferred outcome would be
-            // misread as a client disconnect (#1649 R7 finding 1).
-            method.eq_ignore_ascii_case("HEAD"),
-            streaming_response_status_is_passively_unhealthy(
-                &epoch.load_balancer,
-                &proxy,
-                upstream_target.as_deref(),
-                response_status,
-            ),
-        );
+        ),
+    );
     // TTFB captured at header arrival; reused whether the deferred outcome is
     // recorded synchronously (an after_proxy reject replaced the streaming body)
     // or at body completion, matching the synchronous path's
     // `backend_start.elapsed()` least-latency sample.
-    let streaming_h2_dispatch_elapsed = backend_start.elapsed();
-    if defer_streaming_h2_dispatch {
+    let streaming_dispatch_elapsed = backend_start.elapsed();
+    if defer_streaming_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
         // completion as a non-probe. Gated by `!skip_final_cb_record` because a
@@ -15950,7 +15957,12 @@ async fn handle_proxy_request_inner(
     // outcome. Record it synchronously now, using the BACKEND's captured
     // status/error (NOT the plugin reject's, which says nothing about backend
     // health) and as a non-probe (the slot was released at header time).
-    if defer_streaming_h2_dispatch && !matches!(&response_body, ResponseBody::StreamingH2(_)) {
+    if defer_streaming_dispatch
+        && !matches!(
+            &response_body,
+            ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
+        )
+    {
         // #1649 R5 finding 3: the after_proxy hook may have run long enough for the
         // breaker to open a new cycle. Skip the CB record if this header-time
         // outcome is stale for the current generation (parity with the
@@ -15974,7 +15986,7 @@ async fn handle_proxy_request_inner(
             backend_admission_error_class,
             false,
             skip_final_cb_record || cb_stale,
-            streaming_h2_dispatch_elapsed,
+            streaming_dispatch_elapsed,
         );
     }
 
@@ -16558,7 +16570,7 @@ async fn handle_proxy_request_inner(
             // `record_deferred_backend_dispatch` derives the post-wire
             // `connection_error` from the terminal body error class, so pass
             // `connection_error = false` / `error_class = None` here.
-            if defer_streaming_h2_dispatch {
+            if defer_streaming_dispatch {
                 body = body
                     .with_deferred_backend_dispatch_outcome(
                         Arc::clone(&state),
@@ -16572,7 +16584,7 @@ async fn handle_proxy_request_inner(
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_h2_dispatch_elapsed,
+                        streaming_dispatch_elapsed,
                     )
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
@@ -16602,6 +16614,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -16613,6 +16626,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -16623,6 +16637,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -16632,6 +16647,28 @@ async fn handle_proxy_request_inner(
                     backend_admission_response_status,
                     backend_admission_elapsed,
                 );
+            }
+            // Native-H3 streaming responses can fail after headers (read timeout,
+            // reset, or close) just like the direct-H2 path. Defer CB / passive
+            // health / least-latency accounting until body completion so a
+            // 2xx/206-then-stall does not bank a header-time success.
+            if defer_streaming_dispatch {
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::clone(&state),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        upstream_target.clone(),
+                        final_cb_target_key.clone(),
+                        backend_admission_response_status,
+                        false,
+                        None,
+                        false,
+                        skip_final_cb_record,
+                        streaming_dispatch_elapsed,
+                    )
+                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
             }
             body
         }
@@ -22026,16 +22063,13 @@ async fn proxy_to_backend_http3(
 /// H1 (chunked trailers) and H2 (trailers frame) downstream clients receive
 /// them.
 ///
-/// KNOWN LIMITATION (pre-existing, shared with every native-H3 streaming
-/// response): unlike the `StreamingH2` arm, the downstream `StreamingH3` body
-/// builders do NOT yet apply the per-frame `backend_read_timeout_ms` idle
-/// regime, and the dispatch site does NOT defer the CB / passive-health
-/// outcome to body completion. So a 2xx/206 H3 response that stalls or resets
-/// AFTER headers banks a header-time success and relies on the QUIC idle
-/// timeout rather than a 504. This downgrade widens the set of responses on
-/// that streaming path (a `compression`-released `206`/SSE used to take the
-/// buffered drain's 504 + failure accounting); bringing the H3 streaming path
-/// to `StreamingH2` parity is tracked in issue #1901.
+/// Native-H3 streaming responses use the same per-frame
+/// `backend_read_timeout_ms` idle regime and deferred CB / passive-health
+/// accounting as direct-H2 streaming responses. That keeps
+/// buffer-to-stream-downgraded H3 responses (for example
+/// `compression`-released `206`/SSE responses) from banking a header-time
+/// success or waiting for the QUIC idle timeout when the backend stalls after
+/// headers.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
