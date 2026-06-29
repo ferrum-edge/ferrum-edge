@@ -15829,10 +15829,16 @@ async fn handle_proxy_request_inner(
         // path instead of the backend success. Treat it eagerly, mirroring the
         // H2 `is_end_stream` case (#1940 review). HEAD / 204 / 304 stay covered
         // by `streaming_dispatch_should_defer`'s own gates.
-        ResponseBody::StreamingH3(resp) => {
+        //
+        // Read the content-length from `response_headers`, NOT the
+        // `H3StreamingResponse.headers` inside the variant: `proxy_to_backend`
+        // already `std::mem::take`s the H3 headers into `backend_resp.headers`
+        // (→ `response_headers`) before this point, so the variant's own map is
+        // empty here (this is the same map the H3 body builder reads its `cl`
+        // from below).
+        ResponseBody::StreamingH3(_) => {
             response_is_no_body_status(response_status)
-                || resp
-                    .headers
+                || response_headers
                     .get("content-length")
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     == Some(0)

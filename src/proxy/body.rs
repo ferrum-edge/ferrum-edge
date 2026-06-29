@@ -1668,35 +1668,24 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                     }
                 }
                 H3FrameSourceState::Trailers => {
-                    // Bound the optional trailer read and collapse a timeout
-                    // into a clean EOS (no trailers) rather than erroring an
-                    // already-complete response — mirroring the buffered drain's
-                    // `read_h3_trailers_with_timeout`. The DATA body already
-                    // finished (a clean FIN took us into this state), so a
-                    // missing/slow trailer frame must NOT fail it or trip
-                    // CB/passive-health. Bounding at the source here is safe even
-                    // though the DATA-phase idle timeout lives on the outer
-                    // `IdleReadTimeoutBody`: with the body complete nothing is
-                    // buffered for a slow downstream client, so the only wait is
-                    // genuinely the backend's trailer frame (no slow-client
+                    // Poll the optional trailer frame FIRST; only when it is
+                    // still pending do we consult a trailer-read deadline that
+                    // collapses to a clean EOS (no trailers) instead of erroring
+                    // an already-complete response — mirroring the buffered
+                    // drain's `read_h3_trailers_with_timeout`. Polling first
+                    // guarantees a trailer frame that has ALREADY arrived (but is
+                    // only polled after the deadline would elapse, e.g. because
+                    // downstream backpressure delayed this final poll) is still
+                    // delivered rather than dropped.
+                    //
+                    // The DATA body already finished (a clean FIN took us into
+                    // this state), so a missing/slow trailer frame must NOT fail
+                    // it or trip CB/passive-health. Bounding at the source here is
+                    // safe even though the DATA-phase idle timeout lives on the
+                    // outer `IdleReadTimeoutBody`: with the body complete nothing
+                    // is buffered for a slow downstream client, so the only wait
+                    // is genuinely the backend's trailer frame (no slow-client
                     // false positive). `read_timeout_ms == 0` keeps it unbounded.
-                    if this.read_timeout_ms > 0 {
-                        let timeout_ms = this.read_timeout_ms;
-                        let deadline = this.trailer_deadline.get_or_insert_with(|| {
-                            Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
-                                timeout_ms,
-                            )))
-                        });
-                        if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-                            this.state = H3FrameSourceState::Done;
-                            tracing::debug!(
-                                timeout_ms,
-                                "H3 streaming recv_trailers timed out after complete body; \
-                                 forwarding response without trailers"
-                            );
-                            return Poll::Ready(None);
-                        }
-                    }
                     match Pin::new(&mut this.recv_stream).poll_recv_trailers_map(cx) {
                         Poll::Ready(Ok(Some(mut trailers))) => {
                             this.state = H3FrameSourceState::Done;
@@ -1713,7 +1702,27 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             this.state = H3FrameSourceState::Done;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            if this.read_timeout_ms == 0 {
+                                return Poll::Pending;
+                            }
+                            let timeout_ms = this.read_timeout_ms;
+                            let deadline = this.trailer_deadline.get_or_insert_with(|| {
+                                Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
+                                    timeout_ms,
+                                )))
+                            });
+                            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                                this.state = H3FrameSourceState::Done;
+                                tracing::debug!(
+                                    timeout_ms,
+                                    "H3 streaming recv_trailers timed out after complete body; \
+                                     forwarding response without trailers"
+                                );
+                                return Poll::Ready(None);
+                            }
+                            return Poll::Pending;
+                        }
                     }
                 }
                 H3FrameSourceState::Done => return Poll::Ready(None),
@@ -2098,16 +2107,16 @@ where
     // stall elapse a deadline armed during an earlier backend-pending — a false
     // positive the outermost placement avoids.
     //
-    // One bounded residual window remains for the H3 coalescer, which carries a
+    // One window would otherwise remain for the H3 coalescer, which carries a
     // `flush_after` timer (the reqwest/H2 coalescers use `Coalescing::new`, no
     // flush, and flush a buffered frame immediately on backend-`Pending`): while
     // the H3 coalescer holds a sub-target frame waiting on that flush timer AND
     // the backend is itself pending, it returns `Pending`, so this wrapper arms
-    // the deadline. That window is capped by the flush interval
-    // (`FERRUM_HTTP3_FLUSH_INTERVAL_MICROS`, microseconds) and the next flush
-    // delivers a frame that resets `waiting`, so it can only fire spuriously if
-    // `backend_read_timeout_ms` is configured BELOW the flush interval — a
-    // self-contradictory configuration. A boxed `dyn Error` does not implement
+    // the deadline. To keep that flush wait from being misread as a backend-read
+    // timeout, the H3 builders clamp the effective flush interval to half the
+    // read timeout via `h3_effective_flush_interval`, so a buffered frame always
+    // flushes (resetting `waiting`) before the deadline can fire. A boxed
+    // `dyn Error` does not implement
     // `Error`, but that no longer matters: the wrapper is no longer a
     // `FrameSource` inner, so it needs no concrete error type. The timeout is
     // emitted as a boxed `io::Error` of kind `TimedOut`, which
@@ -2633,6 +2642,25 @@ where
     }
 }
 
+/// Clamp the H3 coalescer flush interval so a buffered sub-target frame always
+/// flushes BEFORE the outer [`IdleReadTimeoutBody`] read deadline could fire.
+///
+/// `Coalescing` (with `flush_after`) returns `Pending` while holding a sub-target
+/// frame awaiting its flush timer; the outer idle timer treats that as a
+/// backend-read wait. With `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` configured
+/// at/above `backend_read_timeout_ms`, the deadline could fire before the flush
+/// timer releases an already-ready frame, aborting the response as a backend
+/// read timeout even though a frame was ready to send (#1940 review). Capping the
+/// flush at half the read timeout guarantees the flush wins. `read_timeout_ms == 0`
+/// (unbounded) keeps the configured interval; sane configs (e.g. a 2 ms flush vs
+/// a 30 s timeout) are unaffected.
+fn h3_effective_flush_interval(flush_interval: Duration, read_timeout_ms: u64) -> Duration {
+    if read_timeout_ms == 0 {
+        return flush_interval;
+    }
+    flush_interval.min(Duration::from_millis(read_timeout_ms) / 2)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
@@ -2656,7 +2684,7 @@ pub(crate) fn coalescing_h3_body(
         target_bytes,
         buffer_capacity,
         content_length,
-        Some(flush_interval),
+        Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
     if read_timeout_ms > 0 {
         ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
@@ -2690,7 +2718,7 @@ pub(crate) fn size_limited_streaming_h3_body(
         target_bytes,
         buffer_capacity,
         content_length,
-        Some(flush_interval),
+        Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
     if read_timeout_ms > 0 {
         ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(body, read_timeout_ms)))
@@ -3361,8 +3389,17 @@ mod tests {
                     MockH3DataStep::Data(Bytes::from("body")),
                     MockH3DataStep::End,
                 ],
-                // Trailers never arrive.
-                vec![MockH3TrailerStep::Pending],
+                // Trailers stay pending across every poll, so the deadline — not
+                // mock-step exhaustion — is what collapses the stream. (The arm
+                // polls trailers FIRST and only consults the deadline on a
+                // Pending result, so a single step would let the End default
+                // collapse it instead of the timeout.) The test polls trailers
+                // twice; three pending steps leaves margin.
+                vec![
+                    MockH3TrailerStep::Pending,
+                    MockH3TrailerStep::Pending,
+                    MockH3TrailerStep::Pending,
+                ],
             ),
             Arc::from("GET"),
             200,
@@ -3410,6 +3447,50 @@ mod tests {
         assert!(matches!(poll_source(&mut source), Poll::Pending));
         assert!(source.trailer_deadline.is_none());
         assert!(!source.is_done());
+    }
+
+    #[tokio::test]
+    async fn h3_frame_source_delivers_trailers_that_arrive_after_deadline() {
+        // Codex #1940 review: the arm polls `recv_trailers` BEFORE consulting the
+        // deadline, so a trailer frame that has already arrived is delivered even
+        // when the read deadline has since elapsed (e.g. downstream backpressure
+        // delayed this poll). It must NOT be dropped/collapsed to EOS.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-trace", "abc".parse().unwrap());
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![MockH3DataStep::End],
+                // First poll pending (arms the 1ms deadline), then the trailers
+                // become available after the deadline has elapsed.
+                vec![
+                    MockH3TrailerStep::Pending,
+                    MockH3TrailerStep::Trailers(trailers),
+                ],
+            ),
+            Arc::from("GET"),
+            200,
+            Some(0),
+            1, // 1ms trailer-read timeout
+        );
+
+        // recv_data End → Trailers → recv_trailers Pending; arms the deadline.
+        assert!(matches!(poll_source(&mut source), Poll::Pending));
+        assert!(source.trailer_deadline.is_some());
+
+        // Elapse well past the 1ms deadline before the next poll.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The now-available trailer frame is delivered, NOT collapsed to EOS.
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let t = frame
+                    .trailers_ref()
+                    .expect("an arrived trailer must be delivered despite the elapsed deadline");
+                assert_eq!(t.get("x-trace").unwrap(), "abc");
+            }
+            other => panic!("expected trailer frame, got {other:?}"),
+        }
+        assert!(source.is_done());
     }
 
     // ── StripHopByHopTrailers ───────────────────────────────────────────────
