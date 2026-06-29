@@ -1799,7 +1799,12 @@ fn http2_pool_sender_error_response(
         status_code: 502,
         body: ResponseBody::Buffered(error_body.into_bytes()),
         headers: HashMap::new(),
-        connection_error: true,
+        // Derive connection_error from the class so a gateway-side egress denial
+        // (DispatchPolicyRejected — a hostname/dns_override that resolves or
+        // rebinds to a blocked IP) is non-retryable and neutral to backend
+        // health: request_reached_wire(DispatchPolicyRejected) is true, so this
+        // is false (no backend was dialed) instead of a hard-coded connect error.
+        connection_error: !retry::request_reached_wire(h2_error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(h2_error_class),
     }
@@ -14438,7 +14443,11 @@ async fn handle_proxy_request_inner(
                 // previously here let post-wire errors bypass
                 // `retry_on_methods`.
                 let is_connection_error = match &grpc_result {
-                    Err(GrpcProxyError::BackendUnavailable { kind, .. }) => kind.is_connect_class(),
+                    // A gateway-side egress denial (DnsResolution kind whose message
+                    // carries "egress policy") dialed no backend → not connect-class.
+                    Err(GrpcProxyError::BackendUnavailable { kind, message, .. }) => {
+                        kind.is_connect_class() && !message.contains("egress policy")
+                    }
                     Err(GrpcProxyError::BackendTimeout {
                         kind: grpc_proxy::GrpcTimeoutKind::Connect,
                         ..
@@ -14761,7 +14770,11 @@ async fn handle_proxy_request_inner(
                     grpc_probe_guard.disarm();
                     let connection_error = matches!(
                         e,
-                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                        GrpcProxyError::BackendUnavailable { kind, message, .. }
+                        // A gateway-side egress denial (DnsResolution kind whose
+                        // message carries "egress policy") dialed no backend, so it
+                        // is NOT a connect-class failure even though the kind is.
+                        if kind.is_connect_class() && !message.contains("egress policy")
                     ) || matches!(
                         e,
                         GrpcProxyError::BackendTimeout {
@@ -15757,7 +15770,11 @@ async fn handle_proxy_request_inner(
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
                 let grpc_backend_connection_error = matches!(
                     &e,
-                    GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                    GrpcProxyError::BackendUnavailable { kind, message, .. }
+                        // A gateway-side egress denial (DnsResolution kind whose
+                        // message carries "egress policy") dialed no backend, so it
+                        // is NOT a connect-class failure even though the kind is.
+                        if kind.is_connect_class() && !message.contains("egress policy")
                 ) || matches!(
                     &e,
                     GrpcProxyError::BackendTimeout {
@@ -18328,12 +18345,21 @@ fn backend_dispatch_response(
 fn record_h2_pool_admission_failure(
     permits: &mut Option<BackendAdmissionPermitSet>,
     started_at: &Instant,
+    err: &http2_pool::Http2PoolError,
 ) {
     if let Some(permits) = permits.take() {
+        // Record the REAL classified class (not a hard-coded ConnectionPoolError):
+        // a gateway-side egress denial (DispatchPolicyRejected — a hostname /
+        // dns_override that resolves or rebinds to a blocked IP) dialed no
+        // backend, so it must be neutral. `client_side_no_backend_signal` skips
+        // the adaptive-concurrency shrink for that class, and the connect flag is
+        // derived from `request_reached_wire` so it isn't charged as a connect
+        // failure either.
+        let class = http2_pool::classify_http2_pool_error(err);
         permits.record_backend_outcome(BackendAdmissionOutcome {
             response_status: 502,
-            connection_error: true,
-            error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            connection_error: !retry::request_reached_wire(class),
+            error_class: Some(class),
             backend_elapsed: started_at.elapsed(),
         });
     }
@@ -18883,6 +18909,7 @@ async fn proxy_to_backend(
                             record_h2_pool_admission_failure(
                                 &mut h2_admission_permits,
                                 backend_admission_started_at,
+                                &e,
                             );
                             return backend_dispatch_response(
                                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
@@ -18907,6 +18934,7 @@ async fn proxy_to_backend(
                         record_h2_pool_admission_failure(
                             &mut h2_admission_permits,
                             backend_admission_started_at,
+                            &e,
                         );
                         return backend_dispatch_response(
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
