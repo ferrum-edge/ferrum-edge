@@ -1665,16 +1665,24 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             this.state = H3FrameSourceState::Done;
                             // A graceful connection-level close (H3_NO_ERROR /
                             // GOAWAY) at the trailer phase means the backend
-                            // finished without trailers. The DATA body is already
-                            // complete (a clean FIN took us into this state), so
-                            // emit a clean EOS rather than a spurious stream error
-                            // — matching the buffered drain's
-                            // `read_h3_trailers_with_timeout`, which treats a
-                            // graceful trailer-phase close as "no trailers". This
-                            // keeps a complete 2xx response from being recorded as
-                            // a backend failure by the deferred dispatch (#1940
-                            // review).
-                            if err
+                            // finished without trailers — emit a clean EOS rather
+                            // than a spurious stream error, matching the buffered
+                            // drain's `read_h3_trailers_with_timeout` ("no
+                            // trailers"). Gate it on the SAME completeness
+                            // predicate the DATA-phase graceful-close arm uses:
+                            // entering the trailer state on a clean FIN does NOT
+                            // prove the body satisfied its declared Content-Length
+                            // (a truncated body can FIN early), so recover only
+                            // when `received` matches — otherwise a truncated H3
+                            // response would be laundered into a successful
+                            // deferred dispatch instead of surfacing the framing
+                            // error (#1940 review).
+                            if crate::http3::client::is_response_body_complete(
+                                this.received,
+                                &this.method,
+                                this.status,
+                                this.content_length,
+                            ) && err
                                 .downcast_ref::<h3::error::StreamError>()
                                 .is_some_and(crate::http3::client::is_h3_graceful_close)
                             {
