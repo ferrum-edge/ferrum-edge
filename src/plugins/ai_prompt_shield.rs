@@ -330,6 +330,11 @@ impl AiPromptShield {
                         collect_field_text(value, &self.exclude_roles, &mut texts);
                     }
                 }
+                // Azure OpenAI "On Your Data" carries a per-data-source
+                // instruction the backend applies as a de-facto system prompt;
+                // scan it so a PII/jailbreak payload smuggled there does not slip
+                // past Content mode. See `collect_azure_role_information_text`.
+                collect_azure_role_information_text(json, &mut texts);
                 texts
             }
         }
@@ -687,6 +692,11 @@ impl AiPromptShield {
                 redact_field_text(value, &self.exclude_roles, &|text| self.redact_text(text));
             }
         }
+        // Keep redaction symmetric with detection: `extract_scan_text` scans
+        // Azure "On Your Data" `role_information`, so redact it here too —
+        // otherwise Redact mode would report the PII removed while forwarding it
+        // unredacted (a fail-open bypass).
+        redact_azure_role_information(json, &|text| self.redact_text(text));
     }
 
     /// Replace all PII pattern matches in the text with the redaction placeholder.
@@ -1335,6 +1345,85 @@ fn redact_field_text(
             }
         }
         _ => {}
+    }
+}
+
+/// All Azure OpenAI "On Your Data" data-source items, across BOTH the GA
+/// snake_case `data_sources` and the original extensions-API camelCase
+/// `dataSources` arrays. Both keys are iterated rather than short-circuited on
+/// the first present one: `Option::or_else` only falls through on `None`, so a
+/// body that pairs an empty/`null` `data_sources` with a populated `dataSources`
+/// (or vice versa) would otherwise slip the second array past the scan. Mirrors
+/// the dual-casing extraction in the sibling `ai_request_guard` plugin.
+fn azure_data_source_items(json: &Value) -> impl Iterator<Item = &Value> {
+    ["data_sources", "dataSources"]
+        .into_iter()
+        .filter_map(|key| json.get(key))
+        .filter_map(Value::as_array)
+        .flatten()
+}
+
+/// Every per-data-source instruction string under `parameters.role_information`
+/// (GA) and `parameters.roleInformation` (original extensions API). BOTH inner
+/// keys are yielded — like [`azure_data_source_items`] does for the outer keys —
+/// rather than short-circuiting on the first present one: `as_str` of an empty
+/// string is `Some("")` (not `None`), so an `or_else` chain would let
+/// `{role_information: "", roleInformation: "<jailbreak>"}` hide the populated
+/// camelCase value from the scan.
+fn azure_role_information_values(source: &Value) -> impl Iterator<Item = &str> {
+    let parameters = source.get("parameters");
+    ["role_information", "roleInformation"]
+        .into_iter()
+        .filter_map(move |key| parameters.and_then(|p| p.get(key)).and_then(Value::as_str))
+}
+
+/// Collect Azure OpenAI "On Your Data" per-data-source instruction text for
+/// Content-mode scanning. The backend applies
+/// `data_sources[].parameters.role_information` (and the camelCase
+/// `dataSources[].parameters.roleInformation`) as a de-facto system prompt even
+/// when the top-level `messages` carry only ordinary `user` turns, so PII or a
+/// jailbreak smuggled there would otherwise pass Content mode unseen
+/// (`ScanMode::All` already covers it via full-body recursion).
+///
+/// Not gated by `exclude_roles`: that set filters chat *message roles* (the
+/// `role` field on a message/part), but `role_information` is a nested config
+/// field with no `role` to match against — and it is exactly where a payload
+/// would be hidden — so it is always scanned.
+fn collect_azure_role_information_text<'a>(json: &'a Value, texts: &mut Vec<&'a str>) {
+    for source in azure_data_source_items(json) {
+        for role_information in azure_role_information_values(source) {
+            texts.push(role_information);
+        }
+    }
+}
+
+/// Redact PII in every Azure "On Your Data" `role_information` instruction
+/// (both `data_sources`/`dataSources` outer casings and
+/// `role_information`/`roleInformation` inner casings), mirroring
+/// `collect_azure_role_information_text` so Content-mode detection and redaction
+/// stay symmetric. Without this, `Redact` mode would report the PII removed
+/// while forwarding the original `role_information` unchanged (a fail-open
+/// bypass). Both casings are iterated (no short-circuit) for the same reason the
+/// scan helpers iterate both.
+fn redact_azure_role_information(json: &mut Value, redact: &impl Fn(&str) -> String) {
+    for outer_key in ["data_sources", "dataSources"] {
+        let Some(sources) = json.get_mut(outer_key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for source in sources.iter_mut() {
+            let Some(parameters) = source.get_mut("parameters").and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            for inner_key in ["role_information", "roleInformation"] {
+                if let Some(text) = parameters.get(inner_key).and_then(Value::as_str) {
+                    let redacted = redact(text);
+                    if redacted != text {
+                        parameters.insert(inner_key.to_string(), Value::String(redacted));
+                    }
+                }
+            }
+        }
     }
 }
 
