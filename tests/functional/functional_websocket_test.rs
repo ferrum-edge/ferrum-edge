@@ -295,10 +295,23 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
+    // in the same functional shard never contend on the default admin ports
+    // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
+    // would otherwise surface here as a spurious "gateway did not start" when an
+    // unrelated parallel test holds the default port. These tests never use the
+    // admin API.
+    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())

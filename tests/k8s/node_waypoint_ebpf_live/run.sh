@@ -214,6 +214,7 @@ render_chart_assertions() {
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf)"
   if ! grep -q "image: \"$DEFAULT_CHART_IMAGE_REPOSITORY:$DEFAULT_CHART_IMAGE_TAG-ebpf\"" <<<"$rendered"; then
     echo "nodeAgent.enabled=true,captureMode=ebpf did not render $DEFAULT_CHART_IMAGE_REPOSITORY:$DEFAULT_CHART_IMAGE_TAG-ebpf" >&2
@@ -228,8 +229,10 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
@@ -278,9 +281,11 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set-string "ambient.env.FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR=$ambient_registry_override" \
     --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
@@ -319,8 +324,10 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set-string "ambient.env.FERRUM_NAMESPACE=$WORKLOAD_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint)"
   if ! grep -A1 "name: FERRUM_NAMESPACE" <<<"$rendered" | grep -q "value: \"$WORKLOAD_NS\""; then
@@ -343,9 +350,11 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.spire.enabled=true \
     --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint)"
   if ! grep -q "name: spire-agent-socket" <<<"$rendered" ||
@@ -369,10 +378,12 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.spire.enabled=true \
     --set ambient.spire.productionMode=false \
     --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint)"
   if ! grep -A1 "name: FERRUM_MESH_PRODUCTION_MODE" <<<"$rendered" | grep -q 'value: "false"'; then
@@ -385,8 +396,10 @@ render_chart_assertions() {
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.spire.enabled=true \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-missing-id-render.out 2>&1; then
     echo "NodeWaypoint SPIRE render accepted ambient.spire.enabled without a workload SPIFFE ID" >&2
@@ -404,9 +417,11 @@ render_chart_assertions() {
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.spire.enabled=true \
     --set-string "ambient.spire.workloadSpiffeId=$shared_spire_id" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-shared-id-render.out 2>&1; then
     echo "NodeWaypoint SPIRE render accepted a shared DaemonSet SPIFFE ID" >&2
@@ -423,10 +438,12 @@ render_chart_assertions() {
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.env.FERRUM_MESH_CA_BACKEND=none \
     --set ambient.spire.enabled=true \
     --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-managed-env-render.out 2>&1; then
     echo "NodeWaypoint SPIRE render accepted a chart-managed identity env override" >&2
@@ -443,10 +460,12 @@ render_chart_assertions() {
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.env.FERRUM_GATEWAY_SVID_CERT_PATH=/etc/ferrum/svid/cert.pem \
     --set ambient.spire.enabled=true \
     --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-file-svid-render.out 2>&1; then
     echo "NodeWaypoint SPIRE render accepted a file-SVID override" >&2
@@ -462,10 +481,12 @@ render_chart_assertions() {
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set ambient.env.FERRUM_GATEWAY_SVID_CERT_PATH_FILE=/etc/ferrum/svid/cert-path-secret \
     --set ambient.spire.enabled=true \
     --set-string "ambient.spire.workloadSpiffeId=$spire_id" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-spire-file-svid-suffix-render.out 2>&1; then
     echo "NodeWaypoint SPIRE render accepted a suffixed file-SVID override" >&2
@@ -485,8 +506,10 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node-waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set-string "ambient.env.FERRUM_ADMIN_HTTP_PORT=$AMBIENT_ADMIN_PORT" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node-waypoint \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
@@ -509,7 +532,9 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
     --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_render_ips_helm")"
@@ -524,7 +549,9 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-default-admin-port-render.out 2>&1; then
     echo "NodeWaypoint render rejected the non-conflicting default node-agent admin port" >&2
@@ -537,8 +564,10 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=0 \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint >/tmp/ferrum-node-waypoint-ambient-admin-disabled-render.out 2>&1; then
     echo "NodeWaypoint render accepted disabled ambient admin readiness port" >&2
@@ -577,7 +606,9 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
@@ -591,6 +622,7 @@ render_chart_assertions() {
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.admin.enabled=true \
     --set-string nodeAgent.admin.port=0)"
   if grep -q "readinessProbe:" <<<"$rendered"; then
@@ -602,6 +634,7 @@ render_chart_assertions() {
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.admin.enabled=true \
     --set-string nodeAgent.admin.bindAddress=::1)"
   if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- "::1"'; then
@@ -613,6 +646,7 @@ render_chart_assertions() {
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.admin.enabled=true \
     --set-string nodeAgent.admin.bindAddress=0.0.0.0)"
   if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- "127.0.0.1"'; then
@@ -626,7 +660,9 @@ render_chart_assertions() {
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
     --set-string nodeAgent.admin.port=9000 >/tmp/ferrum-node-waypoint-admin-port-render.out 2>&1; then
@@ -638,6 +674,7 @@ render_chart_assertions() {
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set-string nodeAgent.env.FERRUM_ADMIN_HTTP_PORT=9000 >/tmp/ferrum-node-agent-managed-env-render.out 2>&1; then
     echo "Node-agent render accepted a chart-managed env override" >&2
@@ -653,6 +690,7 @@ render_chart_assertions() {
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set-string nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS=10.244.1.1 >/tmp/ferrum-node-agent-managed-probe-env-render.out 2>&1; then
     echo "Node-agent render accepted a chart-managed probe source env override" >&2
@@ -669,7 +707,9 @@ render_chart_assertions() {
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf >/tmp/ferrum-node-waypoint-invalid-render.out 2>&1; then
     echo "NodeWaypoint render accepted ambient node_waypoint without nodeAgent.proxyMode=node_waypoint" >&2
     cat /tmp/ferrum-node-waypoint-invalid-render.out >&2 || true
@@ -897,10 +937,12 @@ install_ferrum() {
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=false \
     --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
+    --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MODE=mesh \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set-string "ambient.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set-string "ambient.env.FERRUM_DP_CP_GRPC_URLS=http://ferrum-mesh-control-plane.$MESH_NS.svc.cluster.local:50051" \
     --set ambient.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-node-waypoint-live-grpc-secret \
     --set-string "ambient.env.FERRUM_NAMESPACE=$WORKLOAD_NS" \
@@ -911,6 +953,7 @@ install_ferrum() {
     "${identity_args[@]}" \
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
     --set nodeAgent.enabled=true \
+    --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \

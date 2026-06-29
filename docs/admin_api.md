@@ -11,7 +11,18 @@ See also:
 
 ## Authentication
 
-All endpoints (except `/health`, `/status`, `/overload`, and exact `/metrics`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). `/metrics/runtime` requires JWT authentication because it exposes process and host diagnostics. `/charges` also requires JWT authentication because it exposes customer and billing data.
+Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters). The observability surfaces have a tiered model:
+
+| Endpoint | Unauthenticated | Authenticated |
+| --- | --- | --- |
+| `/live` | `{"status":"ok"}` (always; minimal liveness) | same |
+| `/health`, `/status` | `status` + `ready` only, with the correct status code (200 / 503 starting) | full diagnostics (mode, DB/pool, cached-config counts, polling degradation, mesh state) |
+| `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter snapshot |
+| `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS` | 200 Prometheus text |
+
+"Authenticated" here means **any** of: a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
+
+The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
 Admin JWTs must include a string `role` claim:
 
@@ -30,16 +41,33 @@ Generate a token:
 node -e "console.log(require('jsonwebtoken').sign({sub:'admin', role:'admin'}, 'my-super-secret-jwt-key'))"
 ```
 
-## Health Check (Unauthenticated)
+## Liveness and Health Checks
+
+### `/live` — liveness (unauthenticated, minimal)
 
 ```bash
-curl http://localhost:9000/health
-# or equivalently:
-curl http://localhost:9000/status
-# Returns: {"status": "ok", "timestamp": "...", "mode": "database"}
+curl http://localhost:9000/live
+# Returns: {"status": "ok"}
 ```
 
-Both endpoints return the same response and do not require JWT authentication, making them suitable for load balancer health probes. In database mode, the response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` there while the gateway keeps serving the last known-good runtime config.
+`/live` is always unauthenticated and returns only `{"status":"ok"}` with a 200. It reveals no operational internals and is the recommended endpoint for load-balancer / Kubernetes **liveness** probes.
+
+### `/health`, `/status` — readiness + diagnostics (tiered)
+
+```bash
+# Unauthenticated (LB / readiness probe): status + ready only.
+curl http://localhost:9000/health
+# Returns: {"status": "ok", "ready": true}     (503 with "starting" before ready)
+
+# Authenticated: full diagnostics.
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
+# Returns: {"status","timestamp","mode","database":{...},"admin_writes_enabled",
+#           "ready","cached_config":{"proxy_count":...},"database_polling":{...}, ...}
+```
+
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. The detailed diagnostics (DB type/pool stats, cached-config proxy/consumer counts, `database_polling` degradation, mesh state) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config.
+
+**Recommended split:** point liveness at `/live` and readiness at `/health`; route detailed diagnostics scraping through an authenticated path.
 
 ## TLS Inventory
 
@@ -512,7 +540,29 @@ Returns:
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
 
-The unauthenticated exact `/metrics` endpoint returns Prometheus text exposition for scrapers. It includes TLS inventory gauges `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` for loaded certificate sources, plus `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_refresh_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total` for background source watcher activity. It also exposes the admin/management-plane connection limiter: `ferrum_admin_active_connections` (gauge of admin connections in flight), `ferrum_admin_max_connections` (the configured `FERRUM_ADMIN_MAX_CONNECTIONS` cap, `0` = unlimited), and `ferrum_admin_rejected_connections_total{reason="max_connections"|"max_connections_per_ip"}` (admin connections dropped by the cap). In database mode it also includes bounded rejected-delta polling metrics such as `ferrum_database_delta_rejections_total`, `ferrum_database_delta_backoff_bucket`, `ferrum_database_delta_forced_full_reloads_total`, and `ferrum_database_delta_recoveries_total`. In mesh mode it also includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels, so expose `/metrics` only on trusted scrape networks; in Kubernetes, put it behind a `NetworkPolicy` or a scrape-side reverse proxy when workload identity inventory is sensitive.
+### Prometheus `/metrics` (gated)
+
+The exact `/metrics` endpoint returns Prometheus text exposition for scrapers. **It is gated by default** — a scraper must present a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or originate from a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Without one of these, `/metrics` returns `401` with a `WWW-Authenticate: Bearer` header. Unauthenticated scraping is an explicit operator opt-in.
+
+Safe Prometheus scrape configurations:
+
+```yaml
+# Option A — dedicated metrics bearer token (FERRUM_METRICS_BEARER_TOKEN=<token>)
+scrape_configs:
+  - job_name: ferrum-edge
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: "<token>"          # or credentials_file: /etc/prometheus/ferrum.token
+    static_configs:
+      - targets: ["ferrum-admin:9000"]
+
+# Option B — allowlist the Prometheus subnet (FERRUM_METRICS_ALLOWED_CIDRS=10.0.0.0/8)
+#   then scrape with no credential. Combine with FERRUM_ADMIN_ALLOWED_CIDRS and/or
+#   a NetworkPolicy so only the scrape network can reach the admin listener.
+```
+
+The output includes TLS inventory gauges `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` for loaded certificate sources, plus `ferrum_tls_cert_rotations_total`, `ferrum_tls_source_refresh_total`, `ferrum_tls_source_fetch_duration_seconds`, and `ferrum_tls_source_fetch_failures_total` for background source watcher activity. It also exposes the admin/management-plane connection limiter: `ferrum_admin_active_connections` (gauge of admin connections in flight), `ferrum_admin_max_connections` (the configured `FERRUM_ADMIN_MAX_CONNECTIONS` cap, `0` = unlimited), and `ferrum_admin_rejected_connections_total{reason="max_connections"|"max_connections_per_ip"}` (admin connections dropped by the cap). In database mode it also includes bounded rejected-delta polling metrics such as `ferrum_database_delta_rejections_total`, `ferrum_database_delta_backoff_bucket`, `ferrum_database_delta_forced_full_reloads_total`, and `ferrum_database_delta_recoveries_total`. In mesh mode it also includes `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_config_last_received_timestamp_seconds`, and `ferrum_mesh_mtls_handshake_failures_total` alongside request RED metrics. Mesh RED and certificate series include SPIFFE identity labels — another reason the endpoint is gated by default; in Kubernetes, still put it behind a `NetworkPolicy` as defense in depth when workload identity inventory is sensitive.
 
 ### Runtime Metrics
 

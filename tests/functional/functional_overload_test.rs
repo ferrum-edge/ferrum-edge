@@ -45,6 +45,37 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
+/// Admin JWT secret wired into every gateway spawned by this file. `/overload`
+/// now exposes its full pressure/counter snapshot only to authorized callers
+/// (admin JWT / metrics token / allowlisted CIDR), so these tests mint an admin
+/// token against this secret to read the detailed body. Must be >= 32 chars.
+const ADMIN_JWT_SECRET: &str = "ferrum-edge-overload-functional-secret-0001";
+
+/// Mint a short-lived admin JWT matching [`ADMIN_JWT_SECRET`] so a test can read
+/// the detailed `/overload` view (gated behind observability auth).
+fn admin_bearer() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64;
+    let claims = serde_json::json!({
+        "iss": "ferrum-edge",
+        "sub": "overload-test",
+        "role": "admin",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 600,
+        "jti": format!("overload-{now}"),
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(ADMIN_JWT_SECRET.as_bytes()),
+    )
+    .expect("encode admin JWT");
+    format!("Bearer {token}")
+}
+
 // ============================================================================
 // Slow backend — a minimal HTTP/1.1 server that sleeps before responding.
 // ============================================================================
@@ -141,7 +172,10 @@ fn start_gateway(
         // this log-assertion harness isolated from the developer shell.
         .env_remove("RUST_LOG")
         // Make sure perf features don't destabilize the small functional test harness.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Known admin secret so the test can mint a token for the detailed
+        // (auth-gated) `/overload` view. File mode honors this when set.
+        .env("FERRUM_ADMIN_JWT_SECRET", ADMIN_JWT_SECRET);
 
     if let Some(v) = env.max_connections {
         cmd.env("FERRUM_MAX_CONNECTIONS", v.to_string());
@@ -333,6 +367,7 @@ async fn get_overload(admin_port: u16) -> (u16, serde_json::Value) {
         .unwrap();
     let resp = client
         .get(format!("http://127.0.0.1:{admin_port}/overload"))
+        .header("Authorization", admin_bearer())
         .send()
         .await
         .expect("GET /overload");

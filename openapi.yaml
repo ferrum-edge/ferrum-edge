@@ -104,21 +104,50 @@ tags:
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
+  /live:
+    get:
+      operationId: getLive
+      summary: Liveness probe (unauthenticated, minimal)
+      description: |
+        Always returns `200 OK` with the body `{"status":"ok"}` and no
+        operational internals. Intended for load-balancer / Kubernetes
+        liveness probes. Never requires authentication.
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+
   /health:
     get:
       operationId: getHealth
-      summary: Gateway health check
+      summary: Gateway health check (tiered detail)
       description: |
-        Returns gateway health status including database connectivity and
-        cached configuration availability. Also accessible at `/status`.
+        Readiness + diagnostics. Also accessible at `/status`.
+
+        **Unauthenticated** callers receive only `status` and `ready` (suitable
+        for readiness probes). The **detailed** diagnostics — `mode`, `database`
+        connectivity/pool stats, `cached_config` proxy/consumer counts,
+        `database_polling` degradation, and mesh state — are returned only when
+        the caller presents a valid admin JWT, a matching
+        `FERRUM_METRICS_BEARER_TOKEN`, or originates from
+        `FERRUM_METRICS_ALLOWED_CIDRS`.
 
         Returns `503 Service Unavailable` while the gateway is still in
-        startup (the body's `status` field is set to `"starting"` and
-        `ready` is `false`). Once startup is complete the endpoint returns
-        `200 OK` with `status` set to `"ok"` or `"degraded"` (DB
-        disconnected / admin writes blocked / database incremental polling
-        repeatedly rejecting the same delta while serving last known-good
-        config).
+        startup (`status: "starting"`, `ready: false`). Once startup is
+        complete it returns `200 OK` with `status` set to `"ok"` or
+        `"degraded"` (DB disconnected / admin writes blocked / database
+        incremental polling repeatedly rejecting the same delta while serving
+        last known-good config).
       tags: [Health]
       security: []
       responses:
@@ -1212,17 +1241,22 @@ paths:
   /overload:
     get:
       operationId: getOverload
-      summary: Overload status
+      summary: Overload status (tiered detail)
       description: |
-        Returns the gateway's current overload state including resource pressure
-        metrics (file descriptors, connections, event loop latency) and active
-        load-shedding actions. Unauthenticated so it can be used by load balancers
-        and monitoring probes.
+        Returns the gateway's current overload state. **Unauthenticated** callers
+        receive a coarse, LB-safe `{"level": ...}` (with the correct status code)
+        so load balancers and monitoring probes can act on the level without
+        seeing resource internals. The **full** snapshot — resource pressure
+        (file descriptors, connections, requests, event-loop latency), active
+        counts, port-exhaustion events, load-shedding actions, and stream-listener
+        diagnostics — requires a valid admin JWT, a matching
+        `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
+        source IP.
 
-        Returns `503 Service Unavailable` when the overload level is `critical`.
+        Returns `503 Service Unavailable` when the overload level is `critical`
+        (for both tiers).
 
-        In control-plane mode (no proxy state), returns a minimal
-        `{"level":"normal","message":"No proxy state available"}` response.
+        In control-plane mode (no proxy state), returns `{"level":"normal"}`.
       tags: [Health]
       security: []
       responses:
@@ -1233,22 +1267,30 @@ paths:
               schema:
                 oneOf:
                   - $ref: "#/components/schemas/OverloadSnapshot"
+                  - $ref: "#/components/schemas/OverloadLevelOnly"
                   - $ref: "#/components/schemas/OverloadNoProxyState"
         "503":
           description: Overload state is critical — gateway is shedding load
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OverloadSnapshot"
+                oneOf:
+                  - $ref: "#/components/schemas/OverloadSnapshot"
+                  - $ref: "#/components/schemas/OverloadLevelOnly"
 
   # ── Metrics ─────────────────────────────────────────────────────────
   /metrics:
     get:
       operationId: getPrometheusMetrics
-      summary: Prometheus metrics
+      summary: Prometheus metrics (gated)
       description: |
-        Returns gateway metrics in Prometheus exposition format.
-        Unauthenticated so it can be scraped by Prometheus without credentials.
+        Returns gateway metrics in Prometheus exposition format. **Gated by
+        default**: the caller must present a valid admin JWT, a matching
+        `FERRUM_METRICS_BEARER_TOKEN`, or originate from a
+        `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Otherwise the endpoint
+        returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header.
+        Unauthenticated scraping is an explicit operator opt-in (token or CIDR).
+
         TLS source watcher telemetry includes certificate expiry gauges,
         certificate rotation counters, source refresh outcomes, source fetch
         duration histograms, and bounded source fetch failure counters when
@@ -1268,7 +1310,9 @@ paths:
         dropped by the cap, with `reason` one of `max_connections` /
         `max_connections_per_ip`).
       tags: [Metrics]
-      security: []
+      security:
+        - bearerAuth: []
+        - {}
       responses:
         "200":
           description: Prometheus text exposition
@@ -1286,6 +1330,8 @@ paths:
                 # HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.
                 # TYPE ferrum_admin_rejected_connections_total counter
                 ferrum_admin_rejected_connections_total{reason="max_connections"} 0
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /metrics/runtime:
     get:
@@ -7937,7 +7983,13 @@ components:
     # ── Health response ─────────────────────────────────────────────
     HealthResponse:
       type: object
-      required: [status, timestamp, mode, ready, admin_writes_enabled, cached_config]
+      description: |
+        Tiered: unauthenticated callers receive only `status` and `ready`. The
+        remaining detailed fields (`timestamp`, `mode`, `database`,
+        `admin_writes_enabled`, `cached_config`, `database_polling`, `mesh`) are
+        present only when the caller is authenticated (admin JWT, metrics bearer
+        token, or allowlisted CIDR).
+      required: [status, ready]
       properties:
         status:
           type: [string, "null"]
@@ -8059,6 +8111,19 @@ components:
         message:
           type: string
           example: No proxy state available
+
+    OverloadLevelOnly:
+      type: object
+      description: |
+        Coarse, LB-safe overload view returned to unauthenticated callers — only
+        the level, with no resource internals. The full `OverloadSnapshot` is
+        returned to authenticated callers (admin JWT / metrics token / allowlisted
+        CIDR).
+      required: [level]
+      properties:
+        level:
+          type: string
+          enum: [normal, pressure, critical]
 
     OverloadSnapshot:
       type: object

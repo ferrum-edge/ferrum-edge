@@ -89,10 +89,20 @@ fn start_gateway(
     config_path: &str,
     http_port: u16,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    // Fresh admin HTTP port + admin HTTPS disabled so parallel gateways in the
+    // same shard never contend on the default admin ports (9000/9443); an admin
+    // bind failure aborts startup. These tests do not use the admin API.
+    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
     let cmd = std::process::Command::new(gateway_binary_path())
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

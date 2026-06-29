@@ -105,6 +105,7 @@ fn build_admin_state(
     AdminState {
         db: None,
         jwt_manager: jwt,
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: Some(proxy_state),
         mode: "mesh".to_string(),

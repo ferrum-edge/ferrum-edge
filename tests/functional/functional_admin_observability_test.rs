@@ -3,10 +3,11 @@
 //! Exercises admin endpoints that surface operational state:
 //! - `/cluster` — CP/DP connection status (database mode returns informational)
 //! - `/metrics/runtime` — JWT-authenticated combined runtime JSON
-//! - `/overload` — unauthenticated JSON shape + 503 under request-critical load
+//! - `/overload` — coarse `{level}` unauthenticated, full snapshot with auth, 503 under request-critical load
+//! - `/metrics` — gated by default (401), 200 with admin JWT; `/live` always minimal+unauthenticated
 //! - `/namespaces` — distinct sorted namespaces (JWT required)
 //! - `/restore` — body-size limit (413) and malformed JSON (400)
-//! - JWT auth required on `/cluster`, `/metrics/runtime`, and `/namespaces`; `/overload` unauthenticated
+//! - JWT auth required on `/cluster`, `/metrics/runtime`, `/namespaces`, `/metrics`, and detailed `/overload`
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge
@@ -123,12 +124,12 @@ async fn test_cluster_endpoint_database_mode() {
     );
 }
 
-/// Test 2: `/overload` shape — unauthenticated, 200 under normal load, JSON contains
-/// `level`, `fd_pressure`, `conn_pressure`, `req_pressure`, `port_exhaustion_events`,
-/// `active_connections`, `active_requests`.
+/// Test 2: `/overload` tiering — unauthenticated callers get a coarse, LB-safe
+/// `{level}` with NO resource internals; authenticated callers get the full
+/// pressure/counter snapshot.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_overload_endpoint_shape_unauthenticated() {
+async fn test_overload_endpoint_tiered_auth() {
     let harness = TestGateway::builder()
         .log_level("warn")
         .spawn()
@@ -136,73 +137,128 @@ async fn test_overload_endpoint_shape_unauthenticated() {
         .expect("Failed to create harness");
 
     let client = reqwest::Client::new();
-    // No Authorization header — /overload MUST be unauthenticated.
+
+    // --- Unauthenticated: coarse {level} only, 200 under normal load ---
     let resp = client
         .get(format!("{}/overload", harness.admin_base_url))
         .send()
         .await
-        .expect("GET /overload failed");
-
+        .expect("GET /overload (unauth) failed");
     assert_eq!(
         resp.status().as_u16(),
         200,
         "/overload under normal load should return 200"
     );
-
     let body: serde_json::Value = resp.json().await.expect("JSON body");
-
     assert!(
         body.get("level").and_then(|v| v.as_str()).is_some(),
-        "level field missing: {body}"
+        "coarse /overload must still expose `level`: {body}"
     );
-    // Numeric fields — use .as_u64() / .as_f64() to validate shape.
+    for leaked in [
+        "active_connections",
+        "active_requests",
+        "port_exhaustion_events",
+        "pressure",
+        "actions",
+        "stream_listeners",
+    ] {
+        assert!(
+            body.get(leaked).is_none(),
+            "unauthenticated /overload must not expose `{leaked}`: {body}"
+        );
+    }
+
+    // --- Authenticated: full pressure/counter snapshot ---
+    let resp = client
+        .get(format!("{}/overload", harness.admin_base_url))
+        .header("Authorization", harness.auth_header())
+        .send()
+        .await
+        .expect("GET /overload (auth) failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
     assert!(
         body.get("active_connections")
             .and_then(|v| v.as_u64())
             .is_some(),
-        "active_connections numeric field missing: {body}"
+        "active_connections numeric field missing (auth): {body}"
     );
     assert!(
         body.get("active_requests")
             .and_then(|v| v.as_u64())
             .is_some(),
-        "active_requests numeric field missing: {body}"
+        "active_requests numeric field missing (auth): {body}"
     );
     assert!(
         body.get("port_exhaustion_events")
             .and_then(|v| v.as_u64())
             .is_some(),
-        "port_exhaustion_events numeric field missing: {body}"
+        "port_exhaustion_events numeric field missing (auth): {body}"
     );
-
-    // Pressure block contains fd / connections / requests sub-objects with ratios.
     let pressure = body
         .get("pressure")
-        .expect("pressure object present (fd/conn/req)");
-    assert!(
-        pressure
-            .get("file_descriptors")
-            .and_then(|v| v.get("ratio"))
-            .and_then(|v| v.as_f64())
-            .is_some(),
-        "pressure.file_descriptors.ratio missing: {body}"
+        .expect("pressure object present (auth, fd/conn/req)");
+    for sub in ["file_descriptors", "connections", "requests"] {
+        assert!(
+            pressure
+                .get(sub)
+                .and_then(|v| v.get("ratio"))
+                .and_then(|v| v.as_f64())
+                .is_some(),
+            "pressure.{sub}.ratio missing (auth): {body}"
+        );
+    }
+}
+
+/// Test 2b: `/metrics` is gated by default (401), succeeds with an admin JWT;
+/// `/live` is always unauthenticated and minimal.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_metrics_gated_and_live_minimal() {
+    let harness = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("Failed to create harness");
+
+    let client = reqwest::Client::new();
+
+    // /metrics without a credential → 401.
+    let resp = client
+        .get(format!("{}/metrics", harness.admin_base_url))
+        .send()
+        .await
+        .expect("GET /metrics (unauth) failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "/metrics must require auth by default"
     );
+
+    // /metrics with a valid admin JWT → 200 Prometheus text.
+    let resp = client
+        .get(format!("{}/metrics", harness.admin_base_url))
+        .header("Authorization", harness.auth_header())
+        .send()
+        .await
+        .expect("GET /metrics (auth) failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.unwrap_or_default();
     assert!(
-        pressure
-            .get("connections")
-            .and_then(|v| v.get("ratio"))
-            .and_then(|v| v.as_f64())
-            .is_some(),
-        "pressure.connections.ratio missing: {body}"
+        text.contains("ferrum_"),
+        "expected Prometheus metrics output, got: {}",
+        &text[..text.len().min(200)]
     );
-    assert!(
-        pressure
-            .get("requests")
-            .and_then(|v| v.get("ratio"))
-            .and_then(|v| v.as_f64())
-            .is_some(),
-        "pressure.requests.ratio missing: {body}"
-    );
+
+    // /live is always unauthenticated and minimal.
+    let resp = client
+        .get(format!("{}/live", harness.admin_base_url))
+        .send()
+        .await
+        .expect("GET /live failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.expect("live JSON");
+    assert_eq!(body, serde_json::json!({"status": "ok"}));
 }
 
 /// Test 3: `/overload` returns 503 under request-critical load.

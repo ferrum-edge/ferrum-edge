@@ -734,16 +734,23 @@ impl GatewayHarness {
         self.get_admin_json_unauth("/health").await
     }
 
-    /// Fetch the admin `/metrics` endpoint (unauthenticated, like a
-    /// Prometheus scraper) and return the raw text. The real endpoint
-    /// renders Prometheus format, so the caller does its own parsing /
+    /// Fetch the admin `/metrics` endpoint and return the raw text. The real
+    /// endpoint renders Prometheus format, so the caller does its own parsing /
     /// substring assertions.
+    ///
+    /// `/metrics` is gated by default (admin JWT, `FERRUM_METRICS_BEARER_TOKEN`,
+    /// or `FERRUM_METRICS_ALLOWED_CIDRS`), so this sends the admin JWT — the
+    /// equivalent of a Prometheus deployment configured with a bearer token.
     pub async fn metrics(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()?;
         let url = self.admin_url("/metrics");
-        let resp = client.get(&url).send().await?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", self.admin_auth_header())
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {

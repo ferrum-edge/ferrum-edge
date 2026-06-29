@@ -177,6 +177,7 @@ async fn mesh_multicluster_discoverer_resolves_local_and_remote_targets() {
         &local_services,
         &snapshot,
         Some(&admitting_candidate()),
+        true,
     );
     let mesh = MeshConfig {
         workloads,

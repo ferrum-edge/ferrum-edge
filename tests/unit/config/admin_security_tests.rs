@@ -440,10 +440,9 @@ fn test_union_coverage_allowlist_does_not_satisfy_database_guard() {
 }
 
 #[test]
-fn test_read_only_database_admin_is_not_hard_failed() {
-    // FERRUM_ADMIN_READ_ONLY=true blocks admin mutations, so a public plaintext
-    // read-only db/cp admin is warned (in main.rs), not hard-failed — it must not
-    // be forced to add an allowlist or the dev opt-in just to start.
+fn test_read_only_database_admin_is_hard_failed_when_plaintext_unrestricted() {
+    // FERRUM_ADMIN_READ_ONLY=true blocks mutations, but it does not protect
+    // sensitive read endpoints or bearer tokens sent to a plaintext listener.
     for mode in [OperatingMode::Database, OperatingMode::ControlPlane] {
         let config = EnvConfig {
             mode: mode.clone(),
@@ -457,8 +456,8 @@ fn test_read_only_database_admin_is_not_hard_failed() {
             "exposure classification is unchanged by read-only"
         );
         assert!(
-            config.admin_insecure_plaintext_startup_error().is_none(),
-            "{mode:?} with FERRUM_ADMIN_READ_ONLY=true must not hard-fail"
+            config.admin_insecure_plaintext_startup_error().is_some(),
+            "{mode:?} with FERRUM_ADMIN_READ_ONLY=true still needs loopback, TLS-only admin, an effective allowlist, or the dev opt-in"
         );
     }
 }

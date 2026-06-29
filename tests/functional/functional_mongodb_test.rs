@@ -460,6 +460,7 @@ async fn run_crud_and_proxy_tests(
     println!("\n--- {}: Health Check ---", test_prefix);
     let resp = client
         .get(format!("{}/health", harness.admin_base_url))
+        .header("Authorization", &auth_header)
         .send()
         .await
         .expect("Health check failed");
