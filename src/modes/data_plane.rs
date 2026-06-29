@@ -66,6 +66,9 @@ pub async fn run(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     // Start with empty config; CP will push the real one via gRPC.
     // The empty initial config means `start_with_shutdown` spawns no
@@ -499,6 +502,7 @@ pub async fn run(
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+        metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,

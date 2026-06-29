@@ -1479,6 +1479,22 @@ pub struct EnvConfig {
     /// Example: "10.0.100.0/24,10.0.200.5,::1"
     pub admin_allowed_cidrs: String,
 
+    /// Comma-separated CIDRs/IPs allowed to scrape `/metrics` (and the detailed
+    /// `/health` / `/overload` views) WITHOUT a JWT or metrics bearer token.
+    /// Empty (default) means unauthenticated scraping is disabled — `/metrics`
+    /// returns 401 unless the caller presents a valid admin JWT or
+    /// `FERRUM_METRICS_BEARER_TOKEN`. Set this to opt the listed source ranges
+    /// (e.g. a Prometheus subnet) back into unauthenticated scraping.
+    /// Example: "10.0.0.0/8,127.0.0.1,::1"
+    pub metrics_allowed_cidrs: String,
+
+    /// Dedicated bearer token that authorizes `/metrics` scraping (and the
+    /// detailed `/health` / `/overload` views) without a full admin JWT.
+    /// When set, a request whose `Authorization: Bearer <token>` matches this
+    /// value (constant-time compare) is allowed. Empty/unset disables this path.
+    /// Use this for Prometheus deployments that cannot mint admin JWTs.
+    pub metrics_bearer_token: Option<String>,
+
     /// Maximum concurrent connections across all admin/management-plane
     /// listeners (plaintext + TLS share one cap). Independent of the data-plane
     /// `max_connections` (`FERRUM_MAX_CONNECTIONS`) so proxy traffic and
@@ -1998,6 +2014,8 @@ impl Default for EnvConfig {
             plugin_http_retry_delay_ms: 100,
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
+            metrics_allowed_cidrs: String::new(),
+            metrics_bearer_token: None,
             admin_max_connections: 1024,
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
@@ -2408,6 +2426,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
+            metrics_allowed_cidrs: String = "FERRUM_METRICS_ALLOWED_CIDRS" => String::new();
+            metrics_bearer_token: Option<String> = "FERRUM_METRICS_BEARER_TOKEN";
             admin_max_connections: usize = "FERRUM_ADMIN_MAX_CONNECTIONS" => 1024usize;
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
@@ -2997,6 +3017,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms,
             tls_crl_file_path,
             admin_allowed_cidrs,
+            metrics_allowed_cidrs,
+            metrics_bearer_token,
             admin_max_connections,
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,

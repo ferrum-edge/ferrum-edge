@@ -126,6 +126,7 @@ fn make_admin_state(jwt: JwtManager, with_resolver: bool) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: jwt,
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: Some(proxy_state),
         mode: "test".to_string(),

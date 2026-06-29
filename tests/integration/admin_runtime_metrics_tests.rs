@@ -99,6 +99,7 @@ fn admin_state_with_runtime_metrics(jwt: JwtManager) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: jwt,
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: Some(proxy_state),
         mode: "test".to_string(),

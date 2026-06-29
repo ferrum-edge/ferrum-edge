@@ -107,6 +107,7 @@ jobs:
               integration::admin_audit_rbac_tests
               integration::admin_backend_capabilities_tests
               integration::admin_runtime_metrics_tests
+              integration::admin_observability_auth_tests
           - shard: admin-config
             kind: integration
             filters: |
