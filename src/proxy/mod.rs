@@ -15821,11 +15821,22 @@ async fn handle_proxy_request_inner(
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
     let streaming_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
-        // Native H3 exposes a recv stream rather than a `Body` at this point,
-        // so rely on `streaming_dispatch_should_defer`'s HEAD/no-body/status
-        // gates for eager outcomes. Empty H3 bodies that still go through the
-        // streaming body complete on the first poll and record success there.
-        ResponseBody::StreamingH3(_) => false,
+        // Native H3 exposes a recv stream rather than a `Body` here, so we can't
+        // call `is_end_stream()`. A known zero-length body (`content-length: 0`
+        // on a streamable status such as `200`) is still END_STREAM-at-headers:
+        // hyper may never poll such a body, and a deferred outcome would then be
+        // recorded as a `ClientDisconnect` by the never-polled `ProxyBody::Drop`
+        // path instead of the backend success. Treat it eagerly, mirroring the
+        // H2 `is_end_stream` case (#1940 review). HEAD / 204 / 304 stay covered
+        // by `streaming_dispatch_should_defer`'s own gates.
+        ResponseBody::StreamingH3(resp) => {
+            response_is_no_body_status(response_status)
+                || resp
+                    .headers
+                    .get("content-length")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    == Some(0)
+        }
         _ => false,
     };
     let defer_streaming_dispatch = matches!(
