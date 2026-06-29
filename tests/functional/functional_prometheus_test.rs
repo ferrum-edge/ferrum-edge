@@ -71,6 +71,7 @@ plugin_configs:
     // Scrape /metrics on admin port
     let metrics_resp = client
         .get(gateway.admin_url("/metrics"))
+        .header("Authorization", gateway.auth_header())
         .send()
         .await
         .expect("Failed to scrape /metrics");
@@ -168,6 +169,7 @@ plugin_configs:
     // Scrape /metrics
     let metrics_resp = client
         .get(gateway.admin_url("/metrics"))
+        .header("Authorization", gateway.auth_header())
         .send()
         .await
         .expect("Failed to scrape /metrics");

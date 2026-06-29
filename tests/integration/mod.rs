@@ -11,6 +11,7 @@ mod admin_mesh_remote_clusters_tests;
 mod admin_mesh_runtime_overlay_tests;
 mod admin_mesh_service_graph_tests;
 mod admin_node_waypoint_identities_tests;
+mod admin_observability_auth_tests;
 mod admin_runtime_metrics_tests;
 mod api_chargeback_sink_tests;
 mod apply_incremental_outcome_tests;

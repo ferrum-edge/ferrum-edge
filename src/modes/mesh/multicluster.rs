@@ -3591,10 +3591,7 @@ mod tests {
     #[test]
     fn tls_selection_respects_grpcs_scheme() {
         let tls_cfg = RemoteDiscoveryTlsConfig {
-            tls_urls: Some(DpGrpcTlsConfig {
-                no_verify: true,
-                ..DpGrpcTlsConfig::default()
-            }),
+            tls_urls: Some(DpGrpcTlsConfig::default()),
             plain_urls: None,
         };
         // grpcs normalizes to https — must pick TLS config.
@@ -3622,10 +3619,7 @@ mod tests {
             node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
             tls_config: RemoteDiscoveryTlsConfig {
-                tls_urls: Some(DpGrpcTlsConfig {
-                    no_verify: true,
-                    ..DpGrpcTlsConfig::default()
-                }),
+                tls_urls: Some(DpGrpcTlsConfig::default()),
                 plain_urls: None,
             },
         };

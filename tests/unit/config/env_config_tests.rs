@@ -840,6 +840,9 @@ fn test_env_config_cp_mode_missing_grpc_listen() {
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "grpc-secret-padding-32-char-min!",
             ),
+            // Default 0.0.0.0:50051 plaintext bind requires the explicit opt-in
+            // under the secure-by-default CP/DP transport policy.
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
         ],
         || {
             remove_var("FERRUM_CP_GRPC_LISTEN_ADDR");
@@ -1688,6 +1691,8 @@ fn test_env_config_dp_mode_valid() {
         &[
             ("FERRUM_MODE", "dp"),
             ("FERRUM_DP_CP_GRPC_URLS", "http://control-plane:50051"),
+            // Non-loopback http:// CP URL requires the explicit plaintext opt-in.
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "my-secret-padding-for-32-char-min!",
@@ -1724,6 +1729,8 @@ fn test_env_config_cp_mode_valid() {
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "grpc-secret-padding-32-char-min!",
             ),
+            // Non-loopback plaintext bind requires the explicit plaintext opt-in.
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -4625,6 +4632,8 @@ fn test_resolved_dp_cp_grpc_urls_single_entry() {
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
             ),
+            // Non-loopback http:// CP URL requires the explicit plaintext opt-in.
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -4762,6 +4771,8 @@ fn test_dp_cp_failover_primary_retry_secs_default() {
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
             ),
+            // Non-loopback http:// CP URL requires the explicit plaintext opt-in.
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -4781,6 +4792,8 @@ fn test_dp_cp_failover_primary_retry_secs_custom() {
                 "secret-padding-for-32-char-min!!",
             ),
             ("FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS", "60"),
+            // Non-loopback http:// CP URL requires the explicit plaintext opt-in.
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();

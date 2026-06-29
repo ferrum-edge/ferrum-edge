@@ -72,6 +72,9 @@ async fn functional_admin_connection_cap_plaintext_rejects_over_limit() {
         .env("FERRUM_ADMIN_MAX_CONNECTIONS", "2")
         // Idle raw connections must hold their permits for the duration.
         .env("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", "0")
+        // `/metrics` is gated by default; this test scrapes it from loopback to
+        // read the connection-cap gauges, so allowlist the loopback scrape.
+        .env("FERRUM_METRICS_ALLOWED_CIDRS", "127.0.0.1/32,::1")
         .spawn()
         .await
         .expect("start admin-cap gateway");
