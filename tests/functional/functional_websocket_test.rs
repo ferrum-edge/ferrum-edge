@@ -546,13 +546,25 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 }
 
 /// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+///
+/// The deadline is generous (60s) because the TLS/HTTP3 gateway cold-start
+/// (jemalloc + rustls + config/cert load + QUIC socket setup + DNS/pool warmup)
+/// can exceed a tight budget on a loaded CI runner — the previous 15s caused
+/// intermittent "Gateway did not start" failures in the H3 WebSocket tests even
+/// across the 3 retry attempts. This does not slow the happy path: the loop
+/// returns as soon as the port accepts a TCP connection (polled every 300ms), so
+/// a fast start still finishes in a few seconds; the deadline only bounds a
+/// genuinely stuck start.
 async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+    const STARTUP_TIMEOUT_SECS: u64 = 60;
+    let deadline = std::time::SystemTime::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
     let addr = format!("127.0.0.1:{}", gateway_port);
 
     loop {
         if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 15 seconds".into());
+            return Err(
+                format!("Gateway did not start within {STARTUP_TIMEOUT_SECS} seconds").into(),
+            );
         }
         match tokio::net::TcpStream::connect(&addr).await {
             Ok(_) => return Ok(()),
