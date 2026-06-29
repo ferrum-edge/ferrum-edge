@@ -3364,7 +3364,7 @@ pub fn screen_mesh_route_dispatch_egress(
     let mut errors = Vec::new();
     for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
         if let Some(host) = rule.destination.backend_host.as_deref()
-            && let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && let Some(ip) = crate::config::types::egress_literal_ip(host)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(

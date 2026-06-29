@@ -2733,19 +2733,22 @@ async fn handle_dtls_client_inner(
     {
         Ok(ip) => ip,
         Err(e) => {
-            // A backend-egress-policy denial means no backend was dialed, so keep
-            // circuit-breaker accounting neutral (a denied literal/rebound target
-            // must not trip the breaker as a connect failure). Genuine DNS/transport
-            // failures still record a CB failure.
-            if !crate::dns::is_egress_policy_denial(&e)
-                && let Some(ref cb_config) = proxy.circuit_breaker
-            {
+            // Settle any HALF_OPEN probe slot `can_execute` admitted. A
+            // backend-egress-policy denial dialed no backend, so release the slot
+            // NEUTRALLY (no count) rather than leaking it — otherwise
+            // `half_open_in_flight` stays consumed and the breaker can never
+            // recover. Genuine DNS/transport failures still record a failure.
+            if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_is_half_open_probe);
+                if crate::dns::is_egress_policy_denial(&e) {
+                    cb.record_neutral(cb_is_half_open_probe);
+                } else {
+                    cb.record_failure(502, true, cb_is_half_open_probe);
+                }
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -3219,19 +3222,22 @@ async fn create_session(
     {
         Ok(ip) => ip,
         Err(e) => {
-            // A backend-egress-policy denial means no backend was dialed, so keep
-            // circuit-breaker accounting neutral (a denied literal/rebound target
-            // must not trip the breaker as a connect failure). Genuine DNS/transport
-            // failures still record a CB failure.
-            if !crate::dns::is_egress_policy_denial(&e)
-                && let Some(ref cb_config) = proxy.circuit_breaker
-            {
+            // Settle any HALF_OPEN probe slot `can_execute` admitted. A
+            // backend-egress-policy denial dialed no backend, so release the slot
+            // NEUTRALLY (no count) rather than leaking it — otherwise
+            // `half_open_in_flight` stays consumed and the breaker can never
+            // recover. Genuine DNS/transport failures still record a failure.
+            if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_is_half_open_probe);
+                if crate::dns::is_egress_policy_denial(&e) {
+                    cb.record_neutral(cb_is_half_open_probe);
+                } else {
+                    cb.record_failure(502, true, cb_is_half_open_probe);
+                }
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",

@@ -2513,8 +2513,14 @@ async fn handle_tcp_connection_inner(
                 // A backend-egress-policy denial means no backend was dialed, so
                 // keep circuit-breaker accounting neutral (a denied literal/rebound
                 // target must not trip the breaker as a connect failure). Genuine
-                // DNS/transport failures still record a CB failure.
-                if !crate::dns::is_egress_policy_denial(&e) {
+                // DNS/transport failures still record a CB failure. Either way we
+                // must settle a HALF_OPEN probe slot `can_execute` admitted — a
+                // policy denial releases it NEUTRALLY (no count) rather than
+                // leaking it, else `half_open_in_flight` stays consumed and the
+                // breaker can never recover.
+                if crate::dns::is_egress_policy_denial(&e) {
+                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                } else {
                     record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 }
                 let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);

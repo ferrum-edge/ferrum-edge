@@ -886,49 +886,61 @@ impl HealthChecker {
                         // keeps the hostname so TLS SNI is unchanged but is still
                         // screened by the resolve above.
                         HealthProbeType::Tcp | HealthProbeType::Udp | HealthProbeType::Grpc => {
+                            // Strip URI brackets: `DnsCache::resolve` only
+                            // recognizes UNbracketed IP literals, so a bracketed
+                            // IPv6 target (`[::1]`, `[fd00::1]`) would fall through
+                            // to DNS and flap unhealthy. Bare hostnames pass through
+                            // unchanged (the legacy tcp/udp probe handled brackets
+                            // via `format_probe_socket_addr`).
+                            let resolve_host = host
+                                .strip_prefix('[')
+                                .and_then(|h| h.strip_suffix(']'))
+                                .unwrap_or(host.as_str());
                             match probe_dns_cache.as_ref() {
-                                Some(cache) => match cache.resolve(&host, None, None).await {
-                                    Ok(resolved_ip) => {
-                                        let ip_str = resolved_ip.to_string();
-                                        match probe_type {
-                                            HealthProbeType::Tcp => {
-                                                tcp_probe(&ip_str, port, timeout).await
-                                            }
-                                            HealthProbeType::Udp => {
-                                                udp_probe(&ip_str, port, timeout, &udp_payload)
+                                Some(cache) => {
+                                    match cache.resolve(resolve_host, None, None).await {
+                                        Ok(resolved_ip) => {
+                                            let ip_str = resolved_ip.to_string();
+                                            match probe_type {
+                                                HealthProbeType::Tcp => {
+                                                    tcp_probe(&ip_str, port, timeout).await
+                                                }
+                                                HealthProbeType::Udp => {
+                                                    udp_probe(&ip_str, port, timeout, &udp_payload)
+                                                        .await
+                                                }
+                                                // gRPC: dial the screened IP (`ip_str`)
+                                                // so tonic does not re-resolve and risk
+                                                // a split-DNS rebind, while keeping the
+                                                // hostname for TLS SNI / cert validation.
+                                                _ => {
+                                                    grpc_probe(
+                                                        &host,
+                                                        &ip_str,
+                                                        port,
+                                                        timeout,
+                                                        use_tls,
+                                                        &grpc_service_name,
+                                                        &probe_tls_config,
+                                                        probe_global_ca.as_deref(),
+                                                        probe_global_cert.as_deref(),
+                                                        probe_global_key.as_deref(),
+                                                        probe_no_verify,
+                                                    )
                                                     .await
-                                            }
-                                            // gRPC: dial the screened IP (`ip_str`)
-                                            // so tonic does not re-resolve and risk
-                                            // a split-DNS rebind, while keeping the
-                                            // hostname for TLS SNI / cert validation.
-                                            _ => {
-                                                grpc_probe(
-                                                    &host,
-                                                    &ip_str,
-                                                    port,
-                                                    timeout,
-                                                    use_tls,
-                                                    &grpc_service_name,
-                                                    &probe_tls_config,
-                                                    probe_global_ca.as_deref(),
-                                                    probe_global_cert.as_deref(),
-                                                    probe_global_key.as_deref(),
-                                                    probe_no_verify,
-                                                )
-                                                .await
+                                                }
                                             }
                                         }
+                                        Err(e) => {
+                                            warn!(
+                                                target = %host,
+                                                error = %e,
+                                                "Health probe target blocked or unresolvable by backend egress policy; marking unhealthy"
+                                            );
+                                            false
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!(
-                                            target = %host,
-                                            error = %e,
-                                            "Health probe target blocked or unresolvable by backend egress policy; marking unhealthy"
-                                        );
-                                        false
-                                    }
-                                },
+                                }
                                 // No DNS cache wired (e.g. tests): fall back to the
                                 // legacy direct dial.
                                 None => match probe_type {
@@ -1138,7 +1150,17 @@ async fn grpc_probe(
     let endpoint_url = format_probe_url(scheme, dial_addr, port, "");
 
     let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
-        Ok(ep) => ep.timeout(timeout).connect_timeout(timeout),
+        Ok(ep) => {
+            let ep = ep.timeout(timeout).connect_timeout(timeout);
+            // We dial `dial_addr` (the screened IP), but tonic otherwise derives
+            // the HTTP/2 `:authority` from that URI. Override the origin with the
+            // original host so a virtual-hosted / H2-multiplexed backend routes
+            // the health RPC the same as normal proxy traffic to the hostname.
+            match format_probe_url(scheme, host, port, "").parse::<http::Uri>() {
+                Ok(origin) => ep.origin(origin),
+                Err(_) => ep,
+            }
+        }
         Err(e) => {
             debug!(
                 "gRPC health probe: invalid endpoint for {}:{}: {}",

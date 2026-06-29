@@ -7917,16 +7917,21 @@ async fn handle_websocket_request_authenticated(
                 // (the default), WS backend connect failures never fed the
                 // breaker at all on H1/H2, and an admitted probe slot leaked
                 // permanently.
-                if !cb_failure_already_recorded
-                    && !ws_egress_denied
-                    && let Some(cb_config) = &proxy.circuit_breaker
-                {
+                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    if ws_egress_denied {
+                        // Gateway-side egress denial dialed no backend: release any
+                        // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
+                        // so the breaker can recover, rather than leaking it by
+                        // skipping the record entirely.
+                        cb.record_neutral(ws_cb_probe_slot_available);
+                    } else {
+                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    }
                 }
                 if !backend_outcome_already_recorded
                     && !ws_egress_denied

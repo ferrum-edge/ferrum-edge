@@ -882,16 +882,20 @@ pub(crate) async fn handle_h3_websocket(
                     });
                 }
 
-                if !cb_failure_already_recorded
-                    && !ws_egress_denied
-                    && let Some(cb_config) = &proxy.circuit_breaker
-                {
+                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    if ws_egress_denied {
+                        // Gateway-side egress denial dialed no backend: release any
+                        // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
+                        // recover, rather than leaking it by skipping the record.
+                        cb.record_neutral(ws_cb_probe_slot_available);
+                    } else {
+                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    }
                 }
 
                 crate::proxy::record_request(&state, 502);
