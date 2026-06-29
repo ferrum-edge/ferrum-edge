@@ -69,16 +69,21 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 > data-plane bind, `FERRUM_PROXY_BIND_ADDRESS`, still defaults to `0.0.0.0`). If
 > you move the admin API to any non-loopback address (`0.0.0.0`/`::`, a public
 > IP, or a private/VPC interface IP — all reachable beyond this host),
-> the writable `database`/`cp` modes **refuse to start** while the plaintext
+> the `database`/`cp` modes **refuse to start** while the plaintext
 > listener (`FERRUM_ADMIN_HTTP_PORT`, non-zero) has no `FERRUM_ADMIN_ALLOWED_CIDRS`
-> allowlist — otherwise the writable admin API and any operator bearer tokens
-> would be served in cleartext on every interface. To expose admin, do one of:
-> set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin over TLS and
-> disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
+> allowlist — otherwise the admin API and any operator bearer tokens
+> would be served in cleartext on every interface. **This applies even with
+> `FERRUM_ADMIN_READ_ONLY=true`**: read-only blocks mutations, but the admin API
+> still serves sensitive management-plane reads (e.g. unredacted `/backup`) and a
+> plaintext listener still exposes operator bearer tokens on the wire, so
+> read-only is not a substitute for loopback, TLS, or an allowlist. To expose
+> admin, do one of: set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin
+> over TLS and disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
 > `FERRUM_ADMIN_HTTP_PORT=0`), or — for local development only — set
-> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. Read-only modes (`file`/`dp`/`mesh`)
-> emit a high-severity warning instead of failing; the `node_agent` admin
-> listener also defaults to loopback.
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. The read-only **modes**
+> (`file`/`dp`/`mesh`) generate a random admin JWT secret at startup, so no
+> externally-minted token can validate; they emit a high-severity warning
+> instead of failing. The `node_agent` admin listener also defaults to loopback.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -86,7 +91,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | No | `127.0.0.1` | Bind address for admin listeners (HTTP, HTTPS). Loopback by default (safe — admin not network-exposed). Set to `0.0.0.0`/`::` to expose; in `database`/`cp` modes a public plaintext bind also needs an allowlist, TLS, or `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` (see the security note above) |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to connect to the admin API. Empty permits all |
-| `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` | No | `false` | Dev-only escape hatch. When `true`, downgrades the writable `database`/`cp` public-plaintext-admin startup guard from a hard error to a warning. Never enable in production |
+| `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` | No | `false` | Dev-only escape hatch. When `true`, downgrades the `database`/`cp` public-plaintext-admin startup guard (applies to read-only `database`/`cp` too) from a hard error to a warning. Never enable in production |
 | `FERRUM_ADMIN_MAX_CONNECTIONS` | No | `1024` | Max concurrent connections across all admin/management-plane listeners (plaintext + TLS share one cap). Independent of the data-plane `FERRUM_MAX_CONNECTIONS`. Enforced after the admin CIDR allowlist and before the TLS handshake / request parsing; over-limit connections are dropped (TCP RST). `0` = unlimited |
 | `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP` | No | `0` | Max concurrent admin connections per resolved source IP. `0` (default) disables per-IP limiting so a single monitoring/load-balancer source is not capped by accident |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
@@ -97,7 +102,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed |
 | `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (`exp - iat`) for externally minted Admin API JWTs |
-| `FERRUM_ADMIN_READ_ONLY` | No | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
+| `FERRUM_ADMIN_READ_ONLY` | No | `false` | Set Admin API to read-only mode (DP mode defaults to true). Blocks mutations only — it does **not** exempt the plaintext-admin startup guard above, since read endpoints (e.g. `/backup`) and bearer tokens remain sensitive |
 | `FERRUM_ADMIN_AUDIT_ENABLED` | No | `false` | Enable database-backed audit events for successful Admin API mutations. Responses wait only for bounded queue enqueue; persistence is asynchronous best-effort |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE` | No | — | Source override for `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`; accepts path, `file://`, inline PEM, or provider URI |
