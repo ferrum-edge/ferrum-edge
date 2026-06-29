@@ -25,8 +25,9 @@ paths:
 - Admin API validates JWTs but never mints them. Operators pre-sign tokens externally.
 - DB and CP modes require `FERRUM_ADMIN_JWT_SECRET` of at least 32 chars because their admin APIs are writable.
 - File and DP admin surfaces are read-only where configured and must reject writes.
-- `/health` remains unauthenticated and DB check remains cached 15s via `AdminState.CachedDbHealthResult`.
-- `/health` response includes `database.pool` stats when connected.
+- Observability surfaces are tiered (`MetricsAuthPolicy` + `observability_detail_allowed` in `src/admin/mod.rs`): `/live` is always unauthenticated and returns only `{"status":"ok"}`; `/health`+`/status` return `status`+`ready` unauthenticated and full diagnostics only when authenticated; `/overload` returns coarse `{level}` unauthenticated and the full snapshot only when authenticated; `/metrics` returns `401` unless authenticated. "Authenticated" = valid admin JWT OR matching `FERRUM_METRICS_BEARER_TOKEN` OR a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Do not regress these to unauthenticated detail.
+- `/health` (and `/overload`) still respond unauthenticated so liveness/LB probes work; the DB check remains cached 15s via `AdminState.CachedDbHealthResult` so unauthenticated probes cannot flood the pool.
+- `/health` response includes `database.pool` stats when connected, but only in the authenticated (detailed) tier.
 - `/metrics/runtime` remains JWT-authenticated and cached through `runtime_metrics_cache()`.
 - `GET /cluster` is JWT-authenticated. CP returns connected DPs from `DpNodeRegistry`; DP returns CP connection state including primary/fallback and `last_config_received_at`.
 - `GET /backend-capabilities` and `POST /backend-capabilities/refresh` are JWT-authenticated and expose only classifications plus probe timestamps.

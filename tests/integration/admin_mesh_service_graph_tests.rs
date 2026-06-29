@@ -69,6 +69,7 @@ fn admin_state_with_mesh_runtime(
     AdminState {
         db: None,
         jwt_manager: jwt,
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "mesh".to_string(),

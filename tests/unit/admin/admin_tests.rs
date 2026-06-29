@@ -50,6 +50,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
