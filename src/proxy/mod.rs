@@ -23401,8 +23401,12 @@ async fn proxy_to_backend_http3_retry(
             }
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
-            let is_conn_error = !e.request_on_wire();
             let (error_kind, error_class) = classify_h3_pool_error(&e);
+            // …except a gateway-side egress denial (DispatchPolicyRejected) dialed
+            // no backend, so keep it non-retryable + backend-health-neutral even
+            // on the retry path (matches the other H3 dispatch sites).
+            let is_conn_error = !e.request_on_wire()
+                && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
             record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,

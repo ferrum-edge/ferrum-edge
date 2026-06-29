@@ -196,6 +196,20 @@ impl RedisConfig {
         Some(host)
     }
 
+    /// Parse the Redis URL host as a literal IP — the dual of [`hostname`], which
+    /// returns `None` for literals. Strips URI brackets; returns `None` for
+    /// hostnames. Used to screen a literal `redis_url` at dial time, since the
+    /// hostname-based DNS-cache screen never sees it.
+    fn literal_host_ip(&self) -> Option<std::net::IpAddr> {
+        let url = Url::parse(&self.effective_url()).ok()?;
+        let host = normalized_url_hostname(&url)?;
+        host.strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&host)
+            .parse::<std::net::IpAddr>()
+            .ok()
+    }
+
     /// Build a Redis URL with a resolved IP address substituted for the hostname.
     ///
     /// For non-TLS connections, replacing the hostname with a resolved IP avoids
@@ -452,6 +466,21 @@ impl RedisRateLimitClient {
                 }
             }
         }
+        // A literal-IP `redis_url` never reaches the hostname screen above
+        // (`hostname()` is None for literals), and the config-load Redis screen is
+        // warning-only in database mode — so screen the literal here too and fail
+        // CLOSED on a denial instead of handing the literal to the Redis client.
+        if let Some(ref dns_cache) = self.dns_cache
+            && let Some(ip) = self.config.literal_host_ip()
+            && let Some(reason) = dns_cache.backend_allow_ips().deny_reason(&ip)
+        {
+            warn!(
+                redis_ip = %ip,
+                reason,
+                "Redis literal host blocked by backend egress policy — failing closed (in-memory fallback)"
+            );
+            return None;
+        }
         Some(self.config.effective_url())
     }
 
@@ -542,9 +571,11 @@ impl RedisRateLimitClient {
 
         let Some(url) = self.resolve_url().await else {
             // Egress policy blocked the Redis host: fail closed to the in-memory
-            // limiter rather than dialing a denied address.
+            // limiter. Do NOT start the recovery health-checker — it would
+            // re-resolve and, on a generic DNS error, fall back to dialing the
+            // denied host every interval. A policy denial is config, not a
+            // transient outage; a config change rebuilds the client.
             self.mark_unavailable();
-            self.start_health_checker_if_needed();
             return None;
         };
         let client = match self.build_client(&url) {
@@ -608,9 +639,11 @@ impl RedisRateLimitClient {
     async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
         let Some(url) = self.resolve_url().await else {
             // Egress policy blocked the Redis host: fail closed to the in-memory
-            // limiter rather than dialing a denied address.
+            // limiter. Do NOT start the recovery health-checker — it would
+            // re-resolve and, on a generic DNS error, fall back to dialing the
+            // denied host every interval. A policy denial is config, not a
+            // transient outage; a config change rebuilds the client.
             self.mark_unavailable();
-            self.start_health_checker_if_needed();
             return None;
         };
         let client = match self.build_client(&url) {
@@ -1279,6 +1312,42 @@ mod tests {
         // `-i64::MIN` overflows; the helper must saturate to `i64::MAX` rather
         // than panic on overflow.
         assert_eq!(floor_zero_compensation(i64::MIN), Some(i64::MAX));
+    }
+
+    #[test]
+    fn literal_host_ip_and_hostname_are_duals() {
+        use super::RedisConfig;
+        use serde_json::json;
+
+        let cfg = |url: &str| {
+            RedisConfig::from_plugin_config(
+                &json!({"sync_mode": "redis", "redis_url": url}),
+                "test",
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        // Literal-IP redis_url: `hostname()` returns None (so the hostname DNS
+        // screen never sees it), which is exactly why `literal_host_ip()` must
+        // surface the IP for the dial-time literal screen / fail-closed path.
+        let metadata = cfg("redis://169.254.169.254:6379");
+        assert_eq!(metadata.hostname(), None);
+        assert_eq!(
+            metadata.literal_host_ip(),
+            Some("169.254.169.254".parse().unwrap())
+        );
+
+        let loopback = cfg("redis://127.0.0.1:6379");
+        assert_eq!(
+            loopback.literal_host_ip(),
+            Some("127.0.0.1".parse().unwrap())
+        );
+
+        // Hostname redis_url: the dual — `hostname()` Some, `literal_host_ip()` None.
+        let host = cfg("redis://cache.internal:6379");
+        assert_eq!(host.hostname(), Some("cache.internal".to_string()));
+        assert_eq!(host.literal_host_ip(), None);
     }
 
     #[test]

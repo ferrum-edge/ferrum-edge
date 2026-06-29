@@ -1496,7 +1496,11 @@ fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     context: &'static str,
 ) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    // Carry the no-redirect policy into the degraded fallback too: a 3xx to an
+    // IP literal would otherwise skip the DnsCacheResolver and the egress screen,
+    // bouncing the probe to a denied address (same rationale as the primary
+    // builders).
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -1504,11 +1508,16 @@ fn build_dns_cached_fallback_client(
     builder.build().unwrap_or_else(|e| {
         tracing::error!(
             "Failed to build minimal DNS-cached fallback {} client: {}. \
-             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+             Using a redirect-disabled minimal client as a last resort — DNS will bypass the gateway cache.",
             context,
             e
         );
-        reqwest::Client::new()
+        // Last resort: still disable redirects. Fall back to `Client::new()` only
+        // if even this trivial builder fails (effectively never).
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 

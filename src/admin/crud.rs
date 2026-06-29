@@ -1473,6 +1473,12 @@ impl AdminResource for PluginConfig {
             crate::plugins::screen_mesh_route_dispatch_egress(&self.config, ctx.backend_allow_ips)
                 .map_err(ValidationError::Fields)?;
         }
+        // Redis-backed plugins (rate_limiting / request_deduplication /
+        // ai_semantic_cache) build their client from `redis_url` without the
+        // egress policy; screen a denied literal endpoint on direct/batch admin
+        // writes too, matching the policy-aware whole-config / API-spec paths.
+        crate::plugins::screen_redis_endpoint_egress(&self.config, ctx.backend_allow_ips)
+            .map_err(|e| ValidationError::Fields(vec![e]))?;
         Ok(())
     }
 

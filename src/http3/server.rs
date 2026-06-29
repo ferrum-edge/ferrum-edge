@@ -2083,7 +2083,16 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             cb_is_half_open_probe,
         );
-        record_request(&state, 502);
+        // `send_h3_error_flavor_aware` emits a gRPC error as HTTP 200 + trailers
+        // (gRPC errors ride 200), so the recorded request status must match the
+        // wire — 200 for gRPC, 502 otherwise — to agree with the H1/H2 gRPC
+        // egress reject path.
+        let reject_metric_status = if http_flavor == HttpFlavor::Grpc {
+            200
+        } else {
+            502
+        };
+        record_request(&state, reject_metric_status);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -3753,7 +3762,10 @@ async fn handle_h3_request(
             (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
             (None, Some(_)) => true,
             (Some(_), Some(_)) => true,
-            (Some(_), None) => !h3_stream_result.request_on_wire,
+            (Some(_), None) => h3_connection_error(
+                h3_stream_result.request_on_wire,
+                h3_stream_result.error_class,
+            ),
         };
         // Prefer the body class so a body-only ClientDisconnect is recognized as
         // a client-side (non-backend) signal by passive health / the breaker
@@ -3912,7 +3924,10 @@ async fn handle_h3_request(
                 &method,
                 &crate::retry::BackendResponse {
                     status_code: result.status,
-                    connection_error: !result.request_on_wire,
+                    connection_error: h3_connection_error(
+                        result.request_on_wire,
+                        result.error_class,
+                    ),
                     body: crate::retry::ResponseBody::Buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
@@ -3923,7 +3938,7 @@ async fn handle_h3_request(
                 record_h3_backend_admission_outcome(
                     &mut backend_admission_permits,
                     result.status,
-                    !result.request_on_wire,
+                    h3_connection_error(result.request_on_wire, result.error_class),
                     result.error_class,
                     backend_admission_start.elapsed(),
                 );
@@ -3939,7 +3954,7 @@ async fn handle_h3_request(
                     );
                     cb.record_failure(
                         result.status,
-                        !result.request_on_wire,
+                        h3_connection_error(result.request_on_wire, result.error_class),
                         cb_retry_probe_slot_available,
                     );
                     cb_retry_probe_slot_available = false;
@@ -4003,7 +4018,7 @@ async fn handle_h3_request(
                     proxy_id = %proxy.id,
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
-                    connection_error = !result.request_on_wire,
+                    connection_error = h3_connection_error(result.request_on_wire, result.error_class),
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
@@ -4698,6 +4713,27 @@ pub(crate) fn inject_sticky_cookie(
                 .or_insert(cookie_val);
         }
     }
+}
+
+/// Whether an H3 dispatch failure counts as a connect-class (pre-wire) backend
+/// failure for circuit-breaker / adaptive-concurrency accounting.
+///
+/// `request_on_wire` is the authoritative H3 signal — `connection_error` is its
+/// negation — for every *transport* class. The one exception is a gateway-side
+/// egress denial (`DispatchPolicyRejected`): it dialed no backend, so it must be
+/// neutral even though `request_on_wire` is false, otherwise adaptive concurrency
+/// shrinks the limit and the breaker trips for a policy denial. This is the same
+/// narrow override the native-H3 dispatch sites apply inline; `DispatchPolicyRejected`
+/// is a gateway class, not a transport class that could disagree with the signal.
+fn h3_connection_error(
+    request_on_wire: bool,
+    error_class: Option<crate::retry::ErrorClass>,
+) -> bool {
+    !request_on_wire
+        && !matches!(
+            error_class,
+            Some(crate::retry::ErrorClass::DispatchPolicyRejected)
+        )
 }
 
 fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
@@ -5973,7 +6009,8 @@ async fn dispatch_grpc_native_h3(
             // pre-`send_request`) is a connection error; a post-wire reset, read
             // timeout, or oversized / aborted upload already reached the backend
             // wire and must NOT be recorded as a connect-class failure.
-            let outcome_connection_error = !e.request_on_wire();
+            let outcome_connection_error =
+                h3_connection_error(e.request_on_wire(), outcome_error_class);
             crate::proxy::backend_dispatch::record_backend_outcome(
                 state,
                 proxy,

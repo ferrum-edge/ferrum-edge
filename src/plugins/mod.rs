@@ -3363,7 +3363,7 @@ pub fn validate_plugin_config_with_policy(
 /// endpoint (`redis://169.254.169.254:6379`) would otherwise be dialed. No-op
 /// when there is no `redis_url`, it's a hostname (screened at resolve), or it
 /// doesn't parse (shape errors are surfaced by the constructor).
-fn screen_redis_endpoint_egress(
+pub(crate) fn screen_redis_endpoint_egress(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
