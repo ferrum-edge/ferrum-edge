@@ -3129,20 +3129,19 @@ impl EnvConfig {
         }
     }
 
-    /// Hard-fail guard for the **writable** admin API. Returns `Some(error)`
-    /// when a `database`/`cp`-mode gateway would start a plaintext admin HTTP
-    /// listener reachable beyond loopback with no (effective)
-    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist and without the explicit
-    /// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
+    /// Hard-fail guard for the admin API. Returns `Some(error)` when a
+    /// `database`/`cp`-mode gateway would start a plaintext admin HTTP listener
+    /// reachable beyond loopback with no (effective) `FERRUM_ADMIN_ALLOWED_CIDRS`
+    /// allowlist and without the explicit `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev
+    /// opt-in.
     ///
-    /// The hard error is reserved for the elevated risk of an unauthenticated-
-    /// network-exposed *writable* admin surface. Read-only admin surfaces get a
-    /// high-severity startup warning instead (see `main.rs`): the read-only
-    /// modes (`file`/`dp`/`mesh`), and also `database`/`cp` when
-    /// `FERRUM_ADMIN_READ_ONLY=true` blocks mutations — in that case the
-    /// remaining plaintext-token risk matches the read-only modes, so it warns
-    /// rather than forcing an allowlist/opt-in just to start. The node-agent
-    /// admin listener has its own safe-by-default loopback fallback.
+    /// `FERRUM_ADMIN_READ_ONLY=true` blocks admin mutations, but it is not a
+    /// substitute for loopback binding, TLS-only admin, or an effective IP
+    /// allowlist: read-only admin still serves sensitive management-plane reads
+    /// (for example unredacted backups), and plaintext listeners still expose
+    /// operator bearer tokens on the network. The read-only modes
+    /// (`file`/`dp`/`mesh`) warn instead of failing; the node-agent admin listener
+    /// has its own safe-by-default loopback fallback.
     ///
     /// Pure (reads only `self`), so it is unit-testable without touching the
     /// process environment.
@@ -3151,10 +3150,6 @@ impl EnvConfig {
             self.mode,
             OperatingMode::Database | OperatingMode::ControlPlane
         ) {
-            return None;
-        }
-        // A read-only db/cp admin is not a writable surface — warn, don't fail.
-        if self.admin_read_only {
             return None;
         }
         if self.admin_http_exposure() != AdminHttpExposure::ReachableUnrestricted {
