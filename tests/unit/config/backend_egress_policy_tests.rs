@@ -189,6 +189,41 @@ fn deny_cidr_matches_both_local_use_nat64_layouts() {
 }
 
 #[test]
+fn ambiguous_local_use_nat64_deny_wins_over_cross_decode_allow() {
+    // A NAT64 local-use address decodes to TWO IPv4s; an allow match on one decode
+    // must NOT override a deny match on the other (the backend could resolve to
+    // either layout). `64:ff9b:1:a01:2:500::` is 10.1.0.2 contiguously (allow-listed)
+    // but 10.1.2.5 under RFC 6052 (deny-listed) — so it must be DENIED.
+    let p = BackendEgressPolicy::from_env(
+        BackendAllowIps::Both,
+        "10.1.0.2/32", // allow the contiguous decode
+        "10.1.2.0/24", // deny the RFC 6052 decode's range
+        true,
+    )
+    .expect("valid");
+    assert!(p.is_allowed(&ip("10.1.0.2"))); // the allow-listed decode on its own
+    assert!(!p.is_allowed(&ip("10.1.2.5"))); // the denied decode on its own
+    assert!(!p.is_allowed(&ip("64:ff9b:1:a01:2:500::"))); // ambiguous: deny wins
+
+    // Escape hatch still works when BOTH decodes are explicitly allow-listed.
+    let both = BackendEgressPolicy::from_env(
+        BackendAllowIps::Both,
+        "10.1.0.2/32,10.1.2.5/32",
+        "10.1.2.0/24",
+        true,
+    )
+    .expect("valid");
+    assert!(both.is_allowed(&ip("64:ff9b:1:a01:2:500::")));
+
+    // The same protection covers the dangerous-range baseline: allow-listing only
+    // one decode of a NAT64-encoded IMDS address must not let it through, because
+    // the other decode is still link-local.
+    let imds = BackendEgressPolicy::from_env(BackendAllowIps::Both, "169.254.169.254/32", "", true)
+        .expect("valid");
+    assert!(!imds.is_allowed(&ip("64:ff9b:1:a9fe:a9fe::")));
+}
+
+#[test]
 fn allow_cidr_takes_precedence_over_deny_cidr() {
     // Overlapping allow + deny: allow wins (checked first).
     let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "10.0.0.5/32", "10.0.0.0/8", true)

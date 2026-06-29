@@ -616,15 +616,31 @@ impl BackendEgressPolicy {
         // can't be bypassed by a backend that resolves to the IPv6 encoding of
         // that address (`64:ff9b::0a00:1`, `::ffff:10.0.0.1`, …).
         let embedded = embedded_ipv4(addr).map(std::net::IpAddr::V4);
-        // A NAT64 local-use prefix can embed the IPv4 in either the contiguous
-        // layout (covered by `embedded` above) or the RFC 6052 /48 u-byte-split
-        // layout — check the split candidate too so neither DNS64 layout evades a
-        // deny/allow CIDR rule written in IPv4 form.
-        let embedded_rfc6052 = embedded_ipv4_local_use_rfc6052(addr).map(std::net::IpAddr::V4);
+        // A NAT64 *local-use* address (`64:ff9b:1::/48`, RFC 8215) decodes to TWO
+        // possible IPv4 addresses depending on the DNS64 octet layout — the
+        // contiguous layout (`embedded` above) and the RFC 6052 /48 u-byte-split
+        // layout — and the gateway cannot know which the backend will actually
+        // resolve to. So the address is acceptable only if BOTH decodes are
+        // individually acceptable: evaluate each through the FULL precedence and
+        // deny if EITHER is denied. This stops an allow match on one decode from
+        // overriding a deny/dangerous match on the other (the attacker picks the
+        // layout), while a per-decode `FERRUM_BACKEND_ALLOW_CIDRS` entry is still
+        // honored as the escape hatch. Recursion terminates: each decode is an
+        // IPv4, for which `embedded_ipv4_local_use_rfc6052` is `None`.
+        if let Some(rfc6052_decode) =
+            embedded_ipv4_local_use_rfc6052(addr).map(std::net::IpAddr::V4)
+        {
+            let contiguous_decode = embedded.unwrap_or(rfc6052_decode);
+            if let Some(reason) = self.deny_reason(&contiguous_decode) {
+                return Some(reason);
+            }
+            return self.deny_reason(&rfc6052_decode);
+        }
+        // Every other address embeds at most ONE IPv4 (well-known NAT64 `/96`,
+        // IPv4-mapped, IPv4-compatible); match CIDR rules against the address and
+        // that single decode.
         let cidr_match = |set: &CidrSet| {
-            set.contains(addr)
-                || embedded.as_ref().is_some_and(|e| set.contains(e))
-                || embedded_rfc6052.as_ref().is_some_and(|e| set.contains(e))
+            set.contains(addr) || embedded.as_ref().is_some_and(|e| set.contains(e))
         };
         // 1. Explicit allow overrides every deny below.
         if cidr_match(&self.allow_cidrs) {
