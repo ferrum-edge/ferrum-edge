@@ -2308,6 +2308,21 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 
 /// Auto-anchor a regex listen_path pattern for full-path matching.
 ///
+/// Parse a backend host as a literal IP, stripping URI brackets first.
+///
+/// `build_backend_url_with_target` preserves bracketed IPv6 literals
+/// (`[fd00:ec2::254]`) and the runtime dial paths strip the brackets before
+/// screening, so config/admin/API-spec admission must do the same — otherwise a
+/// bracketed denied literal parses as a non-IP here and is admitted, only to be
+/// blocked later at dispatch.
+pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>().ok()
+}
+
 /// Wraps the operator pattern in a non-capturing group and anchors the group,
 /// ensuring alternation and other top-level regex operators still apply to the
 /// full request path. Operators who need prefix-style matching can end their
@@ -4307,7 +4322,7 @@ impl Proxy {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if let Ok(ip) = self.backend_host.parse::<std::net::IpAddr>()
+        if let Some(ip) = egress_literal_ip(&self.backend_host)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
@@ -4315,7 +4330,7 @@ impl Proxy {
             ));
         }
         if let Some(ref dns_override) = self.dns_override
-            && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
+            && let Some(ip) = egress_literal_ip(dns_override)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
@@ -5220,7 +5235,7 @@ impl Upstream {
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for (i, target) in self.targets.iter().enumerate() {
-            if let Ok(ip) = target.host.parse::<std::net::IpAddr>()
+            if let Some(ip) = egress_literal_ip(&target.host)
                 && let Some(reason) = backend_allow_ips.deny_reason(&ip)
             {
                 errors.push(format!(

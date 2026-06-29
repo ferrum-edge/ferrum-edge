@@ -210,6 +210,29 @@ impl ServiceDiscoveryManager {
             }
             SdProvider::Kubernetes => {
                 if let Some(k8s_config) = &sd_config.kubernetes {
+                    // Screen the in-cluster API endpoint before starting the
+                    // poller: KubernetesDiscoverer reads KUBERNETES_SERVICE_HOST
+                    // and dials `https://{host}:{port}` via the raw client
+                    // (`.send()`), bypassing execute_request, and reqwest skips
+                    // the resolver for an IP-literal host. A denied literal (e.g.
+                    // a private API IP under `FERRUM_BACKEND_ALLOW_IPS=public`)
+                    // must be rejected before the service-account bearer token is
+                    // ever sent.
+                    if let Ok(api_host) = std::env::var("KUBERNETES_SERVICE_HOST")
+                        && let Some(ip) = api_host
+                            .strip_prefix('[')
+                            .and_then(|h| h.strip_suffix(']'))
+                            .unwrap_or(api_host.as_str())
+                            .parse::<IpAddr>()
+                            .ok()
+                        && let Some(reason) = self.http_client.backend_allow_ips().deny_reason(&ip)
+                    {
+                        warn!(
+                            "Service discovery: upstream {} Kubernetes API host {} blocked by egress policy: {}",
+                            upstream_id, api_host, reason
+                        );
+                        return;
+                    }
                     Box::new(kubernetes::KubernetesDiscoverer::new(
                         self.http_client.get().clone(),
                         k8s_config.namespace.clone(),

@@ -2510,7 +2510,13 @@ async fn handle_tcp_connection_inner(
         {
             Ok(ip) => ip,
             Err(e) => {
-                record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
+                // A backend-egress-policy denial means no backend was dialed, so
+                // keep circuit-breaker accounting neutral (a denied literal/rebound
+                // target must not trip the breaker as a connect failure). Genuine
+                // DNS/transport failures still record a CB failure.
+                if !crate::dns::is_egress_policy_denial(&e) {
+                    record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
+                }
                 let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);
                 if can_retry
                     && attempt < max_retries

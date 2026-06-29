@@ -898,12 +898,14 @@ impl HealthChecker {
                                                 udp_probe(&ip_str, port, timeout, &udp_payload)
                                                     .await
                                             }
-                                            // gRPC: dial the hostname to preserve TLS
-                                            // SNI; the resolve above already screened
-                                            // the resolved address.
+                                            // gRPC: dial the screened IP (`ip_str`)
+                                            // so tonic does not re-resolve and risk
+                                            // a split-DNS rebind, while keeping the
+                                            // hostname for TLS SNI / cert validation.
                                             _ => {
                                                 grpc_probe(
                                                     &host,
+                                                    &ip_str,
                                                     port,
                                                     timeout,
                                                     use_tls,
@@ -935,7 +937,10 @@ impl HealthChecker {
                                         udp_probe(&host, port, timeout, &udp_payload).await
                                     }
                                     _ => {
+                                        // No DNS cache to screen/pin an IP; dial the
+                                        // hostname directly (legacy behavior).
                                         grpc_probe(
+                                            &host,
                                             &host,
                                             port,
                                             timeout,
@@ -1114,6 +1119,7 @@ async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> 
 #[allow(clippy::too_many_arguments)]
 async fn grpc_probe(
     host: &str,
+    dial_addr: &str,
     port: u16,
     timeout: Duration,
     use_tls: bool,
@@ -1125,7 +1131,11 @@ async fn grpc_probe(
     global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
-    let endpoint_url = format_probe_url(scheme, host, port, "");
+    // Dial the pre-screened address (`dial_addr` = the resolved IP from the
+    // health loop) so tonic does not re-resolve `host` and risk a split-DNS /
+    // rebind to a denied address between the egress screen and the dial. TLS
+    // SNI and the cert hostname still come from `host` (see `domain_name`).
+    let endpoint_url = format_probe_url(scheme, dial_addr, port, "");
 
     let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
         Ok(ep) => ep.timeout(timeout).connect_timeout(timeout),
@@ -1176,7 +1186,9 @@ async fn grpc_probe(
             }
         }
     } else if use_tls {
-        let mut tonic_tls = tonic::transport::ClientTlsConfig::new();
+        // SNI / cert hostname stays the original `host` even though we dial the
+        // pre-screened IP via `dial_addr`, so backend cert validation is unchanged.
+        let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(host);
 
         // Load CA certs (upstream → global → system roots)
         if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
@@ -1404,6 +1416,10 @@ fn build_health_check_client(
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        // Do not follow redirects on health probes: a 3xx from an allowed host to
+        // an IP literal (e.g. http://169.254.169.254/) skips the DnsCacheResolver
+        // and the one-time egress screen, bouncing the probe to a denied address.
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(no_verify);
 
     if let Some(dns_cache) = dns_cache.clone() {
@@ -1485,6 +1501,9 @@ fn build_health_check_client_with_tls(
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        // Do not follow redirects on health probes: a 3xx to an IP literal skips
+        // the DnsCacheResolver and the egress screen (see build_health_check_client).
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(skip_verify);
 
     if let Some(dns_cache) = dns_cache.clone() {
@@ -1593,6 +1612,7 @@ pub async fn grpc_probe_for_test(
 ) -> bool {
     let default_tls = BackendTlsConfig::default_verify();
     grpc_probe(
+        host,
         host,
         port,
         timeout,

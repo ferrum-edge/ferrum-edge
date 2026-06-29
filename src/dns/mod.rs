@@ -1245,6 +1245,21 @@ impl DnsCache {
     }
 }
 
+/// Whether a [`DnsCache::resolve`] / [`DnsCache::resolve_all`] error is a
+/// backend-egress-policy denial (the resolved or literal address was blocked by
+/// [`check_backend_ip_policy`]) rather than a transport DNS failure.
+///
+/// reqwest paths classify this via `classify_reqwest_error` (the resolver wraps
+/// the message into an io error). Direct stream-proxy callers — TCP/UDP setup,
+/// denied `dns_override` construction — instead call this so they keep circuit-
+/// breaker / adaptive-concurrency accounting NEUTRAL: no backend was dialed, so
+/// a policy denial must not be recorded as a connect-class failure that could
+/// trip the breaker for an otherwise-reachable target. Matches the stable
+/// `denied by backend egress policy` marker emitted by `check_backend_ip_policy`.
+pub fn is_egress_policy_denial(err: &anyhow::Error) -> bool {
+    err.to_string().contains("denied by backend egress policy")
+}
+
 /// Build a hickory-resolver `Resolver` from a `DnsConfig`.
 fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
     // Start with system configuration as the base

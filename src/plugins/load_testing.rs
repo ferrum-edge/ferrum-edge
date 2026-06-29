@@ -206,6 +206,11 @@ impl LoadTesting {
         // client for hostname targets.
         let mut load_test_builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
+            // Do not follow redirects: a 3xx `Location: http://169.254.169.254/`
+            // from the target under test would otherwise bounce the synthetic
+            // request to an IP literal that skips the DnsCacheResolver, bypassing
+            // the egress baseline from the load-test worker.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(request_timeout_ms));
         if let Some(dns_cache) = http_client.dns_cache() {
             load_test_builder =

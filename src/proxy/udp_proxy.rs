@@ -2733,7 +2733,13 @@ async fn handle_dtls_client_inner(
     {
         Ok(ip) => ip,
         Err(e) => {
-            if let Some(ref cb_config) = proxy.circuit_breaker {
+            // A backend-egress-policy denial means no backend was dialed, so keep
+            // circuit-breaker accounting neutral (a denied literal/rebound target
+            // must not trip the breaker as a connect failure). Genuine DNS/transport
+            // failures still record a CB failure.
+            if !crate::dns::is_egress_policy_denial(&e)
+                && let Some(ref cb_config) = proxy.circuit_breaker
+            {
                 let cb = circuit_breaker_cache.get_or_create(
                     proxy_id,
                     cb_target_key.as_deref(),
@@ -3213,7 +3219,13 @@ async fn create_session(
     {
         Ok(ip) => ip,
         Err(e) => {
-            if let Some(ref cb_config) = proxy.circuit_breaker {
+            // A backend-egress-policy denial means no backend was dialed, so keep
+            // circuit-breaker accounting neutral (a denied literal/rebound target
+            // must not trip the breaker as a connect failure). Genuine DNS/transport
+            // failures still record a CB failure.
+            if !crate::dns::is_egress_policy_denial(&e)
+                && let Some(ref cb_config) = proxy.circuit_breaker
+            {
                 let cb = circuit_breaker_cache.get_or_create(
                     proxy_id,
                     cb_target_key.as_deref(),

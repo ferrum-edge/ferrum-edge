@@ -13928,11 +13928,14 @@ async fn handle_proxy_request_inner(
                 reason,
                 "Backend egress policy denied literal-IP gRPC backend; not dialing"
             );
-            // Mirror the cross-cluster gRPC reject accounting: this reject
-            // precedes any dispatch, so release a HALF_OPEN probe slot
-            // `check_circuit_breaker` may have admitted (else it wedges the
-            // breaker) and count the request so policy-denied gRPC calls still
-            // appear in request/status metrics instead of vanishing.
+            // Release a HALF_OPEN probe slot `check_circuit_breaker` may have
+            // admitted (else it wedges the breaker) and count the request so
+            // policy-denied gRPC calls still appear in request/status metrics.
+            // Unlike the cross-cluster reject above (which runs BEFORE
+            // `grpc_probe_guard` exists), this reject is AFTER the guard, so
+            // disarm it first — otherwise its still-armed `Drop` fires a SECOND
+            // neutral release that would decrement another in-flight probe slot.
+            grpc_probe_guard.disarm();
             release_circuit_breaker_probe_on_admission_reject(
                 &state,
                 &proxy,
