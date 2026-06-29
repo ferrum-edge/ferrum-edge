@@ -80,10 +80,15 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 > admin, do one of: set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin
 > over TLS and disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
 > `FERRUM_ADMIN_HTTP_PORT=0`), or — for local development only — set
-> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. The read-only **modes**
-> (`file`/`dp`/`mesh`) generate a random admin JWT secret at startup, so no
-> externally-minted token can validate; they emit a high-severity warning
-> instead of failing. The `node_agent` admin listener also defaults to loopback.
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. The hard fail is scoped to the
+> write-capable `database`/`cp` modes (where read-only is only an opt-in toggle
+> that does not reduce read/token exposure); the inherently read-only modes
+> (`file`/`dp`/`mesh`) emit a high-severity warning instead of failing. (Note:
+> `file`/`mesh` fall back to a random, unguessable admin JWT secret when
+> `FERRUM_ADMIN_JWT_SECRET` is unset, so externally-minted tokens cannot validate
+> there; `dp` requires the secret and aborts startup if it is missing. Either way,
+> if you bind a plaintext admin listener beyond loopback, prefer an allowlist or
+> TLS.) The `node_agent` admin listener also defaults to loopback.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
