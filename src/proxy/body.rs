@@ -1656,8 +1656,10 @@ impl<S> H3FrameSource<S> {
         self.state = H3FrameSourceState::Trailers;
         // Only enable collapse-on-timeout for a COMPLETE body — a truncated body
         // that FINs early must keep surfacing a failure on a trailer timeout /
-        // graceful close (#1940 review).
-        let body_complete = crate::http3::client::is_response_body_complete(
+        // graceful close. Use the post-FIN predicate: a clean FIN already ended
+        // the DATA stream, so an absent Content-Length (FIN-delimited / chunked)
+        // is complete; only a declared-length mismatch is rejected (#1940 review).
+        let body_complete = crate::http3::client::is_response_body_complete_after_fin(
             self.received,
             &self.method,
             self.status,
@@ -1769,16 +1771,15 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             // finished without trailers — emit a clean EOS rather
                             // than a spurious stream error, matching the buffered
                             // drain's `read_h3_trailers_with_timeout` ("no
-                            // trailers"). Gate it on the SAME completeness
-                            // predicate the DATA-phase graceful-close arm uses:
-                            // entering the trailer state on a clean FIN does NOT
-                            // prove the body satisfied its declared Content-Length
-                            // (a truncated body can FIN early), so recover only
-                            // when `received` matches — otherwise a truncated H3
-                            // response would be laundered into a successful
-                            // deferred dispatch instead of surfacing the framing
-                            // error (#1940 review).
-                            if crate::http3::client::is_response_body_complete(
+                            // trailers"). Use the POST-FIN completeness predicate:
+                            // a clean FIN already ended the DATA stream here, so an
+                            // absent Content-Length (FIN-delimited / chunked) is
+                            // complete; only a declared-length mismatch (a body
+                            // that FINs early or overlong) is rejected — otherwise
+                            // a truncated H3 response would be laundered into a
+                            // successful deferred dispatch instead of surfacing the
+                            // framing error (#1940 review).
+                            if crate::http3::client::is_response_body_complete_after_fin(
                                 this.received,
                                 &this.method,
                                 this.status,
@@ -3643,6 +3644,34 @@ mod tests {
             progress.epoch.load(Ordering::Acquire),
             2,
             "the FIN still bumps the epoch (backend progress) even when truncated",
+        );
+    }
+
+    #[test]
+    fn h3_frame_source_fin_delimited_body_flags_trailer_collapse() {
+        // A FIN-delimited body (no Content-Length, i.e. chunked/streaming) is
+        // COMPLETE once it cleanly FINs, so collapse-on-timeout IS enabled — a
+        // subsequent trailer timeout / graceful close forwards the complete
+        // response without trailers, matching the buffered drain (#1940 review).
+        let progress = Arc::new(H3ReadProgress::default());
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![
+                    MockH3DataStep::Data(Bytes::from("body")),
+                    MockH3DataStep::End,
+                ],
+                vec![MockH3TrailerStep::Pending],
+            ),
+            Arc::from("GET"),
+            200,
+            None, // no Content-Length → FIN-delimited, complete on FIN
+            Some(Arc::clone(&progress)),
+        );
+        assert!(matches!(poll_source(&mut source), Poll::Ready(Some(Ok(_)))));
+        assert!(matches!(poll_source(&mut source), Poll::Pending));
+        assert!(
+            progress.trailer_phase.load(Ordering::Acquire),
+            "a FIN-delimited (no Content-Length) body must enable trailer-collapse",
         );
     }
 

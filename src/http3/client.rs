@@ -528,6 +528,28 @@ pub(crate) fn is_response_body_complete(
     }
 }
 
+/// Like [`is_response_body_complete`], but for the case where a clean FIN has
+/// ALREADY ended the DATA stream — e.g. the native-H3 trailer phase, entered
+/// only after `recv_data` returned `Ok(None)`.
+///
+/// The only difference is the absent-Content-Length case: a FIN-delimited
+/// (chunked / unknown-length) body is COMPLETE once the FIN arrives, so an
+/// absent length is accepted here (matching the buffered drain, which forwards a
+/// FIN-delimited body without a length check). A DECLARED length must still
+/// match exactly — a truncated or overlong body that FINs early is a framing
+/// violation that must surface, not be laundered into a clean EOS.
+pub(crate) fn is_response_body_complete_after_fin(
+    body_len: u64,
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+        return body_len == 0;
+    }
+    content_length.map_or(true, |declared| body_len == declared)
+}
+
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 
