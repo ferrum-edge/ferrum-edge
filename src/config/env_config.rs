@@ -416,6 +416,28 @@ pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
                     a, b, c, d,
                 )));
             }
+            // NAT64 local-use prefix (RFC 8215, `64:ff9b:1::/48`): a DNS64
+            // resolver configured with this prefix embeds the IPv4 in the bits
+            // after the /48. The exact octet positions depend on the embedding —
+            // RFC 6052 reserves the u-byte at bits 64-71 — so decode BOTH the
+            // contiguous form (IPv4 in `segments[3..=4]`, e.g. `64:ff9b:1:a9fe:a9fe::`
+            // for 169.254.169.254) and the RFC 6052 /48 form (IPv4 split across the
+            // u-byte) and block if EITHER lands in a dangerous range, so an
+            // IPv6-only / DNS64 answer cannot rebind to IMDS through this prefix.
+            // `is_private_ip` already treats the whole `64:ff9b:1::/48` as private,
+            // so this stays a strict subset of it.
+            if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+                let [s3hi, s3lo] = segments[3].to_be_bytes();
+                let [s4hi, s4lo] = segments[4].to_be_bytes();
+                let [s5hi, _] = segments[5].to_be_bytes();
+                let contiguous = std::net::Ipv4Addr::new(s3hi, s3lo, s4hi, s4lo);
+                let rfc6052_48 = std::net::Ipv4Addr::new(s3hi, s3lo, s4lo, s5hi);
+                if is_always_blocked_range(&std::net::IpAddr::V4(contiguous))
+                    || is_always_blocked_range(&std::net::IpAddr::V4(rfc6052_48))
+                {
+                    return true;
+                }
+            }
             ip.is_unspecified()                     // ::
             // AWS EC2 IPv6 instance metadata (IMDSv6) lives at fd00:ec2::254,
             // inside the otherwise-allowed ULA range (fc00::/7) — block the

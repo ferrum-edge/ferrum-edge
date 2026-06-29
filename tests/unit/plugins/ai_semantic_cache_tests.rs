@@ -437,8 +437,10 @@ fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
     );
 }
 
-#[test]
-fn validate_plugin_config_with_policy_screens_denied_ldap_and_kafka_endpoints() {
+// `#[tokio::test]` because kafka_logging's constructor spawns a background
+// batching-flush task, which requires a Tokio reactor.
+#[tokio::test]
+async fn validate_plugin_config_with_policy_screens_denied_ldap_and_kafka_endpoints() {
     use ferrum_edge::config::BackendEgressPolicy;
     use ferrum_edge::plugins::validate_plugin_config_with_policy;
 

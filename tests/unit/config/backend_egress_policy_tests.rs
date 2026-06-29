@@ -47,6 +47,12 @@ fn default_blocks_cloud_metadata_and_link_local() {
     assert!(!p.is_allowed(&ip("64:ff9b::6464:64c8"))); // 100.100.100.200
     assert!(p.is_allowed(&ip("100.100.100.201"))); // adjacent CGNAT host stays allowed
     assert!(p.is_allowed(&ip("100.64.0.1"))); // ordinary CGNAT backend stays allowed
+    // NAT64 local-use prefix (RFC 8215, 64:ff9b:1::/48) encoding the IPv4 IMDS
+    // must be blocked too — both the contiguous embedding and a NAT64 of a
+    // public address (which stays allowed).
+    assert!(!p.is_allowed(&ip("64:ff9b:1:a9fe:a9fe::"))); // 169.254.169.254
+    assert!(!p.is_allowed(&ip("64:ff9b:1:6464:64c8::"))); // 100.100.100.200 (Alibaba)
+    assert!(p.is_allowed(&ip("64:ff9b:1:808:808::"))); // 8.8.8.8 (public) stays allowed
 }
 
 #[test]
