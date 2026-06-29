@@ -3532,3 +3532,37 @@ async fn prompt_estimate_counts_role_information_on_non_first_data_source() {
     );
     assert_eq!(reserved_with - reserved_base, instruction_tokens);
 }
+
+#[tokio::test]
+async fn prompt_estimate_preserves_whole_body_fallback_prompt_with_role_information() {
+    // Regression guard (Codex P2 on #1942): fields like TGI/HuggingFace `inputs`
+    // are AI markers but are NOT summed by the recognized-field pass, so their
+    // prompt text is captured only by the zero-char whole-body fallback. Counting
+    // `role_information` must NOT make the recognized-field total nonzero and
+    // short-circuit that fallback — doing so would drop the real `inputs` prompt
+    // and reserve only the short instruction.
+    let inputs = "a".repeat(400); // real prompt text, counted only via the fallback
+    let instruction = "Be terse.";
+
+    let mut body = json!({ "inputs": inputs });
+    let reserved_inputs_only = azure_reserved(body.clone()).await;
+    assert!(
+        reserved_inputs_only > 0,
+        "the `inputs` prompt must be counted via the whole-body fallback"
+    );
+
+    body["data_sources"] = json!([{
+        "type": "azure_search",
+        "parameters": { "role_information": instruction }
+    }]);
+    let reserved_with_role = azure_reserved(body).await;
+
+    // The fallback still walks the whole body, so the full `inputs` prompt remains
+    // counted (now alongside the instruction) — the estimate must not collapse to
+    // just the instruction.
+    assert!(
+        reserved_with_role >= reserved_inputs_only,
+        "role_information must not drop the fallback-counted `inputs` prompt \
+         (got {reserved_with_role}, inputs-only was {reserved_inputs_only})"
+    );
+}

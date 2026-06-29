@@ -926,22 +926,28 @@ fn prompt_character_count(json: &Value) -> u64 {
         chars = chars.saturating_add(string_value_character_count(tools));
     }
 
+    if chars == 0 {
+        // No recognized prompt field carried text. Fall back to counting the whole
+        // body — this is how AI markers that are NOT summed above (`inputs`,
+        // `inputText`, `chat_history`, `previous_response_id`) get their prompt
+        // text counted. That whole-body walk already includes any `data_sources` /
+        // `dataSources` role_information, so the targeted add below is gated behind
+        // this early return: counting it again would double it, and (worse) making
+        // `chars` nonzero here would skip the fallback and drop the real prompt,
+        // reserving only the instruction.
+        return string_value_character_count(json);
+    }
+
     // Azure OpenAI "On Your Data" carries a per-data-source system instruction in
     // `data_sources[].parameters.role_information` (current chat-completions data
     // plane) / `dataSources[].parameters.roleInformation` (the original
     // extensions-API camelCase). That text is sent to the model and billed as
-    // input, but it is not part of any field counted above. The whole-body
-    // fallback below only fires when the recognized fields contribute zero chars,
-    // which never happens for an On Your Data request (it always carries
-    // `messages`), so without this the instruction is silently uncounted and the
-    // reservation under-estimates the prompt the backend bills.
-    chars = chars.saturating_add(count_data_source_role_information(json));
-
-    if chars == 0 {
-        string_value_character_count(json)
-    } else {
-        chars
-    }
+    // input, but it is not part of any recognized field above. A recognized field
+    // DID contribute (we are past the zero-char fallback), so add the instruction
+    // text explicitly — otherwise an On Your Data request (which always carries
+    // `messages`) would never count it and the reservation would under-estimate
+    // the prompt the backend bills.
+    chars.saturating_add(count_data_source_role_information(json))
 }
 
 /// The data-source entries of an Azure OpenAI "On Your Data" request, across both
