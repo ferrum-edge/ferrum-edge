@@ -240,6 +240,27 @@ fn public_mode_blocks_local_use_nat64_with_public_decodes() {
 }
 
 #[test]
+fn deny_ipv6_cidr_blocks_local_use_nat64_literal() {
+    // An IPv6-form deny CIDR on the local-use NAT64 prefix must block the literal
+    // even when both decoded IPv4s would otherwise pass under `both` mode — the
+    // shared precedence applies deny_cidrs to the original IPv6 address, not just
+    // the decodes.
+    let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "64:ff9b:1::/48", true)
+        .expect("valid");
+    assert!(!p.is_allowed(&ip("64:ff9b:1:808:808::"))); // public decodes, IPv6 prefix denied
+    assert!(p.is_allowed(&ip("8.8.8.8"))); // bare decode unaffected by the IPv6 deny
+    // An explicit allow CIDR still overrides the IPv6 deny (allow > deny).
+    let carved = BackendEgressPolicy::from_env(
+        BackendAllowIps::Both,
+        "64:ff9b:1::/48",
+        "64:ff9b:1::/48",
+        true,
+    )
+    .expect("valid");
+    assert!(carved.is_allowed(&ip("64:ff9b:1:808:808::")));
+}
+
+#[test]
 fn allow_cidr_takes_precedence_over_deny_cidr() {
     // Overlapping allow + deny: allow wins (checked first).
     let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "10.0.0.5/32", "10.0.0.0/8", true)
