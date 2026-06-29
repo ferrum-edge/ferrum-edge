@@ -382,9 +382,10 @@ impl AiRateLimiter {
             .unwrap_or(0)
     }
 
-    /// Whether `before_proxy` identified this request as an AI call (it ran the
-    /// token estimate over a parseable JSON request body). This is the gate for
-    /// the `on_unmetered_response` policy: without it, that policy would apply to
+    /// Whether `before_proxy` identified this request as an AI call (it parsed a
+    /// JSON request body that carries a recognized LLM request field — see
+    /// [`json_looks_like_ai_request`]). This is the gate for the
+    /// `on_unmetered_response` policy: without it, that policy would apply to
     /// EVERY buffered 2xx (the plugin forces full response buffering, and
     /// `on_response_body` runs for all buffered responses regardless of content
     /// type), so under `reject` a GET, a 204/empty-body 200, a non-JSON 2xx, or a
@@ -458,12 +459,14 @@ impl AiRateLimiter {
     }
 
     /// Estimate the tokens to pre-reserve for this request and report whether it
-    /// looked like an AI call at all. The returned `bool` is `true` exactly when
-    /// the buffered `request_body` parsed as JSON (the precondition for any token
-    /// estimate); the estimate itself may still be 0 for a parseable AI request
-    /// (e.g. `completion_tokens` mode with no `max_*` cap), which is why callers
-    /// must track the AI-request signal separately from `reserved_tokens > 0`.
-    /// Parses the body exactly once.
+    /// looked like an AI call at all. The returned `bool` is `true` only when the
+    /// buffered `request_body` parsed as JSON **and** carries a recognized LLM
+    /// request field (see [`json_looks_like_ai_request`]); a parseable but non-LLM
+    /// JSON `POST` returns `false` so a shared proxy doesn't subject ordinary API
+    /// traffic to the `on_unmetered_response` policy. The estimate itself may still
+    /// be 0 for a genuine AI request (e.g. `completion_tokens` mode with no `max_*`
+    /// cap), which is why callers must track the AI-request signal separately from
+    /// `reserved_tokens > 0`. Parses the body exactly once.
     fn estimate_request_tokens(&self, ctx: &RequestContext) -> (bool, u64) {
         let Some(body) = ctx.metadata.get("request_body") else {
             return (false, 0);
@@ -471,6 +474,14 @@ impl AiRateLimiter {
         let Ok(json) = serde_json::from_str::<Value>(body) else {
             return (false, 0);
         };
+        // Gate the AI-request marker on LLM shape, not mere JSON parseability: the
+        // plugin forces full response buffering, so `reconcile_usage` runs for
+        // EVERY buffered 2xx. Without this gate a `reject`-mode limiter would 502
+        // (and `charge_estimate` would bill) an ordinary non-LLM JSON `POST` that
+        // happens to share the proxy. See `request_was_ai_call`.
+        if !json_looks_like_ai_request(&json) {
+            return (false, 0);
+        }
 
         (true, self.estimate_request_tokens_from_json(&json))
     }
@@ -767,12 +778,102 @@ impl AiRateLimiter {
     }
 }
 
+/// Output-token cap requested by the client, across OpenAI and provider-native
+/// request shapes. Sizes the `completion_tokens` portion of the pre-dispatch
+/// reservation. Returns the max across every recognized field (only one is
+/// normally present, so `max` is a safe union) or 0 when none is set.
+///
+/// Top-level: OpenAI `max_tokens` / `max_completion_tokens`, OpenAI Responses
+/// `max_output_tokens`, legacy Anthropic `max_tokens_to_sample`, TGI/HuggingFace
+/// `max_new_tokens`, and the rarer top-level provider forms `maxOutputTokens` /
+/// `maxTokens`. Nested provider containers: Gemini/Vertex
+/// `generationConfig.maxOutputTokens`, AWS Bedrock Converse
+/// `inferenceConfig.maxTokens`, Amazon Titan `textGenerationConfig.maxTokenCount`,
+/// and TGI `parameters.max_new_tokens`. Without the nested forms a native Gemini,
+/// Bedrock, or Titan request reserves 0 in `completion_tokens` mode, so a burst of
+/// capped completions can oversubscribe the budget until post-response
+/// reconciliation. Mirrors the token-field coverage in `ai_request_guard`.
 fn requested_completion_tokens(json: &Value) -> u64 {
-    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+    let top_level = [
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens_to_sample",
+        "max_new_tokens",
+        "maxOutputTokens",
+        "maxTokens",
+    ]
+    .iter()
+    .filter_map(|field| json.get(*field).and_then(Value::as_u64))
+    .max()
+    .unwrap_or(0);
+
+    let nested = [
+        ("generationConfig", "maxOutputTokens"),
+        ("generation_config", "max_output_tokens"),
+        ("inferenceConfig", "maxTokens"),
+        ("inference_config", "max_tokens"),
+        ("textGenerationConfig", "maxTokenCount"),
+        ("parameters", "max_new_tokens"),
+    ]
+    .iter()
+    .filter_map(|(container, field)| {
+        json.get(*container)
+            .and_then(|nested| nested.get(*field))
+            .and_then(Value::as_u64)
+    })
+    .max()
+    .unwrap_or(0);
+
+    top_level.max(nested)
+}
+
+/// Strong, LLM-idiomatic top-level fields — each marks an AI request on its own.
+/// These (chat message arrays, Gemini `contents`, Cohere `chat_history`, TGI/Titan
+/// inputs, the legacy completions `prompt`) do not appear in ordinary non-LLM JSON,
+/// so classifying on them does not risk a false `on_unmetered_response` rejection.
+/// `system` is intentionally absent: an Anthropic body always carries `messages`,
+/// so a bare top-level `system` (a common generic word) is never the sole signal.
+const AI_REQUEST_STRONG_MARKERS: &[&str] = &[
+    "messages",             // OpenAI / Anthropic / Mistral chat (array)
+    "contents",             // Google Gemini / Vertex (array)
+    "chat_history",         // Cohere history (array)
+    "inputs",               // TGI / HuggingFace
+    "inputText",            // Amazon Titan
+    "prompt",               // legacy completions
+    "input",                // OpenAI Responses / embeddings
+    "previous_response_id", // OpenAI Responses continuation (no `input` needed)
+];
+
+/// Generic words that ALSO appear in ordinary non-LLM JSON (e.g. `{"message":
+/// "contact me"}`, `{"instructions": "..."}`). They mark an AI request only when
+/// corroborated by a top-level `model` field — which real LLM requests (Cohere v2
+/// chat, OpenAI Responses) carry — so a bare `{"message": "..."}` on a shared
+/// proxy is NOT classified as AI and is never turned into a false 502 under
+/// `reject`. `instructions` is the OpenAI Responses system field (matching
+/// `ai_request_guard::looks_like_responses`), gated on `model` for the same
+/// false-positive reason. (`input` stays strong: as a top-level request field it
+/// is LLM-idiomatic, and Codex flagged only the much more generic `message`.)
+const AI_REQUEST_WEAK_MARKERS: &[&str] = &["message", "instructions"];
+
+/// Whether a parsed request body looks like an LLM/AI call. A strong marker alone
+/// qualifies; a generic weak marker qualifies only alongside a top-level `model`.
+/// A JSON object matching neither is treated as non-AI traffic and left out of the
+/// token-budget / unmetered-response path.
+fn json_looks_like_ai_request(json: &Value) -> bool {
+    let Some(obj) = json.as_object() else {
+        return false;
+    };
+    if AI_REQUEST_STRONG_MARKERS
         .iter()
-        .filter_map(|field| json.get(*field).and_then(Value::as_u64))
-        .max()
-        .unwrap_or(0)
+        .any(|field| obj.contains_key(*field))
+    {
+        return true;
+    }
+    obj.contains_key("model")
+        && AI_REQUEST_WEAK_MARKERS
+            .iter()
+            .any(|field| obj.contains_key(*field))
 }
 
 /// True when a `content-encoding` header marks the request body as encoded with
@@ -846,16 +947,37 @@ fn prompt_character_count(json: &Value) -> u64 {
 /// - OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:..."}}`
 /// - OpenAI audio part: `{"type":"input_audio","input_audio":{"data":"..."}}`
 /// - OpenAI file part: `{"type":"file","file":{"file_data":"..."}}`
-/// - Anthropic image/document part: `{"type":"image","source":{"data":"..."}}`
 /// - Google inline data: `{"inline_data":{"data":"..."}}` / `inlineData`
+///
+/// Anthropic's `source` block is handled separately (see `source_is_text_document`)
+/// because it is binary for image/PDF documents but carries prose for a *text*
+/// document (`source:{type:"text",media_type:"text/plain",data:"<prose>"}`); that
+/// prose is real prompt input and must be counted, so `source` is not a blanket
+/// skip key.
 const BINARY_CONTENT_KEYS: &[&str] = &[
     "image_url",
     "input_audio",
-    "source",
     "inline_data",
     "inlineData",
     "file_data",
 ];
+
+/// Whether an Anthropic-style `source` block carries TEXT prose to count toward
+/// the estimate, rather than a binary blob to skip. Only an explicit
+/// `type:"text"` source (the Anthropic text-document shape
+/// `source:{type:"text",media_type:"text/plain",data:"<prose>"}`) qualifies. We
+/// deliberately do NOT key off `media_type` alone: a base64 source can declare
+/// `media_type:"text/plain"` (`type:"base64"`) while its `data` is encoded bytes,
+/// and counting those would charge the ~33%-inflated base64 payload as prompt
+/// text — the exact over-count `BINARY_CONTENT_KEYS` exists to prevent. Every
+/// non-`text` shape (`base64`, `url`, `file`, …) is treated as binary and skipped.
+fn source_is_text_document(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|obj| obj.get("type"))
+        .and_then(Value::as_str)
+        == Some("text")
+}
 
 fn string_value_character_count(value: &Value) -> u64 {
     match value {
@@ -877,8 +999,21 @@ fn string_value_character_count(value: &Value) -> u64 {
             if matches!(
                 key.as_str(),
                 "max_tokens" | "max_completion_tokens" | "max_output_tokens"
-            ) || BINARY_CONTENT_KEYS.contains(&key.as_str())
-            {
+            ) {
+                return acc;
+            }
+            // `source` is binary for image/PDF documents (skip) but prose for a
+            // text document (`source:{type:"text",...,data:"<prose>"}`) — that
+            // prose is sent to the model and billed as input, so count it. Only a
+            // genuinely binary source is skipped.
+            if key == "source" {
+                return if source_is_text_document(value) {
+                    acc.saturating_add(string_value_character_count(value))
+                } else {
+                    acc
+                };
+            }
+            if BINARY_CONTENT_KEYS.contains(&key.as_str()) {
                 acc
             } else {
                 acc.saturating_add(string_value_character_count(value))
@@ -988,6 +1123,17 @@ impl Plugin for AiRateLimiter {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // A compressed body can't be estimated at `before_proxy` (decompression
+        // runs later in `transform_request_body`), so `before_proxy` forces
+        // `reserved_tokens = 0` and takes the reconcile-only path for it. Buffering
+        // it here would only spend memory/latency (and risk the pre-buffer size
+        // cap) for a reservation this plugin will never compute. Returning `false`
+        // just withdraws *this* plugin's buffering request — the handler still
+        // buffers if a co-located plugin (e.g. `ai_request_guard`) needs the body.
+        // See `has_non_identity_content_encoding` and `before_proxy` limitation #4.
+        if has_non_identity_content_encoding(&ctx.headers) {
+            return false;
+        }
         ctx.method == "POST"
             && ctx
                 .headers
@@ -1219,10 +1365,29 @@ impl Plugin for AiRateLimiter {
         if ctx.metadata.contains_key("ai_federation_provider") {
             if !ctx.metadata.contains_key(&self.federation_flag_key) {
                 let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
+                // Reconcile against the federation provider's ORIGINAL synthetic
+                // status, not the current after_proxy status. `ai_federation`
+                // delivers its provider response as a `before_proxy` RejectBinary,
+                // and on the synthetic short-circuit path a response-body guardrail
+                // (`ai_response_guard` / `ai_semantic_firewall`) can replace that
+                // 2xx with a 5xx before this hook runs. Reconciling a usage-less
+                // response against the 5xx would take the non-2xx branch and
+                // RELEASE the reservation for a provider call that already consumed
+                // tokens — making a paid call free. `ai_federation` records its
+                // status in `ai_federation_status`; absent it (older path / no
+                // federation status), fall back to the observed `response_status`.
+                // When `actual_tokens` is `Some`, reconciliation charges the actual
+                // usage regardless of status, so this only changes the usage-less
+                // case (routes it through `on_unmetered_response` instead).
+                let federation_status = ctx
+                    .metadata
+                    .get("ai_federation_status")
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .unwrap_or(response_status);
                 let result = self
                     .reconcile_usage(
                         ctx,
-                        response_status,
+                        federation_status,
                         actual_tokens,
                         "ai_federation_metadata",
                     )

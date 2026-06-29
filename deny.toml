@@ -1,0 +1,120 @@
+# cargo-deny configuration — dependency security & supply-chain gate.
+#
+# This is the enforcement half of Ferrum Edge's dependency-patch governance.
+# The documentation half lives in docs/dependency-policy.md (vendored-crate
+# inventory, owners, retirement triggers, emergency-update process).
+#
+# Run locally:
+#   cargo install --locked cargo-deny
+#   cargo deny check advisories bans sources   # the blocking gate (see CI)
+#   cargo deny check licenses                  # informational, not gated (yet)
+#
+# CI runs `cargo deny check advisories bans sources` on every PR that touches a
+# dependency surface (Cargo.toml/Cargo.lock/deny.toml/vendor/**) and on a weekly
+# schedule (.github/workflows/dependency-audit.yml). The advisories check is
+# BLOCKING: a new RUSTSEC advisory that is not explicitly ignored below fails CI.
+#
+# Every [advisories.ignore] entry MUST carry a rationale and an
+# `[expires:YYYY-MM-DD]` token. scripts/check_advisory_expiry.sh (run by the
+# scheduled workflow) fails once an expiry date passes, forcing re-review so an
+# exception can never become permanent silently.
+
+[graph]
+# Evaluate the full dependency graph including all optional features, so
+# feature-gated backends (cloud secret providers, MySQL, MongoDB, GeoIP) are
+# audited even though `default = []`.
+all-features = true
+
+[advisories]
+version = 2
+# Reject crates whose current version has been yanked from the registry.
+yanked = "deny"
+# Audit the FULL graph, not just direct workspace members. In cargo-deny 0.19
+# these default to "workspace", which — even with [graph].all-features — would
+# let a transitive unmaintained/unsound advisory pass silently. "all" makes them
+# blocking everywhere, matching the intent of the exceptions enumerated below.
+unmaintained = "all"
+unsound = "all"
+# Fail if an ignore no longer matches any advisory in the current graph, so a
+# fixed/removed vulnerable crate forces deletion of its now-stale exception
+# (default is "warn"). Otherwise a stale ignore could linger and silently
+# re-suppress the same RUSTSEC id if a later dependency reintroduces it.
+unused-ignored-advisory = "deny"
+# Everything not listed here is denied (vulnerabilities, unmaintained, unsound,
+# and notices alike, under advisories schema v2). Each exception is time-boxed.
+ignore = [
+    # ── hickory-proto 0.25.2 — pulled ONLY by mongodb 3.6.0 (its internal SRV
+    # resolver). The gateway's own DNS path uses hickory-resolver 0.26.1, which
+    # is already patched. mongodb 3.6 pins hickory `^0.25`, so we cannot bump
+    # the transitive copy without mongodb relaxing its requirement.
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.25.2 O(n^2) name-compression DoS; confined to the mongodb driver's SRV resolver (gateway DNS uses 0.26.1); mongodb 3.6 pins ^0.25. Tracking mongodb release. [expires:2026-09-30]" },
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto 0.25.2 NSEC3 unbounded loop; no upstream fix available; confined to the mongodb driver's resolver, not the proxy/gateway DNS path. Re-evaluate quarterly / on mongodb bump. [expires:2026-09-30]" },
+
+    # ── rsa 0.9.10 — pulled ONLY by sqlx-mysql. The Marvin timing side-channel
+    # affects RSA key-exchange used by MySQL's sha2 public-key auth fallback.
+    # No fixed release exists upstream. Mitigation: use FERRUM_DB_TLS_MODE so
+    # the MySQL handshake does not fall back to RSA-encrypted password exchange;
+    # only relevant when the MySQL config backend is in use.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel via sqlx-mysql; no upstream fix; only on the optional MySQL config-DB path; mitigated by DB TLS. Re-evaluate on rsa/sqlx fix. [expires:2026-09-30]" },
+
+    # ── rustls-webpki 0.101.7 — pulled ONLY by the AWS SDK chain (hyper-rustls
+    # 0.24.2 / rustls 0.21), which is gated behind the optional `secrets-aws`
+    # feature (NOT in default builds). The gateway's own TLS stack uses
+    # rustls 0.23 + rustls-webpki 0.103. The AWS chain pins webpki `^0.101.7`,
+    # so the fix (>=0.103.x) is unreachable until aws-sdk-rust moves off
+    # rustls 0.21.
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic via AWS SDK (rustls 0.21) behind optional `secrets-aws`; gateway TLS uses webpki 0.103; aws chain pins ^0.101.7. Tracking aws-sdk-rust. [expires:2026-09-30]" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 name-constraint (URI) bypass via AWS SDK behind optional `secrets-aws`; gateway TLS uses webpki 0.103. Tracking aws-sdk-rust off rustls 0.21. [expires:2026-09-30]" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 name-constraint (wildcard) bypass via AWS SDK behind optional `secrets-aws`; gateway TLS uses webpki 0.103. Tracking aws-sdk-rust off rustls 0.21. [expires:2026-09-30]" },
+
+    # ── Unmaintained / unsound (advisory schema v2 treats these as deny too).
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained; proc-macro only (tikv-jemalloc-ctl + dev-deps), no runtime/security surface. Replace if a successor stabilizes. [expires:2026-09-30]" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 unmaintained; functional PEM parser at config load. Migrate to rustls-pki-types pemfile helpers. [expires:2026-09-30]" },
+    { id = "RUSTSEC-2026-0186", reason = "memmap2 0.9.10 unsound pointer offset; confined to maxminddb mmap reads (geo_restriction plugin). Track maxminddb/memmap2 fix. [expires:2026-09-30]" },
+]
+
+[bans]
+# The repo intentionally carries duplicate major versions during build-out
+# (rustls 0.21+0.23, hyper 0.14+1.x, hickory 0.25+0.26, tungstenite 0.28+0.29).
+# Surface them as warnings for visibility without blocking PRs.
+multiple-versions = "warn"
+# Block `*` registry version requirements (an unpinned-dependency supply-chain
+# risk). The only wildcard in the tree is the in-repo workspace path dep
+# `ferrum-ebpf-common = { path = "ebpf/..." }`. `allow-wildcard-paths` exempts
+# path deps of *private* crates, and the workspace crate is marked
+# `publish = false` in Cargo.toml so that exemption applies to it.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Crates must come from crates.io. Vendored patches are local path deps under
+# [patch.crates-io] and are exempt (no registry/git source).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+# Informational only — NOT part of the blocking CI gate (see header). Kept here
+# so `cargo deny check licenses` is usable and licenses can be promoted to the
+# gate later without a from-scratch policy.
+version = 2
+# The workspace crate itself is PolyForm-Noncommercial (non-SPDX-OSI); skip
+# evaluating first-party member licenses.
+private = { ignore = true }
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+    "OpenSSL",
+    "BSL-1.0",
+]

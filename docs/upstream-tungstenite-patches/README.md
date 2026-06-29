@@ -1,5 +1,10 @@
 # Vendored tungstenite patches: lossless WebSocket raw takeover
 
+> Governance: tracked in [docs/dependency-policy.md](../dependency-policy.md). Any
+> change to `vendor/tungstenite-0.29.0-ferrum-patched/` or
+> `vendor/tokio-tungstenite-0.29.0-ferrum-patched/` must regenerate the drift
+> manifest (`scripts/update_vendor_integrity.sh`).
+
 ## What this patches
 
 Ferrum vendors patched copies of `tungstenite` and `tokio-tungstenite` so

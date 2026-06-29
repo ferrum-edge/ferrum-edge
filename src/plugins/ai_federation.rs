@@ -3054,8 +3054,20 @@ impl Plugin for AiFederation {
                     let mut resp_headers = HashMap::new();
                     resp_headers.insert("content-type".to_string(), "application/json".to_string());
 
+                    let status_code = if status >= 400 { status } else { 200 };
+                    // Record the synthetic response status alongside the token
+                    // metadata so `ai_rate_limiter` can reconcile a pre-reservation
+                    // against the provider's ORIGINAL status. This response is a
+                    // `before_proxy` short-circuit, so a later response-body
+                    // guardrail can replace it with a 5xx before `ai_rate_limiter`'s
+                    // after_proxy runs; without this signal a usage-less federation
+                    // response that gets guard-rejected would release the
+                    // reservation for a provider call that already consumed tokens.
+                    ctx.metadata
+                        .insert("ai_federation_status".to_string(), status_code.to_string());
+
                     return PluginResult::RejectBinary {
-                        status_code: if status >= 400 { status } else { 200 },
+                        status_code,
                         body: Bytes::from(bytes_received),
                         headers: resp_headers,
                     };

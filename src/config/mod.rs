@@ -30,6 +30,7 @@ pub use env_config::AutoBool;
 pub use env_config::is_private_ip;
 #[allow(unused_imports)] // DbTlsMode is used by unit tests and public config consumers
 pub use env_config::{
-    BackendAllowIps, DbTlsMode, EnvConfig, OperatingMode, check_backend_ip_allowed,
+    AdminHttpExposure, BackendAllowIps, DbTlsMode, EnvConfig, OperatingMode,
+    check_backend_ip_allowed,
 };
 pub use pool_config::PoolConfig;

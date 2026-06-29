@@ -2723,6 +2723,16 @@ fn debug_capture() -> (DebugLogCapture, tracing::subscriber::DefaultGuard) {
         .with_writer(capture.clone())
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
+    // Force a global callsite-interest re-evaluation against this DEBUG
+    // subscriber. `set_default` (unlike `set_global_default`) installs only a
+    // thread-local dispatcher and does NOT rebuild tracing's global callsite
+    // interest cache. If a *parallel* test hit one of the `debug!` reject
+    // callsites first — while no DEBUG subscriber was active — that callsite is
+    // cached as "disabled", and this capture then intermittently misses the
+    // event (a flaky failure seen under the parallel, instrumented coverage run).
+    // Rebuilding re-evaluates every callsite against the now-active subscriber so
+    // the DEBUG events are reliably captured regardless of test ordering.
+    tracing::callsite::rebuild_interest_cache();
     (capture, guard)
 }
 

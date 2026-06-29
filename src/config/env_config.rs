@@ -585,8 +585,26 @@ pub struct EnvConfig {
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
     /// Bind address for Admin API listeners (HTTP, HTTPS).
-    /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
+    ///
+    /// Default: `127.0.0.1` (loopback) — the admin API is a management plane and
+    /// is safe-by-default, NOT exposed on the network. Set to `0.0.0.0` (or a
+    /// specific address, or `::` for dual-stack) to expose it, but in the
+    /// writable `database`/`cp` modes a public plaintext bind also requires an
+    /// allowlist, TLS, or the `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` opt-in — see
+    /// [`EnvConfig::admin_insecure_plaintext_startup_error`]. The proxy data
+    /// plane (`FERRUM_PROXY_BIND_ADDRESS`) still defaults to `0.0.0.0`.
     pub admin_bind_address: String,
+
+    /// Dev-only escape hatch: allow the plaintext admin HTTP listener to bind a
+    /// publicly reachable address (e.g. `0.0.0.0`) with no
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist in the writable `database`/`cp`
+    /// modes. Without this, such a posture is a hard startup error (see
+    /// [`EnvConfig::admin_insecure_plaintext_startup_error`]) because the
+    /// writable admin API and operator bearer tokens would be exposed in
+    /// cleartext on all matching interfaces. Default: `false`. Never enable in
+    /// production — bind to loopback, set an allowlist, or serve admin over TLS
+    /// instead.
+    pub allow_insecure_admin_http: bool,
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
@@ -1748,6 +1766,38 @@ pub struct EnvConfig {
     pub so_busy_poll_us: u32,
 }
 
+/// Network-exposure classification of the gateway's **plaintext** admin HTTP
+/// listener (`FERRUM_ADMIN_HTTP_PORT`).
+///
+/// Used to gate startup (writable `database`/`cp` modes hard-fail on
+/// [`AdminHttpExposure::ReachableUnrestricted`] unless
+/// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`) and to emit graded startup
+/// warnings. The admin HTTPS listener is a separate port and does not affect
+/// this classification — to serve admin TLS-only, disable plaintext with
+/// `FERRUM_ADMIN_HTTP_PORT=0`.
+///
+/// The safe boundary is **loopback only**. A private / VPC / link-local
+/// address (e.g. a pod or VM interface IP) is still reachable by other hosts on
+/// that network, so it is treated as exposed — binding the writable admin there
+/// in cleartext without an allowlist is a guarded posture, not a safe one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminHttpExposure {
+    /// `FERRUM_ADMIN_HTTP_PORT=0` — no plaintext admin listener.
+    Disabled,
+    /// Bound to a loopback address (`127.0.0.0/8`, `::1`) — reachable only from
+    /// within the host/network namespace.
+    Loopback,
+    /// Bound to a non-loopback address reachable beyond the host (incl.
+    /// `0.0.0.0` / `::`, a public IP, or a private/VPC address) but
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` restricts which source IPs may connect.
+    /// Bearer tokens still traverse cleartext on this port.
+    ReachableAllowlisted,
+    /// Bound to a non-loopback address reachable beyond the host with no
+    /// allowlist — the admin API and any bearer tokens are exposed in cleartext
+    /// to every host that can route to that interface.
+    ReachableUnrestricted,
+}
+
 impl Default for EnvConfig {
     fn default() -> Self {
         Self {
@@ -1779,7 +1829,8 @@ impl Default for EnvConfig {
             admin_https_port: 9443,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
-            admin_bind_address: "0.0.0.0".into(),
+            admin_bind_address: "127.0.0.1".into(),
+            allow_insecure_admin_http: false,
             admin_jwt_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
@@ -2109,7 +2160,8 @@ impl EnvConfig {
             admin_https_port: u16 = "FERRUM_ADMIN_HTTPS_PORT" => 9443u16;
             admin_tls_cert_path: Option<String> = "FERRUM_ADMIN_TLS_CERT_PATH";
             admin_tls_key_path: Option<String> = "FERRUM_ADMIN_TLS_KEY_PATH";
-            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "0.0.0.0".to_string();
+            admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "127.0.0.1".to_string();
+            allow_insecure_admin_http: bool = "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" => false;
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
                 => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
@@ -2453,14 +2505,18 @@ impl EnvConfig {
             so_busy_poll_us: u32 = "FERRUM_SO_BUSY_POLL_US" => 0u32;
         }
 
-        // Keep this hand-written: the CP gRPC listener inherits the admin bind
-        // address when unset, so the default depends on another parsed field.
+        // The CP gRPC listener is a JWT-authenticated config-distribution server
+        // that data planes connect to over the network, so it defaults to
+        // 0.0.0.0 (all interfaces) — deliberately NOT coupled to the admin bind,
+        // which is loopback-by-default. Inheriting the loopback admin default
+        // here would make a fresh CP unreachable by remote DPs. Operators narrow
+        // it (or go TLS-only with port 0) via an explicit FERRUM_CP_GRPC_LISTEN_ADDR.
         let cp_grpc_listen_addr =
             match env_config_macro::resolve_optional::<String>(conf, "FERRUM_CP_GRPC_LISTEN_ADDR")?
             {
                 Some(addr) => Some(addr),
                 None if matches!(mode, OperatingMode::ControlPlane) => {
-                    Some(format!("{}:50051", admin_bind_address))
+                    Some("0.0.0.0:50051".to_string())
                 }
                 None => None,
             };
@@ -2774,6 +2830,7 @@ impl EnvConfig {
             admin_tls_cert_path,
             admin_tls_key_path,
             admin_bind_address,
+            allow_insecure_admin_http,
             admin_jwt_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
@@ -3078,6 +3135,98 @@ impl EnvConfig {
             .parse()
             .expect("admin_bind_address validated at config load");
         std::net::SocketAddr::new(ip, port)
+    }
+
+    /// Classify the network exposure of the **plaintext** admin HTTP listener
+    /// (`FERRUM_ADMIN_HTTP_PORT`). This is independent of whether an admin
+    /// HTTPS listener is also configured: a TLS listener on the HTTPS port does
+    /// not protect the separate plaintext HTTP port. To run admin TLS-only, set
+    /// `FERRUM_ADMIN_HTTP_PORT=0`.
+    ///
+    /// Only a **loopback** bind is treated as safe. Any other bind — `0.0.0.0` /
+    /// `::`, a public IP, or a private/VPC/link-local interface address — is
+    /// reachable by other hosts on that network and is classified as exposed.
+    pub fn admin_http_exposure(&self) -> AdminHttpExposure {
+        if self.admin_http_port == 0 {
+            return AdminHttpExposure::Disabled;
+        }
+        // An unparseable bind address is rejected separately in `validate()`;
+        // treat it as non-exposing here so this method never panics.
+        let Ok(ip) = self.admin_bind_address.parse::<std::net::IpAddr>() else {
+            return AdminHttpExposure::Loopback;
+        };
+        // Loopback (127.0.0.0/8, ::1) is the only bind reachable solely from
+        // within the host. Everything else (unspecified/public/private/
+        // link-local) is reachable beyond loopback and must be protected.
+        if ip.is_loopback() {
+            return AdminHttpExposure::Loopback;
+        }
+        // An empty allowlist — or a catch-all one (a `/0` CIDR like `0.0.0.0/0`,
+        // `::/0`, or an IPv4-mapped spelling the filter folds to a `/0`, which
+        // the admin middleware then matches against every source) — provides no
+        // real restriction, so the listener is still unrestricted. Reuse the
+        // runtime filter's own canonicalization via `cidr_list_permits_all`.
+        if self.admin_allowed_cidrs.trim().is_empty()
+            || crate::proxy::client_ip::TrustedProxies::cidr_list_permits_all(
+                &self.admin_allowed_cidrs,
+            )
+        {
+            AdminHttpExposure::ReachableUnrestricted
+        } else {
+            AdminHttpExposure::ReachableAllowlisted
+        }
+    }
+
+    /// Hard-fail guard for the **writable** admin API. Returns `Some(error)`
+    /// when a `database`/`cp`-mode gateway would start a plaintext admin HTTP
+    /// listener reachable beyond loopback with no (effective)
+    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist and without the explicit
+    /// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
+    ///
+    /// The hard error is reserved for the elevated risk of an unauthenticated-
+    /// network-exposed *writable* admin surface. Read-only admin surfaces get a
+    /// high-severity startup warning instead (see `main.rs`): the read-only
+    /// modes (`file`/`dp`/`mesh`), and also `database`/`cp` when
+    /// `FERRUM_ADMIN_READ_ONLY=true` blocks mutations — in that case the
+    /// remaining plaintext-token risk matches the read-only modes, so it warns
+    /// rather than forcing an allowlist/opt-in just to start. The node-agent
+    /// admin listener has its own safe-by-default loopback fallback.
+    ///
+    /// Pure (reads only `self`), so it is unit-testable without touching the
+    /// process environment.
+    pub fn admin_insecure_plaintext_startup_error(&self) -> Option<String> {
+        if !matches!(
+            self.mode,
+            OperatingMode::Database | OperatingMode::ControlPlane
+        ) {
+            return None;
+        }
+        // A read-only db/cp admin is not a writable surface — warn, don't fail.
+        if self.admin_read_only {
+            return None;
+        }
+        if self.admin_http_exposure() != AdminHttpExposure::ReachableUnrestricted {
+            return None;
+        }
+        if self.allow_insecure_admin_http {
+            return None;
+        }
+        Some(format!(
+            "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
+             (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', a non-loopback address \
+             reachable beyond this host, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The \
+             writable admin API and any operator bearer tokens would be served in cleartext to \
+             every host that can route to it (a private/VPC interface IP is still LAN-reachable). \
+             Choose one: \
+             (1) bind admin to loopback — FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1; \
+             (2) restrict callers — FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list>; \
+             (3) serve admin over TLS and disable plaintext — set FERRUM_ADMIN_TLS_CERT_PATH \
+             and FERRUM_ADMIN_TLS_KEY_PATH, then FERRUM_ADMIN_HTTP_PORT=0; \
+             or (4) for local development only — FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true.",
+            mode = self.mode,
+            port = self.admin_http_port,
+            bind = self.admin_bind_address,
+        ))
     }
 
     /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
@@ -3906,6 +4055,19 @@ impl EnvConfig {
             ));
         }
 
+        // Safe-by-default management plane. The admin bind defaults to loopback,
+        // so a fresh startup is never exposed. This guard catches the case where
+        // an operator has EXPLICITLY moved the writable (`database`/`cp`) admin
+        // API to a publicly reachable plaintext bind with no IP allowlist:
+        // refuse to start unless they opt in via FERRUM_ALLOW_INSECURE_ADMIN_HTTP,
+        // because the writable admin API and operator bearer tokens would be
+        // served in cleartext on all matching interfaces. Read-only modes
+        // (file/dp/mesh) are warned (not failed) in main.rs; node-agent has its
+        // own loopback fallback.
+        if let Some(err) = self.admin_insecure_plaintext_startup_error() {
+            return Err(err);
+        }
+
         // Validate global backend TLS cert/key files exist and are parseable
         match (
             &self.backend_tls_client_cert_path,
@@ -4045,24 +4207,25 @@ impl EnvConfig {
         Ok(())
     }
 
-    /// Resolve the CP gRPC listen address the same way `modes::control_plane`
-    /// does: an explicit `FERRUM_CP_GRPC_LISTEN_ADDR`, else the admin bind
-    /// address on port 50051. Returns `Err` for a malformed address so startup
-    /// (and `ferrum-edge validate`) fail with a clear message instead of an
-    /// `expect()` panic at bind time.
+    /// Resolve the CP gRPC listen address: an explicit
+    /// `FERRUM_CP_GRPC_LISTEN_ADDR`, else the hardcoded `0.0.0.0:50051` default.
+    /// The default is deliberately NOT derived from `admin_bind_address` (which
+    /// defaults to loopback) — a Data Plane in another pod/host must be able to
+    /// reach the CP gRPC listener. `from_env_with_conf` already populates this
+    /// to `Some("0.0.0.0:50051")` for CP mode; the fallback keeps hand-built
+    /// configs (tests) consistent with that default. Returns `Err` for a
+    /// malformed explicit address so startup (and `ferrum-edge validate`) fail
+    /// with a clear message instead of an `expect()` panic at bind time.
     pub fn cp_grpc_socket_addr(&self) -> Result<std::net::SocketAddr, String> {
         if let Some(addr) = &self.cp_grpc_listen_addr {
             addr.parse().map_err(|e| {
                 format!("FERRUM_CP_GRPC_LISTEN_ADDR '{addr}' is not a valid socket address: {e}")
             })
         } else {
-            let ip: std::net::IpAddr = self.admin_bind_address.parse().map_err(|e| {
-                format!(
-                    "FERRUM_ADMIN_BIND_ADDRESS '{}' is not a valid IP address: {e}",
-                    self.admin_bind_address
-                )
-            })?;
-            Ok(std::net::SocketAddr::new(ip, 50051))
+            Ok(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                50051,
+            ))
         }
     }
 
@@ -4230,8 +4393,8 @@ mod tests {
 
     #[test]
     fn cp_default_bind_plaintext_is_rejected_without_allow_flag() {
-        // Default CP gRPC bind resolves to admin_bind_address:50051 = 0.0.0.0:50051
-        // (non-loopback) with no TLS — must be refused.
+        // Default CP gRPC bind resolves to 0.0.0.0:50051 (hardcoded, NOT derived
+        // from admin_bind_address) — non-loopback + no TLS, so it must be refused.
         let config = cp_mode_config();
         let err = config
             .validate_cp_dp_grpc_transport_security()
