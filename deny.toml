@@ -71,6 +71,7 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained; proc-macro only (tikv-jemalloc-ctl + dev-deps), no runtime/security surface. Replace if a successor stabilizes. [expires:2026-09-30]" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 unmaintained; functional PEM parser at config load. Migrate to rustls-pki-types pemfile helpers. [expires:2026-09-30]" },
     { id = "RUSTSEC-2026-0186", reason = "memmap2 0.9.10 unsound pointer offset; confined to maxminddb mmap reads (geo_restriction plugin). Track maxminddb/memmap2 fix. [expires:2026-09-30]" },
+    { id = "RUSTSEC-2026-0190", reason = "anyhow 1.0.102 Error::downcast_mut() unsoundness; only triggers via Error::context(...).downcast_mut() which this codebase never uses (no downcast_mut call site). Drop on the anyhow patch release. [expires:2026-09-30]" },
 ]
 
 [bans]

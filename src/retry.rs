@@ -781,7 +781,23 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
     // disconnect (`disconnected = false`); graceful H3 closes never reach here
     // (`H3FrameSource` recovers a complete body to a clean EOS).
     if h3_stream_error_in_chain(e) {
-        return (crate::http3::client::classify_http3_error(e), false);
+        let class = crate::http3::client::classify_http3_error(e);
+        // An h3 stream error that reaches the body error path is a genuine
+        // backend failure: graceful closes (H3_NO_ERROR / GOAWAY) are recovered
+        // to a clean EOS by `H3FrameSource` before this point, so anything left
+        // is a real mid-stream fault. If the H3 classifier could only produce a
+        // class the deferred dispatch does NOT count as a failure (notably the
+        // `RequestError` catch-all for `HeaderTooBig`, whose display text matches
+        // no heuristic), surface it as `ProtocolError` so it trips CB /
+        // passive-health instead of banking a phantom success.
+        let class = if crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
+            Some(class),
+        ) {
+            class
+        } else {
+            ErrorClass::ProtocolError
+        };
+        return (class, false);
     }
 
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);

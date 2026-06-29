@@ -16298,28 +16298,16 @@ async fn handle_proxy_request_inner(
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
     let streaming_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
-        // Native H3 exposes a recv stream rather than a `Body` here, so we can't
-        // call `is_end_stream()`. A known zero-length body (`content-length: 0`
-        // on a streamable status such as `200`) is still END_STREAM-at-headers:
-        // hyper may never poll such a body, and a deferred outcome would then be
-        // recorded as a `ClientDisconnect` by the never-polled `ProxyBody::Drop`
-        // path instead of the backend success. Treat it eagerly, mirroring the
-        // H2 `is_end_stream` case (#1940 review). HEAD / 204 / 304 stay covered
-        // by `streaming_dispatch_should_defer`'s own gates.
-        //
-        // Read the content-length from `response_headers`, NOT the
-        // `H3StreamingResponse.headers` inside the variant: `proxy_to_backend`
-        // already `std::mem::take`s the H3 headers into `backend_resp.headers`
-        // (→ `response_headers`) before this point, so the variant's own map is
-        // empty here (this is the same map the H3 body builder reads its `cl`
-        // from below).
-        ResponseBody::StreamingH3(_) => {
-            response_is_no_body_status(response_status)
-                || response_headers
-                    .get("content-length")
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    == Some(0)
-        }
+        // Native H3 exposes a recv stream rather than a `Body` here, so we cannot
+        // call `is_end_stream()` — and `content-length: 0` does NOT prove the
+        // QUIC stream has ended (the backend may keep it open for trailers or
+        // simply stall), so we must not infer END_STREAM from the header (#1940
+        // review). Leave it `false` and rely on `streaming_dispatch_should_defer`
+        // for the genuine no-body cases (HEAD / 204 / 304). The H3 body always
+        // reports `is_end_stream() == false` until its terminal poll, so hyper
+        // polls it at least once and the deferred outcome is recorded at body
+        // completion rather than misread as a never-polled disconnect.
+        ResponseBody::StreamingH3(_) => false,
         _ => false,
     };
     let defer_streaming_dispatch = matches!(
@@ -17108,7 +17096,6 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     cl,
-                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -17120,7 +17107,6 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
-                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -17131,7 +17117,6 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
-                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -17142,10 +17127,13 @@ async fn handle_proxy_request_inner(
                     backend_admission_elapsed,
                 );
             }
-            // Native-H3 streaming responses can fail after headers (read timeout,
-            // reset, or close) just like the direct-H2 path. Defer CB / passive
-            // health / least-latency accounting until body completion so a
-            // 2xx/206-then-stall does not bank a header-time success.
+            // Native-H3 streaming responses can fail after headers (a mid-stream
+            // reset / protocol error, or a stall that the QUIC idle timeout
+            // eventually tears down) just like the direct-H2 path. Defer CB /
+            // passive-health / least-latency accounting until body completion so a
+            // 2xx/206-then-failure does not bank a header-time success. (A
+            // per-frame `backend_read_timeout_ms` for native H3 is tracked
+            // separately — see the read-timeout follow-up issue.)
             if defer_streaming_dispatch {
                 body = body
                     .with_deferred_backend_dispatch_outcome(
