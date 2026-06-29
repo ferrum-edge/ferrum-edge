@@ -733,6 +733,21 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     ErrorClass::RequestError
 }
 
+/// Whether the error chain contains a native-H3 stream error
+/// (`h3::error::StreamError`), i.e. it came from the native-H3 response body
+/// rather than a reqwest/hyper/io path. Used to route H3 body errors through the
+/// H3-aware classifier in [`classify_body_error`].
+fn h3_stream_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(node) = current {
+        if node.downcast_ref::<h3::error::StreamError>().is_some() {
+            return true;
+        }
+        current = node.source();
+    }
+    false
+}
+
 /// Classify an error that was emitted by a streaming response body wrapper
 /// (i.e. after response headers have been sent to the client).
 ///
@@ -754,6 +769,19 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
     // the chain anyway so we never misclassify it as a generic error.
     if is_port_exhaustion(e) {
         return (ErrorClass::PortExhaustion, false);
+    }
+
+    // Native-H3 streaming bodies surface `h3::error::StreamError` (e.g.
+    // `RemoteTerminate`, `HeaderTooBig`, `H3_INTERNAL_ERROR`), which is neither
+    // an io nor a hyper error — the generic walk below would fall through to
+    // `RequestError` with `connection_error == false` and the deferred dispatch
+    // would bank it as a phantom SUCCESS. Route it through the H3-aware
+    // classifier so a mid-stream H3 reset / protocol fault on an already-2xx
+    // response trips CB / passive-health. It is a backend error, not a client
+    // disconnect (`disconnected = false`); graceful H3 closes never reach here
+    // (`H3FrameSource` recovers a complete body to a clean EOS).
+    if h3_stream_error_in_chain(e) {
+        return (crate::http3::client::classify_http3_error(e), false);
     }
 
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
