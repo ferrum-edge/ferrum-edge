@@ -224,6 +224,22 @@ fn ambiguous_local_use_nat64_deny_wins_over_cross_decode_allow() {
 }
 
 #[test]
+fn public_mode_blocks_local_use_nat64_with_public_decodes() {
+    // Under `public` mode all private/reserved backends are blocked. A local-use
+    // NAT64 literal (64:ff9b:1::/48) is ITSELF private/reserved (`is_private_ip`
+    // classifies the whole RFC 8215 prefix as private), so it must be blocked even
+    // when both decoded IPv4s are public (8.8.8.8) — the decode checks alone don't
+    // catch it, the original IPv6's mode check does.
+    let p = BackendEgressPolicy::from_env(BackendAllowIps::Public, "", "", true).expect("valid");
+    assert!(p.is_allowed(&ip("8.8.8.8"))); // the public decode on its own
+    assert!(!p.is_allowed(&ip("64:ff9b:1:808:808::"))); // private NAT64 prefix blocked
+    // The allow-CIDR escape hatch still re-permits it (allow > mode).
+    let carved = BackendEgressPolicy::from_env(BackendAllowIps::Public, "8.8.8.8/32", "", true)
+        .expect("valid");
+    assert!(carved.is_allowed(&ip("64:ff9b:1:808:808::")));
+}
+
+#[test]
 fn allow_cidr_takes_precedence_over_deny_cidr() {
     // Overlapping allow + deny: allow wins (checked first).
     let p = BackendEgressPolicy::from_env(BackendAllowIps::Both, "10.0.0.5/32", "10.0.0.0/8", true)

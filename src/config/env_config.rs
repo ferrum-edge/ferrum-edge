@@ -634,7 +634,22 @@ impl BackendEgressPolicy {
             if let Some(reason) = self.deny_reason(&contiguous_decode) {
                 return Some(reason);
             }
-            return self.deny_reason(&rfc6052_decode);
+            if let Some(reason) = self.deny_reason(&rfc6052_decode) {
+                return Some(reason);
+            }
+            // Both decodes pass. The local-use NAT64 prefix is ITSELF
+            // private/reserved (`is_private_ip`), so a restrictive
+            // `FERRUM_BACKEND_ALLOW_IPS=public`/`private` mode must still reject the
+            // IPv6 literal even when both decoded IPv4s satisfy the mode — unless an
+            // explicit allow CIDR (on the address or a decode) re-permits it
+            // (allow > mode, matching the normal precedence below).
+            if self.allow_cidrs.contains(addr)
+                || self.allow_cidrs.contains(&contiguous_decode)
+                || self.allow_cidrs.contains(&rfc6052_decode)
+            {
+                return None;
+            }
+            return self.mode_reason(addr);
         }
         // Every other address embeds at most ONE IPv4 (well-known NAT64 `/96`,
         // IPv4-mapped, IPv4-compatible); match CIDR rules against the address and
@@ -659,6 +674,15 @@ impl BackendEgressPolicy {
             );
         }
         // 4. Legacy mode.
+        self.mode_reason(addr)
+    }
+
+    /// The `FERRUM_BACKEND_ALLOW_IPS` mode verdict for `addr` (step 4 of
+    /// [`deny_reason`]): `None` if the mode permits it, else a reason. Factored
+    /// out so the ambiguous local-use NAT64 branch can apply the mode check on the
+    /// original IPv6 literal (which `is_private_ip` classifies as private/reserved)
+    /// after its decode checks, instead of bypassing the mode entirely.
+    fn mode_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
         if check_backend_ip_allowed(addr, &self.allow_ips) {
             None
         } else {
