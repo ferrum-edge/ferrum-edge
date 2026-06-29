@@ -395,6 +395,49 @@ fn test_new_with_redis_config() {
 }
 
 #[test]
+fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    // Production default policy (mode `both` + dangerous-range baseline) — the
+    // file/db config-load path. A Redis-backed semantic cache pointed at the
+    // cloud-metadata address must be rejected at config-load: the Redis client
+    // builds from `redis_url` WITHOUT the policy and skips IP literals, so the
+    // literal endpoint must be caught here.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let denied = json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://169.254.169.254:6379/0"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ai_semantic_cache", &denied, &default_policy).is_err(),
+        "metadata Redis endpoint must be rejected under the default policy"
+    );
+
+    // A loopback Redis (local cache) still validates by default.
+    let loopback = json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:6379/0"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ai_semantic_cache", &loopback, &default_policy).is_ok(),
+        "loopback Redis must remain valid by default"
+    );
+
+    // The fully-unrestricted policy accepts the metadata endpoint (legacy posture).
+    assert!(
+        validate_plugin_config_with_policy(
+            "ai_semantic_cache",
+            &denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn test_requires_response_body_buffering() {
     let config = json!({});
     let plugin = make_plugin(config);

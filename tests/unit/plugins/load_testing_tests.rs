@@ -18,6 +18,41 @@ fn make_plugin() -> LoadTesting {
     LoadTesting::new(&make_valid_config(), PluginHttpClient::default()).unwrap()
 }
 
+#[test]
+fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    // `gateway_addresses` are dialed via the raw client (`.send()`), bypassing
+    // the shared execute() literal-IP screen, so a denied literal must be caught
+    // at config-load under the production default policy.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let denied = json!({
+        "key": "test-secret-key",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "gateway_addresses": ["http://169.254.169.254:8000"]
+    });
+    assert!(
+        validate_plugin_config_with_policy("load_testing", &denied, &default_policy).is_err(),
+        "metadata gateway address must be rejected under the default policy"
+    );
+
+    // Loopback / RFC1918 gateway targets (the normal case) still validate.
+    let loopback = json!({
+        "key": "test-secret-key",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "gateway_addresses": ["http://127.0.0.1:8000"]
+    });
+    assert!(
+        validate_plugin_config_with_policy("load_testing", &loopback, &default_policy).is_ok(),
+        "loopback gateway address must remain valid by default"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Plugin metadata
 // ---------------------------------------------------------------------------
