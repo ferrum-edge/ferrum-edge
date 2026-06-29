@@ -218,10 +218,26 @@ impl RedisConfig {
     ///
     /// For TLS connections, the hostname must be preserved for SNI verification,
     /// so this returns the original URL unchanged.
+    ///
+    /// ACCEPTED LIMITATION (egress policy, `rediss://` hostnames): the resolved IP
+    /// is NOT pinned for TLS hostnames because the `redis` crate derives the TLS
+    /// server name from the URL host — pinning the IP would break SNI/cert
+    /// verification, and the crate exposes no way to dial a chosen address while
+    /// presenting a separate server name. `screen_redis_endpoint` has already
+    /// screened the CURRENT resolution against the egress policy, but the Redis
+    /// client re-resolves the hostname itself at connect/reconnect time outside
+    /// the gateway DNS cache, so a hostname whose DNS rebinds to a blocked address
+    /// between screen and dial could still be reached. This is a narrow TOCTOU
+    /// that requires control of the operator's own Redis DNS (which already
+    /// implies control of the gateway's resolver). Literal-IP `rediss://` and all
+    /// `redis://` (plaintext) endpoints ARE pinned/screened. Closing the TLS-
+    /// hostname gap requires a custom pinned TLS connector (abandoning the crate's
+    /// ConnectionManager) and is deliberately out of scope — see PR #1933.
     pub(crate) fn url_with_resolved_ip(&self, resolved_ip: std::net::IpAddr) -> String {
         let url = self.effective_url();
 
-        // Don't replace hostname for TLS — SNI needs the original hostname
+        // Don't replace hostname for TLS — SNI needs the original hostname (see
+        // the ACCEPTED LIMITATION note above on the residual rebinding gap).
         if url.starts_with("rediss://") {
             return url;
         }

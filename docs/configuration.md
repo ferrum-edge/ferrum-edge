@@ -793,6 +793,10 @@ A fresh gateway runs `both` + baseline-on. It still reaches **loopback and RFC19
 
 The allow/deny CIDR lists accept comma-separated CIDRs or bare IPs (`10.0.0.0/8, 192.168.1.1, fc00::/7, ::1`); an invalid entry fails startup rather than silently failing open. The same policy is enforced by config validation, the DNS resolver, the connection pool, service discovery, and plugin endpoint screening.
 
+### Known limitation: `rediss://` (TLS) Redis hostnames
+
+The centralized rate-limiter's Redis endpoint is screened through the same policy: literal-IP `redis://`/`rediss://` endpoints are screened, and plaintext `redis://` hostnames are **pinned** to the gateway-resolved IP so the Redis client cannot re-resolve outside the cache. A **`rediss://` (TLS) endpoint specified as a hostname** is the one exception — it is screened on every resolve but **not pinned**, because the `redis` crate derives the TLS server name (SNI) from the URL host and offers no way to dial a chosen IP while presenting a separate server name. The Redis client therefore re-resolves the hostname itself at connect/reconnect time, leaving a narrow DNS-rebinding window between the gateway's screen and the client's dial. Exploiting it requires control of the operator's *own* Redis DNS (which already implies control of the gateway's resolver), and on any screen/resolve failure the rate limiter fails **closed** to the in-memory limiter rather than dialing unscreened. To remove the window entirely, use a literal-IP `rediss://` endpoint (e.g. `rediss://10.0.0.5:6380`) or a plaintext `redis://` hostname.
+
 ## Configuration File (`ferrum.conf`)
 
 As an alternative to environment variables, the gateway supports a `ferrum.conf` configuration file for setting reasonable defaults. Environment variables **take precedence** over values in the conf file, allowing operators to define baseline configuration in the file and override specific values per deployment via env vars.
