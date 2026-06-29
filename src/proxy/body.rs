@@ -1587,10 +1587,17 @@ impl H3ReadProgress {
         self.epoch.fetch_add(1, Ordering::Release);
     }
 
-    /// FIN seen: DATA complete, only optional trailers remain. Re-arms the
-    /// inactivity clock (via the epoch bump) AND enables collapse-on-timeout.
-    fn enter_trailer_phase(&self) {
-        self.trailer_phase.store(true, Ordering::Release);
+    /// FIN seen: the DATA stream ended. Always re-arm the inactivity clock (epoch
+    /// bump) for the trailer wait, but enable collapse-on-timeout ONLY when the
+    /// body was actually COMPLETE. A truncated body that FINs early
+    /// (`received < content_length`) must still surface a failure — its trailer
+    /// timeout (or graceful close) must NOT collapse to a clean EOS — matching
+    /// the graceful-close arm's `is_response_body_complete` guard, so early-FIN
+    /// truncation with pending trailers is not laundered into success.
+    fn enter_trailer_phase(&self, body_complete: bool) {
+        if body_complete {
+            self.trailer_phase.store(true, Ordering::Release);
+        }
         self.epoch.fetch_add(1, Ordering::Release);
     }
 }
@@ -1647,8 +1654,17 @@ impl<S> H3FrameSource<S> {
     /// trailers remain.
     fn enter_trailer_phase(&mut self) {
         self.state = H3FrameSourceState::Trailers;
+        // Only enable collapse-on-timeout for a COMPLETE body — a truncated body
+        // that FINs early must keep surfacing a failure on a trailer timeout /
+        // graceful close (#1940 review).
+        let body_complete = crate::http3::client::is_response_body_complete(
+            self.received,
+            &self.method,
+            self.status,
+            self.content_length,
+        );
         if let Some(p) = &self.progress {
-            p.enter_trailer_phase();
+            p.enter_trailer_phase(body_complete);
         }
     }
 }
@@ -3593,13 +3609,50 @@ mod tests {
         assert!(source.is_done());
     }
 
+    #[test]
+    fn h3_frame_source_truncated_fin_does_not_flag_trailer_collapse() {
+        // A backend that declares Content-Length but FINs early (fewer bytes)
+        // must NOT enable collapse-on-timeout: a subsequent trailer timeout /
+        // graceful close has to surface the framing error, not be laundered into
+        // a clean EOS / successful deferred dispatch (#1940 review). The epoch is
+        // still bumped (the FIN is backend progress), but `trailer_phase` stays
+        // clear because `received < content_length`.
+        let progress = Arc::new(H3ReadProgress::default());
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![
+                    MockH3DataStep::Data(Bytes::from("body")),
+                    MockH3DataStep::End,
+                ],
+                vec![MockH3TrailerStep::Pending],
+            ),
+            Arc::from("GET"),
+            200,
+            Some(8), // declares 8 bytes but only 4 ("body") are sent → truncated
+            Some(Arc::clone(&progress)),
+        );
+
+        // DATA frame (4 bytes), then FIN → Trailers.
+        assert!(matches!(poll_source(&mut source), Poll::Ready(Some(Ok(_)))));
+        assert!(matches!(poll_source(&mut source), Poll::Pending));
+        assert!(
+            !progress.trailer_phase.load(Ordering::Acquire),
+            "a truncated (received < content_length) FIN must NOT enable trailer-collapse",
+        );
+        assert_eq!(
+            progress.epoch.load(Ordering::Acquire),
+            2,
+            "the FIN still bumps the epoch (backend progress) even when truncated",
+        );
+    }
+
     #[tokio::test]
     async fn idle_read_timeout_collapses_to_eos_in_trailer_phase() {
         // With `trailer_phase` set (H3 body complete, only an optional trailer
         // still pending), a fired read deadline COLLAPSES to a clean EOS instead
         // of erroring — parity with the buffered drain's trailer-timeout collapse.
         let progress = Arc::new(H3ReadProgress::default());
-        progress.enter_trailer_phase(); // body complete, only trailers pending
+        progress.enter_trailer_phase(true); // body complete, only trailers pending
         let inner = Coalescing::new(
             MockSource::new(vec![
                 MockStep::Pending,

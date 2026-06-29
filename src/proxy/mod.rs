@@ -16299,15 +16299,25 @@ async fn handle_proxy_request_inner(
     let streaming_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         // Native H3 exposes a recv stream rather than a `Body` here, so we cannot
-        // call `is_end_stream()` — and `content-length: 0` does NOT prove the
-        // QUIC stream has ended (the backend may keep it open for trailers or
-        // simply stall), so we must not infer END_STREAM from the header (#1940
-        // review). Leave it `false` and rely on `streaming_dispatch_should_defer`
-        // for the genuine no-body cases (HEAD / 204 / 304). The H3 body always
-        // reports `is_end_stream() == false` until its terminal poll, so hyper
-        // polls it at least once and the deferred outcome is recorded at body
-        // completion (or, on a stall, surfaced by the per-frame read timeout).
-        ResponseBody::StreamingH3(_) => false,
+        // call `is_end_stream()`. A declared `content-length: 0` (on a streamable
+        // status such as 200/206) means the DATA body is COMPLETE at header time
+        // — zero bytes — so the response is already a success; mark it ended and
+        // record the dispatch EAGERLY. Deferring it instead risks
+        // `ProxyBody::Drop` recording the never-polled zero-length body as a
+        // `ClientDisconnect` / neutral, which loses the success and prevents a
+        // HALF_OPEN breaker from healing on zero-length traffic (#1940 review). A
+        // lingering QUIC stream (optional trailers, or a late close) does NOT make
+        // an already-complete 0-byte response incomplete. Only a KNOWN-zero length
+        // is treated this way: non-zero / unknown lengths stay deferred so a
+        // post-header DATA stall or reset still trips the breaker. HEAD / 204 /
+        // 304 remain covered by `streaming_dispatch_should_defer`'s own gates.
+        ResponseBody::StreamingH3(_) => {
+            response_is_no_body_status(response_status)
+                || response_headers
+                    .get("content-length")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    == Some(0)
+        }
         _ => false,
     };
     let defer_streaming_dispatch = matches!(
