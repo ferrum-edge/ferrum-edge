@@ -4792,19 +4792,24 @@ impl ProxyState {
         {
             let egress_policy = &self.env_config.backend_allow_ips;
             targets.retain(|target| {
-                let bare = target
-                    .host()
-                    .strip_prefix('[')
-                    .and_then(|h| h.strip_suffix(']'))
-                    .unwrap_or(target.host());
-                match bare
-                    .parse::<std::net::IpAddr>()
-                    .ok()
-                    .and_then(|ip| egress_policy.deny_reason(&ip))
-                {
+                // Screen BOTH the probe's backend host literal AND a literal
+                // `dns_override`: the H3/H2/reqwest capability probes dial via
+                // `resolve_backend_addr_cached`, whose IP-literal fast path skips
+                // the `DnsCacheResolver`, so a denied literal in EITHER field would
+                // be dialed at startup/reload (e.g. a QUIC probe to 169.254.169.254)
+                // even when a DB-sourced row only warned at load. Mirrors the
+                // request-path `denied_literal_backend_or_dns_override` guard;
+                // dropping the target leaves it `Unknown`, which routes via reqwest
+                // at dispatch and is rejected there by the same policy.
+                match denied_literal_backend_or_dns_override(
+                    target.host(),
+                    &target.proxy,
+                    egress_policy,
+                ) {
                     Some(reason) => {
                         warn!(
                             host = %target.host(),
+                            dns_override = ?target.proxy.dns_override,
                             reason,
                             "Skipping capability probe for egress-policy-denied backend"
                         );
