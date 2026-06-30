@@ -931,9 +931,12 @@ enum DefaultTokenTarget {
 /// schemas the guard understands.
 ///
 /// These markers are still request-controlled, so they must not be used to
-/// suppress the top-level default cap. `inject_default_max_tokens` always keeps
-/// a top-level fallback for top-level-compatible upstreams, then adds the
-/// provider-native cap when a native target is detected.
+/// suppress the top-level default cap on an OpenAI-shaped body.
+/// `inject_default_max_tokens` keeps a top-level fallback whenever the body
+/// carries a top-level OpenAI-family prompt field (see
+/// [`has_top_level_prompt_marker`]) or no native container at all, then adds the
+/// provider-native cap when a native target is detected. A body that is
+/// unambiguously provider-native is left to its native cap only.
 fn default_token_target(json: &Value) -> DefaultTokenTarget {
     if json.get("generationConfig").is_some()
         || json.get("contents").is_some()
@@ -954,6 +957,23 @@ fn top_level_already_caps_output(json: &Value) -> bool {
     TOP_LEVEL_TOKEN_FIELDS
         .iter()
         .any(|field| json.get(*field).is_some())
+}
+
+/// True when the body carries a top-level prompt field that an OpenAI-compatible
+/// (top-level-`max_tokens`) upstream reads: `messages` (OpenAI Chat Completions,
+/// Anthropic Messages, Cohere v2, Bedrock Converse), `prompt` (legacy
+/// completions), or `input` (Responses API). Unlike the provider-native prompt
+/// fields — `contents` (Gemini), `inputs` (TGI), `inputText` (Titan) — these
+/// signal that a top-level `max_tokens` would actually cap the output, so a
+/// client-spoofed provider-native marker on such a body must NOT divert the
+/// default cap away from the top level (the #1950 bypass). A body with a native
+/// container and none of these fields is unambiguously provider-native and is
+/// left to its native cap only, so a strict provider backend (Gemini/Bedrock) is
+/// not handed an unsupported top-level field. Bedrock Converse is the irreducible
+/// exception: it shares `messages` with OpenAI, so it is treated as
+/// top-level-capable and fail-closed-capped. See [`inject_default_max_tokens`].
+fn has_top_level_prompt_marker(json: &Value) -> bool {
+    json.get("messages").is_some() || json.get("prompt").is_some() || json.get("input").is_some()
 }
 
 fn inject_provider_default_max_tokens(
@@ -996,17 +1016,26 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
     let target = default_token_target(json);
     let top_level_already_capped = top_level_already_caps_output(json);
     let target_already_capped = target_already_caps_output(json, target);
+    // The top-level fallback exists to defeat the #1950 spoof: a client appends a
+    // provider-native marker (`generationConfig`/`inferenceConfig`/`contents`) to
+    // an OpenAI-shaped body so the default routes only into a field the real
+    // (top-level-capped) upstream ignores, leaving output uncapped. Inject the
+    // top-level fallback only when the body actually carries an OpenAI-family
+    // top-level prompt field — the spoof must keep one so the OpenAI/Anthropic/
+    // Cohere upstream still processes the request — or when no provider-native
+    // container is present at all. A body that is unambiguously provider-native (a
+    // native container and NO top-level prompt field, e.g. Gemini `contents`, TGI
+    // `inputs`) is left to its native cap only, so a strict provider backend is
+    // not handed an unsupported top-level `max_tokens`.
+    let wants_top_level_fallback =
+        matches!(target, DefaultTokenTarget::TopLevel) || has_top_level_prompt_marker(json);
     let Some(obj) = json.as_object_mut() else {
         return false;
     };
 
     let mut modified = false;
 
-    // Request-body schema markers are client controlled and may not match the
-    // configured upstream. Always inject the top-level fallback unless a
-    // recognized top-level cap already exists, so an OpenAI-compatible backend
-    // cannot be left uncapped by a stray provider-native marker.
-    if !top_level_already_capped {
+    if wants_top_level_fallback && !top_level_already_capped {
         obj.insert("max_tokens".to_string(), Value::Number(default.into()));
         modified = true;
     }

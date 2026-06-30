@@ -744,9 +744,85 @@ async fn default_max_tokens_routes_tgi_bodies_to_max_new_tokens() {
         .await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["max_new_tokens"], 256);
+    assert!(
+        modified.get("max_tokens").is_none(),
+        "an unambiguously-native TGI body (no OpenAI-family top-level prompt) must \
+         receive only its native cap, not an unsupported top-level max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn default_max_tokens_skips_top_level_for_native_bodies_without_openai_prompt() {
+    // Codex #1950: an unambiguously provider-native body (a native container and
+    // no OpenAI-family top-level prompt field) must NOT be handed a spurious
+    // top-level `max_tokens` a strict provider backend (Gemini/Bedrock) would
+    // reject. The default still lands in the native cap field.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+
+    // Pure Gemini, uncapped -> native cap only, NO top-level max_tokens.
+    let gemini = serde_json::to_vec(&json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+    }))
+    .unwrap();
+    let modified: serde_json::Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body(&gemini, Some("application/json"), &HashMap::new())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(modified["generationConfig"]["maxOutputTokens"], 256);
+    assert!(
+        modified.get("max_tokens").is_none(),
+        "a native Gemini body must not receive a spurious top-level max_tokens"
+    );
+
+    // Native body that already carries its own native cap -> untouched (the
+    // documented "inject only if no supported token field is present" contract).
+    let gemini_capped = serde_json::to_vec(&json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {"maxOutputTokens": 100}
+    }))
+    .unwrap();
+    let result = plugin
+        .transform_request_body(&gemini_capped, Some("application/json"), &HashMap::new())
+        .await;
+    assert!(
+        result.is_none(),
+        "a native body that already caps output natively must not be modified"
+    );
+}
+
+#[tokio::test]
+async fn default_max_tokens_top_level_fallback_when_openai_body_carries_native_marker() {
+    // The #1950 spoof stays closed when an OpenAI-shaped body (top-level
+    // `messages`) also carries a provider-native prompt/marker: the top-level
+    // fallback lands so an OpenAI upstream cannot be left uncapped, AND the native
+    // field is filled for a native upstream. The OpenAI-family prompt field is the
+    // signal that a top-level cap is warranted despite the native marker.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let spoof = serde_json::to_vec(&json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "inputs": "hi"
+    }))
+    .unwrap();
+    let modified: serde_json::Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body(&spoof, Some("application/json"), &HashMap::new())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
-        "TGI bodies also receive the top-level fallback so a spoofed marker cannot leave other compatible upstreams uncapped"
+        "an OpenAI-shaped body keeps the top-level cap even with a native marker"
+    );
+    assert_eq!(
+        modified["max_new_tokens"], 256,
+        "the native field is filled too for a native upstream"
     );
 }
 
