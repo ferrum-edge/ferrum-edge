@@ -16278,7 +16278,6 @@ async fn handle_proxy_request_inner(
                 }
             }
 
-            backend_admission_started_at = Instant::now();
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -16307,6 +16306,12 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            // Start the final-attempt health/LB/adaptive-concurrency sample
+            // after admission succeeds. This mirrors `proxy_to_backend`, which
+            // resets the same timer immediately before dispatch. A rotated
+            // retry's successful target must not inherit the previous target's
+            // failed-attempt latency or retry backoff in least-latency EWMA.
+            backend_admission_started_at = Instant::now();
 
             warn!(
                 proxy_id = %proxy.id,
@@ -16529,11 +16534,11 @@ async fn handle_proxy_request_inner(
                 response_status,
             ),
         );
-    // TTFB captured at header arrival; reused whether the deferred outcome is
-    // recorded synchronously (an after_proxy reject replaced the streaming body)
-    // or at body completion, matching the synchronous path's
-    // `backend_start.elapsed()` least-latency sample.
-    let streaming_dispatch_elapsed = backend_start.elapsed();
+    // Final-attempt dispatch elapsed for CB/passive-health/least-latency and
+    // adaptive-concurrency samples. `backend_start` intentionally spans every
+    // retry attempt and backoff for transaction logs below; using it here would
+    // penalize a rotated retry target with another target's failure/backoff.
+    let final_backend_dispatch_elapsed = backend_admission_started_at.elapsed();
     if defer_streaming_h2_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
@@ -16562,13 +16567,13 @@ async fn handle_proxy_request_inner(
             backend_error_class,
             cb_retry_probe_slot_available,
             skip_final_cb_record,
-            backend_start.elapsed(),
+            final_backend_dispatch_elapsed,
         );
     }
     let backend_admission_response_status = response_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = backend_admission_started_at.elapsed();
+    let backend_admission_elapsed = final_backend_dispatch_elapsed;
     let is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -16665,7 +16670,7 @@ async fn handle_proxy_request_inner(
             backend_admission_error_class,
             false,
             skip_final_cb_record || cb_stale,
-            streaming_dispatch_elapsed,
+            final_backend_dispatch_elapsed,
         );
     }
 
@@ -17263,7 +17268,7 @@ async fn handle_proxy_request_inner(
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_dispatch_elapsed,
+                        final_backend_dispatch_elapsed,
                     )
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
