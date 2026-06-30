@@ -610,9 +610,9 @@ pub(crate) async fn handle_h3_websocket(
     // effective idle window for an H3 WebSocket is `min(this timeout,
     // FERRUM_HTTP3_IDLE_TIMEOUT)`. A WebSocket idle value larger than the QUIC
     // idle timeout — including `0` (disabled) — cannot keep an idle H3 session
-    // open past the QUIC bound. Operators raise `FERRUM_HTTP3_IDLE_TIMEOUT` to
-    // honor a longer WebSocket idle window on H3. Coordinating the two bounds
-    // automatically is tracked as follow-up work (issue #1935).
+    // open past the QUIC bound. Startup/reload config warnings surface this
+    // interaction for affected H3-reachable proxies so operators can raise
+    // `FERRUM_HTTP3_IDLE_TIMEOUT` or lower the WebSocket idle window.
     let ws_idle_tracker = crate::proxy::WsIdleTracker::from_timeout_seconds(
         proxy.effective_websocket_idle_timeout_seconds(
             state.env_config.websocket_idle_timeout_seconds,

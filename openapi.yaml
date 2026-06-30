@@ -5939,7 +5939,8 @@ components:
             FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies, so an idle H3
             WebSocket is bounded by min(websocket_idle_timeout_seconds,
             FERRUM_HTTP3_IDLE_TIMEOUT); raise FERRUM_HTTP3_IDLE_TIMEOUT to honor a
-            longer idle window on H3.
+            longer idle window on H3. Startup/reload warnings are logged for
+            affected H3-reachable proxies.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64

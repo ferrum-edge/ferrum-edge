@@ -1330,6 +1330,124 @@ fn warn_if_websocket_idle_newly_disabled(
     emit_websocket_idle_disabled_warning(&newly_disabled, global_ws_idle_timeout_seconds);
 }
 
+fn h3_websocket_idle_capped_proxy_ids(
+    config: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) -> Vec<&str> {
+    if !h3_websocket_reachable || http3_idle_timeout_seconds == 0 {
+        return Vec::new();
+    }
+
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_http_family())
+        .filter(|proxy| {
+            let ws_idle =
+                proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds);
+            ws_idle == 0 || ws_idle > http3_idle_timeout_seconds
+        })
+        .map(|proxy| proxy.id.as_str())
+        .collect()
+}
+
+fn emit_h3_websocket_idle_capped_warning(
+    capped_proxy_ids: &[&str],
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let sample = capped_proxy_ids
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        h3_websocket_idle_capped_proxy_count = capped_proxy_ids.len(),
+        h3_websocket_idle_capped_proxy_sample = %sample,
+        global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+        "One or more HTTP-family proxies have a WebSocket idle timeout that cannot be honored for HTTP/3 WebSockets. \
+         QUIC max_idle_timeout (FERRUM_HTTP3_IDLE_TIMEOUT) also applies, so the effective idle window is capped by the HTTP/3 idle timeout. \
+         Raise FERRUM_HTTP3_IDLE_TIMEOUT or lower websocket_idle_timeout_seconds / FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS to make the H3 behavior explicit."
+    );
+}
+
+fn warn_if_h3_websocket_idle_capped(
+    config: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let capped = h3_websocket_idle_capped_proxy_ids(
+        config,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+    if capped.is_empty() {
+        return;
+    }
+    emit_h3_websocket_idle_capped_warning(
+        &capped,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+}
+
+fn h3_websocket_idle_newly_capped_proxy_ids<'a>(
+    previous: &GatewayConfig,
+    next: &'a GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) -> Vec<&'a str> {
+    let previously_capped: std::collections::HashSet<&str> = h3_websocket_idle_capped_proxy_ids(
+        previous,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    )
+    .into_iter()
+    .collect();
+
+    h3_websocket_idle_capped_proxy_ids(
+        next,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    )
+    .into_iter()
+    .filter(|id| !previously_capped.contains(id))
+    .collect()
+}
+
+fn warn_if_h3_websocket_idle_newly_capped(
+    previous: &GatewayConfig,
+    next: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let newly_capped = h3_websocket_idle_newly_capped_proxy_ids(
+        previous,
+        next,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+    if newly_capped.is_empty() {
+        return;
+    }
+    emit_h3_websocket_idle_capped_warning(
+        &newly_capped,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -4198,6 +4316,12 @@ impl ProxyState {
             None
         };
         warn_if_websocket_idle_disabled(&config, env_config.websocket_idle_timeout_seconds);
+        warn_if_h3_websocket_idle_capped(
+            &config,
+            env_config.enable_http3 && env_config.http3_websocket_enabled,
+            env_config.websocket_idle_timeout_seconds,
+            env_config.http3_idle_timeout,
+        );
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
@@ -6366,10 +6490,18 @@ impl ProxyState {
         // reload that makes a proxy's WebSocket idle bound *newly* disabled emits
         // the same resource-hoarding warning, without re-warning on every
         // unrelated reload while a persistent opt-out is in place.
+        let previous_config = self.config.load_full();
         warn_if_websocket_idle_newly_disabled(
-            &self.config.load_full(),
+            &previous_config,
             &published.config,
             self.env_config.websocket_idle_timeout_seconds,
+        );
+        warn_if_h3_websocket_idle_newly_capped(
+            &previous_config,
+            &published.config,
+            self.env_config.enable_http3 && self.env_config.http3_websocket_enabled,
+            self.env_config.websocket_idle_timeout_seconds,
+            self.env_config.http3_idle_timeout,
         );
         self.config.store(Arc::clone(&published.config));
     }
@@ -29946,6 +30078,57 @@ mod tests {
         // Steady state (no new transitions) reports nothing, so a persistent
         // opt-out does not re-warn on every unrelated reload.
         assert!(websocket_idle_newly_disabled_proxy_ids(&next, &next, 300).is_empty());
+    }
+
+    #[test]
+    fn h3_websocket_idle_capped_collector_filters_h3_reachable_http_family() {
+        let mut disabled = make_validation_proxy("disabled", "/disabled");
+        disabled.websocket_idle_timeout_seconds = Some(0);
+        let mut long = make_validation_proxy("long", "/long");
+        long.websocket_idle_timeout_seconds = Some(120);
+        let mut equal = make_validation_proxy("equal", "/equal");
+        equal.websocket_idle_timeout_seconds = Some(30);
+        let mut shorter = make_validation_proxy("shorter", "/shorter");
+        shorter.websocket_idle_timeout_seconds = Some(10);
+        let inherit = make_validation_proxy("inherit", "/inherit");
+        let mut stream = make_validation_stream_proxy("stream", 18080);
+        stream.websocket_idle_timeout_seconds = Some(120);
+
+        let mut config =
+            make_validation_config(vec![disabled, long, equal, shorter, inherit, stream]);
+        config.normalize_fields();
+
+        let mut capped = h3_websocket_idle_capped_proxy_ids(&config, true, 300, 30);
+        capped.sort();
+        assert_eq!(capped, vec!["disabled", "inherit", "long"]);
+
+        assert!(h3_websocket_idle_capped_proxy_ids(&config, false, 300, 30).is_empty());
+        assert!(h3_websocket_idle_capped_proxy_ids(&config, true, 300, 0).is_empty());
+    }
+
+    #[test]
+    fn h3_websocket_idle_newly_capped_reports_only_transitions() {
+        let mut prev_a = make_validation_proxy("a", "/a");
+        prev_a.websocket_idle_timeout_seconds = Some(120); // already capped
+        let mut prev_b = make_validation_proxy("b", "/b");
+        prev_b.websocket_idle_timeout_seconds = Some(10); // not capped
+        let mut previous = make_validation_config(vec![prev_a, prev_b]);
+        previous.normalize_fields();
+
+        let mut next_a = make_validation_proxy("a", "/a");
+        next_a.websocket_idle_timeout_seconds = Some(120); // still capped
+        let mut next_b = make_validation_proxy("b", "/b");
+        next_b.websocket_idle_timeout_seconds = Some(45); // newly capped
+        let mut next_c = make_validation_proxy("c", "/c");
+        next_c.websocket_idle_timeout_seconds = Some(0); // added and capped by QUIC
+        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        next.normalize_fields();
+
+        let mut newly = h3_websocket_idle_newly_capped_proxy_ids(&previous, &next, true, 300, 30);
+        newly.sort();
+        assert_eq!(newly, vec!["b", "c"]);
+
+        assert!(h3_websocket_idle_newly_capped_proxy_ids(&next, &next, true, 300, 30).is_empty());
     }
 
     fn test_runtime_trust_bundles(
