@@ -83,11 +83,14 @@ const COMPRESSED_AI_REQUEST_METADATA_KEY: &str = "ai_ratelimit_compressed_ai_req
 /// body is available. Mirrors `ai_request_guard`'s deferred-compressed handling
 /// (#1919).
 const DEFERRED_COMPRESSED_CLASSIFICATION_KEY: &str = "ai_ratelimit_deferred_compressed_classify";
-/// Private header the `compression` plugin stashes the original `Content-Encoding`
-/// under after decompressing a request body (see `compression.rs::before_proxy`).
-/// Its presence with no live `Content-Encoding` tells `ai_rate_limiter` the body
-/// WAS compressed and will be available decompressed in `on_final_request_body`.
-const ORIGINAL_CONTENT_ENCODING_HEADER: &str = "x-ferrum-original-content-encoding";
+/// Metadata key the `compression` plugin sets (see `compression.rs::before_proxy`)
+/// when it decompresses a request body. It is written into `ctx.metadata`, which
+/// clients cannot influence, so — unlike the `x-ferrum-original-content-encoding`
+/// header, which is only sanitized when `compression` actually runs — it is a
+/// trustworthy signal that the body WAS compressed and will be available
+/// decompressed in `on_final_request_body`. Detecting the deferred (Case A) path
+/// from a client-settable header would let a spoofed header skip pre-reservation.
+const COMPRESSION_REQUEST_ENCODING_METADATA_KEY: &str = "compression:request_encoding";
 
 /// Process-wide monotonic counter used to give every `AiRateLimiter` instance a
 /// unique id. The id is folded into [`AiRateLimiter::federation_flag_key`] so the
@@ -928,6 +931,17 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
     })
 }
 
+/// True for native gRPC (`application/grpc*`) and gRPC-Web (`application/grpc-web*`)
+/// content types, including the `+json` variants. Their bodies are length-prefixed
+/// wire frames, not a bare JSON document, so they must be excluded from the
+/// JSON-AI candidate path even though `is_json_content_type` matches the `+json`
+/// suffix — otherwise a normal HTTP-200 gRPC response without LLM usage could be
+/// turned into a 502 by `on_unmetered_response`. Mirrors `ai_request_guard`.
+fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+        || crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+}
+
 fn estimate_prompt_tokens(json: &Value) -> u64 {
     let chars = prompt_character_count(json);
     if chars == 0 { 0 } else { chars.div_ceil(4) }
@@ -1276,15 +1290,18 @@ impl Plugin for AiRateLimiter {
         // handled the body:
         //
         //   Case A — `compression` with `decompress_request: true` already
-        //     decoded the body: it strips `content-encoding`, stashes the
-        //     original under `x-ferrum-original-content-encoding`, and decodes
-        //     the body in its later `transform_request_body`. The decoded bytes
-        //     are NOT written back into `ctx.metadata["request_body"]`, so we
-        //     cannot classify here — but `on_final_request_body` receives the
-        //     decompressed body, so classification is DEFERRED to there. Without
-        //     this, the bare `content-encoding` check below misses the request
-        //     (the header is already gone) and a usage-less compressed AI 2xx
-        //     would bypass the policy in the common `decompress_request` setup.
+        //     decoded the body: it strips `content-encoding`, records the
+        //     `compression:request_encoding` metadata key, and decodes the body in
+        //     its later `transform_request_body`. The decoded bytes are NOT written
+        //     back into `ctx.metadata["request_body"]`, so we cannot classify here
+        //     — but `on_final_request_body` receives the decompressed body, so
+        //     classification is DEFERRED to there. We detect this from the
+        //     compression-owned METADATA key (not the `x-ferrum-original-content-`
+        //     `encoding` header, which a client can forge when `compression` is
+        //     absent or ordered after this plugin — that would let a forged header
+        //     skip pre-reservation). Without deferral the bare `content-encoding`
+        //     check below misses the request (the header is gone) and a usage-less
+        //     compressed AI 2xx would bypass the policy in the common setup.
         //   Case B — the body stays compressed end to end (no co-located
         //     decompression, or an encoding `compression` does not support):
         //     `content-encoding` is still present and the body is never
@@ -1298,13 +1315,22 @@ impl Plugin for AiRateLimiter {
         // headers out of `ctx.headers` for this phase. See limitation #4 below
         // and docs/plugins.md. Mirrors `ai_request_guard` (#1919), which defers
         // compressed-body inspection the same way. We do NOT decompress here.
+        // Framed gRPC / gRPC-Web bodies carry length-prefixed wire frames, not a
+        // bare JSON document, even when their media type ends in `+json`; exclude
+        // them so a normal gRPC 2xx without LLM usage is never marked an AI
+        // candidate and turned into a 502.
         let is_post_json = ctx.method == "POST"
-            && headers
-                .get("content-type")
-                .is_some_and(|content_type| is_json_content_type(content_type));
+            && headers.get("content-type").is_some_and(|content_type| {
+                is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+            });
         let still_compressed = has_non_identity_content_encoding(headers);
-        let decompressed_by_compression =
-            !still_compressed && headers.contains_key(ORIGINAL_CONTENT_ENCODING_HEADER);
+        // Detect the decompressed-by-`compression` (Case A) path from the
+        // compression-owned metadata, NOT a client-settable header. See
+        // `COMPRESSION_REQUEST_ENCODING_METADATA_KEY`.
+        let decompressed_by_compression = !still_compressed
+            && ctx
+                .metadata
+                .contains_key(COMPRESSION_REQUEST_ENCODING_METADATA_KEY);
         let defer_compressed_classification = decompressed_by_compression && is_post_json;
         let (is_ai_request, reserved_tokens) = if still_compressed {
             // Case B: uninspectable compressed body — fail closed for POST JSON.
