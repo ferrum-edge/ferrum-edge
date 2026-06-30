@@ -4,7 +4,8 @@
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
 //! `backend_admission` → `after_proxy` → `on_response_body` → `transform_response_body` →
-//! `on_final_response_body` → `log` → `on_ws_frame`.
+//! `on_final_response_body` → `on_response_stream_end` (streamed responses only)
+//! → `log` → `on_ws_frame`.
 //!
 //! `backend_admission` runs last on the request side — after request-body
 //! transforms and `on_final_request_body`, immediately before the backend
@@ -2766,6 +2767,21 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Called exactly once when a streamed, non-buffered response body reaches a
+    /// terminal state.
+    ///
+    /// Unlike `on_response_body` / `on_final_response_body`, this hook does not
+    /// receive body bytes and cannot replace the response. It exists for plugins
+    /// that hold per-request state across streaming responses and need the same
+    /// terminal signal the proxy uses for deferred logging/accounting.
+    async fn on_response_stream_end(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
     }
 
     /// Called for transaction logging.

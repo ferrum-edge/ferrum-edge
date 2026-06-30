@@ -4,7 +4,7 @@ Ferrum Edge executes plugins in a deterministic order based on two dimensions: *
 
 ## Lifecycle Phases
 
-Every HTTP-family request passes through ten main request/response phases in strict order. WebSocket connections optionally enter an eleventh frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:
+Every HTTP-family request passes through the request/header phases in strict order. Buffered responses then run the body phases before logging; streamed non-buffered responses skip the buffered body phases and run a terminal stream hook before logging. WebSocket connections optionally enter a frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:
 
 ```
 Request In
@@ -59,6 +59,9 @@ Request In
 │ 9. on_final_response_body │ Final client-visible body validation/storage
 └────────────┬────────────┘
              │
+             │  Streamed non-buffered bodies skip phases 7-9 and call
+             │  on_response_stream_end here when the body terminates.
+             │
              ▼
 ┌─────────────────────────┐
 │ 10. log                 │  Logging & observability (fire-and-forget)
@@ -70,6 +73,8 @@ Any plugin can short-circuit the pipeline by returning a `Reject` result. For ex
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
+
+`on_response_stream_end` is streaming-only. It receives the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before `log` from the same deferred terminal path used for streaming accounting. Plugins that hold per-request state across streamed responses, such as `request_deduplication`, use this hook to release state without forcing event streams or other long-lived responses onto the buffered path.
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 

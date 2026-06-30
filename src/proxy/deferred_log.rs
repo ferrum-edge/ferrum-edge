@@ -209,13 +209,14 @@ impl DeferredTransactionLogger {
             ctx,
             start_time,
         } = state;
-        summary.body_completed = outcome.body_completed;
-        summary.body_error_class = outcome.body_error_class;
-        summary.client_disconnected = outcome.client_disconnected;
+        let stream_outcome = outcome.clone();
+        summary.body_completed = stream_outcome.body_completed;
+        summary.body_error_class = stream_outcome.body_error_class;
+        summary.client_disconnected = stream_outcome.client_disconnected;
         // Streaming responses only learn their final byte count when the
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.
-        summary.bytes_received = outcome.bytes_streamed;
+        summary.bytes_received = stream_outcome.bytes_streamed;
 
         // Re-derive wall-clock latencies so streaming responses report the
         // real body-completion time instead of the header-flush snapshot.
@@ -243,6 +244,12 @@ impl DeferredTransactionLogger {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    let response_status = summary.response_status_code;
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_stream_end(&ctx, response_status, &stream_outcome)
+                            .await;
+                    }
                     log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
                 });
             }
@@ -333,6 +340,38 @@ mod tests {
         let summary = captured.lock().unwrap().clone().expect("log fired");
         assert_eq!(summary.bytes_received, 12345);
         assert!(summary.body_completed);
+    }
+
+    #[tokio::test]
+    async fn fire_invokes_response_stream_end_before_log() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let status = Arc::new(Mutex::new(None));
+        let outcome = Arc::new(Mutex::new(None));
+        let plugin: Arc<dyn Plugin> = Arc::new(StreamEndCapturingPlugin {
+            events: events.clone(),
+            status: status.clone(),
+            outcome: outcome.clone(),
+        });
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![plugin]);
+        let ctx = Arc::new(RequestContext::new(
+            "1.2.3.4".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        ));
+        let mut summary = fake_summary();
+        summary.response_status_code = 206;
+
+        let logger = DeferredTransactionLogger::new(summary, plugins, ctx);
+        logger.fire(BodyOutcome::error(ErrorClass::ReadWriteTimeout, 77, false));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["stream_end", "log"]);
+        assert_eq!(*status.lock().unwrap(), Some(206));
+        let outcome = outcome.lock().unwrap().clone().expect("stream hook fired");
+        assert!(!outcome.body_completed);
+        assert_eq!(outcome.body_error_class, Some(ErrorClass::ReadWriteTimeout));
+        assert!(!outcome.client_disconnected);
+        assert_eq!(outcome.bytes_streamed, 77);
     }
 
     #[tokio::test]
@@ -429,6 +468,38 @@ mod tests {
 
         async fn log(&self, summary: &TransactionSummary) {
             *self.0.lock().unwrap() = Some(summary.clone());
+        }
+    }
+
+    struct StreamEndCapturingPlugin {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        status: Arc<Mutex<Option<u16>>>,
+        outcome: Arc<Mutex<Option<BodyOutcome>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for StreamEndCapturingPlugin {
+        fn name(&self) -> &str {
+            "stream-end-capturing"
+        }
+
+        fn priority(&self) -> u16 {
+            9000
+        }
+
+        async fn on_response_stream_end(
+            &self,
+            _ctx: &RequestContext,
+            response_status: u16,
+            outcome: &BodyOutcome,
+        ) {
+            self.events.lock().unwrap().push("stream_end");
+            *self.status.lock().unwrap() = Some(response_status);
+            *self.outcome.lock().unwrap() = Some(outcome.clone());
+        }
+
+        async fn log(&self, _summary: &TransactionSummary) {
+            self.events.lock().unwrap().push("log");
         }
     }
 

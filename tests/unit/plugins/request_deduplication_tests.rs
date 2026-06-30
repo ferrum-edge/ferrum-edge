@@ -9,6 +9,7 @@ use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -664,13 +665,10 @@ async fn test_response_buffering_releases_event_stream_content_type() {
 /// A keyed request whose response is streamed as `text/event-stream` is handed
 /// to the client incrementally, so `on_final_response_body` (which transitions
 /// the `InFlight` marker to a cached `Completed` entry) never runs. The marker
-/// is intentionally kept in-flight for the lifetime of the stream — there is no
-/// plugin hook for streamed-body completion, and releasing it at response-headers
-/// time would let a concurrent duplicate mutating request reach the backend while
-/// the original stream is still running. While the stream is active a duplicate
-/// key must therefore still 409.
+/// stays in-flight for the lifetime of the stream, then the streamed-terminal
+/// hook releases it without storing a replay body.
 #[tokio::test]
-async fn test_streamed_event_stream_keeps_inflight_marker_for_stream_lifetime() {
+async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -717,15 +715,31 @@ async fn test_streamed_event_stream_keeps_inflight_marker_for_stream_lifetime() 
         ),
         "duplicate during an active streamed SSE response must 409, got {result:?}"
     );
-}
 
-// Note: after a streamed SSE response ends, the `InFlight` marker self-heals
-// once it exceeds `inflight_ttl` (documented to cover the longest protected
-// request, including a long-lived stream) via the staleness branch in
-// `local_lookup_or_mark_inflight`. That path is exercised by the staleness logic
-// generally; a dedicated test here would require either a real >=1s sleep
-// (`inflight_ttl_seconds` is rejected at 0) or injectable time, which this suite
-// deliberately avoids to keep CI fast (see `test_inflight_marker_carries_timestamp`).
+    plugin
+        .on_response_stream_end(&ctx, 200, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "finite streamed SSE completion must release the in-flight marker instead of waiting for TTL"
+    );
+
+    let mut after_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut after_headers = HashMap::new();
+    after_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin
+        .before_proxy(&mut after_ctx, &mut after_headers)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "duplicate after streamed SSE completion should re-execute, not get stale 409 or cached replay; got {result:?}"
+    );
+}
 
 /// A buffered (non-SSE) keyed response keeps the marker in-flight through the
 /// header phase and transitions it to a cached `Completed` entry via

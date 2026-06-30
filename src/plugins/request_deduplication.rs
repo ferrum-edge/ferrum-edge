@@ -1521,13 +1521,9 @@ impl Plugin for RequestDeduplication {
         // on the buffered path with no benefit. Streaming it instead keeps the
         // `InFlight` marker active for the lifetime of the still-in-flight
         // stream — which is exactly the concurrent-duplicate protection this
-        // plugin promises — and the marker self-heals once it exceeds
-        // `inflight_ttl` (documented to cover the longest protected request,
-        // including a long-lived stream). The marker is intentionally NOT
-        // released at response-headers time: there is no plugin hook for
-        // streamed-body completion, and releasing early would admit a duplicate
-        // mutating request to the backend while the original stream is still
-        // running, defeating the in-flight lock.
+        // plugin promises. The streamed-body terminal hook releases the marker
+        // once the stream ends; `inflight_ttl` remains only the crash/leak
+        // backstop for streams that never deliver a terminal signal.
         self.should_buffer_response_body(ctx)
             && !content_type.is_some_and(is_event_stream_content_type)
     }
@@ -1731,6 +1727,25 @@ impl Plugin for RequestDeduplication {
         }
 
         PluginResult::Continue
+    }
+
+    async fn on_response_stream_end(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+            return;
+        };
+        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
+            return;
+        };
+
+        self.remove_matching_local_inflight(key, fingerprint);
+        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+            self.redis_release_inflight(key, fingerprint, token).await;
+        }
     }
 
     async fn on_final_response_body(
