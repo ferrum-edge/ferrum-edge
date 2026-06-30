@@ -16298,26 +16298,25 @@ async fn handle_proxy_request_inner(
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
     let streaming_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
-        // Native H3 exposes a recv stream rather than a `Body` here, so we cannot
-        // call `is_end_stream()`. A declared `content-length: 0` (on a streamable
-        // status such as 200/206) means the DATA body is COMPLETE at header time
-        // — zero bytes — so the response is already a success; mark it ended and
-        // record the dispatch EAGERLY. Deferring it instead risks
-        // `ProxyBody::Drop` recording the never-polled zero-length body as a
-        // `ClientDisconnect` / neutral, which loses the success and prevents a
-        // HALF_OPEN breaker from healing on zero-length traffic (#1940 review). A
-        // lingering QUIC stream (optional trailers, or a late close) does NOT make
-        // an already-complete 0-byte response incomplete. Only a KNOWN-zero length
-        // is treated this way: non-zero / unknown lengths stay deferred so a
-        // post-header DATA stall or reset still trips the breaker. HEAD / 204 /
-        // 304 remain covered by `streaming_dispatch_should_defer`'s own gates.
-        ResponseBody::StreamingH3(_) => {
-            response_is_no_body_status(response_status)
-                || response_headers
-                    .get("content-length")
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    == Some(0)
-        }
+        // Native H3 has no `is_end_stream()` here (it exposes a recv stream, not a
+        // `Body`), and unlike H2 a `content-length: 0` header does NOT prove the
+        // QUIC stream has ended: h3's `poll_recv_data` returns `Ok(None)` only
+        // after it observes the FIN or trailer HEADERS, so even a CL:0 backend can
+        // leave the stream open (awaiting trailers) or reset. ALWAYS defer the
+        // native-H3 dispatch outcome to body completion (#1940 review) — this is
+        // the deliberate, final resolution after eager-recording CL:0 was tried
+        // and reverted:
+        //   * the H3 body reports `is_end_stream() == false` until its terminal
+        //     poll, so hyper polls it at least once; a CL:0 body that cleanly FINs
+        //     records success at completion;
+        //   * a CL:0 (or any) body that stalls/resets while the stream stays open
+        //     hits the per-frame read timeout and records a fault — which an eager
+        //     header-time success would silently drop;
+        //   * a body hyper never polls because the CLIENT went away records a
+        //     `ClientDisconnect`, which is correct, not a misclassification (hyper
+        //     does not drop an unpolled H3 body as "empty" — `is_end_stream` is
+        //     false, so emptiness is never assumed at header time).
+        ResponseBody::StreamingH3(_) => false,
         _ => false,
     };
     let defer_streaming_dispatch = matches!(
@@ -22698,6 +22697,31 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+            }
+        }
+        Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
+            // The backend FIN'd before delivering its declared Content-Length —
+            // a framing violation. The request was on the wire and the backend
+            // responded, so `connection_error=false` (respect `retry_on_methods`);
+            // `ConnectionClosed` is a post-wire backend failure, so the dispatch
+            // outcome trips CB / passive-health rather than banking a short body
+            // as a success.
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                received = received,
+                declared = ?declared,
+                "HTTP/3 backend buffered response truncated (FIN before declared Content-Length)"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HTTP/3 backend response truncated"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionClosed),
             }
         }
     }

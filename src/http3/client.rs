@@ -172,8 +172,19 @@ pub(crate) const H3_BODY_PREALLOC_CAP_BYTES: u64 = 1024 * 1024;
 #[derive(Debug)]
 pub(crate) enum H3BodyDrainError {
     Stream(h3::error::StreamError),
-    ResponseTooLarge { limit: usize },
-    ReadTimeout { timeout_ms: u64 },
+    ResponseTooLarge {
+        limit: usize,
+    },
+    ReadTimeout {
+        timeout_ms: u64,
+    },
+    /// The backend FIN'd the DATA stream before delivering its declared
+    /// Content-Length (truncation) — a framing violation surfaced as a backend
+    /// failure rather than a short-but-successful body.
+    Truncated {
+        received: u64,
+        declared: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for H3BodyDrainError {
@@ -189,6 +200,16 @@ impl std::fmt::Display for H3BodyDrainError {
             Self::ReadTimeout { timeout_ms } => {
                 write!(f, "Backend response read timeout after {timeout_ms}ms")
             }
+            Self::Truncated { received, declared } => match declared {
+                Some(d) => write!(
+                    f,
+                    "Backend FIN after {received} of {d} declared Content-Length bytes"
+                ),
+                None => write!(
+                    f,
+                    "Backend FIN after {received} of unknown declared Content-Length bytes"
+                ),
+            },
         }
     }
 }
@@ -197,7 +218,9 @@ impl std::error::Error for H3BodyDrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Stream(err) => Some(err),
-            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } => None,
+            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } | Self::Truncated { .. } => {
+                None
+            }
         }
     }
 }
@@ -304,7 +327,25 @@ pub(crate) async fn drain_h3_response_body(
                 }
                 body.extend_from_slice(chunk);
             }
-            Ok(None) => break,
+            Ok(None) => {
+                // Clean FIN. A declared Content-Length that the body did NOT
+                // satisfy (truncation / overlong) is a framing violation: surface
+                // it as a backend failure rather than returning a short body as a
+                // success, mirroring the streaming `H3FrameSource` FIN check. An
+                // absent Content-Length is FIN-delimited and complete here.
+                if !is_response_body_complete_after_fin(
+                    body.len() as u64,
+                    method,
+                    status,
+                    content_length,
+                ) {
+                    return Err(H3BodyDrainError::Truncated {
+                        received: body.len() as u64,
+                        declared: content_length,
+                    });
+                }
+                break;
+            }
             Err(e) => {
                 if is_h3_graceful_close(&e)
                     && is_response_body_complete(body.len() as u64, method, status, content_length)

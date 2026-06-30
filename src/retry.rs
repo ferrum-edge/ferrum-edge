@@ -806,8 +806,12 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
             match io_err.kind() {
                 std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted => {
-                    // Backend closed mid-stream — not a client disconnect.
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
+                    // Backend closed mid-stream, or FIN'd before delivering its
+                    // declared Content-Length (native-H3 `H3FrameSource`
+                    // truncation surfaces `UnexpectedEof`) — a backend fault, not
+                    // a client disconnect.
                     return (ErrorClass::ConnectionClosed, false);
                 }
                 std::io::ErrorKind::TimedOut => {

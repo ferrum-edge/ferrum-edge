@@ -1587,17 +1587,13 @@ impl H3ReadProgress {
         self.epoch.fetch_add(1, Ordering::Release);
     }
 
-    /// FIN seen: the DATA stream ended. Always re-arm the inactivity clock (epoch
-    /// bump) for the trailer wait, but enable collapse-on-timeout ONLY when the
-    /// body was actually COMPLETE. A truncated body that FINs early
-    /// (`received < content_length`) must still surface a failure — its trailer
-    /// timeout (or graceful close) must NOT collapse to a clean EOS — matching
-    /// the graceful-close arm's `is_response_body_complete` guard, so early-FIN
-    /// truncation with pending trailers is not laundered into success.
-    fn enter_trailer_phase(&self, body_complete: bool) {
-        if body_complete {
-            self.trailer_phase.store(true, Ordering::Release);
-        }
+    /// FIN seen on a COMPLETE body: re-arm the inactivity clock (epoch bump) for
+    /// the trailer wait AND enable collapse-on-timeout. The caller only reaches
+    /// this after the Data-phase FIN check has confirmed completeness — a
+    /// truncated body surfaces an error there and never enters the trailer phase
+    /// — so this is unconditional.
+    fn enter_trailer_phase(&self) {
+        self.trailer_phase.store(true, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Release);
     }
 }
@@ -1649,24 +1645,14 @@ impl<S> H3FrameSource<S> {
         matches!(self.state, H3FrameSourceState::Done)
     }
 
-    /// Mark the DATA body complete (FIN seen): re-arm the outer inactivity
-    /// deadline (epoch bump) and enable collapse-on-timeout while only optional
-    /// trailers remain.
+    /// Mark the DATA body complete (a clean FIN that satisfied any declared
+    /// Content-Length — the caller runs the truncation check first): re-arm the
+    /// outer inactivity deadline (epoch bump) and enable collapse-on-timeout
+    /// while only optional trailers remain.
     fn enter_trailer_phase(&mut self) {
         self.state = H3FrameSourceState::Trailers;
-        // Only enable collapse-on-timeout for a COMPLETE body — a truncated body
-        // that FINs early must keep surfacing a failure on a trailer timeout /
-        // graceful close. Use the post-FIN predicate: a clean FIN already ended
-        // the DATA stream, so an absent Content-Length (FIN-delimited / chunked)
-        // is complete; only a declared-length mismatch is rejected (#1940 review).
-        let body_complete = crate::http3::client::is_response_body_complete_after_fin(
-            self.received,
-            &self.method,
-            self.status,
-            self.content_length,
-        );
         if let Some(p) = &self.progress {
-            p.enter_trailer_phase(body_complete);
+            p.enter_trailer_phase();
         }
     }
 }
@@ -1692,10 +1678,40 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             return Poll::Ready(Some(Ok(Frame::data(data))));
                         }
                         Poll::Ready(Ok(None)) => {
-                            // Clean FIN: DATA body complete. Flag the trailer
-                            // phase so a fired outer read-timeout collapses to a
-                            // clean EOS instead of erroring while only optional
-                            // trailers remain.
+                            // Clean FIN. If a declared Content-Length was NOT
+                            // satisfied (truncation or overlong), that is a framing
+                            // violation: surface it as a backend error rather than
+                            // entering the trailer phase, where a subsequent
+                            // Ok(None) / trailers / graceful-close / read-timeout
+                            // branch would emit a clean EOS and bank a phantom
+                            // successful deferred dispatch (#1940 review). An absent
+                            // Content-Length is FIN-delimited and complete here.
+                            // `UnexpectedEof` classifies as `ConnectionClosed` (a
+                            // post-wire backend failure) in `classify_body_error`,
+                            // so the deferred dispatch records a fault.
+                            if !crate::http3::client::is_response_body_complete_after_fin(
+                                this.received,
+                                &this.method,
+                                this.status,
+                                this.content_length,
+                            ) {
+                                this.state = H3FrameSourceState::Done;
+                                return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    format!(
+                                        "h3 backend FIN after {} of {} declared Content-Length bytes",
+                                        this.received,
+                                        this.content_length.map_or_else(
+                                            || "unknown".to_string(),
+                                            |c| c.to_string(),
+                                        ),
+                                    ),
+                                ))
+                                    as BoxError)));
+                            }
+                            // Complete body: flag the trailer phase so a fired outer
+                            // read-timeout collapses to a clean EOS instead of
+                            // erroring while only optional trailers remain.
                             this.enter_trailer_phase();
                         }
                         Poll::Ready(Err(err)) => {
@@ -1766,25 +1782,15 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                         }
                         Poll::Ready(Err(err)) => {
                             this.state = H3FrameSourceState::Done;
-                            // A graceful connection-level close (H3_NO_ERROR /
-                            // GOAWAY) at the trailer phase means the backend
-                            // finished without trailers — emit a clean EOS rather
-                            // than a spurious stream error, matching the buffered
-                            // drain's `read_h3_trailers_with_timeout` ("no
-                            // trailers"). Use the POST-FIN completeness predicate:
-                            // a clean FIN already ended the DATA stream here, so an
-                            // absent Content-Length (FIN-delimited / chunked) is
-                            // complete; only a declared-length mismatch (a body
-                            // that FINs early or overlong) is rejected — otherwise
-                            // a truncated H3 response would be laundered into a
-                            // successful deferred dispatch instead of surfacing the
-                            // framing error (#1940 review).
-                            if crate::http3::client::is_response_body_complete_after_fin(
-                                this.received,
-                                &this.method,
-                                this.status,
-                                this.content_length,
-                            ) && err
+                            // The body is already COMPLETE here — truncation is
+                            // surfaced at the DATA-phase FIN check before this state
+                            // is ever entered — so a graceful connection-level close
+                            // (H3_NO_ERROR / GOAWAY) at the trailer phase just means
+                            // the backend finished without trailers: emit a clean
+                            // EOS rather than a spurious stream error, matching the
+                            // buffered drain's `read_h3_trailers_with_timeout` ("no
+                            // trailers"). Any non-graceful error still surfaces.
+                            if err
                                 .downcast_ref::<h3::error::StreamError>()
                                 .is_some_and(crate::http3::client::is_h3_graceful_close)
                             {
@@ -3611,13 +3617,13 @@ mod tests {
     }
 
     #[test]
-    fn h3_frame_source_truncated_fin_does_not_flag_trailer_collapse() {
-        // A backend that declares Content-Length but FINs early (fewer bytes)
-        // must NOT enable collapse-on-timeout: a subsequent trailer timeout /
-        // graceful close has to surface the framing error, not be laundered into
-        // a clean EOS / successful deferred dispatch (#1940 review). The epoch is
-        // still bumped (the FIN is backend progress), but `trailer_phase` stays
-        // clear because `received < content_length`.
+    fn h3_frame_source_truncated_fin_surfaces_error() {
+        // A backend that declares Content-Length but FINs early (fewer bytes) is a
+        // framing violation: the FIN must surface a backend error (not enter the
+        // trailer phase and be laundered into a clean EOS / successful deferred
+        // dispatch). The error is `UnexpectedEof`, which `classify_body_error`
+        // maps to `ConnectionClosed` so the deferred dispatch records a fault
+        // (#1940 review).
         let progress = Arc::new(H3ReadProgress::default());
         let mut source = H3FrameSource::new(
             MockH3RecvStream::new(
@@ -3633,18 +3639,23 @@ mod tests {
             Some(Arc::clone(&progress)),
         );
 
-        // DATA frame (4 bytes), then FIN → Trailers.
+        // DATA frame (4 bytes) is delivered, then the FIN surfaces the truncation.
         assert!(matches!(poll_source(&mut source), Poll::Ready(Some(Ok(_)))));
-        assert!(matches!(poll_source(&mut source), Poll::Pending));
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Err(e))) => {
+                let io = e
+                    .downcast_ref::<std::io::Error>()
+                    .expect("truncated FIN surfaces an io::Error");
+                assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected truncation error, got {other:?}"),
+        }
+        // The truncation never enters the trailer phase.
         assert!(
             !progress.trailer_phase.load(Ordering::Acquire),
-            "a truncated (received < content_length) FIN must NOT enable trailer-collapse",
+            "a truncated FIN must surface an error, not flag the trailer phase",
         );
-        assert_eq!(
-            progress.epoch.load(Ordering::Acquire),
-            2,
-            "the FIN still bumps the epoch (backend progress) even when truncated",
-        );
+        assert!(source.is_done());
     }
 
     #[test]
@@ -3681,7 +3692,7 @@ mod tests {
         // still pending), a fired read deadline COLLAPSES to a clean EOS instead
         // of erroring — parity with the buffered drain's trailer-timeout collapse.
         let progress = Arc::new(H3ReadProgress::default());
-        progress.enter_trailer_phase(true); // body complete, only trailers pending
+        progress.enter_trailer_phase(); // body complete, only trailers pending
         let inner = Coalescing::new(
             MockSource::new(vec![
                 MockStep::Pending,
