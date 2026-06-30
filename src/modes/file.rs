@@ -1243,6 +1243,7 @@ pub async fn serve(
     // resolved by the kernel, or env config holding a stale default).
     // Without this, H1/H2 reach the adopted socket but H3 binds
     // somewhere else and clients see the protocols diverge.
+    let mut h3_listener_started = false;
     if env_config.enable_http3 {
         if let Some(tls_cfg_arc) = tls_config.clone() {
             if bound.proxy_https.is_some() || env_config.proxy_https_port != 0 {
@@ -1279,6 +1280,7 @@ pub async fn serve(
                 });
                 handles.push(("HTTP/3 proxy listener".to_string(), h));
                 startup_signals.push(("HTTP/3 proxy listener".to_string(), started_rx));
+                h3_listener_started = true;
             } else {
                 info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
             }
@@ -1286,7 +1288,6 @@ pub async fn serve(
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
     }
-
     // Build `ServeHandles` BEFORE the late-startup `?` calls so that
     // failure to bind stream listeners / receive listener-started
     // signals / wait for the stream listener manager doesn't leave
@@ -1316,6 +1317,7 @@ pub async fn serve(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
+        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
         startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");
         Ok(())
