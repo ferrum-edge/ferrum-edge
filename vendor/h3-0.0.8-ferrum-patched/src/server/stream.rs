@@ -95,6 +95,14 @@ where
         self.inner.poll_recv_trailers(cx)
     }
 
+    /// Return request trailers that have already been received and buffered
+    /// internally, without consuming them or waiting for the terminal QUIC stream
+    /// FIN.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn peek_recv_trailers(&self) -> Result<Option<HeaderMap>, StreamError> {
+        self.inner.peek_recv_trailers()
+    }
+
     /// Tell the peer to stop sending into the underlying QUIC stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {

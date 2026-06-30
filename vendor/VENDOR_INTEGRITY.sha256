@@ -8,9 +8,9 @@ b6484d78cf87db9336a684f77c1820c2363196f724437f3996cb76809fcc8ad1  vendor/h3-0.0.
 1a26960516ca14f032235db1cc0b305ecb87ec20da31fb7b08d354ab7b889a0a  vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
 1c01a7344f15647e28f935c4d384afb6e3bbb5c51e5970b0e1dffbab962d9f23  vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
 2177e92d0ee744d141fdabdb3b836911def2bb5799951649ed3e40589cb4258c  vendor/h3-0.0.8-ferrum-patched/src/client/mod.rs
-60cdad9a742f91d2be5591bc54a0e0796696c22ec013d17e9211ae8782e354fd  vendor/h3-0.0.8-ferrum-patched/src/client/stream.rs
+b40b156d555bd3524a8c1eb986b78ff13ee73c923cfd6a6f60740710920f0339  vendor/h3-0.0.8-ferrum-patched/src/client/stream.rs
 699304e5831c56ab08a19e2818f1a8fbd8e971422043aa8bd62c365a1195716c  vendor/h3-0.0.8-ferrum-patched/src/config.rs
-fa5acb22e48ba1641611edc21ce52fb64b85c87e39f1944e43a54e18cbdb4247  vendor/h3-0.0.8-ferrum-patched/src/connection.rs
+294c3d53a345af5a8119bfb292c217104e105c85a872ddcaa5d8a4e59f8ce6b0  vendor/h3-0.0.8-ferrum-patched/src/connection.rs
 e08c4f9672fa4ab517becae729091aa4e775f5c1566a9bfffe6360f14b8f2e0c  vendor/h3-0.0.8-ferrum-patched/src/error/codes.rs
 ae0f3914b1db227ea53a4e5d448a51ebb3bd308b00591e03839ad64fe71fbc99  vendor/h3-0.0.8-ferrum-patched/src/error/connection_error_creators.rs
 9dc52b07c76a663095fe6e2f8e2a37b169e85b15bffdec390c917e0b110309df  vendor/h3-0.0.8-ferrum-patched/src/error/error.rs
@@ -47,7 +47,7 @@ f0e4192ad670abff4c8c0b9bd1c7a9e92be8acbdbbe01a3d42f8a3d0e10ce043  vendor/h3-0.0.
 0cfac44b2704e1e1a2dc57cee8c7a4d2d0a6f6b925fe47373ac8504e0012756c  vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
 60aff373f3de2fa842fd97b15a1b9c4dced9c97818ef2bcdf186637a10d7bb26  vendor/h3-0.0.8-ferrum-patched/src/server/mod.rs
 f0c514ab160f4d22be88866126ed99a07e97e4c68d40d1f2a99b77f0019f9089  vendor/h3-0.0.8-ferrum-patched/src/server/request.rs
-90b7a179d374e8c7d11e549f1d816f3cdf33cac5b117e1c8c6ced6caa1c0aa1c  vendor/h3-0.0.8-ferrum-patched/src/server/stream.rs
+b76031a8233b6afe4089eb3967f9965e59cf3be9f1b2239aada5c527a9e3251c  vendor/h3-0.0.8-ferrum-patched/src/server/stream.rs
 42d38196e4e1ddc17151136cb6f6e84ba4fdca90ec22d29f44b1599460f1bb82  vendor/h3-0.0.8-ferrum-patched/src/shared_state.rs
 67a6d6ef94c8204df4005f0d33140c14955fec7154d435881c11e3c5c6861fab  vendor/h3-0.0.8-ferrum-patched/src/stream.rs
 f949117f4c335c064cbafd4c855f92002948d64d2f74b61d850625e37bd3be07  vendor/h3-0.0.8-ferrum-patched/src/webtransport/mod.rs

@@ -421,6 +421,13 @@ async fn read_h3_trailers_with_timeout(
         {
             Ok(result) => result,
             Err(_) => {
+                if let Some(trailers) = stream.peek_recv_trailers()? {
+                    debug!(
+                        timeout_ms = backend_read_timeout_ms,
+                        "H3 recv_trailers timed out after trailers were buffered; forwarding trailers without waiting for delayed FIN"
+                    );
+                    return Ok(Some(trailers));
+                }
                 debug!(
                     timeout_ms = backend_read_timeout_ms,
                     "H3 recv_trailers timed out after complete body; forwarding response without trailers"
