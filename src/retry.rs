@@ -762,6 +762,21 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     ErrorClass::RequestError
 }
 
+/// Whether the error chain contains a native-H3 stream error
+/// (`h3::error::StreamError`), i.e. it came from the native-H3 response body
+/// rather than a reqwest/hyper/io path. Used to route H3 body errors through the
+/// H3-aware classifier in [`classify_body_error`].
+fn h3_stream_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(node) = current {
+        if node.downcast_ref::<h3::error::StreamError>().is_some() {
+            return true;
+        }
+        current = node.source();
+    }
+    false
+}
+
 /// Classify an error that was emitted by a streaming response body wrapper
 /// (i.e. after response headers have been sent to the client).
 ///
@@ -785,14 +800,47 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
         return (ErrorClass::PortExhaustion, false);
     }
 
+    // Native-H3 streaming bodies surface `h3::error::StreamError` (e.g.
+    // `RemoteTerminate`, `HeaderTooBig`, `H3_INTERNAL_ERROR`), which is neither
+    // an io nor a hyper error — the generic walk below would fall through to
+    // `RequestError` with `connection_error == false` and the deferred dispatch
+    // would bank it as a phantom SUCCESS. Route it through the H3-aware
+    // classifier so a mid-stream H3 reset / protocol fault on an already-2xx
+    // response trips CB / passive-health. It is a backend error, not a client
+    // disconnect (`disconnected = false`); graceful H3 closes never reach here
+    // (`H3FrameSource` recovers a complete body to a clean EOS).
+    if h3_stream_error_in_chain(e) {
+        let class = crate::http3::client::classify_http3_error(e);
+        // An h3 stream error that reaches the body error path is a genuine
+        // backend failure: graceful closes (H3_NO_ERROR / GOAWAY) are recovered
+        // to a clean EOS by `H3FrameSource` before this point, so anything left
+        // is a real mid-stream fault. If the H3 classifier could only produce a
+        // class the deferred dispatch does NOT count as a failure (notably the
+        // `RequestError` catch-all for `HeaderTooBig`, whose display text matches
+        // no heuristic), surface it as `ProtocolError` so it trips CB /
+        // passive-health instead of banking a phantom success.
+        let class = if crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
+            Some(class),
+        ) {
+            class
+        } else {
+            ErrorClass::ProtocolError
+        };
+        return (class, false);
+    }
+
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = current {
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             match io_err.kind() {
                 std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted => {
-                    // Backend closed mid-stream — not a client disconnect.
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
+                    // Backend closed mid-stream, or FIN'd before delivering its
+                    // declared Content-Length (native-H3 `H3FrameSource`
+                    // truncation surfaces `UnexpectedEof`) — a backend fault, not
+                    // a client disconnect.
                     return (ErrorClass::ConnectionClosed, false);
                 }
                 std::io::ErrorKind::TimedOut => {

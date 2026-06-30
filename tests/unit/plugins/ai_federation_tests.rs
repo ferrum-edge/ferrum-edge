@@ -3737,6 +3737,52 @@ fn test_translate_strips_parameterized_media_type_for_anthropic() {
 }
 
 #[test]
+fn test_multimodal_rejection_details_bound_client_controlled_values() {
+    let long_role = format!("tool{}TAIL", "r".repeat(256));
+    let long_type = format!("input_audio{}TAIL", "t".repeat(256));
+    let body = json!({
+        "model": "claude-3-sonnet",
+        "messages": [{
+            "role": long_role,
+            "content": [{"type": long_type, "input_audio": {"data": "x"}}]
+        }]
+    });
+
+    let err =
+        test_helpers::validate_multimodal_translate_support_test("anthropic", &body).unwrap_err();
+    assert!(err.contains("<truncated:"), "got: {err}");
+    assert!(!err.contains("TAIL"), "got: {err}");
+
+    let (types, roles) = test_helpers::multimodal_usage_csv_for_test(&body);
+    assert!(types.contains("<truncated:"), "got: {types}");
+    assert!(roles.contains("<truncated:"), "got: {roles}");
+    assert!(!types.contains("TAIL"), "got: {types}");
+    assert!(!roles.contains("TAIL"), "got: {roles}");
+}
+
+#[test]
+fn test_gemini_remote_url_rejection_bounds_echoed_url() {
+    let long_url = format!("https://example.test/{}TAIL.png", "a".repeat(512));
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": long_url}}]
+        }]
+    });
+
+    let err = test_helpers::validate_multimodal_translate_support_test("google_gemini", &body)
+        .unwrap_err();
+    assert!(err.contains("<truncated:"), "got: {err}");
+    assert!(!err.contains("TAIL.png"), "got: {err}");
+    assert!(
+        err.len() < 512,
+        "error should stay bounded, got {} bytes",
+        err.len()
+    );
+}
+
+#[test]
 fn test_gate_rejects_non_image_part_for_user_role() {
     // validate_multimodal_translate_support: a non-text, non-image part for a
     // user role has no native translation.

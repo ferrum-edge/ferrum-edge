@@ -12,6 +12,7 @@ Tracks fixes we've drafted for [hyperium/h3](https://github.com/hyperium/h3) tha
 |---|---|---|---|---|
 | [001](001-recv-frame-drain-on-quic-close/) | frame: drain buffered bytes before propagating QUIC connection error | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | [PR #506](https://github.com/ferrum-edge/ferrum-edge/pull/506) gateway-side suppression (independent correctness) |
 | [002](002-extended-connect-websocket-protocol/) | ext: add `Protocol::WEB_SOCKET` for RFC 9220 Extended CONNECT | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | Ferrum Edge WebSocket-over-HTTP/3 (RFC 9220) support |
+| [003](003-peek-buffered-trailers-before-fin/) | stream: peek already-buffered trailers before terminal FIN | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | Ferrum Edge delayed-FIN backend trailer preservation (#1948) |
 
 ## Conventions
 

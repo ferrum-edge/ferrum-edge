@@ -27,7 +27,7 @@ use crate::scaffolding::backends::{
     tls_backend_without_quic_with_ok_response,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::{Http2Client, Http3Client};
+use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
 use serde_json::{Value, json};
@@ -1602,6 +1602,13 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
 /// default (when the client offers `accept-encoding`), forcing the buffered
 /// dispatch decision these tests need to exercise the downgrade.
 fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
+    file_mode_yaml_for_h3_with_compression_and_read_timeout(port, 5000)
+}
+
+fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
+    port: u16,
+    backend_read_timeout_ms: u64,
+) -> String {
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -1612,7 +1619,7 @@ fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
             "backend_port": port,
             "strip_listen_path": true,
             "backend_connect_timeout_ms": 2000,
-            "backend_read_timeout_ms": 5000,
+            "backend_read_timeout_ms": backend_read_timeout_ms,
             "backend_write_timeout_ms": 5000,
             "backend_tls_verify_server_cert": false,
             "plugins": [{ "plugin_config_id": "compress-1" }],
@@ -1733,6 +1740,15 @@ async fn spawn_h3_streaming_downgrade_harness(
     h3_steps: Vec<H3Step>,
     extra_env: &[(&str, &str)],
 ) -> (GatewayHarness, ScriptedH3Backend) {
+    spawn_h3_streaming_downgrade_harness_with_read_timeout(ca_name, h3_steps, extra_env, 5000).await
+}
+
+async fn spawn_h3_streaming_downgrade_harness_with_read_timeout(
+    ca_name: &str,
+    h3_steps: Vec<H3Step>,
+    extra_env: &[(&str, &str)],
+    backend_read_timeout_ms: u64,
+) -> (GatewayHarness, ScriptedH3Backend) {
     let ca = TestCa::new(ca_name).expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -1764,7 +1780,10 @@ async fn spawn_h3_streaming_downgrade_harness(
         .expect("spawn h3 backend");
 
     let mut builder = GatewayHarness::builder()
-        .file_config(file_mode_yaml_for_h3_with_compression(backend_port))
+        .file_config(file_mode_yaml_for_h3_with_compression_and_read_timeout(
+            backend_port,
+            backend_read_timeout_ms,
+        ))
         .log_level("info")
         .capture_output()
         // Avoid pool warmup issuing an extra H3 request before the test's GET.
@@ -1787,8 +1806,144 @@ async fn spawn_h3_streaming_downgrade_harness(
     (harness, h3_backend)
 }
 
+async fn spawn_h3_frontend_refined_buffering_harness(
+    ca_name: &str,
+    h3_steps: Vec<H3Step>,
+    extra_env: &[(&str, &str)],
+) -> (GatewayHarness, ScriptedH3Backend, u16) {
+    let ca = TestCa::new(ca_name).expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+    Box::leak(Box::new(_tcp_backend));
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(h3_steps)
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let reservation = reserve_port().await.expect("reserve https port");
+    let https_port = reservation.port;
+    drop(reservation);
+
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (_ca_pem, cert_path, key_path) =
+        write_frontend_certs(scratch.path(), "h3-gw-refined-buffering");
+    Box::leak(Box::new(scratch));
+
+    let mut builder = GatewayHarness::builder()
+        .file_config(file_mode_yaml_for_h3_with_compression(backend_port))
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true");
+    for (k, v) in extra_env {
+        builder = builder.env(*k, *v);
+    }
+    let harness = builder.spawn().await.expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the H3 frontend uses the native H3 backend path; entry: {entry:#?}"
+    );
+
+    (harness, h3_backend, https_port)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
-// Test 13 — a 206 the buffered (compression) decision would have buffered is
+// Test 13 — H3 frontend refined-buffered drain rejects a clean FIN that arrives
+// before the declared Content-Length is satisfied.
+//
+// The compression plugin plus `accept-encoding` makes the initial response-body
+// decision buffered. A plain `200 text/plain` response stays buffered after the
+// content-type refinement, so the H3 frontend runs
+// `collect_h3_open_response_body` in `src/http3/server.rs`. Pre-fix that drain
+// broke on `recv_data() == Ok(None)` and forwarded a short 2-byte body as a
+// complete 200 despite `Content-Length: 5`.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_frontend_refined_buffered_rejects_truncated_content_length_fin() {
+    let declared_len = 5usize;
+    let actual = bytes::Bytes::from_static(b"ok");
+
+    let (harness, h3_backend, https_port) = spawn_h3_frontend_refined_buffering_harness(
+        "phase-h3-refined-buffered-truncated-cl",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", declared_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(actual),
+            H3Step::RespondTrailers(vec![("x-backend-finished", "true".to_string())]),
+            H3Step::StallFor(Duration::from_millis(100)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/truncated-cl");
+    let resp = client
+        .get_with_options(
+            &url,
+            GetOptions::default().header("accept-encoding", "gzip"),
+        )
+        .await
+        .unwrap_or_else(|err| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 request failed: {err}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        502,
+        "short Content-Length-delimited H3 body must surface as 502, not a complete 200; body={:?}\n--- logs ---\n{logs}",
+        String::from_utf8_lossy(&resp.body_bytes)
+    );
+    assert!(
+        String::from_utf8_lossy(&resp.body_bytes).contains("HTTP/3 backend response truncated"),
+        "expected truncation error body; got {:?}\n--- logs ---\n{logs}",
+        String::from_utf8_lossy(&resp.body_bytes)
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.path == "/truncated-cl"),
+        "backend should have received the real test request; received={received:?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14 — a 206 the buffered (compression) decision would have buffered is
 // DOWNGRADED to streaming, delivering the full body AND forwarding backend
 // trailers to the H2 downstream client (with hop-by-hop trailer names stripped).
 // Pre-fix this path drained the body buffered and dropped the trailers.
@@ -1895,7 +2050,88 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 14 — a LARGE 206 (no Content-Length) under a small response-size limit
+// Test 15 — trailer HEADERS delivered before a delayed FIN survive the
+// H3 trailer-phase read-timeout collapse.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_forwards_trailers_when_fin_is_delayed_past_timeout() {
+    let body_len = 128usize;
+    let body = bytes::Bytes::from(vec![b't'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness_with_read_timeout(
+        "phase-h3-delayed-fin-trailers",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "206".to_string()),
+                (
+                    "content-range",
+                    format!("bytes 0-{}/{}", body_len - 1, body_len * 8),
+                ),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::RespondTrailersWithoutFin(vec![
+                ("x-backend-checksum", "sha256-delayed-fin".to_string()),
+                ("transfer-encoding", "chunked".to_string()),
+            ]),
+            // Keep the stream open past the 25 ms backend read timeout. Pre-fix,
+            // h3 had the trailer HEADERS buffered internally but withheld them
+            // until FIN, so the gateway's timeout collapse emitted clean EOS and
+            // dropped the trailers.
+            H3Step::StallFor(Duration::from_millis(200)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        25,
+    )
+    .await;
+
+    let resp = raw_h2c_request(
+        &harness.proxy_url("/api/delayed-fin-trailers"),
+        "GET",
+        &[("accept-encoding", "gzip"), ("range", "bytes=0-127")],
+    )
+    .await
+    .unwrap_or_else(|e| {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+    });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 206,
+        "expected delayed-FIN trailered response to stay successful; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected delayed-FIN trailer timeout to end cleanly; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(resp.body.as_slice(), body.as_ref());
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-delayed-fin"),
+        "backend trailer buffered before delayed FIN must be forwarded; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("transfer-encoding"),
+        "hop-by-hop trailer name must be stripped before forwarding; trailers={:?}",
+        resp.trailers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.path == "/delayed-fin-trailers"),
+        "H3 backend must have received the delayed-FIN request; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 16 — a LARGE 206 (no Content-Length) under a small response-size limit
 // is STREAMED (status 206 reaches the client) instead of being converted into a
 // buffered `502 ResponseBodyTooLarge`. The streamed body is then truncated at
 // the limit (a mid-stream `RST_STREAM`), but the `206` status proves the

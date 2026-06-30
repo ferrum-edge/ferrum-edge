@@ -1,0 +1,158 @@
+diff --git a/h3/src/client/stream.rs b/h3/src/client/stream.rs
+--- a/h3/src/client/stream.rs
++++ b/h3/src/client/stream.rs
+@@ -220,6 +220,14 @@ where
+         res
+     }
+ 
++    /// Return response trailers that have already been received and buffered
++    /// internally, without consuming them or waiting for the terminal QUIC stream
++    /// FIN.
++    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
++    pub fn peek_recv_trailers(&self) -> Result<Option<HeaderMap>, StreamError> {
++        self.inner.peek_recv_trailers()
++    }
++
+     /// Tell the peer to stop sending into the underlying QUIC stream
+     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+     pub fn stop_sending(&mut self, error_code: Code) {
+diff --git a/h3/src/connection.rs b/h3/src/connection.rs
+--- a/h3/src/connection.rs
++++ b/h3/src/connection.rs
+@@ -849,6 +849,35 @@ impl<S, B> RequestStream<S, B>
+ where
+     S: quic::RecvStream,
+ {
++    fn decode_trailers(&self, mut trailers: Bytes) -> Result<HeaderMap, StreamError> {
++        let qpack::Decoded { fields, .. } =
++            match qpack::decode_stateless(&mut trailers, self.max_field_section_size) {
++                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
++                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
++                //# the message header it will accept on an individual HTTP message.
++                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
++                    return Err(StreamError::HeaderTooBig {
++                        actual_size: cancel_size,
++                        max_size: self.max_field_section_size,
++                    });
++                }
++                Ok(decoded) => decoded,
++                Err(_e) => {
++                    return Err(StreamError::StreamError {
++                        code: Code::QPACK_DECOMPRESSION_FAILED,
++                        reason: "Failed to decode trailers".to_string(),
++                    });
++                }
++            };
++
++        Ok(Header::try_from(fields)
++            .map_err(|_e| StreamError::StreamError {
++                code: Code::H3_MESSAGE_ERROR,
++                reason: "malformed request".to_string(),
++            })?
++            .into_fields())
++    }
++
+     /// Receive some of the request body.
+     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+     pub fn poll_recv_data(
+@@ -914,7 +943,7 @@ where
+         &mut self,
+         cx: &mut Context<'_>,
+     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+-        let mut trailers = if let Some(encoded) = self.trailers.take() {
++        let trailers = if let Some(encoded) = self.trailers.take() {
+             encoded
+         } else {
+             match ready!(self.stream.poll_next(cx)) {
+@@ -990,39 +1019,41 @@ where
+             }
+         }
+ 
+-        let qpack::Decoded { fields, .. } =
+-            match qpack::decode_stateless(&mut trailers, self.max_field_section_size) {
+-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+-                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+-                //# the message header it will accept on an individual HTTP message.
+-                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+-                    return Poll::Ready(Err(StreamError::HeaderTooBig {
+-                        actual_size: cancel_size,
+-                        max_size: self.max_field_section_size,
+-                    }));
+-                }
+-                Ok(decoded) => decoded,
+-                Err(_e) => {
+-                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+-                        InternalConnectionError {
+-                            code: Code::QPACK_DECOMPRESSION_FAILED,
+-                            message: "Failed to decode trailers".to_string(),
+-                        },
+-                    )))
+-                }
+-            };
++        match self.decode_trailers(trailers) {
++            Ok(trailers) => Poll::Ready(Ok(Some(trailers))),
++            Err(StreamError::StreamError { code, reason })
++                if code == Code::QPACK_DECOMPRESSION_FAILED =>
++            {
++                Poll::Ready(Err(self.handle_connection_error_on_stream(
++                    InternalConnectionError {
++                        code,
++                        message: reason,
++                    },
++                )))
++            }
++            Err(StreamError::StreamError { code, reason }) if code == Code::H3_MESSAGE_ERROR => {
++                self.stop_sending(Code::H3_MESSAGE_ERROR);
++                Poll::Ready(Err(StreamError::StreamError { code, reason }))
++            }
++            Err(err) => Poll::Ready(Err(err)),
++        }
++    }
+ 
+-        Poll::Ready(Ok(Some(
+-            Header::try_from(fields)
+-                .map_err(|_e| {
+-                    self.stop_sending(Code::H3_MESSAGE_ERROR);
+-                    StreamError::StreamError {
+-                        code: Code::H3_MESSAGE_ERROR,
+-                        reason: "malformed request".to_string(),
+-                    }
+-                })?
+-                .into_fields(),
+-        )))
++    /// Return trailers that have already been received and buffered internally,
++    /// without consuming them or waiting for the terminal QUIC stream FIN.
++    ///
++    /// `poll_recv_trailers` intentionally waits for FIN after receiving trailer
++    /// HEADERS so it can reject any known frame that arrives after trailers. Some
++    /// applications still need to recover already-buffered trailers when their
++    /// own post-body trailer wait deadline fires before that FIN; this method
++    /// exposes only the already-buffered trailer block and leaves normal stream
++    /// validation state untouched for callers that keep polling.
++    #[allow(missing_docs)]
++    pub fn peek_recv_trailers(&self) -> Result<Option<HeaderMap>, StreamError> {
++        match self.trailers.as_ref() {
++            Some(trailers) => self.decode_trailers(trailers.clone()).map(Some),
++            None => Ok(None),
++        }
+     }
+ 
+     #[allow(missing_docs)]
+diff --git a/h3/src/server/stream.rs b/h3/src/server/stream.rs
+--- a/h3/src/server/stream.rs
++++ b/h3/src/server/stream.rs
+@@ -95,6 +95,14 @@ where
+         self.inner.poll_recv_trailers(cx)
+     }
+ 
++    /// Return request trailers that have already been received and buffered
++    /// internally, without consuming them or waiting for the terminal QUIC stream
++    /// FIN.
++    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
++    pub fn peek_recv_trailers(&self) -> Result<Option<HeaderMap>, StreamError> {
++        self.inner.peek_recv_trailers()
++    }
++
+     /// Tell the peer to stop sending into the underlying QUIC stream
+     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+     pub fn stop_sending(&mut self, error_code: Code) {

@@ -182,8 +182,19 @@ pub(crate) const H3_BODY_PREALLOC_CAP_BYTES: u64 = 1024 * 1024;
 #[derive(Debug)]
 pub(crate) enum H3BodyDrainError {
     Stream(h3::error::StreamError),
-    ResponseTooLarge { limit: usize },
-    ReadTimeout { timeout_ms: u64 },
+    ResponseTooLarge {
+        limit: usize,
+    },
+    ReadTimeout {
+        timeout_ms: u64,
+    },
+    /// The backend FIN'd the DATA stream before delivering its declared
+    /// Content-Length (truncation) — a framing violation surfaced as a backend
+    /// failure rather than a short-but-successful body.
+    Truncated {
+        received: u64,
+        declared: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for H3BodyDrainError {
@@ -199,6 +210,16 @@ impl std::fmt::Display for H3BodyDrainError {
             Self::ReadTimeout { timeout_ms } => {
                 write!(f, "Backend response read timeout after {timeout_ms}ms")
             }
+            Self::Truncated { received, declared } => match declared {
+                Some(d) => write!(
+                    f,
+                    "Backend FIN after {received} of {d} declared Content-Length bytes"
+                ),
+                None => write!(
+                    f,
+                    "Backend FIN after {received} of unknown declared Content-Length bytes"
+                ),
+            },
         }
     }
 }
@@ -207,7 +228,9 @@ impl std::error::Error for H3BodyDrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Stream(err) => Some(err),
-            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } => None,
+            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } | Self::Truncated { .. } => {
+                None
+            }
         }
     }
 }
@@ -314,7 +337,25 @@ pub(crate) async fn drain_h3_response_body(
                 }
                 body.extend_from_slice(chunk);
             }
-            Ok(None) => break,
+            Ok(None) => {
+                // Clean FIN. A declared Content-Length that the body did NOT
+                // satisfy (truncation / overlong) is a framing violation: surface
+                // it as a backend failure rather than returning a short body as a
+                // success, mirroring the streaming `H3FrameSource` FIN check. An
+                // absent Content-Length is FIN-delimited and complete here.
+                if !is_response_body_complete_after_fin(
+                    body.len() as u64,
+                    method,
+                    status,
+                    content_length,
+                ) {
+                    return Err(H3BodyDrainError::Truncated {
+                        received: body.len() as u64,
+                        declared: content_length,
+                    });
+                }
+                break;
+            }
             Err(e) => {
                 if is_h3_graceful_close(&e)
                     && is_response_body_complete(body.len() as u64, method, status, content_length)
@@ -380,6 +421,13 @@ async fn read_h3_trailers_with_timeout(
         {
             Ok(result) => result,
             Err(_) => {
+                if let Some(trailers) = stream.peek_recv_trailers()? {
+                    debug!(
+                        timeout_ms = backend_read_timeout_ms,
+                        "H3 recv_trailers timed out after trailers were buffered; forwarding trailers without waiting for delayed FIN"
+                    );
+                    return Ok(Some(trailers));
+                }
                 debug!(
                     timeout_ms = backend_read_timeout_ms,
                     "H3 recv_trailers timed out after complete body; forwarding response without trailers"
@@ -536,6 +584,28 @@ pub(crate) fn is_response_body_complete(
         Some(declared) => body_len == declared,
         None => false,
     }
+}
+
+/// Like [`is_response_body_complete`], but for the case where a clean FIN has
+/// ALREADY ended the DATA stream — e.g. the native-H3 trailer phase, entered
+/// only after `recv_data` returned `Ok(None)`.
+///
+/// The only difference is the absent-Content-Length case: a FIN-delimited
+/// (chunked / unknown-length) body is COMPLETE once the FIN arrives, so an
+/// absent length is accepted here (matching the buffered drain, which forwards a
+/// FIN-delimited body without a length check). A DECLARED length must still
+/// match exactly — a truncated or overlong body that FINs early is a framing
+/// violation that must surface, not be laundered into a clean EOS.
+pub(crate) fn is_response_body_complete_after_fin(
+    body_len: u64,
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+        return body_len == 0;
+    }
+    content_length.is_none_or(|declared| body_len == declared)
 }
 
 /// Type alias for the h3 send request handle.

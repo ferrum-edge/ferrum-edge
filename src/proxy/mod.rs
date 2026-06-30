@@ -14097,7 +14097,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
+                // `clone_for_final_request_body_hooks` omits `request_body`; carry
+                // the original across the metadata swap (no on_final hook touches
+                // it). Disjoint field assignments avoid a whole-`ctx` borrow.
+                let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                if let Some(body) = request_body {
+                    ctx.metadata.insert("request_body".to_string(), body);
+                }
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                 ctx.waf_score = body_hook_ctx.waf_score;
@@ -16087,9 +16094,12 @@ async fn handle_proxy_request_inner(
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
     let mut hbone_request_body_exceeded = None;
-    let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
+    let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
+        retry_config
+    {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
+        let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let mut body_hook_ctx = if needs_final_request_body_context {
@@ -16125,7 +16135,14 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
+            // original across the metadata swap (no on_final hook touches it).
+            // Disjoint field assignments avoid a whole-`ctx` borrow.
+            let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            if let Some(body) = request_body {
+                ctx.metadata.insert("request_body".to_string(), body);
+            }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
@@ -16273,7 +16290,6 @@ async fn handle_proxy_request_inner(
                 }
             }
 
-            backend_admission_started_at = Instant::now();
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -16302,6 +16318,12 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            // Start the final-attempt health/LB/adaptive-concurrency sample
+            // after admission succeeds. This mirrors `proxy_to_backend`, which
+            // resets the same timer immediately before dispatch. A rotated
+            // retry's successful target must not inherit the previous target's
+            // failed-attempt latency or retry backoff in least-latency EWMA.
+            backend_admission_started_at = Instant::now();
 
             warn!(
                 proxy_id = %proxy.id,
@@ -16365,8 +16387,9 @@ async fn handle_proxy_request_inner(
                     .backend_capabilities
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
+            final_upstream_target = current_target.clone();
         }
-        (result, current_cb_target_key)
+        (result, current_cb_target_key, final_upstream_target)
     } else {
         let mut body_hook_ctx = if needs_final_request_body_context {
             Some(ctx.clone_for_final_request_body_hooks())
@@ -16401,7 +16424,14 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
+            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
+            // original across the metadata swap (no on_final hook touches it).
+            // Disjoint field assignments avoid a whole-`ctx` borrow.
+            let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            if let Some(body) = request_body {
+                ctx.metadata.insert("request_body".to_string(), body);
+            }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
@@ -16437,7 +16467,7 @@ async fn handle_proxy_request_inner(
                 .await);
             }
         };
-        (resp, cb_target_key.clone())
+        (resp, cb_target_key.clone(), upstream_target.clone())
     };
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
@@ -16493,10 +16523,17 @@ async fn handle_proxy_request_inner(
     // streamable-status-then-stall/reset response-body failures trip backend
     // health while a late client-upload overflow remains neutral instead of being
     // misclassified as a backend fault.
-    // Whether the H2 response body is already end-of-stream at header time (empty
-    // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
-    // without being polled, so deferring it would be misread as a client
+    // Whether the H2 response body is already end-of-stream at header time
+    // (empty 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is
+    // dropped without being polled, so deferring it would be misread as a client
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
+    //
+    // Keep native-H3 out of this defer gate for now. hyper can finish an HTTP/1
+    // downstream response after writing a known Content-Length without polling
+    // the H3 body to its terminal FIN, so a deferred H3 dispatch outcome can be
+    // mis-recorded as ClientDisconnect. H3 streaming still gets per-frame
+    // `backend_read_timeout_ms`; CB / passive-health dispatch accounting remains
+    // eager until #1901 has body-driving-safe terminal accounting.
     let streaming_h2_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
@@ -16512,15 +16549,15 @@ async fn handle_proxy_request_inner(
             streaming_response_status_is_passively_unhealthy(
                 &epoch.load_balancer,
                 &proxy,
-                upstream_target.as_deref(),
+                final_upstream_target.as_deref(),
                 response_status,
             ),
         );
-    // TTFB captured at header arrival; reused whether the deferred outcome is
-    // recorded synchronously (an after_proxy reject replaced the streaming body)
-    // or at body completion, matching the synchronous path's
-    // `backend_start.elapsed()` least-latency sample.
-    let streaming_h2_dispatch_elapsed = backend_start.elapsed();
+    // Final-attempt dispatch elapsed for CB/passive-health/least-latency and
+    // adaptive-concurrency samples. `backend_start` intentionally spans every
+    // retry attempt and backoff for transaction logs below; using it here would
+    // penalize a rotated retry target with another target's failure/backoff.
+    let final_backend_dispatch_elapsed = backend_admission_started_at.elapsed();
     if defer_streaming_h2_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
@@ -16542,20 +16579,20 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
             backend_resp.connection_error,
             backend_error_class,
             cb_retry_probe_slot_available,
             skip_final_cb_record,
-            backend_start.elapsed(),
+            final_backend_dispatch_elapsed,
         );
     }
     let backend_admission_response_status = response_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = backend_admission_started_at.elapsed();
+    let backend_admission_elapsed = final_backend_dispatch_elapsed;
     let is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -16645,14 +16682,14 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             backend_admission_response_status,
             backend_admission_connection_error,
             backend_admission_error_class,
             false,
             skip_final_cb_record || cb_stale,
-            streaming_h2_dispatch_elapsed,
+            final_backend_dispatch_elapsed,
         );
     }
 
@@ -17243,14 +17280,14 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&proxy),
                         Arc::clone(&epoch.load_balancer),
                         upstream_balancer.clone(),
-                        upstream_target.clone(),
+                        final_upstream_target.clone(),
                         final_cb_target_key.clone(),
                         backend_admission_response_status,
                         false,
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_h2_dispatch_elapsed,
+                        final_backend_dispatch_elapsed,
                     )
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
@@ -17280,6 +17317,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -17291,6 +17329,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -17301,6 +17340,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -22845,16 +22885,12 @@ async fn proxy_to_backend_http3(
 /// H1 (chunked trailers) and H2 (trailers frame) downstream clients receive
 /// them.
 ///
-/// KNOWN LIMITATION (pre-existing, shared with every native-H3 streaming
-/// response): unlike the `StreamingH2` arm, the downstream `StreamingH3` body
-/// builders do NOT yet apply the per-frame `backend_read_timeout_ms` idle
-/// regime, and the dispatch site does NOT defer the CB / passive-health
-/// outcome to body completion. So a 2xx/206 H3 response that stalls or resets
-/// AFTER headers banks a header-time success and relies on the QUIC idle
-/// timeout rather than a 504. This downgrade widens the set of responses on
-/// that streaming path (a `compression`-released `206`/SSE used to take the
-/// buffered drain's 504 + failure accounting); bringing the H3 streaming path
-/// to `StreamingH2` parity is tracked in issue #1901.
+/// Native-H3 streaming responses use the same per-frame
+/// `backend_read_timeout_ms` idle regime as direct-H2 streaming responses, so a
+/// backend that sends headers and then stalls is cut by the response-body
+/// wrapper instead of waiting for the QUIC idle timeout. CB / passive-health
+/// dispatch accounting remains eager at header time for native H3 until #1901
+/// has a body-driving-safe terminal accounting design.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
@@ -22991,6 +23027,31 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+            }
+        }
+        Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
+            // The backend FIN'd before delivering its declared Content-Length —
+            // a framing violation. The request was on the wire and the backend
+            // responded, so `connection_error=false` (respect `retry_on_methods`);
+            // `ConnectionClosed` is a post-wire backend failure, so the dispatch
+            // outcome trips CB / passive-health rather than banking a short body
+            // as a success.
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                received = received,
+                declared = ?declared,
+                "HTTP/3 backend buffered response truncated (FIN before declared Content-Length)"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HTTP/3 backend response truncated"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionClosed),
             }
         }
     }
@@ -25613,18 +25674,49 @@ mod tests {
     }
 
     #[test]
-    fn final_body_hook_context_preserves_waf_owned_log_metadata() {
+    fn final_body_hook_context_omits_then_restores_request_body_and_carries_waf_metadata() {
         let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        // The buffered prompt: it must survive the hook-context round-trip even
+        // though the clone omits it (so the full body is not copied per request).
+        ctx.metadata
+            .insert("request_body".into(), "{\"prompt\":\"hello\"}".into());
+
         let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        assert!(
+            !hook_ctx.metadata.contains_key("request_body"),
+            "final-body hook clone must not copy the request_body prompt"
+        );
+
+        // Simulate an `on_final_request_body` hook writing a marker + WAF metadata.
+        hook_ctx
+            .metadata
+            .insert("ai_ratelimit_request".into(), "true".into());
         hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
         hook_ctx.set_waf_metadata("waf.action", "monitored");
 
+        // Mirror the handler's writeback: take the hook context's metadata + WAF
+        // state, carrying the omitted request_body across the swap.
+        let request_body = ctx.metadata.remove("request_body");
         ctx.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
         ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
         ctx.waf_score = hook_ctx.waf_score;
-        let metadata = clone_log_metadata(&ctx);
 
+        // The hook's metadata write propagated back to the live context.
+        assert_eq!(
+            ctx.metadata.get("ai_ratelimit_request").map(String::as_str),
+            Some("true")
+        );
+        // The omitted request_body was restored across the swap.
+        assert_eq!(
+            ctx.metadata.get("request_body").map(String::as_str),
+            Some("{\"prompt\":\"hello\"}")
+        );
+        // WAF metadata is carried across (and surfaces in log metadata).
+        let metadata = clone_log_metadata(&ctx);
         assert_eq!(
             metadata.get("waf.rule_hits").map(String::as_str),
             Some("FE-XSS-001")
