@@ -1154,6 +1154,10 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
             .contains_key("ai_ratelimit_reserved_tokens"),
         "compressed request should skip pre-reservation entirely (no reserved-tokens marker)"
     );
+    assert!(
+        compressed.metadata.contains_key("ai_ratelimit_request"),
+        "compressed POST JSON must stay subject to unmetered-response policy"
+    );
 
     // Reconciliation still charges the ACTUAL provider-reported usage afterward,
     // so the compressed request is debited correctly even without a reservation.
@@ -1167,6 +1171,267 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
         observed_usage(&plugin).await,
         55,
         "reconciliation should charge actual usage (40 + 15) for the compressed request"
+    );
+}
+
+#[tokio::test]
+async fn compressed_unmetered_2xx_reject_mode_returns_502() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "compressed reject-mode prompt");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "compressed request is not pre-reserved"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_ratelimit_request"),
+        "compressed POST JSON must be marked so reject mode cannot be bypassed"
+    );
+
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn compressed_unmetered_2xx_default_charge_estimate_rejects_without_estimate() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "compressed default-mode prompt");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "br".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "compressed request is not pre-reserved"
+    );
+
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn compressed_decompressed_ai_request_classified_in_on_final() {
+    // Case A (the #1949 Finding-2 path): a co-located `compression` plugin with
+    // `decompress_request: true` already stripped `content-encoding` and recorded
+    // the `compression:request_encoding` metadata before this plugin runs, so the
+    // bare content-encoding check sees nothing. `before_proxy` must DEFER (not
+    // mark), and `on_final_request_body` — which receives the DECOMPRESSED body —
+    // must classify and mark it so a usage-less AI 2xx is still rejected. Default
+    // `charge_estimate` mode, to exercise the compressed-candidate reject.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "decompressed ai prompt");
+    // compression has already decompressed: content-encoding gone, trusted
+    // metadata set (clients cannot forge `ctx.metadata`).
+    ctx.metadata.insert(
+        "compression:request_encoding".to_string(),
+        "gzip".to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "a compressed request is never pre-reserved"
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "Case A must DEFER classification, never mark in before_proxy"
+    );
+    assert!(
+        ctx.metadata
+            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        "before_proxy must set the deferred-classification marker for Case A"
+    );
+
+    // on_final receives the now-decompressed body — a genuine AI request.
+    let decompressed = serde_json::to_vec(&json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &decompressed)
+            .await,
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_ratelimit_request"),
+        "on_final must mark the decompressed AI request"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        "on_final must consume the deferred marker"
+    );
+
+    // A usage-less 2xx is now subject to the default charge_estimate reject → 502.
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn compressed_decompressed_non_ai_request_not_marked() {
+    // Case A + #1949 Finding-1: a decompressed NON-AI JSON body must NOT be
+    // marked, so an ordinary successful JSON response on a shared proxy is never
+    // falsely rejected under the unmetered policy. `reject` mode makes a false
+    // positive observable as a 502.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Trusted compression metadata marks the body as decompressed (Case A).
+    ctx.metadata.insert(
+        "compression:request_encoding".to_string(),
+        "gzip".to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        ctx.metadata
+            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        "before_proxy defers compressed POST JSON to on_final"
+    );
+
+    // on_final receives a decompressed body that is NOT an AI request.
+    let decompressed = serde_json::to_vec(&json!({"foo": "bar", "hello": "world"})).unwrap();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &decompressed)
+            .await,
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a decompressed NON-AI body must NOT be marked (no false positive)"
+    );
+
+    // The usage-less 2xx must pass through — this request was never an AI call.
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn spoofed_original_encoding_header_without_compression_still_reserves() {
+    // #1949 round-2 P1 regression: the deferred (Case A) path must be driven by
+    // the compression-owned `compression:request_encoding` metadata, NOT the
+    // client-settable `x-ferrum-original-content-encoding` header. Without a
+    // co-located `compression` plugin, a client could forge that header on a
+    // normal uncompressed AI POST; if trusted, the request would be deferred with
+    // reserved_tokens=0 and skip up-front token-limit enforcement.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "normal uncompressed ai prompt");
+    let mut headers = json_headers();
+    // Forged header, but NO trusted compression metadata (no compression plugin ran).
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "gzip".to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        reserved_tokens(&ctx) > 0,
+        "a normal AI POST must be estimated + pre-reserved even with a forged \
+         x-ferrum-original-content-encoding header"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        "a forged client header must not trigger the deferred path"
+    );
+}
+
+#[tokio::test]
+async fn compressed_framed_grpc_json_not_marked() {
+    // #1949 round-2 P2 regression: a framed gRPC / gRPC-Web body with a `+json`
+    // media type is length-prefixed frames, not a bare JSON document, so it must
+    // NOT be marked a compressed AI candidate — otherwise a normal gRPC 2xx with
+    // no LLM usage would be turned into a 502 under reject/charge_estimate.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+json".to_string(),
+    );
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_request"),
+        "a framed gRPC body must not be marked an AI candidate"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        "a framed gRPC body must not be deferred"
+    );
+
+    // A usage-less 2xx must pass through — it was never an AI call.
+    let body = serde_json::to_vec(&json!({"id": "x"})).unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
     );
 }
 

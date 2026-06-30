@@ -14099,7 +14099,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
+                // `clone_for_final_request_body_hooks` omits `request_body`; carry
+                // the original across the metadata swap (no on_final hook touches
+                // it). Disjoint field assignments avoid a whole-`ctx` borrow.
+                let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                if let Some(body) = request_body {
+                    ctx.metadata.insert("request_body".to_string(), body);
+                }
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                 ctx.waf_score = body_hook_ctx.waf_score;
@@ -16130,7 +16137,14 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
+            // original across the metadata swap (no on_final hook touches it).
+            // Disjoint field assignments avoid a whole-`ctx` borrow.
+            let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            if let Some(body) = request_body {
+                ctx.metadata.insert("request_body".to_string(), body);
+            }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
@@ -16412,7 +16426,14 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
+            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
+            // original across the metadata swap (no on_final hook touches it).
+            // Disjoint field assignments avoid a whole-`ctx` borrow.
+            let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            if let Some(body) = request_body {
+                ctx.metadata.insert("request_body".to_string(), body);
+            }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
@@ -25650,18 +25671,49 @@ mod tests {
     }
 
     #[test]
-    fn final_body_hook_context_preserves_waf_owned_log_metadata() {
+    fn final_body_hook_context_omits_then_restores_request_body_and_carries_waf_metadata() {
         let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        // The buffered prompt: it must survive the hook-context round-trip even
+        // though the clone omits it (so the full body is not copied per request).
+        ctx.metadata
+            .insert("request_body".into(), "{\"prompt\":\"hello\"}".into());
+
         let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        assert!(
+            !hook_ctx.metadata.contains_key("request_body"),
+            "final-body hook clone must not copy the request_body prompt"
+        );
+
+        // Simulate an `on_final_request_body` hook writing a marker + WAF metadata.
+        hook_ctx
+            .metadata
+            .insert("ai_ratelimit_request".into(), "true".into());
         hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
         hook_ctx.set_waf_metadata("waf.action", "monitored");
 
+        // Mirror the handler's writeback: take the hook context's metadata + WAF
+        // state, carrying the omitted request_body across the swap.
+        let request_body = ctx.metadata.remove("request_body");
         ctx.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
         ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
         ctx.waf_score = hook_ctx.waf_score;
-        let metadata = clone_log_metadata(&ctx);
 
+        // The hook's metadata write propagated back to the live context.
+        assert_eq!(
+            ctx.metadata.get("ai_ratelimit_request").map(String::as_str),
+            Some("true")
+        );
+        // The omitted request_body was restored across the swap.
+        assert_eq!(
+            ctx.metadata.get("request_body").map(String::as_str),
+            Some("{\"prompt\":\"hello\"}")
+        );
+        // WAF metadata is carried across (and surfaces in log metadata).
+        let metadata = clone_log_metadata(&ctx);
         assert_eq!(
             metadata.get("waf.rule_hits").map(String::as_str),
             Some("FE-XSS-001")
