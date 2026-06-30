@@ -5207,7 +5207,31 @@ async fn collect_h3_open_response_body(
                 }
                 response_body.extend_from_slice(&chunk_bytes);
             }
-            Ok(None) => break,
+            Ok(None) => {
+                let received = response_body.len() as u64;
+                if !crate::http3::client::is_response_body_complete_after_fin(
+                    received,
+                    method,
+                    response_status,
+                    content_length,
+                ) {
+                    error!(
+                        proxy_id = %proxy.id,
+                        received,
+                        declared = ?content_length,
+                        "HTTP/3 backend refined buffered response truncated (FIN before declared Content-Length)"
+                    );
+                    return H3BufferedDispatchResult {
+                        status: 502,
+                        body: br#"{"error":"HTTP/3 backend response truncated"}"#.to_vec(),
+                        headers: HashMap::new(),
+                        trailers: None,
+                        error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
+                        request_on_wire: true,
+                    };
+                }
+                break;
+            }
             Err(error) => {
                 let received = response_body.len() as u64;
                 if crate::http3::client::is_h3_graceful_close(&error)
