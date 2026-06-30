@@ -366,3 +366,42 @@ fn deny_reason_is_actionable() {
             .contains("FERRUM_BACKEND_DENY_CIDRS")
     );
 }
+
+#[test]
+fn proxy_admission_screens_url_style_ipv4_literals() {
+    let p = default_policy();
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "noncanonical-imds",
+        "hosts": ["example.com"],
+        "backend_host": "2852039166",
+        "backend_port": 80
+    }))
+    .expect("valid proxy shape");
+
+    let errors = proxy
+        .validate_backend_egress_ips(&p)
+        .expect_err("decimal IPv4 form should be canonicalized and denied");
+    assert!(
+        errors.iter().any(|err| err.contains("169.254.169.254")),
+        "expected canonical metadata IP in error, got {errors:?}"
+    );
+}
+
+#[test]
+fn upstream_admission_screens_url_style_ipv4_literals() {
+    let p = default_policy();
+    let upstream: ferrum_edge::config::types::Upstream =
+        serde_json::from_value(serde_json::json!({
+            "id": "noncanonical-imds-upstream",
+            "targets": [{ "host": "0xa9fea9fe", "port": 80 }]
+        }))
+        .expect("valid upstream shape");
+
+    let errors = upstream
+        .validate_backend_egress_ips(&p)
+        .expect_err("hex IPv4 form should be canonicalized and denied");
+    assert!(
+        errors.iter().any(|err| err.contains("169.254.169.254")),
+        "expected canonical metadata IP in error, got {errors:?}"
+    );
+}

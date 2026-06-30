@@ -2320,7 +2320,23 @@ pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    bare.parse::<std::net::IpAddr>().ok()
+
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+
+    // Match the URL parser's host-literal handling before deciding this is a
+    // DNS hostname. The HTTP client stack uses `url`/reqwest parsing, which
+    // accepts non-canonical IPv4 literal forms (for example a 32-bit decimal,
+    // hexadecimal, or octal components) and canonicalizes them to an IPv4
+    // address. Those forms skip resolver-side egress checks just like ordinary
+    // IP literals, so config admission and runtime dispatch must screen them as
+    // IPs too.
+    match url::Host::parse(bare).ok()? {
+        url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    }
 }
 
 /// Wraps the operator pattern in a non-capturing group and anchors the group,

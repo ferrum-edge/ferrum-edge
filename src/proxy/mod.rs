@@ -18430,17 +18430,7 @@ pub(crate) fn denied_literal_backend_ip(
     host: &str,
     policy: &crate::config::BackendEgressPolicy,
 ) -> Option<&'static str> {
-    // Strip URI brackets: `build_backend_url_with_target` preserves bracketed
-    // IPv6 (`[fd00:ec2::254]`) and reqwest/gRPC/H3 treat that as an IP-literal
-    // authority that skips the DnsCacheResolver, so the bare address must still
-    // be screened.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    host.parse::<std::net::IpAddr>()
-        .ok()
-        .and_then(|ip| policy.deny_reason(&ip))
+    crate::config::types::egress_literal_ip(host).and_then(|ip| policy.deny_reason(&ip))
 }
 
 /// Like [`denied_literal_backend_ip`] but also screens the proxy's `dns_override`
@@ -23525,6 +23515,12 @@ mod tests {
         assert!(denied_literal_backend_ip("169.254.169.254", &policy).is_some());
         assert!(denied_literal_backend_ip("64:ff9b::a9fe:a9fe", &policy).is_some());
         assert!(denied_literal_backend_ip("::ffff:169.254.169.254", &policy).is_some());
+        // URL/reqwest parsing canonicalizes these non-DNS IPv4 spellings to
+        // 169.254.169.254, so the literal guard must screen them before the
+        // client can skip the DnsCacheResolver.
+        assert!(denied_literal_backend_ip("2852039166", &policy).is_some());
+        assert!(denied_literal_backend_ip("0xa9fea9fe", &policy).is_some());
+        assert!(denied_literal_backend_ip("0251.0376.0251.0376", &policy).is_some());
         // Allowed literals (loopback / RFC1918) → not blocked.
         assert!(denied_literal_backend_ip("127.0.0.1", &policy).is_none());
         assert!(denied_literal_backend_ip("10.0.0.1", &policy).is_none());
