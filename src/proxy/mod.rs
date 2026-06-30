@@ -16089,9 +16089,12 @@ async fn handle_proxy_request_inner(
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
     let mut hbone_request_body_exceeded = None;
-    let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
+    let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
+        retry_config
+    {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
+        let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let mut body_hook_ctx = if needs_final_request_body_context {
@@ -16367,8 +16370,9 @@ async fn handle_proxy_request_inner(
                     .backend_capabilities
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
+            final_upstream_target = current_target.clone();
         }
-        (result, current_cb_target_key)
+        (result, current_cb_target_key, final_upstream_target)
     } else {
         let mut body_hook_ctx = if needs_final_request_body_context {
             Some(ctx.clone_for_final_request_body_hooks())
@@ -16439,7 +16443,7 @@ async fn handle_proxy_request_inner(
                 .await);
             }
         };
-        (resp, cb_target_key.clone())
+        (resp, cb_target_key.clone(), upstream_target.clone())
     };
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
@@ -16521,7 +16525,7 @@ async fn handle_proxy_request_inner(
             streaming_response_status_is_passively_unhealthy(
                 &epoch.load_balancer,
                 &proxy,
-                upstream_target.as_deref(),
+                final_upstream_target.as_deref(),
                 response_status,
             ),
         );
@@ -16551,7 +16555,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
             backend_resp.connection_error,
@@ -16654,7 +16658,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             backend_admission_response_status,
             backend_admission_connection_error,
@@ -17252,7 +17256,7 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&proxy),
                         Arc::clone(&epoch.load_balancer),
                         upstream_balancer.clone(),
-                        upstream_target.clone(),
+                        final_upstream_target.clone(),
                         final_cb_target_key.clone(),
                         backend_admission_response_status,
                         false,
