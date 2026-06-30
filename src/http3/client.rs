@@ -588,7 +588,7 @@ pub(crate) fn is_response_body_complete_after_fin(
     if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
         return body_len == 0;
     }
-    content_length.map_or(true, |declared| body_len == declared)
+    content_length.is_none_or(|declared| body_len == declared)
 }
 
 /// Type alias for the h3 send request handle.

@@ -1683,12 +1683,12 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             // violation: surface it as a backend error rather than
                             // entering the trailer phase, where a subsequent
                             // Ok(None) / trailers / graceful-close / read-timeout
-                            // branch would emit a clean EOS and bank a phantom
-                            // successful deferred dispatch (#1940 review). An absent
+                            // branch would emit a clean EOS to the client. With
+                            // native-H3 dispatch accounting intentionally eager
+                            // until #1901, this streaming check is about framing
+                            // correctness: the client must see the truncated body
+                            // as an error instead of a complete response. An absent
                             // Content-Length is FIN-delimited and complete here.
-                            // `UnexpectedEof` classifies as `ConnectionClosed` (a
-                            // post-wire backend failure) in `classify_body_error`,
-                            // so the deferred dispatch records a fault.
                             if !crate::http3::client::is_response_body_complete_after_fin(
                                 this.received,
                                 &this.method,
@@ -2126,6 +2126,10 @@ struct IdleReadTimeoutBody<B> {
     inner: B,
     timeout: std::time::Duration,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Set after the wrapper has returned EOF. This fuses synthetic EOFs (the
+    /// H3 trailer-timeout collapse) so a re-poll does not touch the still-live
+    /// source and `is_end_stream()` reports terminal state.
+    done: bool,
     /// `true` once an inner `Pending` poll has begun a backend-read wait, reset
     /// to `false` whenever a frame is delivered. The deadline is re-armed only
     /// on the `false -> true` edge so it never counts downstream-drain time.
@@ -2167,6 +2171,7 @@ impl<B> IdleReadTimeoutBody<B> {
             inner,
             timeout,
             deadline,
+            done: false,
             waiting: false,
             progress,
             last_progress_epoch,
@@ -2232,6 +2237,9 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 // A backend frame arrived — we are no longer waiting on the
@@ -2245,7 +2253,10 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
             Poll::Pending => {
                 // Reset the inactivity deadline if the backend made progress
                 // since the last poll — a DATA chunk Coalescing BUFFERED (so no
@@ -2280,6 +2291,7 @@ where
                                 .as_ref()
                                 .is_some_and(|p| p.trailer_phase.load(Ordering::Acquire))
                             {
+                                this.done = true;
                                 return Poll::Ready(None);
                             }
                             Poll::Ready(Some(Err(Box::new(std::io::Error::new(
@@ -2302,11 +2314,15 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.done || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
+        if self.done {
+            http_body::SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
     }
 }
 
@@ -3620,10 +3636,10 @@ mod tests {
     fn h3_frame_source_truncated_fin_surfaces_error() {
         // A backend that declares Content-Length but FINs early (fewer bytes) is a
         // framing violation: the FIN must surface a backend error (not enter the
-        // trailer phase and be laundered into a clean EOS / successful deferred
-        // dispatch). The error is `UnexpectedEof`, which `classify_body_error`
-        // maps to `ConnectionClosed` so the deferred dispatch records a fault
-        // (#1940 review).
+        // trailer phase and be laundered into a clean EOS). Native-H3 dispatch
+        // accounting is intentionally eager until #1901, so this streaming
+        // validation preserves client-visible framing correctness rather than
+        // training backend health.
         let progress = Arc::new(H3ReadProgress::default());
         let mut source = H3FrameSource::new(
             MockH3RecvStream::new(
@@ -3712,6 +3728,15 @@ mod tests {
         ));
         // Real-time margin; Tokio timers never fire early (no `test-util`).
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert!(
+            body.is_end_stream(),
+            "collapsed trailer-timeout EOF must report terminal state"
+        );
+        assert_eq!(body.size_hint().exact(), Some(0));
         assert!(matches!(
             Pin::new(&mut body).poll_frame(&mut cx),
             Poll::Ready(None)
