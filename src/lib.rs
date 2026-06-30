@@ -226,6 +226,7 @@ pub mod _test_support {
             65_536,
             4_096,
             None,
+            None,
         )
         .await?;
         Ok(handshake.stream)
@@ -269,6 +270,7 @@ pub mod _test_support {
             &crls,
             65_536,
             4_096,
+            None,
             None,
         )
         .await?;

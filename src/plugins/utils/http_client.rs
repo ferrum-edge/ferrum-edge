@@ -46,7 +46,7 @@
 //! }
 //! ```
 
-use crate::config::{BackendAllowIps, PoolConfig};
+use crate::config::{BackendEgressPolicy, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::tls::CrlList;
@@ -100,7 +100,7 @@ pub struct PluginHttpClient {
     /// Resolved backend IP policy (`FERRUM_BACKEND_ALLOW_IPS` after CLI/env/conf
     /// precedence). Used by plugins that validate outbound endpoints outside the
     /// proxy backend path.
-    backend_allow_ips: BackendAllowIps,
+    backend_allow_ips: BackendEgressPolicy,
     /// W3C `baggage` key prefixes stripped from outbound requests built by
     /// plugins (e.g., `request_mirror`'s mirror destination). Mirrors the
     /// proxy-path strip controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`
@@ -291,7 +291,7 @@ impl PluginHttpClient {
         tls_ca_bundle_path: Option<&str>,
         tls_crls: CrlList,
         namespace: &str,
-        backend_allow_ips: BackendAllowIps,
+        backend_allow_ips: BackendEgressPolicy,
         mesh_egress_strip_baggage_keys: Arc<Vec<String>>,
         pool_shard_amount: usize,
     ) -> Self {
@@ -443,7 +443,7 @@ impl PluginHttpClient {
             tls_ca_bundle_path: None,
             tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
-            backend_allow_ips: BackendAllowIps::Both,
+            backend_allow_ips: BackendEgressPolicy::unrestricted(),
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
             pool_shard_amount: 0,
@@ -467,12 +467,36 @@ impl PluginHttpClient {
     /// Used for admin plugin-config validation in modes that have no
     /// `ProxyState` (e.g. control plane), so a plugin's endpoint IP-policy
     /// check honors the gateway's configured `FERRUM_BACKEND_ALLOW_IPS` rather
-    /// than defaulting open (`BackendAllowIps::Both`). Without this, a CP could
+    /// than defaulting open (`BackendEgressPolicy::unrestricted()`). Without this, a CP could
     /// accept a literal-IP backend endpoint that data planes later reject.
-    pub fn default_with_backend_allow_ips(backend_allow_ips: BackendAllowIps) -> Self {
-        let mut client = Self::from_pool_config(&PoolConfig::default());
-        client.backend_allow_ips = backend_allow_ips;
-        client
+    pub fn default_with_backend_allow_ips(backend_allow_ips: BackendEgressPolicy) -> Self {
+        // Route the validation client's reqwest stack through a DnsCacheResolver
+        // carrying the same egress policy. Constructor side effects started
+        // during config-load validation (e.g. jwks_auth / oidc_relying_party
+        // background JWKS/discovery refresh) fetch hostname URLs; without the
+        // resolver they would use the OS resolver, bypassing execute_request's
+        // literal-only guard and letting a hostname that resolves — or rebinds —
+        // to a denied IP (e.g. 169.254.169.254) be dialed before the real
+        // runtime plugin is ever built. The fresh cache is cheap and short-lived
+        // (validation is a cold path), and mirrors the runtime client's screen.
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig {
+            backend_allow_ips: backend_allow_ips.clone(),
+            ..Default::default()
+        });
+        Self::new(
+            &PoolConfig::default(),
+            dns_cache,
+            1000, // slow_threshold_ms (from_pool_config default)
+            0,    // max_retries
+            100,  // retry_delay_ms (from_pool_config default)
+            false,
+            None,
+            Arc::new(Vec::new()),
+            crate::config::types::DEFAULT_NAMESPACE,
+            backend_allow_ips,
+            Arc::new(Vec::new()),
+            0, // pool_shard_amount → auto
+        )
     }
 
     /// Build a plugin HTTP client from pool config with custom slow-call and
@@ -548,7 +572,7 @@ impl PluginHttpClient {
     ///
     /// This is the gateway-level `FERRUM_BACKEND_ALLOW_IPS` value after the
     /// normal CLI/env/conf/default precedence has been applied.
-    pub fn backend_allow_ips(&self) -> &BackendAllowIps {
+    pub fn backend_allow_ips(&self) -> &BackendEgressPolicy {
         &self.backend_allow_ips
     }
 
@@ -689,6 +713,34 @@ impl PluginHttpClient {
         let url = request.url().to_string();
         let log_url = log_url_override.unwrap_or(&url).to_string();
         let method = request.method().clone();
+
+        // reqwest skips the custom `DnsCacheResolver` for an IP-literal host
+        // (there is nothing to resolve), so a denied literal endpoint
+        // (`http://169.254.169.254/...`) would otherwise be dialed unscreened.
+        // Enforce the backend egress policy here — the single runtime chokepoint
+        // for every plugin that dials through the shared client. A denied
+        // destination is surfaced to the plugin as a 502 (not dialed).
+        let literal_ip = match request.url().host() {
+            Some(url::Host::Ipv4(addr)) => Some(std::net::IpAddr::V4(addr)),
+            Some(url::Host::Ipv6(addr)) => Some(std::net::IpAddr::V6(addr)),
+            _ => None,
+        };
+        if let Some(ip) = literal_ip
+            && let Some(reason) = self.backend_allow_ips.deny_reason(&ip)
+        {
+            tracing::warn!(
+                plugin = label,
+                url = %log_url,
+                reason,
+                "Plugin egress policy denied literal-IP endpoint; not dialing"
+            );
+            let mut denied = http::Response::new(reqwest::Body::from(
+                r#"{"error":"endpoint blocked by backend egress policy"}"#,
+            ));
+            *denied.status_mut() = http::StatusCode::BAD_GATEWAY;
+            return Ok(reqwest::Response::from(denied));
+        }
+
         let total_start = std::time::Instant::now();
         let retry_template = request.try_clone();
         let can_retry = self.max_retries > 0
@@ -1062,7 +1114,7 @@ mod redirect_tests {
             None,
             Arc::new(Vec::new()),
             crate::config::types::DEFAULT_NAMESPACE,
-            BackendAllowIps::Both,
+            BackendEgressPolicy::unrestricted(),
             Arc::new(Vec::new()),
             0,
         );

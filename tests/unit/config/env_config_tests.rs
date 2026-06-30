@@ -2557,7 +2557,7 @@ fn test_env_config_backend_allow_ips_default_both() {
         || {
             remove_var("FERRUM_BACKEND_ALLOW_IPS");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.backend_allow_ips, BackendAllowIps::Both);
+            assert_eq!(config.backend_allow_ips.allow_ips(), &BackendAllowIps::Both);
         },
     );
 }
@@ -2572,7 +2572,10 @@ fn test_env_config_backend_allow_ips_private() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.backend_allow_ips, BackendAllowIps::Private);
+            assert_eq!(
+                config.backend_allow_ips.allow_ips(),
+                &BackendAllowIps::Private
+            );
         },
     );
 }
@@ -2587,7 +2590,10 @@ fn test_env_config_backend_allow_ips_public() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.backend_allow_ips, BackendAllowIps::Public);
+            assert_eq!(
+                config.backend_allow_ips.allow_ips(),
+                &BackendAllowIps::Public
+            );
         },
     );
 }
@@ -2602,7 +2608,10 @@ fn test_env_config_backend_allow_ips_case_insensitive() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.backend_allow_ips, BackendAllowIps::Private);
+            assert_eq!(
+                config.backend_allow_ips.allow_ips(),
+                &BackendAllowIps::Private
+            );
         },
     );
 }

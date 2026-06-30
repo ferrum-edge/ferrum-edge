@@ -210,6 +210,29 @@ impl ServiceDiscoveryManager {
             }
             SdProvider::Kubernetes => {
                 if let Some(k8s_config) = &sd_config.kubernetes {
+                    // Screen the in-cluster API endpoint before starting the
+                    // poller: KubernetesDiscoverer reads KUBERNETES_SERVICE_HOST
+                    // and dials `https://{host}:{port}` via the raw client
+                    // (`.send()`), bypassing execute_request, and reqwest skips
+                    // the resolver for an IP-literal host. A denied literal (e.g.
+                    // a private API IP under `FERRUM_BACKEND_ALLOW_IPS=public`)
+                    // must be rejected before the service-account bearer token is
+                    // ever sent.
+                    if let Ok(api_host) = std::env::var("KUBERNETES_SERVICE_HOST")
+                        && let Some(ip) = api_host
+                            .strip_prefix('[')
+                            .and_then(|h| h.strip_suffix(']'))
+                            .unwrap_or(api_host.as_str())
+                            .parse::<IpAddr>()
+                            .ok()
+                        && let Some(reason) = self.http_client.backend_allow_ips().deny_reason(&ip)
+                    {
+                        warn!(
+                            "Service discovery: upstream {} Kubernetes API host {} blocked by egress policy: {}",
+                            upstream_id, api_host, reason
+                        );
+                        return;
+                    }
                     Box::new(kubernetes::KubernetesDiscoverer::new(
                         self.http_client.get().clone(),
                         k8s_config.namespace.clone(),
@@ -228,6 +251,29 @@ impl ServiceDiscoveryManager {
             }
             SdProvider::Consul => {
                 if let Some(consul_config) = &sd_config.consul {
+                    // Screen the Consul API endpoint before starting the poller:
+                    // the discoverer dials `address` via the raw client
+                    // (`.send()`), bypassing execute_request's literal-IP guard,
+                    // and reqwest skips the DnsCacheResolver for IP literals — so
+                    // a denied literal address (e.g. http://169.254.169.254:8500,
+                    // which would also leak any X-Consul-Token) must be rejected
+                    // here. Hostname addresses are screened by the resolver when
+                    // the client polls.
+                    if let Ok(parsed) = url::Url::parse(&consul_config.address)
+                        .or_else(|_| url::Url::parse(&format!("http://{}", consul_config.address)))
+                        && let Err(e) = crate::plugins::utils::log_helpers::screen_url_host_egress(
+                            "service_discovery.consul",
+                            "address",
+                            &parsed,
+                            self.http_client.backend_allow_ips(),
+                        )
+                    {
+                        warn!(
+                            "Service discovery: upstream {} Consul address blocked by egress policy: {}",
+                            upstream_id, e
+                        );
+                        return;
+                    }
                     Box::new(consul::ConsulDiscoverer::new(
                         self.http_client.get().clone(),
                         consul_config.address.clone(),
@@ -647,7 +693,7 @@ pub fn filter_discovered_targets(
     upstream_id: &str,
     provider_name: &str,
     targets: Vec<UpstreamTarget>,
-    backend_allow_ips: crate::config::BackendAllowIps,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Vec<UpstreamTarget> {
     targets
         .into_iter()
@@ -668,14 +714,11 @@ pub fn filter_discovered_targets(
 
 fn validate_discovered_target_host(
     host: &str,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     if let Ok(addr) = host.parse::<IpAddr>() {
-        if !crate::config::check_backend_ip_allowed(&addr, backend_allow_ips) {
-            return Err(format!(
-                "IP denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
-                backend_allow_ips
-            ));
+        if let Some(reason) = backend_allow_ips.deny_reason(&addr) {
+            return Err(format!("IP denied by backend egress policy: {reason}"));
         }
         return Ok(());
     }

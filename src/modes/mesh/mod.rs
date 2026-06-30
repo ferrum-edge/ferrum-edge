@@ -1571,12 +1571,22 @@ fn gateway_config_from_mesh_slice_with_federation(
     // from the accepted slice) evicts the store entry. Fail-closed: a slice with
     // no `multi_cluster` admits no remote endpoints (codex F7.2 round-4).
     let merged_remote = matches!(remote_endpoints, Some(snapshot) if !snapshot.is_empty());
+    // A Sidecar-enforced slice has already narrowed `slice.services` to the
+    // authorized egress registry. Poller-discovered workloads may be unioned
+    // into those admitted services, but remote-only services must not be
+    // appended after narrowing or the merge would widen the outbound policy
+    // boundary.
+    let allow_remote_service_append = !slice
+        .sidecar_egress_scope
+        .as_ref()
+        .is_some_and(|scope| scope.sidecar_applied);
     let (workloads, services) = match remote_endpoints {
         Some(snapshot) if !snapshot.is_empty() => multicluster::merge_remote_endpoints_into_mesh(
             &slice.workloads,
             &slice.services,
             snapshot,
             slice.multi_cluster.as_ref(),
+            allow_remote_service_append,
         ),
         _ => (slice.workloads.clone(), slice.services.clone()),
     };

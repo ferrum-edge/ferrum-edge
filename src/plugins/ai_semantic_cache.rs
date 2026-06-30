@@ -2034,7 +2034,7 @@ fn optional_threshold(config: &Value, field: &'static str) -> Result<Option<f32>
 
 fn parse_semantic_config(
     config: &Value,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<Option<SemanticConfig>, String> {
     let enabled = optional_bool(config, "semantic_similarity_enabled")?.unwrap_or(false);
     let provider = optional_non_empty_string(config, "semantic_embedding_provider")?
@@ -2090,7 +2090,7 @@ fn parse_semantic_config(
 
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let parsed_endpoint = url::Url::parse(endpoint)
         .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
@@ -2111,10 +2111,10 @@ fn validate_semantic_embedding_endpoint(
     };
 
     if let Some(ip) = literal_ip
-        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+        && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_semantic_cache: 'semantic_embedding_endpoint' IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+            "ai_semantic_cache: 'semantic_embedding_endpoint' IP {ip} denied by backend egress policy ({backend_allow_ips})"
         ));
     }
 

@@ -2,6 +2,7 @@ mod admin_enhanced_tls_tests;
 mod admin_listeners_tests;
 mod admin_security_tests;
 mod auto_bool_tests;
+mod backend_egress_policy_tests;
 mod conf_file_tests;
 mod config_backup_tests;
 mod config_file_loader_tests;

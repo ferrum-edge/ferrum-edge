@@ -51,6 +51,16 @@ use crate::tls::backend::{
 pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
 
+    // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
+    // rebinds — to a blocked IP) surfaces here as a resolve error carrying
+    // "...denied by backend egress policy...". Classify it as the non-retryable,
+    // backend-health-neutral DispatchPolicyRejected before the typed/DNS walk
+    // below maps it to DnsLookupError (which would be retried and charged to
+    // backend health even though no backend was dialed).
+    if format!("{err:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(node) = current {
         if let Some(ce) = node.downcast_ref::<quinn::ConnectionError>() {

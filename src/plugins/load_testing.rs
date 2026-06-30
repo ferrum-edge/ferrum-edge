@@ -206,6 +206,11 @@ impl LoadTesting {
         // client for hostname targets.
         let mut load_test_builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
+            // Do not follow redirects: a 3xx `Location: http://169.254.169.254/`
+            // from the target under test would otherwise bounce the synthetic
+            // request to an IP literal that skips the DnsCacheResolver, bypassing
+            // the egress baseline from the load-test worker.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(request_timeout_ms));
         if let Some(dns_cache) = http_client.dns_cache() {
             load_test_builder =
@@ -236,6 +241,20 @@ impl LoadTesting {
                         );
                     }
                     validate_gateway_address(url)?;
+                    // Screen the literal-IP target against the egress policy:
+                    // load_testing dials these via the raw client (`.send()`),
+                    // bypassing the shared execute() literal-IP screen, and
+                    // reqwest skips the resolver for IP literals. Legit gateway
+                    // addresses (loopback / RFC1918) stay allowed; a metadata/
+                    // link-local target is rejected.
+                    if let Ok(parsed) = Url::parse(url) {
+                        crate::plugins::utils::log_helpers::screen_url_host_egress(
+                            "load_testing",
+                            "gateway_addresses",
+                            &parsed,
+                            http_client.backend_allow_ips(),
+                        )?;
+                    }
                     urls.push(url.trim_end_matches('/').to_string());
                 }
                 urls

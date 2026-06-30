@@ -1,6 +1,6 @@
 //! Tests for ai_semantic_firewall plugin.
 
-use ferrum_edge::config::{BackendAllowIps, PoolConfig};
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, ResponseStreamAction,
@@ -63,6 +63,7 @@ fn plugin(config: &Value) -> AiSemanticFirewall {
 }
 
 fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
+    let policy = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(policy);
     let dns_cache = DnsCache::new(DnsConfig {
         backend_allow_ips: policy.clone(),
         ..DnsConfig::default()
@@ -231,7 +232,7 @@ fn factory_validation_uses_supplied_http_client_endpoint_policy() {
         panic!("plugin factory should reject provider endpoint denied by supplied policy");
     };
     assert!(
-        error.contains("denied by FERRUM_BACKEND_ALLOW_IPS=public policy"),
+        error.contains("denied by backend egress policy"),
         "unexpected error: {error}"
     );
 }
@@ -272,7 +273,7 @@ fn provider_endpoint_rejects_literal_ips_denied_by_backend_policy() {
         panic!("literal private/link-local endpoint should be rejected");
     };
     assert!(
-        error.contains("denied by FERRUM_BACKEND_ALLOW_IPS=public policy"),
+        error.contains("denied by backend egress policy"),
         "unexpected error: {error}"
     );
 }
@@ -1412,7 +1413,9 @@ async fn validation_client_honors_backend_ip_policy() {
     // validation client is built from the configured backend IP policy. A
     // link-local (metadata) provider endpoint must be rejected under a
     // public-only policy.
-    let client = PluginHttpClient::default_with_backend_allow_ips(BackendAllowIps::Public);
+    let client = PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+    );
     let config = json!({
         "inspect": {"request": true, "response": false},
         "provider": provider("http://169.254.169.254/v1/embeddings"),
@@ -1422,7 +1425,7 @@ async fn validation_client_honors_backend_ip_policy() {
         .err()
         .expect("expected IP-policy rejection");
     assert!(
-        err.contains("denied by FERRUM_BACKEND_ALLOW_IPS"),
+        err.contains("denied by backend egress policy"),
         "expected IP-policy rejection, got: {err}"
     );
 }

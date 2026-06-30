@@ -2923,11 +2923,68 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DebugLogCapture {
     }
 }
 
+/// A process-global, no-op `tracing` subscriber whose sole purpose is to keep
+/// every callsite's cached interest at `sometimes` (never `disabled`) and the
+/// global max-level hint at `TRACE`. It emits nothing — `enabled` is always
+/// `false` — so it produces no output and never interferes with any per-test
+/// thread-local capture.
+///
+/// Why it exists: the per-test capture below installs its DEBUG subscriber with
+/// `set_default`, which is *thread-local* only. `rebuild_interest_cache()`
+/// recomputes each callsite's interest from the set of *globally* registered
+/// dispatchers — which, without this floor, is empty, so the DEBUG reject
+/// callsites can be cached as `never`. A `never` callsite is skipped by the
+/// `debug!` macro before the thread-local subscriber is ever consulted, so the
+/// capture comes back empty — the flaky failure seen under the parallel,
+/// instrumented coverage run. With this floor registered globally,
+/// `register_callsite` always reports `sometimes` and the hint stays at `TRACE`,
+/// so the macro always defers to the current thread's dispatcher at emit time and
+/// the capture is deterministic regardless of test ordering or parallelism.
+struct InterestFloorSubscriber;
+
+impl tracing::Subscriber for InterestFloorSubscriber {
+    fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+        // Never `never`: force a per-event `enabled()` check against whatever
+        // dispatcher is current at emit time (the thread-local capture, here).
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install [`InterestFloorSubscriber`] as the global default exactly once for the
+/// test binary. Idempotent and tolerant of an already-set global default — the
+/// only invariant we need is that *some* global dispatcher with a `TRACE` hint
+/// exists so callsite interest never collapses to `never`.
+fn install_interest_floor() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(InterestFloorSubscriber);
+    });
+}
+
 /// Install a DEBUG-level `fmt` subscriber as the thread-local default and return
 /// the capture buffer + drop guard. `set_default` is thread-local, so callers
 /// must run on a single-thread runtime (`flavor = "current_thread"`) so the
 /// `debug!` calls land on the same thread the subscriber is bound to.
 fn debug_capture() -> (DebugLogCapture, tracing::subscriber::DefaultGuard) {
+    // Guarantee a global dispatcher with a TRACE hint exists so the
+    // `rebuild_interest_cache()` below can never recompute these callsites to
+    // `never` (see `InterestFloorSubscriber`). Must run before the rebuild.
+    install_interest_floor();
+
     let capture = DebugLogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -2937,15 +2994,12 @@ fn debug_capture() -> (DebugLogCapture, tracing::subscriber::DefaultGuard) {
         .with_writer(capture.clone())
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
-    // Force a global callsite-interest re-evaluation against this DEBUG
-    // subscriber. `set_default` (unlike `set_global_default`) installs only a
-    // thread-local dispatcher and does NOT rebuild tracing's global callsite
-    // interest cache. If a *parallel* test hit one of the `debug!` reject
-    // callsites first — while no DEBUG subscriber was active — that callsite is
-    // cached as "disabled", and this capture then intermittently misses the
-    // event (a flaky failure seen under the parallel, instrumented coverage run).
-    // Rebuilding re-evaluates every callsite against the now-active subscriber so
-    // the DEBUG events are reliably captured regardless of test ordering.
+    // Re-evaluate every callsite's interest now that the global floor is in place.
+    // `set_default` installs only a thread-local dispatcher and does NOT rebuild
+    // tracing's global interest cache, so a callsite a *parallel* test hit first
+    // (before any DEBUG dispatcher existed) may be cached as `disabled`. With the
+    // floor registered, the rebuild yields `sometimes` for these callsites and the
+    // DEBUG events are reliably captured regardless of test ordering.
     tracing::callsite::rebuild_interest_cache();
     (capture, guard)
 }

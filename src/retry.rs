@@ -260,6 +260,17 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
     use crate::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
 
+    // A DnsCacheResolver egress-policy denial (a gRPC backend hostname or
+    // dns_override that resolves — or rebinds — to a blocked IP) surfaces as a
+    // BackendUnavailable{DnsResolution} whose message carries "...denied by
+    // backend egress policy...". Classify it as the non-retryable, backend-
+    // health-neutral DispatchPolicyRejected before the DnsResolution kind below
+    // maps it to DnsLookupError (which the retry loop would replay and charge to
+    // backend health even though no backend was dialed).
+    if format!("{e:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     match e {
         GrpcProxyError::BackendTimeout { kind, .. } => match kind {
             GrpcTimeoutKind::Connect => ErrorClass::ConnectionTimeout,
@@ -520,6 +531,12 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     if is_port_exhaustion_message(error_str) || is_port_exhaustion_message(debug_str) {
         return Some(ErrorClass::PortExhaustion);
     }
+    // Gateway-side egress-policy rejection (e.g. a literal-IP WebSocket backend
+    // blocked before any dial). This is a distinct, non-retryable, backend-
+    // health-neutral dispatch class — not a connect/DNS/TLS transport failure.
+    if error_str.contains("egress policy") {
+        return Some(ErrorClass::DispatchPolicyRejected);
+    }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
         return Some(ErrorClass::ConnectionTimeout);
     }
@@ -665,6 +682,18 @@ fn classify_boxed_with_phase(
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     if is_port_exhaustion(e) {
         return ErrorClass::PortExhaustion;
+    }
+
+    // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
+    // rebinds — to a blocked IP) surfaces as a connect-phase io error carrying
+    // "...denied by backend egress policy...". Classify it as the non-retryable,
+    // backend-health-neutral DispatchPolicyRejected BEFORE the is_connect()
+    // typed/DNS fallback mislabels it (DnsLookupError / ConnectionRefused),
+    // which would retry it under retry_on_connect_failure and charge passive
+    // health / the circuit breaker as a connect-class failure. Error-path only,
+    // so the formatting cost is irrelevant.
+    if format!("{e:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
     }
 
     if e.is_connect() {
@@ -1130,6 +1159,23 @@ mod tests {
                  must respect retry_on_methods"
             );
         }
+    }
+
+    #[test]
+    fn egress_policy_denial_classifies_as_dispatch_policy_rejected() {
+        // A gateway-side egress-policy rejection (e.g. a denied literal-IP
+        // WebSocket backend) is surfaced as a boxed error whose message contains
+        // "egress policy". It must classify as the non-retryable, backend-health-
+        // neutral DispatchPolicyRejected class — NOT a connect/DNS/TLS transport
+        // failure that would replay under retry_on_connect_failure.
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            "backend egress policy denied literal-IP WebSocket backend 169.254.169.254: \
+             link-local / cloud metadata range"
+                .into();
+        let class = super::classify_boxed_setup_error(err.as_ref());
+        assert_eq!(class, ErrorClass::DispatchPolicyRejected);
+        // request_reached_wire == true → ws_is_pre_wire == false → no retry.
+        assert!(request_reached_wire(class));
     }
 
     #[test]

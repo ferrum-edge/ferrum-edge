@@ -25,7 +25,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -52,7 +52,7 @@ fn test_load_json_config() {
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -80,7 +80,7 @@ plugin_configs: []
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .expect_err("file-mode config loading must reject invalid host labels");
@@ -114,7 +114,7 @@ plugin_configs: []
     let result = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     );
     assert!(result.is_err());
@@ -198,7 +198,7 @@ plugin_configs:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -248,7 +248,7 @@ fn test_load_shared_example_config_fixture() {
     let config = load_config_from_file(
         "tests/config.yaml",
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -307,7 +307,7 @@ plugin_configs: []
         let config = load_config_from_file(
             file.path().to_str().unwrap(),
             30,
-            &ferrum_edge::config::BackendAllowIps::Both,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
             "ferrum",
         )
         .unwrap();
@@ -339,7 +339,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -367,7 +367,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     );
     let err = config.expect_err("h3 scheme should be rejected by serde file loading");
@@ -464,7 +464,7 @@ upstreams:
         let result = load_config_from_file(
             file.path().to_str().unwrap(),
             30,
-            &ferrum_edge::config::BackendAllowIps::Both,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
             "ferrum",
         );
         let err = result.expect_err(&format!(
@@ -508,7 +508,7 @@ upstreams:
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .expect_err("file mode must reject an operator-set locality_lb_strict");
@@ -540,7 +540,7 @@ upstreams:
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .expect_err("file mode must reject an operator-set source_locality");
@@ -570,7 +570,7 @@ upstreams:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .expect("a clean operator upstream must still load");
@@ -600,7 +600,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -626,7 +626,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -651,7 +651,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -680,7 +680,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -710,7 +710,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -742,7 +742,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -778,7 +778,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -813,7 +813,7 @@ plugin_configs:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -841,7 +841,7 @@ plugin_configs:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .expect("optional fail-open plugin config errors must not reject file-mode config load");
@@ -876,7 +876,7 @@ plugin_configs:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -912,7 +912,7 @@ plugin_configs:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -981,7 +981,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1024,7 +1024,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1063,7 +1063,7 @@ plugin_configs: []
     let config1 = reload_config_from_file(
         file_path,
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1092,7 +1092,7 @@ plugin_configs: []
     let config2 = reload_config_from_file(
         file_path,
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1108,7 +1108,7 @@ fn test_missing_config_file() {
     let result = load_config_from_file(
         "/nonexistent/path/config.yaml",
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     );
     assert!(result.is_err());
@@ -1134,7 +1134,7 @@ plugin_configs: []
     let result = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     );
     assert!(result.is_err());
@@ -1155,7 +1155,7 @@ fn test_malformed_json() {
     let result = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     );
     assert!(result.is_err());
@@ -1174,7 +1174,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1206,7 +1206,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1232,7 +1232,7 @@ fn test_unknown_extension_fallback_to_json() {
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1287,7 +1287,7 @@ plugin_configs:
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1323,7 +1323,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
     .unwrap();
@@ -1367,7 +1367,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "prod",
     )
     .expect("multi-namespace config with shared listen_path must load");
@@ -1406,7 +1406,7 @@ plugin_configs: []
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "prod",
     )
     .expect_err("duplicate listen_path within same namespace must fail");
@@ -1446,7 +1446,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "staging",
     )
     .expect("multi-namespace stream proxies sharing listen_port must load");
@@ -1476,7 +1476,7 @@ plugin_configs: []
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
-        &ferrum_edge::config::BackendAllowIps::Both,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "prod",
     )
     .expect("multi-namespace consumers sharing username must load");

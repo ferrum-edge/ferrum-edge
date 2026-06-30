@@ -124,15 +124,12 @@ impl ReqwestPoolManager {
         if let Some(ref dns_override) = proxy.dns_override
             && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
         {
-            if !crate::config::check_backend_ip_allowed(
-                &ip,
-                &self.global_env_config.backend_allow_ips,
-            ) {
+            if let Some(reason) = self.global_env_config.backend_allow_ips.deny_reason(&ip) {
                 anyhow::bail!(
-                    "Proxy '{}': dns_override IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                    "Proxy '{}': dns_override IP {} denied by backend egress policy: {}",
                     proxy.id,
                     ip,
-                    self.global_env_config.backend_allow_ips
+                    reason
                 );
             }
             let socket_addr = SocketAddr::new(ip, proxy.backend_port);

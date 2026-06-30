@@ -216,7 +216,7 @@ pub struct AdminState {
     /// validate plugin endpoint IPs at the admin boundary in modes without a
     /// `ProxyState` (e.g. control plane), so CP-accepted configs match what data
     /// planes will accept.
-    pub backend_allow_ips: crate::config::BackendAllowIps,
+    pub backend_allow_ips: crate::config::BackendEgressPolicy,
 }
 
 impl AdminState {
@@ -4019,7 +4019,11 @@ async fn handle_restore(
             .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
             .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
         match ValidationPipeline::new(&mut temp_config)
-            .validate_all_fields(cert_expiry_days, ValidationAction::Collect)
+            .validate_all_fields_with_ip_policy(
+                cert_expiry_days,
+                &state.backend_allow_ips,
+                ValidationAction::Collect,
+            )
             .validate_unique_resource_ids(ValidationAction::Collect)
             .validate_unique_consumer_identities(ValidationAction::Collect)
             .validate_unique_consumer_credentials(ValidationAction::Collect)
@@ -4028,7 +4032,7 @@ async fn handle_restore(
             .validate_listen_path_encodings(ValidationAction::Collect)
             .validate_unique_listen_paths(ValidationAction::Collect)
             .validate_stream_proxies(ValidationAction::Collect)
-            .validate_plugin_configs(ValidationAction::Collect)
+            .validate_plugin_configs(&state.backend_allow_ips, ValidationAction::Collect)
             .validate_upstream_references(ValidationAction::Collect)
             .validate_mesh_route_dispatch_references(ValidationAction::Collect)
             .validate_plugin_references(ValidationAction::Collect)

@@ -20,7 +20,7 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | Rate limiting / flooding | `rate_limiting`, `*_rate_limiting` |
 | Schema / contract validation | `body_validator`, `openapi_validator` |
 | Bot / IP / geo filtering | `bot_detection`, `ip_restriction`, `geo_restriction` |
-| Backend SSRF allow/deny | `FERRUM_BACKEND_ALLOW_IPS` |
+| Backend SSRF allow/deny | `FERRUM_BACKEND_ALLOW_IPS` + `FERRUM_BACKEND_ALLOW_CIDRS` / `FERRUM_BACKEND_DENY_CIDRS` (metadata/link-local/multicast blocked by default) |
 | Response security headers | `security_headers` |
 
 The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command

@@ -732,6 +732,7 @@ pub(crate) async fn handle_h3_websocket(
             state.max_websocket_frame_size_bytes,
             state.websocket_write_buffer_size,
             ws_idle_tracker.clone(),
+            Some(&state.dns_cache),
         )
         .await
         {
@@ -753,10 +754,17 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // A gateway-side egress-policy denial (denied literal/rebound H3
+                // WebSocket backend) never reached a backend: non-retryable AND
+                // neutral to backend health (no CB trip, no backend-admission
+                // failure), matching the H1/H2 path.
+                let ws_egress_denied =
+                    matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     (ws_attempt < retry_config.max_retries
                         && retry_config.retry_on_connect_failure
-                        && ws_is_pre_wire)
+                        && ws_is_pre_wire
+                        && !ws_egress_denied)
                         .then(|| retry::retry_delay(retry_config, ws_attempt))
                 });
 
@@ -863,6 +871,7 @@ pub(crate) async fn handle_h3_websocket(
                     "H3 WebSocket backend connection failed"
                 );
                 if !backend_outcome_already_recorded
+                    && !ws_egress_denied
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -879,7 +888,14 @@ pub(crate) async fn handle_h3_websocket(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    if ws_egress_denied {
+                        // Gateway-side egress denial dialed no backend: release any
+                        // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
+                        // recover, rather than leaking it by skipping the record.
+                        cb.record_neutral(ws_cb_probe_slot_available);
+                    } else {
+                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    }
                 }
 
                 crate::proxy::record_request(&state, 502);

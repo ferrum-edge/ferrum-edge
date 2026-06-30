@@ -33,19 +33,18 @@
 //! When unset (empty), XFF headers are **ignored** and the socket IP is always
 //! used — which is the secure default for edge deployments.
 
+use crate::util::cidr::CidrSet;
 use std::net::IpAddr;
 use tracing::debug;
 
 /// A parsed set of trusted proxy CIDRs for efficient IP matching.
-#[derive(Debug, Clone)]
+///
+/// A thin wrapper over the shared [`CidrSet`](crate::util::cidr::CidrSet)
+/// primitive, so trusted-proxy matching and the backend egress allow/deny
+/// lists share one implementation and cannot drift.
+#[derive(Debug, Clone, Default)]
 pub struct TrustedProxies {
-    cidrs: Vec<CidrEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct CidrEntry {
-    network: IpAddr,
-    prefix_len: u8,
+    cidrs: CidrSet,
 }
 
 impl TrustedProxies {
@@ -54,20 +53,12 @@ impl TrustedProxies {
     /// Accepts formats like: `10.0.0.0/8`, `192.168.1.1`, `::1`, `fd00::/8`
     /// Whitespace around entries is trimmed. Invalid entries are logged and skipped.
     pub fn parse(raw: &str) -> Self {
-        let mut cidrs = Vec::new();
-        for entry in raw.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            if let Some(cidr) = Self::parse_cidr(entry) {
-                cidrs.push(cidr);
-            } else {
-                tracing::warn!(
-                    "Ignoring invalid trusted proxy entry: {:?}. Expected IP or CIDR notation.",
-                    entry
-                );
-            }
+        let (cidrs, invalid) = CidrSet::parse_lenient(raw);
+        for entry in &invalid {
+            tracing::warn!(
+                "Ignoring invalid trusted proxy entry: {:?}. Expected IP or CIDR notation.",
+                entry
+            );
         }
         if !cidrs.is_empty() {
             tracing::info!(
@@ -84,29 +75,7 @@ impl TrustedProxies {
     /// if the input is non-empty but produces zero valid CIDRs. Used for security-
     /// critical allowlists (e.g., admin API) where a typo must not silently fail open.
     pub fn parse_strict(raw: &str) -> Result<Self, String> {
-        if raw.trim().is_empty() {
-            return Ok(Self { cidrs: Vec::new() });
-        }
-        let mut cidrs = Vec::new();
-        let mut invalid = Vec::new();
-        for entry in raw.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                invalid.push("<empty>".to_string());
-                continue;
-            }
-            if let Some(cidr) = Self::parse_cidr(entry) {
-                cidrs.push(cidr);
-            } else {
-                invalid.push(entry.to_string());
-            }
-        }
-        if !invalid.is_empty() {
-            return Err(format!(
-                "Invalid CIDR/IP entries: {}. Expected formats: 10.0.0.0/8, 192.168.1.1, ::1",
-                invalid.join(", ")
-            ));
-        }
+        let cidrs = CidrSet::parse_strict(raw)?;
         if !cidrs.is_empty() {
             tracing::info!("Configured {} admin allowed CIDR(s)", cidrs.len());
         }
@@ -116,7 +85,9 @@ impl TrustedProxies {
     /// Returns an empty set (no trusted proxies — XFF headers will be ignored).
     #[allow(dead_code)] // Used by tests
     pub fn none() -> Self {
-        Self { cidrs: Vec::new() }
+        Self {
+            cidrs: CidrSet::default(),
+        }
     }
 
     /// Returns the number of configured CIDR entries.
@@ -132,179 +103,21 @@ impl TrustedProxies {
 
     /// Check whether the given IP belongs to any trusted proxy CIDR.
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        self.cidrs.iter().any(|cidr| cidr.matches(ip))
+        self.cidrs.contains(ip)
     }
 
     /// Whether a comma-separated CIDR/IP list permits **every** source address
-    /// of some family — i.e. the entries together cover all of IPv4 or all of
-    /// IPv6. This catches both a literal `/0` (`0.0.0.0/0`, `::/0`, or an
-    /// IPv4-mapped spelling like `::ffff:0.0.0.0/96` the parser folds to an IPv4
-    /// `/0`) AND a UNION that covers the whole space with no single `/0` entry
-    /// (e.g. `0.0.0.0/1,128.0.0.0/1`). Such an allowlist makes the filter match
-    /// every source, so it provides no real restriction.
-    ///
-    /// Reuses the same `parse_cidr` canonicalization as the runtime filter (so
-    /// mapped-IPv6 spellings cannot slip past) and is side-effect free (no
-    /// logging) — safe to call from config classification at startup.
+    /// of some family — a literal `/0` or a union spanning the whole family
+    /// (e.g. `0.0.0.0/1,128.0.0.0/1`). Such an allowlist makes the XFF
+    /// trusted-proxy filter match every source, so it provides no real
+    /// restriction. Delegates to the shared `CidrSet` so the canonicalization
+    /// matches the runtime filter; side-effect free, safe for config
+    /// classification at startup.
     pub fn cidr_list_permits_all(raw: &str) -> bool {
-        let mut v4: Vec<(u128, u128)> = Vec::new();
-        let mut v6: Vec<(u128, u128)> = Vec::new();
-        for entry in raw.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            let Some(cidr) = Self::parse_cidr(entry) else {
-                continue;
-            };
-            match cidr.network {
-                IpAddr::V4(net) => {
-                    // prefix ∈ [0,32]; `32 - prefix` ∈ [0,32] shifts safely in u128.
-                    let prefix = u32::from(cidr.prefix_len).min(32);
-                    let host = (1u128 << (32 - prefix)) - 1;
-                    let start = u128::from(u32::from(net)) & !host;
-                    v4.push((start, start | host));
-                }
-                IpAddr::V6(net) => {
-                    let prefix = u32::from(cidr.prefix_len).min(128);
-                    let (start, end) = if prefix == 0 {
-                        (0u128, u128::MAX) // avoid the UB of shifting a u128 by 128
-                    } else {
-                        let host = (1u128 << (128 - prefix)) - 1;
-                        let start = u128::from(net) & !host;
-                        (start, start | host)
-                    };
-                    v6.push((start, end));
-                }
-            }
-        }
-        ranges_cover_full(&mut v4, u128::from(u32::MAX)) || ranges_cover_full(&mut v6, u128::MAX)
+        crate::util::cidr::CidrSet::parse_lenient(raw)
+            .0
+            .permits_all_family()
     }
-
-    fn parse_cidr(entry: &str) -> Option<CidrEntry> {
-        if let Some((ip_str, prefix_str)) = entry.split_once('/') {
-            let ip: IpAddr = ip_str.parse().ok()?;
-            let prefix_len: u8 = prefix_str.parse().ok()?;
-            let (ip, prefix_len) = canonicalize_cidr_network(ip, prefix_len)?;
-            let max_prefix = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            if prefix_len > max_prefix {
-                return None;
-            }
-            Some(CidrEntry {
-                network: ip,
-                prefix_len,
-            })
-        } else {
-            // Bare IP — treat as /32 or /128
-            let ip: IpAddr = entry.parse().ok()?;
-            let ip = canonicalize_ip(ip);
-            let prefix_len = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            Some(CidrEntry {
-                network: ip,
-                prefix_len,
-            })
-        }
-    }
-}
-
-/// Whether the inclusive `[start, end]` ranges cover the entire `[0, max]`
-/// interval once sorted and merged. Used by `cidr_list_permits_all` to detect a
-/// CIDR allowlist whose union admits every address of a family. `max` is
-/// `u32::MAX` for the IPv4 set and `u128::MAX` for the IPv6 set (IPv4 ranges are
-/// widened to `u128` for a single implementation).
-fn ranges_cover_full(ranges: &mut [(u128, u128)], max: u128) -> bool {
-    if ranges.is_empty() {
-        return false;
-    }
-    ranges.sort_unstable();
-    // Coverage must begin at 0; otherwise the low addresses are unprotected.
-    if ranges[0].0 != 0 {
-        return false;
-    }
-    let mut covered = ranges[0].1;
-    for &(start, end) in ranges.iter().skip(1) {
-        if covered >= max {
-            return true;
-        }
-        // A gap exists if the next range starts beyond the next uncovered
-        // address (`covered + 1`). `saturating_add` avoids overflow at u128::MAX.
-        if start > covered.saturating_add(1) {
-            return false;
-        }
-        if end > covered {
-            covered = end;
-        }
-    }
-    covered >= max
-}
-
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        other => other,
-    }
-}
-
-fn canonicalize_cidr_network(ip: IpAddr, prefix_len: u8) -> Option<(IpAddr, u8)> {
-    match ip {
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                if prefix_len < 96 {
-                    return None;
-                }
-                Some((IpAddr::V4(v4), prefix_len - 96))
-            } else {
-                Some((IpAddr::V6(v6), prefix_len))
-            }
-        }
-        other => Some((other, prefix_len)),
-    }
-}
-
-impl CidrEntry {
-    fn matches(&self, ip: &IpAddr) -> bool {
-        match (&self.network, ip) {
-            (IpAddr::V4(net), IpAddr::V4(addr)) => matches_ipv4(*net, *addr, self.prefix_len),
-            (IpAddr::V4(net), IpAddr::V6(addr)) => {
-                if let Some(v4) = addr.to_ipv4_mapped() {
-                    matches_ipv4(*net, v4, self.prefix_len)
-                } else {
-                    false
-                }
-            }
-            (IpAddr::V6(net), IpAddr::V6(addr)) => matches_ipv6(*net, *addr, self.prefix_len),
-            _ => false, // v4 vs v6 mismatch
-        }
-    }
-}
-
-fn matches_ipv4(network: std::net::Ipv4Addr, addr: std::net::Ipv4Addr, prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let net_bits = u32::from(network);
-    let addr_bits = u32::from(addr);
-    let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
-    (net_bits & mask) == (addr_bits & mask)
-}
-
-fn matches_ipv6(network: std::net::Ipv6Addr, addr: std::net::Ipv6Addr, prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let net_bits = u128::from(network);
-    let addr_bits = u128::from(addr);
-    let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
-    (net_bits & mask) == (addr_bits & mask)
 }
 
 /// Resolve the real client IP from the request context.

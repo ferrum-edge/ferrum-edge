@@ -3041,6 +3041,18 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
+    // Fail CLOSED *before* constructing plugins that dial their OWN resolver —
+    // ldap_auth (ldap3), kafka_logging (librdkafka), ws_logging (tungstenite).
+    // These never go through this `PluginHttpClient` + `DnsCache`, and their
+    // constructors spawn the dial task immediately, so a denied literal endpoint
+    // must be rejected here, not merely warned at config-load. Because the
+    // production `PluginCache` is built with the real-policy client
+    // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
+    // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
+    // the plugin instead of letting its background loop reach the metadata service
+    // (warn-only validation can't stop that — there is no runtime egress backstop
+    // for these clients, unlike proxy/Redis dispatch).
+    screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "transaction_log_schema" => Ok(Some(Arc::new(
@@ -3294,17 +3306,202 @@ pub fn create_plugin_with_http_client(
     }
 }
 
-/// Validate a plugin configuration by attempting to instantiate the plugin.
+/// Validate a plugin configuration by attempting to instantiate the plugin,
+/// with a default-open egress policy.
 ///
-/// This is a lightweight validation entry point for use by file_loader and db_loader.
-/// The plugin instance is created and immediately dropped — only the config validation
-/// side effects of the plugin's `new()` constructor matter.
+/// The plugin instance is created and immediately dropped — only the config
+/// validation side effects of the plugin's `new()` constructor matter.
+///
+/// Production config-load paths (file/db/admin/spec) use
+/// [`validate_plugin_config_with_policy`] so a plugin's literal-IP endpoints
+/// are screened against the configured backend egress policy. This bare
+/// variant remains a `pub` entrypoint for external test crates that only need
+/// shape validation of endpoint-less plugins (e.g. `cors`,
+/// `transaction_log_schema`). `#[allow(dead_code)]` because the binary target
+/// recompiles the source without those test crates, so it sees no caller.
 ///
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
+#[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
     match create_plugin(name, config)? {
         Some(_) => Ok(()),
         None => Err(format!("Unknown plugin name '{}'", name)),
+    }
+}
+
+/// Like [`validate_plugin_config`] but screens any literal-IP plugin endpoint
+/// (AI provider, log sink, webhook) against the configured backend egress
+/// policy, so file/db config-load validation rejects e.g.
+/// `http://169.254.169.254/...` the same way runtime plugin construction does
+/// — instead of accepting (and a CP distributing) a config a data plane later
+/// rejects.
+pub fn validate_plugin_config_with_policy(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
+    match create_plugin_with_http_client(name, config, http_client)? {
+        Some(_) => {
+            // The HTTP-endpoint screen above does not cover a plugin's own
+            // literal-IP backend fields that aren't dialed through the shared
+            // client (mesh_route_dispatch route destinations).
+            if name == "mesh_route_dispatch"
+                && let Err(errs) = screen_mesh_route_dispatch_egress(config, backend_allow_ips)
+            {
+                return Err(errs.join("; "));
+            }
+            // Redis-backed plugins (rate_limit / request_deduplication /
+            // ai_semantic_cache with sync_mode=redis) build their client from
+            // `redis_url` WITHOUT the egress policy, and the client skips literals
+            // / falls back to the hostname on a DNS denial — so a denied literal
+            // endpoint must be rejected here at config-load.
+            screen_redis_endpoint_egress(config, backend_allow_ips)?;
+            // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
+            // screened *inside* `create_plugin_with_http_client` above (before the
+            // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
+            // call is needed here — that path already failed closed on a denial.
+            Ok(())
+        }
+        None => Err(format!("Unknown plugin name '{}'", name)),
+    }
+}
+
+/// Screen a `mesh_route_dispatch` plugin's per-rule `destination.backend_host`
+/// literal IPs against the backend egress policy. A route override can point a
+/// matched request at an arbitrary backend, so a denied address (e.g.
+/// `169.254.169.254`) must be rejected at config-admission time — not only in
+/// Screen a Redis-backed plugin's `redis_url` literal-IP host against the egress
+/// policy at config-load. Redis-backed plugins (`rate_limit`,
+/// `request_deduplication`, `ai_semantic_cache` with `sync_mode=redis`) build
+/// their client from `redis_url` WITHOUT the policy, and the client skips IP
+/// literals / falls back to the hostname on a DNS denial — so a denied literal
+/// endpoint (`redis://169.254.169.254:6379`) would otherwise be dialed. No-op
+/// when there is no `redis_url`, it's a hostname (screened at resolve), or it
+/// doesn't parse (shape errors are surfaced by the constructor).
+pub(crate) fn screen_redis_endpoint_egress(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    let Some(redis_url) = config.get("redis_url").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let Ok(parsed) = url::Url::parse(redis_url) else {
+        return Ok(());
+    };
+    if let Some(host) = parsed.host_str() {
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>()
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            return Err(format!(
+                "redis_url IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Screen the literal-IP endpoints of plugins that dial OUTSIDE the shared
+/// `PluginHttpClient` / `DnsCache`: `ldap_auth` (`ldap_url`, via the `ldap3`
+/// crate) and `kafka_logging` (`broker_list`, via librdkafka). Both perform
+/// their own DNS resolution and connect, so the HTTP-endpoint screen in
+/// [`validate_plugin_config_with_policy`] never sees them — a literal denied
+/// endpoint (`ldap://169.254.169.254:389`, `broker_list=169.254.169.254:9092`)
+/// would otherwise pass file/admin validation and reach the metadata service at
+/// runtime under the default baseline. Reject the literal at config-load.
+///
+/// Hostname endpoints that later rebind to a denied address are an accepted
+/// limitation (the client resolves outside `DnsCache`), mirroring the
+/// `rediss://`-hostname case documented in `redis_rate_limiter`.
+pub(crate) fn screen_direct_client_endpoint_egress(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    match name {
+        // ldap_url is a single ldap:// / ldaps:// URL.
+        "ldap_auth" => {
+            if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())
+                && let Ok(parsed) = url::Url::parse(url.trim())
+                && let Some(host) = parsed.host_str()
+                && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+            {
+                return Err(format!(
+                    "ldap_url IP {ip} denied by backend egress policy: {reason}"
+                ));
+            }
+        }
+        // broker_list is a comma-separated list of `host:port` (or `[v6]:port`,
+        // or a bare host/IP) entries with no scheme.
+        "kafka_logging" => {
+            if let Some(brokers) = config.get("broker_list").and_then(|v| v.as_str()) {
+                for entry in brokers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let literal = entry
+                        .parse::<std::net::SocketAddr>()
+                        .map(|sa| sa.ip())
+                        .ok()
+                        .or_else(|| crate::config::types::egress_literal_ip(entry));
+                    if let Some(ip) = literal
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                    {
+                        return Err(format!(
+                            "broker_list IP {ip} denied by backend egress policy: {reason}"
+                        ));
+                    }
+                }
+            }
+        }
+        // endpoint_url is a single ws:// / wss:// URL; ws_logging dials it via
+        // tokio_tungstenite outside the shared client + DnsCache.
+        "ws_logging" => {
+            if let Some(url) = config.get("endpoint_url").and_then(|v| v.as_str())
+                && let Ok(parsed) = url::Url::parse(url.trim())
+                && let Some(host) = parsed.host_str()
+                && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+            {
+                return Err(format!(
+                    "endpoint_url IP {ip} denied by backend egress policy: {reason}"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// whole-config validation but on direct/batch admin plugin writes too.
+/// Returns prefix-free messages; no-op for configs that don't parse as
+/// mesh_route_dispatch (shape errors are surfaced by the constructor).
+pub fn screen_mesh_route_dispatch_egress(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), Vec<String>> {
+    let Ok(dispatch_config) =
+        crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(config)
+    else {
+        return Ok(());
+    };
+    let mut errors = Vec::new();
+    for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+        if let Some(host) = rule.destination.backend_host.as_deref()
+            && let Some(ip) = crate::config::types::egress_literal_ip(host)
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            errors.push(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].destination.backend_host IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 

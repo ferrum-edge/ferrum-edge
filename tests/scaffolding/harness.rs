@@ -102,7 +102,7 @@ use crate::scaffolding::ports::{PortReservation, reserve_port_pair};
 use chrono::Utc;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
 use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::config::{BackendAllowIps, EnvConfig, OperatingMode};
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::{ServeHandles, ServeOptions};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::StatusCode;
@@ -531,9 +531,9 @@ fn apply_env_overrides(
             "FERRUM_TRUSTED_PROXIES" => env_config.trusted_proxies = v.clone(),
             "FERRUM_BACKEND_ALLOW_IPS" => {
                 env_config.backend_allow_ips = match v.trim().to_ascii_lowercase().as_str() {
-                    "private" => BackendAllowIps::Private,
-                    "public" => BackendAllowIps::Public,
-                    "both" => BackendAllowIps::Both,
+                    "private" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
+                    "public" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+                    "both" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
                     _ => {
                         // Match binary-mode `EnvValue::parse_env`: invalid
                         // values are a hard error, not a silent "use the

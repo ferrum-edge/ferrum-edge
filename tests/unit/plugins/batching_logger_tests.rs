@@ -165,7 +165,7 @@ fn parse_http_endpoint_accepts_http_https_host_forms() {
         let (endpoint, host) = parse_http_endpoint(
             &config,
             "batching_logger_endpoint",
-            &ferrum_edge::config::BackendAllowIps::Both,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         )
         .unwrap();
         assert_eq!(endpoint, expected_endpoint);
@@ -187,7 +187,7 @@ fn parse_http_endpoint_rejects_unusable_endpoint_forms() {
             parse_http_endpoint(
                 &config,
                 "batching_logger_endpoint",
-                &ferrum_edge::config::BackendAllowIps::Both,
+                &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
             )
             .is_err(),
             "expected unusable endpoint to be rejected: {config}"
@@ -629,4 +629,40 @@ async fn retries_clone_only_before_final_attempt() {
     wait_for_flush(&notify).await;
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
     assert_eq!(clone_count.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn validate_plugin_config_with_policy_screens_literal_ip_endpoint() {
+    // `http_logging`'s constructor spawns a batch-flush task, so this needs a
+    // Tokio runtime — mirroring the async file/db config-load context.
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    // A log sink pointed at the cloud-metadata address must be rejected at
+    // config-load time under the production default policy (this is the
+    // file/db pipeline path), even though the mode is `both`.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+    let cfg = json!({ "endpoint_url": "http://169.254.169.254/ingest" });
+    assert!(
+        validate_plugin_config_with_policy("http_logging", &cfg, &default_policy).is_err(),
+        "metadata endpoint must be rejected under the default policy"
+    );
+
+    // A loopback sink (local agent) still validates.
+    let loopback = json!({ "endpoint_url": "http://127.0.0.1:9000/ingest" });
+    assert!(
+        validate_plugin_config_with_policy("http_logging", &loopback, &default_policy).is_ok(),
+        "loopback sink must remain valid by default"
+    );
+
+    // The fully-unrestricted policy accepts the metadata endpoint (legacy posture).
+    assert!(
+        validate_plugin_config_with_policy(
+            "http_logging",
+            &cfg,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
 }
