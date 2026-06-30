@@ -16476,9 +16476,10 @@ async fn handle_proxy_request_inner(
     // body completes. Use the no-conn-end variant so the least-connections
     // gauge is not decremented twice per request (guard + this call).
     //
-    // #1649 item 2: a direct-H2 `StreamingH2` response can fail *after* headers —
-    // a streamable non-failure status followed by a stalled body raises a post-wire
-    // read-timeout / reset once the streaming read-timeout window (#1626) fires.
+    // #1649 item 2 / #1901: direct-H2 `StreamingH2` and native-H3 `StreamingH3`
+    // responses can fail *after* headers — a streamable non-failure status
+    // followed by a stalled body raises a post-wire read-timeout / reset once
+    // the streaming read-timeout window (#1626 / #1940) fires.
     // Recording the dispatch outcome here, at header time, would bank a phantom
     // success and even feed the broken backend's fast TTFB into least-latency, and a mid-stream failure could never
     // correct it. Only that genuinely-unknown case is deferred to body completion
@@ -16500,16 +16501,21 @@ async fn handle_proxy_request_inner(
     // dropped without being polled, so deferring it would be misread as a client
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
     //
-    // Keep native-H3 out of this defer gate for now. hyper can finish an HTTP/1
-    // downstream response after writing a known Content-Length without polling
-    // the H3 body to its terminal FIN, so a deferred H3 dispatch outcome can be
-    // mis-recorded as ClientDisconnect. H3 streaming still gets per-frame
-    // `backend_read_timeout_ms`; CB / passive-health dispatch accounting remains
-    // eager until #1901 has body-driving-safe terminal accounting.
     let streaming_h2_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
     };
+    let streaming_h3_content_length = match &response_body {
+        ResponseBody::StreamingH3(_) => response_headers
+            .get("content-length")
+            .and_then(|v| v.parse::<u64>().ok()),
+        _ => None,
+    };
+    // H3 does not expose an `is_end_stream()` signal at response-header time.
+    // Treat declared zero-length responses as already ended for the defer gate;
+    // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
+    let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
+        && streaming_h3_content_length == Some(0);
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
         && streaming_dispatch_should_defer(
             &proxy,
@@ -16525,12 +16531,26 @@ async fn handle_proxy_request_inner(
                 response_status,
             ),
         );
+    let defer_streaming_h3_dispatch = matches!(&response_body, ResponseBody::StreamingH3(_))
+        && streaming_dispatch_should_defer(
+            &proxy,
+            response_status,
+            streaming_h3_body_ended,
+            method.eq_ignore_ascii_case("HEAD"),
+            streaming_response_status_is_passively_unhealthy(
+                &epoch.load_balancer,
+                &proxy,
+                upstream_target.as_deref(),
+                response_status,
+            ),
+        );
+    let defer_streaming_dispatch = defer_streaming_h2_dispatch || defer_streaming_h3_dispatch;
     // TTFB captured at header arrival; reused whether the deferred outcome is
     // recorded synchronously (an after_proxy reject replaced the streaming body)
     // or at body completion, matching the synchronous path's
     // `backend_start.elapsed()` least-latency sample.
     let streaming_dispatch_elapsed = backend_start.elapsed();
-    if defer_streaming_h2_dispatch {
+    if defer_streaming_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
         // completion as a non-probe. Gated by `!skip_final_cb_record` because a
@@ -16632,12 +16652,16 @@ async fn handle_proxy_request_inner(
         });
     }
 
-    // #1649 item 2: an after_proxy reject can replace the `StreamingH2` body with
-    // a buffered response, so the body will no longer carry the deferred dispatch
-    // outcome. Record it synchronously now, using the BACKEND's captured
+    // #1649 item 2 / #1901: an after_proxy reject can replace the `StreamingH2`
+    // or `StreamingH3` body with a buffered response, so the body will no longer
+    // carry the deferred dispatch outcome. Record it synchronously now, using the
+    // BACKEND's captured
     // status/error (NOT the plugin reject's, which says nothing about backend
     // health) and as a non-probe (the slot was released at header time).
-    if defer_streaming_h2_dispatch && !matches!(&response_body, ResponseBody::StreamingH2(_)) {
+    let deferred_streaming_body_still_streaming = (defer_streaming_h2_dispatch
+        && matches!(&response_body, ResponseBody::StreamingH2(_)))
+        || (defer_streaming_h3_dispatch && matches!(&response_body, ResponseBody::StreamingH3(_)));
+    if defer_streaming_dispatch && !deferred_streaming_body_still_streaming {
         // #1649 R5 finding 3: the after_proxy hook may have run long enough for the
         // breaker to open a new cycle. Skip the CB record if this header-time
         // outcome is stale for the current generation (parity with the
@@ -17272,9 +17296,7 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            let cl = streaming_h3_content_length;
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -17315,13 +17337,33 @@ async fn handle_proxy_request_inner(
                     proxy.backend_read_timeout_ms,
                 )
             };
-            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            let mut body = body
+                .with_success_on_drop_after_response_bytes(cl)
+                .with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
                     backend_admission_response_status,
                     backend_admission_elapsed,
                 );
+            }
+            if defer_streaming_h3_dispatch {
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::clone(&state),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        upstream_target.clone(),
+                        final_cb_target_key.clone(),
+                        backend_admission_response_status,
+                        false,
+                        None,
+                        false,
+                        skip_final_cb_record,
+                        streaming_dispatch_elapsed,
+                    )
+                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
             }
             body
         }
@@ -22870,9 +22912,11 @@ async fn proxy_to_backend_http3(
 /// Native-H3 streaming responses use the same per-frame
 /// `backend_read_timeout_ms` idle regime as direct-H2 streaming responses, so a
 /// backend that sends headers and then stalls is cut by the response-body
-/// wrapper instead of waiting for the QUIC idle timeout. CB / passive-health
-/// dispatch accounting remains eager at header time for native H3 until #1901
-/// has a body-driving-safe terminal accounting design.
+/// wrapper instead of waiting for the QUIC idle timeout. Streamable H3 statuses
+/// also defer CB / passive-health dispatch accounting to body completion; a
+/// declared `Content-Length` lets the drop safety net treat a body dropped after
+/// yielding the full byte count as a success instead of a false client
+/// disconnect.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,

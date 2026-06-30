@@ -16,18 +16,21 @@
 //! * direct-H2 / HBONE streaming (`ResponseBody::StreamingH2`) → item 2 (the
 //!   header-time record is deferred; the HALF_OPEN probe slot is released
 //!   promptly via `record_neutral`).
+//! * native-H3 streaming (`ResponseBody::StreamingH3`) → #1901 (the same
+//!   response-body terminal outcome now drives CB/passive-health accounting).
 //!
 //! Run with: `cargo build --bin ferrum-edge && cargo test --test
 //! functional_tests streaming_outcome_accounting -- --ignored --nocapture`.
 
 use crate::scaffolding::backends::{
-    GrpcStep, H2Step, MatchHeaders, MatchRpc, ScriptedGrpcBackend, ScriptedH2Backend,
+    GrpcStep, H2Step, H3Step, H3TlsConfig, MatchHeaders, MatchRpc, ScriptedGrpcBackend,
+    ScriptedH2Backend, ScriptedH3Backend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, Http2Client};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
 use bytes::Bytes;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -76,6 +79,51 @@ fn gateway_port(harness: &GatewayHarness) -> u16 {
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .expect("gateway port")
+}
+
+async fn wait_for_h3_capability_supported(harness: &GatewayHarness, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let body = harness
+            .get_admin_json("/backend-capabilities")
+            .await
+            .expect("backend capability registry");
+        let h3 = body["entries"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry["plain_http"]["h3"].as_str());
+        if h3 == Some("supported") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for h3=supported capability entry; latest={body:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn h3_cb_file_config(port: u16, read_timeout_ms: u64, circuit_breaker: Value) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-cb",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": read_timeout_ms,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "circuit_breaker": circuit_breaker,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    serde_yaml::to_string(&config).expect("serialize yaml")
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -271,6 +319,113 @@ async fn h2_streaming_status_then_stall_trips_circuit_breaker(status: u16) {
     );
     assert_eq!(
         second.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "open circuit breaker must return 503"
+    );
+    assert!(
+        second_elapsed < Duration::from_millis(read_timeout_ms),
+        "2nd request was not short-circuited (took {second_elapsed:?}) — breaker did not trip"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// #1901 — native-H3 (StreamingH3) streaming: 2xx headers then stall must trip
+// the breaker at body completion, matching direct-H2.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_2xx_then_stall_trips_circuit_breaker() {
+    let ca = TestCa::new("h3-stall-cb").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+    let read_timeout_ms: u64 = 700;
+
+    // TCP+TLS sidecar answers non-H3 capability probes on the same backend port.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls sidecar");
+    Box::leak(Box::new(_tcp_backend));
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::StallFor(Duration::from_millis(read_timeout_ms + 2_000)),
+        ])
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let yaml = h3_cb_file_config(backend_port, read_timeout_ms, trip_on_first_failure_cb());
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        .capture_output()
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    wait_for_h3_capability_supported(&harness, Duration::from_secs(15)).await;
+    let client = reqwest::Client::new();
+    let base = harness.proxy_base_url();
+    let requests_before = h3_backend.received_requests().await.len();
+
+    // Request 1: streamable 200 headers plus stalled body. The client must
+    // consume the body so `ProxyBody` observes the H3 read-timeout terminal and
+    // deferred dispatch records the breaker failure.
+    let started = Instant::now();
+    let first = client
+        .get(format!("{base}/api/stall"))
+        .send()
+        .await
+        .expect("first response headers");
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = first.bytes().await;
+    let first_elapsed = started.elapsed();
+    let requests_after_1 = h3_backend.received_requests().await.len();
+    assert_eq!(
+        requests_after_1,
+        requests_before + 1,
+        "the stall request must reach the H3 backend"
+    );
+    assert!(
+        first_elapsed >= Duration::from_millis(read_timeout_ms.saturating_sub(300)),
+        "stall request returned too fast ({first_elapsed:?}); expected the ~{read_timeout_ms}ms read-timeout to cut the body"
+    );
+
+    // Request 2: breaker OPEN -> short-circuited 503, never reaches H3.
+    let started = Instant::now();
+    let second = client
+        .get(format!("{base}/api/stall"))
+        .send()
+        .await
+        .expect("circuit-open 503 surfaces");
+    let second_elapsed = started.elapsed();
+    assert_eq!(
+        h3_backend.received_requests().await.len(),
+        requests_after_1,
+        "circuit breaker must short-circuit the 2nd request; another H3 request means the 2xx-then-stall did not record a breaker failure"
+    );
+    assert_eq!(
+        second.status(),
         StatusCode::SERVICE_UNAVAILABLE,
         "open circuit breaker must return 503"
     );
