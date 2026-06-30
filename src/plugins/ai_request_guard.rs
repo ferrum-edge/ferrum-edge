@@ -953,27 +953,62 @@ fn default_token_target(json: &Value) -> DefaultTokenTarget {
     }
 }
 
-fn top_level_already_caps_output(json: &Value) -> bool {
-    TOP_LEVEL_TOKEN_FIELDS
-        .iter()
-        .any(|field| json.get(*field).is_some())
+/// The top-level output-cap field for the body's OpenAI-family schema. OpenAI
+/// Responses caps output via `max_output_tokens`; every other top-level-capped
+/// family (Chat Completions, legacy completions, Anthropic Messages, Cohere)
+/// caps via `max_tokens`. Provider-native families cap via their own container
+/// (`inject_provider_default_max_tokens`), not this field.
+fn top_level_cap_field(json: &Value) -> &'static str {
+    if looks_like_responses(json) {
+        "max_output_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// True when the body already declares the cap field its OWN top-level family
+/// reads. Checks only that family's field(s) — not every recognized token alias:
+/// a stray cross-provider alias an OpenAI-family upstream ignores (e.g. a TGI
+/// `max_new_tokens`, a Gemini `maxOutputTokens`, or a Bedrock `maxTokens` sitting
+/// at the top level of a Chat body) must NOT be mistaken for the real cap and
+/// suppress the fallback. `max_completion_tokens` is the Chat-Completions alias
+/// for `max_tokens` and counts.
+fn top_level_cap_present(json: &Value) -> bool {
+    if looks_like_responses(json) {
+        json.get("max_output_tokens").is_some()
+    } else {
+        json.get("max_tokens").is_some() || json.get("max_completion_tokens").is_some()
+    }
 }
 
 /// True when the body carries a top-level prompt field that an OpenAI-compatible
-/// (top-level-`max_tokens`) upstream reads: `messages` (OpenAI Chat Completions,
+/// (top-level-capped) upstream reads, so a top-level cap would actually bound its
+/// output. Covers every top-level-capped family: `messages` (OpenAI Chat,
 /// Anthropic Messages, Cohere v2, Bedrock Converse), `prompt` (legacy
-/// completions), or `input` (Responses API). Unlike the provider-native prompt
-/// fields — `contents` (Gemini), `inputs` (TGI), `inputText` (Titan) — these
-/// signal that a top-level `max_tokens` would actually cap the output, so a
-/// client-spoofed provider-native marker on such a body must NOT divert the
-/// default cap away from the top level (the #1950 bypass). A body with a native
-/// container and none of these fields is unambiguously provider-native and is
-/// left to its native cap only, so a strict provider backend (Gemini/Bedrock) is
-/// not handed an unsupported top-level field. Bedrock Converse is the irreducible
-/// exception: it shares `messages` with OpenAI, so it is treated as
-/// top-level-capable and fail-closed-capped. See [`inject_default_max_tokens`].
+/// completions), `input` / `instructions` / `previous_response_id` (Responses),
+/// and `message` / `chat_history` (Cohere v1). The provider-native prompt fields
+/// `contents` (Gemini), `inputs` (TGI), and `inputText` (Titan) are deliberately
+/// excluded — those bodies cap via their native container, so a client-spoofed
+/// provider-native marker on a top-level-shaped body must NOT divert the default
+/// away from the top level (the #1950 bypass), while an unambiguously native body
+/// (a native container and none of these prompts) is left to its native cap only
+/// and a strict provider backend is not handed an unsupported top-level field.
+/// Bedrock Converse is the irreducible exception: it shares `messages` with
+/// OpenAI, so it is treated as top-level-capable and fail-closed-capped. See
+/// [`inject_default_max_tokens`].
 fn has_top_level_prompt_marker(json: &Value) -> bool {
-    json.get("messages").is_some() || json.get("prompt").is_some() || json.get("input").is_some()
+    const TOP_LEVEL_PROMPT_MARKERS: &[&str] = &[
+        "messages",
+        "prompt",
+        "input",
+        "instructions",
+        "previous_response_id",
+        "message",
+        "chat_history",
+    ];
+    TOP_LEVEL_PROMPT_MARKERS
+        .iter()
+        .any(|field| json.get(*field).is_some())
 }
 
 fn inject_provider_default_max_tokens(
@@ -1014,19 +1049,24 @@ fn inject_provider_default_max_tokens(
 
 fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
     let target = default_token_target(json);
-    let top_level_already_capped = top_level_already_caps_output(json);
+    // Use the body's OWN family cap field (`max_output_tokens` for Responses, else
+    // `max_tokens`) both to test whether a real cap is present and as the field to
+    // inject — so a Responses body gets the cap the Responses API actually reads,
+    // and a stray cross-provider alias does not pass as an existing cap.
+    let cap_field = top_level_cap_field(json);
+    let top_level_already_capped = top_level_cap_present(json);
     let target_already_capped = target_already_caps_output(json, target);
     // The top-level fallback exists to defeat the #1950 spoof: a client appends a
     // provider-native marker (`generationConfig`/`inferenceConfig`/`contents`) to
     // an OpenAI-shaped body so the default routes only into a field the real
     // (top-level-capped) upstream ignores, leaving output uncapped. Inject the
-    // top-level fallback only when the body actually carries an OpenAI-family
-    // top-level prompt field — the spoof must keep one so the OpenAI/Anthropic/
-    // Cohere upstream still processes the request — or when no provider-native
-    // container is present at all. A body that is unambiguously provider-native (a
-    // native container and NO top-level prompt field, e.g. Gemini `contents`, TGI
+    // top-level fallback only when the body actually carries a top-level-capped
+    // prompt field — the spoof must keep one so the OpenAI/Anthropic/Cohere
+    // upstream still processes the request — or when no provider-native container
+    // is present at all. A body that is unambiguously provider-native (a native
+    // container and NO top-level prompt field, e.g. Gemini `contents`, TGI
     // `inputs`) is left to its native cap only, so a strict provider backend is
-    // not handed an unsupported top-level `max_tokens`.
+    // not handed an unsupported top-level cap field.
     let wants_top_level_fallback =
         matches!(target, DefaultTokenTarget::TopLevel) || has_top_level_prompt_marker(json);
     let Some(obj) = json.as_object_mut() else {
@@ -1036,7 +1076,7 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
     let mut modified = false;
 
     if wants_top_level_fallback && !top_level_already_capped {
-        obj.insert("max_tokens".to_string(), Value::Number(default.into()));
+        obj.insert(cap_field.to_string(), Value::Number(default.into()));
         modified = true;
     }
 

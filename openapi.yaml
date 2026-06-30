@@ -14357,7 +14357,7 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject a default output-token limit if no supported token field is present; OpenAI-shaped bodies keep a top-level max_tokens fallback (so a spoofed provider marker cannot uncap them) while unambiguously provider-native bodies receive only their native cap
+          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, auto]
