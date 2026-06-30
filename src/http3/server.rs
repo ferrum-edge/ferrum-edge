@@ -305,7 +305,11 @@ where
         .await
         {
             Ok(result) => result,
-            Err(_) => return Err(H3TrailerFinishError::BackendTimeout),
+            Err(_) => match recv_stream.peek_recv_trailers() {
+                Ok(Some(trailers)) => Ok(Some(trailers)),
+                Ok(None) => return Err(H3TrailerFinishError::BackendTimeout),
+                Err(err) => return Err(H3TrailerFinishError::Backend(err)),
+            },
         }
     } else {
         recv_stream.recv_trailers().await
