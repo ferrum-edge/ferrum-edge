@@ -14357,7 +14357,7 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject a default output-token limit if no supported token field is present
+          description: Inject a default output-token limit if no supported token field is present, keeping a top-level fallback and adding provider-native caps for recognized body shapes
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, auto]

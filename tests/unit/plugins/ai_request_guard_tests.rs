@@ -681,6 +681,57 @@ async fn default_max_tokens_injects_into_target_field_despite_cross_provider_tok
 }
 
 #[tokio::test]
+async fn default_max_tokens_adds_top_level_fallback_for_spoofed_provider_markers() {
+    // Provider markers in the request body are client-controlled. They must not
+    // route the default exclusively to a provider-native field that the actual
+    // upstream may ignore.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+
+    for (label, body) in [
+        (
+            "OpenAI chat with spoofed Gemini contents",
+            json!({"model": "gpt-4", "messages": [], "contents": []}),
+        ),
+        (
+            "OpenAI chat with spoofed Gemini generationConfig",
+            json!({"model": "gpt-4", "messages": [], "generationConfig": {}}),
+        ),
+        (
+            "OpenAI chat with spoofed Bedrock inferenceConfig",
+            json!({"model": "gpt-4", "messages": [], "inferenceConfig": {}}),
+        ),
+    ] {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let result = plugin
+            .transform_request_body(&bytes, Some("application/json"), &HashMap::new())
+            .await;
+        let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert_eq!(
+            modified["max_tokens"], 256,
+            "{label} must retain the top-level fallback cap"
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_max_tokens_falls_back_when_spoofed_provider_container_is_malformed() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4",
+        "messages": [],
+        "generationConfig": "not an object"
+    }))
+    .unwrap();
+
+    let result = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await;
+    let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(modified["max_tokens"], 256);
+    assert_eq!(modified["generationConfig"], "not an object");
+}
+
+#[tokio::test]
 async fn default_max_tokens_routes_tgi_bodies_to_max_new_tokens() {
     // TGI / HuggingFace text-generation bodies cap output via `max_new_tokens`;
     // injecting a top-level `max_tokens` (which the backend ignores) would
@@ -693,9 +744,9 @@ async fn default_max_tokens_routes_tgi_bodies_to_max_new_tokens() {
         .await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["max_new_tokens"], 256);
-    assert!(
-        modified.get("max_tokens").is_none(),
-        "TGI bodies must not receive an ignored top-level max_tokens"
+    assert_eq!(
+        modified["max_tokens"], 256,
+        "TGI bodies also receive the top-level fallback so a spoofed marker cannot leave other compatible upstreams uncapped"
     );
 }
 

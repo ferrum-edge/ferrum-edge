@@ -926,21 +926,14 @@ enum DefaultTokenTarget {
     TextGeneration,
 }
 
-/// Picks the container that `default_max_tokens` is injected into.
+/// Picks the provider-native container that `default_max_tokens` should also be
+/// injected into when the body is clearly using one of the provider-native
+/// schemas the guard understands.
 ///
-/// Routing is driven by provider-native marker containers that are already
-/// present on the body. A Bedrock Converse body is only recognized when it
-/// already carries `inferenceConfig`; a body that omits it — or an Amazon Titan
-/// body (`textGenerationConfig.maxTokenCount`) — falls through to `TopLevel` and
-/// receives a top-level `max_tokens` those providers ignore. A bare,
-/// messages-only Bedrock body is wire-indistinguishable from OpenAI, so this is
-/// inherent: we do not provider-sniff. This limitation is documented in the
-/// schema-coverage matrix in docs/plugins.md.
-///
-/// TGI / HuggingFace text-generation bodies (recognized by their top-level
-/// `inputs` prompt field) cap output via `max_new_tokens`, so they route to
-/// `TextGeneration`; injecting a top-level `max_tokens` there would be ignored
-/// by the backend and silently drop the intended default cap.
+/// These markers are still request-controlled, so they must not be used to
+/// suppress the top-level default cap. `inject_default_max_tokens` always keeps
+/// a top-level fallback for top-level-compatible upstreams, then adds the
+/// provider-native cap when a native target is detected.
 fn default_token_target(json: &Value) -> DefaultTokenTarget {
     if json.get("generationConfig").is_some()
         || json.get("contents").is_some()
@@ -957,19 +950,17 @@ fn default_token_target(json: &Value) -> DefaultTokenTarget {
     }
 }
 
-fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
-    let target = default_token_target(json);
-    // Provider-aware: only suppress injection when the *target* provider already
-    // caps output tokens. A token-looking field for a different provider that the
-    // target backend ignores must not block the default from landing in the real
-    // field.
-    if target_already_caps_output(json, target) {
-        return false;
-    }
-    let Some(obj) = json.as_object_mut() else {
-        return false;
-    };
+fn top_level_already_caps_output(json: &Value) -> bool {
+    TOP_LEVEL_TOKEN_FIELDS
+        .iter()
+        .any(|field| json.get(*field).is_some())
+}
 
+fn inject_provider_default_max_tokens(
+    obj: &mut serde_json::Map<String, Value>,
+    target: DefaultTokenTarget,
+    default: u64,
+) -> bool {
     match target {
         DefaultTokenTarget::Gemini => {
             let entry = obj
@@ -997,11 +988,38 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
             obj.insert("max_new_tokens".to_string(), Value::Number(default.into()));
             true
         }
-        DefaultTokenTarget::TopLevel => {
-            obj.insert("max_tokens".to_string(), Value::Number(default.into()));
-            true
-        }
+        DefaultTokenTarget::TopLevel => false,
     }
+}
+
+fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
+    let target = default_token_target(json);
+    let top_level_already_capped = top_level_already_caps_output(json);
+    let target_already_capped = target_already_caps_output(json, target);
+    let Some(obj) = json.as_object_mut() else {
+        return false;
+    };
+
+    let mut modified = false;
+
+    // Request-body schema markers are client controlled and may not match the
+    // configured upstream. Always inject the top-level fallback unless a
+    // recognized top-level cap already exists, so an OpenAI-compatible backend
+    // cannot be left uncapped by a stray provider-native marker.
+    if !top_level_already_capped {
+        obj.insert("max_tokens".to_string(), Value::Number(default.into()));
+        modified = true;
+    }
+
+    // Preserve provider-native functionality too: native backends that ignore
+    // the top-level fallback still receive their own output-token cap. A
+    // malformed provider container simply skips the native insertion; the
+    // top-level fallback above remains in place for compatible upstreams.
+    if !target_already_capped {
+        modified |= inject_provider_default_max_tokens(obj, target, default);
+    }
+
+    modified
 }
 
 fn count_message_entries(json: &Value) -> u64 {
