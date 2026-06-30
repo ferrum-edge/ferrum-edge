@@ -73,6 +73,9 @@ const FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX: &str =
 /// never about charging real usage or about window maintenance.
 const RESERVATION_RECONCILED_METADATA_KEY: &str = "ai_ratelimit_reservation_reconciled";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+/// Marks compressed JSON requests that look like possible AI calls but could not
+/// be estimated before proxying because decompression happens later.
+const COMPRESSED_AI_REQUEST_METADATA_KEY: &str = "ai_ratelimit_compressed_ai_request";
 
 /// Process-wide monotonic counter used to give every `AiRateLimiter` instance a
 /// unique id. The id is folded into [`AiRateLimiter::federation_flag_key`] so the
@@ -397,6 +400,11 @@ impl AiRateLimiter {
         ctx.metadata.contains_key(AI_REQUEST_METADATA_KEY)
     }
 
+    fn request_was_compressed_ai_candidate(ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .contains_key(COMPRESSED_AI_REQUEST_METADATA_KEY)
+    }
+
     fn reservation_id(ctx: &RequestContext) -> Option<u64> {
         ctx.metadata
             .get(RESERVATION_ID_METADATA_KEY)
@@ -597,6 +605,15 @@ impl AiRateLimiter {
                     UNMETERED_ACTION_METADATA_KEY.to_string(),
                     OnUnmeteredResponse::ChargeEstimate.as_str().to_string(),
                 );
+                if reserved_tokens == 0 && Self::request_was_compressed_ai_candidate(ctx) {
+                    warn!(
+                        provider = %self.provider,
+                        count_mode = %self.count_mode,
+                        detail = %unmetered_detail,
+                        "ai_rate_limiter: rejecting compressed AI response without token usage because no safe pre-request estimate exists"
+                    );
+                    return self.reject_unmetered();
+                }
                 warn!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
@@ -1182,12 +1199,18 @@ impl Plugin for AiRateLimiter {
         // the handler `mem::take`s headers out of `ctx.headers` for this phase.
         // See limitation #4 below and docs/plugins.md (compressed requests are
         // reconciled-only, not pre-reserved). Mirrors `ai_request_guard` (#1919).
+        let is_compressed_ai_candidate = has_non_identity_content_encoding(headers)
+            && ctx.method == "POST"
+            && headers
+                .get("content-type")
+                .is_some_and(|content_type| is_json_content_type(content_type));
         let (is_ai_request, reserved_tokens) = if has_non_identity_content_encoding(headers) {
-            // Compressed body: not parseable here, so we cannot positively
-            // identify it as an AI call. Leave the marker unset — the request is
-            // reconcile-only and thus exempt from the `on_unmetered_response`
-            // policy, the safe direction (never a false 502).
-            (false, 0)
+            // Compressed JSON requests cannot be parsed here, but they are still
+            // possible AI calls. Marking only POST JSON keeps the unmetered
+            // policy scoped away from ordinary GET/empty/non-JSON traffic while
+            // preventing compressed AI requests from bypassing reject/default
+            // enforcement when the provider returns no usage metadata.
+            (is_compressed_ai_candidate, 0)
         } else {
             self.estimate_request_tokens(ctx)
         };
@@ -1272,14 +1295,20 @@ impl Plugin for AiRateLimiter {
             return self.reject(usage);
         }
 
-        // Mark this as an AI request whenever `before_proxy` parsed a JSON body
-        // and ran the token estimate over it — independent of `reserved_tokens`
-        // (`completion_tokens` mode reserves 0 for AI calls with no output cap).
-        // `reconcile_usage` gates its `on_unmetered_response` policy on this
-        // marker so a non-AI 2xx on a shared proxy is never rejected/charged.
+        // Mark this as an AI request whenever `before_proxy` either parsed a JSON
+        // body with recognized LLM fields or saw a compressed POST JSON body that
+        // cannot be parsed until the later decompression phase. The latter is a
+        // conservative candidate marker: it preserves `on_unmetered_response`
+        // enforcement for compressed AI calls that return no usage metadata.
         if is_ai_request {
             ctx.metadata
                 .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
+            if is_compressed_ai_candidate {
+                ctx.metadata.insert(
+                    COMPRESSED_AI_REQUEST_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                );
+            }
         }
 
         if reserved_tokens > 0 {

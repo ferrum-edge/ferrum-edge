@@ -1154,6 +1154,10 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
             .contains_key("ai_ratelimit_reserved_tokens"),
         "compressed request should skip pre-reservation entirely (no reserved-tokens marker)"
     );
+    assert!(
+        compressed.metadata.contains_key("ai_ratelimit_request"),
+        "compressed POST JSON must stay subject to unmetered-response policy"
+    );
 
     // Reconciliation still charges the ACTUAL provider-reported usage afterward,
     // so the compressed request is debited correctly even without a reservation.
@@ -1168,6 +1172,65 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
         55,
         "reconciliation should charge actual usage (40 + 15) for the compressed request"
     );
+}
+
+#[tokio::test]
+async fn compressed_unmetered_2xx_reject_mode_returns_502() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "compressed reject-mode prompt");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "compressed request is not pre-reserved"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_ratelimit_request"),
+        "compressed POST JSON must be marked so reject mode cannot be bypassed"
+    );
+
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn compressed_unmetered_2xx_default_charge_estimate_rejects_without_estimate() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "compressed default-mode prompt");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "br".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        reserved_tokens(&ctx),
+        0,
+        "compressed request is not pre-reserved"
+    );
+
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
 }
 
 #[tokio::test]
