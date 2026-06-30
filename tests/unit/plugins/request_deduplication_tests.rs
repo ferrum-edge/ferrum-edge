@@ -2,6 +2,7 @@ use bytes::Bytes;
 use ferrum_edge::_test_support::{
     request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
+    request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test,
 };
@@ -739,6 +740,73 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
         matches!(result, PluginResult::Continue),
         "duplicate after streamed SSE completion should re-execute, not get stale 409 or cached replay; got {result:?}"
     );
+}
+
+#[tokio::test]
+async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
+    let plugin = make_plugin(json!({
+        "inflight_ttl_seconds": 1
+    }));
+
+    let mut original_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut original_headers = HashMap::new();
+    original_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin
+        .before_proxy(&mut original_ctx, &mut original_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+
+    let mut successor_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut successor_headers = HashMap::new();
+    successor_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin
+        .before_proxy(&mut successor_ctx, &mut successor_headers)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "successor should replace the stale in-flight marker, got {result:?}"
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    plugin
+        .on_response_stream_end(&original_ctx, 200, &BodyOutcome::success(32))
+        .await;
+
+    let mut duplicate_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut duplicate_headers = HashMap::new();
+    duplicate_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin
+        .before_proxy(&mut duplicate_ctx, &mut duplicate_headers)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "late stream-end from the stale owner must not clear the successor marker; got {result:?}"
+    );
+
+    plugin
+        .on_response_stream_end(&successor_ctx, 200, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
 
 /// A buffered (non-SSE) keyed response keeps the marker in-flight through the

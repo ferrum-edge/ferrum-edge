@@ -103,6 +103,12 @@ pub mod _test_support {
         plugin.expire_completed_entries_for_tests();
     }
 
+    pub fn request_deduplication_expire_inflight_entries_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) {
+        plugin.expire_inflight_entries_for_tests();
+    }
+
     pub fn request_deduplication_redis_payload_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         status_code: u16,
