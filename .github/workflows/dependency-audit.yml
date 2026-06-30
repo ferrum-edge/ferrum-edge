@@ -43,7 +43,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-deny and cargo-audit
-        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
+        uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2
         with:
           # cargo-deny pinned to the validated schema version; cargo-audit is a
           # non-blocking second opinion, so it tracks latest.

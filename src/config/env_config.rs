@@ -12,6 +12,7 @@
 use super::conf_file::ConfFile;
 use super::db_backend::redact_url;
 use crate::ebpf::NodeAgentProxyMode;
+use crate::util::cidr::CidrSet;
 use std::collections::{HashMap, HashSet};
 use std::env;
 
@@ -186,6 +187,41 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Classify a DP CP gRPC URL for the secure-by-default plaintext gate.
+///
+/// Returns `Ok(true)` when the URL is plaintext (`http://`/`grpc://`) AND its
+/// host is non-loopback — the only case the gate blocks without an explicit
+/// opt-in. Returns `Ok(false)` for TLS URLs (`https://`/`grpcs://`) and for
+/// loopback plaintext (`127.0.0.1`, `::1`, `localhost`, `*.localhost`). A URL
+/// that does not parse, or that carries an unsupported scheme, is an `Err` so
+/// the misconfiguration surfaces at startup rather than at first dial.
+fn cp_dp_grpc_url_is_nonloopback_plaintext(url: &str) -> Result<bool, String> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is not a valid URL: {e}"))?;
+    let plaintext = match parsed.scheme() {
+        "https" | "grpcs" => return Ok(false),
+        "http" | "grpc" => true,
+        other => {
+            return Err(format!(
+                "FERRUM_DP_CP_GRPC_URLS entry '{url}' has unsupported scheme '{other}://' \
+                 (expected http:// or https://)"
+            ));
+        }
+    };
+    let host = parsed
+        .host()
+        .ok_or_else(|| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is missing a host"))?;
+    let is_loopback = match host {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(d) => {
+            let d = d.to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+    };
+    Ok(plaintext && !is_loopback)
+}
+
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
@@ -297,12 +333,387 @@ fn is_well_known_nat64_private_ip(segments: [u16; 8]) -> bool {
     is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)))
 }
 
-/// Check whether an IP is allowed under the given backend IP policy.
+/// Check whether an IP is allowed under the given backend IP *mode* alone.
+///
+/// This is the legacy `FERRUM_BACKEND_ALLOW_IPS` primitive. It is the mode
+/// component of [`BackendEgressPolicy`] and is still used directly where a
+/// fixed mode is wanted regardless of CIDR overlays or the dangerous-range
+/// baseline (e.g. ACME, which always demands a public IP). New egress
+/// decisions should go through [`BackendEgressPolicy::is_allowed`].
 pub fn check_backend_ip_allowed(addr: &std::net::IpAddr, policy: &BackendAllowIps) -> bool {
     match policy {
         BackendAllowIps::Both => true,
         BackendAllowIps::Private => is_private_ip(addr),
         BackendAllowIps::Public => !is_private_ip(addr),
+    }
+}
+
+/// The "never a legitimate backend" ranges that the egress baseline denies by
+/// default — even under `FERRUM_BACKEND_ALLOW_IPS=both`.
+///
+/// This is deliberately a STRICT SUBSET of [`is_private_ip`]: loopback
+/// (`127.0.0.0/8`, `::1`) and RFC1918 (`10/8`, `172.16/12`, `192.168/16`) and
+/// their IPv6 ULA equivalent (`fc00::/7`) are intentionally NOT here. The
+/// gateway's whole job is to reach private backends — mesh inbound dials
+/// `127.0.0.1:<appPort>`, sidecars and same-host services use loopback, and
+/// internal upstreams use RFC1918 — so blocking those by default would break
+/// normal deployments. What this blocks instead is the set of ranges that are
+/// essentially never a real backend yet are the classic SSRF pivots:
+///
+/// - **Cloud metadata / link-local**: `169.254.0.0/16` (incl. `169.254.169.254`,
+///   the AWS/GCP/Azure IMDS) and IPv6 `fe80::/10`, plus the Alibaba Cloud / ENS
+///   IMDS host `100.100.100.200` (which sits in CGNAT, not link-local).
+/// - **Multicast**: `224.0.0.0/4` and `ff00::/8`.
+/// - **Unspecified / "this host"**: `0.0.0.0`, `0.0.0.0/8`, and IPv6 `::`.
+/// - **Limited broadcast**: `255.255.255.255`.
+///
+/// Operators who genuinely need one of these (e.g. an IMDS proxy) re-allow it
+/// explicitly with `FERRUM_BACKEND_ALLOW_CIDRS`.
+pub fn is_always_blocked_range(addr: &std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_link_local()      // 169.254.0.0/16 (cloud metadata)
+            || ip.is_unspecified()  // 0.0.0.0
+            || ip.octets()[0] == 0  // 0.0.0.0/8 ("this host on this network")
+            || ip.is_multicast()    // 224.0.0.0/4
+            || ip.is_broadcast() // 255.255.255.255
+            // Alibaba Cloud / ENS instance metadata service. Unlike AWS/GCP/Azure
+            // (all on 169.254.169.254), Alibaba's IMDS lives at 100.100.100.200,
+            // which sits inside CGNAT (100.64.0.0/10) and is otherwise NOT
+            // link-local — so block the EXACT host (not the whole /10, which can
+            // carry legitimate CGNAT backends). Re-allow with FERRUM_BACKEND_ALLOW_CIDRS.
+            || ip.octets() == [100, 100, 100, 200]
+        }
+        std::net::IpAddr::V6(ip) => {
+            // Loopback (`::1`) is explicitly allowed and must NOT be caught by
+            // the IPv4-compat mapping below — `::1`.to_ipv4() is `0.0.0.1`,
+            // which is inside the blocked `0.0.0.0/8`. Guard it first.
+            if ip.is_loopback() {
+                return false;
+            }
+            // Canonicalise an IPv4-mapped (`::ffff:a.b.c.d`) or deprecated
+            // IPv4-compatible (`::a.b.c.d`) address to its v4 form so a
+            // mapped/compat metadata/multicast/unspecified/this-host address is
+            // caught too (parity with `is_private_ip`).
+            if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4()) {
+                return is_always_blocked_range(&std::net::IpAddr::V4(v4));
+            }
+            // NAT64 well-known prefix (64:ff9b::/96): decode the embedded IPv4
+            // and apply the same baseline, so a NAT64-encoded metadata/multicast
+            // address (e.g. 64:ff9b::a9fe:a9fe for 169.254.169.254) cannot bypass
+            // the default block via an IPv6-only / NAT64 DNS answer (rebinding).
+            let segments = ip.segments();
+            if segments[0] == 0x0064
+                && segments[1] == 0xff9b
+                && segments[2] == 0
+                && segments[3] == 0
+                && segments[4] == 0
+                && segments[5] == 0
+            {
+                let [a, b] = segments[6].to_be_bytes();
+                let [c, d] = segments[7].to_be_bytes();
+                return is_always_blocked_range(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    a, b, c, d,
+                )));
+            }
+            // NAT64 local-use prefix (RFC 8215, `64:ff9b:1::/48`): a DNS64
+            // resolver configured with this prefix embeds the IPv4 in the bits
+            // after the /48. The exact octet positions depend on the embedding —
+            // RFC 6052 reserves the u-byte at bits 64-71 — so decode BOTH the
+            // contiguous form (IPv4 in `segments[3..=4]`, e.g. `64:ff9b:1:a9fe:a9fe::`
+            // for 169.254.169.254) and the RFC 6052 /48 form (IPv4 split across the
+            // u-byte) and block if EITHER lands in a dangerous range, so an
+            // IPv6-only / DNS64 answer cannot rebind to IMDS through this prefix.
+            // `is_private_ip` already treats the whole `64:ff9b:1::/48` as private,
+            // so this stays a strict subset of it.
+            if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+                let [s3hi, s3lo] = segments[3].to_be_bytes();
+                let [s4hi, s4lo] = segments[4].to_be_bytes();
+                let [s5hi, _] = segments[5].to_be_bytes();
+                let contiguous = std::net::Ipv4Addr::new(s3hi, s3lo, s4hi, s4lo);
+                let rfc6052_48 = std::net::Ipv4Addr::new(s3hi, s3lo, s4lo, s5hi);
+                if is_always_blocked_range(&std::net::IpAddr::V4(contiguous))
+                    || is_always_blocked_range(&std::net::IpAddr::V4(rfc6052_48))
+                {
+                    return true;
+                }
+            }
+            ip.is_unspecified()                     // ::
+            // AWS EC2 IPv6 instance metadata (IMDSv6) lives at fd00:ec2::254,
+            // inside the otherwise-allowed ULA range (fc00::/7) — block the
+            // exact metadata host so the IPv6 IMDS SSRF pivot is closed by
+            // default while ordinary ULA backends stay reachable.
+            || segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+            || ip.is_multicast() // ff00::/8
+        }
+    }
+}
+
+/// Extract the IPv4 address embedded in an IPv4-mapped (`::ffff:a.b.c.d`),
+/// deprecated IPv4-compatible (`::a.b.c.d`), or NAT64 (`64:ff9b::a.b.c.d`) IPv6
+/// address. Used so operator allow/deny CIDR rules written in IPv4 form also
+/// apply to a backend that resolves to the IPv6 encoding of that address.
+/// Loopback (`::1`) is excluded — its compat form `0.0.0.1` would be a false
+/// embedded match.
+fn embedded_ipv4(addr: &std::net::IpAddr) -> Option<std::net::Ipv4Addr> {
+    let std::net::IpAddr::V6(ip) = addr else {
+        return None;
+    };
+    if ip.is_loopback() {
+        return None;
+    }
+    let segments = ip.segments();
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    // NAT64 local-use prefix `64:ff9b:1::/48` (RFC 8215): the embedded IPv4
+    // follows the /48 contiguously in `segments[3..=4]` (e.g. `64:ff9b:1:a00:1::`
+    // = 10.0.0.1), so a deny CIDR written in IPv4 form (e.g. `10.0.0.0/8`) is
+    // matched by the decoded address instead of being bypassed by the IPv6
+    // encoding. `is_always_blocked_range` additionally decodes the RFC 6052 /48
+    // u-byte-split form for the dangerous baseline; the contiguous form is the
+    // realistic DNS64 encoding for CIDR-list matching.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        let [a, b] = segments[3].to_be_bytes();
+        let [c, d] = segments[4].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and deprecated IPv4-compatible (`::a.b.c.d`).
+    ip.to_ipv4_mapped().or_else(|| ip.to_ipv4())
+}
+
+/// The IPv4 embedded in a NAT64 *local-use* prefix (`64:ff9b:1::/48`, RFC 8215)
+/// under the RFC 6052 /48 layout, where the low two octets are split around the
+/// reserved `u` byte (bits 64-71): IPv4 = `[s3.hi, s3.lo, s4.lo, s5.hi]`.
+/// [`embedded_ipv4`] returns the contiguous-layout candidate (`[s3.hi, s3.lo,
+/// s4.hi, s4.lo]`); CIDR-list matching checks BOTH so neither DNS64 octet layout
+/// can evade a narrow deny CIDR (e.g. `64:ff9b:1:a01:2:500::` is `10.1.2.5` here
+/// but `10.1.0.2` contiguously). `None` for any address outside the local-use
+/// prefix. (The dangerous-range baseline decodes both inline in
+/// [`is_always_blocked_range`].)
+fn embedded_ipv4_local_use_rfc6052(addr: &std::net::IpAddr) -> Option<std::net::Ipv4Addr> {
+    let std::net::IpAddr::V6(ip) = addr else {
+        return None;
+    };
+    let segments = ip.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        let [a, b] = segments[3].to_be_bytes();
+        let [_u, c] = segments[4].to_be_bytes();
+        let [d, _] = segments[5].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
+/// Resolved backend egress policy: the `FERRUM_BACKEND_ALLOW_IPS` mode plus an
+/// explicit allow/deny CIDR overlay and the dangerous-range baseline.
+///
+/// Evaluation precedence for a resolved IP (first match wins):
+/// 1. `FERRUM_BACKEND_ALLOW_CIDRS` — explicit ALLOW, overrides everything below
+///    (the escape hatch for an operator who truly needs e.g. `169.254.169.254`
+///    or a private host under a `public` mode).
+/// 2. `FERRUM_BACKEND_DENY_CIDRS` — explicit DENY.
+/// 3. Dangerous-range baseline ([`is_always_blocked_range`]) when
+///    `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES` is enabled (the default).
+/// 4. `FERRUM_BACKEND_ALLOW_IPS` mode (`both` allows; `private`/`public` filter
+///    on [`is_private_ip`]).
+///
+/// The whole point of this type is that a *default* gateway (no env vars set)
+/// is `both` + baseline-on: it still reaches loopback/RFC1918 backends, but it
+/// is no longer an unrestricted bridge to cloud-metadata / multicast /
+/// unspecified addresses.
+#[derive(Debug, Clone)]
+pub struct BackendEgressPolicy {
+    allow_ips: BackendAllowIps,
+    allow_cidrs: CidrSet,
+    deny_cidrs: CidrSet,
+    block_dangerous: bool,
+}
+
+impl BackendEgressPolicy {
+    /// A truly unrestricted policy: `both` mode, no CIDR overlays, no baseline.
+    ///
+    /// Used by back-compat helpers and tests that intentionally want *no*
+    /// egress screening (the historical behaviour of `BackendAllowIps::Both`).
+    /// This is NOT the production default — see [`Self::from_env`].
+    pub fn unrestricted() -> Self {
+        Self {
+            allow_ips: BackendAllowIps::Both,
+            allow_cidrs: CidrSet::default(),
+            deny_cidrs: CidrSet::default(),
+            block_dangerous: false,
+        }
+    }
+
+    /// Build a policy from a bare mode with the production dangerous-range
+    /// baseline enabled and no CIDR overlays. Useful for tests and for callers
+    /// that only have a mode in hand.
+    pub fn from_allow_ips(allow_ips: BackendAllowIps) -> Self {
+        Self {
+            allow_ips,
+            allow_cidrs: CidrSet::default(),
+            deny_cidrs: CidrSet::default(),
+            block_dangerous: true,
+        }
+    }
+
+    /// Build the resolved policy from parsed env inputs.
+    pub fn from_env(
+        allow_ips: BackendAllowIps,
+        allow_cidrs_raw: &str,
+        deny_cidrs_raw: &str,
+        block_dangerous: bool,
+    ) -> Result<Self, String> {
+        let allow_cidrs = CidrSet::parse_strict(allow_cidrs_raw)
+            .map_err(|e| format!("FERRUM_BACKEND_ALLOW_CIDRS: {e}"))?;
+        let deny_cidrs = CidrSet::parse_strict(deny_cidrs_raw)
+            .map_err(|e| format!("FERRUM_BACKEND_DENY_CIDRS: {e}"))?;
+        let policy = Self {
+            allow_ips,
+            allow_cidrs,
+            deny_cidrs,
+            block_dangerous,
+        };
+        if policy.is_fully_open() {
+            tracing::warn!(
+                "FERRUM_BACKEND_ALLOW_IPS=both with the dangerous-range baseline disabled \
+                 (FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false) and no FERRUM_BACKEND_DENY_CIDRS: \
+                 backend egress is UNRESTRICTED. The gateway will proxy/forward to ANY resolved \
+                 address including cloud-metadata (169.254.169.254), loopback, and link-local. \
+                 Leave the baseline enabled and/or set FERRUM_BACKEND_ALLOW_IPS=public for \
+                 internet-only backends."
+            );
+        }
+        Ok(policy)
+    }
+
+    /// The underlying allow-ips mode.
+    pub fn allow_ips(&self) -> &BackendAllowIps {
+        &self.allow_ips
+    }
+
+    /// Whether a resolved backend IP is permitted to be dialed.
+    pub fn is_allowed(&self, addr: &std::net::IpAddr) -> bool {
+        self.deny_reason(addr).is_none()
+    }
+
+    /// Returns a short human-readable reason if `addr` is denied, else `None`.
+    /// Used to build actionable errors at config-load and resolution time.
+    pub fn deny_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
+        // Match allow/deny CIDR rules against both the address and the IPv4
+        // embedded in a NAT64 / IPv4-mapped / IPv4-compatible IPv6 address, so a
+        // rule written in IPv4 form (e.g. `FERRUM_BACKEND_DENY_CIDRS=10.0.0.0/8`)
+        // can't be bypassed by a backend that resolves to the IPv6 encoding of
+        // that address (`64:ff9b::0a00:1`, `::ffff:10.0.0.1`, …).
+        let embedded = embedded_ipv4(addr).map(std::net::IpAddr::V4);
+        let embedded_rfc6052 = embedded_ipv4_local_use_rfc6052(addr).map(std::net::IpAddr::V4);
+        // Deny-wins for an ambiguous NAT64 *local-use* address (`64:ff9b:1::/48`,
+        // RFC 8215): it decodes to TWO IPv4s depending on the DNS64 octet layout —
+        // the contiguous layout (`embedded`) and the RFC 6052 /48 u-byte-split
+        // layout (`embedded_rfc6052`) — and the gateway can't know which the
+        // backend resolves to. Evaluate EACH decode through the full precedence
+        // FIRST; if either is denied (and not itself allow-listed) the address is
+        // denied, so an allow match on one decode can't short-circuit a
+        // deny/baseline match on the other. Recursion terminates: a decode is an
+        // IPv4, for which `embedded_ipv4_local_use_rfc6052` is `None`.
+        if let Some(rfc6052_decode) = embedded_rfc6052 {
+            let contiguous_decode = embedded.unwrap_or(rfc6052_decode);
+            if let Some(reason) = self.deny_reason(&contiguous_decode) {
+                return Some(reason);
+            }
+            if let Some(reason) = self.deny_reason(&rfc6052_decode) {
+                return Some(reason);
+            }
+        }
+        // Shared precedence. `cidr_match` covers the address AND every embedded
+        // IPv4 decode (both NAT64 layouts for local-use, the single well-known /96
+        // / IPv4-mapped / IPv4-compatible decode otherwise), so neither an
+        // IPv4-form rule (matched via a decode) nor an IPv6-form rule (matched via
+        // the literal — e.g. `FERRUM_BACKEND_DENY_CIDRS=64:ff9b:1::/48`) is
+        // bypassed. `mode_reason` then runs on the original literal, so the
+        // private/reserved local-use NAT64 prefix is still rejected under
+        // `public`/`private` mode even when both decoded IPv4s would pass.
+        let cidr_match = |set: &CidrSet| {
+            set.contains(addr)
+                || embedded.as_ref().is_some_and(|e| set.contains(e))
+                || embedded_rfc6052.as_ref().is_some_and(|e| set.contains(e))
+        };
+        // 1. Explicit allow overrides every deny below.
+        if cidr_match(&self.allow_cidrs) {
+            return None;
+        }
+        // 2. Explicit deny.
+        if cidr_match(&self.deny_cidrs) {
+            return Some("listed in FERRUM_BACKEND_DENY_CIDRS");
+        }
+        // 3. Dangerous-range baseline.
+        if self.block_dangerous && is_always_blocked_range(addr) {
+            return Some(
+                "cloud-metadata/link-local/multicast/unspecified range blocked by default \
+                 (set FERRUM_BACKEND_ALLOW_CIDRS to permit, or \
+                 FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false to disable the baseline)",
+            );
+        }
+        // 4. Legacy mode.
+        self.mode_reason(addr)
+    }
+
+    /// The `FERRUM_BACKEND_ALLOW_IPS` mode verdict for `addr` (step 4 of
+    /// [`deny_reason`]): `None` if the mode permits it, else a reason. Factored
+    /// out so the ambiguous local-use NAT64 branch can apply the mode check on the
+    /// original IPv6 literal (which `is_private_ip` classifies as private/reserved)
+    /// after its decode checks, instead of bypassing the mode entirely.
+    fn mode_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
+        if check_backend_ip_allowed(addr, &self.allow_ips) {
+            None
+        } else {
+            match self.allow_ips {
+                BackendAllowIps::Public => {
+                    Some("private/reserved IP rejected by FERRUM_BACKEND_ALLOW_IPS=public")
+                }
+                BackendAllowIps::Private => {
+                    Some("public IP rejected by FERRUM_BACKEND_ALLOW_IPS=private")
+                }
+                // `Both` can never reach this arm.
+                BackendAllowIps::Both => None,
+            }
+        }
+    }
+
+    /// True only when the policy can never deny any address — lets callers
+    /// skip literal-IP validation work entirely. Note explicit ALLOW CIDRs do
+    /// not affect this (they only ever permit), so a fully-open policy is
+    /// `both` mode + no deny CIDRs + baseline disabled.
+    pub fn is_fully_open(&self) -> bool {
+        matches!(self.allow_ips, BackendAllowIps::Both)
+            && self.deny_cidrs.is_empty()
+            && !self.block_dangerous
+    }
+}
+
+impl std::fmt::Display for BackendEgressPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "allow_ips={}", self.allow_ips)?;
+        if self.block_dangerous {
+            write!(f, "+block-dangerous-ranges")?;
+        }
+        if !self.deny_cidrs.is_empty() {
+            write!(f, "+deny_cidrs({})", self.deny_cidrs.len())?;
+        }
+        if !self.allow_cidrs.is_empty() {
+            write!(f, "+allow_cidrs({})", self.allow_cidrs.len())?;
+        }
+        Ok(())
     }
 }
 
@@ -709,6 +1120,16 @@ pub struct EnvConfig {
     /// How often (in seconds) the DP retries the primary (first) CP URL while
     /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
     pub dp_cp_failover_primary_retry_secs: u64,
+    /// Allow plaintext (non-TLS) CP/DP gRPC config sync on a non-loopback
+    /// address. Off by default (secure-by-default): the CP gRPC listener refuses
+    /// to bind a non-loopback address without TLS, and the DP rejects a
+    /// non-loopback `http://` CP URL, unless this is `true`. Loopback
+    /// (`127.0.0.1`/`::1`/`localhost`) plaintext is always permitted for local
+    /// development. Even when permitted, plaintext config sync emits a
+    /// high-severity startup warning — the DP authentication JWT and the full
+    /// gateway configuration travel unencrypted and unauthenticated against MITM.
+    /// `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`.
+    pub cp_dp_grpc_allow_plaintext: bool,
 
     // CP gRPC TLS (server-side)
     /// Path to PEM certificate for the CP gRPC server. When set (with key),
@@ -1429,9 +1850,13 @@ pub struct EnvConfig {
     /// address is always used (secure default for edge deployments).
     /// Example: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1"
     pub trusted_proxies: String,
-    /// Backend IP allowlist policy for SSRF protection.
-    /// "private" = only private/reserved IPs, "public" = only public IPs, "both" = all (default).
-    pub backend_allow_ips: BackendAllowIps,
+    /// Resolved backend egress policy for SSRF protection: the
+    /// `FERRUM_BACKEND_ALLOW_IPS` mode (`private`/`public`/`both`) composed with
+    /// `FERRUM_BACKEND_ALLOW_CIDRS`, `FERRUM_BACKEND_DENY_CIDRS`, and the
+    /// dangerous-range baseline (`FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES`, on by
+    /// default). See [`BackendEgressPolicy`]. The field name is retained for
+    /// continuity with the many carriers that thread it through.
+    pub backend_allow_ips: BackendEgressPolicy,
     /// When true, add a Via header on both request and response paths per RFC 9110 §7.6.3.
     pub add_via_header: bool,
     /// Pseudonym used in the Via header. Defaults to "ferrum-edge".
@@ -1478,6 +1903,22 @@ pub struct EnvConfig {
     /// non-matching IPs are rejected at the TCP level before any request processing.
     /// Example: "10.0.100.0/24,10.0.200.5,::1"
     pub admin_allowed_cidrs: String,
+
+    /// Comma-separated CIDRs/IPs allowed to scrape `/metrics` (and the detailed
+    /// `/health` / `/overload` views) WITHOUT a JWT or metrics bearer token.
+    /// Empty (default) means unauthenticated scraping is disabled — `/metrics`
+    /// returns 401 unless the caller presents a valid admin JWT or
+    /// `FERRUM_METRICS_BEARER_TOKEN`. Set this to opt the listed source ranges
+    /// (e.g. a Prometheus subnet) back into unauthenticated scraping.
+    /// Example: "10.0.0.0/8,127.0.0.1,::1"
+    pub metrics_allowed_cidrs: String,
+
+    /// Dedicated bearer token that authorizes `/metrics` scraping (and the
+    /// detailed `/health` / `/overload` views) without a full admin JWT.
+    /// When set, a request whose `Authorization: Bearer <token>` matches this
+    /// value (constant-time compare) is allowed. Empty/unset disables this path.
+    /// Use this for Prometheus deployments that cannot mint admin JWTs.
+    pub metrics_bearer_token: Option<String>,
 
     /// Maximum concurrent connections across all admin/management-plane
     /// listeners (plaintext + TLS share one cap). Independent of the data-plane
@@ -1825,6 +2266,7 @@ impl Default for EnvConfig {
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
+            cp_dp_grpc_allow_plaintext: false,
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
@@ -1987,7 +2429,7 @@ impl Default for EnvConfig {
             tls_cert_expiry_warning_days: 30,
             tls_early_data_methods: HashSet::new(),
             trusted_proxies: String::new(),
-            backend_allow_ips: BackendAllowIps::Both,
+            backend_allow_ips: BackendEgressPolicy::unrestricted(),
             add_via_header: true,
             via_pseudonym: "ferrum-edge".into(),
             add_forwarded_header: false,
@@ -1998,6 +2440,8 @@ impl Default for EnvConfig {
             plugin_http_retry_delay_ms: 100,
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
+            metrics_allowed_cidrs: String::new(),
+            metrics_bearer_token: None,
             admin_max_connections: 1024,
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
@@ -2205,6 +2649,7 @@ impl EnvConfig {
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
+            cp_dp_grpc_allow_plaintext: bool = "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" => false;
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
@@ -2399,6 +2844,9 @@ impl EnvConfig {
             [client_ip]
             trusted_proxies: String = "FERRUM_TRUSTED_PROXIES" => String::new();
             backend_allow_ips: BackendAllowIps = "FERRUM_BACKEND_ALLOW_IPS" => BackendAllowIps::Both;
+            backend_allow_cidrs: String = "FERRUM_BACKEND_ALLOW_CIDRS" => String::new();
+            backend_deny_cidrs: String = "FERRUM_BACKEND_DENY_CIDRS" => String::new();
+            backend_block_dangerous_ranges: bool = "FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES" => true;
             add_via_header: bool = "FERRUM_ADD_VIA_HEADER" => true;
             via_pseudonym: String = "FERRUM_VIA_PSEUDONYM" => "ferrum-edge".to_string();
             add_forwarded_header: bool = "FERRUM_ADD_FORWARDED_HEADER" => false;
@@ -2408,6 +2856,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms: u64 = "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS" => 100u64;
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
+            metrics_allowed_cidrs: String = "FERRUM_METRICS_ALLOWED_CIDRS" => String::new();
+            metrics_bearer_token: Option<String> = "FERRUM_METRICS_BEARER_TOKEN";
             admin_max_connections: usize = "FERRUM_ADMIN_MAX_CONNECTIONS" => 1024usize;
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
@@ -2755,6 +3205,16 @@ impl EnvConfig {
             tls_crl_file_path,
         );
 
+        // Compose the raw allow-ips mode + CIDR overlays + baseline flag into
+        // the resolved egress policy, shadowing the bare-mode local. Invalid
+        // CIDR entries fail startup loudly rather than silently opening egress.
+        let backend_allow_ips = BackendEgressPolicy::from_env(
+            backend_allow_ips,
+            &backend_allow_cidrs,
+            &backend_deny_cidrs,
+            backend_block_dangerous_ranges,
+        )?;
+
         let mut config = Self {
             mode: mode.clone(),
             namespace,
@@ -2823,6 +3283,7 @@ impl EnvConfig {
             cp_dp_grpc_jwt_issuer,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
+            cp_dp_grpc_allow_plaintext,
             cp_grpc_tls_cert_path,
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
@@ -2997,6 +3458,8 @@ impl EnvConfig {
             plugin_http_retry_delay_ms,
             tls_crl_file_path,
             admin_allowed_cidrs,
+            metrics_allowed_cidrs,
+            metrics_bearer_token,
             admin_max_connections,
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
@@ -3129,20 +3592,19 @@ impl EnvConfig {
         }
     }
 
-    /// Hard-fail guard for the **writable** admin API. Returns `Some(error)`
-    /// when a `database`/`cp`-mode gateway would start a plaintext admin HTTP
-    /// listener reachable beyond loopback with no (effective)
-    /// `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist and without the explicit
-    /// `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev opt-in.
+    /// Hard-fail guard for the admin API. Returns `Some(error)` when a
+    /// `database`/`cp`-mode gateway would start a plaintext admin HTTP listener
+    /// reachable beyond loopback with no (effective) `FERRUM_ADMIN_ALLOWED_CIDRS`
+    /// allowlist and without the explicit `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` dev
+    /// opt-in.
     ///
-    /// The hard error is reserved for the elevated risk of an unauthenticated-
-    /// network-exposed *writable* admin surface. Read-only admin surfaces get a
-    /// high-severity startup warning instead (see `main.rs`): the read-only
-    /// modes (`file`/`dp`/`mesh`), and also `database`/`cp` when
-    /// `FERRUM_ADMIN_READ_ONLY=true` blocks mutations — in that case the
-    /// remaining plaintext-token risk matches the read-only modes, so it warns
-    /// rather than forcing an allowlist/opt-in just to start. The node-agent
-    /// admin listener has its own safe-by-default loopback fallback.
+    /// `FERRUM_ADMIN_READ_ONLY=true` blocks admin mutations, but it is not a
+    /// substitute for loopback binding, TLS-only admin, or an effective IP
+    /// allowlist: read-only admin still serves sensitive management-plane reads
+    /// (for example unredacted backups), and plaintext listeners still expose
+    /// operator bearer tokens on the network. The read-only modes
+    /// (`file`/`dp`/`mesh`) warn instead of failing; the node-agent admin listener
+    /// has its own safe-by-default loopback fallback.
     ///
     /// Pure (reads only `self`), so it is unit-testable without touching the
     /// process environment.
@@ -3151,10 +3613,6 @@ impl EnvConfig {
             self.mode,
             OperatingMode::Database | OperatingMode::ControlPlane
         ) {
-            return None;
-        }
-        // A read-only db/cp admin is not a writable surface — warn, don't fail.
-        if self.admin_read_only {
             return None;
         }
         if self.admin_http_exposure() != AdminHttpExposure::ReachableUnrestricted {
@@ -3167,7 +3625,8 @@ impl EnvConfig {
             "Refusing to start {mode:?} mode: the plaintext admin HTTP listener \
              (FERRUM_ADMIN_HTTP_PORT={port}) is bound to '{bind}', a non-loopback address \
              reachable beyond this host, with no FERRUM_ADMIN_ALLOWED_CIDRS allowlist. The \
-             writable admin API and any operator bearer tokens would be served in cleartext to \
+             admin API (read endpoints still serve sensitive management-plane data, e.g. \
+             unredacted backups) and any operator bearer tokens would be served in cleartext to \
              every host that can route to it (a private/VPC interface IP is still LAN-reachable). \
              Choose one: \
              (1) bind admin to loopback — FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1; \
@@ -3780,23 +4239,17 @@ impl EnvConfig {
                                 .into(),
                         );
                     }
-                    if self.mesh_remote_discovery_poll_interval_seconds > 0 {
-                        if self.mesh_remote_discovery_max_stale_seconds == 0 {
-                            return Err(
-                                "FERRUM_MESH_PRODUCTION_MODE=true requires \
-                                 FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
-                                 discovery is enabled; unbounded last-good endpoints are dev/test only"
-                                    .into(),
-                            );
-                        }
-                        if self.dp_grpc_tls_no_verify {
-                            return Err(
-                                "FERRUM_MESH_PRODUCTION_MODE=true forbids \
-                                 FERRUM_DP_GRPC_TLS_NO_VERIFY=true when remote-cluster discovery is \
-                                 enabled; remote control-plane TLS must verify server identity"
-                                    .into(),
-                            );
-                        }
+                    // (FERRUM_DP_GRPC_TLS_NO_VERIFY is rejected unconditionally by
+                    // validate_cp_dp_grpc_transport_security() — it is not honored
+                    // on the tonic-managed CP/DP gRPC client, so it can never
+                    // silently disable verification under remote discovery either.)
+                    if self.mesh_remote_discovery_poll_interval_seconds > 0
+                        && self.mesh_remote_discovery_max_stale_seconds == 0
+                    {
+                        return Err("FERRUM_MESH_PRODUCTION_MODE=true requires \
+                             FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS > 0 when remote \
+                             discovery is enabled; unbounded last-good endpoints are dev/test only"
+                            .into());
                     }
                 }
                 // The running mesh's workload identity comes either from
@@ -4156,10 +4609,105 @@ impl EnvConfig {
                 "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
             );
         }
+
+        // Secure-by-default CP/DP gRPC transport: refuse non-loopback plaintext
+        // config sync (and reject the non-functional no-verify flag) unless the
+        // operator made an explicit, auditable choice to permit it.
+        self.validate_cp_dp_grpc_transport_security()?;
+
+        Ok(())
+    }
+
+    /// Resolve the CP gRPC listen address: an explicit
+    /// `FERRUM_CP_GRPC_LISTEN_ADDR`, else the hardcoded `0.0.0.0:50051` default.
+    /// The default is deliberately NOT derived from `admin_bind_address` (which
+    /// defaults to loopback) — a Data Plane in another pod/host must be able to
+    /// reach the CP gRPC listener. `from_env_with_conf` already populates this
+    /// to `Some("0.0.0.0:50051")` for CP mode; the fallback keeps hand-built
+    /// configs (tests) consistent with that default. Returns `Err` for a
+    /// malformed explicit address so startup (and `ferrum-edge validate`) fail
+    /// with a clear message instead of an `expect()` panic at bind time.
+    pub fn cp_grpc_socket_addr(&self) -> Result<std::net::SocketAddr, String> {
+        if let Some(addr) = &self.cp_grpc_listen_addr {
+            addr.parse().map_err(|e| {
+                format!("FERRUM_CP_GRPC_LISTEN_ADDR '{addr}' is not a valid socket address: {e}")
+            })
+        } else {
+            Ok(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                50051,
+            ))
+        }
+    }
+
+    /// Enforce the secure-by-default CP/DP gRPC transport policy.
+    ///
+    /// 1. `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected outright: the
+    ///    tonic-managed CP/DP gRPC client exposes no hook to skip server
+    ///    verification, so the flag never actually disabled it — keeping it
+    ///    would only grant false confidence. Pin the CP CA via
+    ///    `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs instead.
+    /// 2. In CP mode, a plaintext gRPC listener bound to a non-loopback address
+    ///    is refused unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`.
+    /// 3. In DP mode, a non-loopback `http://` CP URL is refused unless the same
+    ///    escape hatch is set. (Mesh mode reaches a CP over the same URLs but has
+    ///    its own `FERRUM_MESH_PRODUCTION_MODE` TLS posture, so it is not gated
+    ///    here.)
+    ///
+    /// Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always permitted so
+    /// the local-dev quickstart keeps working without the flag.
+    fn validate_cp_dp_grpc_transport_security(&self) -> Result<(), String> {
         if self.dp_grpc_tls_no_verify {
-            tracing::warn!(
-                "WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production."
+            return Err(
+                "FERRUM_DP_GRPC_TLS_NO_VERIFY=true is not supported: the CP/DP gRPC client cannot \
+                 skip server certificate verification, so the flag offers only false confidence. \
+                 To connect to a CP with a self-signed certificate, pin its CA via \
+                 FERRUM_DP_GRPC_TLS_CA_CERT_PATH (one-way TLS) or supply the full \
+                 FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH/KEY_PATH (mTLS)."
+                    .into(),
             );
+        }
+
+        // CP server side: a plaintext listener on a non-loopback address leaks
+        // DP JWTs and the full gateway config to anyone on the network.
+        if matches!(self.mode, OperatingMode::ControlPlane) {
+            let grpc_addr = self.cp_grpc_socket_addr()?;
+            // Port 0 disables the plaintext listener entirely (TLS-only or off),
+            // so there is no plaintext surface to guard.
+            let tls_configured =
+                self.cp_grpc_tls_cert_path.is_some() && self.cp_grpc_tls_key_path.is_some();
+            if grpc_addr.port() != 0
+                && !tls_configured
+                && !grpc_addr.ip().is_loopback()
+                && !self.cp_dp_grpc_allow_plaintext
+            {
+                return Err(format!(
+                    "CP gRPC config sync would bind PLAINTEXT on non-loopback address {grpc_addr} \
+                     with no TLS configured — DP authentication JWTs and the full gateway \
+                     configuration would be exposed to the network. Configure \
+                     FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH, bind a loopback \
+                     address (e.g. 127.0.0.1:50051), or set FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
+                     to explicitly permit plaintext config sync."
+                ));
+            }
+        }
+
+        // DP client side: each CP URL must be https:// (TLS) or loopback http://.
+        // Scoped to DP mode — mesh mode dials a CP over the same URLs but governs
+        // plaintext through FERRUM_MESH_PRODUCTION_MODE instead.
+        if matches!(self.mode, OperatingMode::DataPlane) {
+            for url in &self.dp_cp_grpc_urls {
+                if cp_dp_grpc_url_is_nonloopback_plaintext(url)? && !self.cp_dp_grpc_allow_plaintext
+                {
+                    return Err(format!(
+                        "DP CP URL '{url}' is PLAINTEXT to a non-loopback host — the DP \
+                         authentication JWT and config data would be exposed to the network. Use \
+                         an https:// URL with FERRUM_DP_GRPC_TLS_CA_CERT_PATH, target a loopback \
+                         host, or set FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true to explicitly permit \
+                         plaintext config sync."
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -4236,6 +4784,194 @@ mod tests {
             file_config_path: Some("/tmp/dummy.yaml".into()),
             ..Default::default()
         }
+    }
+
+    fn cp_mode_config() -> EnvConfig {
+        EnvConfig {
+            mode: OperatingMode::ControlPlane,
+            ..Default::default()
+        }
+    }
+
+    fn dp_mode_config() -> EnvConfig {
+        EnvConfig {
+            mode: OperatingMode::DataPlane,
+            ..Default::default()
+        }
+    }
+
+    // --- CP/DP gRPC transport security (secure-by-default plaintext gate) ---
+
+    #[test]
+    fn cp_default_bind_plaintext_is_rejected_without_allow_flag() {
+        // Default CP gRPC bind resolves to 0.0.0.0:50051 (hardcoded, NOT derived
+        // from admin_bind_address) — non-loopback + no TLS, so it must be refused.
+        let config = cp_mode_config();
+        let err = config
+            .validate_cp_dp_grpc_transport_security()
+            .expect_err("non-loopback plaintext CP must be rejected by default");
+        assert!(err.contains("PLAINTEXT"), "unexpected error: {err}");
+        assert!(err.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"));
+    }
+
+    #[test]
+    fn cp_explicit_nonloopback_plaintext_is_rejected_without_allow_flag() {
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:50051".into()),
+            ..cp_mode_config()
+        };
+        assert!(config.validate_cp_dp_grpc_transport_security().is_err());
+    }
+
+    #[test]
+    fn cp_nonloopback_plaintext_allowed_with_explicit_flag() {
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:50051".into()),
+            cp_dp_grpc_allow_plaintext: true,
+            ..cp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("explicit opt-in must permit non-loopback plaintext CP");
+    }
+
+    #[test]
+    fn cp_nonloopback_with_tls_is_allowed() {
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:50051".into()),
+            cp_grpc_tls_cert_path: Some("/certs/server.pem".into()),
+            cp_grpc_tls_key_path: Some("/certs/server-key.pem".into()),
+            ..cp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("TLS-configured CP must be allowed on any address");
+    }
+
+    #[test]
+    fn cp_loopback_plaintext_is_allowed_for_dev() {
+        for addr in ["127.0.0.1:50051", "[::1]:50051"] {
+            let config = EnvConfig {
+                cp_grpc_listen_addr: Some(addr.into()),
+                ..cp_mode_config()
+            };
+            config
+                .validate_cp_dp_grpc_transport_security()
+                .unwrap_or_else(|e| panic!("loopback plaintext CP {addr} must be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn cp_disabled_listener_port_zero_skips_plaintext_gate() {
+        // Port 0 disables the plaintext listener, so there is no surface to guard
+        // even on a non-loopback bind address.
+        let config = EnvConfig {
+            cp_grpc_listen_addr: Some("0.0.0.0:0".into()),
+            ..cp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("port 0 disables the plaintext listener");
+    }
+
+    #[test]
+    fn dp_nonloopback_http_url_is_rejected_without_allow_flag() {
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec!["http://cp-host:50051".into()],
+            ..dp_mode_config()
+        };
+        let err = config
+            .validate_cp_dp_grpc_transport_security()
+            .expect_err("non-loopback http:// CP URL must be rejected by default");
+        assert!(err.contains("PLAINTEXT"), "unexpected error: {err}");
+        assert!(err.contains("cp-host"));
+    }
+
+    #[test]
+    fn dp_nonloopback_http_url_allowed_with_explicit_flag() {
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec!["http://cp-host:50051".into()],
+            cp_dp_grpc_allow_plaintext: true,
+            ..dp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("explicit opt-in must permit non-loopback http:// CP URL");
+    }
+
+    #[test]
+    fn dp_https_url_is_allowed() {
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec!["https://cp-host:50051".into()],
+            ..dp_mode_config()
+        };
+        config
+            .validate_cp_dp_grpc_transport_security()
+            .expect("https:// CP URL must always be allowed");
+    }
+
+    #[test]
+    fn dp_loopback_http_urls_are_allowed_for_dev() {
+        for url in [
+            "http://localhost:50051",
+            "http://127.0.0.1:50051",
+            "http://[::1]:50051",
+        ] {
+            let config = EnvConfig {
+                dp_cp_grpc_urls: vec![url.into()],
+                ..dp_mode_config()
+            };
+            config
+                .validate_cp_dp_grpc_transport_security()
+                .unwrap_or_else(|e| panic!("loopback dev URL {url} must be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn dp_mixed_url_list_rejects_the_nonloopback_plaintext_entry() {
+        // One secure + one loopback-plaintext + one non-loopback-plaintext: the
+        // last must trip the gate even though the list is partly safe.
+        let config = EnvConfig {
+            dp_cp_grpc_urls: vec![
+                "https://cp1:50051".into(),
+                "http://localhost:50051".into(),
+                "http://cp3:50051".into(),
+            ],
+            ..dp_mode_config()
+        };
+        assert!(config.validate_cp_dp_grpc_transport_security().is_err());
+    }
+
+    #[test]
+    fn dp_grpc_tls_no_verify_is_rejected() {
+        // The flag is not honored by the tonic-managed client, so it must fail
+        // closed rather than provide false confidence — in any mode.
+        let config = EnvConfig {
+            dp_grpc_tls_no_verify: true,
+            ..file_mode_config()
+        };
+        let err = config
+            .validate_cp_dp_grpc_transport_security()
+            .expect_err("FERRUM_DP_GRPC_TLS_NO_VERIFY=true must be rejected");
+        assert!(err.contains("FERRUM_DP_GRPC_TLS_NO_VERIFY"));
+        assert!(err.contains("FERRUM_DP_GRPC_TLS_CA_CERT_PATH"));
+    }
+
+    #[test]
+    fn cp_dp_grpc_url_classifier_distinguishes_secure_loopback_and_exposed() {
+        // Non-loopback plaintext → blocked (true).
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("http://cp-host:50051").unwrap());
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("http://10.0.0.5:50051").unwrap());
+        // TLS → not blocked (false).
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("https://cp-host:50051").unwrap());
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("grpcs://cp-host:50051").unwrap());
+        // Loopback plaintext → not blocked (false).
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("http://localhost:50051").unwrap());
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("http://127.0.0.1:50051").unwrap());
+        assert!(!cp_dp_grpc_url_is_nonloopback_plaintext("http://[::1]:50051").unwrap());
+        // Malformed / unsupported → error.
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("not a url").is_err());
+        assert!(cp_dp_grpc_url_is_nonloopback_plaintext("ftp://cp-host:50051").is_err());
     }
 
     #[test]

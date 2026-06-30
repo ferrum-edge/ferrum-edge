@@ -196,6 +196,20 @@ impl RedisConfig {
         Some(host)
     }
 
+    /// Parse the Redis URL host as a literal IP — the dual of [`hostname`], which
+    /// returns `None` for literals. Strips URI brackets; returns `None` for
+    /// hostnames. Used to screen a literal `redis_url` at dial time, since the
+    /// hostname-based DNS-cache screen never sees it.
+    fn literal_host_ip(&self) -> Option<std::net::IpAddr> {
+        let url = Url::parse(&self.effective_url()).ok()?;
+        let host = normalized_url_hostname(&url)?;
+        host.strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&host)
+            .parse::<std::net::IpAddr>()
+            .ok()
+    }
+
     /// Build a Redis URL with a resolved IP address substituted for the hostname.
     ///
     /// For non-TLS connections, replacing the hostname with a resolved IP avoids
@@ -204,10 +218,26 @@ impl RedisConfig {
     ///
     /// For TLS connections, the hostname must be preserved for SNI verification,
     /// so this returns the original URL unchanged.
+    ///
+    /// ACCEPTED LIMITATION (egress policy, `rediss://` hostnames): the resolved IP
+    /// is NOT pinned for TLS hostnames because the `redis` crate derives the TLS
+    /// server name from the URL host — pinning the IP would break SNI/cert
+    /// verification, and the crate exposes no way to dial a chosen address while
+    /// presenting a separate server name. `screen_redis_endpoint` has already
+    /// screened the CURRENT resolution against the egress policy, but the Redis
+    /// client re-resolves the hostname itself at connect/reconnect time outside
+    /// the gateway DNS cache, so a hostname whose DNS rebinds to a blocked address
+    /// between screen and dial could still be reached. This is a narrow TOCTOU
+    /// that requires control of the operator's own Redis DNS (which already
+    /// implies control of the gateway's resolver). Literal-IP `rediss://` and all
+    /// `redis://` (plaintext) endpoints ARE pinned/screened. Closing the TLS-
+    /// hostname gap requires a custom pinned TLS connector (abandoning the crate's
+    /// ConnectionManager) and is deliberately out of scope — see PR #1933.
     pub(crate) fn url_with_resolved_ip(&self, resolved_ip: std::net::IpAddr) -> String {
         let url = self.effective_url();
 
-        // Don't replace hostname for TLS — SNI needs the original hostname
+        // Don't replace hostname for TLS — SNI needs the original hostname (see
+        // the ACCEPTED LIMITATION note above on the residual rebinding gap).
         if url.starts_with("rediss://") {
             return url;
         }
@@ -311,6 +341,75 @@ fn parse_optional_u64(
 /// Redis is unreachable and recovers when connectivity is restored.
 ///
 /// When a `DnsCache` is provided, Redis hostnames are resolved through the
+/// Outcome of screening + resolving the Redis endpoint through the gateway DNS
+/// cache. The client NEVER dials an address the egress policy hasn't cleared, so
+/// any screen failure fails closed to the in-memory limiter rather than handing
+/// an unscreened host to the Redis crate's own resolver.
+enum RedisEndpoint {
+    /// A policy-screened URL to dial.
+    Url(String),
+    /// Host blocked by the backend egress policy. Fail closed and do NOT start
+    /// the recovery checker — this is configuration, not a transient outage, so a
+    /// config change (which rebuilds the client) is the only recovery.
+    EgressDenied,
+    /// The DNS cache could not resolve the host (resolver outage / misconfigured
+    /// gateway DNS). Fail closed rather than dialing an unscreened address, but
+    /// the background recovery checker may re-screen successfully later.
+    ResolveFailed,
+}
+
+/// Screen + resolve the Redis endpoint through the gateway DNS cache, NEVER
+/// returning an unscreened address. Shared by the hot-path connect (`resolve_url`)
+/// AND the background recovery checker so neither can hand an unscreened host to
+/// the Redis crate's own resolver.
+async fn screen_redis_endpoint(
+    config: &RedisConfig,
+    dns_cache: Option<&DnsCache>,
+) -> RedisEndpoint {
+    if let Some(dns_cache) = dns_cache
+        && let Some(hostname) = config.hostname()
+    {
+        match dns_cache.resolve(&hostname, None, None).await {
+            Ok(ip) => return RedisEndpoint::Url(config.url_with_resolved_ip(ip)),
+            Err(e) => {
+                if crate::dns::is_egress_policy_denial(&e) {
+                    warn!(
+                        hostname = %hostname,
+                        error = %e,
+                        "Redis host blocked by backend egress policy — failing closed (in-memory fallback)"
+                    );
+                    return RedisEndpoint::EgressDenied;
+                }
+                // Fail CLOSED on ANY screen failure (resolver outage / misconfigured
+                // gateway DNS), not just policy denials: handing the unscreened
+                // hostname to the Redis client would let it re-resolve outside the
+                // egress policy and possibly dial a denied address.
+                warn!(
+                    hostname = %hostname,
+                    error = %e,
+                    "DNS cache resolution failed for Redis host — failing closed (in-memory fallback, will retry)"
+                );
+                return RedisEndpoint::ResolveFailed;
+            }
+        }
+    }
+    // A literal-IP `redis_url` never reaches the hostname screen above
+    // (`hostname()` is None for literals), and the config-load Redis screen is
+    // warning-only in database mode — so screen the literal here too.
+    if let Some(dns_cache) = dns_cache
+        && let Some(ip) = config.literal_host_ip()
+        && let Some(reason) = dns_cache.backend_allow_ips().deny_reason(&ip)
+    {
+        warn!(
+            redis_ip = %ip,
+            reason,
+            "Redis literal host blocked by backend egress policy — failing closed (in-memory fallback)"
+        );
+        return RedisEndpoint::EgressDenied;
+    }
+    RedisEndpoint::Url(config.effective_url())
+}
+
 /// gateway's shared DNS cache. On connection failure, the connection is cleared
 /// so the next attempt re-resolves DNS (handling IP changes gracefully).
 pub struct RedisRateLimitClient {
@@ -419,24 +518,12 @@ impl RedisRateLimitClient {
     /// Resolve the Redis hostname via the gateway's DNS cache and build the
     /// connection URL with the resolved IP (for non-TLS) or the original
     /// hostname (for TLS, to preserve SNI).
-    async fn resolve_url(&self) -> String {
-        if let Some(ref dns_cache) = self.dns_cache
-            && let Some(hostname) = self.config.hostname()
-        {
-            match dns_cache.resolve(&hostname, None, None).await {
-                Ok(ip) => {
-                    return self.config.url_with_resolved_ip(ip);
-                }
-                Err(e) => {
-                    warn!(
-                        hostname = %hostname,
-                        error = %e,
-                        "DNS cache resolution failed for Redis host — using hostname directly"
-                    );
-                }
-            }
-        }
-        self.config.effective_url()
+    /// Resolve the Redis endpoint URL through the DNS cache, returning `None`
+    /// when the host is blocked by the backend egress policy so the caller fails
+    /// CLOSED (in-memory limiter) instead of dialing a denied address. A generic
+    /// DNS failure still falls back to the hostname (the existing behavior).
+    async fn resolve_url(&self) -> RedisEndpoint {
+        screen_redis_endpoint(&self.config, self.dns_cache.as_ref()).await
     }
 
     /// Build a Redis client with proper TLS configuration.
@@ -524,7 +611,23 @@ impl RedisRateLimitClient {
         }
         drop(guard);
 
-        let url = self.resolve_url().await;
+        let url = match self.resolve_url().await {
+            RedisEndpoint::Url(url) => url,
+            RedisEndpoint::EgressDenied => {
+                // Policy denial: fail closed to the in-memory limiter with NO
+                // recovery checker — it would re-screen and stay denied every
+                // interval. A config change rebuilds the client.
+                self.mark_unavailable();
+                return None;
+            }
+            RedisEndpoint::ResolveFailed => {
+                // Transient DNS failure: fail closed (never dial an unscreened
+                // host), but let the recovery checker re-screen later.
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                return None;
+            }
+        };
         let client = match self.build_client(&url) {
             Ok(c) => c,
             Err(e) => {
@@ -584,7 +687,23 @@ impl RedisRateLimitClient {
     /// because another command sequence on that same manager can interleave `UNWATCH` or
     /// `EXEC` and break the optimistic transaction boundary.
     async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
-        let url = self.resolve_url().await;
+        let url = match self.resolve_url().await {
+            RedisEndpoint::Url(url) => url,
+            RedisEndpoint::EgressDenied => {
+                // Policy denial: fail closed to the in-memory limiter with NO
+                // recovery checker — it would re-screen and stay denied every
+                // interval. A config change rebuilds the client.
+                self.mark_unavailable();
+                return None;
+            }
+            RedisEndpoint::ResolveFailed => {
+                // Transient DNS failure: fail closed (never dial an unscreened
+                // host), but let the recovery checker re-screen later.
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                return None;
+            }
+        };
         let client = match self.build_client(&url) {
             Ok(client) => client,
             Err(e) => {
@@ -659,16 +778,15 @@ impl RedisRateLimitClient {
             loop {
                 tokio::time::sleep(interval).await;
 
-                // Resolve the Redis hostname via the shared DNS cache
-                let url = if let Some(ref dns_cache) = dns_cache
-                    && let Some(hostname) = config.hostname()
-                {
-                    match dns_cache.resolve(&hostname, None, None).await {
-                        Ok(ip) => config.url_with_resolved_ip(ip),
-                        Err(_) => config.effective_url(),
-                    }
-                } else {
-                    config.effective_url()
+                // Screen + resolve through the shared DNS cache, fail-closed: the
+                // recovery checker must NOT hand an unscreened host to the Redis
+                // client either (a DNS-cache outage or a later rebind/policy denial
+                // would otherwise let the background ping dial a denied address).
+                let url = match screen_redis_endpoint(&config, dns_cache.as_ref()).await {
+                    RedisEndpoint::Url(url) => url,
+                    // Blocked by the egress policy or unresolvable — skip this ping
+                    // and re-check next interval (stay on the in-memory limiter).
+                    RedisEndpoint::EgressDenied | RedisEndpoint::ResolveFailed => continue,
                 };
 
                 // Build the client with TLS settings matching the main connection.
@@ -1251,6 +1369,42 @@ mod tests {
         // `-i64::MIN` overflows; the helper must saturate to `i64::MAX` rather
         // than panic on overflow.
         assert_eq!(floor_zero_compensation(i64::MIN), Some(i64::MAX));
+    }
+
+    #[test]
+    fn literal_host_ip_and_hostname_are_duals() {
+        use super::RedisConfig;
+        use serde_json::json;
+
+        let cfg = |url: &str| {
+            RedisConfig::from_plugin_config(
+                &json!({"sync_mode": "redis", "redis_url": url}),
+                "test",
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        // Literal-IP redis_url: `hostname()` returns None (so the hostname DNS
+        // screen never sees it), which is exactly why `literal_host_ip()` must
+        // surface the IP for the dial-time literal screen / fail-closed path.
+        let metadata = cfg("redis://169.254.169.254:6379");
+        assert_eq!(metadata.hostname(), None);
+        assert_eq!(
+            metadata.literal_host_ip(),
+            Some("169.254.169.254".parse().unwrap())
+        );
+
+        let loopback = cfg("redis://127.0.0.1:6379");
+        assert_eq!(
+            loopback.literal_host_ip(),
+            Some("127.0.0.1".parse().unwrap())
+        );
+
+        // Hostname redis_url: the dual — `hostname()` Some, `literal_host_ip()` None.
+        let host = cfg("redis://cache.internal:6379");
+        assert_eq!(host.hostname(), Some("cache.internal".to_string()));
+        assert_eq!(host.literal_host_ip(), None);
     }
 
     #[test]

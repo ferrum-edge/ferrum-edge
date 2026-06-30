@@ -648,3 +648,38 @@ fn http2_pool_key_partitions_on_backend_host_override() {
         "H2 pool key must partition on backend_host override"
     );
 }
+
+#[test]
+fn screen_mesh_route_dispatch_egress_rejects_metadata_destination() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::plugins::screen_mesh_route_dispatch_egress;
+    use serde_json::json;
+
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid policy");
+
+    // A rule overriding the backend to the cloud-metadata address must be
+    // rejected at admin/config-admission time, not only at dial time.
+    let denied = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "169.254.169.254", "backend_port": 80}
+        }]
+    });
+    let errs = screen_mesh_route_dispatch_egress(&denied, &default_policy)
+        .expect_err("metadata destination must be rejected");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("169.254.169.254") && e.contains("backend egress policy")),
+        "got: {errs:?}"
+    );
+
+    // A loopback / RFC1918 destination still validates by default.
+    let allowed = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "10.0.0.5", "backend_port": 80}
+        }]
+    });
+    assert!(screen_mesh_route_dispatch_egress(&allowed, &default_policy).is_ok());
+}

@@ -939,7 +939,9 @@ fn cluster_admitted_by_candidate(
 ///   cluster already advertises keeps the local definition (ports / overrides);
 ///   only the remote `workloads` refs are unioned in so the local service can
 ///   resolve the remote endpoints. A service that exists ONLY remotely is added
-///   wholesale.
+///   wholesale only when `allow_remote_service_append` is true. Callers that
+///   pass an already Sidecar-egress-narrowed service list must set it false so
+///   the discovery merge cannot widen the outbound authorization boundary.
 ///
 /// `local_workloads` / `local_services` are cloned and extended; callers pass
 /// the slice's own vectors.
@@ -948,6 +950,7 @@ pub fn merge_remote_endpoints_into_mesh(
     local_services: &[MeshService],
     snapshot: &RemoteEndpointSnapshot,
     candidate_multi_cluster: Option<&MultiClusterConfig>,
+    allow_remote_service_append: bool,
 ) -> (Vec<Workload>, Vec<MeshService>) {
     if snapshot.is_empty() {
         return (local_workloads.to_vec(), local_services.to_vec());
@@ -1001,10 +1004,16 @@ pub fn merge_remote_endpoints_into_mesh(
                         local.workloads.push(wref.clone());
                     }
                 }
-            } else {
+            } else if allow_remote_service_append {
                 let new_idx = services.len();
                 services.push(remote_svc.clone());
                 service_index.insert(key, new_idx);
+            } else {
+                tracing::debug!(
+                    namespace = %remote_svc.namespace,
+                    service = %remote_svc.name,
+                    "skipping poller-discovered remote service absent from Sidecar-narrowed slice"
+                );
             }
         }
     }
@@ -2563,6 +2572,7 @@ mod tests {
             &local_services,
             &snapshot,
             Some(&candidate_admitting("west")),
+            true,
         );
 
         assert_eq!(workloads.len(), 2, "remote workload appended");
@@ -2570,6 +2580,37 @@ mod tests {
         // resolves local + remote endpoints.
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].workloads.len(), 2);
+    }
+
+    #[test]
+    fn merge_does_not_append_remote_only_service_when_append_disabled() {
+        let remote = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/forbidden",
+                "forbidden",
+                "10.2.0.1",
+                Some("remote-west"),
+            )],
+            services: vec![service(
+                "forbidden",
+                &["spiffe://remote.local/ns/default/sa/forbidden"],
+            )],
+        };
+        let snapshot = snapshot_with("west", remote);
+
+        let (workloads, services) = merge_remote_endpoints_into_mesh(
+            &[],
+            &[],
+            &snapshot,
+            Some(&candidate_admitting("west")),
+            false,
+        );
+
+        assert_eq!(workloads.len(), 1, "remote workload inventory is retained");
+        assert!(
+            services.is_empty(),
+            "a poller-discovered remote-only service must not widen a Sidecar-narrowed service list"
+        );
     }
 
     #[test]
@@ -2597,6 +2638,7 @@ mod tests {
             &[],
             &snapshot,
             Some(&candidate_admitting("west")),
+            true,
         );
         assert_eq!(workloads.len(), 2);
         assert_eq!(workloads[0].addresses, vec!["10.1.0.1".to_string()]);
@@ -2667,7 +2709,7 @@ mod tests {
         };
 
         let (workloads, _) =
-            merge_remote_endpoints_into_mesh(&[], &[], &snapshot, Some(&candidate));
+            merge_remote_endpoints_into_mesh(&[], &[], &snapshot, Some(&candidate), true);
 
         assert_eq!(
             workloads.len(),
@@ -2705,6 +2747,7 @@ mod tests {
             &[],
             &snapshot,
             Some(&candidate_admitting("west")),
+            true,
         );
         assert_eq!(workloads.len(), 1);
     }
@@ -2725,6 +2768,7 @@ mod tests {
             )],
             &RemoteEndpointSnapshot::default(),
             None,
+            true,
         );
         assert_eq!(workloads.len(), 1);
         assert_eq!(services.len(), 1);
@@ -2759,7 +2803,8 @@ mod tests {
 
         // Candidate declares NO multi-cluster at all → fail closed, no remote
         // endpoints contributed.
-        let (workloads, services) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot, None);
+        let (workloads, services) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, None, true);
         assert_eq!(
             workloads.len(),
             1,
@@ -2780,7 +2825,8 @@ mod tests {
             }],
             ..MultiClusterConfig::default()
         };
-        let (workloads, _) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&other));
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&other), true);
         assert_eq!(
             workloads.len(),
             1,
@@ -2825,7 +2871,7 @@ mod tests {
             ..MultiClusterConfig::default()
         };
         let (workloads, _) =
-            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&diverged_network));
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&diverged_network), true);
         assert_eq!(workloads.len(), 1, "diverged network is not admitted");
 
         // Candidate declares `west`/`net2` but a DIFFERENT trust domain.
@@ -2841,7 +2887,7 @@ mod tests {
             ..MultiClusterConfig::default()
         };
         let (workloads, _) =
-            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&diverged_td));
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&diverged_td), true);
         assert_eq!(workloads.len(), 1, "diverged trust domain is not admitted");
 
         // Matching identity admits it.
@@ -2850,6 +2896,7 @@ mod tests {
             &[],
             &snapshot,
             Some(&candidate_admitting("west")),
+            true,
         );
         assert_eq!(
             workloads.len(),
@@ -2897,7 +2944,7 @@ mod tests {
             ..MultiClusterConfig::default()
         };
         let (workloads, _) =
-            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&url_only_change));
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&url_only_change), true);
         assert_eq!(
             workloads.len(),
             1,
@@ -2918,7 +2965,7 @@ mod tests {
             ..MultiClusterConfig::default()
         };
         let (workloads, _) =
-            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&grpcs_same));
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&grpcs_same), true);
         assert_eq!(
             workloads.len(),
             2,
@@ -3591,10 +3638,7 @@ mod tests {
     #[test]
     fn tls_selection_respects_grpcs_scheme() {
         let tls_cfg = RemoteDiscoveryTlsConfig {
-            tls_urls: Some(DpGrpcTlsConfig {
-                no_verify: true,
-                ..DpGrpcTlsConfig::default()
-            }),
+            tls_urls: Some(DpGrpcTlsConfig::default()),
             plain_urls: None,
         };
         // grpcs normalizes to https — must pick TLS config.
@@ -3622,10 +3666,7 @@ mod tests {
             node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
             tls_config: RemoteDiscoveryTlsConfig {
-                tls_urls: Some(DpGrpcTlsConfig {
-                    no_verify: true,
-                    ..DpGrpcTlsConfig::default()
-                }),
+                tls_urls: Some(DpGrpcTlsConfig::default()),
                 plain_urls: None,
             },
         };

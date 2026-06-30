@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
 fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
+    let policy = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(policy);
     let dns_cache = DnsCache::new(DnsConfig {
         backend_allow_ips: policy.clone(),
         ..DnsConfig::default()
@@ -341,7 +342,7 @@ fn test_semantic_endpoint_rejects_literal_ips_denied_by_backend_policy() {
             panic!("literal internal endpoint should be rejected: {endpoint}");
         };
         assert!(
-            error.contains("denied by FERRUM_BACKEND_ALLOW_IPS=public policy"),
+            error.contains("denied by backend egress policy"),
             "unexpected error for {endpoint}: {error}"
         );
     }
@@ -391,6 +392,144 @@ fn test_new_with_redis_config() {
     });
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "ai_semantic_cache");
+}
+
+#[test]
+fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    // Production default policy (mode `both` + dangerous-range baseline) — the
+    // file/db config-load path. A Redis-backed semantic cache pointed at the
+    // cloud-metadata address must be rejected at config-load: the Redis client
+    // builds from `redis_url` WITHOUT the policy and skips IP literals, so the
+    // literal endpoint must be caught here.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let denied = json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://169.254.169.254:6379/0"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ai_semantic_cache", &denied, &default_policy).is_err(),
+        "metadata Redis endpoint must be rejected under the default policy"
+    );
+
+    // A loopback Redis (local cache) still validates by default.
+    let loopback = json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:6379/0"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ai_semantic_cache", &loopback, &default_policy).is_ok(),
+        "loopback Redis must remain valid by default"
+    );
+
+    // The fully-unrestricted policy accepts the metadata endpoint (legacy posture).
+    assert!(
+        validate_plugin_config_with_policy(
+            "ai_semantic_cache",
+            &denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
+}
+
+// `#[tokio::test]` because kafka_logging's constructor spawns a background
+// batching-flush task, which requires a Tokio reactor.
+#[tokio::test]
+async fn validate_plugin_config_with_policy_screens_denied_direct_client_endpoints() {
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    // ldap_auth (ldap3 crate) and kafka_logging (librdkafka) dial their OWN
+    // resolver, outside the shared PluginHttpClient + DnsCache — so a literal
+    // metadata endpoint that constructs fine must still be rejected at config
+    // load under the default policy (mode `both` + dangerous-range baseline).
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let ldap_denied = json!({
+        "ldap_url": "ldap://169.254.169.254:389",
+        "bind_dn_template": "uid={username},dc=example,dc=com"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ldap_auth", &ldap_denied, &default_policy).is_err(),
+        "metadata ldap_url must be rejected under the default policy"
+    );
+
+    let ldap_loopback = json!({
+        "ldap_url": "ldap://127.0.0.1:389",
+        "bind_dn_template": "uid={username},dc=example,dc=com"
+    });
+    assert!(
+        validate_plugin_config_with_policy("ldap_auth", &ldap_loopback, &default_policy).is_ok(),
+        "loopback ldap_url must remain valid by default"
+    );
+
+    // A comma-separated broker_list with a denied broker (alongside an allowed
+    // RFC1918 one) is rejected — the screen checks every entry.
+    let kafka_denied = json!({
+        "broker_list": "10.0.0.1:9092,169.254.169.254:9092",
+        "topic": "logs"
+    });
+    assert!(
+        validate_plugin_config_with_policy("kafka_logging", &kafka_denied, &default_policy)
+            .is_err(),
+        "a metadata broker in broker_list must be rejected under the default policy"
+    );
+
+    let kafka_loopback = json!({
+        "broker_list": "127.0.0.1:9092",
+        "topic": "logs"
+    });
+    assert!(
+        validate_plugin_config_with_policy("kafka_logging", &kafka_loopback, &default_policy)
+            .is_ok(),
+        "loopback kafka broker must remain valid by default"
+    );
+
+    // ws_logging dials its endpoint_url via tungstenite (outside the shared
+    // client); a literal metadata endpoint must be rejected before the flush
+    // loop spawns.
+    let ws_denied = json!({ "endpoint_url": "ws://169.254.169.254/logs" });
+    assert!(
+        validate_plugin_config_with_policy("ws_logging", &ws_denied, &default_policy).is_err(),
+        "metadata ws_logging endpoint_url must be rejected under the default policy"
+    );
+    let ws_loopback = json!({ "endpoint_url": "ws://127.0.0.1:9000/logs" });
+    assert!(
+        validate_plugin_config_with_policy("ws_logging", &ws_loopback, &default_policy).is_ok(),
+        "loopback ws_logging endpoint must remain valid by default"
+    );
+
+    // The fully-unrestricted policy accepts all (legacy posture).
+    assert!(
+        validate_plugin_config_with_policy(
+            "ws_logging",
+            &ws_denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_plugin_config_with_policy(
+            "ldap_auth",
+            &ldap_denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_plugin_config_with_policy(
+            "kafka_logging",
+            &kafka_denied,
+            &BackendEgressPolicy::unrestricted()
+        )
+        .is_ok()
+    );
 }
 
 #[test]

@@ -142,7 +142,7 @@ fn create_proxy_state() -> ProxyState {
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
         warmup_concurrency: 500,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         slow_threshold_ms: None,
         refresh_threshold_percent: 90,
         failed_retry_interval_seconds: 10,
@@ -189,6 +189,7 @@ fn build_cp_admin_state(
         reserved_ports: HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".into(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        metrics_auth: Default::default(),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: Some(registry),
         mesh_registry: None,
@@ -196,7 +197,7 @@ fn build_cp_admin_state(
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
 
@@ -226,6 +227,7 @@ fn build_dp_admin_state(
         reserved_ports: HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".into(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        metrics_auth: Default::default(),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,
@@ -233,7 +235,7 @@ fn build_dp_admin_state(
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
 

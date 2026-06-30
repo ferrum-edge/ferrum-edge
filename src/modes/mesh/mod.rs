@@ -1571,12 +1571,22 @@ fn gateway_config_from_mesh_slice_with_federation(
     // from the accepted slice) evicts the store entry. Fail-closed: a slice with
     // no `multi_cluster` admits no remote endpoints (codex F7.2 round-4).
     let merged_remote = matches!(remote_endpoints, Some(snapshot) if !snapshot.is_empty());
+    // A Sidecar-enforced slice has already narrowed `slice.services` to the
+    // authorized egress registry. Poller-discovered workloads may be unioned
+    // into those admitted services, but remote-only services must not be
+    // appended after narrowing or the merge would widen the outbound policy
+    // boundary.
+    let allow_remote_service_append = !slice
+        .sidecar_egress_scope
+        .as_ref()
+        .is_some_and(|scope| scope.sidecar_applied);
     let (workloads, services) = match remote_endpoints {
         Some(snapshot) if !snapshot.is_empty() => multicluster::merge_remote_endpoints_into_mesh(
             &slice.workloads,
             &slice.services,
             snapshot,
             slice.multi_cluster.as_ref(),
+            allow_remote_service_append,
         ),
         _ => (slice.workloads.clone(), slice.services.clone()),
     };
@@ -9398,6 +9408,10 @@ fn start_mesh_admin_listeners(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
     );
+    let metrics_auth = Arc::new(
+        crate::admin::MetricsAuthPolicy::from_env(env_config)
+            .map_err(|err| anyhow::anyhow!(err))?,
+    );
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
         Err(err) => {
@@ -9427,6 +9441,7 @@ fn start_mesh_admin_listeners(
         reserved_ports: env_config.reserved_gateway_ports(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs,
+        metrics_auth,
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         mesh_registry: None,

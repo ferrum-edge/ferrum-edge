@@ -821,6 +821,14 @@ impl HealthChecker {
         let probe_global_cert = self.global_backend_tls_client_cert_path.clone();
         let probe_global_key = self.global_backend_tls_client_key_path.clone();
         let probe_no_verify = self.global_tls_no_verify;
+        // Screen the probe target against the backend egress policy so active
+        // health checks never dial a denied address (an SSRF/port-scan vector via
+        // the health probe). reqwest skips the resolver for IP literals and the
+        // TCP/UDP/gRPC probes connect directly, so screen the literal here; the
+        // DNS cache (below) additionally screens hostnames for the non-HTTP
+        // probes (HTTP hostnames go through reqwest's DnsCacheResolver).
+        let probe_egress_policy = self.dns_cache.as_ref().map(|c| c.backend_allow_ips());
+        let probe_dns_cache = self.dns_cache.clone();
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -844,26 +852,123 @@ impl HealthChecker {
                     .clone();
 
                 let probe_start = std::time::Instant::now();
-                let probe_success = match probe_type {
-                    HealthProbeType::Http => {
-                        http_probe(&client, &url, timeout, &healthy_status_codes).await
-                    }
-                    HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
-                    HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
-                    HealthProbeType::Grpc => {
-                        grpc_probe(
-                            &host,
-                            port,
-                            timeout,
-                            use_tls,
-                            &grpc_service_name,
-                            &probe_tls_config,
-                            probe_global_ca.as_deref(),
-                            probe_global_cert.as_deref(),
-                            probe_global_key.as_deref(),
-                            probe_no_verify,
-                        )
-                        .await
+                // A target whose literal IP is denied by the egress policy is
+                // never dialed; treat it as a failed probe (unhealthy) instead.
+                let egress_denied = probe_egress_policy.as_ref().and_then(|policy| {
+                    let bare = host
+                        .strip_prefix('[')
+                        .and_then(|h| h.strip_suffix(']'))
+                        .unwrap_or(host.as_str());
+                    bare.parse::<std::net::IpAddr>()
+                        .ok()
+                        .and_then(|ip| policy.deny_reason(&ip))
+                });
+                let probe_success = if let Some(reason) = egress_denied {
+                    warn!(
+                        target = %host,
+                        reason,
+                        "Health probe target blocked by backend egress policy; marking unhealthy without dialing"
+                    );
+                    false
+                } else {
+                    match probe_type {
+                        HealthProbeType::Http => {
+                            // reqwest routes hostnames through the
+                            // DnsCacheResolver (which screens); literal IPs skip
+                            // it and were screened by `egress_denied` above.
+                            http_probe(&client, &url, timeout, &healthy_status_codes).await
+                        }
+                        // TCP/UDP/gRPC dial directly (TcpStream/UdpSocket/tonic),
+                        // bypassing the DnsCacheResolver, so resolve through the
+                        // gateway DNS cache here to enforce the egress policy on
+                        // the resolved address (hostname rebinding to a denied IP
+                        // fails). TCP/UDP then dial that exact screened IP; gRPC
+                        // keeps the hostname so TLS SNI is unchanged but is still
+                        // screened by the resolve above.
+                        HealthProbeType::Tcp | HealthProbeType::Udp | HealthProbeType::Grpc => {
+                            // Strip URI brackets: `DnsCache::resolve` only
+                            // recognizes UNbracketed IP literals, so a bracketed
+                            // IPv6 target (`[::1]`, `[fd00::1]`) would fall through
+                            // to DNS and flap unhealthy. Bare hostnames pass through
+                            // unchanged (the legacy tcp/udp probe handled brackets
+                            // via `format_probe_socket_addr`).
+                            let resolve_host = host
+                                .strip_prefix('[')
+                                .and_then(|h| h.strip_suffix(']'))
+                                .unwrap_or(host.as_str());
+                            match probe_dns_cache.as_ref() {
+                                Some(cache) => {
+                                    match cache.resolve(resolve_host, None, None).await {
+                                        Ok(resolved_ip) => {
+                                            let ip_str = resolved_ip.to_string();
+                                            match probe_type {
+                                                HealthProbeType::Tcp => {
+                                                    tcp_probe(&ip_str, port, timeout).await
+                                                }
+                                                HealthProbeType::Udp => {
+                                                    udp_probe(&ip_str, port, timeout, &udp_payload)
+                                                        .await
+                                                }
+                                                // gRPC: dial the screened IP (`ip_str`)
+                                                // so tonic does not re-resolve and risk
+                                                // a split-DNS rebind, while keeping the
+                                                // hostname for TLS SNI / cert validation.
+                                                _ => {
+                                                    grpc_probe(
+                                                        &host,
+                                                        &ip_str,
+                                                        port,
+                                                        timeout,
+                                                        use_tls,
+                                                        &grpc_service_name,
+                                                        &probe_tls_config,
+                                                        probe_global_ca.as_deref(),
+                                                        probe_global_cert.as_deref(),
+                                                        probe_global_key.as_deref(),
+                                                        probe_no_verify,
+                                                    )
+                                                    .await
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                target = %host,
+                                                error = %e,
+                                                "Health probe target blocked or unresolvable by backend egress policy; marking unhealthy"
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
+                                // No DNS cache wired (e.g. tests): fall back to the
+                                // legacy direct dial.
+                                None => match probe_type {
+                                    HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
+                                    HealthProbeType::Udp => {
+                                        udp_probe(&host, port, timeout, &udp_payload).await
+                                    }
+                                    _ => {
+                                        // No DNS cache to screen/pin an IP; dial the
+                                        // hostname directly (legacy behavior).
+                                        grpc_probe(
+                                            &host,
+                                            &host,
+                                            port,
+                                            timeout,
+                                            use_tls,
+                                            &grpc_service_name,
+                                            &probe_tls_config,
+                                            probe_global_ca.as_deref(),
+                                            probe_global_cert.as_deref(),
+                                            probe_global_key.as_deref(),
+                                            probe_no_verify,
+                                        )
+                                        .await
+                                    }
+                                },
+                            }
+                        }
                     }
                 };
 
@@ -1026,6 +1131,7 @@ async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> 
 #[allow(clippy::too_many_arguments)]
 async fn grpc_probe(
     host: &str,
+    dial_addr: &str,
     port: u16,
     timeout: Duration,
     use_tls: bool,
@@ -1037,10 +1143,24 @@ async fn grpc_probe(
     global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
-    let endpoint_url = format_probe_url(scheme, host, port, "");
+    // Dial the pre-screened address (`dial_addr` = the resolved IP from the
+    // health loop) so tonic does not re-resolve `host` and risk a split-DNS /
+    // rebind to a denied address between the egress screen and the dial. TLS
+    // SNI and the cert hostname still come from `host` (see `domain_name`).
+    let endpoint_url = format_probe_url(scheme, dial_addr, port, "");
 
     let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
-        Ok(ep) => ep.timeout(timeout).connect_timeout(timeout),
+        Ok(ep) => {
+            let ep = ep.timeout(timeout).connect_timeout(timeout);
+            // We dial `dial_addr` (the screened IP), but tonic otherwise derives
+            // the HTTP/2 `:authority` from that URI. Override the origin with the
+            // original host so a virtual-hosted / H2-multiplexed backend routes
+            // the health RPC the same as normal proxy traffic to the hostname.
+            match format_probe_url(scheme, host, port, "").parse::<http::Uri>() {
+                Ok(origin) => ep.origin(origin),
+                Err(_) => ep,
+            }
+        }
         Err(e) => {
             debug!(
                 "gRPC health probe: invalid endpoint for {}:{}: {}",
@@ -1088,7 +1208,16 @@ async fn grpc_probe(
             }
         }
     } else if use_tls {
-        let mut tonic_tls = tonic::transport::ClientTlsConfig::new();
+        // SNI / cert hostname stays the original `host` even though we dial the
+        // pre-screened IP via `dial_addr`, so backend cert validation is unchanged.
+        // rustls/tonic want a BARE SNI host, not a URI-bracketed IPv6 literal
+        // (`[fd00::1]`), so strip brackets here — the `origin`/authority above
+        // keeps the bracketed form because a URI authority requires it.
+        let sni_host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(sni_host);
 
         // Load CA certs (upstream → global → system roots)
         if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
@@ -1316,6 +1445,10 @@ fn build_health_check_client(
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        // Do not follow redirects on health probes: a 3xx from an allowed host to
+        // an IP literal (e.g. http://169.254.169.254/) skips the DnsCacheResolver
+        // and the one-time egress screen, bouncing the probe to a denied address.
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(no_verify);
 
     if let Some(dns_cache) = dns_cache.clone() {
@@ -1363,7 +1496,11 @@ fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     context: &'static str,
 ) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    // Carry the no-redirect policy into the degraded fallback too: a 3xx to an
+    // IP literal would otherwise skip the DnsCacheResolver and the egress screen,
+    // bouncing the probe to a denied address (same rationale as the primary
+    // builders).
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -1371,11 +1508,16 @@ fn build_dns_cached_fallback_client(
     builder.build().unwrap_or_else(|e| {
         tracing::error!(
             "Failed to build minimal DNS-cached fallback {} client: {}. \
-             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+             Using a redirect-disabled minimal client as a last resort — DNS will bypass the gateway cache.",
             context,
             e
         );
-        reqwest::Client::new()
+        // Last resort: still disable redirects. Fall back to `Client::new()` only
+        // if even this trivial builder fails (effectively never).
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
@@ -1397,6 +1539,9 @@ fn build_health_check_client_with_tls(
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        // Do not follow redirects on health probes: a 3xx to an IP literal skips
+        // the DnsCacheResolver and the egress screen (see build_health_check_client).
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(skip_verify);
 
     if let Some(dns_cache) = dns_cache.clone() {
@@ -1505,6 +1650,7 @@ pub async fn grpc_probe_for_test(
 ) -> bool {
     let default_tls = BackendTlsConfig::default_verify();
     grpc_probe(
+        host,
         host,
         port,
         timeout,

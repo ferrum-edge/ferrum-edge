@@ -79,6 +79,7 @@ impl UdpLogging {
             .ok_or_else(|| "udp_logging: 'host' is required".to_string())?
             .to_string();
         let socket_host = parse_socket_host("udp_logging", "host", &raw_host)?;
+        socket_host.screen_egress_ip("udp_logging", "host", http_client.backend_allow_ips())?;
         let host = socket_host.dial_host.clone();
         let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
             "udp_logging: 'port' is required and must be a positive integer".to_string()

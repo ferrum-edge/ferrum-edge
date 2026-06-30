@@ -425,6 +425,7 @@ async fn test_db_config_backup_bootstrap() {
         // are disabled because the primary isn't reachable yet.
         let health = client
             .get(format!("http://127.0.0.1:{}/health", admin_port))
+            .header("Authorization", auth_header(&jwt_secret, &jwt_issuer))
             .send()
             .await
             .expect("health");
@@ -551,8 +552,13 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let health_url = format!("http://127.0.0.1:{}/health", admin_port);
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut recovered = false;
+        let health_auth = auth_header(&jwt_secret, &jwt_issuer);
         while std::time::Instant::now() < deadline {
-            if let Ok(resp) = client.get(&health_url).send().await
+            if let Ok(resp) = client
+                .get(&health_url)
+                .header("Authorization", &health_auth)
+                .send()
+                .await
                 && let Ok(hjson) = resp.json::<serde_json::Value>().await
                 && hjson["admin_writes_enabled"].as_bool() == Some(true)
             {
@@ -721,6 +727,7 @@ async fn test_db_read_replica_startup() {
         // connected cleanly so there's no degradation warning.
         let health = client
             .get(format!("http://127.0.0.1:{}/health", admin_port))
+            .header("Authorization", &auth)
             .send()
             .await
             .expect("health");

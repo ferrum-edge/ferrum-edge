@@ -249,7 +249,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         dns_error_ttl: 1,
         dns_failed_retry_interval: 10,
         dns_warmup_concurrency: 500,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         tls_ca_bundle_path: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -313,7 +313,7 @@ fn create_test_proxy_state() -> ProxyState {
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
         warmup_concurrency: 500,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         slow_threshold_ms: None,
         refresh_threshold_percent: 90,
         failed_retry_interval_seconds: 10,
@@ -1817,7 +1817,6 @@ async fn test_dp_connects_to_cp_with_tls() {
         ca_cert_pem: Some(ca_pem),
         client_cert_pem: None,
         client_key_pem: None,
-        no_verify: false,
     };
 
     // See `test_dp_receives_initial_config_from_cp` for why this is
@@ -1912,7 +1911,6 @@ async fn test_dp_connects_to_cp_with_mtls() {
         ca_cert_pem: Some(ca_pem),
         client_cert_pem: Some(client_cert_pem),
         client_key_pem: Some(client_key_pem),
-        no_verify: false,
     };
 
     // See `test_dp_receives_initial_config_from_cp` for why this is
@@ -1983,7 +1981,6 @@ async fn test_dp_rejects_untrusted_cp_server_cert() {
         ca_cert_pem: Some(different_ca_pem),
         client_cert_pem: None,
         client_key_pem: None,
-        no_verify: false,
     };
 
     let result = timeout(

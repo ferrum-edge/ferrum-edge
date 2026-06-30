@@ -260,6 +260,17 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
     use crate::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
 
+    // A DnsCacheResolver egress-policy denial (a gRPC backend hostname or
+    // dns_override that resolves — or rebinds — to a blocked IP) surfaces as a
+    // BackendUnavailable{DnsResolution} whose message carries "...denied by
+    // backend egress policy...". Classify it as the non-retryable, backend-
+    // health-neutral DispatchPolicyRejected before the DnsResolution kind below
+    // maps it to DnsLookupError (which the retry loop would replay and charge to
+    // backend health even though no backend was dialed).
+    if format!("{e:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     match e {
         GrpcProxyError::BackendTimeout { kind, .. } => match kind {
             GrpcTimeoutKind::Connect => ErrorClass::ConnectionTimeout,
@@ -520,6 +531,12 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     if is_port_exhaustion_message(error_str) || is_port_exhaustion_message(debug_str) {
         return Some(ErrorClass::PortExhaustion);
     }
+    // Gateway-side egress-policy rejection (e.g. a literal-IP WebSocket backend
+    // blocked before any dial). This is a distinct, non-retryable, backend-
+    // health-neutral dispatch class — not a connect/DNS/TLS transport failure.
+    if error_str.contains("egress policy") {
+        return Some(ErrorClass::DispatchPolicyRejected);
+    }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
         return Some(ErrorClass::ConnectionTimeout);
     }
@@ -667,6 +684,18 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::PortExhaustion;
     }
 
+    // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
+    // rebinds — to a blocked IP) surfaces as a connect-phase io error carrying
+    // "...denied by backend egress policy...". Classify it as the non-retryable,
+    // backend-health-neutral DispatchPolicyRejected BEFORE the is_connect()
+    // typed/DNS fallback mislabels it (DnsLookupError / ConnectionRefused),
+    // which would retry it under retry_on_connect_failure and charge passive
+    // health / the circuit breaker as a connect-class failure. Error-path only,
+    // so the formatting cost is irrelevant.
+    if format!("{e:?}").contains("egress policy") {
+        return ErrorClass::DispatchPolicyRejected;
+    }
+
     if e.is_connect() {
         if e.is_timeout() {
             return ErrorClass::ConnectionTimeout;
@@ -733,6 +762,21 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     ErrorClass::RequestError
 }
 
+/// Whether the error chain contains a native-H3 stream error
+/// (`h3::error::StreamError`), i.e. it came from the native-H3 response body
+/// rather than a reqwest/hyper/io path. Used to route H3 body errors through the
+/// H3-aware classifier in [`classify_body_error`].
+fn h3_stream_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(node) = current {
+        if node.downcast_ref::<h3::error::StreamError>().is_some() {
+            return true;
+        }
+        current = node.source();
+    }
+    false
+}
+
 /// Classify an error that was emitted by a streaming response body wrapper
 /// (i.e. after response headers have been sent to the client).
 ///
@@ -756,14 +800,47 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
         return (ErrorClass::PortExhaustion, false);
     }
 
+    // Native-H3 streaming bodies surface `h3::error::StreamError` (e.g.
+    // `RemoteTerminate`, `HeaderTooBig`, `H3_INTERNAL_ERROR`), which is neither
+    // an io nor a hyper error — the generic walk below would fall through to
+    // `RequestError` with `connection_error == false` and the deferred dispatch
+    // would bank it as a phantom SUCCESS. Route it through the H3-aware
+    // classifier so a mid-stream H3 reset / protocol fault on an already-2xx
+    // response trips CB / passive-health. It is a backend error, not a client
+    // disconnect (`disconnected = false`); graceful H3 closes never reach here
+    // (`H3FrameSource` recovers a complete body to a clean EOS).
+    if h3_stream_error_in_chain(e) {
+        let class = crate::http3::client::classify_http3_error(e);
+        // An h3 stream error that reaches the body error path is a genuine
+        // backend failure: graceful closes (H3_NO_ERROR / GOAWAY) are recovered
+        // to a clean EOS by `H3FrameSource` before this point, so anything left
+        // is a real mid-stream fault. If the H3 classifier could only produce a
+        // class the deferred dispatch does NOT count as a failure (notably the
+        // `RequestError` catch-all for `HeaderTooBig`, whose display text matches
+        // no heuristic), surface it as `ProtocolError` so it trips CB /
+        // passive-health instead of banking a phantom success.
+        let class = if crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
+            Some(class),
+        ) {
+            class
+        } else {
+            ErrorClass::ProtocolError
+        };
+        return (class, false);
+    }
+
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = current {
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             match io_err.kind() {
                 std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted => {
-                    // Backend closed mid-stream — not a client disconnect.
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
+                    // Backend closed mid-stream, or FIN'd before delivering its
+                    // declared Content-Length (native-H3 `H3FrameSource`
+                    // truncation surfaces `UnexpectedEof`) — a backend fault, not
+                    // a client disconnect.
                     return (ErrorClass::ConnectionClosed, false);
                 }
                 std::io::ErrorKind::TimedOut => {
@@ -1082,6 +1159,23 @@ mod tests {
                  must respect retry_on_methods"
             );
         }
+    }
+
+    #[test]
+    fn egress_policy_denial_classifies_as_dispatch_policy_rejected() {
+        // A gateway-side egress-policy rejection (e.g. a denied literal-IP
+        // WebSocket backend) is surfaced as a boxed error whose message contains
+        // "egress policy". It must classify as the non-retryable, backend-health-
+        // neutral DispatchPolicyRejected class — NOT a connect/DNS/TLS transport
+        // failure that would replay under retry_on_connect_failure.
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            "backend egress policy denied literal-IP WebSocket backend 169.254.169.254: \
+             link-local / cloud metadata range"
+                .into();
+        let class = super::classify_boxed_setup_error(err.as_ref());
+        assert_eq!(class, ErrorClass::DispatchPolicyRejected);
+        // request_reached_wire == true → ws_is_pre_wire == false → no retry.
+        assert!(request_reached_wire(class));
     }
 
     #[test]

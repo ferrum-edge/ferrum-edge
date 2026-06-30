@@ -2084,7 +2084,16 @@ async fn handle_tcp_connection_inner(
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    // A gateway-side egress-policy denial (literal / dns_override /
+                    // rebound passthrough host blocked) dialed no backend, so it
+                    // must NOT trip the breaker as a connect failure — release any
+                    // HALF_OPEN probe slot NEUTRALLY (mirrors the non-passthrough
+                    // TCP/UDP paths). Genuine DNS/transport failures still count.
+                    if crate::dns::is_egress_policy_denial(&e) {
+                        cb.record_neutral(cb_info.is_half_open_probe);
+                    } else {
+                        cb.record_failure(502, true, cb_info.is_half_open_probe);
+                    }
                 }
                 return Err(anyhow::anyhow!(
                     "DNS resolution failed for {}: {}",
@@ -2510,7 +2519,19 @@ async fn handle_tcp_connection_inner(
         {
             Ok(ip) => ip,
             Err(e) => {
-                record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
+                // A backend-egress-policy denial means no backend was dialed, so
+                // keep circuit-breaker accounting neutral (a denied literal/rebound
+                // target must not trip the breaker as a connect failure). Genuine
+                // DNS/transport failures still record a CB failure. Either way we
+                // must settle a HALF_OPEN probe slot `can_execute` admitted — a
+                // policy denial releases it NEUTRALLY (no count) rather than
+                // leaking it, else `half_open_in_flight` stays consumed and the
+                // breaker can never recover.
+                if crate::dns::is_egress_policy_denial(&e) {
+                    record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
+                } else {
+                    record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
+                }
                 let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);
                 if can_retry
                     && attempt < max_retries

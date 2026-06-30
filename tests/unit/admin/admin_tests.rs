@@ -50,6 +50,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(config),
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
@@ -71,7 +72,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
 

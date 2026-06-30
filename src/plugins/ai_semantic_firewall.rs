@@ -2396,7 +2396,7 @@ fn parse_custom_rules(
 
 fn parse_provider_config(
     config: &Value,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<Option<ProviderConfig>, String> {
     let Some(provider) = optional_object(config, "provider")? else {
         return Ok(None);
@@ -2441,7 +2441,7 @@ fn parse_provider_config(
 
 fn validate_provider_endpoint(
     endpoint: &str,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<String, String> {
     let parsed = Url::parse(endpoint)
         .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
@@ -2464,10 +2464,10 @@ fn validate_provider_endpoint(
         Host::Domain(_) => None,
     };
     if let Some(ip) = literal_ip
-        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+        && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_semantic_firewall: provider.endpoint IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+            "ai_semantic_firewall: provider.endpoint IP {ip} denied by backend egress policy ({backend_allow_ips})"
         ));
     }
 

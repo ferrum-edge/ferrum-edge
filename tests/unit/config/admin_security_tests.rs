@@ -8,7 +8,9 @@
 //! of these fields is covered by env_config_tests.rs; these focus on the
 //! domain model and defaults.
 
-use ferrum_edge::config::{AdminHttpExposure, BackendAllowIps, EnvConfig, OperatingMode};
+use ferrum_edge::config::{
+    AdminHttpExposure, BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode,
+};
 
 // ── FERRUM_ADMIN_ALLOWED_CIDRS ──────────────────────────────────────────────
 
@@ -66,31 +68,40 @@ fn test_max_concurrent_requests_per_ip_can_be_set() {
 fn test_backend_allow_ips_default_is_both() {
     let config = EnvConfig::default();
     assert_eq!(
-        config.backend_allow_ips,
-        BackendAllowIps::Both,
-        "Default should be Both (no restriction)"
+        config.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Both,
+        "Default mode should be Both"
     );
 }
 
 #[test]
 fn test_backend_allow_ips_variants() {
     let config_private = EnvConfig {
-        backend_allow_ips: BackendAllowIps::Private,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
         ..Default::default()
     };
-    assert_eq!(config_private.backend_allow_ips, BackendAllowIps::Private);
+    assert_eq!(
+        config_private.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Private
+    );
 
     let config_public = EnvConfig {
-        backend_allow_ips: BackendAllowIps::Public,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
         ..Default::default()
     };
-    assert_eq!(config_public.backend_allow_ips, BackendAllowIps::Public);
+    assert_eq!(
+        config_public.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Public
+    );
 
     let config_both = EnvConfig {
-        backend_allow_ips: BackendAllowIps::Both,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
         ..Default::default()
     };
-    assert_eq!(config_both.backend_allow_ips, BackendAllowIps::Both);
+    assert_eq!(
+        config_both.backend_allow_ips.allow_ips(),
+        &BackendAllowIps::Both
+    );
 }
 
 #[test]
@@ -429,10 +440,9 @@ fn test_union_coverage_allowlist_does_not_satisfy_database_guard() {
 }
 
 #[test]
-fn test_read_only_database_admin_is_not_hard_failed() {
-    // FERRUM_ADMIN_READ_ONLY=true blocks admin mutations, so a public plaintext
-    // read-only db/cp admin is warned (in main.rs), not hard-failed — it must not
-    // be forced to add an allowlist or the dev opt-in just to start.
+fn test_read_only_database_admin_is_hard_failed_when_plaintext_unrestricted() {
+    // FERRUM_ADMIN_READ_ONLY=true blocks mutations, but it does not protect
+    // sensitive read endpoints or bearer tokens sent to a plaintext listener.
     for mode in [OperatingMode::Database, OperatingMode::ControlPlane] {
         let config = EnvConfig {
             mode: mode.clone(),
@@ -446,8 +456,8 @@ fn test_read_only_database_admin_is_not_hard_failed() {
             "exposure classification is unchanged by read-only"
         );
         assert!(
-            config.admin_insecure_plaintext_startup_error().is_none(),
-            "{mode:?} with FERRUM_ADMIN_READ_ONLY=true must not hard-fail"
+            config.admin_insecure_plaintext_startup_error().is_some(),
+            "{mode:?} with FERRUM_ADMIN_READ_ONLY=true still needs loopback, TLS-only admin, an effective allowlist, or the dev opt-in"
         );
     }
 }

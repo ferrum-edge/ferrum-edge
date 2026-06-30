@@ -102,7 +102,7 @@ use crate::scaffolding::ports::{PortReservation, reserve_port_pair};
 use chrono::Utc;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
 use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::config::{BackendAllowIps, EnvConfig, OperatingMode};
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::{ServeHandles, ServeOptions};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::StatusCode;
@@ -531,9 +531,9 @@ fn apply_env_overrides(
             "FERRUM_TRUSTED_PROXIES" => env_config.trusted_proxies = v.clone(),
             "FERRUM_BACKEND_ALLOW_IPS" => {
                 env_config.backend_allow_ips = match v.trim().to_ascii_lowercase().as_str() {
-                    "private" => BackendAllowIps::Private,
-                    "public" => BackendAllowIps::Public,
-                    "both" => BackendAllowIps::Both,
+                    "private" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
+                    "public" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+                    "both" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
                     _ => {
                         // Match binary-mode `EnvValue::parse_env`: invalid
                         // values are a hard error, not a silent "use the
@@ -734,16 +734,23 @@ impl GatewayHarness {
         self.get_admin_json_unauth("/health").await
     }
 
-    /// Fetch the admin `/metrics` endpoint (unauthenticated, like a
-    /// Prometheus scraper) and return the raw text. The real endpoint
-    /// renders Prometheus format, so the caller does its own parsing /
+    /// Fetch the admin `/metrics` endpoint and return the raw text. The real
+    /// endpoint renders Prometheus format, so the caller does its own parsing /
     /// substring assertions.
+    ///
+    /// `/metrics` is gated by default (admin JWT, `FERRUM_METRICS_BEARER_TOKEN`,
+    /// or `FERRUM_METRICS_ALLOWED_CIDRS`), so this sends the admin JWT — the
+    /// equivalent of a Prometheus deployment configured with a bearer token.
     pub async fn metrics(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()?;
         let url = self.admin_url("/metrics");
-        let resp = client.get(&url).send().await?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", self.admin_auth_header())
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
