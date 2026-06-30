@@ -19,6 +19,7 @@ PATCHES=(
   "reqwest per-request connect_timeout|reqwest|0.13.3|seanmonstar/reqwest|3017|NONE|docs/upstream-reqwest-patches/001-per-request-connect-timeout/"
   "h3 frame-drain on QUIC close|h3|0.0.8|hyperium/h3|339|338|docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/"
   "h3 Extended CONNECT :protocol=websocket|h3|0.0.8|hyperium/h3|NONE|NONE|docs/upstream-h3-patches/002-extended-connect-websocket-protocol/"
+  "h3 peek buffered trailers before FIN|h3|0.0.8|hyperium/h3|NONE|NONE|docs/upstream-h3-patches/003-peek-buffered-trailers-before-fin/"
   "tungstenite lossless raw takeover|tungstenite|0.29.0|snapview/tungstenite-rs|556|NONE|docs/upstream-tungstenite-patches/"
   "tokio-tungstenite lossless raw takeover|tokio-tungstenite|0.29.0|snapview/tokio-tungstenite|380|NONE|docs/upstream-tungstenite-patches/"
 )

@@ -81,12 +81,12 @@ pub struct ProxyBody {
     /// coalescing overlap — matches the design rule preserved from the
     /// original deferred-log investigation.
     bytes_streamed: AtomicU64,
-    /// Treat Drop after at least this many yielded response-body DATA bytes as a
+    /// Treat Drop after exactly this many yielded response-body DATA bytes as a
     /// successful backend body completion instead of a client disconnect. Used
     /// for native H3 responses with a trusted `Content-Length`: hyper may stop
     /// polling once an H1 downstream receives the declared byte count, before the
-    /// H3 source yields its terminal FIN/trailer poll. Partial bodies still fall
-    /// through to the normal disconnect/error classification.
+    /// H3 source yields its terminal FIN/trailer poll. Partial or overlong
+    /// bodies still fall through to the normal disconnect/error classification.
     success_on_drop_after_bytes: Option<u64>,
     /// Whether `poll_frame` was ever called. Used by the `Drop` safety net
     /// to distinguish "hyper decided not to stream this body" (HEAD / 204 /
@@ -555,9 +555,9 @@ impl ProxyBody {
     }
 
     /// Classify a dropped, already-polled streaming body as successful if it has
-    /// yielded the declared response length. This is intentionally opt-in:
-    /// only protocol adapters whose downstream framing can complete from the
-    /// declared byte count should use it.
+    /// yielded exactly the declared response length. This is intentionally
+    /// opt-in: only protocol adapters whose downstream framing can complete from
+    /// the declared byte count should use it.
     pub(crate) fn with_success_on_drop_after_response_bytes(mut self, bytes: Option<u64>) -> Self {
         self.success_on_drop_after_bytes = bytes.filter(|bytes| *bytes > 0);
         self
@@ -965,7 +965,7 @@ impl Drop for ProxyBody {
             //    success.
             let completed_declared_bytes = self
                 .success_on_drop_after_bytes
-                .is_some_and(|expected| bytes >= expected);
+                .is_some_and(|expected| bytes == expected);
             let outcome = if self.polled.load(Ordering::Relaxed) {
                 // Polled at least once but never reached Ready(None) or an
                 // error terminal. That's normally a client disconnect
@@ -1011,7 +1011,7 @@ impl Drop for ProxyBody {
             && self.polled.load(Ordering::Relaxed)
             && self
                 .success_on_drop_after_bytes
-                .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) < expected)
+                .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;
@@ -1558,6 +1558,10 @@ trait H3RecvStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<http::HeaderMap>, BoxError>>;
+
+    fn peek_recv_trailers_map(&self) -> Result<Option<http::HeaderMap>, BoxError> {
+        Ok(None)
+    }
 }
 
 impl H3RecvStream for crate::http3::client::H3RequestStream {
@@ -1588,6 +1592,11 @@ impl H3RecvStream for crate::http3::client::H3RequestStream {
             Poll::Pending => Poll::Pending,
         }
     }
+
+    fn peek_recv_trailers_map(&self) -> Result<Option<http::HeaderMap>, BoxError> {
+        self.peek_recv_trailers()
+            .map_err(|err| Box::new(err) as BoxError)
+    }
 }
 
 /// Shared read-progress signal between an [`H3FrameSource`] and the outer
@@ -1612,6 +1621,11 @@ struct H3ReadProgress {
     /// outer re-arms a fresh trailer-wait budget first, so trailers arriving
     /// shortly after FIN are still delivered rather than dropped.
     trailer_phase: AtomicBool,
+    /// Trailers that h3 has already buffered but is withholding until the
+    /// terminal stream FIN arrives. If the caller's trailer-phase timeout fires
+    /// before that FIN, the outer timeout wrapper can still forward these
+    /// trailers before ending the downstream body.
+    pending_trailers: std::sync::Mutex<Option<http::HeaderMap>>,
 }
 
 impl H3ReadProgress {
@@ -1628,6 +1642,21 @@ impl H3ReadProgress {
     fn enter_trailer_phase(&self) {
         self.trailer_phase.store(true, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn store_pending_trailers(&self, trailers: http::HeaderMap) {
+        if let Ok(mut slot) = self.pending_trailers.lock()
+            && slot.is_none()
+        {
+            *slot = Some(trailers);
+        }
+    }
+
+    fn take_pending_trailers(&self) -> Option<http::HeaderMap> {
+        self.pending_trailers
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 }
 
@@ -1831,7 +1860,24 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             }
                             return Poll::Ready(Some(Err(err)));
                         }
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            if let Some(p) = &this.progress {
+                                match this.recv_stream.peek_recv_trailers_map() {
+                                    Ok(Some(mut trailers)) => {
+                                        crate::proxy::headers::strip_response_hop_by_hop_trailers(
+                                            &mut trailers,
+                                        );
+                                        p.store_pending_trailers(trailers);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        this.state = H3FrameSourceState::Done;
+                                        return Poll::Ready(Some(Err(err)));
+                                    }
+                                }
+                            }
+                            return Poll::Pending;
+                        }
                     }
                 }
                 H3FrameSourceState::Done => return Poll::Ready(None),
@@ -2324,6 +2370,14 @@ where
                                 .as_ref()
                                 .is_some_and(|p| p.trailer_phase.load(Ordering::Acquire))
                             {
+                                if let Some(trailers) = this
+                                    .progress
+                                    .as_ref()
+                                    .and_then(|p| p.take_pending_trailers())
+                                {
+                                    this.done = true;
+                                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                                }
                                 this.done = true;
                                 return Poll::Ready(None);
                             }
@@ -3005,11 +3059,13 @@ mod tests {
         Trailers(http::HeaderMap),
         End,
         Pending,
+        PendingWithBuffered(http::HeaderMap),
     }
 
     struct MockH3RecvStream {
         data_steps: VecDeque<MockH3DataStep>,
         trailer_steps: VecDeque<MockH3TrailerStep>,
+        buffered_trailers: Option<http::HeaderMap>,
     }
 
     impl MockH3RecvStream {
@@ -3017,6 +3073,7 @@ mod tests {
             Self {
                 data_steps: data_steps.into(),
                 trailer_steps: trailer_steps.into(),
+                buffered_trailers: None,
             }
         }
     }
@@ -3042,8 +3099,8 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<Option<http::HeaderMap>, BoxError>> {
-            match self
-                .get_mut()
+            let this = self.get_mut();
+            match this
                 .trailer_steps
                 .pop_front()
                 .unwrap_or(MockH3TrailerStep::End)
@@ -3051,7 +3108,15 @@ mod tests {
                 MockH3TrailerStep::Trailers(trailers) => Poll::Ready(Ok(Some(trailers))),
                 MockH3TrailerStep::End => Poll::Ready(Ok(None)),
                 MockH3TrailerStep::Pending => Poll::Pending,
+                MockH3TrailerStep::PendingWithBuffered(trailers) => {
+                    this.buffered_trailers = Some(trailers);
+                    Poll::Pending
+                }
             }
+        }
+
+        fn peek_recv_trailers_map(&self) -> Result<Option<http::HeaderMap>, BoxError> {
+            Ok(self.buffered_trailers.clone())
         }
     }
 
@@ -3770,6 +3835,71 @@ mod tests {
             "collapsed trailer-timeout EOF must report terminal state"
         );
         assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_forwards_buffered_h3_trailers_before_delayed_fin() {
+        let progress = Arc::new(H3ReadProgress::default());
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-trace", "abc".parse().unwrap());
+        trailers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![
+                    MockH3DataStep::Data(Bytes::from("body")),
+                    MockH3DataStep::End,
+                ],
+                vec![
+                    MockH3TrailerStep::PendingWithBuffered(trailers),
+                    MockH3TrailerStep::Pending,
+                ],
+            ),
+            Arc::from("GET"),
+            200,
+            Some(4),
+            Some(Arc::clone(&progress)),
+        );
+        let direct = DirectH3Body {
+            source,
+            content_length: Some(4),
+        };
+        let mut body = IdleReadTimeoutBody::with_progress(direct, 1, Some(Arc::clone(&progress)));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"body");
+            }
+            other => panic!("expected data frame, got {other:?}"),
+        }
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Pending
+        ));
+        assert!(
+            progress.trailer_phase.load(Ordering::Acquire),
+            "body FIN must put the source into trailer phase",
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let trailers = frame.trailers_ref().expect("expected trailer frame");
+                assert_eq!(trailers.get("x-trace").unwrap(), "abc");
+                assert!(
+                    trailers.get("transfer-encoding").is_none(),
+                    "hop-by-hop trailers must still be stripped before timeout forwarding",
+                );
+            }
+            other => panic!("expected buffered trailers on timeout, got {other:?}"),
+        }
+        assert!(body.is_end_stream());
         assert!(matches!(
             Pin::new(&mut body).poll_frame(&mut cx),
             Poll::Ready(None)

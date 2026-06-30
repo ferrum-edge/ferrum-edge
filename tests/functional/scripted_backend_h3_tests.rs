@@ -1602,6 +1602,13 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
 /// default (when the client offers `accept-encoding`), forcing the buffered
 /// dispatch decision these tests need to exercise the downgrade.
 fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
+    file_mode_yaml_for_h3_with_compression_and_read_timeout(port, 5000)
+}
+
+fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
+    port: u16,
+    backend_read_timeout_ms: u64,
+) -> String {
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -1612,7 +1619,7 @@ fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
             "backend_port": port,
             "strip_listen_path": true,
             "backend_connect_timeout_ms": 2000,
-            "backend_read_timeout_ms": 5000,
+            "backend_read_timeout_ms": backend_read_timeout_ms,
             "backend_write_timeout_ms": 5000,
             "backend_tls_verify_server_cert": false,
             "plugins": [{ "plugin_config_id": "compress-1" }],
@@ -1733,6 +1740,15 @@ async fn spawn_h3_streaming_downgrade_harness(
     h3_steps: Vec<H3Step>,
     extra_env: &[(&str, &str)],
 ) -> (GatewayHarness, ScriptedH3Backend) {
+    spawn_h3_streaming_downgrade_harness_with_read_timeout(ca_name, h3_steps, extra_env, 5000).await
+}
+
+async fn spawn_h3_streaming_downgrade_harness_with_read_timeout(
+    ca_name: &str,
+    h3_steps: Vec<H3Step>,
+    extra_env: &[(&str, &str)],
+    backend_read_timeout_ms: u64,
+) -> (GatewayHarness, ScriptedH3Backend) {
     let ca = TestCa::new(ca_name).expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -1764,7 +1780,10 @@ async fn spawn_h3_streaming_downgrade_harness(
         .expect("spawn h3 backend");
 
     let mut builder = GatewayHarness::builder()
-        .file_config(file_mode_yaml_for_h3_with_compression(backend_port))
+        .file_config(file_mode_yaml_for_h3_with_compression_and_read_timeout(
+            backend_port,
+            backend_read_timeout_ms,
+        ))
         .log_level("info")
         .capture_output()
         // Avoid pool warmup issuing an extra H3 request before the test's GET.
@@ -2031,7 +2050,88 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 15 — a LARGE 206 (no Content-Length) under a small response-size limit
+// Test 15 — trailer HEADERS delivered before a delayed FIN survive the
+// H3 trailer-phase read-timeout collapse.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_forwards_trailers_when_fin_is_delayed_past_timeout() {
+    let body_len = 128usize;
+    let body = bytes::Bytes::from(vec![b't'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness_with_read_timeout(
+        "phase-h3-delayed-fin-trailers",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "206".to_string()),
+                (
+                    "content-range",
+                    format!("bytes 0-{}/{}", body_len - 1, body_len * 8),
+                ),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::RespondTrailersWithoutFin(vec![
+                ("x-backend-checksum", "sha256-delayed-fin".to_string()),
+                ("transfer-encoding", "chunked".to_string()),
+            ]),
+            // Keep the stream open past the 25 ms backend read timeout. Pre-fix,
+            // h3 had the trailer HEADERS buffered internally but withheld them
+            // until FIN, so the gateway's timeout collapse emitted clean EOS and
+            // dropped the trailers.
+            H3Step::StallFor(Duration::from_millis(200)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        25,
+    )
+    .await;
+
+    let resp = raw_h2c_request(
+        &harness.proxy_url("/api/delayed-fin-trailers"),
+        "GET",
+        &[("accept-encoding", "gzip"), ("range", "bytes=0-127")],
+    )
+    .await
+    .unwrap_or_else(|e| {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+    });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 206,
+        "expected delayed-FIN trailered response to stay successful; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected delayed-FIN trailer timeout to end cleanly; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(resp.body.as_slice(), body.as_ref());
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-delayed-fin"),
+        "backend trailer buffered before delayed FIN must be forwarded; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("transfer-encoding"),
+        "hop-by-hop trailer name must be stripped before forwarding; trailers={:?}",
+        resp.trailers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.path == "/delayed-fin-trailers"),
+        "H3 backend must have received the delayed-FIN request; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 16 — a LARGE 206 (no Content-Length) under a small response-size limit
 // is STREAMED (status 206 reaches the client) instead of being converted into a
 // buffered `502 ResponseBodyTooLarge`. The streamed body is then truncated at
 // the limit (a mid-stream `RST_STREAM`), but the `206` status proves the

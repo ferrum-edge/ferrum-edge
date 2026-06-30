@@ -16089,9 +16089,12 @@ async fn handle_proxy_request_inner(
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
     let mut hbone_request_body_exceeded = None;
-    let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
+    let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
+        retry_config
+    {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
+        let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let mut body_hook_ctx = if needs_final_request_body_context {
@@ -16275,7 +16278,6 @@ async fn handle_proxy_request_inner(
                 }
             }
 
-            backend_admission_started_at = Instant::now();
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -16304,6 +16306,12 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            // Start the final-attempt health/LB/adaptive-concurrency sample
+            // after admission succeeds. This mirrors `proxy_to_backend`, which
+            // resets the same timer immediately before dispatch. A rotated
+            // retry's successful target must not inherit the previous target's
+            // failed-attempt latency or retry backoff in least-latency EWMA.
+            backend_admission_started_at = Instant::now();
 
             warn!(
                 proxy_id = %proxy.id,
@@ -16367,8 +16375,9 @@ async fn handle_proxy_request_inner(
                     .backend_capabilities
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
+            final_upstream_target = current_target.clone();
         }
-        (result, current_cb_target_key)
+        (result, current_cb_target_key, final_upstream_target)
     } else {
         let mut body_hook_ctx = if needs_final_request_body_context {
             Some(ctx.clone_for_final_request_body_hooks())
@@ -16439,7 +16448,7 @@ async fn handle_proxy_request_inner(
                 .await);
             }
         };
-        (resp, cb_target_key.clone())
+        (resp, cb_target_key.clone(), upstream_target.clone())
     };
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
@@ -16505,7 +16514,7 @@ async fn handle_proxy_request_inner(
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
     };
-    let streaming_h3_content_length = match &response_body {
+    let streaming_h3_header_content_length = match &response_body {
         ResponseBody::StreamingH3(_) => response_headers
             .get("content-length")
             .and_then(|v| v.parse::<u64>().ok()),
@@ -16515,7 +16524,7 @@ async fn handle_proxy_request_inner(
     // Treat declared zero-length responses as already ended for the defer gate;
     // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
     let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
-        && streaming_h3_content_length == Some(0);
+        && streaming_h3_header_content_length == Some(0);
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
         && streaming_dispatch_should_defer(
             &proxy,
@@ -16527,7 +16536,7 @@ async fn handle_proxy_request_inner(
             streaming_response_status_is_passively_unhealthy(
                 &epoch.load_balancer,
                 &proxy,
-                upstream_target.as_deref(),
+                final_upstream_target.as_deref(),
                 response_status,
             ),
         );
@@ -16540,16 +16549,16 @@ async fn handle_proxy_request_inner(
             streaming_response_status_is_passively_unhealthy(
                 &epoch.load_balancer,
                 &proxy,
-                upstream_target.as_deref(),
+                final_upstream_target.as_deref(),
                 response_status,
             ),
         );
     let defer_streaming_dispatch = defer_streaming_h2_dispatch || defer_streaming_h3_dispatch;
-    // TTFB captured at header arrival; reused whether the deferred outcome is
-    // recorded synchronously (an after_proxy reject replaced the streaming body)
-    // or at body completion, matching the synchronous path's
-    // `backend_start.elapsed()` least-latency sample.
-    let streaming_dispatch_elapsed = backend_start.elapsed();
+    // Final-attempt dispatch elapsed for CB/passive-health/least-latency and
+    // adaptive-concurrency samples. `backend_start` intentionally spans every
+    // retry attempt and backoff for transaction logs below; using it here would
+    // penalize a rotated retry target with another target's failure/backoff.
+    let final_backend_dispatch_elapsed = backend_admission_started_at.elapsed();
     if defer_streaming_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
@@ -16571,20 +16580,20 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
             backend_resp.connection_error,
             backend_error_class,
             cb_retry_probe_slot_available,
             skip_final_cb_record,
-            backend_start.elapsed(),
+            final_backend_dispatch_elapsed,
         );
     }
     let backend_admission_response_status = response_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = backend_admission_started_at.elapsed();
+    let backend_admission_elapsed = final_backend_dispatch_elapsed;
     let is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -16678,14 +16687,14 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             backend_admission_response_status,
             backend_admission_connection_error,
             backend_admission_error_class,
             false,
             skip_final_cb_record || cb_stale,
-            streaming_dispatch_elapsed,
+            final_backend_dispatch_elapsed,
         );
     }
 
@@ -17276,14 +17285,14 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&proxy),
                         Arc::clone(&epoch.load_balancer),
                         upstream_balancer.clone(),
-                        upstream_target.clone(),
+                        final_upstream_target.clone(),
                         final_cb_target_key.clone(),
                         backend_admission_response_status,
                         false,
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_dispatch_elapsed,
+                        final_backend_dispatch_elapsed,
                     )
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
@@ -17296,7 +17305,9 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let cl = streaming_h3_content_length;
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -17354,14 +17365,14 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&proxy),
                         Arc::clone(&epoch.load_balancer),
                         upstream_balancer.clone(),
-                        upstream_target.clone(),
+                        final_upstream_target.clone(),
                         final_cb_target_key.clone(),
                         backend_admission_response_status,
                         false,
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_dispatch_elapsed,
+                        final_backend_dispatch_elapsed,
                     )
                     .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
             }
