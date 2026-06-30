@@ -5717,13 +5717,11 @@ impl ProxyState {
         {
             let egress_policy = &self.env_config.backend_allow_ips;
             let denied_literal = |candidate: &ReqwestWarmupCandidate| -> bool {
-                let bare = candidate
-                    .host
-                    .strip_prefix('[')
-                    .and_then(|h| h.strip_suffix(']'))
-                    .unwrap_or(candidate.host.as_str());
-                bare.parse::<std::net::IpAddr>()
-                    .ok()
+                // Warmup dials are reqwest HEAD/capability probes, so screen with
+                // the URL-canonicalizing `egress_literal_ip` (matches the request
+                // path) — a non-canonical literal like `2852039166` would
+                // otherwise be probed straight to the metadata IP.
+                crate::config::types::egress_literal_ip(&candidate.host)
                     .and_then(|ip| egress_policy.deny_reason(&ip))
                     .inspect(|reason| {
                         warn!(
@@ -23521,6 +23519,15 @@ mod tests {
         assert!(denied_literal_backend_ip("2852039166", &policy).is_some());
         assert!(denied_literal_backend_ip("0xa9fea9fe", &policy).is_some());
         assert!(denied_literal_backend_ip("0251.0376.0251.0376", &policy).is_some());
+        // The URL parser strips ASCII tab/newline/CR from the authority before
+        // parsing, so these canonicalize to the metadata IP at dispatch; the guard
+        // must strip them too rather than treat the raw host as a DNS name.
+        assert!(denied_literal_backend_ip("169.254.169.\n254", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.\t169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip("2852039166\r", &policy).is_some());
+        // A digit-leading hostname is still a hostname (the numeric prefilter must
+        // not misclassify it) and is screened by the resolver, not here.
+        assert!(denied_literal_backend_ip("3com.example.com", &policy).is_none());
         // Allowed literals (loopback / RFC1918) → not blocked.
         assert!(denied_literal_backend_ip("127.0.0.1", &policy).is_none());
         assert!(denied_literal_backend_ip("10.0.0.1", &policy).is_none());

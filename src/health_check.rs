@@ -855,12 +855,11 @@ impl HealthChecker {
                 // A target whose literal IP is denied by the egress policy is
                 // never dialed; treat it as a failed probe (unhealthy) instead.
                 let egress_denied = probe_egress_policy.as_ref().and_then(|policy| {
-                    let bare = host
-                        .strip_prefix('[')
-                        .and_then(|h| h.strip_suffix(']'))
-                        .unwrap_or(host.as_str());
-                    bare.parse::<std::net::IpAddr>()
-                        .ok()
+                    // Active HTTP health probes dial through reqwest, so screen
+                    // with the URL-canonicalizing `egress_literal_ip` (matches the
+                    // request path) — a non-canonical literal such as `2852039166`
+                    // would otherwise be probed straight to the metadata IP.
+                    crate::config::types::egress_literal_ip(&host)
                         .and_then(|ip| policy.deny_reason(&ip))
                 });
                 let probe_success = if let Some(reason) = egress_denied {

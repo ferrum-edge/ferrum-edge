@@ -2316,27 +2316,72 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 /// bracketed denied literal parses as a non-IP here and is admitted, only to be
 /// blocked later at dispatch.
 pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    // Canonical literal first (also covers bracketed IPv6).
+    if let Some(ip) = stream_literal_ip(host) {
+        return Some(ip);
+    }
+
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return Some(ip);
+    // Match the URL parser's host-literal handling before deciding this is a DNS
+    // hostname. The HTTP client stack (reqwest, the H2/gRPC/H3 pools, kafka broker
+    // dials) parses authorities through `url`/getaddrinfo, which accept
+    // non-canonical IPv4 literal forms (a 32-bit decimal, hex, or octal-component
+    // address) and canonicalize them to an IPv4 address, skipping the
+    // DnsCacheResolver. The URL parser also STRIPS ASCII tab/newline/CR from the
+    // authority before parsing, so `169.254.169.\n254` canonicalizes to the
+    // metadata IP; replicate that strip here, or the screen and the dispatcher
+    // disagree and the literal slips through. Stream (`tcp`/`udp`/`dtls`)
+    // backends resolve through `DnsCache::resolve` instead and must use
+    // [`stream_literal_ip`].
+    let stripped;
+    let cleaned = if bare.contains(['\t', '\n', '\r']) {
+        stripped = bare.replace(['\t', '\n', '\r'], "");
+        stripped.as_str()
+    } else {
+        bare
+    };
+
+    // Hot-path guard: a URL-style IPv4 literal (decimal/hex/octal) always begins
+    // with an ASCII digit, while an ordinary DNS hostname does not. Every
+    // canonical literal (including IPv6) was already handled by
+    // `stream_literal_ip` above, so skip the allocating URL/IDNA parse for the
+    // common hostname case — this is called on the request path for every
+    // hostname-backed dispatch and must stay allocation-free there.
+    if !cleaned
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_digit())
+    {
+        return None;
     }
 
-    // Match the URL parser's host-literal handling before deciding this is a
-    // DNS hostname. The HTTP client stack uses `url`/reqwest parsing, which
-    // accepts non-canonical IPv4 literal forms (for example a 32-bit decimal,
-    // hexadecimal, or octal components) and canonicalizes them to an IPv4
-    // address. Those forms skip resolver-side egress checks just like ordinary
-    // IP literals, so config admission and runtime dispatch must screen them as
-    // IPs too.
-    match url::Host::parse(bare).ok()? {
+    match url::Host::parse(cleaned).ok()? {
         url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
         url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
         url::Host::Domain(_) => None,
     }
+}
+
+/// Canonical-literal-only screen (bracket strip + `IpAddr::parse`) for **stream**
+/// (`tcp`/`udp`/`dtls`) backends. Their dial path resolves through
+/// `DnsCache::resolve`, whose literal fast path is `IpAddr::parse` and which
+/// otherwise performs real DNS and then policy-screens the *resolved* address. A
+/// non-canonical numeric host (e.g. a service legitimately named `111`) is a DNS
+/// NAME on that path, not the URL-canonicalized literal `0.0.0.111`, so it must
+/// NOT be canonicalized here — doing so would wrongly reject it at admission even
+/// though the stream path would resolve and policy-check the real DNS result. The
+/// URL-canonicalizing sibling [`egress_literal_ip`] is for HTTP/URL-dispatched
+/// backends.
+pub(crate) fn stream_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .ok()
 }
 
 /// Wraps the operator pattern in a non-capturing group and anchors the group,
@@ -4338,7 +4383,21 @@ impl Proxy {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if let Some(ip) = egress_literal_ip(&self.backend_host)
+        // Stream (`tcp`/`udp`/`dtls`) backends resolve through `DnsCache::resolve`
+        // (canonical literals only; everything else is real DNS, then the
+        // resolved address is policy-screened), so a numeric host is a DNS name —
+        // screen them with `stream_literal_ip`. HTTP-family backends are dialed
+        // through `url`/reqwest, which canonicalizes non-canonical IPv4 spellings
+        // into literals that skip the resolver — screen those with
+        // `egress_literal_ip`.
+        let parse_literal = |host: &str| {
+            if self.effective_scheme().is_stream() {
+                stream_literal_ip(host)
+            } else {
+                egress_literal_ip(host)
+            }
+        };
+        if let Some(ip) = parse_literal(&self.backend_host)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
@@ -4346,7 +4405,7 @@ impl Proxy {
             ));
         }
         if let Some(ref dns_override) = self.dns_override
-            && let Some(ip) = egress_literal_ip(dns_override)
+            && let Some(ip) = parse_literal(dns_override)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
@@ -5245,13 +5304,22 @@ impl Upstream {
     /// Screen this upstream's literal-IP target hosts against the backend
     /// egress policy. Hostname targets are screened at DNS-resolution time.
     /// Returns prefix-free messages so each caller can attribute them.
+    ///
+    /// Uses the canonical-literal-only [`stream_literal_ip`] rather than the
+    /// URL-canonicalizing [`egress_literal_ip`]: an upstream can be referenced by
+    /// stream (`tcp`/`udp`) proxies whose dial path resolves a numeric name like
+    /// `111` through DNS, so URL-canonicalizing it here would wrongly reject a
+    /// legitimate stream target at admission. URL-style IPv4 spellings on an
+    /// HTTP-family target are still blocked at dispatch by the request-path
+    /// `denied_literal_backend_ip` screen (which uses `egress_literal_ip` on the
+    /// resolved target), so this admission scope does not weaken HTTP egress.
     pub fn validate_backend_egress_ips(
         &self,
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for (i, target) in self.targets.iter().enumerate() {
-            if let Some(ip) = egress_literal_ip(&target.host)
+            if let Some(ip) = stream_literal_ip(&target.host)
                 && let Some(reason) = backend_allow_ips.deny_reason(&ip)
             {
                 errors.push(format!(
