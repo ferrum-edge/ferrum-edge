@@ -622,6 +622,61 @@ async fn default_max_tokens_uses_provider_native_containers_when_detected() {
 }
 
 #[tokio::test]
+async fn default_max_tokens_native_bedrock_converse_gets_no_top_level() {
+    // #1950 round-3 P2: a genuine Bedrock Converse body carries `messages` +
+    // `inferenceConfig` but NO top-level `model` (the model is in the request
+    // URL). It caps via `inferenceConfig.maxTokens`, and the AWS Converse API
+    // rejects an unexpected top-level `max_tokens`, so the fallback must NOT be
+    // added — only the native cap.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let body = serde_json::to_vec(&json!({
+        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+        "inferenceConfig": {}
+    }))
+    .unwrap();
+    let modified: serde_json::Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body(&body, Some("application/json"), &HashMap::new())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        modified["inferenceConfig"]["maxTokens"], 256,
+        "native Converse cap must be injected"
+    );
+    assert!(
+        modified.get("max_tokens").is_none(),
+        "a native Bedrock Converse body (no top-level model) must not receive a top-level max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn default_max_tokens_model_bearing_inference_config_keeps_top_level() {
+    // A `model`-bearing `inferenceConfig` body is an OpenAI/Anthropic-shaped spoof
+    // (real Converse has no body model), so the top-level fallback still applies
+    // to keep an OpenAI-family upstream capped.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4",
+        "messages": [],
+        "inferenceConfig": {}
+    }))
+    .unwrap();
+    let modified: serde_json::Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body(&body, Some("application/json"), &HashMap::new())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        modified["max_tokens"], 256,
+        "a model-bearing inferenceConfig body must keep the top-level cap"
+    );
+}
+
+#[tokio::test]
 async fn default_max_tokens_injects_into_target_field_despite_cross_provider_token() {
     // Regression: the default-injection presence check is provider-aware. A
     // Gemini- or TGI-native body that carries a stray OpenAI-style top-level

@@ -1067,8 +1067,20 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
     // container and NO top-level prompt field, e.g. Gemini `contents`, TGI
     // `inputs`) is left to its native cap only, so a strict provider backend is
     // not handed an unsupported top-level cap field.
-    let wants_top_level_fallback =
-        matches!(target, DefaultTokenTarget::TopLevel) || has_top_level_prompt_marker(json);
+    //
+    // Bedrock Converse is the one provider-native shape that DOES carry a
+    // top-level prompt marker (`messages`) — but it caps via
+    // `inferenceConfig.maxTokens`, and the AWS Converse API rejects an unexpected
+    // top-level `max_tokens`. Real Converse bodies put the model in the request
+    // URL, so a body routing to the Bedrock target with NO top-level `model` is
+    // genuine Converse and must stay on the native cap only. A `model`-bearing
+    // `inferenceConfig` body is instead an OpenAI/Anthropic-shaped spoof (a
+    // model-bearing body an OpenAI-family upstream would process), so the
+    // top-level fallback still applies there to keep it capped.
+    let bedrock_converse_native =
+        matches!(target, DefaultTokenTarget::Bedrock) && json.get("model").is_none();
+    let wants_top_level_fallback = matches!(target, DefaultTokenTarget::TopLevel)
+        || (has_top_level_prompt_marker(json) && !bedrock_converse_native);
     let Some(obj) = json.as_object_mut() else {
         return false;
     };
