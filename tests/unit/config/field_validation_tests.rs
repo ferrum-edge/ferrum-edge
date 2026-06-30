@@ -2082,7 +2082,7 @@ fn test_proxy_udp_amplification_factor_negative_rejected() {
 
 // ---- SSRF: Backend IP policy validation tests ----
 
-use ferrum_edge::config::BackendAllowIps;
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 
 #[test]
 fn test_validate_backend_ip_policy_public_denies_private_proxy() {
@@ -2094,12 +2094,15 @@ fn test_validate_backend_ip_policy_public_denies_private_proxy() {
         }],
         ..Default::default()
     };
-    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    let result = config.validate_all_fields_with_ip_policy(
+        30,
+        &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+    );
     assert!(result.is_err());
     let errs = result.unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("denied by FERRUM_BACKEND_ALLOW_IPS"))
+            .any(|e| e.contains("denied by backend egress policy"))
     );
 }
 
@@ -2115,7 +2118,10 @@ fn test_validate_backend_ip_policy_public_allows_public_proxy() {
     };
     assert!(
         config
-            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .validate_all_fields_with_ip_policy(
+                30,
+                &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public)
+            )
             .is_ok()
     );
 }
@@ -2131,7 +2137,10 @@ fn test_validate_backend_ip_policy_public_denies_private_dns_override() {
         }],
         ..Default::default()
     };
-    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    let result = config.validate_all_fields_with_ip_policy(
+        30,
+        &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+    );
     assert!(result.is_err());
     let errs = result.unwrap_err();
     assert!(
@@ -2153,7 +2162,10 @@ fn test_validate_backend_ip_policy_public_allows_public_dns_override() {
     };
     assert!(
         config
-            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .validate_all_fields_with_ip_policy(
+                30,
+                &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public)
+            )
             .is_ok()
     );
 }
@@ -2168,7 +2180,10 @@ fn test_validate_backend_ip_policy_private_denies_public_proxy() {
         }],
         ..Default::default()
     };
-    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Private);
+    let result = config.validate_all_fields_with_ip_policy(
+        30,
+        &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
+    );
     assert!(result.is_err());
 }
 
@@ -2184,9 +2199,92 @@ fn test_validate_backend_ip_policy_both_allows_everything() {
     };
     assert!(
         config
-            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Both)
+            .validate_all_fields_with_ip_policy(30, &BackendEgressPolicy::unrestricted())
             .is_ok()
     );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_default_blocks_metadata_backend_host() {
+    // The PRODUCTION default (mode `both` + dangerous-range baseline) must
+    // reject a literal cloud-metadata backend_host at config-load time, even
+    // though loopback/RFC1918 backends remain allowed.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let metadata_cfg = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "169.254.169.254".to_string(),
+            ..make_proxy("meta", "/api")
+        }],
+        ..Default::default()
+    };
+    let err = metadata_cfg
+        .validate_all_fields_with_ip_policy(30, &default_policy)
+        .expect_err("metadata backend must be rejected by default");
+    assert!(
+        err.iter()
+            .any(|e| e.contains("169.254.169.254") && e.contains("backend egress policy"))
+    );
+
+    // ...but a loopback / RFC1918 backend still validates under the same default.
+    let private_cfg = GatewayConfig {
+        proxies: vec![
+            Proxy {
+                backend_host: "127.0.0.1".to_string(),
+                ..make_proxy("loop", "/lo")
+            },
+            Proxy {
+                backend_host: "10.0.0.5".to_string(),
+                ..make_proxy("rfc1918", "/internal")
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(
+        private_cfg
+            .validate_all_fields_with_ip_policy(30, &default_policy)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_proxy_validate_backend_egress_ips_helper() {
+    // The per-resource helper (used by the admin write path) screens
+    // backend_host + dns_override under the default policy.
+    let default_policy =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
+
+    let metadata = Proxy {
+        backend_host: "169.254.169.254".to_string(),
+        ..make_proxy("m", "/a")
+    };
+    let errs = metadata
+        .validate_backend_egress_ips(&default_policy)
+        .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("backend_host")
+        && e.contains("169.254.169.254")
+        && e.contains("backend egress policy")));
+
+    let rebind = Proxy {
+        backend_host: "example.com".to_string(),
+        dns_override: Some("fd00:ec2::254".to_string()),
+        ..make_proxy("r", "/b")
+    };
+    assert!(
+        rebind
+            .validate_backend_egress_ips(&default_policy)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("dns_override") && e.contains("fd00:ec2::254"))
+    );
+
+    // Loopback / RFC1918 backends still validate.
+    let ok = Proxy {
+        backend_host: "127.0.0.1".to_string(),
+        ..make_proxy("ok", "/c")
+    };
+    assert!(ok.validate_backend_egress_ips(&default_policy).is_ok());
 }
 
 #[test]
@@ -2202,7 +2300,10 @@ fn test_validate_backend_ip_policy_hostname_skipped() {
     };
     assert!(
         config
-            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .validate_all_fields_with_ip_policy(
+                30,
+                &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public)
+            )
             .is_ok()
     );
 }
@@ -2248,7 +2349,10 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         upstreams: vec![upstream],
         ..Default::default()
     };
-    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    let result = config.validate_all_fields_with_ip_policy(
+        30,
+        &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+    );
     assert!(result.is_err());
     let errs = result.unwrap_err();
     assert!(
@@ -2285,7 +2389,10 @@ fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
         ..Default::default()
     };
 
-    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    let result = config.validate_all_fields_with_ip_policy(
+        30,
+        &BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+    );
 
     assert!(result.is_err());
     let errs = result.unwrap_err();
@@ -2293,7 +2400,7 @@ fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
         e.contains("PluginConfig")
             && e.contains("mesh_route_dispatch")
             && e.contains("169.254.169.254")
-            && e.contains("FERRUM_BACKEND_ALLOW_IPS")
+            && e.contains("backend egress policy")
     }));
 }
 

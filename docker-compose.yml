@@ -193,6 +193,9 @@ services:
       FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD to a strong secret}@postgres:5432/ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}
       FERRUM_CP_GRPC_LISTEN_ADDR: 0.0.0.0:50051
+      # Local demo runs CP/DP gRPC config sync in plaintext on the compose network.
+      # Production must use TLS (FERRUM_CP_GRPC_TLS_CERT_PATH/KEY_PATH) instead of this flag.
+      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
@@ -226,6 +229,8 @@ services:
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
+      # Local demo: plaintext CP/DP gRPC on the compose network (use TLS in production).
+      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:
@@ -258,6 +263,8 @@ services:
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URLS: http://ferrum-cp:50051
+      # Local demo: plaintext CP/DP gRPC on the compose network (use TLS in production).
+      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
       FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:?Set FERRUM_CP_DP_GRPC_JWT_SECRET to a strong secret}
       FERRUM_LOG_LEVEL: info
     networks:

@@ -476,8 +476,8 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
         AdminHttpExposure::ReachableUnrestricted => {
             // database/cp only reach here with FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true
-            // (otherwise `validate()` already aborted startup). Read-only admin
-            // modes (file/dp/mesh) are warned but allowed to start.
+            // (otherwise `validate()` already aborted startup). Read-only modes
+            // (file/dp/mesh) are warned but allowed to start.
             if env_config.allow_insecure_admin_http {
                 warn!(
                     "FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true: the plaintext admin HTTP listener is \

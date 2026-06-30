@@ -305,7 +305,11 @@ where
         .await
         {
             Ok(result) => result,
-            Err(_) => return Err(H3TrailerFinishError::BackendTimeout),
+            Err(_) => match recv_stream.peek_recv_trailers() {
+                Ok(Some(trailers)) => Ok(Some(trailers)),
+                Ok(None) => return Err(H3TrailerFinishError::BackendTimeout),
+                Err(err) => return Err(H3TrailerFinishError::Backend(err)),
+            },
         }
     } else {
         recv_stream.recv_trailers().await
@@ -2059,6 +2063,54 @@ async fn handle_h3_request(
         .as_ref()
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+
+    // Enforce the backend egress policy for a literal-IP H3 backend BEFORE any
+    // dispatch. This sits ahead of the native-H3 / cross-protocol branch, both
+    // of which skip the DnsCacheResolver for an IP literal — so without it an H3
+    // client could still dial a denied literal (e.g. a DB row load only warned
+    // about) that H1/H2 clients are already blocked from. Hostname backends are
+    // screened by the resolver at dial time on every H3 dispatch path.
+    if let Some(reason) = crate::proxy::denied_literal_backend_or_dns_override(
+        effective_host,
+        &proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP H3 backend; not dialing"
+        );
+        // Release any HALF_OPEN probe slot the circuit-breaker check above
+        // admitted so the breaker doesn't wedge (mirrors the WS-origin reject).
+        crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        // `send_h3_error_flavor_aware` emits a gRPC error as HTTP 200 + trailers
+        // (gRPC errors ride 200), so the recorded request status must match the
+        // wire — 200 for gRPC, 502 otherwise — to agree with the H1/H2 gRPC
+        // egress reject path.
+        let reject_metric_status = if http_flavor == HttpFlavor::Grpc {
+            200
+        } else {
+            502
+        };
+        record_request(&state, reject_metric_status);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"backend address blocked by egress policy"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+            "backend address blocked by egress policy",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let backend_resolved_ip = state
         .dns_cache
         .resolve(
@@ -3716,7 +3768,10 @@ async fn handle_h3_request(
             (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
             (None, Some(_)) => true,
             (Some(_), Some(_)) => true,
-            (Some(_), None) => !h3_stream_result.request_on_wire,
+            (Some(_), None) => h3_connection_error(
+                h3_stream_result.request_on_wire,
+                h3_stream_result.error_class,
+            ),
         };
         // Prefer the body class so a body-only ClientDisconnect is recognized as
         // a client-side (non-backend) signal by passive health / the breaker
@@ -3875,7 +3930,10 @@ async fn handle_h3_request(
                 &method,
                 &crate::retry::BackendResponse {
                     status_code: result.status,
-                    connection_error: !result.request_on_wire,
+                    connection_error: h3_connection_error(
+                        result.request_on_wire,
+                        result.error_class,
+                    ),
                     body: crate::retry::ResponseBody::Buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
@@ -3886,7 +3944,7 @@ async fn handle_h3_request(
                 record_h3_backend_admission_outcome(
                     &mut backend_admission_permits,
                     result.status,
-                    !result.request_on_wire,
+                    h3_connection_error(result.request_on_wire, result.error_class),
                     result.error_class,
                     backend_admission_start.elapsed(),
                 );
@@ -3902,7 +3960,7 @@ async fn handle_h3_request(
                     );
                     cb.record_failure(
                         result.status,
-                        !result.request_on_wire,
+                        h3_connection_error(result.request_on_wire, result.error_class),
                         cb_retry_probe_slot_available,
                     );
                     cb_retry_probe_slot_available = false;
@@ -3940,6 +3998,40 @@ async fn handle_h3_request(
                     current_target = Some(next);
                 }
 
+                // Re-screen the rotated retry target BEFORE admission/dispatch:
+                // the native-H3 pool's `resolve_backend_addr_cached` fast-path
+                // returns IP literals without going through `DnsCache`, so a
+                // rotated denied literal / `dns_override` target (e.g. a warn-only
+                // DB/DP config carrying `169.254.169.254`) would otherwise be
+                // admitted and dialed here, bypassing the pre-loop screen that only
+                // covered the first target. Break with a synthetic
+                // `DispatchPolicyRejected` result so no backend is dialed and the
+                // post-loop `record_backend_outcome` (which skips the
+                // adaptive-concurrency / passive-health charge for that class via
+                // `client_side_no_backend_signal`) stays health/breaker-neutral.
+                if let Some(reason) = current_target.as_deref().and_then(|t| {
+                    crate::proxy::denied_literal_backend_or_dns_override(
+                        &t.host,
+                        &proxy,
+                        &state.env_config.backend_allow_ips,
+                    )
+                }) {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        reason,
+                        "Backend egress policy denied rotated H3 retry target; not dialing"
+                    );
+                    result = H3BufferedDispatchResult {
+                        status: 502,
+                        body: br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+                        headers: HashMap::new(),
+                        trailers: None,
+                        error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
+                    };
+                    break;
+                }
+
                 backend_admission_start = std::time::Instant::now();
                 backend_admission_permits = match run_h3_backend_admission_or_send_reject(
                     backend_admission_plugins.as_ref(),
@@ -3966,7 +4058,7 @@ async fn handle_h3_request(
                     proxy_id = %proxy.id,
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
-                    connection_error = !result.request_on_wire,
+                    connection_error = h3_connection_error(result.request_on_wire, result.error_class),
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
@@ -4663,6 +4755,27 @@ pub(crate) fn inject_sticky_cookie(
     }
 }
 
+/// Whether an H3 dispatch failure counts as a connect-class (pre-wire) backend
+/// failure for circuit-breaker / adaptive-concurrency accounting.
+///
+/// `request_on_wire` is the authoritative H3 signal — `connection_error` is its
+/// negation — for every *transport* class. The one exception is a gateway-side
+/// egress denial (`DispatchPolicyRejected`): it dialed no backend, so it must be
+/// neutral even though `request_on_wire` is false, otherwise adaptive concurrency
+/// shrinks the limit and the breaker trips for a policy denial. This is the same
+/// narrow override the native-H3 dispatch sites apply inline; `DispatchPolicyRejected`
+/// is a gateway class, not a transport class that could disagree with the signal.
+fn h3_connection_error(
+    request_on_wire: bool,
+    error_class: Option<crate::retry::ErrorClass>,
+) -> bool {
+    !request_on_wire
+        && !matches!(
+            error_class,
+            Some(crate::retry::ErrorClass::DispatchPolicyRejected)
+        )
+}
+
 fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
     // Graceful remote close (`H3_NO_ERROR` ApplicationClose / GOAWAY) at
     // the response read boundary is the peer's spec-legal teardown
@@ -5098,7 +5211,31 @@ async fn collect_h3_open_response_body(
                 }
                 response_body.extend_from_slice(&chunk_bytes);
             }
-            Ok(None) => break,
+            Ok(None) => {
+                let received = response_body.len() as u64;
+                if !crate::http3::client::is_response_body_complete_after_fin(
+                    received,
+                    method,
+                    response_status,
+                    content_length,
+                ) {
+                    error!(
+                        proxy_id = %proxy.id,
+                        received,
+                        declared = ?content_length,
+                        "HTTP/3 backend refined buffered response truncated (FIN before declared Content-Length)"
+                    );
+                    return H3BufferedDispatchResult {
+                        status: 502,
+                        body: br#"{"error":"HTTP/3 backend response truncated"}"#.to_vec(),
+                        headers: HashMap::new(),
+                        trailers: None,
+                        error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
+                        request_on_wire: true,
+                    };
+                }
+                break;
+            }
             Err(error) => {
                 let received = response_body.len() as u64;
                 if crate::http3::client::is_h3_graceful_close(&error)
@@ -5936,7 +6073,8 @@ async fn dispatch_grpc_native_h3(
             // pre-`send_request`) is a connection error; a post-wire reset, read
             // timeout, or oversized / aborted upload already reached the backend
             // wire and must NOT be recorded as a connect-class failure.
-            let outcome_connection_error = !e.request_on_wire();
+            let outcome_connection_error =
+                h3_connection_error(e.request_on_wire(), outcome_error_class);
             crate::proxy::backend_dispatch::record_backend_outcome(
                 state,
                 proxy,

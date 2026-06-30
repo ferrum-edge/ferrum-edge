@@ -87,6 +87,10 @@ pub enum H3Step {
     /// exercise backend-trailer forwarding to H1/H2 and native-H3 (gRPC)
     /// downstream clients.
     RespondTrailers(Vec<(&'static str, String)>),
+    /// Send an H3 trailers (HEADERS) frame without sending the terminal stream
+    /// FIN. Follow with `StallFor` to exercise gateway behavior when trailers
+    /// are delivered but the backend delays FIN past the read timeout.
+    RespondTrailersWithoutFin(Vec<(&'static str, String)>),
     /// Send `RESET_STREAM` with the given application error code, then
     /// end the script.
     SendStreamReset(u64),
@@ -567,6 +571,26 @@ async fn run_h3_script(
                     .send_data(bytes)
                     .await
                     .map_err(|e| format!("send_data: {e}"))?;
+            }
+            H3Step::RespondTrailersWithoutFin(pairs) => {
+                let stream = response_stream.as_mut().ok_or_else(|| {
+                    "RespondTrailers without preceding RespondHeaders".to_string()
+                })?;
+                let mut trailers = http::HeaderMap::new();
+                for (name, value) in pairs {
+                    if name.starts_with(':') {
+                        return Err(format!("pseudo-header {name:?} is illegal in trailers"));
+                    }
+                    let hn = HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|e| format!("bad trailer name {name}: {e}"))?;
+                    let hv = HeaderValue::from_str(&value)
+                        .map_err(|e| format!("bad trailer value {value}: {e}"))?;
+                    trailers.append(hn, hv);
+                }
+                stream
+                    .send_trailers(trailers)
+                    .await
+                    .map_err(|e| format!("send_trailers: {e}"))?;
             }
             H3Step::RespondTrailers(pairs) => {
                 let stream = response_stream.as_mut().ok_or_else(|| {

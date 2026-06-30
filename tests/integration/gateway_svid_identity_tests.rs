@@ -78,7 +78,7 @@ fn test_dns_cache() -> DnsCache {
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
         warmup_concurrency: 500,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         slow_threshold_ms: None,
         refresh_threshold_percent: 90,
         failed_retry_interval_seconds: 10,

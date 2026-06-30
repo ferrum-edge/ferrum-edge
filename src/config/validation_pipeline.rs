@@ -1,4 +1,4 @@
-use crate::config::BackendAllowIps;
+use crate::config::BackendEgressPolicy;
 use crate::config::types::GatewayConfig;
 use tracing::{error, warn};
 
@@ -17,11 +17,7 @@ enum ValidationStep<'a> {
     },
     AllFieldsWithIpPolicy {
         cert_expiry_warning_days: u64,
-        backend_allow_ips: &'a BackendAllowIps,
-        action: ValidationAction<'a>,
-    },
-    AllFields {
-        cert_expiry_warning_days: u64,
+        backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     },
     UniqueResourceIds {
@@ -61,6 +57,7 @@ enum ValidationStep<'a> {
         action: ValidationAction<'a>,
     },
     PluginConfigs {
+        backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     },
     PluginFileDependencies {
@@ -102,24 +99,12 @@ impl<'a> ValidationPipeline<'a> {
     pub(crate) fn validate_all_fields_with_ip_policy(
         mut self,
         cert_expiry_warning_days: u64,
-        backend_allow_ips: &'a BackendAllowIps,
+        backend_allow_ips: &'a BackendEgressPolicy,
         action: ValidationAction<'a>,
     ) -> Self {
         self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
             cert_expiry_warning_days,
             backend_allow_ips,
-            action,
-        });
-        self
-    }
-
-    pub(crate) fn validate_all_fields(
-        mut self,
-        cert_expiry_warning_days: u64,
-        action: ValidationAction<'a>,
-    ) -> Self {
-        self.steps.push(ValidationStep::AllFields {
-            cert_expiry_warning_days,
             action,
         });
         self
@@ -202,8 +187,15 @@ impl<'a> ValidationPipeline<'a> {
         self
     }
 
-    pub(crate) fn validate_plugin_configs(mut self, action: ValidationAction<'a>) -> Self {
-        self.steps.push(ValidationStep::PluginConfigs { action });
+    pub(crate) fn validate_plugin_configs(
+        mut self,
+        backend_allow_ips: &'a BackendEgressPolicy,
+        action: ValidationAction<'a>,
+    ) -> Self {
+        self.steps.push(ValidationStep::PluginConfigs {
+            backend_allow_ips,
+            action,
+        });
         self
     }
 
@@ -249,14 +241,6 @@ impl<'a> ValidationPipeline<'a> {
                         cert_expiry_warning_days,
                         backend_allow_ips,
                     ) {
-                        handle_validation_errors(action, errors, &mut collected_errors)?;
-                    }
-                }
-                ValidationStep::AllFields {
-                    cert_expiry_warning_days,
-                    action,
-                } => {
-                    if let Err(errors) = config.validate_all_fields(cert_expiry_warning_days) {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }
@@ -322,15 +306,19 @@ impl<'a> ValidationPipeline<'a> {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }
-                ValidationStep::PluginConfigs { action } => {
+                ValidationStep::PluginConfigs {
+                    backend_allow_ips,
+                    action,
+                } => {
                     let mut errors = Vec::new();
                     for plugin_config in &config.plugin_configs {
                         if !plugin_config.enabled {
                             continue;
                         }
-                        if let Err(err) = crate::plugins::validate_plugin_config(
+                        if let Err(err) = crate::plugins::validate_plugin_config_with_policy(
                             &plugin_config.plugin_name,
                             &plugin_config.config,
+                            backend_allow_ips,
                         ) {
                             let message = format!(
                                 "Plugin '{}' (id={}): {}",
@@ -516,7 +504,10 @@ mod tests {
         };
 
         let errors = ValidationPipeline::new(&mut config)
-            .validate_plugin_configs(ValidationAction::Collect)
+            .validate_plugin_configs(
+                &crate::config::BackendEgressPolicy::unrestricted(),
+                ValidationAction::Collect,
+            )
             .run()
             .expect("collect validation should return accumulated errors");
 

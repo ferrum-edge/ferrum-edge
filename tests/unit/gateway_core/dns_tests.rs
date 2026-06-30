@@ -1,6 +1,6 @@
 //! Tests for DNS cache and resolution module
 
-use ferrum_edge::config::BackendAllowIps;
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use std::collections::HashMap;
 
@@ -15,7 +15,7 @@ fn default_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
 fn public_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
     DnsConfig {
         global_overrides: overrides,
-        backend_allow_ips: BackendAllowIps::Public,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
         ..DnsConfig::default()
     }
 }
@@ -162,9 +162,60 @@ async fn test_dns_public_policy_denies_case_insensitive_global_override() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("169.254.169.254"), "unexpected error: {err}");
     assert!(
-        err.contains("denied by FERRUM_BACKEND_ALLOW_IPS"),
+        err.contains("denied by backend egress policy"),
         "unexpected error: {err}"
     );
+}
+
+/// A DnsConfig with the *production default* egress policy (mode `both` +
+/// dangerous-range baseline on). Models a gateway with no `FERRUM_BACKEND_*`
+/// env vars set.
+fn default_egress_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
+    DnsConfig {
+        global_overrides: overrides,
+        backend_allow_ips: BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true)
+            .expect("valid default policy"),
+        ..DnsConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn test_dns_default_policy_blocks_metadata_rebind() {
+    // DNS-rebinding defense under the DEFAULT policy: a hostname whose answer
+    // resolves (here via override) to the cloud-metadata address is rejected at
+    // the cache-insertion path, so the denied IP is never cached or served —
+    // even though the mode is `both`. Every fresh resolve is screened, which is
+    // exactly what stops a public→private rebind.
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "rebind.example.com".to_string(),
+        "169.254.169.254".to_string(),
+    );
+    let cache = DnsCache::new(default_egress_dns_config(overrides));
+
+    let result = cache.resolve("rebind.example.com", None, None).await;
+    assert!(
+        result.is_err(),
+        "metadata answer must be rejected under the default policy"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("denied by backend egress policy"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_dns_default_policy_allows_loopback_and_rfc1918() {
+    // The default must NOT break normal private backends (mesh/sidecar loopback,
+    // internal RFC1918 services).
+    let mut overrides = HashMap::new();
+    overrides.insert("app.local".to_string(), "127.0.0.1".to_string());
+    overrides.insert("svc.internal".to_string(), "10.0.0.5".to_string());
+    let cache = DnsCache::new(default_egress_dns_config(overrides));
+
+    assert!(cache.resolve("app.local", None, None).await.is_ok());
+    assert!(cache.resolve("svc.internal", None, None).await.is_ok());
 }
 
 #[tokio::test]

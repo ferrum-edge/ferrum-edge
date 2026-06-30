@@ -332,7 +332,7 @@ mod inner {
         db_type_str: String,
         slow_query_threshold_ms: Option<u64>,
         cert_expiry_warning_days: u64,
-        backend_allow_ips: crate::config::BackendAllowIps,
+        backend_allow_ips: crate::config::BackendEgressPolicy,
         failover_urls: Vec<String>,
         replica_set_configured: Arc<AtomicBool>,
     }
@@ -411,7 +411,7 @@ mod inner {
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
                 cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
-                backend_allow_ips: crate::config::BackendAllowIps::Both,
+                backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
                 failover_urls: Vec::new(),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
             })
@@ -2063,7 +2063,7 @@ mod inner {
             self.cert_expiry_warning_days = days;
         }
 
-        fn set_backend_allow_ips(&mut self, policy: crate::config::BackendAllowIps) {
+        fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy) {
             self.backend_allow_ips = policy;
         }
 
@@ -7907,7 +7907,7 @@ mod inner {
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
                 cert_expiry_warning_days: 30,
-                backend_allow_ips: crate::config::BackendAllowIps::Both,
+                backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
                 failover_urls,
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,

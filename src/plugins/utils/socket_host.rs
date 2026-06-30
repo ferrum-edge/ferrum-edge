@@ -62,6 +62,37 @@ pub fn parse_socket_host(
     }
 }
 
+impl SocketHost {
+    /// Screen a literal-IP `dial_host` against the backend egress policy, so a
+    /// socket log sink (tcp/udp/statsd) pointed at a denied address (e.g.
+    /// `169.254.169.254`) is rejected at config-load time — these sinks dial
+    /// their `host` directly rather than through the policy-screened HTTP
+    /// client. A hostname (`warmup_hostname` set) is screened at resolution
+    /// time by the DNS cache instead.
+    pub fn screen_egress_ip(
+        &self,
+        plugin_name: &str,
+        field: &str,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), String> {
+        if self.warmup_hostname.is_some() {
+            return Ok(());
+        }
+        let Ok(ip) = self.dial_host.parse::<IpAddr>() else {
+            return Ok(());
+        };
+        match backend_allow_ips.deny_reason(&ip) {
+            None => Ok(()),
+            Some(reason) => Err(format!(
+                "{plugin_name}: '{field}' address {ip} is blocked by the backend egress \
+                 policy ({reason}); refusing to send telemetry there. Adjust \
+                 FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS or point the sink at \
+                 an allowed address."
+            )),
+        }
+    }
+}
+
 pub fn socket_addr_lookup_input(host: &str, port: u16) -> String {
     if host.parse::<Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")

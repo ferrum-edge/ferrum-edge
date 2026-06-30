@@ -102,6 +102,49 @@ async fn start_status_server(port: u16, name: &'static str, status_code: u16) {
     }
 }
 
+async fn start_retry_accounting_server_on(
+    listener: TcpListener,
+    name: &'static str,
+    trigger_status: u16,
+    probe_status: u16,
+) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let server_name = name;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let status_code = if path.contains("/trigger") {
+                    trigger_status
+                } else {
+                    probe_status
+                };
+                let reason = if status_code < 400 { "OK" } else { "Error" };
+                let body = format!(
+                    r#"{{"server":"{}","path":"{}","status_code":{}}}"#,
+                    server_name, path, status_code
+                );
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    status_code,
+                    reason,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
 /// Start a server that initially returns errors then switches to healthy.
 /// Uses a shared atomic counter to track call count.
 async fn start_flapping_server(port: u16, name: &'static str, fail_count: u32) {
@@ -1179,6 +1222,116 @@ plugin_configs: []
         success_count > 0,
         "Some requests should succeed via retry to fallback-server"
     );
+
+    let _ = gateway.kill();
+    s1.abort();
+    s2.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_retry_final_status_marks_rotated_target_passively_unhealthy() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    let initial_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let initial_port = initial_listener.local_addr().unwrap().port();
+    let retry_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let retry_port = retry_listener.local_addr().unwrap().port();
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "retry-accounting-proxy"
+    listen_path: "/retry-accounting"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {initial_port}
+    strip_listen_path: true
+    upstream_id: "retry-accounting-upstream"
+    retry:
+      max_retries: 1
+      retryable_status_codes: [502]
+      retryable_methods: ["GET"]
+      retry_on_connect_failure: false
+      backoff: !fixed
+        delay_ms: 1
+
+upstreams:
+  - id: "retry-accounting-upstream"
+    name: "Retry Accounting Upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: {initial_port}
+        weight: 1
+      - host: "127.0.0.1"
+        port: {retry_port}
+        weight: 1
+    health_checks:
+      passive:
+        unhealthy_status_codes: [429]
+        unhealthy_threshold: 1
+        unhealthy_window_seconds: 60
+
+consumers: []
+plugin_configs: []
+"#
+    );
+
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
+
+    // Round-robin dispatches the first request to initial-target. That response
+    // is retryable (502), so the retry rotates to retry-target, whose final 429
+    // is passively unhealthy. The follow-up probe should therefore avoid only
+    // retry-target. Before #1943's fix the final 429 was charged to
+    // initial-target, making the probe land on retry-target instead.
+    let s1 = tokio::spawn(start_retry_accounting_server_on(
+        initial_listener,
+        "initial-target",
+        502,
+        200,
+    ));
+    let s2 = tokio::spawn(start_retry_accounting_server_on(
+        retry_listener,
+        "retry-target",
+        429,
+        429,
+    ));
+
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+
+    let client = reqwest::Client::new();
+    let trigger_resp = client
+        .get(format!(
+            "http://127.0.0.1:{}/retry-accounting/trigger",
+            proxy_port
+        ))
+        .send()
+        .await
+        .expect("trigger request should complete");
+    assert_eq!(trigger_resp.status().as_u16(), 429);
+    let trigger_body = trigger_resp.text().await.unwrap_or_default();
+    assert_eq!(parse_server_name(&trigger_body), "retry-target");
+
+    sleep(Duration::from_millis(200)).await;
+
+    let probe_resp = client
+        .get(format!(
+            "http://127.0.0.1:{}/retry-accounting/probe",
+            proxy_port
+        ))
+        .send()
+        .await
+        .expect("probe request should complete");
+    assert_eq!(probe_resp.status().as_u16(), 200);
+    let probe_body = probe_resp.text().await.unwrap_or_default();
+    assert_eq!(parse_server_name(&probe_body), "initial-target");
 
     let _ = gateway.kill();
     s1.abort();

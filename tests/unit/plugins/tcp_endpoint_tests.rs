@@ -11,6 +11,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::utils::resolve_tcp_endpoint;
 
 fn cache_with_override_and_policy(host: &str, ip: &str, policy: BackendAllowIps) -> DnsCache {
+    let policy = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(policy);
     let mut overrides = HashMap::new();
     overrides.insert(host.to_string(), ip.to_string());
     DnsCache::new(DnsConfig {

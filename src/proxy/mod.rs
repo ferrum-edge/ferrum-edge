@@ -1799,7 +1799,12 @@ fn http2_pool_sender_error_response(
         status_code: 502,
         body: ResponseBody::Buffered(error_body.into_bytes()),
         headers: HashMap::new(),
-        connection_error: true,
+        // Derive connection_error from the class so a gateway-side egress denial
+        // (DispatchPolicyRejected — a hostname/dns_override that resolves or
+        // rebinds to a blocked IP) is non-retryable and neutral to backend
+        // health: request_reached_wire(DispatchPolicyRejected) is true, so this
+        // is false (no backend was dialed) instead of a hard-coded connect error.
+        connection_error: !retry::request_reached_wire(h2_error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(h2_error_class),
     }
@@ -4777,6 +4782,43 @@ impl ProxyState {
         );
 
         self.backend_capabilities.retain_keys(&seen);
+
+        // Screen denied-literal probe targets: capability classification dials
+        // backends with reqwest/H2/H3 probes that skip the DnsCacheResolver for
+        // IP literals, so a blocked address (e.g. 169.254.169.254) would be
+        // probed at startup/reload even when a DB-sourced row only warned at
+        // load. Dropping it leaves the target `Unknown`, which routes via
+        // reqwest at dispatch and is rejected there by the same policy.
+        {
+            let egress_policy = &self.env_config.backend_allow_ips;
+            targets.retain(|target| {
+                // Screen BOTH the probe's backend host literal AND a literal
+                // `dns_override`: the H3/H2/reqwest capability probes dial via
+                // `resolve_backend_addr_cached`, whose IP-literal fast path skips
+                // the `DnsCacheResolver`, so a denied literal in EITHER field would
+                // be dialed at startup/reload (e.g. a QUIC probe to 169.254.169.254)
+                // even when a DB-sourced row only warned at load. Mirrors the
+                // request-path `denied_literal_backend_or_dns_override` guard;
+                // dropping the target leaves it `Unknown`, which routes via reqwest
+                // at dispatch and is rejected there by the same policy.
+                match denied_literal_backend_or_dns_override(
+                    target.host(),
+                    &target.proxy,
+                    egress_policy,
+                ) {
+                    Some(reason) => {
+                        warn!(
+                            host = %target.host(),
+                            dns_override = ?target.proxy.dns_override,
+                            reason,
+                            "Skipping capability probe for egress-policy-denied backend"
+                        );
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
         targets
     }
 
@@ -5665,6 +5707,36 @@ impl ProxyState {
                 &mut http_candidates,
                 &mut https_candidates,
             );
+        }
+
+        // Drop any warmup candidate whose backend is a literal IP denied by the
+        // egress policy: startup must never issue a HEAD/capability probe to a
+        // blocked address (e.g. 169.254.169.254) even when a DB-sourced row only
+        // warned at load. Hostname candidates are screened at resolve time by the
+        // DnsCacheResolver plugged into every warmup client.
+        {
+            let egress_policy = &self.env_config.backend_allow_ips;
+            let denied_literal = |candidate: &ReqwestWarmupCandidate| -> bool {
+                let bare = candidate
+                    .host
+                    .strip_prefix('[')
+                    .and_then(|h| h.strip_suffix(']'))
+                    .unwrap_or(candidate.host.as_str());
+                bare.parse::<std::net::IpAddr>()
+                    .ok()
+                    .and_then(|ip| egress_policy.deny_reason(&ip))
+                    .inspect(|reason| {
+                        warn!(
+                            host = %candidate.host,
+                            port = candidate.port,
+                            reason,
+                            "Skipping warmup probe for egress-policy-denied backend"
+                        );
+                    })
+                    .is_some()
+            };
+            http_candidates.retain(|_, candidate| !denied_literal(candidate));
+            https_candidates.retain(|_, candidate| !denied_literal(candidate));
         }
 
         // Phase 1: capability refresh ‖ HTTP-only reqwest warmup. HTTP
@@ -7662,6 +7734,7 @@ async fn handle_websocket_request_authenticated(
                     state.max_websocket_frame_size_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
+                    Some(&state.dns_cache),
                 )
                 .await
                 .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
@@ -7693,6 +7766,13 @@ async fn handle_websocket_request_authenticated(
                 // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // A gateway-side egress-policy rejection (denied literal-IP
+                // backend) never reached a backend: it must be non-retryable AND
+                // neutral to backend health — no circuit-breaker trip and no
+                // backend-admission failure — matching the HTTP/H3
+                // DispatchPolicyRejected dispatch path.
+                let ws_egress_denied =
+                    matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
                 // handshake / port exhaustion). A backend that got the
@@ -7703,6 +7783,7 @@ async fn handle_websocket_request_authenticated(
                     ws_attempt < retry_config.max_retries
                         && retry_config.retry_on_connect_failure
                         && ws_is_pre_wire
+                        && !ws_egress_denied
                 } else {
                     false
                 };
@@ -7852,9 +7933,18 @@ async fn handle_websocket_request_authenticated(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    if ws_egress_denied {
+                        // Gateway-side egress denial dialed no backend: release any
+                        // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
+                        // so the breaker can recover, rather than leaking it by
+                        // skipping the record entirely.
+                        cb.record_neutral(ws_cb_probe_slot_available);
+                    } else {
+                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                    }
                 }
                 if !backend_outcome_already_recorded
+                    && !ws_egress_denied
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -8744,6 +8834,11 @@ pub(crate) async fn connect_websocket_backend(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
+    // When `Some`, the backend host is resolved through the gateway DNS cache so
+    // the egress policy is enforced on the *resolved* address (DNS-rebinding
+    // safe) and that exact IP is dialed. `None` (test helpers only) keeps OS
+    // resolution. Literal-IP backends are screened explicitly regardless.
+    dns_cache: Option<&crate::dns::DnsCache>,
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -8757,6 +8852,24 @@ pub(crate) async fn connect_websocket_backend(
             hyper::header::HeaderValue::from_str(value),
         ) {
             ws_request.headers_mut().append(header_name, header_value);
+        }
+    }
+
+    // Enforce the backend egress policy for a literal-IP WebSocket backend
+    // before dialing (the dial skips the DnsCacheResolver for IP literals).
+    if let Ok(parsed) = url::Url::parse(backend_url) {
+        let literal_ip = match parsed.host() {
+            Some(url::Host::Ipv4(a)) => Some(std::net::IpAddr::V4(a)),
+            Some(url::Host::Ipv6(a)) => Some(std::net::IpAddr::V6(a)),
+            _ => None,
+        };
+        if let Some(ip) = literal_ip
+            && let Some(reason) = env_config.backend_allow_ips.deny_reason(&ip)
+        {
+            return Err(format!(
+                "backend egress policy denied literal-IP WebSocket backend {ip}: {reason}"
+            )
+            .into());
         }
     }
 
@@ -8784,7 +8897,27 @@ pub(crate) async fn connect_websocket_backend(
         }
     });
     let connect_future = async {
-        let tcp = tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?;
+        // Resolve through the gateway DNS cache when available so the egress
+        // policy is enforced on the resolved address (a hostname that resolves —
+        // or rebinds — to a denied IP such as 169.254.169.254 fails here) and we
+        // dial that exact IP. The TLS connector still derives SNI from
+        // `ws_request` (the hostname), so dialing the IP is transparent.
+        let tcp = match dns_cache {
+            Some(cache) => {
+                let resolved_ip = cache
+                    .resolve(
+                        &dial_host,
+                        proxy.dns_override.as_deref(),
+                        proxy.dns_cache_ttl_seconds,
+                    )
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("WebSocket backend resolution failed for {dial_host}: {e}").into()
+                    })?;
+                tokio::net::TcpStream::connect((resolved_ip, dial_port)).await?
+            }
+            None => tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?,
+        };
         // Without nodelay, 70 KB WS messages hit Nagle + delayed-ACK
         // (~40 ms/msg); keepalive bounds dead-peer detection on idle
         // long-lived sessions.
@@ -13799,6 +13932,39 @@ async fn handle_proxy_request_inner(
             resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref());
         let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
         let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
+        // Enforce the backend egress policy for a literal-IP gRPC backend before
+        // dialing (the gRPC pool skips the DnsCacheResolver for IP literals).
+        if let Some(reason) = denied_literal_backend_or_dns_override(
+            grpc_effective_host,
+            grpc_dispatch_proxy,
+            &state.env_config.backend_allow_ips,
+        ) {
+            warn!(
+                proxy_id = %proxy.id,
+                backend = %grpc_effective_host,
+                reason,
+                "Backend egress policy denied literal-IP gRPC backend; not dialing"
+            );
+            // Release a HALF_OPEN probe slot `check_circuit_breaker` may have
+            // admitted (else it wedges the breaker) and count the request so
+            // policy-denied gRPC calls still appear in request/status metrics.
+            // Unlike the cross-cluster reject above (which runs BEFORE
+            // `grpc_probe_guard` exists), this reject is AFTER the guard, so
+            // disarm it first — otherwise its still-armed `Drop` fires a SECOND
+            // neutral release that would decrement another in-flight probe slot.
+            grpc_probe_guard.disarm();
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+            return Ok(grpc_proxy::build_grpc_error_response(
+                14,
+                "backend address blocked by egress policy",
+            ));
+        }
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
         let mut grpc_backend_url = build_backend_url_with_target(
             grpc_dispatch_proxy,
@@ -14282,7 +14448,11 @@ async fn handle_proxy_request_inner(
                 // previously here let post-wire errors bypass
                 // `retry_on_methods`.
                 let is_connection_error = match &grpc_result {
-                    Err(GrpcProxyError::BackendUnavailable { kind, .. }) => kind.is_connect_class(),
+                    // A gateway-side egress denial (DnsResolution kind whose message
+                    // carries "egress policy") dialed no backend → not connect-class.
+                    Err(GrpcProxyError::BackendUnavailable { kind, message, .. }) => {
+                        kind.is_connect_class() && !message.contains("egress policy")
+                    }
                     Err(GrpcProxyError::BackendTimeout {
                         kind: grpc_proxy::GrpcTimeoutKind::Connect,
                         ..
@@ -14384,6 +14554,31 @@ async fn handle_proxy_request_inner(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Re-screen the (possibly LB-rotated) retry target before
+                // dispatch: the gRPC pool skips the DnsCacheResolver for IP
+                // literals, so a denied literal reached via rotation must be
+                // rejected here too (mirrors the first-attempt gRPC screen). No
+                // circuit-breaker probe slot is held for the new target yet (the
+                // breaker is checked just below), so only the request is counted.
+                if let Some(ref rotated_target) = grpc_current_target
+                    && denied_literal_backend_ip(
+                        &rotated_target.host,
+                        &state.env_config.backend_allow_ips,
+                    )
+                    .is_some()
+                {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        backend = %rotated_target.host,
+                        "Backend egress policy denied literal-IP gRPC retry target; not dialing"
+                    );
+                    record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        14,
+                        "backend address blocked by egress policy",
+                    ));
                 }
 
                 // Enforce the (possibly rotated) target's circuit breaker before
@@ -14580,7 +14775,11 @@ async fn handle_proxy_request_inner(
                     grpc_probe_guard.disarm();
                     let connection_error = matches!(
                         e,
-                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                        GrpcProxyError::BackendUnavailable { kind, message, .. }
+                        // A gateway-side egress denial (DnsResolution kind whose
+                        // message carries "egress policy") dialed no backend, so it
+                        // is NOT a connect-class failure even though the kind is.
+                        if kind.is_connect_class() && !message.contains("egress policy")
                     ) || matches!(
                         e,
                         GrpcProxyError::BackendTimeout {
@@ -15576,7 +15775,11 @@ async fn handle_proxy_request_inner(
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
                 let grpc_backend_connection_error = matches!(
                     &e,
-                    GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                    GrpcProxyError::BackendUnavailable { kind, message, .. }
+                        // A gateway-side egress denial (DnsResolution kind whose
+                        // message carries "egress policy") dialed no backend, so it
+                        // is NOT a connect-class failure even though the kind is.
+                        if kind.is_connect_class() && !message.contains("egress policy")
                 ) || matches!(
                     &e,
                     GrpcProxyError::BackendTimeout {
@@ -15886,9 +16089,12 @@ async fn handle_proxy_request_inner(
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
     let mut hbone_request_body_exceeded = None;
-    let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
+    let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
+        retry_config
+    {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
+        let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let mut body_hook_ctx = if needs_final_request_body_context {
@@ -16072,7 +16278,6 @@ async fn handle_proxy_request_inner(
                 }
             }
 
-            backend_admission_started_at = Instant::now();
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -16101,6 +16306,12 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            // Start the final-attempt health/LB/adaptive-concurrency sample
+            // after admission succeeds. This mirrors `proxy_to_backend`, which
+            // resets the same timer immediately before dispatch. A rotated
+            // retry's successful target must not inherit the previous target's
+            // failed-attempt latency or retry backoff in least-latency EWMA.
+            backend_admission_started_at = Instant::now();
 
             warn!(
                 proxy_id = %proxy.id,
@@ -16164,8 +16375,9 @@ async fn handle_proxy_request_inner(
                     .backend_capabilities
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
+            final_upstream_target = current_target.clone();
         }
-        (result, current_cb_target_key)
+        (result, current_cb_target_key, final_upstream_target)
     } else {
         let mut body_hook_ctx = if needs_final_request_body_context {
             Some(ctx.clone_for_final_request_body_hooks())
@@ -16236,7 +16448,7 @@ async fn handle_proxy_request_inner(
                 .await);
             }
         };
-        (resp, cb_target_key.clone())
+        (resp, cb_target_key.clone(), upstream_target.clone())
     };
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
@@ -16292,10 +16504,17 @@ async fn handle_proxy_request_inner(
     // streamable-status-then-stall/reset response-body failures trip backend
     // health while a late client-upload overflow remains neutral instead of being
     // misclassified as a backend fault.
-    // Whether the H2 response body is already end-of-stream at header time (empty
-    // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
-    // without being polled, so deferring it would be misread as a client
+    // Whether the H2 response body is already end-of-stream at header time
+    // (empty 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is
+    // dropped without being polled, so deferring it would be misread as a client
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
+    //
+    // Keep native-H3 out of this defer gate for now. hyper can finish an HTTP/1
+    // downstream response after writing a known Content-Length without polling
+    // the H3 body to its terminal FIN, so a deferred H3 dispatch outcome can be
+    // mis-recorded as ClientDisconnect. H3 streaming still gets per-frame
+    // `backend_read_timeout_ms`; CB / passive-health dispatch accounting remains
+    // eager until #1901 has body-driving-safe terminal accounting.
     let streaming_h2_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
@@ -16311,15 +16530,15 @@ async fn handle_proxy_request_inner(
             streaming_response_status_is_passively_unhealthy(
                 &epoch.load_balancer,
                 &proxy,
-                upstream_target.as_deref(),
+                final_upstream_target.as_deref(),
                 response_status,
             ),
         );
-    // TTFB captured at header arrival; reused whether the deferred outcome is
-    // recorded synchronously (an after_proxy reject replaced the streaming body)
-    // or at body completion, matching the synchronous path's
-    // `backend_start.elapsed()` least-latency sample.
-    let streaming_h2_dispatch_elapsed = backend_start.elapsed();
+    // Final-attempt dispatch elapsed for CB/passive-health/least-latency and
+    // adaptive-concurrency samples. `backend_start` intentionally spans every
+    // retry attempt and backoff for transaction logs below; using it here would
+    // penalize a rotated retry target with another target's failure/backoff.
+    let final_backend_dispatch_elapsed = backend_admission_started_at.elapsed();
     if defer_streaming_h2_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
@@ -16341,20 +16560,20 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
             backend_resp.connection_error,
             backend_error_class,
             cb_retry_probe_slot_available,
             skip_final_cb_record,
-            backend_start.elapsed(),
+            final_backend_dispatch_elapsed,
         );
     }
     let backend_admission_response_status = response_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = backend_admission_started_at.elapsed();
+    let backend_admission_elapsed = final_backend_dispatch_elapsed;
     let is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -16444,14 +16663,14 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_balancer.as_ref(),
-            upstream_target.as_deref(),
+            final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
             backend_admission_response_status,
             backend_admission_connection_error,
             backend_admission_error_class,
             false,
             skip_final_cb_record || cb_stale,
-            streaming_h2_dispatch_elapsed,
+            final_backend_dispatch_elapsed,
         );
     }
 
@@ -17042,14 +17261,14 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&proxy),
                         Arc::clone(&epoch.load_balancer),
                         upstream_balancer.clone(),
-                        upstream_target.clone(),
+                        final_upstream_target.clone(),
                         final_cb_target_key.clone(),
                         backend_admission_response_status,
                         false,
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_h2_dispatch_elapsed,
+                        final_backend_dispatch_elapsed,
                     )
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
@@ -17079,6 +17298,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -17090,6 +17310,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -17100,6 +17321,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -17747,6 +17969,15 @@ pub(crate) async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // Re-screen the (possibly LB-rotated) retry target: reqwest skips the
+    // DnsCacheResolver for IP literals, so a denied literal reached via retry
+    // rotation must be rejected here too, mirroring the first-attempt screen in
+    // proxy_to_backend. (Hostname targets are screened by the resolver at
+    // dispatch and classified via classify_reqwest_error.)
+    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+        return backend_egress_denied_response(effective_host);
+    }
+
     if proxy.resolved_tls.sni.is_some() {
         warn!(
             proxy_id = %proxy.id,
@@ -18138,12 +18369,21 @@ fn backend_dispatch_response(
 fn record_h2_pool_admission_failure(
     permits: &mut Option<BackendAdmissionPermitSet>,
     started_at: &Instant,
+    err: &http2_pool::Http2PoolError,
 ) {
     if let Some(permits) = permits.take() {
+        // Record the REAL classified class (not a hard-coded ConnectionPoolError):
+        // a gateway-side egress denial (DispatchPolicyRejected — a hostname /
+        // dns_override that resolves or rebinds to a blocked IP) dialed no
+        // backend, so it must be neutral. `client_side_no_backend_signal` skips
+        // the adaptive-concurrency shrink for that class, and the connect flag is
+        // derived from `request_reached_wire` so it isn't charged as a connect
+        // failure either.
+        let class = http2_pool::classify_http2_pool_error(err);
         permits.record_backend_outcome(BackendAdmissionOutcome {
             response_status: 502,
-            connection_error: true,
-            error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            connection_error: !retry::request_reached_wire(class),
+            error_class: Some(class),
             backend_elapsed: started_at.elapsed(),
         });
     }
@@ -18195,6 +18435,75 @@ fn buffered_backend_response_from_body_read(
 /// fall-through), and their request-size check lives inside the backend dispatch
 /// function — i.e. after admission. With the adaptive limiter at capacity, an
 /// oversized upload would then be rejected as a concurrency 503 instead of the
+/// The egress-policy enforcement point for **literal-IP** backends.
+///
+/// reqwest and the H2/gRPC/H3 pools skip the `DnsCacheResolver` for a host that
+/// is already an IP literal (there is nothing to resolve), so the resolver-side
+/// screen never runs for them — only *hostname* backends are screened at dial
+/// time. A denied literal `backend_host`/target (for example a row that DB load
+/// only warned about, or any path that treats an IP as already resolved) would
+/// otherwise be dialed. Returns the denial reason when `host` is a literal IP
+/// blocked by the policy; `None` for hostnames (screened by the resolver) and
+/// allowed IPs.
+pub(crate) fn denied_literal_backend_ip(
+    host: &str,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    // Strip URI brackets: `build_backend_url_with_target` preserves bracketed
+    // IPv6 (`[fd00:ec2::254]`) and reqwest/gRPC/H3 treat that as an IP-literal
+    // authority that skips the DnsCacheResolver, so the bare address must still
+    // be screened.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .and_then(|ip| policy.deny_reason(&ip))
+}
+
+/// Like [`denied_literal_backend_ip`] but also screens the proxy's `dns_override`
+/// literal IP: a `dns_override` pins resolution to a fixed address, so a denied
+/// literal there must be rejected at dispatch too. Without this, a DB/CP-loaded
+/// proxy (load only warns) with `dns_override` = a denied literal reaches the
+/// connection-pool builder, which `bail!`s a generic `ConnectionPoolError`
+/// (`connection_error=true`) that the retry loop replays and charges to passive
+/// health / the breaker even though no backend was dialed.
+pub(crate) fn denied_literal_backend_or_dns_override(
+    host: &str,
+    proxy: &Proxy,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    denied_literal_backend_ip(host, policy).or_else(|| {
+        proxy
+            .dns_override
+            .as_deref()
+            .and_then(|ovr| denied_literal_backend_ip(ovr, policy))
+    })
+}
+
+/// Build the fail-closed `BackendResponse` for a literal-IP backend blocked by
+/// the egress policy: a 502 that is NOT retried and is neutral to backend health
+/// (the backend was never dialed), via `ErrorClass::DispatchPolicyRejected`.
+fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: Some(host.to_string()),
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
+/// Dispatch-result wrapper around [`backend_egress_denied_response`] for the
+/// first-attempt `proxy_to_backend` path.
+fn backend_egress_denied_dispatch_result(host: &str) -> BackendDispatchResult {
+    backend_dispatch_response(backend_egress_denied_response(host), None, None)
+}
+
 /// deterministic gateway 413, masking a client/gateway policy violation as
 /// upstream pressure. The reqwest/direct-H2 paths already run their size checks
 /// before admitting; this restores the same ordering. Returns the 413 dispatch
@@ -18311,6 +18620,22 @@ async fn proxy_to_backend(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+
+    // Enforce the backend egress policy for a literal-IP backend before dialing
+    // (reqwest/pools skip the DnsCacheResolver for IP literals).
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP backend; not dialing"
+        );
+        return backend_egress_denied_dispatch_result(effective_host);
+    }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
     // This is the same cache reqwest will use internally via DnsCacheResolver,
@@ -18608,6 +18933,7 @@ async fn proxy_to_backend(
                             record_h2_pool_admission_failure(
                                 &mut h2_admission_permits,
                                 backend_admission_started_at,
+                                &e,
                             );
                             return backend_dispatch_response(
                                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
@@ -18632,6 +18958,7 @@ async fn proxy_to_backend(
                         record_h2_pool_admission_failure(
                             &mut h2_admission_permits,
                             backend_admission_started_at,
+                            &e,
                         );
                         return backend_dispatch_response(
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
@@ -21912,6 +22239,33 @@ async fn proxy_to_backend_http3(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
+    // Enforce the backend egress policy for a literal-IP backend before dialing
+    // (the native-H3/reqwest paths skip the DnsCacheResolver for IP literals).
+    if let Some(reason) = denied_literal_backend_or_dns_override(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP H3 backend; not dialing"
+        );
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: Some(effective_host.to_string()),
+                error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            },
+            None,
+        );
+    }
     let resolved_ip = state
         .dns_cache
         .resolve(
@@ -22120,8 +22474,15 @@ async fn proxy_to_backend_http3(
                             // ANDing the class here would silently skip
                             // `retry_on_connect_failure` for those cases.
                             // Trust the pool's typed signal.
-                            let is_conn_error = !e.request_on_wire();
                             let (error_kind, error_class) = classify_h3_pool_error(&e);
+                            // A gateway-side egress denial (DispatchPolicyRejected)
+                            // dialed no backend — override the pre-wire signal to
+                            // keep it non-retryable + backend-health-neutral.
+                            let is_conn_error = !e.request_on_wire()
+                                && !matches!(
+                                    error_class,
+                                    retry::ErrorClass::DispatchPolicyRejected
+                                );
                             record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
@@ -22336,8 +22697,14 @@ async fn proxy_to_backend_http3(
                 // Trust the pool's body-on-wire signal — see the
                 // streaming-incoming-body branch above for why we drop
                 // the error-class contribution here.
-                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                // A gateway-side egress denial (DispatchPolicyRejected) dialed no
+                // backend, so override the pool's pre-wire signal to keep it
+                // non-retryable + backend-health-neutral. This is the ONE class
+                // safe to AND with the typed `request_on_wire` signal — it is a
+                // gateway rejection, not a transport class that could disagree.
+                let is_conn_error = !e.request_on_wire()
+                    && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
@@ -22460,8 +22827,14 @@ async fn proxy_to_backend_http3(
                 }
                 // Trust the pool's body-on-wire signal — see the streaming
                 // H3 branch above for why we drop the class contribution.
-                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                // A gateway-side egress denial (DispatchPolicyRejected) dialed no
+                // backend, so override the pool's pre-wire signal to keep it
+                // non-retryable + backend-health-neutral. This is the ONE class
+                // safe to AND with the typed `request_on_wire` signal — it is a
+                // gateway rejection, not a transport class that could disagree.
+                let is_conn_error = !e.request_on_wire()
+                    && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
@@ -22503,16 +22876,12 @@ async fn proxy_to_backend_http3(
 /// H1 (chunked trailers) and H2 (trailers frame) downstream clients receive
 /// them.
 ///
-/// KNOWN LIMITATION (pre-existing, shared with every native-H3 streaming
-/// response): unlike the `StreamingH2` arm, the downstream `StreamingH3` body
-/// builders do NOT yet apply the per-frame `backend_read_timeout_ms` idle
-/// regime, and the dispatch site does NOT defer the CB / passive-health
-/// outcome to body completion. So a 2xx/206 H3 response that stalls or resets
-/// AFTER headers banks a header-time success and relies on the QUIC idle
-/// timeout rather than a 504. This downgrade widens the set of responses on
-/// that streaming path (a `compression`-released `206`/SSE used to take the
-/// buffered drain's 504 + failure accounting); bringing the H3 streaming path
-/// to `StreamingH2` parity is tracked in issue #1901.
+/// Native-H3 streaming responses use the same per-frame
+/// `backend_read_timeout_ms` idle regime as direct-H2 streaming responses, so a
+/// backend that sends headers and then stalls is cut by the response-body
+/// wrapper instead of waiting for the QUIC idle timeout. CB / passive-health
+/// dispatch accounting remains eager at header time for native H3 until #1901
+/// has a body-driving-safe terminal accounting design.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
@@ -22651,6 +23020,31 @@ async fn drain_h3_streaming_response_to_buffered(
                 error_class: Some(error_class),
             }
         }
+        Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
+            // The backend FIN'd before delivering its declared Content-Length —
+            // a framing violation. The request was on the wire and the backend
+            // responded, so `connection_error=false` (respect `retry_on_methods`);
+            // `ConnectionClosed` is a post-wire backend failure, so the dispatch
+            // outcome trips CB / passive-health rather than banking a short body
+            // as a success.
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                received = received,
+                declared = ?declared,
+                "HTTP/3 backend buffered response truncated (FIN before declared Content-Length)"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HTTP/3 backend response truncated"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionClosed),
+            }
+        }
     }
 }
 
@@ -22726,6 +23120,16 @@ pub(crate) fn record_port_exhaustion_if_class(
 fn classify_h3_pool_error(
     e: &crate::http3::client::H3PoolError,
 ) -> (&'static str, retry::ErrorClass) {
+    // A DnsCacheResolver egress-policy denial (hostname resolving/rebinding to a
+    // blocked IP) surfaces in the pool error message as "...denied by backend
+    // egress policy...". Classify it as the non-retryable, health-neutral
+    // DispatchPolicyRejected — the dispatch sites pair this with a
+    // `request_on_wire`-based `is_conn_error` override so it is neither retried
+    // nor charged to backend health (no backend was dialed).
+    if format!("{e:?}").contains("egress policy") {
+        let class = retry::ErrorClass::DispatchPolicyRejected;
+        return (retry::error_class_log_kind(class), class);
+    }
     if e.is_graceful_close() {
         let class = retry::ErrorClass::GracefulRemoteClose;
         return (retry::error_class_log_kind(class), class);
@@ -22857,6 +23261,13 @@ async fn proxy_to_backend_http3_retry(
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
 
+    // Re-screen the (possibly LB-rotated) retry target: the native H3 pool skips
+    // the DnsCacheResolver for IP literals, so a denied literal reached via retry
+    // rotation must be rejected here, mirroring the first-attempt H3 screen.
+    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+        return backend_egress_denied_response(effective_host);
+    }
+
     let resolved_ip = state
         .dns_cache
         .resolve(
@@ -22965,8 +23376,14 @@ async fn proxy_to_backend_http3_retry(
                     );
                     return h3_read_timeout_backend_response(resolved_ip);
                 }
-                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                // A gateway-side egress denial (DispatchPolicyRejected) dialed no
+                // backend, so override the pool's pre-wire signal to keep it
+                // non-retryable + backend-health-neutral. This is the ONE class
+                // safe to AND with the typed `request_on_wire` signal — it is a
+                // gateway rejection, not a transport class that could disagree.
+                let is_conn_error = !e.request_on_wire()
+                    && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
                 record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
@@ -23083,8 +23500,12 @@ async fn proxy_to_backend_http3_retry(
             }
             // Trust the pool's body-on-wire signal — see the streaming
             // H3 branch above for why we drop the class contribution.
-            let is_conn_error = !e.request_on_wire();
             let (error_kind, error_class) = classify_h3_pool_error(&e);
+            // …except a gateway-side egress denial (DispatchPolicyRejected) dialed
+            // no backend, so keep it non-retryable + backend-health-neutral even
+            // on the retry path (matches the other H3 dispatch sites).
+            let is_conn_error = !e.request_on_wire()
+                && !matches!(error_class, retry::ErrorClass::DispatchPolicyRejected);
             record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,
@@ -23132,6 +23553,25 @@ mod tests {
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
+
+    #[test]
+    fn denied_literal_backend_ip_screens_only_denied_literals() {
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
+        // Production default: mode `both` + dangerous-range baseline. This is the
+        // dial-time enforcement point for literal-IP backends (reqwest/the pools
+        // skip the DnsCacheResolver for IP literals).
+        let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+        // Denied literal metadata IPs (incl. NAT64 / IPv4-mapped encodings).
+        assert!(denied_literal_backend_ip("169.254.169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip("64:ff9b::a9fe:a9fe", &policy).is_some());
+        assert!(denied_literal_backend_ip("::ffff:169.254.169.254", &policy).is_some());
+        // Allowed literals (loopback / RFC1918) → not blocked.
+        assert!(denied_literal_backend_ip("127.0.0.1", &policy).is_none());
+        assert!(denied_literal_backend_ip("10.0.0.1", &policy).is_none());
+        // Hostnames are screened by the DnsCacheResolver at resolution time, not
+        // here, so this returns None for them.
+        assert!(denied_literal_backend_ip("metadata.example.com", &policy).is_none());
+    }
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

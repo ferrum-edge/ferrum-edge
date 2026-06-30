@@ -64,6 +64,27 @@ async fn test_execute_returns_error_response() {
 }
 
 #[tokio::test]
+async fn test_execute_screens_denied_literal_ip_endpoint() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+
+    // A shared client carrying the production default egress policy (blocks
+    // cloud-metadata / link-local). reqwest skips the DnsCacheResolver for an IP
+    // literal, so `execute` is the runtime chokepoint: a request to a denied
+    // literal must be surfaced to the plugin as a 502 WITHOUT dialing (so this is
+    // hermetic — no server needed).
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let client = PluginHttpClient::default_with_backend_allow_ips(policy);
+
+    let req = client.get().get("http://169.254.169.254/latest/meta-data/");
+    let resp = client.execute(req, "test_plugin").await.unwrap();
+    assert_eq!(
+        resp.status(),
+        502,
+        "denied literal-IP endpoint must be screened to 502, not dialed"
+    );
+}
+
+#[tokio::test]
 async fn test_execute_returns_redirect_response_without_following() {
     let redirect_server = MockServer::start().await;
     let target_server = MockServer::start().await;

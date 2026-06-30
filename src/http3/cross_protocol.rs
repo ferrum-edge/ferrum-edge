@@ -952,6 +952,52 @@ async fn run_plain_attempt_local_policy_or_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    // Enforce the backend egress policy for a literal-IP backend on this
+    // (possibly LB-rotated) cross-protocol attempt before dialing — reqwest and
+    // the H2 pool skip the DnsCacheResolver for IP literals. The handler screens
+    // the first target before entering the bridge, but a retry rotation lands
+    // here with a fresh `effective_host`. Fail-closed, non-retryable, neutral to
+    // backend health (no backend was dialed).
+    if let Some(reason) =
+        crate::proxy::denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips)
+    {
+        warn!(
+            proxy_id = %dispatch_proxy.id,
+            backend = %effective_host,
+            reason,
+            "Backend egress policy denied literal-IP H3 cross-protocol backend; not dialing"
+        );
+        record_backend_outcome_no_conn_end(
+            state,
+            dispatch_proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            502,
+            false,
+            Some(ErrorClass::DispatchPolicyRejected),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        if halt_request_body_before_reject {
+            crate::http3::stream_util::halt_request_body(stream);
+        }
+        let mut outcome = write_error_with_header(
+            stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"backend address blocked by egress policy"}"#,
+            Some(("gateway-error-reason", "backend-egress-policy-denied")),
+            backend_start,
+            bytes_sent,
+        )
+        .await?;
+        outcome.backend_target = Some(strip_query_from_backend_url(current_url));
+        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+        return Ok(Err(outcome));
+    }
+
     if dispatch_proxy.resolved_tls.sni.is_some() {
         warn!(
             proxy_id = %dispatch_proxy.id,

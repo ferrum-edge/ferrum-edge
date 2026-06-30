@@ -483,6 +483,20 @@ impl McpGateway {
         if servers.is_empty() {
             return Err("mcp_gateway: 'servers' must not be empty".to_string());
         }
+        // Screen each upstream's literal-IP URL against the egress policy at
+        // config-load: these are dialed through the shared client, but reqwest
+        // skips the DnsCacheResolver for IP literals, so an operator/file/CP
+        // write naming e.g. `http://169.254.169.254/...` must be rejected here.
+        for server in servers.values() {
+            if let Ok(parsed) = url::Url::parse(&server.upstream_url) {
+                crate::plugins::utils::log_helpers::screen_url_host_egress(
+                    "mcp_gateway",
+                    "upstream_url",
+                    &parsed,
+                    http_client.backend_allow_ips(),
+                )?;
+            }
+        }
         if sessions.initialize_upstreams == InitializeStrategy::Startup
             || servers
                 .values()

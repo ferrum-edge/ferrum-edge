@@ -110,7 +110,7 @@ fn poller_http_client_with_ca(ca_bundle_path: &str) -> PluginHttpClient {
         Some(ca_bundle_path),
         Arc::new(Vec::new()),
         ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        ferrum_edge::config::BackendAllowIps::Both,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         Arc::new(Vec::new()),
         0,
     )
@@ -405,6 +405,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
     AdminState {
         db: None,
         jwt_manager: jwt,
+        metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: Some(proxy_state),
         mode: "mesh".to_string(),
@@ -424,7 +425,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state,
         admin_tls_handshake_timeout_seconds: 10,
-        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
 

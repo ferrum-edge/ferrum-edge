@@ -69,16 +69,26 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 > data-plane bind, `FERRUM_PROXY_BIND_ADDRESS`, still defaults to `0.0.0.0`). If
 > you move the admin API to any non-loopback address (`0.0.0.0`/`::`, a public
 > IP, or a private/VPC interface IP — all reachable beyond this host),
-> the writable `database`/`cp` modes **refuse to start** while the plaintext
+> the `database`/`cp` modes **refuse to start** while the plaintext
 > listener (`FERRUM_ADMIN_HTTP_PORT`, non-zero) has no `FERRUM_ADMIN_ALLOWED_CIDRS`
-> allowlist — otherwise the writable admin API and any operator bearer tokens
-> would be served in cleartext on every interface. To expose admin, do one of:
-> set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin over TLS and
-> disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
+> allowlist — otherwise the admin API and any operator bearer tokens
+> would be served in cleartext on every interface. **This applies even with
+> `FERRUM_ADMIN_READ_ONLY=true`**: read-only blocks mutations, but the admin API
+> still serves sensitive management-plane reads (e.g. unredacted `/backup`) and a
+> plaintext listener still exposes operator bearer tokens on the wire, so
+> read-only is not a substitute for loopback, TLS, or an allowlist. To expose
+> admin, do one of: set an allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`), serve admin
+> over TLS and disable plaintext (`FERRUM_ADMIN_TLS_CERT_PATH`/`FERRUM_ADMIN_TLS_KEY_PATH` +
 > `FERRUM_ADMIN_HTTP_PORT=0`), or — for local development only — set
-> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. Read-only modes (`file`/`dp`/`mesh`)
-> emit a high-severity warning instead of failing; the `node_agent` admin
-> listener also defaults to loopback.
+> `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true`. The hard fail is scoped to the
+> write-capable `database`/`cp` modes (where read-only is only an opt-in toggle
+> that does not reduce read/token exposure); the inherently read-only modes
+> (`file`/`dp`/`mesh`) emit a high-severity warning instead of failing. (Note:
+> `file`/`mesh` fall back to a random, unguessable admin JWT secret when
+> `FERRUM_ADMIN_JWT_SECRET` is unset, so externally-minted tokens cannot validate
+> there; `dp` requires the secret and aborts startup if it is missing. Either way,
+> if you bind a plaintext admin listener beyond loopback, prefer an allowlist or
+> TLS.) The `node_agent` admin listener also defaults to loopback.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -86,7 +96,9 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | No | `127.0.0.1` | Bind address for admin listeners (HTTP, HTTPS). Loopback by default (safe — admin not network-exposed). Set to `0.0.0.0`/`::` to expose; in `database`/`cp` modes a public plaintext bind also needs an allowlist, TLS, or `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` (see the security note above) |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to connect to the admin API. Empty permits all |
-| `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` | No | `false` | Dev-only escape hatch. When `true`, downgrades the writable `database`/`cp` public-plaintext-admin startup guard from a hard error to a warning. Never enable in production |
+| `FERRUM_METRICS_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to scrape `/metrics` (and see detailed `/health` / `/overload`) **without** a credential. Empty (default) requires an admin JWT or `FERRUM_METRICS_BEARER_TOKEN`; set this to opt a Prometheus subnet into unauthenticated scraping |
+| `FERRUM_METRICS_BEARER_TOKEN` | No | — | Dedicated bearer token that authorizes `/metrics` scraping (and detailed `/health` / `/overload`) without a full admin JWT. Empty (default) disables this path. Use for Prometheus deployments that cannot mint admin JWTs |
+| `FERRUM_ALLOW_INSECURE_ADMIN_HTTP` | No | `false` | Dev-only escape hatch. When `true`, downgrades the `database`/`cp` public-plaintext-admin startup guard (applies to read-only `database`/`cp` too) from a hard error to a warning. Never enable in production |
 | `FERRUM_ADMIN_MAX_CONNECTIONS` | No | `1024` | Max concurrent connections across all admin/management-plane listeners (plaintext + TLS share one cap). Independent of the data-plane `FERRUM_MAX_CONNECTIONS`. Enforced after the admin CIDR allowlist and before the TLS handshake / request parsing; over-limit connections are dropped (TCP RST). `0` = unlimited |
 | `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP` | No | `0` | Max concurrent admin connections per resolved source IP. `0` (default) disables per-IP limiting so a single monitoring/load-balancer source is not capped by accident |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
@@ -97,7 +109,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed |
 | `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (`exp - iat`) for externally minted Admin API JWTs |
-| `FERRUM_ADMIN_READ_ONLY` | No | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
+| `FERRUM_ADMIN_READ_ONLY` | No | `false` | Set Admin API to read-only mode (DP mode defaults to true). Blocks mutations only — it does **not** exempt the plaintext-admin startup guard above, since read endpoints (e.g. `/backup`) and bearer tokens remain sensitive |
 | `FERRUM_ADMIN_AUDIT_ENABLED` | No | `false` | Enable database-backed audit events for successful Admin API mutations. Responses wait only for bounded queue enqueue; persistence is asynchronous best-effort |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE` | No | — | Source override for `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`; accepts path, `file://`, inline PEM, or provider URI |
@@ -266,8 +278,9 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP, DP & mesh modes | — | Shared JWT secret for CP/DP/mesh gRPC auth (DP/mesh clients generate short-lived JWTs, CP validates). Must be at least 32 characters |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC. **Secure-by-default:** binding a non-loopback address in plaintext (no CP gRPC TLS) is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
+| `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | `false` | Permit plaintext (non-TLS) CP/DP gRPC config sync on a non-loopback address. When `false`, the CP refuses to bind a non-loopback plaintext gRPC listener and the DP refuses a non-loopback `http://` CP URL — the channel carries DP authentication JWTs and the full gateway config, which plaintext exposes unencrypted and unauthenticated against MITM. Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always permitted for local development. Set `true` only on a trusted network with compensating controls; a high-severity warning is logged whenever plaintext is used (CP and DP) |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP, DP & mesh modes | — | Shared JWT secret for CP/DP/mesh gRPC auth (DP/mesh clients generate short-lived JWTs, CP validates). Must be at least 32 characters. This is the only DP authentication factor unless CP gRPC mTLS (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`) is configured |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate. File/provider/Kubernetes-backed sources are watched in CP mode; new handshakes use rotated material after validation |
 | `FERRUM_CP_GRPC_TLS_CERT_SOURCE` | If CP gRPC TLS and set | — | Source override for `FERRUM_CP_GRPC_TLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key. File/provider/Kubernetes-backed sources are watched with the cert and optional client CA |
@@ -288,7 +301,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_SOURCE` | No | — | Source override for `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | — | DP client private key for CP mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_SOURCE` | No | — | Source override for `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |
-| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | Skip DP gRPC TLS verification (testing only). Refused when `FERRUM_MESH_PRODUCTION_MODE=true` and remote-cluster discovery is enabled |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | **Not supported — rejected at startup when `true`.** The tonic-managed CP/DP gRPC client exposes no hook to skip server certificate verification, so the flag only ever offered false confidence. To connect to a CP presenting a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` (one-way TLS) or supply `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`/`KEY_PATH` (mTLS) |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
 
@@ -481,7 +494,7 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | `FERRUM_NODE_AGENT_BPF_ELF_PATH` | Linux `ebpf` feature | build-tree eBPF target path | Compiled `ferrum-ebpf` ELF loaded by the aya backend |
 | `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES` | No | `4194304` (4 MiB) | SOCK_OPS event ringbuf size sized at BPF load time by the node-agent and consumed by the mesh-proxy via the pinned map at `/sys/fs/bpf/ferrum/sock_ops_events`. Must be a power of two ≥ 4096; invalid values fall back to the default with a warn. Raise when `ferrum_mesh_bpf_ringbuf_overruns_total` advances under load |
 | `FERRUM_NODE_AGENT_PROXY_MODE` | No | `local_pod` | Capture topology contract: `local_pod` or `node_waypoint` |
-| `FERRUM_NODE_AGENT_ADMIN_ENABLED` | No | `false` | Enables the node-agent read-only admin listener for metrics/health. When enabled, defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set; JWT does not affect bind because metrics/health are unauthenticated |
+| `FERRUM_NODE_AGENT_ADMIN_ENABLED` | No | `false` | Enables the node-agent read-only admin listener for metrics/health. When enabled, defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. `/live` and basic `/health` (status/ready) are unauthenticated; `/metrics` and detailed `/health` require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or `FERRUM_METRICS_ALLOWED_CIDRS` |
 | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT` | No | `15008` | HBONE redirect/listener port written into the node-agent capture contract and BPF config map. Must match the mesh proxy HBONE listener (`15008` today) |
 | `FERRUM_NODE_AGENT_CNI_ENABLED` | No | `false` | Opts in to the CNI-style install. When `true`, the node-agent binds a Unix socket and listens for ADD/DEL/CHECK calls forwarded by the `ferrum-cni` binary that the Helm chart drops into `/opt/cni/bin/`. ADD fetches pod metadata immediately, while the kube-rs watcher remains the reconciliation source of truth. See [node_agent.md](node_agent.md#cni-plugin-install-optional) |
 | `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` | No | `/var/run/ferrum/node-agent-cni.sock` | Unix socket the node-agent listens on for CNI plugin RPCs. Only consulted when `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The CNI plugin and the node-agent must agree on the path; the Helm chart renders both from one value |
@@ -644,7 +657,10 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | No | `2` | Maximum active credential entries per type per consumer |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
-| `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend SSRF policy: `both`, `private`, or `public` |
+| `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend egress mode: `both` (any IP), `private` (only private/reserved), or `public` (only public — blocks all private/reserved). Composes with the CIDR lists and the dangerous-range baseline below |
+| `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES` | No | `true` | When `true` (default), backend egress to cloud-metadata/link-local (`169.254.0.0/16`, `fe80::/10`), the AWS IPv6 instance-metadata host (`fd00:ec2::254`), the Alibaba Cloud/ENS metadata host (`100.100.100.200`, an exact-host block since it sits in CGNAT not link-local), multicast (`224.0.0.0/4`, `ff00::/8`), and unspecified/this-host (`0.0.0.0/8`, `::`, `255.255.255.255`) is **blocked even under `both`** — including IPv4-mapped (`::ffff:…`) and NAT64 (`64:ff9b::/96`) encodings of those ranges, so an IPv6-only DNS answer can't bypass the block. Loopback and RFC1918/ULA stay allowed. Set `false` to restore fully-open egress (logs an unrestricted-egress warning) |
+| `FERRUM_BACKEND_ALLOW_CIDRS` | No | — | Comma-separated CIDRs/IPs that are **always allowed** regardless of mode, deny list, or baseline (the escape hatch). E.g. `169.254.169.254/32` to permit a real IMDS proxy, or `10.1.2.0/24` to carve a private subnet out of `public` mode |
+| `FERRUM_BACKEND_DENY_CIDRS` | No | — | Comma-separated CIDRs/IPs that are **denied** (unless also in the allow list). E.g. `10.0.0.0/8` to forbid an internal range while otherwise allowing private backends. Invalid entries fail startup |
 | `FERRUM_ADD_VIA_HEADER` | No | `true` | Add `Via` on request and response paths |
 | `FERRUM_VIA_PSEUDONYM` | No | `ferrum-edge` | Pseudonym used in the `Via` header |
 | `FERRUM_ADD_FORWARDED_HEADER` | No | `false` | Add RFC 7239 `Forwarded` alongside `X-Forwarded-*` |
@@ -764,6 +780,35 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_SO_BUSY_POLL_US` | No | `0` | Linux SO_BUSY_POLL duration for latency-sensitive UDP sockets |
 
 Core environment parsing lives in `src/config/env_config.rs`; early startup/pool settings use the same `FERRUM_*` names via conf-aware helpers.
+
+## Backend Egress / SSRF Protection
+
+The gateway dials backends, upstream targets, service-discovery results, and plugin endpoints (AI providers, log sinks, JWKS/OIDC, webhooks). Every production egress path resolves through the shared DNS cache, and each resolved IP — on **every** fresh resolve and cache insertion, including stale/background refreshes — is screened against the **backend egress policy**. This is what makes DNS rebinding safe: a hostname that re-resolves to a now-denied address is rejected at insertion and never cached or served.
+
+The policy is composed from four `FERRUM_BACKEND_*` env vars and evaluated in this precedence (first match wins) for each resolved IP:
+
+1. **`FERRUM_BACKEND_ALLOW_CIDRS`** — explicit allow; overrides everything below (the escape hatch).
+2. **`FERRUM_BACKEND_DENY_CIDRS`** — explicit deny.
+3. **Dangerous-range baseline** (`FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES`, default `true`) — denies cloud-metadata/link-local, multicast, and unspecified/this-host ranges.
+4. **`FERRUM_BACKEND_ALLOW_IPS`** mode — `both` allows; `private`/`public` filter on whether the IP is private/reserved.
+
+### Default posture (no `FERRUM_BACKEND_*` set)
+
+A fresh gateway runs `both` + baseline-on. It still reaches **loopback and RFC1918/ULA backends** (so mesh sidecars, same-host services, and internal upstreams work out of the box), but it is **not** an unrestricted SSRF bridge: egress to the cloud-metadata endpoints (`169.254.169.254` and the rest of `169.254.0.0/16`/`fe80::/10`, plus the AWS IPv6 IMDS host `fd00:ec2::254` and the Alibaba Cloud/ENS IMDS host `100.100.100.200`), multicast, and `0.0.0.0`/`::` is denied by default. A literal dangerous backend IP is also rejected at config-load time (proxy/upstream/plugin endpoints, on file/db loads and admin writes alike).
+
+### Migration / deployment guidance
+
+- **Internal-service deployments** (the common case): no change needed — loopback and RFC1918 backends keep working. If an internal backend lives in a normally-blocked range (rare), add it with `FERRUM_BACKEND_ALLOW_CIDRS`.
+- **You genuinely need the metadata endpoint as a backend** (e.g. an IMDS proxy): set `FERRUM_BACKEND_ALLOW_CIDRS=169.254.169.254/32`. Prefer the narrowest CIDR.
+- **Lock egress to the public internet** (egress-gateway style): set `FERRUM_BACKEND_ALLOW_IPS=public`. Carve out specific internal services with `FERRUM_BACKEND_ALLOW_CIDRS`.
+- **Forbid a specific internal range** while otherwise allowing private backends: `FERRUM_BACKEND_DENY_CIDRS=10.0.0.0/8`.
+- **Restore the legacy fully-open behaviour** (not recommended): `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`. With `both` + no deny CIDRs this makes egress unrestricted and the gateway logs a startup warning to that effect.
+
+The allow/deny CIDR lists accept comma-separated CIDRs or bare IPs (`10.0.0.0/8, 192.168.1.1, fc00::/7, ::1`); an invalid entry fails startup rather than silently failing open. The same policy is enforced by config validation, the DNS resolver, the connection pool, service discovery, and plugin endpoint screening.
+
+### Known limitation: `rediss://` (TLS) Redis hostnames
+
+The centralized rate-limiter's Redis endpoint is screened through the same policy: literal-IP `redis://`/`rediss://` endpoints are screened, and plaintext `redis://` hostnames are **pinned** to the gateway-resolved IP so the Redis client cannot re-resolve outside the cache. A **`rediss://` (TLS) endpoint specified as a hostname** is the one exception — it is screened on every resolve but **not pinned**, because the `redis` crate derives the TLS server name (SNI) from the URL host and offers no way to dial a chosen IP while presenting a separate server name. The Redis client therefore re-resolves the hostname itself at connect/reconnect time, leaving a narrow DNS-rebinding window between the gateway's screen and the client's dial. Exploiting it requires control of the operator's *own* Redis DNS (which already implies control of the gateway's resolver), and on any screen/resolve failure the rate limiter fails **closed** to the in-memory limiter rather than dialing unscreened. To remove the window entirely, use a literal-IP `rediss://` endpoint (e.g. `rediss://10.0.0.5:6380`) or a plaintext `redis://` hostname.
 
 ## Configuration File (`ferrum.conf`)
 

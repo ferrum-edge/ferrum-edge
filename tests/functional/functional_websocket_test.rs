@@ -295,10 +295,23 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
+    // in the same functional shard never contend on the default admin ports
+    // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
+    // would otherwise surface here as a spurious "gateway did not start" when an
+    // unrelated parallel test holds the default port. These tests never use the
+    // admin API.
+    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
@@ -546,13 +559,25 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 }
 
 /// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+///
+/// The deadline is generous (60s) because the TLS/HTTP3 gateway cold-start
+/// (jemalloc + rustls + config/cert load + QUIC socket setup + DNS/pool warmup)
+/// can exceed a tight budget on a loaded CI runner — the previous 15s caused
+/// intermittent "Gateway did not start" failures in the H3 WebSocket tests even
+/// across the 3 retry attempts. This does not slow the happy path: the loop
+/// returns as soon as the port accepts a TCP connection (polled every 300ms), so
+/// a fast start still finishes in a few seconds; the deadline only bounds a
+/// genuinely stuck start.
 async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+    const STARTUP_TIMEOUT_SECS: u64 = 60;
+    let deadline = std::time::SystemTime::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
     let addr = format!("127.0.0.1:{}", gateway_port);
 
     loop {
         if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 15 seconds".into());
+            return Err(
+                format!("Gateway did not start within {STARTUP_TIMEOUT_SECS} seconds").into(),
+            );
         }
         match tokio::net::TcpStream::connect(&addr).await {
             Ok(_) => return Ok(()),

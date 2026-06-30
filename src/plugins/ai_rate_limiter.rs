@@ -927,10 +927,73 @@ fn prompt_character_count(json: &Value) -> u64 {
     }
 
     if chars == 0 {
-        string_value_character_count(json)
-    } else {
-        chars
+        // No recognized prompt field carried text. Fall back to counting the whole
+        // body — this is how AI markers that are NOT summed above (`inputs`,
+        // `inputText`, `chat_history`, `previous_response_id`) get their prompt
+        // text counted. That whole-body walk already includes any `data_sources` /
+        // `dataSources` role_information, so the targeted add below is gated behind
+        // this early return: counting it again would double it, and (worse) making
+        // `chars` nonzero here would skip the fallback and drop the real prompt,
+        // reserving only the instruction.
+        return string_value_character_count(json);
     }
+
+    // Azure OpenAI "On Your Data" carries a per-data-source system instruction in
+    // `data_sources[].parameters.role_information` (current chat-completions data
+    // plane) / `dataSources[].parameters.roleInformation` (the original
+    // extensions-API camelCase). That text is sent to the model and billed as
+    // input, but it is not part of any recognized field above. A recognized field
+    // DID contribute (we are past the zero-char fallback), so add the instruction
+    // text explicitly — otherwise an On Your Data request (which always carries
+    // `messages`) would never count it and the reservation would under-estimate
+    // the prompt the backend bills.
+    chars.saturating_add(count_data_source_role_information(json))
+}
+
+/// The data-source entries of an Azure OpenAI "On Your Data" request, across both
+/// the current chat-completions casing (`data_sources`) and the original
+/// extensions-API camelCase (`dataSources`). Both keys are scanned and their
+/// arrays concatenated rather than `or_else`-chained, so a body carrying one
+/// casing — or, defensively, both — is fully enumerated. Non-array values (and
+/// absent keys) yield nothing.
+fn azure_data_source_items(json: &Value) -> impl Iterator<Item = &Value> {
+    ["data_sources", "dataSources"]
+        .into_iter()
+        .filter_map(move |key| json.get(key))
+        .filter_map(Value::as_array)
+        .flatten()
+}
+
+/// The `role_information` instruction string(s) for one data-source entry, across
+/// both the current `role_information` and the legacy `roleInformation` field
+/// casings. Every present key is yielded independently — we deliberately do NOT
+/// fold to the first present key with `or_else`, because `Value::as_str` on an
+/// empty string returns `Some("")` (not `None`), so an `or_else` chain would stop
+/// at a decoy `role_information: ""` and never see a real `roleInformation`
+/// sibling. Non-string values are skipped.
+fn azure_role_information_values(item: &Value) -> impl Iterator<Item = &str> {
+    item.get("parameters").into_iter().flat_map(|parameters| {
+        ["role_information", "roleInformation"]
+            .into_iter()
+            .filter_map(move |key| parameters.get(key))
+            .filter_map(Value::as_str)
+    })
+}
+
+/// Total characters of every Azure "On Your Data" `role_information` instruction
+/// in the request. This text is sent to the model and billed as input but is not
+/// part of any field `prompt_character_count` already recognizes, so it is counted
+/// here. Only the instruction text is summed — the surrounding `endpoint`,
+/// `index_name`, and key/secret fields under `parameters` are intentionally left
+/// out (they are not prompt input, and counting them would inflate the estimate).
+fn count_data_source_role_information(json: &Value) -> u64 {
+    let mut chars = 0_u64;
+    for item in azure_data_source_items(json) {
+        for text in azure_role_information_values(item) {
+            chars = chars.saturating_add(text.chars().count() as u64);
+        }
+    }
+    chars
 }
 
 /// Object keys whose values carry binary/non-text payloads (base64 image,

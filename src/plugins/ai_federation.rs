@@ -411,7 +411,7 @@ fn validate_base_url(
     provider_name: &str,
     base_url: &str,
     allow_plaintext: bool,
-    backend_allow_ips: &crate::config::BackendAllowIps,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let parsed = Url::parse(base_url).map_err(|e| {
         format!("ai_federation: provider '{provider_name}' invalid base_url '{base_url}': {e}")
@@ -446,10 +446,10 @@ fn validate_base_url(
     // If the host is a literal IP, enforce the gateway IP policy at config
     // time. Hostnames are checked at runtime by `DnsCacheResolver`.
     if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+        && !backend_allow_ips.is_allowed(&ip)
     {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by backend egress policy ({backend_allow_ips})"
         ));
     }
 
@@ -1229,6 +1229,9 @@ fn text_only_openai_body(openai_body: &Value) -> Value {
     body
 }
 
+const MAX_MULTIMODAL_ERROR_VALUE_CHARS: usize = 64;
+const MAX_MULTIMODAL_ERROR_VALUES: usize = 8;
+
 #[derive(Debug, Clone)]
 struct MultimodalUsage {
     non_text_parts: usize,
@@ -1242,12 +1245,47 @@ impl MultimodalUsage {
     }
 
     fn types_csv(&self) -> String {
-        self.types.iter().cloned().collect::<Vec<_>>().join(",")
+        bounded_values_csv(&self.types)
     }
 
     fn roles_csv(&self) -> String {
-        self.roles.iter().cloned().collect::<Vec<_>>().join(",")
+        bounded_values_csv(&self.roles)
     }
+}
+
+fn bounded_error_value(value: &str) -> String {
+    let mut end = value.len();
+    let mut chars = 0;
+    for (idx, _) in value.char_indices() {
+        if chars == MAX_MULTIMODAL_ERROR_VALUE_CHARS {
+            end = idx;
+            break;
+        }
+        chars += 1;
+    }
+
+    if chars <= MAX_MULTIMODAL_ERROR_VALUE_CHARS && end == value.len() {
+        value.to_string()
+    } else {
+        format!(
+            "{}…<truncated:{} chars>",
+            &value[..end],
+            value.chars().count()
+        )
+    }
+}
+
+fn bounded_values_csv(values: &BTreeSet<String>) -> String {
+    let mut rendered = values
+        .iter()
+        .take(MAX_MULTIMODAL_ERROR_VALUES)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = values.len().saturating_sub(MAX_MULTIMODAL_ERROR_VALUES);
+    if remaining > 0 {
+        rendered.push(format!("…<{} more>", remaining));
+    }
+    rendered.join(",")
 }
 
 fn analyze_multimodal_usage(openai_body: &Value) -> MultimodalUsage {
@@ -1278,13 +1316,12 @@ fn analyze_multimodal_usage(openai_body: &Value) -> MultimodalUsage {
             }
 
             usage.non_text_parts += 1;
-            usage.roles.insert(role.to_string());
-            usage.types.insert(
+            usage.roles.insert(bounded_error_value(role));
+            usage.types.insert(bounded_error_value(
                 part.get("type")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-            );
+                    .unwrap_or("unknown"),
+            ));
         }
     }
 
@@ -1369,17 +1406,22 @@ fn validate_multimodal_translate_support(
                 .unwrap_or("unknown");
             if is_instruction_role(role) {
                 return Err(format!(
-                    "non-text content part '{part_type}' is not supported in {role} messages for provider-native translation"
+                    "non-text content part '{}' is not supported in {} messages for provider-native translation",
+                    bounded_error_value(part_type),
+                    bounded_error_value(role)
                 ));
             }
             if role != "user" && role != "assistant" {
                 return Err(format!(
-                    "non-text content part '{part_type}' is not supported for role '{role}'"
+                    "non-text content part '{}' is not supported for role '{}'",
+                    bounded_error_value(part_type),
+                    bounded_error_value(role)
                 ));
             }
             if part_type != "image_url" {
                 return Err(format!(
-                    "non-text content part '{part_type}' has no provider-native translation"
+                    "non-text content part '{}' has no provider-native translation",
+                    bounded_error_value(part_type)
                 ));
             }
 
@@ -1391,7 +1433,8 @@ fn validate_multimodal_translate_support(
             // narrows the remaining user/assistant set to user-only.)
             if provider.provider_type == ProviderType::AwsBedrock && role != "user" {
                 return Err(format!(
-                    "AWS Bedrock Converse only allows image content in user messages, not '{role}' messages"
+                    "AWS Bedrock Converse only allows image content in user messages, not '{}' messages",
+                    bounded_error_value(role)
                 ));
             }
 
@@ -1716,7 +1759,8 @@ fn classify_gemini_image_url(part: &Value) -> Result<GeminiImageRef<'_>, String>
         });
     }
     Err(format!(
-        "Gemini/Vertex image translation only supports image_url data URLs, gs:// GCS URIs, or Files API URIs (arbitrary remote URL '{url}' is not fetched/inlined)"
+        "Gemini/Vertex image translation only supports image_url data URLs, gs:// GCS URIs, or Files API URIs (arbitrary remote URL '{}' is not fetched/inlined)",
+        bounded_error_value(url)
     ))
 }
 
@@ -3283,6 +3327,12 @@ pub mod test_helpers {
         super::request_wants_streaming(openai_body)
     }
 
+    /// Expose bounded multimodal usage rendering for security regression tests.
+    pub fn multimodal_usage_csv_for_test(openai_body: &Value) -> (String, String) {
+        let usage = super::analyze_multimodal_usage(openai_body);
+        (usage.types_csv(), usage.roles_csv())
+    }
+
     /// Maximum raw upstream-error bytes reflected to callers (finding #52).
     pub const MAX_UPSTREAM_ERROR_BYTES: usize = super::MAX_UPSTREAM_ERROR_BYTES;
 
@@ -3446,11 +3496,11 @@ pub mod test_helpers {
         allow_plaintext: bool,
         policy: &str,
     ) -> Result<(), String> {
-        use crate::config::BackendAllowIps;
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
         let policy = match policy {
-            "private" => BackendAllowIps::Private,
-            "public" => BackendAllowIps::Public,
-            "both" => BackendAllowIps::Both,
+            "private" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Private),
+            "public" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+            "both" => BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
             other => return Err(format!("invalid policy '{other}'")),
         };
         validate_base_url(provider_name, base_url, allow_plaintext, &policy)

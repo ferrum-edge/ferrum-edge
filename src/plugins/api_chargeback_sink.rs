@@ -613,6 +613,15 @@ impl ApiChargebackSink {
         }
 
         let parsed_url = parse_clickhouse_url(&config.clickhouse.url)?;
+        // The ClickHouse sink builds a dedicated client, so screen a literal-IP
+        // clickhouse.url against the egress policy at config-load (the shared
+        // DNS-cache screen still applies at send time).
+        crate::plugins::utils::log_helpers::screen_url_host_egress(
+            PLUGIN_NAME,
+            "clickhouse.url",
+            &parsed_url,
+            http_client.backend_allow_ips(),
+        )?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &config.clickhouse);
         let password = resolve_password_ref(config.clickhouse.password_ref.as_deref())?;
@@ -1418,7 +1427,11 @@ fn build_clickhouse_http_client(
 
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(cfg.timeout_ms))
-        .timeout(Duration::from_millis(cfg.timeout_ms));
+        .timeout(Duration::from_millis(cfg.timeout_ms))
+        // Do not follow redirects: a 3xx from an allowed ClickHouse host could
+        // otherwise bounce an export to an egress-policy-denied IP (matches the
+        // shared PluginHttpClient redirect policy).
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = shared.dns_cache().cloned() {
         builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
     }
