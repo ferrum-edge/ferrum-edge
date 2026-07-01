@@ -116,10 +116,11 @@ fn resolve_node_waypoint_stream_scope(
             Some(resolved.identity.spiffe_id.as_str().to_string()),
         ),
         Err(error) => {
-            debug!(
+            warn!(
                 proxy_id = %proxy_id,
                 client = %client_ip,
                 error = %error,
+                fallback_scope = "mesh-wide",
                 "Node-waypoint TCP stream: no resolved pod identity; \
                  falling back to mesh-wide authorization"
             );
