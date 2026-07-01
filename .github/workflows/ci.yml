@@ -1934,6 +1934,9 @@ jobs:
           shared-key: "ci-lint"
           components: clippy
 
+      - name: Verify docs JWT secret placeholders
+        run: python3 .github/scripts/verify_docs_jwt_secret_placeholders.py
+
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
