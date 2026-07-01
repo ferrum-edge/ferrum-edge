@@ -7552,6 +7552,7 @@ async fn handle_connection(
 
 /// Check if a hyper connection error indicates a client disconnect.
 fn is_client_disconnect_error(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
     err.contains("connection reset")
         || err.contains("broken pipe")
         || err.contains("connection abort")
