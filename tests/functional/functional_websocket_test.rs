@@ -1379,8 +1379,8 @@ async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
-/// gateway, including unmasked compliant frames, binary frames, and today's
-/// documented permissive handling of masked client frames.
+/// gateway, including unmasked compliant frames, binary frames, and strict
+/// RFC 9220 rejection of masked client frames.
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
@@ -1420,15 +1420,21 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         "Echo binary: 5 bytes"
     );
 
-    ws.send_masked_text("masked but accepted")
+    ws.send_masked_text("masked but rejected")
         .await
         .expect("send masked text");
-    assert_eq!(
-        ws.recv_text().await.expect("masked text echo"),
-        "Echo: masked but accepted"
-    );
+    match ws.recv_frame().await.expect("protocol close") {
+        H3WebSocketFrame::Close(payload) => {
+            assert!(
+                payload.len() >= 2,
+                "protocol close payload must include a status code"
+            );
+            let code = u16::from_be_bytes([payload[0], payload[1]]);
+            assert_eq!(code, 1002, "masked H3 frames must close as protocol error");
+        }
+        other => panic!("expected protocol close after masked frame, got {other:?}"),
+    }
 
-    ws.send_close().await.expect("close");
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();

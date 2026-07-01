@@ -311,21 +311,17 @@ See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, and 
 
 ## Plugin System
 
-Plugins execute in a defined pipeline with priority ordering (lower = runs first):
+Ferrum ships a large built-in plugin set for request preflight, authentication,
+authorization and backend admission, request/response transformation, AI/agent
+gateway policy, protocol bridging, stream/WebSocket/UDP handling, and
+observability. Plugins execute in a deterministic priority pipeline (lower
+priority runs first) and are protocol-aware, so the gateway skips plugins that
+do not apply to the current protocol.
 
-| Phase | Plugins |
-|-------|---------|
-| **Tracing** (25) | `otel_tracing` |
-| **Early** (50-275) | `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `grpc_method_router` (275) |
-| **Authentication** (950-1500) | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** (2000-2999) | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090 target-aware backend admission), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_semantic_cache` (2980), `ai_federation` (2985), `mcp_gateway` (2992), `a2a_gateway` (2993) |
-| **Transform** (3000-3999) | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
-| **Response** (4000-4999) | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
-| **Logging** (9000-9999) | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300) |
-
-Plugins are protocol-aware — the gateway automatically skips plugins that don't apply to the current protocol (e.g., CORS is never invoked on TCP streams).
-
-See [docs/plugins.md](docs/plugins.md) for detailed configuration of each plugin, and [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full protocol support matrix.
+The canonical plugin registry and ordering live outside the README to avoid
+drift: see [docs/plugins.md](docs/plugins.md) for detailed configuration of each
+plugin, and [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for
+the full execution order and protocol support matrix.
 
 
 ### AI / LLM Plugins

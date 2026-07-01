@@ -77,7 +77,7 @@ FERRUM_MODE=database \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_PROXY_HTTPS_PORT=8543 \
   FERRUM_ADMIN_HTTP_PORT=9100 \
-  FERRUM_ADMIN_JWT_SECRET=your-secret \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   ./ferrum-edge-new
 ```
 
@@ -250,8 +250,8 @@ FERRUM_MODE=cp \
   FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_upgrade \
   FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50052 \
   FERRUM_ADMIN_HTTP_PORT=9100 \
-  FERRUM_ADMIN_JWT_SECRET=your-secret \
-  FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
+  FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   ./ferrum-edge-new
 ```
 
@@ -260,10 +260,10 @@ Optionally connect a test DP to the staging CP to verify the full gRPC config sy
 ```bash
 FERRUM_MODE=dp \
   FERRUM_DP_CP_GRPC_URLS=http://cp-host:50052 \
-  FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
+  FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_ADMIN_HTTP_PORT=9200 \
-  FERRUM_ADMIN_JWT_SECRET=your-secret \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   ./ferrum-edge-new
 ```
 
@@ -287,8 +287,8 @@ FERRUM_MODE=cp \
   FERRUM_DB_TYPE=postgres \
   FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db \
   FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
-  FERRUM_ADMIN_JWT_SECRET=your-secret \
-  FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
+  FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   ./ferrum-edge-new
 ```
 
@@ -300,8 +300,8 @@ Upgrade DP nodes one at a time (or in batches). Each DP reconnects to the CP on 
 # On each DP node, stop old binary and start new:
 FERRUM_MODE=dp \
   FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051 \
-  FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
-  FERRUM_ADMIN_JWT_SECRET=your-secret \
+  FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   ./ferrum-edge-new
 ```
 
@@ -321,8 +321,8 @@ This eliminates the read-only window during CP upgrades — DPs always have at l
 # DP configured for multi-CP failover:
 FERRUM_MODE=dp \
   FERRUM_DP_CP_GRPC_URLS=https://cp1:50051,https://cp2:50051 \
-  FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
-  FERRUM_ADMIN_JWT_SECRET=your-secret \
+  FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
+  FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   ./ferrum-edge-new
 ```
 

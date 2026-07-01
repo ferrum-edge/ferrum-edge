@@ -164,7 +164,7 @@ docker run -d \
   -e FERRUM_DB_URL="postgres://ferrum:secret@host.docker.internal:5432/ferrum" \
   -e FERRUM_DB_TLS_MODE=verify-full \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
-  -e FERRUM_ADMIN_JWT_SECRET=your-secret \
+  -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   -v $(pwd)/certs:/certs:ro \
   ferrum-edge
 ```
@@ -251,7 +251,7 @@ docker run -d \
   -e FERRUM_DB_URL="mysql://ferrum:secret@host.docker.internal:3306/ferrum" \
   -e FERRUM_DB_TLS_MODE=verify-full \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
-  -e FERRUM_ADMIN_JWT_SECRET=your-secret \
+  -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   -v $(pwd)/certs:/certs:ro \
   ferrum-edge
 ```
@@ -332,7 +332,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
   -e FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.crt \
   -e FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key \
-  -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
+  -e FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
   -v /path/to/certs:/certs:ro \
   ghcr.io/ferrum-edge/ferrum-edge:latest
 ```

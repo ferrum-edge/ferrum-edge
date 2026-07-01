@@ -117,7 +117,8 @@ services:
   # ============================================================================
   # MongoDB Database (for use with database mode)
   # ============================================================================
-  # Requires building with: cargo build --features mongodb
+  # MongoDB support is included in the standard binary; enable this sample stack
+  # with the `mongodb` compose profile.
   mongodb:
     image: mongo:7-jammy
     container_name: ferrum-mongodb-db

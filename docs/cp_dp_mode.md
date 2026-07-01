@@ -183,7 +183,7 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | PEM CA for verifying DP client certs (mTLS) |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
-| `FERRUM_DB_TYPE` | Yes | Database type (`sqlite` or `postgres`) |
+| `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |
 | `FERRUM_DB_POLL_INTERVAL` | No | Config poll interval in seconds (default: 30) |
 
@@ -210,6 +210,13 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 
 The CP and DP must use the same `FERRUM_CP_DP_GRPC_JWT_SECRET` value. The DP automatically generates short-lived JWTs (59-minute TTL) from this secret on each connection attempt, and the CP validates them with the same secret. No manual JWT generation is required.
 
+The examples below use SQLite for local development and PostgreSQL for the TLS
+deployment path. CP mode supports the same database backends as database mode:
+PostgreSQL, MySQL, SQLite, and MongoDB. See
+[configuration.md](configuration.md#database) for the canonical
+`FERRUM_DB_TYPE` reference and [mongodb.md](mongodb.md) for MongoDB-specific
+connection and pooling behavior.
+
 ### Control Plane (Plaintext — local development only)
 
 Plaintext is permitted only on a loopback bind address. For a networked CP, use
@@ -220,9 +227,9 @@ intentionally run plaintext on a non-loopback address (trusted network only).
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL=sqlite://ferrum.db \
-FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
 FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1:50051 \
-FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
 FERRUM_DB_POLL_INTERVAL=10 \
 ./ferrum-edge run
 ```
@@ -236,8 +243,8 @@ only).
 ```bash
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS=http://localhost:50051 \
-FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
-FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_PROXY_HTTPS_PORT=8443 \
 ./ferrum-edge run
@@ -249,9 +256,9 @@ FERRUM_PROXY_HTTPS_PORT=8443 \
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=postgres \
 FERRUM_DB_URL=postgres://user:pass@db:5432/ferrum \
-FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
-FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
 FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem \
 FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem \
 FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH=/certs/ca.pem \
@@ -263,11 +270,11 @@ FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH=/certs/ca.pem \
 ```bash
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS=https://cp-host:50051 \
-FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-shared-secret \
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
 FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem \
 FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH=/certs/dp-client.pem \
 FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH=/certs/dp-client-key.pem \
-FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
 ./ferrum-edge run
 ```
 
