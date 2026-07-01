@@ -64,10 +64,12 @@ pub struct ProxyBody {
     /// client-visible outcome rather than values at header-flush time.
     logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>>,
     /// Monotonic byte count streamed to the client. Updated on each
-    /// successful data frame **only when a deferred logger is attached** —
-    /// the counter has no consumer without a logger, so the hot path skips
-    /// the atomic RMW in that case. Read when firing the deferred logger
-    /// (on success, streaming error, or Drop client-disconnect safety net).
+    /// successful data frame when a deferred logger is attached or a drop-time
+    /// declared-length success hint needs it. Otherwise the counter has no
+    /// consumer, so the hot path skips the atomic RMW. Read when firing the
+    /// deferred logger (on success, streaming error, or Drop
+    /// client-disconnect safety net) and when evaluating
+    /// `success_on_drop_after_bytes`.
     ///
     /// **Counting invariant**: bytes are counted ONCE per outer frame at this
     /// `ProxyBody::poll_frame` site, never on inner adapter frames and never
@@ -79,6 +81,14 @@ pub struct ProxyBody {
     /// coalescing overlap — matches the design rule preserved from the
     /// original deferred-log investigation.
     bytes_streamed: AtomicU64,
+    /// Treat Drop after exactly this many yielded response-body DATA bytes as a
+    /// successful backend body completion instead of a client disconnect. Used
+    /// for native H3 responses with a trusted `Content-Length` on an HTTP/1.x
+    /// downstream: hyper may stop polling once the client receives the declared
+    /// byte count, before the H3 source yields its terminal FIN/trailer poll.
+    /// Partial or overlong bodies still fall through to the normal
+    /// disconnect/error classification.
+    success_on_drop_after_bytes: Option<u64>,
     /// Whether `poll_frame` was ever called. Used by the `Drop` safety net
     /// to distinguish "hyper decided not to stream this body" (HEAD / 204 /
     /// zero-length responses where hyper drops without polling) from "hyper
@@ -351,6 +361,7 @@ impl ProxyBody {
             backend_dispatch_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
+            success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
         }
     }
@@ -373,6 +384,7 @@ impl ProxyBody {
             backend_dispatch_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
+            success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
         }
     }
@@ -543,6 +555,15 @@ impl ProxyBody {
         self
     }
 
+    /// Classify a dropped, already-polled streaming body as successful if it has
+    /// yielded exactly the declared response length. This is intentionally
+    /// opt-in: only protocol adapters whose downstream framing can complete from
+    /// the declared byte count should use it.
+    pub(crate) fn with_success_on_drop_after_response_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.success_on_drop_after_bytes = bytes.filter(|bytes| *bytes > 0);
+        self
+    }
+
     /// Attach the gRPC streaming request-body-overflow flag to an already-set
     /// deferred backend-admission outcome. When the flag has tripped by the time
     /// the body terminates, the recorded outcome is forced to `RequestBodyTooLarge`
@@ -606,6 +627,7 @@ impl ProxyBody {
             backend_dispatch_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
+            success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
         }
     }
@@ -825,7 +847,7 @@ impl http_body::Body for ProxyBody {
         // succeeds when a logger was attached.
         match &result {
             Poll::Ready(Some(Ok(frame))) => {
-                if this.logger.is_some()
+                if (this.logger.is_some() || this.success_on_drop_after_bytes.is_some())
                     && let Some(data) = frame.data_ref()
                 {
                     this.bytes_streamed
@@ -942,10 +964,19 @@ impl Drop for ProxyBody {
             //    `is_end_stream()` is still unreliable before terminal poll,
             //    so we trust `polled` exclusively and treat never-polled as
             //    success.
+            let completed_declared_bytes = self
+                .success_on_drop_after_bytes
+                .is_some_and(|expected| bytes == expected);
             let outcome = if self.polled.load(Ordering::Relaxed) {
                 // Polled at least once but never reached Ready(None) or an
-                // error terminal. That's a client disconnect mid-stream.
-                crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
+                // error terminal. That's normally a client disconnect
+                // mid-stream, except for protocol adapters that can prove the
+                // downstream body completed from the declared byte count.
+                if completed_declared_bytes {
+                    crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                } else {
+                    crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
+                }
             } else {
                 match &self.kind {
                     // Never polled + Full: if Full has prepared data we never
@@ -979,6 +1010,9 @@ impl Drop for ProxyBody {
             && self.backend_admission_outcome.is_some()
             || self.backend_dispatch_outcome.is_some())
             && self.polled.load(Ordering::Relaxed)
+            && self
+                .success_on_drop_after_bytes
+                .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
         {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;

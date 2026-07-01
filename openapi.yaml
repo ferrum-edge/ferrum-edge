@@ -5936,10 +5936,11 @@ components:
             disable for this proxy (idle sessions then live forever, bounded only by
             FERRUM_WEBSOCKET_MAX_CONNECTIONS). Maximum 86400 (24h).
             HTTP/3 caveat: on QUIC frontends the transport idle timeout
-            FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies, so an idle H3
-            WebSocket is bounded by min(websocket_idle_timeout_seconds,
-            FERRUM_HTTP3_IDLE_TIMEOUT); raise FERRUM_HTTP3_IDLE_TIMEOUT to honor a
-            longer idle window on H3.
+            FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies. On an
+            otherwise-idle H3 connection, QUIC may close before a longer WebSocket
+            idle timer; multiplexed H3 connections with other active streams may
+            stay open. Startup/reload warnings are logged only for affected proxies
+            when an H3 WebSocket listener is actually reachable.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64
@@ -14422,7 +14423,7 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject a default output-token limit if no supported token field is present
+          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, auto]

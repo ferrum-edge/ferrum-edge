@@ -1330,6 +1330,130 @@ fn warn_if_websocket_idle_newly_disabled(
     emit_websocket_idle_disabled_warning(&newly_disabled, global_ws_idle_timeout_seconds);
 }
 
+fn h3_websocket_reachable_from_listener(env_config: &EnvConfig, h3_listener_started: bool) -> bool {
+    h3_listener_started && env_config.enable_http3 && env_config.http3_websocket_enabled
+}
+
+fn h3_websocket_quic_idle_mismatch_proxy_ids(
+    config: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) -> Vec<&str> {
+    if !h3_websocket_reachable || http3_idle_timeout_seconds == 0 {
+        return Vec::new();
+    }
+
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_http_family())
+        .filter(|proxy| {
+            let ws_idle =
+                proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds);
+            ws_idle == 0 || ws_idle > http3_idle_timeout_seconds
+        })
+        .map(|proxy| proxy.id.as_str())
+        .collect()
+}
+
+fn emit_h3_websocket_quic_idle_mismatch_warning(
+    affected_proxy_ids: &[&str],
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let sample = affected_proxy_ids
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        h3_websocket_quic_idle_mismatch_proxy_count = affected_proxy_ids.len(),
+        h3_websocket_quic_idle_mismatch_proxy_sample = %sample,
+        global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+        "One or more HTTP-family proxies have a WebSocket idle timeout longer than the HTTP/3 QUIC connection idle timeout. \
+         On an otherwise-idle H3 connection, QUIC max_idle_timeout (FERRUM_HTTP3_IDLE_TIMEOUT) can close the connection before the WebSocket idle timer; \
+         multiplexed H3 connections with other active streams may stay open. Raise FERRUM_HTTP3_IDLE_TIMEOUT or lower websocket_idle_timeout_seconds / \
+         FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS if isolated H3 WebSockets must honor the longer idle window."
+    );
+}
+
+fn warn_if_h3_websocket_quic_idle_mismatch(
+    config: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let affected = h3_websocket_quic_idle_mismatch_proxy_ids(
+        config,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+    if affected.is_empty() {
+        return;
+    }
+    emit_h3_websocket_quic_idle_mismatch_warning(
+        &affected,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+}
+
+fn h3_websocket_new_quic_idle_mismatch_proxy_ids<'a>(
+    previous: &GatewayConfig,
+    next: &'a GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) -> Vec<&'a str> {
+    let previous_affected: std::collections::HashSet<&str> =
+        h3_websocket_quic_idle_mismatch_proxy_ids(
+            previous,
+            h3_websocket_reachable,
+            global_ws_idle_timeout_seconds,
+            http3_idle_timeout_seconds,
+        )
+        .into_iter()
+        .collect();
+
+    h3_websocket_quic_idle_mismatch_proxy_ids(
+        next,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    )
+    .into_iter()
+    .filter(|id| !previous_affected.contains(id))
+    .collect()
+}
+
+fn warn_if_h3_websocket_new_quic_idle_mismatch(
+    previous: &GatewayConfig,
+    next: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let newly_affected = h3_websocket_new_quic_idle_mismatch_proxy_ids(
+        previous,
+        next,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+    if newly_affected.is_empty() {
+        return;
+    }
+    emit_h3_websocket_quic_idle_mismatch_warning(
+        &newly_affected,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -2291,6 +2415,20 @@ fn streaming_response_status_is_passively_unhealthy(
         .is_some_and(|passive| passive.unhealthy_status_codes.contains(&response_status))
 }
 
+fn h3_success_on_drop_after_response_bytes(
+    inbound_version: hyper::Version,
+    content_length: Option<u64>,
+) -> Option<u64> {
+    if matches!(
+        inbound_version,
+        hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+    ) {
+        content_length
+    } else {
+        None
+    }
+}
+
 /// Owns the gRPC **streaming** circuit-breaker outcome, settling it at the join of
 /// request-upload termination and response-body completion so a streaming RPC is
 /// classified correctly without pinning a HALF_OPEN probe slot (#1649 item 3,
@@ -2909,6 +3047,12 @@ pub struct ProxyState {
     /// Optional dedicated WebSocket admission control.
     /// Enforced only on the upgrade path, never on the frame-forwarding hot path.
     pub websocket_conn_limit: Option<Arc<tokio::sync::Semaphore>>,
+    /// True only after the serving mode actually starts an H3 listener whose
+    /// extended CONNECT/WebSocket support is enabled.
+    ///
+    /// `EnvConfig::enable_http3` alone is not enough: serving modes also gate
+    /// listener startup on HTTPS port and frontend TLS availability.
+    pub h3_websocket_reachable: Arc<AtomicBool>,
     /// Per-IP concurrent request counters. Each IP gets an AtomicU64 tracking
     /// active requests. `None` when `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (disabled).
     pub per_ip_request_counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
@@ -4600,6 +4744,7 @@ impl ProxyState {
             websocket_tunnel_mode,
             trusted_proxies,
             websocket_conn_limit,
+            h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -5717,13 +5862,11 @@ impl ProxyState {
         {
             let egress_policy = &self.env_config.backend_allow_ips;
             let denied_literal = |candidate: &ReqwestWarmupCandidate| -> bool {
-                let bare = candidate
-                    .host
-                    .strip_prefix('[')
-                    .and_then(|h| h.strip_suffix(']'))
-                    .unwrap_or(candidate.host.as_str());
-                bare.parse::<std::net::IpAddr>()
-                    .ok()
+                // Warmup dials are reqwest HEAD/capability probes, so screen with
+                // the URL-canonicalizing `egress_literal_ip` (matches the request
+                // path) — a non-canonical literal like `2852039166` would
+                // otherwise be probed straight to the metadata IP.
+                crate::config::types::egress_literal_ip(&candidate.host)
                     .and_then(|ip| egress_policy.deny_reason(&ip))
                     .inspect(|reason| {
                         warn!(
@@ -6366,12 +6509,42 @@ impl ProxyState {
         // reload that makes a proxy's WebSocket idle bound *newly* disabled emits
         // the same resource-hoarding warning, without re-warning on every
         // unrelated reload while a persistent opt-out is in place.
+        let previous_config = self.config.load_full();
         warn_if_websocket_idle_newly_disabled(
-            &self.config.load_full(),
+            &previous_config,
             &published.config,
             self.env_config.websocket_idle_timeout_seconds,
         );
+        warn_if_h3_websocket_new_quic_idle_mismatch(
+            &previous_config,
+            &published.config,
+            self.h3_websocket_reachable.load(Ordering::Acquire),
+            self.env_config.websocket_idle_timeout_seconds,
+            self.env_config.http3_idle_timeout,
+        );
         self.config.store(Arc::clone(&published.config));
+    }
+
+    /// Record whether the serving mode actually started an H3 listener.
+    ///
+    /// This must be set by mode startup after it evaluates the same gates used
+    /// to spawn the listener: H3 enabled, HTTPS port available, and frontend
+    /// TLS material or a dynamic TLS slot. Keeping this as a listener-start
+    /// signal avoids warning about H3 WebSocket behavior in HTTP-only
+    /// deployments where env flags are enabled but no QUIC listener exists.
+    pub(crate) fn set_h3_websocket_listener_started(&self, h3_listener_started: bool) {
+        let reachable = h3_websocket_reachable_from_listener(&self.env_config, h3_listener_started);
+        let was_reachable = self
+            .h3_websocket_reachable
+            .swap(reachable, Ordering::AcqRel);
+        if reachable && !was_reachable {
+            warn_if_h3_websocket_quic_idle_mismatch(
+                &self.config.load_full(),
+                true,
+                self.env_config.websocket_idle_timeout_seconds,
+                self.env_config.http3_idle_timeout,
+            );
+        }
     }
 
     /// Update the proxy configuration.
@@ -13933,8 +14106,12 @@ async fn handle_proxy_request_inner(
         let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
         let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
         // Enforce the backend egress policy for a literal-IP gRPC backend before
-        // dialing (the gRPC pool skips the DnsCacheResolver for IP literals).
-        if let Some(reason) = denied_literal_backend_or_dns_override(
+        // dialing. The gRPC pool self-resolves via `DnsCache::resolve` (canonical
+        // `IpAddr` fast path; non-canonical spellings go to real DNS and are
+        // screened on the resolved address), never reqwest's URL parser, so use
+        // the canonical screen — the URL-canonicalizing one would wrongly reject a
+        // legitimate all-numeric gRPC backend hostname (e.g. `2852039166`).
+        if let Some(reason) = denied_literal_backend_or_dns_override_canonical(
             grpc_effective_host,
             grpc_dispatch_proxy,
             &state.env_config.backend_allow_ips,
@@ -14564,13 +14741,15 @@ async fn handle_proxy_request_inner(
                 }
 
                 // Re-screen the (possibly LB-rotated) retry target before
-                // dispatch: the gRPC pool skips the DnsCacheResolver for IP
-                // literals, so a denied literal reached via rotation must be
-                // rejected here too (mirrors the first-attempt gRPC screen). No
+                // dispatch: the gRPC pool self-resolves via `DnsCache::resolve`
+                // (canonical `IpAddr` fast path; non-canonical → real DNS +
+                // resolved-address screen), so use the canonical screen here too
+                // (mirrors the first-attempt gRPC screen) — the URL-canonicalizing
+                // one would wrongly reject a legitimate all-numeric hostname. No
                 // circuit-breaker probe slot is held for the new target yet (the
                 // breaker is checked just below), so only the request is counted.
                 if let Some(ref rotated_target) = grpc_current_target
-                    && denied_literal_backend_ip(
+                    && denied_literal_backend_ip_canonical(
                         &rotated_target.host,
                         &state.env_config.backend_allow_ips,
                     )
@@ -16506,9 +16685,10 @@ async fn handle_proxy_request_inner(
     // body completes. Use the no-conn-end variant so the least-connections
     // gauge is not decremented twice per request (guard + this call).
     //
-    // #1649 item 2: a direct-H2 `StreamingH2` response can fail *after* headers —
-    // a streamable non-failure status followed by a stalled body raises a post-wire
-    // read-timeout / reset once the streaming read-timeout window (#1626) fires.
+    // #1649 item 2 / #1901: direct-H2 `StreamingH2` and native-H3 `StreamingH3`
+    // responses can fail *after* headers — a streamable non-failure status
+    // followed by a stalled body raises a post-wire read-timeout / reset once
+    // the streaming read-timeout window (#1626 / #1940) fires.
     // Recording the dispatch outcome here, at header time, would bank a phantom
     // success and even feed the broken backend's fast TTFB into least-latency, and a mid-stream failure could never
     // correct it. Only that genuinely-unknown case is deferred to body completion
@@ -16530,16 +16710,21 @@ async fn handle_proxy_request_inner(
     // dropped without being polled, so deferring it would be misread as a client
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
     //
-    // Keep native-H3 out of this defer gate for now. hyper can finish an HTTP/1
-    // downstream response after writing a known Content-Length without polling
-    // the H3 body to its terminal FIN, so a deferred H3 dispatch outcome can be
-    // mis-recorded as ClientDisconnect. H3 streaming still gets per-frame
-    // `backend_read_timeout_ms`; CB / passive-health dispatch accounting remains
-    // eager until #1901 has body-driving-safe terminal accounting.
     let streaming_h2_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
     };
+    let streaming_h3_header_content_length = match &response_body {
+        ResponseBody::StreamingH3(_) => response_headers
+            .get("content-length")
+            .and_then(|v| v.parse::<u64>().ok()),
+        _ => None,
+    };
+    // H3 does not expose an `is_end_stream()` signal at response-header time.
+    // Treat declared zero-length responses as already ended for the defer gate;
+    // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
+    let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
+        && streaming_h3_header_content_length == Some(0);
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
         && streaming_dispatch_should_defer(
             &proxy,
@@ -16555,12 +16740,26 @@ async fn handle_proxy_request_inner(
                 response_status,
             ),
         );
+    let defer_streaming_h3_dispatch = matches!(&response_body, ResponseBody::StreamingH3(_))
+        && streaming_dispatch_should_defer(
+            &proxy,
+            response_status,
+            streaming_h3_body_ended,
+            method.eq_ignore_ascii_case("HEAD"),
+            streaming_response_status_is_passively_unhealthy(
+                &epoch.load_balancer,
+                &proxy,
+                final_upstream_target.as_deref(),
+                response_status,
+            ),
+        );
+    let defer_streaming_dispatch = defer_streaming_h2_dispatch || defer_streaming_h3_dispatch;
     // Final-attempt dispatch elapsed for CB/passive-health/least-latency and
     // adaptive-concurrency samples. `backend_start` intentionally spans every
     // retry attempt and backoff for transaction logs below; using it here would
     // penalize a rotated retry target with another target's failure/backoff.
     let final_backend_dispatch_elapsed = backend_admission_started_at.elapsed();
-    if defer_streaming_h2_dispatch {
+    if defer_streaming_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
         // completion as a non-probe. Gated by `!skip_final_cb_record` because a
@@ -16662,12 +16861,16 @@ async fn handle_proxy_request_inner(
         });
     }
 
-    // #1649 item 2: an after_proxy reject can replace the `StreamingH2` body with
-    // a buffered response, so the body will no longer carry the deferred dispatch
-    // outcome. Record it synchronously now, using the BACKEND's captured
+    // #1649 item 2 / #1901: an after_proxy reject can replace the `StreamingH2`
+    // or `StreamingH3` body with a buffered response, so the body will no longer
+    // carry the deferred dispatch outcome. Record it synchronously now, using the
+    // BACKEND's captured
     // status/error (NOT the plugin reject's, which says nothing about backend
     // health) and as a non-probe (the slot was released at header time).
-    if defer_streaming_h2_dispatch && !matches!(&response_body, ResponseBody::StreamingH2(_)) {
+    let deferred_streaming_body_still_streaming = (defer_streaming_h2_dispatch
+        && matches!(&response_body, ResponseBody::StreamingH2(_)))
+        || (defer_streaming_h3_dispatch && matches!(&response_body, ResponseBody::StreamingH3(_)));
+    if defer_streaming_dispatch && !deferred_streaming_body_still_streaming {
         // #1649 R5 finding 3: the after_proxy hook may have run long enough for the
         // breaker to open a new cycle. Skip the CB record if this header-time
         // outcome is stale for the current generation (parity with the
@@ -17305,6 +17508,8 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            let success_on_drop_after_bytes =
+                h3_success_on_drop_after_response_bytes(inbound_version, cl);
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -17345,13 +17550,33 @@ async fn handle_proxy_request_inner(
                     proxy.backend_read_timeout_ms,
                 )
             };
-            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            let mut body = body
+                .with_success_on_drop_after_response_bytes(success_on_drop_after_bytes)
+                .with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
                     backend_admission_response_status,
                     backend_admission_elapsed,
                 );
+            }
+            if defer_streaming_h3_dispatch {
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::clone(&state),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        final_upstream_target.clone(),
+                        final_cb_target_key.clone(),
+                        backend_admission_response_status,
+                        false,
+                        None,
+                        false,
+                        skip_final_cb_record,
+                        final_backend_dispatch_elapsed,
+                    )
+                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
             }
             body
         }
@@ -18470,17 +18695,7 @@ pub(crate) fn denied_literal_backend_ip(
     host: &str,
     policy: &crate::config::BackendEgressPolicy,
 ) -> Option<&'static str> {
-    // Strip URI brackets: `build_backend_url_with_target` preserves bracketed
-    // IPv6 (`[fd00:ec2::254]`) and reqwest/gRPC/H3 treat that as an IP-literal
-    // authority that skips the DnsCacheResolver, so the bare address must still
-    // be screened.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    host.parse::<std::net::IpAddr>()
-        .ok()
-        .and_then(|ip| policy.deny_reason(&ip))
+    crate::config::types::egress_literal_ip(host).and_then(|ip| policy.deny_reason(&ip))
 }
 
 /// Like [`denied_literal_backend_ip`] but also screens the proxy's `dns_override`
@@ -18500,6 +18715,46 @@ pub(crate) fn denied_literal_backend_or_dns_override(
             .dns_override
             .as_deref()
             .and_then(|ovr| denied_literal_backend_ip(ovr, policy))
+    })
+}
+
+/// Canonical-literal-only counterpart of [`denied_literal_backend_ip`] for the
+/// **self-resolving** dispatch pools — gRPC (`GrpcConnectionPool`) and native H3
+/// (`Http3ConnectionPool`). Those pools do NOT hand the host to reqwest's URL
+/// parser; they resolve it themselves through `DnsCache::resolve` /
+/// `resolve_backend_addr_cached`, whose literal fast path is `IpAddr::parse`
+/// (canonical only) and which otherwise performs real DNS and policy-screens the
+/// *resolved* address. So a non-canonical numeric spelling like `2852039166` or
+/// `111` is a DNS NAME on those paths (resolved, then screened), NOT the
+/// URL-canonicalized literal `169.254.169.254` / `0.0.0.111` — screening it with
+/// the URL-canonicalizing [`egress_literal_ip`] would wrongly reject a legitimate
+/// all-numeric backend hostname. Canonical denied literals are still caught here
+/// (and again by the resolver's own screen). reqwest-dialed paths (HTTP/1.1,
+/// H2-via-reqwest, the H3 cross-protocol bridge) and config admission — none of
+/// which know the runtime dispatch pool — MUST keep using [`egress_literal_ip`],
+/// since a cold capability registry routes plain-HTTPS traffic through reqwest
+/// where the URL-canonicalized bypass is real.
+pub(crate) fn denied_literal_backend_ip_canonical(
+    host: &str,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    crate::config::types::stream_literal_ip(host).and_then(|ip| policy.deny_reason(&ip))
+}
+
+/// Like [`denied_literal_backend_ip_canonical`] but also screens the proxy's
+/// `dns_override` literal. `dns_override` is always consumed as a canonical
+/// `IpAddr` (`DnsCache::resolve` parses it with `IpAddr::parse`), so the
+/// canonical screen matches its dial semantics exactly.
+pub(crate) fn denied_literal_backend_or_dns_override_canonical(
+    host: &str,
+    proxy: &Proxy,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    denied_literal_backend_ip_canonical(host, policy).or_else(|| {
+        proxy
+            .dns_override
+            .as_deref()
+            .and_then(|ovr| denied_literal_backend_ip_canonical(ovr, policy))
     })
 }
 
@@ -22260,9 +22515,15 @@ async fn proxy_to_backend_http3(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
-    // Enforce the backend egress policy for a literal-IP backend before dialing
-    // (the native-H3/reqwest paths skip the DnsCacheResolver for IP literals).
-    if let Some(reason) = denied_literal_backend_or_dns_override(
+    // Enforce the backend egress policy for a literal-IP backend before dialing.
+    // The native H3 pool self-resolves via `resolve_backend_addr_cached` — whose
+    // literal fast path is canonical `IpAddr::parse` (non-canonical spellings go
+    // to real DNS and are screened on the resolved address) — never reqwest's URL
+    // parser, so use the canonical screen. The URL-canonicalizing one would
+    // wrongly reject a legitimate all-numeric H3 backend hostname (`2852039166`).
+    // (A denied literal reached via a reqwest fallback is re-screened on that
+    // path's own `egress_literal_ip` guard.)
+    if let Some(reason) = denied_literal_backend_or_dns_override_canonical(
         effective_host,
         proxy,
         &state.env_config.backend_allow_ips,
@@ -22900,9 +23161,11 @@ async fn proxy_to_backend_http3(
 /// Native-H3 streaming responses use the same per-frame
 /// `backend_read_timeout_ms` idle regime as direct-H2 streaming responses, so a
 /// backend that sends headers and then stalls is cut by the response-body
-/// wrapper instead of waiting for the QUIC idle timeout. CB / passive-health
-/// dispatch accounting remains eager at header time for native H3 until #1901
-/// has a body-driving-safe terminal accounting design.
+/// wrapper instead of waiting for the QUIC idle timeout. Streamable H3 statuses
+/// also defer CB / passive-health dispatch accounting to body completion; a
+/// declared `Content-Length` lets the drop safety net treat a body dropped after
+/// yielding the full byte count as a success instead of a false client
+/// disconnect.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
@@ -23282,10 +23545,15 @@ async fn proxy_to_backend_http3_retry(
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
 
-    // Re-screen the (possibly LB-rotated) retry target: the native H3 pool skips
-    // the DnsCacheResolver for IP literals, so a denied literal reached via retry
-    // rotation must be rejected here, mirroring the first-attempt H3 screen.
-    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+    // Re-screen the (possibly LB-rotated) retry target: the native H3 pool
+    // self-resolves via `resolve_backend_addr_cached` (canonical `IpAddr` fast
+    // path; non-canonical → real DNS + resolved-address screen), so use the
+    // canonical screen, mirroring the first-attempt H3 screen — the
+    // URL-canonicalizing one would wrongly reject a legitimate all-numeric
+    // hostname reached via rotation.
+    if denied_literal_backend_ip_canonical(effective_host, &state.env_config.backend_allow_ips)
+        .is_some()
+    {
         return backend_egress_denied_response(effective_host);
     }
 
@@ -23586,12 +23854,75 @@ mod tests {
         assert!(denied_literal_backend_ip("169.254.169.254", &policy).is_some());
         assert!(denied_literal_backend_ip("64:ff9b::a9fe:a9fe", &policy).is_some());
         assert!(denied_literal_backend_ip("::ffff:169.254.169.254", &policy).is_some());
+        // URL/reqwest parsing canonicalizes these non-DNS IPv4 spellings to
+        // 169.254.169.254, so the literal guard must screen them before the
+        // client can skip the DnsCacheResolver.
+        assert!(denied_literal_backend_ip("2852039166", &policy).is_some());
+        assert!(denied_literal_backend_ip("0xa9fea9fe", &policy).is_some());
+        assert!(denied_literal_backend_ip("0251.0376.0251.0376", &policy).is_some());
+        // The URL parser strips ASCII tab/newline/CR from the authority before
+        // parsing, so these canonicalize to the metadata IP at dispatch; the guard
+        // must strip them too rather than treat the raw host as a DNS name.
+        assert!(denied_literal_backend_ip("169.254.169.\n254", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.\t169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip("2852039166\r", &policy).is_some());
+        // Control chars split into an otherwise-canonical IPv6 literal (the
+        // digit-leading prefilter must not skip it once stripped).
+        assert!(denied_literal_backend_ip("64:ff9b::a9fe:\ta9fe", &policy).is_some());
+        // Userinfo `@`: the URL client dials the post-`@` host, so screen that.
+        assert!(denied_literal_backend_ip("allowed@169.254.169.254", &policy).is_some());
+        // Authority TERMINATORS: the URL authority (and thus the dialed host) ends
+        // at the first '/', '?', '#', or (for special http/https URLs) '\', so the
+        // metadata IP BEFORE the terminator is what gets dialed — the '@' after it
+        // is in the path and must not steer screening onto the post-'@' label.
+        assert!(denied_literal_backend_ip("169.254.169.254/@evil.com", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.169.254\\@evil.com", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.169.254?@evil.com", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.169.254#@evil.com", &policy).is_some());
+        // Control chars are stripped before the authority is parsed but are never
+        // terminators, so a control-then-terminator sequence still truncates.
+        assert!(denied_literal_backend_ip("169.254.169.254\t/@evil.com", &policy).is_some());
+        // IDNA/UTS-46 fullwidth digits the URL parser maps to the metadata IP;
+        // a non-ASCII host must not be skipped by the digit prefilter.
+        assert!(denied_literal_backend_ip("１６９。２５４。１６９。２５４", &policy).is_some());
+        // Percent-encoding: the URL parser percent-DECODES the host before IPv4
+        // parsing, so a '%'-leading spelling canonicalizes to the metadata IP and
+        // must not be skipped by the (non-digit-leading) ASCII prefilter.
+        assert!(
+            denied_literal_backend_ip("%31%36%39.%32%35%34.%31%36%39.%32%35%34", &policy).is_some()
+        );
+        // A digit-leading hostname is still a hostname (the numeric prefilter must
+        // not misclassify it) and is screened by the resolver, not here.
+        assert!(denied_literal_backend_ip("3com.example.com", &policy).is_none());
         // Allowed literals (loopback / RFC1918) → not blocked.
         assert!(denied_literal_backend_ip("127.0.0.1", &policy).is_none());
         assert!(denied_literal_backend_ip("10.0.0.1", &policy).is_none());
         // Hostnames are screened by the DnsCacheResolver at resolution time, not
         // here, so this returns None for them.
         assert!(denied_literal_backend_ip("metadata.example.com", &policy).is_none());
+    }
+
+    #[test]
+    fn canonical_backend_ip_screen_matches_selfresolving_pools() {
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
+        let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+
+        // Self-resolving pools (gRPC / native H3) resolve through
+        // `DnsCache::resolve`, whose literal fast path is canonical `IpAddr::parse`
+        // and which otherwise does real DNS + screens the resolved address. A
+        // canonical denied literal is still blocked by the canonical screen...
+        assert!(denied_literal_backend_ip_canonical("169.254.169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip_canonical("64:ff9b::a9fe:a9fe", &policy).is_some());
+        // ...but a NON-canonical numeric spelling is a DNS NAME on those paths (it
+        // fails `IpAddr::parse` and is resolved, then the resolved IP is screened),
+        // NOT the URL-canonicalized metadata literal — so the canonical screen must
+        // pass it, whereas the URL-canonicalizing screen (reqwest paths) blocks it.
+        assert!(denied_literal_backend_ip_canonical("2852039166", &policy).is_none());
+        assert!(denied_literal_backend_ip_canonical("0xa9fea9fe", &policy).is_none());
+        assert!(denied_literal_backend_ip_canonical("111", &policy).is_none());
+        assert!(denied_literal_backend_ip("2852039166", &policy).is_some());
+        // Allowed canonical literals are not blocked by either screen.
+        assert!(denied_literal_backend_ip_canonical("127.0.0.1", &policy).is_none());
     }
     use serde_json::json;
     use wiremock::matchers::{method, path};
@@ -25816,6 +26147,26 @@ mod tests {
     fn plain_and_grpc_flavors_allow_request_body_buffering() {
         assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Plain));
         assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Grpc));
+    }
+
+    #[test]
+    fn h3_drop_success_hint_only_applies_to_http1_downstreams() {
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_10, Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_11, Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_2, Some(42)),
+            None
+        );
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_3, Some(42)),
+            None
+        );
     }
 
     #[test]
@@ -30007,6 +30358,81 @@ mod tests {
         // Steady state (no new transitions) reports nothing, so a persistent
         // opt-out does not re-warn on every unrelated reload.
         assert!(websocket_idle_newly_disabled_proxy_ids(&next, &next, 300).is_empty());
+    }
+
+    #[test]
+    fn h3_websocket_reachable_requires_listener_and_extended_connect() {
+        let mut env = EnvConfig {
+            enable_http3: true,
+            http3_websocket_enabled: true,
+            ..EnvConfig::default()
+        };
+
+        assert!(h3_websocket_reachable_from_listener(&env, true));
+        assert!(
+            !h3_websocket_reachable_from_listener(&env, false),
+            "env flags alone must not make H3 WebSockets reachable when no listener started"
+        );
+
+        env.http3_websocket_enabled = false;
+        assert!(
+            !h3_websocket_reachable_from_listener(&env, true),
+            "an H3 listener without extended CONNECT/WebSocket support should not warn"
+        );
+    }
+
+    #[test]
+    fn h3_websocket_quic_idle_mismatch_collector_filters_reachable_http_family() {
+        let mut disabled = make_validation_proxy("disabled", "/disabled");
+        disabled.websocket_idle_timeout_seconds = Some(0);
+        let mut long = make_validation_proxy("long", "/long");
+        long.websocket_idle_timeout_seconds = Some(120);
+        let mut equal = make_validation_proxy("equal", "/equal");
+        equal.websocket_idle_timeout_seconds = Some(30);
+        let mut shorter = make_validation_proxy("shorter", "/shorter");
+        shorter.websocket_idle_timeout_seconds = Some(10);
+        let inherit = make_validation_proxy("inherit", "/inherit");
+        let mut stream = make_validation_stream_proxy("stream", 18080);
+        stream.websocket_idle_timeout_seconds = Some(120);
+
+        let mut config =
+            make_validation_config(vec![disabled, long, equal, shorter, inherit, stream]);
+        config.normalize_fields();
+
+        let mut affected = h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 30);
+        affected.sort();
+        assert_eq!(affected, vec!["disabled", "inherit", "long"]);
+
+        assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, false, 300, 30).is_empty());
+        assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 0).is_empty());
+    }
+
+    #[test]
+    fn h3_websocket_new_quic_idle_mismatch_reports_only_transitions() {
+        let mut prev_a = make_validation_proxy("a", "/a");
+        prev_a.websocket_idle_timeout_seconds = Some(120); // already affected
+        let mut prev_b = make_validation_proxy("b", "/b");
+        prev_b.websocket_idle_timeout_seconds = Some(10); // not affected
+        let mut previous = make_validation_config(vec![prev_a, prev_b]);
+        previous.normalize_fields();
+
+        let mut next_a = make_validation_proxy("a", "/a");
+        next_a.websocket_idle_timeout_seconds = Some(120); // still affected
+        let mut next_b = make_validation_proxy("b", "/b");
+        next_b.websocket_idle_timeout_seconds = Some(45); // newly affected
+        let mut next_c = make_validation_proxy("c", "/c");
+        next_c.websocket_idle_timeout_seconds = Some(0); // added and affected
+        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        next.normalize_fields();
+
+        let mut newly =
+            h3_websocket_new_quic_idle_mismatch_proxy_ids(&previous, &next, true, 300, 30);
+        newly.sort();
+        assert_eq!(newly, vec!["b", "c"]);
+
+        assert!(
+            h3_websocket_new_quic_idle_mismatch_proxy_ids(&next, &next, true, 300, 30).is_empty()
+        );
     }
 
     fn test_runtime_trust_bundles(

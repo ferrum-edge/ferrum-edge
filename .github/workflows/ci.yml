@@ -2233,8 +2233,28 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install protoc nasm -y
-          echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          $ErrorActionPreference = "Stop"
+
+          $protocVersion = "35.1"
+          $protocRoot = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion"
+          $protocZip = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion-win64.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip" `
+            -OutFile $protocZip
+          Expand-Archive -Path $protocZip -DestinationPath $protocRoot -Force
+          $protocBin = Join-Path $protocRoot "bin"
+          $protocExe = Join-Path $protocBin "protoc.exe"
+          if (!(Test-Path $protocExe)) {
+            throw "protoc.exe was not found after extracting $protocZip"
+          }
+          $protocBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          if (!(Test-Path "C:\Program Files\NASM\nasm.exe")) {
+            throw "nasm.exe was not found after Chocolatey install"
+          }
 
       - name: Install cross (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'

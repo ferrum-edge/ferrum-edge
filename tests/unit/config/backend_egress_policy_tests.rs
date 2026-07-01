@@ -366,3 +366,89 @@ fn deny_reason_is_actionable() {
             .contains("FERRUM_BACKEND_DENY_CIDRS")
     );
 }
+
+#[test]
+fn proxy_admission_screens_url_style_ipv4_literals() {
+    let p = default_policy();
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "noncanonical-imds",
+        "hosts": ["example.com"],
+        "backend_host": "2852039166",
+        "backend_port": 80
+    }))
+    .expect("valid proxy shape");
+
+    let errors = proxy
+        .validate_backend_egress_ips(&p)
+        .expect_err("decimal IPv4 form should be canonicalized and denied");
+    assert!(
+        errors.iter().any(|err| err.contains("169.254.169.254")),
+        "expected canonical metadata IP in error, got {errors:?}"
+    );
+}
+
+#[test]
+fn upstream_admission_does_not_overblock_numeric_names() {
+    // An upstream can be referenced by stream (tcp/udp) proxies, which resolve a
+    // numeric name like `0xa9fea9fe` through DNS rather than the URL
+    // canonicalization the HTTP stack uses. Admission therefore screens upstream
+    // targets with the canonical-literal-only path and must NOT pre-canonicalize
+    // these to IP literals, so a legitimate stream target is not rejected.
+    // URL-style literals on HTTP-dispatched targets are blocked at the request
+    // path by `denied_literal_backend_ip` instead (covered by an inline test in
+    // `src/proxy/mod.rs`).
+    let p = default_policy();
+    let upstream: ferrum_edge::config::types::Upstream =
+        serde_json::from_value(serde_json::json!({
+            "id": "noncanonical-imds-upstream",
+            "targets": [{ "host": "0xa9fea9fe", "port": 80 }]
+        }))
+        .expect("valid upstream shape");
+    assert!(
+        upstream.validate_backend_egress_ips(&p).is_ok(),
+        "a URL-style literal on an upstream target must not be over-blocked at admission"
+    );
+}
+
+#[test]
+fn stream_proxy_admission_does_not_overblock_numeric_name() {
+    // A tcp/udp backend host resolves through `DnsCache::resolve` (real DNS for
+    // non-canonical names), so a numeric service name like `111` must not be
+    // URL-canonicalized to `0.0.0.111` and rejected at admission.
+    let p = default_policy();
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "numeric-stream-backend",
+        "listen_port": 9999,
+        "backend_host": "111",
+        "backend_port": 80,
+        "backend_scheme": "tcp"
+    }))
+    .expect("valid stream proxy shape");
+    assert!(
+        proxy.validate_backend_egress_ips(&p).is_ok(),
+        "a numeric stream backend name must not be over-blocked at admission"
+    );
+}
+
+#[test]
+fn http_proxy_admission_screens_control_char_literal() {
+    // The URL parser strips ASCII tab/newline/CR from the authority before
+    // parsing, so `169.254.169.\n254` canonicalizes to the metadata IP at
+    // dispatch. HTTP-family admission must canonicalize it the same way.
+    let p = default_policy();
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "control-char-imds",
+        "hosts": ["example.com"],
+        "backend_host": "169.254.169.\n254",
+        "backend_port": 80
+    }))
+    .expect("valid proxy shape");
+
+    let errors = proxy
+        .validate_backend_egress_ips(&p)
+        .expect_err("control-char IPv4 form should be canonicalized and denied");
+    assert!(
+        errors.iter().any(|err| err.contains("169.254.169.254")),
+        "expected canonical metadata IP in error, got {errors:?}"
+    );
+}

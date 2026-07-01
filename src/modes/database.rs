@@ -1464,6 +1464,7 @@ pub async fn run(
     }
 
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
+    let mut h3_listener_started = false;
     if env_config.enable_http3 {
         if let Some(tls_config) = tls_config.clone() {
             if env_config.proxy_https_port == 0 {
@@ -1502,12 +1503,12 @@ pub async fn run(
                 });
                 handles.push(("HTTP/3 proxy listener".to_string(), h3_handle));
                 startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
+                h3_listener_started = true;
             }
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
     }
-
     if env_config.proxy_http_port == 0 && (tls_config.is_none() || env_config.proxy_https_port == 0)
     {
         warn!(
@@ -1735,6 +1736,7 @@ pub async fn run(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
+        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
         Ok(())
     }
     .await;

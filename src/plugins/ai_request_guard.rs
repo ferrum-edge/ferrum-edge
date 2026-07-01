@@ -926,21 +926,17 @@ enum DefaultTokenTarget {
     TextGeneration,
 }
 
-/// Picks the container that `default_max_tokens` is injected into.
+/// Picks the provider-native container that `default_max_tokens` should also be
+/// injected into when the body is clearly using one of the provider-native
+/// schemas the guard understands.
 ///
-/// Routing is driven by provider-native marker containers that are already
-/// present on the body. A Bedrock Converse body is only recognized when it
-/// already carries `inferenceConfig`; a body that omits it — or an Amazon Titan
-/// body (`textGenerationConfig.maxTokenCount`) — falls through to `TopLevel` and
-/// receives a top-level `max_tokens` those providers ignore. A bare,
-/// messages-only Bedrock body is wire-indistinguishable from OpenAI, so this is
-/// inherent: we do not provider-sniff. This limitation is documented in the
-/// schema-coverage matrix in docs/plugins.md.
-///
-/// TGI / HuggingFace text-generation bodies (recognized by their top-level
-/// `inputs` prompt field) cap output via `max_new_tokens`, so they route to
-/// `TextGeneration`; injecting a top-level `max_tokens` there would be ignored
-/// by the backend and silently drop the intended default cap.
+/// These markers are still request-controlled, so they must not be used to
+/// suppress the top-level default cap on an OpenAI-shaped body.
+/// `inject_default_max_tokens` keeps a top-level fallback whenever the body
+/// carries a top-level OpenAI-family prompt field (see
+/// [`has_top_level_prompt_marker`]) or no native container at all, then adds the
+/// provider-native cap when a native target is detected. A body that is
+/// unambiguously provider-native is left to its native cap only.
 fn default_token_target(json: &Value) -> DefaultTokenTarget {
     if json.get("generationConfig").is_some()
         || json.get("contents").is_some()
@@ -957,19 +953,80 @@ fn default_token_target(json: &Value) -> DefaultTokenTarget {
     }
 }
 
-fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
-    let target = default_token_target(json);
-    // Provider-aware: only suppress injection when the *target* provider already
-    // caps output tokens. A token-looking field for a different provider that the
-    // target backend ignores must not block the default from landing in the real
-    // field.
-    if target_already_caps_output(json, target) {
-        return false;
-    }
-    let Some(obj) = json.as_object_mut() else {
-        return false;
-    };
+/// A Responses-shaped body uses `input` / `instructions` / `previous_response_id`
+/// and NO chat `messages` array. A body that carries `messages` is a Chat /
+/// Anthropic / Cohere request (it caps via top-level `max_tokens`) even if a
+/// client also adds a Responses marker — routing such a body to
+/// `max_output_tokens` would let `{messages, input}` divert `default_max_tokens`
+/// into a field the chat upstream ignores, leaving it uncapped.
+fn is_responses_shape(json: &Value) -> bool {
+    looks_like_responses(json) && json.get("messages").is_none()
+}
 
+/// The top-level output-cap field for the body's OpenAI-family schema. A
+/// Responses-shaped body (see [`is_responses_shape`]) caps output via
+/// `max_output_tokens`; every other top-level-capped family (Chat Completions,
+/// legacy completions, Anthropic Messages, Cohere) caps via `max_tokens`.
+/// Provider-native families cap via their own container
+/// (`inject_provider_default_max_tokens`), not this field.
+fn top_level_cap_field(json: &Value) -> &'static str {
+    if is_responses_shape(json) {
+        "max_output_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// True when the body already declares the cap field its OWN top-level family
+/// reads. Checks only that family's field(s) — not every recognized token alias:
+/// a stray cross-provider alias an OpenAI-family upstream ignores (e.g. a TGI
+/// `max_new_tokens`, a Gemini `maxOutputTokens`, or a Bedrock `maxTokens` sitting
+/// at the top level of a Chat body) must NOT be mistaken for the real cap and
+/// suppress the fallback. `max_completion_tokens` is the Chat-Completions alias
+/// for `max_tokens` and counts.
+fn top_level_cap_present(json: &Value) -> bool {
+    if is_responses_shape(json) {
+        json.get("max_output_tokens").is_some()
+    } else {
+        json.get("max_tokens").is_some() || json.get("max_completion_tokens").is_some()
+    }
+}
+
+/// True when the body carries a top-level prompt field that an OpenAI-compatible
+/// (top-level-capped) upstream reads, so a top-level cap would actually bound its
+/// output. Covers every top-level-capped family: `messages` (OpenAI Chat,
+/// Anthropic Messages, Cohere v2, Bedrock Converse), `prompt` (legacy
+/// completions), `input` / `instructions` / `previous_response_id` (Responses),
+/// and `message` / `chat_history` (Cohere v1). The provider-native prompt fields
+/// `contents` (Gemini), `inputs` (TGI), and `inputText` (Titan) are deliberately
+/// excluded — those bodies cap via their native container, so a client-spoofed
+/// provider-native marker on a top-level-shaped body must NOT divert the default
+/// away from the top level (the #1950 bypass), while an unambiguously native body
+/// (a native container and none of these prompts) is left to its native cap only
+/// and a strict provider backend is not handed an unsupported top-level field.
+/// Bedrock Converse is the irreducible exception: it shares `messages` with
+/// OpenAI, so it is treated as top-level-capable and fail-closed-capped. See
+/// [`inject_default_max_tokens`].
+fn has_top_level_prompt_marker(json: &Value) -> bool {
+    const TOP_LEVEL_PROMPT_MARKERS: &[&str] = &[
+        "messages",
+        "prompt",
+        "input",
+        "instructions",
+        "previous_response_id",
+        "message",
+        "chat_history",
+    ];
+    TOP_LEVEL_PROMPT_MARKERS
+        .iter()
+        .any(|field| json.get(*field).is_some())
+}
+
+fn inject_provider_default_max_tokens(
+    obj: &mut serde_json::Map<String, Value>,
+    target: DefaultTokenTarget,
+    default: u64,
+) -> bool {
     match target {
         DefaultTokenTarget::Gemini => {
             let entry = obj
@@ -997,11 +1054,67 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
             obj.insert("max_new_tokens".to_string(), Value::Number(default.into()));
             true
         }
-        DefaultTokenTarget::TopLevel => {
-            obj.insert("max_tokens".to_string(), Value::Number(default.into()));
-            true
-        }
+        DefaultTokenTarget::TopLevel => false,
     }
+}
+
+fn inject_default_max_tokens(json: &mut Value, default: u64, schema: SupportedSchema) -> bool {
+    let target = default_token_target(json);
+    // Use the body's OWN family cap field (`max_output_tokens` for Responses, else
+    // `max_tokens`) both to test whether a real cap is present and as the field to
+    // inject — so a Responses body gets the cap the Responses API actually reads,
+    // and a stray cross-provider alias does not pass as an existing cap.
+    let cap_field = top_level_cap_field(json);
+    let top_level_already_capped = top_level_cap_present(json);
+    let target_already_capped = target_already_caps_output(json, target);
+    // The top-level fallback exists to defeat the #1950 spoof: a client appends a
+    // provider-native marker (`generationConfig`/`inferenceConfig`/`contents`) to
+    // an OpenAI-shaped body so the default routes only into a field the real
+    // (top-level-capped) upstream ignores, leaving output uncapped. Inject the
+    // top-level fallback only when the body actually carries a top-level-capped
+    // prompt field — the spoof must keep one so the OpenAI/Anthropic/Cohere
+    // upstream still processes the request — or when no provider-native container
+    // is present at all. A body that is unambiguously provider-native (a native
+    // container and NO top-level prompt field, e.g. Gemini `contents`, TGI
+    // `inputs`) is left to its native cap only, so a strict provider backend is
+    // not handed an unsupported top-level cap field.
+    //
+    // Bedrock Converse is the one provider-native shape that DOES carry a
+    // top-level prompt marker (`messages`) — but it caps via
+    // `inferenceConfig.maxTokens`, and the AWS Converse API rejects an unexpected
+    // top-level `max_tokens`. A model-less `{messages, inferenceConfig}` body,
+    // however, is ALSO what an OpenAI-compatible backend that derives the model
+    // outside the JSON body receives (Azure OpenAI / deployment-in-URL routes),
+    // so absence of `model` cannot prove Converse. Only suppress the top-level
+    // fallback when the operator has explicitly declared a provider-native
+    // backend (`supported_schema: provider_native`); in `auto` or OpenAI-family
+    // modes, fail closed and keep the top-level cap so an Azure/OpenAI upstream is
+    // not left uncapped. Native backends still get their `inferenceConfig` cap
+    // below either way.
+    let bedrock_converse_native = matches!(target, DefaultTokenTarget::Bedrock)
+        && matches!(schema, SupportedSchema::ProviderNative);
+    let wants_top_level_fallback = matches!(target, DefaultTokenTarget::TopLevel)
+        || (has_top_level_prompt_marker(json) && !bedrock_converse_native);
+    let Some(obj) = json.as_object_mut() else {
+        return false;
+    };
+
+    let mut modified = false;
+
+    if wants_top_level_fallback && !top_level_already_capped {
+        obj.insert(cap_field.to_string(), Value::Number(default.into()));
+        modified = true;
+    }
+
+    // Preserve provider-native functionality too: native backends that ignore
+    // the top-level fallback still receive their own output-token cap. A
+    // malformed provider container simply skips the native insertion; the
+    // top-level fallback above remains in place for compatible upstreams.
+    if !target_already_capped {
+        modified |= inject_provider_default_max_tokens(obj, target, default);
+    }
+
+    modified
 }
 
 fn count_message_entries(json: &Value) -> u64 {
@@ -1576,7 +1689,7 @@ impl Plugin for AiRequestGuard {
 
         // Inject default_max_tokens if not present
         if let Some(default) = self.default_max_tokens {
-            body_modified |= inject_default_max_tokens(&mut json, default);
+            body_modified |= inject_default_max_tokens(&mut json, default, self.supported_schema);
         }
 
         if body_modified && let Ok(new_body) = serde_json::to_string(&json) {
@@ -1729,7 +1842,7 @@ impl Plugin for AiRequestGuard {
 
         // Inject default_max_tokens if not present
         if let Some(default) = self.default_max_tokens {
-            modified |= inject_default_max_tokens(&mut json, default);
+            modified |= inject_default_max_tokens(&mut json, default, self.supported_schema);
         }
 
         if modified {
