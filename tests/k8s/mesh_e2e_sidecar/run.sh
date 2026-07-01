@@ -635,8 +635,12 @@ probe_plaintext_rejected() {
       body=""
       for _ in 1 2 3; do
         : >/tmp/pt 2>/dev/null || true
+        # curl can emit its -w "000" AND fail (connection reset after send),
+        # so an `|| echo 000` fallback would double up as "000000" in the
+        # recorded outcome; normalize the empty case instead.
         out="$(curl -s -m 5 -o /tmp/pt -w "%{http_code}" \
-          -H "Host: $host" "http://$ip:8080/" 2>/dev/null || echo 000)"
+          -H "Host: $host" "http://$ip:8080/" 2>/dev/null || true)"
+        [ -n "$out" ] || out=000
         body="$(tr -d "\r\n" </tmp/pt 2>/dev/null || true)"
         if [ "$out" = "200" ] || printf "%s" "$body" | grep -q "$marker"; then
           printf "SERVED\t%s\t%s\n" "$out" "$body"
