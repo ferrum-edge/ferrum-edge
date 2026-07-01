@@ -2315,11 +2315,108 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 /// bracketed denied literal parses as a non-IP here and is admitted, only to be
 /// blocked later at dispatch.
 pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    // The URL authority ends at the first '/', '?', or '#' — or '\' for the
+    // special http/https schemes our backend URLs use, which the WHATWG parser
+    // folds to '/'. Everything from that terminator on is path/query/fragment,
+    // NOT the dialed host: `169.254.169.254/@evil` and `169.254.169.254\@evil`
+    // both dial 169.254.169.254 (the '@' is in the PATH, not userinfo). Truncate
+    // to the authority FIRST so the userinfo split below cannot reach past the
+    // authority into the path and screen the wrong host. (ASCII tab/newline/CR
+    // are stripped by the parser before parsing but are never authority
+    // terminators, so scanning the raw string here still finds the first real
+    // terminator.)
+    let authority = match host.find(['/', '?', '#', '\\']) {
+        Some(i) => &host[..i],
+        None => host,
+    };
+    // Within the authority, the parser treats the substring after the LAST '@'
+    // as the host (any userinfo precedes it), so `allowed@169.254.169.254` is
+    // dialed as `169.254.169.254`. A real host never contains '@', so screening
+    // only the post-'@' part just narrows malicious input — otherwise the literal
+    // slips through the resolver behind userinfo.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+
+    // Canonical literal first (also covers bracketed IPv6).
+    if let Some(ip) = stream_literal_ip(host) {
+        return Some(ip);
+    }
+
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    bare.parse::<std::net::IpAddr>().ok()
+
+    // Match the URL parser's host-literal handling before deciding this is a DNS
+    // hostname. The HTTP client stack (reqwest, the H2/gRPC/H3 pools, kafka broker
+    // dials) parses authorities through `url`/getaddrinfo, which accept
+    // non-canonical IPv4 literal forms (a 32-bit decimal, hex, or octal-component
+    // address) and canonicalize them to an IPv4 address, skipping the
+    // DnsCacheResolver. The URL parser also STRIPS ASCII tab/newline/CR from the
+    // authority before parsing, so `169.254.169.\n254` (and a control-split IPv6
+    // such as `fd00:ec2::\n254`) canonicalizes to a literal at dispatch; replicate
+    // that strip here, then re-check `IpAddr::parse` so a control-stripped
+    // canonical literal is still caught. Stream (`tcp`/`udp`/`dtls`) backends
+    // resolve through `DnsCache::resolve` instead and must use
+    // [`stream_literal_ip`].
+    let stripped;
+    let cleaned = if bare.contains(['\t', '\n', '\r']) {
+        stripped = bare.replace(['\t', '\n', '\r'], "");
+        if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+            return Some(ip);
+        }
+        stripped.as_str()
+    } else {
+        bare
+    };
+
+    // Hot-path guard: skip the allocating URL/IDNA parse only for an ordinary
+    // ASCII hostname — all-ASCII, NO percent-encoding, AND not beginning with an
+    // ASCII digit. Each excluded form is one the URL parser can still resolve to
+    // an IPv4 literal, so it must NOT be skipped:
+    //  - canonical literals (incl. IPv6) were already handled by `IpAddr::parse`;
+    //  - a non-canonical IPv4 spelling (decimal/hex/octal) begins with a digit;
+    //  - a NON-ASCII host may be an IDNA/UTS-46 form (e.g. fullwidth digits
+    //    `１６９。２５４。１６９。２５４`) the parser maps to an IP;
+    //  - a '%'-containing host may percent-DECODE to a digit-leading literal
+    //    (`%31%36%39.%32%35%34.%31%36%39.%32%35%34` → `169.254.169.254`), which
+    //    the URL parser decodes before IPv4 parsing.
+    // For plain ASCII with none of those, the parser's IPv4 path requires the
+    // first authority label to parse as a number, which can only start with a
+    // digit — so an ASCII, '%'-free, non-digit-leading host is never a literal.
+    // This keeps hostname-backed dispatch on the request path allocation-free.
+    if cleaned.is_ascii()
+        && !cleaned.contains('%')
+        && !cleaned
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+
+    match url::Host::parse(cleaned).ok()? {
+        url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    }
+}
+
+/// Canonical-literal-only screen (bracket strip + `IpAddr::parse`) for **stream**
+/// (`tcp`/`udp`/`dtls`) backends. Their dial path resolves through
+/// `DnsCache::resolve`, whose literal fast path is `IpAddr::parse` and which
+/// otherwise performs real DNS and then policy-screens the *resolved* address. A
+/// non-canonical numeric host (e.g. a service legitimately named `111`) is a DNS
+/// NAME on that path, not the URL-canonicalized literal `0.0.0.111`, so it must
+/// NOT be canonicalized here — doing so would wrongly reject it at admission even
+/// though the stream path would resolve and policy-check the real DNS result. The
+/// URL-canonicalizing sibling [`egress_literal_ip`] is for HTTP/URL-dispatched
+/// backends.
+pub(crate) fn stream_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .ok()
 }
 
 /// Wraps the operator pattern in a non-capturing group and anchors the group,
@@ -4321,7 +4418,21 @@ impl Proxy {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        if let Some(ip) = egress_literal_ip(&self.backend_host)
+        // Stream (`tcp`/`udp`/`dtls`) backends resolve through `DnsCache::resolve`
+        // (canonical literals only; everything else is real DNS, then the
+        // resolved address is policy-screened), so a numeric host is a DNS name —
+        // screen them with `stream_literal_ip`. HTTP-family backends are dialed
+        // through `url`/reqwest, which canonicalizes non-canonical IPv4 spellings
+        // into literals that skip the resolver — screen those with
+        // `egress_literal_ip`.
+        let parse_literal = |host: &str| {
+            if self.effective_scheme().is_stream() {
+                stream_literal_ip(host)
+            } else {
+                egress_literal_ip(host)
+            }
+        };
+        if let Some(ip) = parse_literal(&self.backend_host)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
@@ -4329,7 +4440,7 @@ impl Proxy {
             ));
         }
         if let Some(ref dns_override) = self.dns_override
-            && let Some(ip) = egress_literal_ip(dns_override)
+            && let Some(ip) = parse_literal(dns_override)
             && let Some(reason) = backend_allow_ips.deny_reason(&ip)
         {
             errors.push(format!(
@@ -5228,13 +5339,22 @@ impl Upstream {
     /// Screen this upstream's literal-IP target hosts against the backend
     /// egress policy. Hostname targets are screened at DNS-resolution time.
     /// Returns prefix-free messages so each caller can attribute them.
+    ///
+    /// Uses the canonical-literal-only [`stream_literal_ip`] rather than the
+    /// URL-canonicalizing [`egress_literal_ip`]: an upstream can be referenced by
+    /// stream (`tcp`/`udp`) proxies whose dial path resolves a numeric name like
+    /// `111` through DNS, so URL-canonicalizing it here would wrongly reject a
+    /// legitimate stream target at admission. URL-style IPv4 spellings on an
+    /// HTTP-family target are still blocked at dispatch by the request-path
+    /// `denied_literal_backend_ip` screen (which uses `egress_literal_ip` on the
+    /// resolved target), so this admission scope does not weaken HTTP egress.
     pub fn validate_backend_egress_ips(
         &self,
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for (i, target) in self.targets.iter().enumerate() {
-            if let Some(ip) = egress_literal_ip(&target.host)
+            if let Some(ip) = stream_literal_ip(&target.host)
                 && let Some(reason) = backend_allow_ips.deny_reason(&ip)
             {
                 errors.push(format!(

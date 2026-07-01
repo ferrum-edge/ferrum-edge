@@ -5862,13 +5862,11 @@ impl ProxyState {
         {
             let egress_policy = &self.env_config.backend_allow_ips;
             let denied_literal = |candidate: &ReqwestWarmupCandidate| -> bool {
-                let bare = candidate
-                    .host
-                    .strip_prefix('[')
-                    .and_then(|h| h.strip_suffix(']'))
-                    .unwrap_or(candidate.host.as_str());
-                bare.parse::<std::net::IpAddr>()
-                    .ok()
+                // Warmup dials are reqwest HEAD/capability probes, so screen with
+                // the URL-canonicalizing `egress_literal_ip` (matches the request
+                // path) — a non-canonical literal like `2852039166` would
+                // otherwise be probed straight to the metadata IP.
+                crate::config::types::egress_literal_ip(&candidate.host)
                     .and_then(|ip| egress_policy.deny_reason(&ip))
                     .inspect(|reason| {
                         warn!(
@@ -14108,8 +14106,12 @@ async fn handle_proxy_request_inner(
         let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
         let grpc_effective_host = grpc_dispatch_proxy.backend_host.as_str();
         // Enforce the backend egress policy for a literal-IP gRPC backend before
-        // dialing (the gRPC pool skips the DnsCacheResolver for IP literals).
-        if let Some(reason) = denied_literal_backend_or_dns_override(
+        // dialing. The gRPC pool self-resolves via `DnsCache::resolve` (canonical
+        // `IpAddr` fast path; non-canonical spellings go to real DNS and are
+        // screened on the resolved address), never reqwest's URL parser, so use
+        // the canonical screen — the URL-canonicalizing one would wrongly reject a
+        // legitimate all-numeric gRPC backend hostname (e.g. `2852039166`).
+        if let Some(reason) = denied_literal_backend_or_dns_override_canonical(
             grpc_effective_host,
             grpc_dispatch_proxy,
             &state.env_config.backend_allow_ips,
@@ -14739,13 +14741,15 @@ async fn handle_proxy_request_inner(
                 }
 
                 // Re-screen the (possibly LB-rotated) retry target before
-                // dispatch: the gRPC pool skips the DnsCacheResolver for IP
-                // literals, so a denied literal reached via rotation must be
-                // rejected here too (mirrors the first-attempt gRPC screen). No
+                // dispatch: the gRPC pool self-resolves via `DnsCache::resolve`
+                // (canonical `IpAddr` fast path; non-canonical → real DNS +
+                // resolved-address screen), so use the canonical screen here too
+                // (mirrors the first-attempt gRPC screen) — the URL-canonicalizing
+                // one would wrongly reject a legitimate all-numeric hostname. No
                 // circuit-breaker probe slot is held for the new target yet (the
                 // breaker is checked just below), so only the request is counted.
                 if let Some(ref rotated_target) = grpc_current_target
-                    && denied_literal_backend_ip(
+                    && denied_literal_backend_ip_canonical(
                         &rotated_target.host,
                         &state.env_config.backend_allow_ips,
                     )
@@ -18691,17 +18695,7 @@ pub(crate) fn denied_literal_backend_ip(
     host: &str,
     policy: &crate::config::BackendEgressPolicy,
 ) -> Option<&'static str> {
-    // Strip URI brackets: `build_backend_url_with_target` preserves bracketed
-    // IPv6 (`[fd00:ec2::254]`) and reqwest/gRPC/H3 treat that as an IP-literal
-    // authority that skips the DnsCacheResolver, so the bare address must still
-    // be screened.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    host.parse::<std::net::IpAddr>()
-        .ok()
-        .and_then(|ip| policy.deny_reason(&ip))
+    crate::config::types::egress_literal_ip(host).and_then(|ip| policy.deny_reason(&ip))
 }
 
 /// Like [`denied_literal_backend_ip`] but also screens the proxy's `dns_override`
@@ -18721,6 +18715,46 @@ pub(crate) fn denied_literal_backend_or_dns_override(
             .dns_override
             .as_deref()
             .and_then(|ovr| denied_literal_backend_ip(ovr, policy))
+    })
+}
+
+/// Canonical-literal-only counterpart of [`denied_literal_backend_ip`] for the
+/// **self-resolving** dispatch pools — gRPC (`GrpcConnectionPool`) and native H3
+/// (`Http3ConnectionPool`). Those pools do NOT hand the host to reqwest's URL
+/// parser; they resolve it themselves through `DnsCache::resolve` /
+/// `resolve_backend_addr_cached`, whose literal fast path is `IpAddr::parse`
+/// (canonical only) and which otherwise performs real DNS and policy-screens the
+/// *resolved* address. So a non-canonical numeric spelling like `2852039166` or
+/// `111` is a DNS NAME on those paths (resolved, then screened), NOT the
+/// URL-canonicalized literal `169.254.169.254` / `0.0.0.111` — screening it with
+/// the URL-canonicalizing [`egress_literal_ip`] would wrongly reject a legitimate
+/// all-numeric backend hostname. Canonical denied literals are still caught here
+/// (and again by the resolver's own screen). reqwest-dialed paths (HTTP/1.1,
+/// H2-via-reqwest, the H3 cross-protocol bridge) and config admission — none of
+/// which know the runtime dispatch pool — MUST keep using [`egress_literal_ip`],
+/// since a cold capability registry routes plain-HTTPS traffic through reqwest
+/// where the URL-canonicalized bypass is real.
+pub(crate) fn denied_literal_backend_ip_canonical(
+    host: &str,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    crate::config::types::stream_literal_ip(host).and_then(|ip| policy.deny_reason(&ip))
+}
+
+/// Like [`denied_literal_backend_ip_canonical`] but also screens the proxy's
+/// `dns_override` literal. `dns_override` is always consumed as a canonical
+/// `IpAddr` (`DnsCache::resolve` parses it with `IpAddr::parse`), so the
+/// canonical screen matches its dial semantics exactly.
+pub(crate) fn denied_literal_backend_or_dns_override_canonical(
+    host: &str,
+    proxy: &Proxy,
+    policy: &crate::config::BackendEgressPolicy,
+) -> Option<&'static str> {
+    denied_literal_backend_ip_canonical(host, policy).or_else(|| {
+        proxy
+            .dns_override
+            .as_deref()
+            .and_then(|ovr| denied_literal_backend_ip_canonical(ovr, policy))
     })
 }
 
@@ -22481,9 +22515,15 @@ async fn proxy_to_backend_http3(
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
-    // Enforce the backend egress policy for a literal-IP backend before dialing
-    // (the native-H3/reqwest paths skip the DnsCacheResolver for IP literals).
-    if let Some(reason) = denied_literal_backend_or_dns_override(
+    // Enforce the backend egress policy for a literal-IP backend before dialing.
+    // The native H3 pool self-resolves via `resolve_backend_addr_cached` — whose
+    // literal fast path is canonical `IpAddr::parse` (non-canonical spellings go
+    // to real DNS and are screened on the resolved address) — never reqwest's URL
+    // parser, so use the canonical screen. The URL-canonicalizing one would
+    // wrongly reject a legitimate all-numeric H3 backend hostname (`2852039166`).
+    // (A denied literal reached via a reqwest fallback is re-screened on that
+    // path's own `egress_literal_ip` guard.)
+    if let Some(reason) = denied_literal_backend_or_dns_override_canonical(
         effective_host,
         proxy,
         &state.env_config.backend_allow_ips,
@@ -23505,10 +23545,15 @@ async fn proxy_to_backend_http3_retry(
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
 
-    // Re-screen the (possibly LB-rotated) retry target: the native H3 pool skips
-    // the DnsCacheResolver for IP literals, so a denied literal reached via retry
-    // rotation must be rejected here, mirroring the first-attempt H3 screen.
-    if denied_literal_backend_ip(effective_host, &state.env_config.backend_allow_ips).is_some() {
+    // Re-screen the (possibly LB-rotated) retry target: the native H3 pool
+    // self-resolves via `resolve_backend_addr_cached` (canonical `IpAddr` fast
+    // path; non-canonical → real DNS + resolved-address screen), so use the
+    // canonical screen, mirroring the first-attempt H3 screen — the
+    // URL-canonicalizing one would wrongly reject a legitimate all-numeric
+    // hostname reached via rotation.
+    if denied_literal_backend_ip_canonical(effective_host, &state.env_config.backend_allow_ips)
+        .is_some()
+    {
         return backend_egress_denied_response(effective_host);
     }
 
@@ -23809,12 +23854,75 @@ mod tests {
         assert!(denied_literal_backend_ip("169.254.169.254", &policy).is_some());
         assert!(denied_literal_backend_ip("64:ff9b::a9fe:a9fe", &policy).is_some());
         assert!(denied_literal_backend_ip("::ffff:169.254.169.254", &policy).is_some());
+        // URL/reqwest parsing canonicalizes these non-DNS IPv4 spellings to
+        // 169.254.169.254, so the literal guard must screen them before the
+        // client can skip the DnsCacheResolver.
+        assert!(denied_literal_backend_ip("2852039166", &policy).is_some());
+        assert!(denied_literal_backend_ip("0xa9fea9fe", &policy).is_some());
+        assert!(denied_literal_backend_ip("0251.0376.0251.0376", &policy).is_some());
+        // The URL parser strips ASCII tab/newline/CR from the authority before
+        // parsing, so these canonicalize to the metadata IP at dispatch; the guard
+        // must strip them too rather than treat the raw host as a DNS name.
+        assert!(denied_literal_backend_ip("169.254.169.\n254", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.\t169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip("2852039166\r", &policy).is_some());
+        // Control chars split into an otherwise-canonical IPv6 literal (the
+        // digit-leading prefilter must not skip it once stripped).
+        assert!(denied_literal_backend_ip("64:ff9b::a9fe:\ta9fe", &policy).is_some());
+        // Userinfo `@`: the URL client dials the post-`@` host, so screen that.
+        assert!(denied_literal_backend_ip("allowed@169.254.169.254", &policy).is_some());
+        // Authority TERMINATORS: the URL authority (and thus the dialed host) ends
+        // at the first '/', '?', '#', or (for special http/https URLs) '\', so the
+        // metadata IP BEFORE the terminator is what gets dialed — the '@' after it
+        // is in the path and must not steer screening onto the post-'@' label.
+        assert!(denied_literal_backend_ip("169.254.169.254/@evil.com", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.169.254\\@evil.com", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.169.254?@evil.com", &policy).is_some());
+        assert!(denied_literal_backend_ip("169.254.169.254#@evil.com", &policy).is_some());
+        // Control chars are stripped before the authority is parsed but are never
+        // terminators, so a control-then-terminator sequence still truncates.
+        assert!(denied_literal_backend_ip("169.254.169.254\t/@evil.com", &policy).is_some());
+        // IDNA/UTS-46 fullwidth digits the URL parser maps to the metadata IP;
+        // a non-ASCII host must not be skipped by the digit prefilter.
+        assert!(denied_literal_backend_ip("１６９。２５４。１６９。２５４", &policy).is_some());
+        // Percent-encoding: the URL parser percent-DECODES the host before IPv4
+        // parsing, so a '%'-leading spelling canonicalizes to the metadata IP and
+        // must not be skipped by the (non-digit-leading) ASCII prefilter.
+        assert!(
+            denied_literal_backend_ip("%31%36%39.%32%35%34.%31%36%39.%32%35%34", &policy).is_some()
+        );
+        // A digit-leading hostname is still a hostname (the numeric prefilter must
+        // not misclassify it) and is screened by the resolver, not here.
+        assert!(denied_literal_backend_ip("3com.example.com", &policy).is_none());
         // Allowed literals (loopback / RFC1918) → not blocked.
         assert!(denied_literal_backend_ip("127.0.0.1", &policy).is_none());
         assert!(denied_literal_backend_ip("10.0.0.1", &policy).is_none());
         // Hostnames are screened by the DnsCacheResolver at resolution time, not
         // here, so this returns None for them.
         assert!(denied_literal_backend_ip("metadata.example.com", &policy).is_none());
+    }
+
+    #[test]
+    fn canonical_backend_ip_screen_matches_selfresolving_pools() {
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
+        let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+
+        // Self-resolving pools (gRPC / native H3) resolve through
+        // `DnsCache::resolve`, whose literal fast path is canonical `IpAddr::parse`
+        // and which otherwise does real DNS + screens the resolved address. A
+        // canonical denied literal is still blocked by the canonical screen...
+        assert!(denied_literal_backend_ip_canonical("169.254.169.254", &policy).is_some());
+        assert!(denied_literal_backend_ip_canonical("64:ff9b::a9fe:a9fe", &policy).is_some());
+        // ...but a NON-canonical numeric spelling is a DNS NAME on those paths (it
+        // fails `IpAddr::parse` and is resolved, then the resolved IP is screened),
+        // NOT the URL-canonicalized metadata literal — so the canonical screen must
+        // pass it, whereas the URL-canonicalizing screen (reqwest paths) blocks it.
+        assert!(denied_literal_backend_ip_canonical("2852039166", &policy).is_none());
+        assert!(denied_literal_backend_ip_canonical("0xa9fea9fe", &policy).is_none());
+        assert!(denied_literal_backend_ip_canonical("111", &policy).is_none());
+        assert!(denied_literal_backend_ip("2852039166", &policy).is_some());
+        // Allowed canonical literals are not blocked by either screen.
+        assert!(denied_literal_backend_ip_canonical("127.0.0.1", &policy).is_none());
     }
     use serde_json::json;
     use wiremock::matchers::{method, path};
