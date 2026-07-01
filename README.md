@@ -471,7 +471,7 @@ All gateways run in Docker containers for apples-to-apples comparison:
 | Kong 3.14 | 25,009 | 3.91 ms | Ferrum 12% faster |
 | Tyk v5.12 | 19,186 | 5.08 ms | Ferrum 46% faster |
 
-Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See [`tests/performance/multi_protocol/README.md`](tests/performance/multi_protocol/README.md) for the maintained comparison harness and methodology, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
+Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See [`comparison/README.md`](comparison/README.md) and [`comparison/run_comparison.sh`](comparison/run_comparison.sh) for the reproducible Docker gateway comparison harness, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
 
 ## Troubleshooting
 
