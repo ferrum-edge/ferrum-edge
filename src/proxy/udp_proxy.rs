@@ -1062,8 +1062,23 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         let fd = frontend_socket.as_raw_fd();
         // SO_BUSY_POLL: spin in kernel for low-latency recv (Linux 3.11+).
         if so_busy_poll_us > 0 {
-            let _ = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us);
-            let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
+            if let Err(e) = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us) {
+                warn!(
+                    proxy_id = %proxy_id,
+                    listen_port = port,
+                    so_busy_poll_us,
+                    "Failed to enable SO_BUSY_POLL on UDP listener: {}",
+                    e
+                );
+            }
+            if let Err(e) = crate::socket_opts::set_so_prefer_busy_poll(fd, true) {
+                warn!(
+                    proxy_id = %proxy_id,
+                    listen_port = port,
+                    "Failed to enable SO_PREFER_BUSY_POLL on UDP listener: {}",
+                    e
+                );
+            }
         }
         // IP(v6)_PKTINFO: capture the per-datagram local destination address on
         // recv and reuse it as the reply source on send (skips the kernel

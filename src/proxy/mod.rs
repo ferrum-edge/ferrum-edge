@@ -7563,7 +7563,9 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     use std::os::windows::io::AsSocket;
 
     // Disable Nagle's algorithm for lower latency on small responses
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY on accepted HTTP stream: {}", e);
+    }
     #[cfg(unix)]
     let borrowed = stream.as_fd();
     #[cfg(windows)]
