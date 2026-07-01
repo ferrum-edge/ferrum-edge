@@ -1831,6 +1831,12 @@ fn spawn_new_session_datagram(
 }
 
 fn is_client_or_policy_udp_setup_drop(error: &anyhow::Error) -> bool {
+    if let Some(setup_error) = find_stream_setup_error(error) {
+        if setup_error.kind.is_client_side() {
+            return true;
+        }
+    }
+
     let message = error.to_string();
     message.starts_with("Dropping DTLS continuation fragment")
         || message.starts_with("No matching passthrough proxy for SNI")
@@ -1979,9 +1985,8 @@ async fn process_new_session_datagram(
 
     // Drain follow-up datagrams that arrived while setup ran, in arrival
     // order, then atomically remove the pending gate. Each drained datagram
-    // goes through the same per-datagram plugin hooks as the
-    // established-session path. A mid-drain forward failure propagates and
-    // the still-armed gate drops the remainder of the queue wholesale.
+    // goes through the same per-datagram plugin hooks and debug-level
+    // packet-error handling as the established-session path.
     while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
         for dgram in batch {
             if !udp_datagram_allowed(
@@ -1999,7 +2004,16 @@ async fn process_new_session_datagram(
             {
                 continue;
             }
-            forward_client_datagram_to_backend(&session, &dgram).await?;
+            if let Err(e) = forward_client_datagram_to_backend(&session, &dgram).await {
+                debug!(
+                    proxy_id = %session.datagram_proxy_id,
+                    client = %client_addr,
+                    listen_port = session.listen_port,
+                    error = %e,
+                    "UDP pending datagram forward error"
+                );
+                continue;
+            }
             metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
             metrics
                 .bytes_out
