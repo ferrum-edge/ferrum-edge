@@ -872,13 +872,13 @@ impl HealthChecker {
                     };
                     literal.and_then(|ip| policy.deny_reason(&ip))
                 });
-                let probe_success = if let Some(reason) = egress_denied {
+                let probe_outcome = if let Some(reason) = egress_denied {
                     warn!(
                         target = %host,
-                        reason,
+                        reason = %reason,
                         "Health probe target blocked by backend egress policy; marking unhealthy without dialing"
                     );
-                    false
+                    ProbeOutcome::failure(format!("egress policy denied: {reason}"))
                 } else {
                     match probe_type {
                         HealthProbeType::Http => {
@@ -946,7 +946,9 @@ impl HealthChecker {
                                                 error = %e,
                                                 "Health probe target blocked or unresolvable by backend egress policy; marking unhealthy"
                                             );
-                                            false
+                                            ProbeOutcome::failure(format!(
+                                                "dns resolve or egress screen failed: {e}"
+                                            ))
                                         }
                                     }
                                 }
@@ -981,7 +983,7 @@ impl HealthChecker {
                     }
                 };
 
-                if probe_success {
+                if probe_outcome.success {
                     state.consecutive_failures.store(0, Ordering::Relaxed);
                     let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -1005,10 +1007,18 @@ impl HealthChecker {
 
                     if failures >= unhealthy_threshold {
                         let key_ref = key.clone();
+                        let elapsed_ms = probe_start.elapsed().as_millis() as u64;
+                        let last_failure =
+                            probe_outcome.failure.as_deref().unwrap_or("probe failed");
                         unhealthy_targets.entry(key.clone()).or_insert_with(|| {
                             warn!(
-                                "Active health check: target {} is unhealthy ({:?} probe)",
-                                key_ref, probe_type
+                                target = %key_ref,
+                                probe_type = ?probe_type,
+                                failures = failures,
+                                unhealthy_threshold = unhealthy_threshold,
+                                elapsed_ms = elapsed_ms,
+                                last_failure = %last_failure,
+                                "Active health check: target is unhealthy"
                             );
                             now_epoch_ms()
                         });
@@ -1036,20 +1046,46 @@ impl Drop for HealthChecker {
     }
 }
 
+struct ProbeOutcome {
+    success: bool,
+    failure: Option<String>,
+}
+
+impl ProbeOutcome {
+    fn success() -> Self {
+        Self {
+            success: true,
+            failure: None,
+        }
+    }
+
+    fn failure(reason: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            failure: Some(reason.into()),
+        }
+    }
+}
+
 /// HTTP health probe — sends a GET request and checks the status code.
 async fn http_probe(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
     healthy_status_codes: &[u16],
-) -> bool {
+) -> ProbeOutcome {
     match client.get(url).timeout(timeout).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            if healthy_status_codes.is_empty() {
+            let healthy = if healthy_status_codes.is_empty() {
                 (200..300).contains(&status)
             } else {
                 healthy_status_codes.contains(&status)
+            };
+            if healthy {
+                ProbeOutcome::success()
+            } else {
+                ProbeOutcome::failure(format!("http status {status}"))
             }
         }
         Err(e) => {
@@ -1062,16 +1098,16 @@ async fn http_probe(
             } else {
                 debug!("HTTP health probe failed for {}: {}", url, e);
             }
-            false
+            ProbeOutcome::failure(format!("http request failed: {e}"))
         }
     }
 }
 
 /// TCP health probe — attempts a TCP connection within the timeout.
-async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
+async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> ProbeOutcome {
     let addr = format_probe_socket_addr(host, port);
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-        Ok(Ok(_stream)) => true,
+        Ok(Ok(_stream)) => ProbeOutcome::success(),
         Ok(Err(e)) => {
             if crate::retry::is_port_exhaustion(&e) {
                 tracing::error!(
@@ -1082,17 +1118,17 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
             } else {
                 debug!("TCP health probe connection failed for {}: {}", addr, e);
             }
-            false
+            ProbeOutcome::failure(format!("tcp connect failed: {e}"))
         }
         Err(_) => {
             debug!("TCP health probe timed out for {}", addr);
-            false
+            ProbeOutcome::failure("tcp connect timed out")
         }
     }
 }
 
 /// UDP health probe — sends a payload and waits for any response within the timeout.
-async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> bool {
+async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> ProbeOutcome {
     let addr = format_probe_socket_addr(host, port);
     let bind_addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         "[::]:0"
@@ -1103,31 +1139,31 @@ async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> 
         Ok(s) => s,
         Err(e) => {
             debug!("UDP health probe: failed to bind socket: {}", e);
-            return false;
+            return ProbeOutcome::failure(format!("udp bind failed: {e}"));
         }
     };
 
     if let Err(e) = socket.connect(&addr).await {
         debug!("UDP health probe: failed to connect to {}: {}", addr, e);
-        return false;
+        return ProbeOutcome::failure(format!("udp connect failed: {e}"));
     }
 
     let data = if payload.is_empty() { &[0u8] } else { payload };
     if let Err(e) = socket.send(data).await {
         debug!("UDP health probe: failed to send to {}: {}", addr, e);
-        return false;
+        return ProbeOutcome::failure(format!("udp send failed: {e}"));
     }
 
     let mut buf = [0u8; 1];
     match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
-        Ok(Ok(_)) => true,
+        Ok(Ok(_)) => ProbeOutcome::success(),
         Ok(Err(e)) => {
             debug!("UDP health probe: recv error from {}: {}", addr, e);
-            false
+            ProbeOutcome::failure(format!("udp recv failed: {e}"))
         }
         Err(_) => {
             debug!("UDP health probe timed out for {}", addr);
-            false
+            ProbeOutcome::failure("udp recv timed out")
         }
     }
 }
@@ -1150,7 +1186,7 @@ async fn grpc_probe(
     global_cert_path: Option<&str>,
     global_key_path: Option<&str>,
     global_no_verify: bool,
-) -> bool {
+) -> ProbeOutcome {
     let scheme = if use_tls { "https" } else { "http" };
     // Dial the pre-screened address (`dial_addr` = the resolved IP from the
     // health loop) so tonic does not re-resolve `host` and risk a split-DNS /
@@ -1175,7 +1211,7 @@ async fn grpc_probe(
                 "gRPC health probe: invalid endpoint for {}:{}: {}",
                 host, port, e
             );
-            return false;
+            return ProbeOutcome::failure(format!("grpc invalid endpoint: {e}"));
         }
     };
 
@@ -1213,7 +1249,7 @@ async fn grpc_probe(
                         host, port, e
                     );
                 }
-                return false;
+                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
             }
         }
     } else if use_tls {
@@ -1276,7 +1312,7 @@ async fn grpc_probe(
                     "gRPC health probe: TLS config error for {}:{}: {}",
                     host, port, e
                 );
-                return false;
+                return ProbeOutcome::failure(format!("grpc tls config failed: {e}"));
             }
         };
         match tokio::time::timeout(timeout, endpoint.connect()).await {
@@ -1298,11 +1334,11 @@ async fn grpc_probe(
                         host, port, e
                     );
                 }
-                return false;
+                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
             }
             Err(_) => {
                 debug!("gRPC health probe: connect timed out for {}:{}", host, port);
-                return false;
+                return ProbeOutcome::failure("grpc connect timed out");
             }
         }
     } else {
@@ -1325,11 +1361,11 @@ async fn grpc_probe(
                         host, port, e
                     );
                 }
-                return false;
+                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
             }
             Err(_) => {
                 debug!("gRPC health probe: connect timed out for {}:{}", host, port);
-                return false;
+                return ProbeOutcome::failure("grpc connect timed out");
             }
         }
     };
@@ -1342,15 +1378,19 @@ async fn grpc_probe(
     match tokio::time::timeout(timeout, client.check(request)).await {
         Ok(Ok(response)) => {
             let status = response.into_inner().status;
-            status == grpc_health_v1::health_check_response::ServingStatus::Serving as i32
+            if status == grpc_health_v1::health_check_response::ServingStatus::Serving as i32 {
+                ProbeOutcome::success()
+            } else {
+                ProbeOutcome::failure(format!("grpc serving status {status}"))
+            }
         }
         Ok(Err(e)) => {
             debug!("gRPC health probe: RPC failed for {}:{}: {}", host, port, e);
-            false
+            ProbeOutcome::failure(format!("grpc rpc failed: {e}"))
         }
         Err(_) => {
             debug!("gRPC health probe: RPC timed out for {}:{}", host, port);
-            false
+            ProbeOutcome::failure("grpc rpc timed out")
         }
     }
 }
@@ -1672,6 +1712,7 @@ pub async fn grpc_probe_for_test(
         false,
     )
     .await
+    .success
 }
 
 #[cfg(test)]
