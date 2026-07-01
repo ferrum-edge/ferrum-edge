@@ -233,7 +233,7 @@ Lists all proxies.
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `FERRUM_MODE` | `database` | Operating mode |
-| `FERRUM_ADMIN_JWT_SECRET` | `test-gateway-secret-key-12345` | JWT signing secret |
+| `FERRUM_ADMIN_JWT_SECRET` | `change-me-to-a-32-character-admin-secret` | JWT signing secret |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge-test` | JWT issuer claim |
 | `FERRUM_DB_TYPE` | `sqlite` | Database type |
 | `FERRUM_DB_URL` | `sqlite:////tmp/xxx/test.db` | Database connection string |

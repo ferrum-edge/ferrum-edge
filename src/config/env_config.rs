@@ -1,4 +1,4 @@
-//! Environment variable parsing for the gateway's 90+ configuration options.
+//! Environment variable and `ferrum.conf` parsing for gateway runtime settings.
 //!
 //! **Three-tier resolution** (highest precedence first):
 //! 1. Environment variable (`std::env::var`)
@@ -857,7 +857,7 @@ impl std::fmt::Display for AutoBool {
 
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Some fields are only used with optional features (e.g. mongodb)
+#[allow(dead_code)] // Some fields are used only in specific modes or feature paths.
 pub struct EnvConfig {
     pub mode: OperatingMode,
     /// Namespace this gateway instance loads and manages. Resources from other
@@ -1091,7 +1091,7 @@ pub struct EnvConfig {
 
     // MongoDB-specific settings (when FERRUM_DB_TYPE=mongodb).
     // These fields are read by `mongo_store::MongoStore::connect()` when the
-    // `mongodb` feature is enabled and `FERRUM_DB_TYPE=mongodb`.
+    // active database backend is `FERRUM_DB_TYPE=mongodb`.
     /// MongoDB database name to use. Default: "ferrum".
     pub mongo_database: String,
     /// MongoDB application name for server-side connection tracking.

@@ -34,8 +34,19 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 
 The Dockerfile uses a **multi-stage build** for optimal size:
 
-1. **Builder Stage**: Compiles the Rust binary with all build dependencies (rust:latest)
-2. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) — no shell, no package manager, no OS-level CVEs
+1. **eBPF Builder Stage**: Compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
+2. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
+3. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) — no shell, no package manager, no OS-level CVEs
+
+> **Current eBPF build coupling.** The runtime stage unconditionally copies the
+> eBPF ELF from the `ebpf-builder` stage, so every `docker build` runs that
+> stage, including the default image built with `FEATURES=cloud-secrets`.
+> The resulting `/app/bpf/ferrum-ebpf` file is only used when the binary is
+> built with the `ebpf` feature for node-agent or ambient-mesh capture, but the
+> Docker build still depends on the nightly Rust toolchain, `rust-src`,
+> `bpf-linker`, and `-Z build-std=core` inside the build container. If an image
+> build fails before the main Rust binary compiles, inspect the `ebpf-builder`
+> stage first.
 
 **Image Features**:
 - **Distroless**: Zero OS packages beyond glibc, libgcc, and ca-certificates. No shell, no curl, no apt — dramatically reduced attack surface
@@ -62,7 +73,7 @@ docker run -d \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=sqlite \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
-  -e FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32+character-admin-secret" \
+  -e FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
   -e FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
   -e FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
   -v ferrum_data:/data \
@@ -154,7 +165,7 @@ Production-grade setup with managed PostgreSQL:
 ```bash
 # Set environment variables (optional)
 export POSTGRES_PASSWORD="secure-password"
-export FERRUM_ADMIN_JWT_SECRET="jwt-secret-key"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
 
 # Start PostgreSQL + Ferrum Edge
 docker-compose --profile postgres up ferrum-postgres
@@ -198,8 +209,8 @@ Multi-node architecture with separate Control Plane and Data Planes:
 ```bash
 # Set environment variables
 export POSTGRES_PASSWORD="secure-password"
-export FERRUM_ADMIN_JWT_SECRET="jwt-secret-key"
-export FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-shared-secret"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
+export FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-to-a-32-character-grpc-secret"
 
 # Start all services
 docker-compose --profile cp-dp up
@@ -273,7 +284,7 @@ FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 # Admin API
 FERRUM_ADMIN_HTTP_PORT=9000
 FERRUM_ADMIN_HTTPS_PORT=9443
-FERRUM_ADMIN_JWT_SECRET=your-secret-key
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret
 
 # Database (for database/cp modes)
 FERRUM_DB_TYPE=postgres           # postgres, mysql, sqlite, mongodb
@@ -286,7 +297,7 @@ FERRUM_DB_POLL_INTERVAL=30
 # and `https://` DP URLs instead.
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
 FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
-FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret
 
 # Data Plane (for dp mode)
 # Local demo plaintext on a Docker network. Production should use `https://`
@@ -296,7 +307,7 @@ FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 # For multi-CP failover:
 # FERRUM_DP_CP_GRPC_URLS=https://cp1:50051,https://cp2:50051,https://cp3:50051
 # FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
-FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret
 ```
 
 ### Setting Variables in Docker
@@ -310,7 +321,7 @@ docker run -e FERRUM_LOG_LEVEL=debug ferrum-edge:latest
 ```bash
 # Create .env file
 cat > .env << EOF
-FERRUM_ADMIN_JWT_SECRET=my-secret
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret
 POSTGRES_PASSWORD=pg-secret
 EOF
 
@@ -319,7 +330,7 @@ docker-compose up
 
 **Via environment substitution**:
 ```bash
-export FERRUM_ADMIN_JWT_SECRET="secret-key"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
 docker-compose up
 ```
 

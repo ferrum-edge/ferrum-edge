@@ -130,11 +130,11 @@ When FERRUM_MODE=cp:
 **Required Environment Variables:**
 ```bash
 FERRUM_MODE=cp
-FERRUM_ADMIN_JWT_SECRET=<secret-key>
+FERRUM_ADMIN_JWT_SECRET=<change-me-to-a-32-character-admin-secret>
 FERRUM_DB_TYPE=sqlite  # or postgres, mysql
 FERRUM_DB_URL=sqlite://ferrum.db
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=<secret-key>
+FERRUM_CP_DP_GRPC_JWT_SECRET=<change-me-to-a-32-character-grpc-secret>
 ```
 
 ### Data Plane (DP)
@@ -151,8 +151,8 @@ When FERRUM_MODE=dp:
 ```bash
 FERRUM_MODE=dp
 FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051
-FERRUM_CP_DP_GRPC_JWT_SECRET=<secret-key>
-FERRUM_ADMIN_JWT_SECRET=<secret-key>
+FERRUM_CP_DP_GRPC_JWT_SECRET=<change-me-to-a-32-character-grpc-secret>
+FERRUM_ADMIN_JWT_SECRET=<change-me-to-a-32-character-admin-secret>
 ```
 
 ## Admin API
@@ -204,11 +204,11 @@ export FERRUM_DB_URL="sqlite://./test-ferrum.db"
 2. Start CP in one terminal:
 ```bash
 FERRUM_MODE=cp \
-FERRUM_ADMIN_JWT_SECRET=test-secret \
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL=sqlite://./test-ferrum.db \
 FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1:50051 \
-FERRUM_CP_DP_GRPC_JWT_SECRET=test-grpc-secret \
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
 FERRUM_ADMIN_HTTP_PORT=9000 \
 FERRUM_LOG_LEVEL=debug \
 cargo run --bin ferrum-edge -- run
@@ -223,7 +223,7 @@ cargo run --bin ferrum-edge -- run
   "role": "admin",
   "iat": 1704067200
 }
-# Sign with FERRUM_ADMIN_JWT_SECRET: "test-secret"
+# Sign with FERRUM_ADMIN_JWT_SECRET: "change-me-to-a-32-character-admin-secret"
 ```
 
 4. Create a proxy via Admin API:
@@ -249,8 +249,8 @@ curl -X POST http://localhost:9000/proxies \
 ```bash
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS=http://127.0.0.1:50051 \
-FERRUM_CP_DP_GRPC_JWT_SECRET=test-grpc-secret \
-FERRUM_ADMIN_JWT_SECRET=test-secret \
+FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
+FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_LOG_LEVEL=debug \
 cargo run --bin ferrum-edge -- run
