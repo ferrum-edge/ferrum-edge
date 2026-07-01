@@ -2496,7 +2496,7 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
             request_user_agent: proxy_headers.get("user-agent").cloned(),
-            response_streamed: true,
+            response_streamed: outcome.response_streamed,
             client_disconnected: outcome.client_disconnected,
             body_error_class: outcome.body_error_class,
             body_completed: outcome.body_completed,
@@ -2506,19 +2506,21 @@ async fn handle_h3_request(
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
-        let stream_outcome = BodyOutcome {
-            body_completed: outcome.body_completed,
-            body_error_class: outcome.body_error_class,
-            bytes_streamed: outcome.bytes_streamed,
-            client_disconnected: outcome.client_disconnected,
-        };
-        run_response_stream_end_hooks(
-            &plugins,
-            &ctx,
-            summary.response_status_code,
-            &stream_outcome,
-        )
-        .await;
+        if outcome.response_streamed {
+            let stream_outcome = BodyOutcome {
+                body_completed: outcome.body_completed,
+                body_error_class: outcome.body_error_class,
+                bytes_streamed: outcome.bytes_streamed,
+                client_disconnected: outcome.client_disconnected,
+            };
+            run_response_stream_end_hooks(
+                &plugins,
+                &ctx,
+                summary.response_status_code,
+                &stream_outcome,
+            )
+            .await;
+        }
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         return Ok(());
