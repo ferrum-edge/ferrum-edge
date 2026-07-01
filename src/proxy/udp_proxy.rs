@@ -1846,10 +1846,10 @@ fn spawn_new_session_datagram(
 }
 
 fn is_client_or_policy_udp_setup_drop(error: &anyhow::Error) -> bool {
-    if let Some(setup_error) = find_stream_setup_error(error) {
-        if setup_error.kind.is_client_side() {
-            return true;
-        }
+    if let Some(setup_error) = find_stream_setup_error(error)
+        && setup_error.kind.is_client_side()
+    {
+        return true;
     }
 
     let message = error.to_string();
