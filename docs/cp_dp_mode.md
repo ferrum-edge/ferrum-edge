@@ -183,7 +183,7 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | PEM CA for verifying DP client certs (mTLS) |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
-| `FERRUM_DB_TYPE` | Yes | Database type (`sqlite` or `postgres`) |
+| `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |
 | `FERRUM_DB_POLL_INTERVAL` | No | Config poll interval in seconds (default: 30) |
 
@@ -209,6 +209,13 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 ### Shared JWT Secret
 
 The CP and DP must use the same `FERRUM_CP_DP_GRPC_JWT_SECRET` value. The DP automatically generates short-lived JWTs (59-minute TTL) from this secret on each connection attempt, and the CP validates them with the same secret. No manual JWT generation is required.
+
+The examples below use SQLite for local development and PostgreSQL for the TLS
+deployment path. CP mode supports the same database backends as database mode:
+PostgreSQL, MySQL, SQLite, and MongoDB. See
+[configuration.md](configuration.md#database) for the canonical
+`FERRUM_DB_TYPE` reference and [mongodb.md](mongodb.md) for MongoDB-specific
+connection and pooling behavior.
 
 ### Control Plane (Plaintext — local development only)
 
