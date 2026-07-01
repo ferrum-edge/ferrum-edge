@@ -1720,8 +1720,10 @@ mod tests {
 /// Privileged live verification of the mesh UDP **source-capture** path (F3 §3.3
 /// Stage 3) against a real netfilter `TPROXY` rule + policy routing, inside a
 /// throwaway network namespace (the host's iptables / routing tables are never
-/// touched). Runs in CI's `netns-capture-live` job as root; self-skips (passes)
-/// without root / `unshare` / `iptables` / `ip`.
+/// touched). Runs in CI's `netns-capture-live` job as root with
+/// `FERRUM_LIVE_TESTS_REQUIRED=1`, so prerequisite gaps fail there instead of
+/// passing as skips. Local ad-hoc runs still self-skip without root / `unshare` /
+/// `iptables` / `ip`.
 ///
 /// This is the UDP analogue of `socket_opts::original_dst_live_tests` (which
 /// proves the raw-TCP `SO_ORIGINAL_DST` recovery against an iptables `REDIRECT`).
@@ -1789,6 +1791,19 @@ mod live_netns_tests {
         unsafe { libc::geteuid() == 0 }
     }
 
+    fn live_tests_required() -> bool {
+        std::env::var("FERRUM_LIVE_TESTS_REQUIRED")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn skip_or_fail(reason: &str) {
+        if live_tests_required() {
+            panic!("required live netns UDP capture test prerequisite missing: {reason}");
+        }
+        eprintln!("SKIP: {reason}");
+    }
+
     /// Reaps the netns child on drop so the test never leaks it.
     struct ChildGuard(Child);
     impl Drop for ChildGuard {
@@ -1809,8 +1824,9 @@ mod live_netns_tests {
     /// route lookup for the remote dst resolves (a bare netns has no such route —
     /// a real pod gets one from its CNI); the marked-packet output reroute then
     /// overrides it with the fwmark rule's local-delivery table. Exits 97 when
-    /// `iptables` / `ip` is unavailable inside the netns so the test can skip; the
-    /// `set -e` aborts (non-97 exit) if any load-bearing rule fails to install.
+    /// `iptables` / `ip` is unavailable inside the netns so local runs can skip
+    /// (or required CI can fail); the `set -e` aborts (non-97 exit) if any
+    /// load-bearing rule fails to install.
     fn spawn_tproxy_netns_child() -> Option<Child> {
         // Constants pulled from production (NOT hardcoded from memory): a default
         // change in `src/capture/mod.rs` flows through here.
@@ -1887,11 +1903,11 @@ mod live_netns_tests {
     #[ignore = "requires root + iptables/TPROXY + iproute2 to capture UDP in a fresh netns"]
     fn captured_udp_recovers_pre_tproxy_destination() {
         if !is_root() {
-            eprintln!("SKIP: not root; cannot create network namespaces / TPROXY rules");
+            skip_or_fail("not root; cannot create network namespaces / TPROXY rules");
             return;
         }
         let Some(mut child) = spawn_tproxy_netns_child() else {
-            eprintln!("SKIP: `unshare --net` unavailable");
+            skip_or_fail("`unshare --net` unavailable");
             return;
         };
         // Let the child unshare, bring loopback up, and install the TPROXY +
@@ -1925,10 +1941,11 @@ mod live_netns_tests {
             // but a route / fwmark / `-j TPROXY` rule failed to install — a real
             // break in the path under test → FAIL (don't pass vacuously). Every
             // other exit is an ENVIRONMENTAL prerequisite the live job can't meet
-            // → SKIP: 97 = no `iptables`/`ip` binary; anything else means the
-            // script never ran (e.g. `unshare --net` exits 1 without
-            // CAP_SYS_ADMIN, or `sh`/`unshare` missing → 127), so no netns or
-            // UDP capture was exercised. (codex #1823 r1 + r2)
+            // → local SKIP / required-mode failure: 97 = no `iptables`/`ip`
+            // binary; anything else means the script never ran (e.g.
+            // `unshare --net` exits 1 without CAP_SYS_ADMIN, or `sh`/`unshare`
+            // missing → 127), so no netns or UDP capture was exercised.
+            // (codex #1823 r1 + r2)
             if status.code() == Some(98) {
                 panic!(
                     "netns UDP TPROXY setup failed (exit 98): a load-bearing policy-route / \
@@ -1936,17 +1953,17 @@ mod live_netns_tests {
                      NOT exercised — failing rather than skipping vacuously"
                 );
             }
-            eprintln!(
-                "SKIP: netns/capture prerequisites unavailable (setup child exited {:?}: \
-                 `unshare --net` denied, or no iptables/ip binary)",
+            skip_or_fail(&format!(
+                "netns/capture prerequisites unavailable (setup child exited {:?}: \
+                     `unshare --net` denied, or no iptables/ip binary)",
                 status.code()
-            );
+            ));
             return;
         }
         if setup_status_unknown {
             // `try_wait` errored — an environmental ambiguity reading the child,
             // NOT a confirmed load-bearing failure → skip rather than fail.
-            eprintln!("SKIP: could not determine netns setup-child status (try_wait errored)");
+            skip_or_fail("could not determine netns setup-child status (try_wait errored)");
             return;
         }
         let pid = child.id();
@@ -2026,7 +2043,7 @@ mod live_netns_tests {
         // kernel inside the netns — proving the bind the egress return path
         // depends on actually succeeds with CAP_NET_ADMIN.
         if !is_root() {
-            eprintln!("SKIP: not root; IP_TRANSPARENT non-local bind needs CAP_NET_ADMIN");
+            skip_or_fail("not root; IP_TRANSPARENT non-local bind needs CAP_NET_ADMIN");
             return;
         }
         // A plain `unshare --net` (loopback up) is enough — no iptables needed,
@@ -2042,13 +2059,13 @@ mod live_netns_tests {
             .spawn()
             .ok()
         else {
-            eprintln!("SKIP: `unshare --net` unavailable");
+            skip_or_fail("`unshare --net` unavailable");
             return;
         };
         // Confirm the netns child is alive (did not immediately fail).
         std::thread::sleep(Duration::from_millis(200));
         if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!("SKIP: netns child exited before setup completed");
+            skip_or_fail("netns child exited before setup completed");
             let _ = child.wait();
             return;
         }

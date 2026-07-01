@@ -18,8 +18,8 @@ Two main workflows handle different aspects of the development lifecycle:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| **CI** (`ci.yml`) | Pull Requests, push to `main` | PR validation; latest binaries and Docker images on `main` |
-| **Release** (`release.yml`) | Push tag matching `v*` | Versioned binaries, GitHub release, and Docker tags |
+| **CI** (`ci.yml`) | Pull Requests, push to `main` | Required validation for PRs and `main`; latest binaries and Docker images after `main` validation |
+| **Release** (`release.yml`) | Push tag matching `v*` | Validate the tagged SHA, then publish versioned binaries, GitHub release, and Docker tags |
 
 ### CI Pipeline Flow
 
@@ -27,30 +27,42 @@ Two main workflows handle different aspects of the development lifecycle:
 Pull Request
     ├─► Format
     ├─► Unit / inline-lib / integration-shard / functional-shard tests
-    ├─► Lint, eBPF change check, performance regression check
+    ├─► Lint, dependency audit, vendored regressions
+    ├─► Coverage workflow mirror
+    ├─► eBPF/netns live checks when relevant
+    ├─► Gateway / mesh / Helm / performance gates
     └─► Five target release builds
 
 Push to main
+    ├─► Same required validation gate as PRs
     └─► Five target release builds
-            ├─► Replace latest GitHub prerelease
-            └─► Push per-arch Docker images to Docker Hub and GHCR
-                    └─► Create multi-arch Docker manifest (`latest`, `main-<sha>`)
+            └─► Tests aggregate passes
+                    ├─► Replace latest GitHub prerelease
+                    └─► Push per-arch Docker images to Docker Hub and GHCR
+                            └─► Create multi-arch Docker manifest (`latest`, `main-<sha>`)
 ```
 
 ### Release Pipeline Flow
 
 ```
 Push tag v* (e.g., v0.2.0)
-    └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
-        macos-x86_64 / macos-aarch64 / windows-x86_64)
-            └─► Push versioned Docker images to Docker Hub and GHCR
-                    └─► Create Docker manifest tags
-                            └─► Create GitHub Release with binaries and checksums
+    └─► Validate tag target has successful CI and Coverage runs for the exact SHA
+            └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
+                macos-x86_64 / macos-aarch64 / windows-x86_64)
+                    └─► Push versioned Docker images to Docker Hub and GHCR
+                            └─► Create Docker manifest tags
+                                    └─► Create GitHub Release with binaries and checksums
 ```
 
 ## CI Pipeline (ci.yml)
 
-The CI workflow is triggered by every pull request and every push to `main`, but the jobs differ by event. Format, test, lint, eBPF, and performance jobs are PR-only. Pushes to `main` run the cross-platform build matrix and, after successful builds, publish the `latest` prerelease and Docker images in parallel.
+The CI workflow is triggered by every pull request and every push to `main`.
+The `Tests` aggregate is the required validation gate for both event types: it
+waits for format, test shards, lint, dependency audit, vendored patch
+regressions, the Coverage workflow mirror, Gateway/mesh/Helm gates, eBPF/netns
+gates, performance, and the cross-platform build matrix. Pushes to `main`
+publish the `latest` prerelease and Docker images only after that aggregate and
+the build matrix pass.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
@@ -60,7 +72,7 @@ CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progre
 
 **Runs**: `ubuntu-latest`
 
-Checks Rust formatting on pull requests:
+Checks Rust formatting on pull requests and pushes to `main`:
 
 ```bash
 cargo fmt --all -- --check
@@ -74,7 +86,7 @@ cargo fmt --all -- --check
 
 **Runs**: `ubuntu-latest`
 
-Runs the PR test matrix in parallel. The commands below are grouped by job,
+Runs the required test matrix in parallel. The commands below are grouped by job,
 not run as one sequential shell script:
 
 ```bash
@@ -112,7 +124,7 @@ cargo nextest run --test functional_tests \
 
 **Output**:
 - Test pass/fail status
-- Failures block PR merges (if branch protection enabled)
+- Failures block PR merges and `main` publishing through the `Tests` aggregate
 
 #### 3. Lint Job
 
@@ -135,7 +147,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on every PR, but eBPF validation steps only run when files under `ebpf/` changed relative to the PR base. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed, the job no-ops and reports success.
+The job runs on PRs and pushes to `main`. On PRs, eBPF validation steps only run when files under `ebpf/` changed relative to the PR base; on `main`, they run without the PR path filter. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed on a PR, the job no-ops and reports success.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
@@ -174,7 +186,11 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 **Runs**: `ubuntu-latest`
 
-Builds the gateway in the `ci-release` profile, builds `tests/performance/backend_server`, starts both services, and runs:
+Runs on PRs, pushes to `main`, and manual dispatches. PRs first apply a
+performance-sensitive path filter; unrelated PRs skip the expensive benchmark
+and report success. Relevant PRs and all `main` pushes build the gateway in the
+`ci-release` profile, build `tests/performance/backend_server`, start both
+services, and run:
 
 ```bash
 python3 tests/performance/ci_overhead_bench.py \
@@ -205,11 +221,14 @@ Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, m
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and can run in parallel; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease; version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
+On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and the `Tests` aggregate, which includes a mirror of the separate Coverage workflow for the same SHA. They can run in parallel after validation passes; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until required validation passes. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
-The Release pipeline creates official releases when a version tag is pushed.
+The Release pipeline creates official releases when a version tag is pushed. It
+first resolves the tag to its target commit and waits for successful `CI` and
+`Coverage` workflow runs for that exact SHA before any release binary or image
+job starts.
 
 Release runs use `concurrency.group: release-${{ github.ref }}` with `cancel-in-progress: false`, so a versioned release is never canceled by a later tag push.
 
@@ -223,11 +242,22 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
+### Validate Release SHA Job
+
+**Runs**: `ubuntu-latest`
+
+Validates that the tag name matches the release pattern and that the tag target
+commit has successful `ci.yml` and `coverage.yml` runs from a `push` event.
+Manual workflow dispatches do not satisfy this release gate because they do not
+necessarily execute the same required `Tests` aggregate. If either workflow has
+not passed for the exact SHA, the release waits for the push run and then fails
+before publishing binaries or registry tags if it still has no success.
+
 ### Release Build Job
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (matrix)
 
-Builds optimized release binaries for all target platforms:
+Depends on `Validate release SHA`, then builds optimized release binaries for all target platforms:
 
 **Targets**:
 - `x86_64-unknown-linux-gnu` - Linux x86_64
@@ -254,7 +284,7 @@ Builds optimized release binaries for all target platforms:
 
 ### Create Release Job
 
-**Depends On**: Release Build Job and Docker Manifest Job
+**Depends On**: Release Build Job, Docker Manifest Job, and Docker eBPF Manifest Job
 
 Creates a GitHub Release with all binaries and checksums only after the versioned Docker manifests have been pushed. A Docker Hub or GHCR manifest failure blocks GitHub Release creation.
 
@@ -358,7 +388,7 @@ git tag release-0.2.0
 ### Prerequisites
 
 - Modify `Cargo.toml` with new version
-- All tests passing on `main` branch
+- Successful `CI` and `Coverage` workflow runs for the exact commit that will be tagged
 - GitHub repo with Actions enabled
 - Write permission to repository
 
@@ -381,8 +411,8 @@ git push origin main
 
 **3. Wait for CI to Pass**
 
-- Push to main triggers CI pipeline
-- The main-push build and publish jobs must pass; PR-only test, lint, eBPF, and performance gates should already have passed before merge
+- Push to main triggers CI and Coverage
+- Wait for both workflows to pass for the exact commit you will tag
 - Check GitHub Actions tab for status
 
 **4. Create and Push Version Tag**
@@ -399,6 +429,7 @@ git push origin v0.2.0
 
 - GitHub Actions detects tag matching `v*`
 - Release pipeline starts automatically
+- The tag target SHA is validated against successful CI and Coverage runs before publishing starts
 - Binaries built for all platforms
 - Release created with checksums
 

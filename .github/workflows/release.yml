@@ -13,8 +13,97 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-release-sha:
+    name: Validate release SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Require CI and coverage success for tag target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+
+          release_sha="$(git rev-list -n 1 "$TAG_NAME")"
+          echo "Release tag ${TAG_NAME} resolves to ${release_sha}"
+
+          wait_for_success() {
+            local workflow_file="$1"
+            local label="$2"
+            local max_attempts=320
+
+            for attempt in $(seq 1 "$max_attempts"); do
+              local runs
+              runs="$(gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow "$workflow_file" \
+                --commit "$release_sha" \
+                --limit 50 \
+                --json status,conclusion,event,url,createdAt 2>/dev/null || true)"
+              if [ -z "$runs" ]; then
+                echo "${label} run lookup for ${release_sha} failed transiently (attempt ${attempt}/${max_attempts}); retrying"
+                sleep 30
+                continue
+              fi
+
+              local success_url
+              success_url="$(jq -r '[.[] | select(.conclusion == "success" and .event == "push")] | sort_by(.createdAt) | last | .url // empty' <<<"$runs" 2>/dev/null || true)"
+              if [ -n "$success_url" ]; then
+                echo "${label} passed for ${release_sha}: ${success_url}"
+                {
+                  echo "### ${label}"
+                  echo ""
+                  echo "Validated ${release_sha}: ${success_url}"
+                  echo ""
+                } >> "$GITHUB_STEP_SUMMARY"
+                return 0
+              fi
+
+              local active
+              active="$(jq -r '[.[] | select((.status == "queued" or .status == "in_progress") and .event == "push")] | length' <<<"$runs" 2>/dev/null || true)"
+              active="${active:-0}"
+              local failed_url
+              failed_url="$(jq -r '[.[] | select(.status == "completed" and .event == "push" and .conclusion != null and .conclusion != "success")] | sort_by(.createdAt) | last | .url // empty' <<<"$runs" 2>/dev/null || true)"
+              if [ "$active" = "0" ] && [ -n "$failed_url" ]; then
+                echo "::error title=Release validation failed::${label} completed unsuccessfully for ${release_sha}: ${failed_url}"
+                return 1
+              fi
+              echo "${label} has no successful push run for ${release_sha} yet (attempt ${attempt}/${max_attempts}, active=${active}); waiting"
+              sleep 30
+            done
+
+            echo "::error title=Missing release validation::${label} did not complete successfully for ${release_sha} from a push event"
+            return 1
+          }
+
+          {
+            echo "## Release Validation"
+            echo ""
+            echo "Tag: \`${TAG_NAME}\`"
+            echo ""
+            echo "Commit: \`${release_sha}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          wait_for_success "ci.yml" "CI"
+          wait_for_success "coverage.yml" "Coverage"
+
   build-release-binaries:
     name: Build (${{ matrix.asset_name }})
+    needs: validate-release-sha
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -420,6 +509,7 @@ jobs:
   # so the release must not publish until those manifests actually exist.
   docker-ebpf:
     name: Docker eBPF variant (${{ matrix.platform }})
+    needs: validate-release-sha
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

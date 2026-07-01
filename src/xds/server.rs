@@ -1446,6 +1446,26 @@ fn enforce_subscription_limits(
     Ok(())
 }
 
+fn warn_xds_request_rejected(
+    method: &'static str,
+    namespace: &str,
+    node_id: &str,
+    type_url: &str,
+    resource_name_count: usize,
+    status: &Status,
+) {
+    warn!(
+        method,
+        namespace,
+        node_id,
+        type_url,
+        resource_name_count,
+        status_code = ?status.code(),
+        status_message = %status.message(),
+        "xDS request rejected"
+    );
+}
+
 fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     // This serializes the full GatewayConfig, including HashMap fields whose
     // iteration order is process-local. That is fine for the in-memory xDS
@@ -1514,6 +1534,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let allowed = match self.verify_jwt_metadata(request.metadata()) {
             Ok(allowed) => allowed,
             Err(status) => {
+                warn!(
+                    method = "xDS.StreamAggregatedResources",
+                    status_code = ?status.code(),
+                    status_message = %status.message(),
+                    "xDS stream authentication rejected"
+                );
                 CpGrpcServer::audit_tenant_subscription(
                     "xDS.StreamAggregatedResources",
                     "",
@@ -1527,6 +1553,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let stream_namespace = match self.resolve_xds_namespace(&allowed) {
             Ok(namespace) => namespace,
             Err(status) => {
+                warn!(
+                    method = "xDS.StreamAggregatedResources",
+                    status_code = ?status.code(),
+                    status_message = %status.message(),
+                    "xDS stream namespace resolution rejected"
+                );
                 CpGrpcServer::audit_tenant_subscription(
                     "xDS.StreamAggregatedResources",
                     "",
@@ -1624,6 +1656,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
+                            warn_xds_request_rejected(
+                                "xDS.StreamAggregatedResources",
+                                &stream_namespace,
+                                &current_node_id,
+                                &request.type_url,
+                                request.resource_names.len(),
+                                &status,
+                            );
                             let _ = tx.send(Err(status)).await;
                             return;
                         }
@@ -1632,6 +1672,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             &request.type_url,
                             request.resource_names.len(),
                         ) {
+                            warn_xds_request_rejected(
+                                "xDS.StreamAggregatedResources",
+                                &stream_namespace,
+                                &current_node_id,
+                                &request.type_url,
+                                request.resource_names.len(),
+                                &status,
+                            );
                             let _ = tx.send(Err(status)).await;
                             return;
                         }
@@ -1764,6 +1812,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let allowed = match self.verify_jwt_metadata(request.metadata()) {
             Ok(allowed) => allowed,
             Err(status) => {
+                warn!(
+                    method = "xDS.DeltaAggregatedResources",
+                    status_code = ?status.code(),
+                    status_message = %status.message(),
+                    "xDS stream authentication rejected"
+                );
                 CpGrpcServer::audit_tenant_subscription(
                     "xDS.DeltaAggregatedResources",
                     "",
@@ -1777,6 +1831,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let stream_namespace = match self.resolve_xds_namespace(&allowed) {
             Ok(namespace) => namespace,
             Err(status) => {
+                warn!(
+                    method = "xDS.DeltaAggregatedResources",
+                    status_code = ?status.code(),
+                    status_message = %status.message(),
+                    "xDS stream namespace resolution rejected"
+                );
                 CpGrpcServer::audit_tenant_subscription(
                     "xDS.DeltaAggregatedResources",
                     "",
@@ -1876,6 +1936,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
+                            warn_xds_request_rejected(
+                                "xDS.DeltaAggregatedResources",
+                                &stream_namespace,
+                                &current_node_id,
+                                &request.type_url,
+                                request.resource_names_subscribe.len(),
+                                &status,
+                            );
                             let _ = tx.send(Err(status)).await;
                             return;
                         }
@@ -1884,6 +1952,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             &request.type_url,
                             request.resource_names_subscribe.len(),
                         ) {
+                            warn_xds_request_rejected(
+                                "xDS.DeltaAggregatedResources",
+                                &stream_namespace,
+                                &current_node_id,
+                                &request.type_url,
+                                request.resource_names_subscribe.len(),
+                                &status,
+                            );
                             let _ = tx.send(Err(status)).await;
                             return;
                         }

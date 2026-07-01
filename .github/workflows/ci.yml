@@ -26,7 +26,7 @@ env:
 jobs:
   fmt:
     name: Format Check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -42,7 +42,7 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -58,7 +58,7 @@ jobs:
 
   plugin-hardening-unit-regressions:
     name: Plugin Hardening Unit Regressions
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -106,7 +106,7 @@ jobs:
 
   test-lib:
     name: Inline Lib Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -127,7 +127,7 @@ jobs:
 
   test-secrets:
     name: Secret Backends (${{ matrix.name }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -176,7 +176,7 @@ jobs:
 
   test-service-integration:
     name: Service Integration (${{ matrix.name }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -209,7 +209,7 @@ jobs:
 
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -251,7 +251,7 @@ jobs:
 
   build-integration-tests-archive:
     name: Build Integration Tests Archive
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -320,7 +320,7 @@ jobs:
     # gate the suite far more than CPU time, so sharding wins are wall-clock
     # parallelism not core utilisation — same shape as `test-functional`.
     name: Integration Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-integration-tests-archive
     runs-on: ubuntu-latest
     strategy:
@@ -505,7 +505,7 @@ jobs:
     # the on-disk file set against the union of the shard filters; the job
     # fails if either side has files the other doesn't.
     name: Integration Test Shard Coverage
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     needs: test-integration
     steps:
@@ -537,7 +537,7 @@ jobs:
 
   test-conformance:
     name: Mesh Conformance Tests
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -571,7 +571,7 @@ jobs:
 
   dependency-audit:
     name: Dependency Audit (cargo-deny)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
     # not install sccache. Clear the checked-in sccache rustc-wrapper
@@ -611,9 +611,34 @@ jobs:
         # exception is rejected at PR time, not only by the weekly workflow.
         run: bash scripts/check_advisory_expiry.sh
 
+  test-vendor-patches:
+    name: Vendored Patch Regressions
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-vendor-patches"
+
+      - name: Run vendored h3 frame-drain regressions
+        run: cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
+
+      - name: Run vendored tungstenite raw-takeover regressions
+        run: cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
+
+      - name: Run vendored tokio-tungstenite raw-takeover regression
+        run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
+
+      - name: Run reqwest connect-timeout patch smoke regressions
+        run: |
+          cargo test --test integration_tests -- --exact integration::connection_pool_tests::test_connect_timeout_does_not_fragment_pool
+          cargo test --test integration_tests -- --exact integration::connection_pool_tests::test_pooled_client_exposes_per_request_connect_timeout
+
   build-gateway-binary:
     name: Build Gateway Binary (functional tests)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     # This binary is also packaged into a distroless Debian 13 image for the
     # Gateway API conformance lab. Pin the build host so its glibc stays no
     # newer than the runtime image glibc.
@@ -648,7 +673,7 @@ jobs:
 
   build-functional-tests-archive:
     name: Build Functional Tests Archive
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -689,7 +714,7 @@ jobs:
 
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [build-gateway-binary, build-functional-tests-archive]
     runs-on: ubuntu-latest
     strategy:
@@ -953,7 +978,7 @@ jobs:
 
   plugin-hardening-redis-regression:
     name: Plugin Hardening Redis Regression
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [build-gateway-binary, build-functional-tests-archive]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1029,7 +1054,7 @@ jobs:
 
   gateway-api-conformance:
     name: Gateway API Conformance (CI mirror)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     # Backstop above the in-script poll bounds (discovery <=30 min +
     # status <=140 min) so the graceful "Timed out" branch is reachable and
@@ -1042,10 +1067,11 @@ jobs:
       - name: Mirror dedicated Gateway API conformance result
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW_FILE: gateway-api-conformance.yml
+          DEDICATED_EVENT: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
           # This CI run's own id, used to derive the floor timestamp below so we
           # only mirror a dedicated run created for the *current* event.
           CI_RUN_ID: ${{ github.run_id }}
@@ -1098,11 +1124,13 @@ jobs:
           echo "Only mirroring dedicated runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
 
           # Among dedicated runs for this head_sha that are at/after the floor,
-          # prefer the most recent run whose `.pull_requests[]` includes THIS PR
-          # number; only when none match (cross-fork PR runs report an empty
-          # `.pull_requests`) fall back to the most recent in-window head_sha run
-          # so forked PRs still get a result. The `created_at >= env.SINCE` floor
-          # is applied to BOTH paths so a stale same-SHA run cannot satisfy either.
+          # PR events prefer the most recent run whose `.pull_requests[]`
+          # includes THIS PR number; only when none match (cross-fork PR runs
+          # report an empty `.pull_requests`) fall back to the most recent
+          # in-window head_sha run so forked PRs still get a result. Main-push
+          # events have no PR number, so they select the most recent in-window
+          # push run for the exact SHA. The `created_at >= env.SINCE` floor is
+          # applied to both paths so a stale same-SHA run cannot satisfy either.
           # `gh api --jq` runs gojq, which has no `--arg` flag (that's a flag of
           # the standalone `jq` binary, not of `gh`). Passing `--arg` makes `gh`
           # exit non-zero with "unknown flag", and the surrounding
@@ -1114,20 +1142,33 @@ jobs:
           export SINCE="${since}"
           run_id=""
           for _ in $(seq 1 60); do
-            # `env.PR_NUMBER` / `env.SINCE` below read process env from inside
-            # the jq program, so it is intentionally single-quoted.
-            # shellcheck disable=SC2016
-            run_id="$(
-              gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
-                --jq '
-                  [.workflow_runs[]]
-                  | map(select(.created_at >= env.SINCE))
-                  | sort_by(.created_at) | reverse
-                  | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
-                    // (.[0].id)
-                    // empty
-                ' 2>/dev/null || true
-            )"
+            if [ "$DEDICATED_EVENT" = "pull_request" ]; then
+              # `env.PR_NUMBER` / `env.SINCE` below read process env from inside
+              # the jq program, so it is intentionally single-quoted.
+              # shellcheck disable=SC2016
+              run_id="$(
+                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
+                  --jq '
+                    [.workflow_runs[]]
+                    | map(select(.created_at >= env.SINCE))
+                    | sort_by(.created_at) | reverse
+                    | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
+                      // (.[0].id)
+                      // empty
+                  ' 2>/dev/null || true
+              )"
+            else
+              # shellcheck disable=SC2016
+              run_id="$(
+                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=push&head_sha=${HEAD_SHA}&per_page=10" \
+                  --jq '
+                    [.workflow_runs[]]
+                    | map(select(.created_at >= env.SINCE))
+                    | sort_by(.created_at) | reverse
+                    | .[0].id // empty
+                  ' 2>/dev/null || true
+              )"
+            fi
             if [ -n "$run_id" ]; then
               break
             fi
@@ -1171,9 +1212,123 @@ jobs:
           echo "Timed out after ~140 min waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
+  coverage-gate:
+    name: Coverage (CI mirror)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Mirror dedicated Coverage workflow result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: coverage.yml
+          DEDICATED_EVENT: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
+          CI_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Coverage"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          SKEW_TOLERANCE_SECONDS=120
+          ci_created_at=""
+          for _ in $(seq 1 10); do
+            ci_created_at="$(
+              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
+                --jq '.created_at // empty' 2>/dev/null || true
+            )"
+            if [ -n "$ci_created_at" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$ci_created_at" ]; then
+            echo "Could not resolve this CI run's created_at to floor the coverage run search." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || echo "${ci_created_at}")"
+          echo "Only mirroring dedicated coverage runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
+
+          export SINCE="${since}"
+          run_id=""
+          for _ in $(seq 1 60); do
+            if [ "$DEDICATED_EVENT" = "pull_request" ]; then
+              # shellcheck disable=SC2016
+              run_id="$(
+                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
+                  --jq '
+                    [.workflow_runs[]]
+                    | map(select(.created_at >= env.SINCE))
+                    | sort_by(.created_at) | reverse
+                    | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
+                      // (.[0].id)
+                      // empty
+                  ' 2>/dev/null || true
+              )"
+            else
+              # shellcheck disable=SC2016
+              run_id="$(
+                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=push&head_sha=${HEAD_SHA}&per_page=10" \
+                  --jq '
+                    [.workflow_runs[]]
+                    | map(select(.created_at >= env.SINCE))
+                    | sort_by(.created_at) | reverse
+                    | .[0].id // empty
+                  ' 2>/dev/null || true
+              )"
+            fi
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 30
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "Dedicated Coverage workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Mirroring dedicated coverage workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
+
+          for _ in $(seq 1 280); do
+            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
+            if [ -z "$run_json" ]; then
+              sleep 30
+              continue
+            fi
+            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
+            if [ -z "$status" ]; then
+              sleep 30
+              continue
+            fi
+            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Dedicated Coverage workflow passed." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Dedicated Coverage workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            sleep 30
+          done
+
+          echo "Timed out after ~140 min waiting for dedicated Coverage workflow." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: build-gateway-binary
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1197,11 +1352,28 @@ jobs:
         id: changes
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          changed_files="$RUNNER_TEMP/mesh-federation-changed-files.txt"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only "origin/${{ github.base_ref }}...HEAD" | sort > "$changed_files"
+          else
+            : > "$changed_files"
+          fi
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            python3 .github/scripts/live_suite_path_filter.py \
+              --suite mesh-federation \
+              --changed-files "$changed_files" \
+              --force-run \
+              >> "$GITHUB_STEP_SUMMARY"
             echo "mesh_federation_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/ci\.yml|\.github/actions/package-ferrum-runtime-image/|tests/k8s/multicluster-federation/|docs/(mesh|mesh_multicluster_federation_runbook|spire_deployment)\.md|docs/configuration\.md|ferrum\.conf|openapi\.yaml|proto/|src/admin/(mesh_remote_clusters|mod)\.rs|src/config/env_config\.rs|src/grpc/|src/identity/|src/modes/mesh/|src/proxy/|src/tls/|Cargo\.(toml|lock))'; then
+
+          filter_output="$(python3 .github/scripts/live_suite_path_filter.py \
+            --suite mesh-federation \
+            --changed-files "$changed_files")"
+          printf '%s\n' "$filter_output" >> "$GITHUB_STEP_SUMMARY"
+          if printf '%s\n' "$filter_output" | grep -q '^relevant=true$'; then
             echo "mesh_federation_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "mesh_federation_changed=false" >> "$GITHUB_OUTPUT"
@@ -1251,11 +1423,11 @@ jobs:
         run: |
           echo "## Mesh Multicluster Federation" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Skipped: this PR does not touch mesh federation, discovery, SPIFFE identity, proxy, chart, image, proto, docs, config, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch mesh federation, discovery, SPIFFE identity, proxy, image, proto, docs, config, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
 
   helm-chart:
     name: Helm Chart
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build-gateway-binary
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -1272,6 +1444,11 @@ jobs:
         id: helm_changes
         run: |
           set -euo pipefail
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Curated list of source paths whose changes can affect the Helm
           # install checks below, which boot the control-plane binary and assert
@@ -1605,68 +1782,149 @@ jobs:
 
   test:
     name: Tests
-    if: always() && github.event_name == 'pull_request'
+    if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs:
+      - fmt
       - test-unit
       - plugin-hardening-unit-regressions
       - test-lib
       - test-secrets
       - test-service-integration
+      - test-pkcs11-softhsm
       - build-integration-tests-archive
       - test-integration
+      - test-integration-coverage
       - test-conformance
+      - dependency-audit
+      - test-vendor-patches
       - build-gateway-binary
       - build-functional-tests-archive
       - test-functional
       - plugin-hardening-redis-regression
       - gateway-api-conformance
+      - coverage-gate
       - mesh-multicluster-federation
       - helm-chart
+      - lint
+      - detect-ebpf-live-changes
+      - build-ebpf
+      - build-ebpf-userspace
+      - ebpf-live
+      - netns-capture-live
+      - performance-regression
+      - build-binaries
     runs-on: ubuntu-latest
     steps:
-      - name: Summarize test results
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - name: Verify required CI aggregate wiring
+        run: python3 .github/scripts/verify_required_ci.py
+
+      - name: Summarize required CI results
         run: |
-          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+
+          failures=0
+
+          add_row() {
+            echo "| $1 | $2 |" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          require_success() {
+            local label="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "::error title=Required CI failed::${label} completed with result '${result}'"
+              failures=1
+            fi
+          }
+
+          require_live_gate() {
+            local label="$1"
+            local result="$2"
+            local changed="${{ needs.detect-ebpf-live-changes.outputs.changed }}"
+            if [ "$changed" = "true" ]; then
+              require_success "$label" "$result"
+              return
+            fi
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "::error title=Live CI gate failed::${label} completed with result '${result}'"
+              failures=1
+            fi
+          }
+
+          echo "## Required CI Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Suite | Result |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Plugin hardening unit regressions | ${{ needs.plugin-hardening-unit-regressions.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Secret backends | ${{ needs.test-secrets.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Service integration | ${{ needs.test-service-integration.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Integration archive build | ${{ needs.build-integration-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Integration | ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Mesh conformance | ${{ needs.test-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Gateway binary build | ${{ needs.build-gateway-binary.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Functional archive build | ${{ needs.build-functional-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Plugin hardening Redis regression | ${{ needs.plugin-hardening-redis-regression.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Mesh multicluster federation | ${{ needs.mesh-multicluster-federation.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Helm chart | ${{ needs.helm-chart.result }} |" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ needs.test-unit.result }}" != "success" ] ||
-             [ "${{ needs.plugin-hardening-unit-regressions.result }}" != "success" ] ||
-             [ "${{ needs.test-lib.result }}" != "success" ] ||
-             [ "${{ needs.test-secrets.result }}" != "success" ] ||
-             [ "${{ needs.test-service-integration.result }}" != "success" ] ||
-             [ "${{ needs.build-integration-tests-archive.result }}" != "success" ] ||
-             [ "${{ needs.test-integration.result }}" != "success" ] ||
-             [ "${{ needs.test-conformance.result }}" != "success" ] ||
-             [ "${{ needs.build-gateway-binary.result }}" != "success" ] ||
-             [ "${{ needs.build-functional-tests-archive.result }}" != "success" ] ||
-             [ "${{ needs.test-functional.result }}" != "success" ] ||
-             [ "${{ needs.plugin-hardening-redis-regression.result }}" != "success" ] ||
-             [ "${{ needs.gateway-api-conformance.result }}" != "success" ] ||
-             [ "${{ needs.mesh-multicluster-federation.result }}" != "success" ] ||
-             [ "${{ needs.helm-chart.result }}" != "success" ]; then
+          add_row "Format" "${{ needs.fmt.result }}"
+          add_row "Unit" "${{ needs.test-unit.result }}"
+          add_row "Plugin hardening unit regressions" "${{ needs.plugin-hardening-unit-regressions.result }}"
+          add_row "Inline lib" "${{ needs.test-lib.result }}"
+          add_row "Secret backends" "${{ needs.test-secrets.result }}"
+          add_row "Service integration" "${{ needs.test-service-integration.result }}"
+          add_row "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}"
+          add_row "Integration archive build" "${{ needs.build-integration-tests-archive.result }}"
+          add_row "Integration" "${{ needs.test-integration.result }}"
+          add_row "Integration shard coverage" "${{ needs.test-integration-coverage.result }}"
+          add_row "Mesh conformance" "${{ needs.test-conformance.result }}"
+          add_row "Dependency audit" "${{ needs.dependency-audit.result }}"
+          add_row "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}"
+          add_row "Gateway binary build" "${{ needs.build-gateway-binary.result }}"
+          add_row "Functional archive build" "${{ needs.build-functional-tests-archive.result }}"
+          add_row "Functional shards" "${{ needs.test-functional.result }}"
+          add_row "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
+          add_row "Gateway API conformance" "${{ needs.gateway-api-conformance.result }}"
+          add_row "Coverage" "${{ needs.coverage-gate.result }}"
+          add_row "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
+          add_row "Helm chart" "${{ needs.helm-chart.result }}"
+          add_row "Lint" "${{ needs.lint.result }}"
+          add_row "eBPF/netns live change detector" "${{ needs.detect-ebpf-live-changes.result }}"
+          add_row "eBPF programs" "${{ needs.build-ebpf.result }}"
+          add_row "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
+          add_row "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
+          add_row "Netns capture live" "${{ needs.netns-capture-live.result }}"
+          add_row "Performance regression" "${{ needs.performance-regression.result }}"
+          add_row "Cross-platform binaries" "${{ needs.build-binaries.result }}"
+
+          require_success "Format" "${{ needs.fmt.result }}"
+          require_success "Unit" "${{ needs.test-unit.result }}"
+          require_success "Plugin hardening unit regressions" "${{ needs.plugin-hardening-unit-regressions.result }}"
+          require_success "Inline lib" "${{ needs.test-lib.result }}"
+          require_success "Secret backends" "${{ needs.test-secrets.result }}"
+          require_success "Service integration" "${{ needs.test-service-integration.result }}"
+          require_success "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}"
+          require_success "Integration archive build" "${{ needs.build-integration-tests-archive.result }}"
+          require_success "Integration" "${{ needs.test-integration.result }}"
+          require_success "Integration shard coverage" "${{ needs.test-integration-coverage.result }}"
+          require_success "Mesh conformance" "${{ needs.test-conformance.result }}"
+          require_success "Dependency audit" "${{ needs.dependency-audit.result }}"
+          require_success "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}"
+          require_success "Gateway binary build" "${{ needs.build-gateway-binary.result }}"
+          require_success "Functional archive build" "${{ needs.build-functional-tests-archive.result }}"
+          require_success "Functional shards" "${{ needs.test-functional.result }}"
+          require_success "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
+          require_success "Gateway API conformance" "${{ needs.gateway-api-conformance.result }}"
+          require_success "Coverage" "${{ needs.coverage-gate.result }}"
+          require_success "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
+          require_success "Helm chart" "${{ needs.helm-chart.result }}"
+          require_success "Lint" "${{ needs.lint.result }}"
+          require_success "eBPF/netns live change detector" "${{ needs.detect-ebpf-live-changes.result }}"
+          require_success "eBPF programs" "${{ needs.build-ebpf.result }}"
+          require_success "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
+          require_live_gate "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
+          require_live_gate "Netns capture live" "${{ needs.netns-capture-live.result }}"
+          require_success "Performance regression" "${{ needs.performance-regression.result }}"
+          require_success "Cross-platform binaries" "${{ needs.build-binaries.result }}"
+
+          if [ "$failures" -ne 0 ]; then
             exit 1
           fi
 
   lint:
     name: Lint
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1681,7 +1939,7 @@ jobs:
 
   detect-ebpf-live-changes:
     name: Detect eBPF/Netns Live Changes
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.changes.outputs.changed }}
@@ -1693,9 +1951,21 @@ jobs:
       - name: Detect live-kernel-sensitive paths
         id: changes
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            : > "$RUNNER_TEMP/ebpf-live-changed-files.txt"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## eBPF/Netns Live Gate"
+              echo ""
+              echo "Main-push validation runs the live-kernel checks without a PR path filter."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$RUNNER_TEMP/ebpf-live-changed-files.txt"
 
@@ -1751,7 +2021,7 @@ jobs:
 
   build-ebpf:
     name: Build eBPF Programs
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1761,8 +2031,13 @@ jobs:
       - name: Check for eBPF changes
         id: changes
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
         run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "ebpf_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^ebpf/'; then
             echo "ebpf_changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -1808,7 +2083,7 @@ jobs:
 
   build-ebpf-userspace:
     name: Build eBPF Userspace Loader
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1833,7 +2108,7 @@ jobs:
     needs: detect-ebpf-live-changes
     # Live kernel validation is high-value for BPF/node-waypoint-sensitive
     # changes, but it adds several minutes to every PR when run unconditionally.
-    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
+    if: (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1874,19 +2149,58 @@ jobs:
       - name: Ensure bpffs is mounted
         run: sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
 
+      - name: Preflight live-kernel prerequisites
+        run: |
+          set -euo pipefail
+          kernel="$(uname -r)"
+          major="${kernel%%.*}"
+          rest="${kernel#*.}"
+          minor="${rest%%.*}"
+          if [ "$major" -lt 5 ] || { [ "$major" -eq 5 ] && [ "$minor" -lt 7 ]; }; then
+            echo "::error::kernel ${kernel} is older than the required Linux 5.7"
+            exit 1
+          fi
+          test -f /sys/fs/cgroup/cgroup.controllers || {
+            echo "::error::cgroup v2 is not mounted at /sys/fs/cgroup"
+            exit 1
+          }
+          sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+          mountpoint -q /sys/fs/bpf || {
+            echo "::error::bpffs is not mounted at /sys/fs/bpf"
+            exit 1
+          }
+          sudo -n true
+
       - name: Run live-kernel eBPF test as root
         # Loads + verifies every BPF program (including the GAP-2M sock_ops
         # cookie bridge) on the runner's real kernel, attaches them to a
-        # scratch cgroup, and round-trips the workload-identity map. The test
-        # self-skips (passes) if the runner lacks kernel >= 5.7 / cgroup v2 /
-        # bpffs. Run the prebuilt test binary directly under sudo so cargo
-        # never runs as root against the user-owned target dir.
+        # scratch cgroup, and round-trips the workload-identity map. Required
+        # mode turns any test-level SKIP into a CI failure. Run the prebuilt
+        # test binary directly under sudo so cargo never runs as root against
+        # the user-owned target dir.
         run: |
           set -euo pipefail
           BIN="${{ steps.build_test_bin.outputs.test_bin }}"
           echo "Live-kernel test binary: $BIN"
-          sudo -E "FERRUM_NODE_AGENT_BPF_ELF_PATH=$GITHUB_WORKSPACE/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf" \
-            "$BIN" ebpf::loader::live_kernel_tests --ignored --nocapture --test-threads=1
+          set +e
+          output="$(sudo -E \
+            "FERRUM_NODE_AGENT_BPF_ELF_PATH=$GITHUB_WORKSPACE/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf" \
+            "FERRUM_LIVE_TESTS_REQUIRED=1" \
+            "$BIN" ebpf::loader::live_kernel_tests --ignored --nocapture --test-threads=1 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q '^SKIP:' <<<"$output"; then
+            echo "::error::eBPF live tests skipped under required CI mode"
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 2 eBPF live tests to pass"
+            exit 1
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -1895,7 +2209,7 @@ jobs:
     needs: detect-ebpf-live-changes
     # The netns tests require privileged live-kernel operations; the path gate
     # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
-    if: github.event_name == 'pull_request' && needs.detect-ebpf-live-changes.outputs.changed == 'true'
+    if: (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.detect-ebpf-live-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1921,6 +2235,18 @@ jobs:
           echo "In-netns live test binary: $BIN"
           echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
+      - name: Preflight netns capture prerequisites
+        run: |
+          set -euo pipefail
+          sudo -n true
+          for bin in unshare ip iptables; do
+            command -v "$bin" >/dev/null 2>&1 || {
+              echo "::error::$bin is required for strict netns live tests"
+              exit 1
+            }
+          done
+          sudo unshare --net sh -c 'ip link set lo up 2>/dev/null || true; iptables -t nat -L >/dev/null'
+
       - name: Run in-netns capture live tests as root
         # Privileged functional tests for the per-pod-netns outbound capture
         # listener (`src/proxy/netns_capture.rs`). They create + enter network
@@ -1936,15 +2262,30 @@ jobs:
         # TPROXY mangle rule + fwmark policy routing in a throwaway netns must
         # divert a pod-egress UDP datagram onto the transparent capture socket
         # and recover its pre-TPROXY destination from the IP_RECVORIGDSTADDR
-        # cmsg (the UDP analogue of SO_ORIGINAL_DST). Each test self-skips
-        # (passes) when the runner lacks root / `unshare` / `iptables` / `ip`.
-        # Run the prebuilt binary directly under sudo so cargo never runs as
-        # root against the user-owned target.
+        # cmsg (the UDP analogue of SO_ORIGINAL_DST). Required mode turns any
+        # test-level SKIP into a CI failure. Run the prebuilt binary directly
+        # under sudo so cargo never runs as root against the user-owned target.
         run: |
           set -euo pipefail
           BIN="${{ steps.build_test_bin.outputs.test_bin }}"
           echo "In-netns live test binary: $BIN"
-          sudo -E "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests proxy::mesh_udp_capture::live_netns_tests --ignored --nocapture --test-threads=1
+          set +e
+          output="$(sudo -E "FERRUM_LIVE_TESTS_REQUIRED=1" \
+            "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests proxy::mesh_udp_capture::live_netns_tests --ignored --nocapture --test-threads=1 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q '^SKIP:' <<<"$output"; then
+            echo "::error::netns live tests skipped under required CI mode"
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 4 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 4 netns live tests to pass"
+            exit 1
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -2319,8 +2660,8 @@ jobs:
 
   latest-release:
     name: Update Latest Release
-    needs: [build-binaries]
-    if: always() && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build-binaries]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2391,8 +2732,8 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: [build-binaries]
-    if: always() && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build-binaries]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

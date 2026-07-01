@@ -1605,7 +1605,14 @@ async fn handle_tcp_connection(
     mesh_outbound_enforcement: Option<&Arc<MeshOutboundEnforcement>>,
 ) -> TcpConnectionResult {
     let start = Instant::now();
-    let _ = client_stream.set_nodelay(true);
+    if let Err(e) = client_stream.set_nodelay(true) {
+        warn!(
+            proxy_id = %proxy_id,
+            client = %remote_addr,
+            "Failed to set TCP_NODELAY on accepted TCP stream: {}",
+            e
+        );
+    }
 
     // Run the core connection logic, tracking backend info for logging.
     // We use a helper closure so that `?` returns from the closure, not the
@@ -3489,9 +3496,21 @@ async fn connect_backend_plain(
     {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
+        if let Err(e) = crate::socket_opts::set_ip_bind_address_no_port(fd, true) {
+            warn!(
+                backend = %addr,
+                "Failed to enable IP_BIND_ADDRESS_NO_PORT on outbound TCP socket: {}",
+                e
+            );
+        }
         if tcp_fastopen {
-            let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
+            if let Err(e) = crate::socket_opts::set_tcp_fastopen_client(fd) {
+                warn!(
+                    backend = %addr,
+                    "Failed to enable TCP_FASTOPEN_CONNECT on outbound TCP socket: {}",
+                    e
+                );
+            }
         }
     }
     #[cfg(not(unix))]
@@ -3513,7 +3532,13 @@ async fn connect_backend_plain(
             anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
         })?;
 
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!(
+            backend = %addr,
+            "Failed to set TCP_NODELAY on outbound TCP stream: {}",
+            e
+        );
+    }
     Ok(stream)
 }
 

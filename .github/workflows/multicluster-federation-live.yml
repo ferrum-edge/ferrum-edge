@@ -3,49 +3,6 @@ name: Multicluster Federation Live Datapath
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - ".github/workflows/multicluster-federation-live.yml"
-      - ".github/actions/package-ferrum-runtime-image/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
-      - "Dockerfile.release"
-      - "build.rs"
-      - "proto/**"
-      - "src/modes/mesh/**"
-      # The mesh plugins enforce the datapath: `mesh/authz.rs` backs the
-      # required `untrusted_peer_rejected` destination-side 403, and
-      # `mesh/spiffe_identity.rs` stamps the verified peer identity.
-      - "src/plugins/mesh/**"
-      - "src/grpc/**"
-      - "src/identity/**"
-      - "src/tls/**"
-      - "src/secrets/**"
-      - "src/service_discovery/**"
-      # The fixture starts mesh mode through FERRUM_MESH_* / CA-backend env; this
-      # is the parser/validator for them (and is already in the sibling
-      # deploy-only smoke filter in ci.yml).
-      - "src/config/env_config.rs"
-      - "src/proxy/hbone_pool.rs"
-      - "src/proxy/mesh_mtls_pool.rs"
-      - "src/proxy/hbone_proxy.rs"
-      - "src/proxy/mod.rs"
-      # The east-west gateway materializes SNI-passthrough proxies that are
-      # reconciled through the stream listener manager, choose the backend by
-      # ClientHello SNI (`sni::extract_sni_from_tcp_stream`), and are relayed by
-      # the TCP proxy — so changes to any of these alter the cross-cluster datapath.
-      - "src/proxy/stream_listener.rs"
-      - "src/proxy/tcp_proxy.rs"
-      - "src/proxy/sni.rs"
-      - "src/capture/**"
-      # NOTE: charts/ferrum-mesh is intentionally NOT a trigger — this fixture
-      # deploys hand-crafted NodePort manifests (the chart's east-west Service is
-      # ClusterIP-only, not cross-cluster reachable), so a chart edit does not
-      # change what this job exercises. The chart is covered by the `Helm Chart`
-      # CI job (lint/template/install).
-      - "tests/k8s/lib/**"
-      - "tests/k8s/multicluster-federation/**"
-      - "docs/mesh.md"
 
 permissions:
   contents: read
@@ -63,8 +20,58 @@ env:
   KUBECTL_VERSION: v1.32.3
 
 jobs:
+  changes:
+    name: Multicluster federation trigger
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for multicluster federation changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/live_suite_path_filter.py --self-test
+          changed_files="$RUNNER_TEMP/multicluster-federation-changed-files.txt"
+          : > "$changed_files"
+
+          filter_args=(--suite mesh-federation --changed-files "$changed_files")
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags origin "${BASE_REF}"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$changed_files"
+          else
+            filter_args+=(--force-run)
+          fi
+
+          plan="$(python3 .github/scripts/live_suite_path_filter.py "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
   multicluster-federation-live:
     name: Multicluster federation live datapath
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 

@@ -3175,7 +3175,9 @@ mod original_dst_live_tests {
     //! Privileged live verification of `SO_ORIGINAL_DST` against a real
     //! iptables `REDIRECT` rule, inside a throwaway network namespace (the
     //! host's iptables are never touched). Runs in CI's `netns-capture-live`
-    //! job as root; self-skips (passes) without root / `unshare` / `iptables`.
+    //! job as root with `FERRUM_LIVE_TESTS_REQUIRED=1`, so missing prerequisites
+    //! fail there instead of passing as skips. Local ad-hoc runs still self-skip
+    //! without root / `unshare` / `iptables`.
 
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
@@ -3192,6 +3194,21 @@ mod original_dst_live_tests {
         unsafe { libc::geteuid() == 0 }
     }
 
+    fn live_tests_required() -> bool {
+        std::env::var("FERRUM_LIVE_TESTS_REQUIRED")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn skip_or_fail(reason: &str) {
+        if live_tests_required() {
+            panic!(
+                "SO_ORIGINAL_DST live test prerequisite missing under FERRUM_LIVE_TESTS_REQUIRED: {reason}"
+            );
+        }
+        eprintln!("SKIP: {reason}");
+    }
+
     /// Reaps the netns child on drop so the test never leaks it.
     struct ChildGuard(Child);
     impl Drop for ChildGuard {
@@ -3203,7 +3220,8 @@ mod original_dst_live_tests {
 
     /// Spawn a child in a fresh netns with loopback up and the sidecar-shaped
     /// nat rule: TCP to :18080 is REDIRECTed to :25001. Exits 97 when
-    /// `iptables` is unavailable inside the netns so the test can skip.
+    /// `iptables` is unavailable inside the netns so local runs can skip and
+    /// required CI can fail.
     fn spawn_redirect_netns_child() -> Option<Child> {
         Command::new("unshare")
             .args([
@@ -3225,15 +3243,16 @@ mod original_dst_live_tests {
     #[ignore = "requires root + iptables to create a REDIRECT rule in a fresh netns"]
     fn redirected_connection_reports_pre_nat_destination() {
         if !is_root() {
-            eprintln!("SKIP: not root; cannot create network namespaces");
+            skip_or_fail("not root; cannot create network namespaces");
             return;
         }
         let Some(mut child) = spawn_redirect_netns_child() else {
-            eprintln!("SKIP: `unshare --net` unavailable");
+            skip_or_fail("`unshare --net` unavailable");
             return;
         };
         // Let the child unshare, bring loopback up, and install the rule;
-        // exit (97 = iptables unavailable, or any other failure) == skip.
+        // exit (97 = iptables unavailable, or any other failure) == local skip
+        // or required-mode failure.
         // `try_wait` rather than `kill(pid, 0)`: an exited-but-unreaped child
         // is a zombie that still answers signal 0, which would wrongly run
         // the scenario in a namespace without the REDIRECT rule.
@@ -3249,7 +3268,7 @@ mod original_dst_live_tests {
             }
         }
         if child_exited {
-            eprintln!("SKIP: iptables unavailable inside the test netns");
+            skip_or_fail("iptables unavailable inside the test netns");
             return;
         }
         let pid = child.id();
