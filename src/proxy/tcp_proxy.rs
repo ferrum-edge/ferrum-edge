@@ -48,6 +48,10 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+const NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS: u64 = 60_000;
+static NODE_WAYPOINT_IDENTITY_WARN_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
 /// Resolve a node-waypoint TCP connection's source pod identity to a per-pod
 /// authorization scope, mirroring the HTTP/HBONE admit path in
 /// `src/proxy/mod.rs`.
@@ -116,16 +120,36 @@ fn resolve_node_waypoint_stream_scope(
             Some(resolved.identity.spiffe_id.as_str().to_string()),
         ),
         Err(error) => {
-            warn!(
-                proxy_id = %proxy_id,
-                client = %client_ip,
-                error = %error,
-                fallback_scope = "mesh-wide",
-                "Node-waypoint TCP stream: no resolved pod identity; \
-                 falling back to mesh-wide authorization"
-            );
+            warn_node_waypoint_identity_fallback(proxy_id, client_ip, &error);
             (None, None)
         }
+    }
+}
+
+fn warn_node_waypoint_identity_fallback(proxy_id: &str, client_ip: &str, error: &anyhow::Error) {
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    let last_ms = NODE_WAYPOINT_IDENTITY_WARN_LAST_MS.load(Ordering::Relaxed);
+    if last_ms != 0 && now_ms.saturating_sub(last_ms) < NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS {
+        NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    if NODE_WAYPOINT_IDENTITY_WARN_LAST_MS
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let suppressed = NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED.swap(0, Ordering::Relaxed);
+        warn!(
+            proxy_id = %proxy_id,
+            client = %client_ip,
+            error = %error,
+            fallback_scope = "mesh-wide",
+            suppressed,
+            "Node-waypoint TCP stream: no resolved pod identity; \
+             falling back to mesh-wide authorization"
+        );
+    } else {
+        NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
