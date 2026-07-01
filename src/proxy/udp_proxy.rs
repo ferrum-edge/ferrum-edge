@@ -1809,7 +1809,13 @@ fn spawn_new_session_datagram(
         )
         .await;
         if let Err(e) = result {
-            debug!(proxy_id = %proxy_id, client = %client_addr, "UDP session setup/initial forward error: {}", e);
+            warn!(
+                proxy_id = %proxy_id,
+                client = %client_addr,
+                listen_port = listen_port,
+                error = %e,
+                "UDP session setup or initial forward failed"
+            );
         }
     });
 }
