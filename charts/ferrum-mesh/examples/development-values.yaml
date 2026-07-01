@@ -24,6 +24,9 @@ controlPlane:
     FERRUM_XDS_ENABLED: "true"
     FERRUM_LOG_LEVEL: info
     FERRUM_CP_NAMESPACES: "*"
+    # Development example: expose CP/DP gRPC inside the local cluster without TLS.
+    # Production installs should configure FERRUM_CP_GRPC_TLS_* instead.
+    FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
 
 injector:
   enabled: false
