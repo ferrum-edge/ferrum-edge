@@ -2316,12 +2316,26 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 /// bracketed denied literal parses as a non-IP here and is admitted, only to be
 /// blocked later at dispatch.
 pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
-    // The URL/authority parser treats the substring after the LAST '@' as the
-    // host (any userinfo precedes it), so a configured host like
-    // `allowed@169.254.169.254` is dialed as `169.254.169.254`. A real host never
-    // contains '@', so screening only the post-'@' part just narrows malicious
-    // input — otherwise the literal slips through the resolver behind userinfo.
-    let host = host.rsplit('@').next().unwrap_or(host);
+    // The URL authority ends at the first '/', '?', or '#' — or '\' for the
+    // special http/https schemes our backend URLs use, which the WHATWG parser
+    // folds to '/'. Everything from that terminator on is path/query/fragment,
+    // NOT the dialed host: `169.254.169.254/@evil` and `169.254.169.254\@evil`
+    // both dial 169.254.169.254 (the '@' is in the PATH, not userinfo). Truncate
+    // to the authority FIRST so the userinfo split below cannot reach past the
+    // authority into the path and screen the wrong host. (ASCII tab/newline/CR
+    // are stripped by the parser before parsing but are never authority
+    // terminators, so scanning the raw string here still finds the first real
+    // terminator.)
+    let authority = match host.find(['/', '?', '#', '\\']) {
+        Some(i) => &host[..i],
+        None => host,
+    };
+    // Within the authority, the parser treats the substring after the LAST '@'
+    // as the host (any userinfo precedes it), so `allowed@169.254.169.254` is
+    // dialed as `169.254.169.254`. A real host never contains '@', so screening
+    // only the post-'@' part just narrows malicious input — otherwise the literal
+    // slips through the resolver behind userinfo.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
 
     // Canonical literal first (also covers bracketed IPv6).
     if let Some(ip) = stream_literal_ip(host) {
@@ -2357,14 +2371,22 @@ pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
     };
 
     // Hot-path guard: skip the allocating URL/IDNA parse only for an ordinary
-    // ASCII hostname — all-ASCII AND not beginning with an ASCII digit. Canonical
-    // literals (incl. IPv6) were already handled by `IpAddr::parse` above; a
-    // non-canonical IPv4 spelling (decimal/hex/octal) begins with an ASCII digit;
-    // and a NON-ASCII host may be an IDNA/UTS-46 form (e.g. fullwidth digits
-    // `１６９。２５４。１６９。２５４`) the URL parser maps to an IP, so it must NOT be
-    // skipped. This keeps hostname-backed dispatch on the request path
-    // allocation-free.
+    // ASCII hostname — all-ASCII, NO percent-encoding, AND not beginning with an
+    // ASCII digit. Each excluded form is one the URL parser can still resolve to
+    // an IPv4 literal, so it must NOT be skipped:
+    //  - canonical literals (incl. IPv6) were already handled by `IpAddr::parse`;
+    //  - a non-canonical IPv4 spelling (decimal/hex/octal) begins with a digit;
+    //  - a NON-ASCII host may be an IDNA/UTS-46 form (e.g. fullwidth digits
+    //    `１６９。２５４。１６９。２５４`) the parser maps to an IP;
+    //  - a '%'-containing host may percent-DECODE to a digit-leading literal
+    //    (`%31%36%39.%32%35%34.%31%36%39.%32%35%34` → `169.254.169.254`), which
+    //    the URL parser decodes before IPv4 parsing.
+    // For plain ASCII with none of those, the parser's IPv4 path requires the
+    // first authority label to parse as a number, which can only start with a
+    // digit — so an ASCII, '%'-free, non-digit-leading host is never a literal.
+    // This keeps hostname-backed dispatch on the request path allocation-free.
     if cleaned.is_ascii()
+        && !cleaned.contains('%')
         && !cleaned
             .as_bytes()
             .first()
