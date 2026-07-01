@@ -2291,6 +2291,20 @@ fn streaming_response_status_is_passively_unhealthy(
         .is_some_and(|passive| passive.unhealthy_status_codes.contains(&response_status))
 }
 
+fn h3_success_on_drop_after_response_bytes(
+    inbound_version: hyper::Version,
+    content_length: Option<u64>,
+) -> Option<u64> {
+    if matches!(
+        inbound_version,
+        hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+    ) {
+        content_length
+    } else {
+        None
+    }
+}
+
 /// Owns the gRPC **streaming** circuit-breaker outcome, settling it at the join of
 /// request-upload termination and response-body completion so a streaming RPC is
 /// classified correctly without pinning a HALF_OPEN probe slot (#1649 item 3,
@@ -17308,6 +17322,8 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            let success_on_drop_after_bytes =
+                h3_success_on_drop_after_response_bytes(inbound_version, cl);
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -17349,7 +17365,7 @@ async fn handle_proxy_request_inner(
                 )
             };
             let mut body = body
-                .with_success_on_drop_after_response_bytes(cl)
+                .with_success_on_drop_after_response_bytes(success_on_drop_after_bytes)
                 .with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
@@ -25810,6 +25826,26 @@ mod tests {
     fn plain_and_grpc_flavors_allow_request_body_buffering() {
         assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Plain));
         assert!(http_flavor_allows_request_body_buffering(HttpFlavor::Grpc));
+    }
+
+    #[test]
+    fn h3_drop_success_hint_only_applies_to_http1_downstreams() {
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_10, Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_11, Some(42)),
+            Some(42)
+        );
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_2, Some(42)),
+            None
+        );
+        assert_eq!(
+            h3_success_on_drop_after_response_bytes(hyper::Version::HTTP_3, Some(42)),
+            None
+        );
     }
 
     #[test]

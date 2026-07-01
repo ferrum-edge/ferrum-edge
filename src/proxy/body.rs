@@ -83,10 +83,11 @@ pub struct ProxyBody {
     bytes_streamed: AtomicU64,
     /// Treat Drop after exactly this many yielded response-body DATA bytes as a
     /// successful backend body completion instead of a client disconnect. Used
-    /// for native H3 responses with a trusted `Content-Length`: hyper may stop
-    /// polling once an H1 downstream receives the declared byte count, before the
-    /// H3 source yields its terminal FIN/trailer poll. Partial or overlong
-    /// bodies still fall through to the normal disconnect/error classification.
+    /// for native H3 responses with a trusted `Content-Length` on an HTTP/1.x
+    /// downstream: hyper may stop polling once the client receives the declared
+    /// byte count, before the H3 source yields its terminal FIN/trailer poll.
+    /// Partial or overlong bodies still fall through to the normal
+    /// disconnect/error classification.
     success_on_drop_after_bytes: Option<u64>,
     /// Whether `poll_frame` was ever called. Used by the `Drop` safety net
     /// to distinguish "hyper decided not to stream this body" (HEAD / 204 /
