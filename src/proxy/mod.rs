@@ -7537,7 +7537,13 @@ async fn handle_connection(
                 "Client disconnected before response completed"
             );
         } else {
-            debug!(error = %e, "Connection error");
+            error!(
+                remote_addr = %remote_addr,
+                listen_port = frontend_listen_port,
+                tls = false,
+                error = %e,
+                "HTTP connection error"
+            );
         }
     }
 
