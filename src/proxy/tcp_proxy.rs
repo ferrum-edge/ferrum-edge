@@ -9,8 +9,10 @@ use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -47,9 +49,7 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 }
 
 const NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS: u64 = 60_000;
-static NODE_WAYPOINT_IDENTITY_WARN_BUCKETS: OnceLock<
-    dashmap::DashMap<String, NodeWaypointIdentityWarnBucket>,
-> = OnceLock::new();
+const NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS: u64 = u64::MAX;
 
 struct NodeWaypointIdentityWarnBucket {
     last_ms: AtomicU64,
@@ -59,9 +59,64 @@ struct NodeWaypointIdentityWarnBucket {
 impl NodeWaypointIdentityWarnBucket {
     fn new() -> Self {
         Self {
-            last_ms: AtomicU64::new(0),
+            last_ms: AtomicU64::new(NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS),
             suppressed: AtomicU64::new(0),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NodeWaypointIdentityErrorKind {
+    SocketCookieUnavailable,
+    UnknownCookie,
+    MissingPodUid,
+    MissingWorkloadHash,
+    UnknownPod,
+    WorkloadHashMismatch,
+    PodUidMismatch,
+}
+
+impl NodeWaypointIdentityErrorKind {
+    const COUNT: usize = 7;
+
+    fn index(self) -> usize {
+        match self {
+            Self::SocketCookieUnavailable => 0,
+            Self::UnknownCookie => 1,
+            Self::MissingPodUid => 2,
+            Self::MissingWorkloadHash => 3,
+            Self::UnknownPod => 4,
+            Self::WorkloadHashMismatch => 5,
+            Self::PodUidMismatch => 6,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SocketCookieUnavailable => "socket_cookie_unavailable",
+            Self::UnknownCookie => "unknown_cookie",
+            Self::MissingPodUid => "missing_pod_uid",
+            Self::MissingWorkloadHash => "missing_workload_hash",
+            Self::UnknownPod => "unknown_pod",
+            Self::WorkloadHashMismatch => "workload_hash_mismatch",
+            Self::PodUidMismatch => "pod_uid_mismatch",
+        }
+    }
+}
+
+struct NodeWaypointIdentityWarnLimiter {
+    buckets: [NodeWaypointIdentityWarnBucket; NodeWaypointIdentityErrorKind::COUNT],
+}
+
+impl NodeWaypointIdentityWarnLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| NodeWaypointIdentityWarnBucket::new()),
+        }
+    }
+
+    fn bucket(&self, kind: NodeWaypointIdentityErrorKind) -> &NodeWaypointIdentityWarnBucket {
+        &self.buckets[kind.index()]
     }
 }
 
@@ -115,6 +170,7 @@ fn resolve_node_waypoint_stream_scope(
     stream: &TcpStream,
     proxy_id: &str,
     client_ip: &str,
+    warn_limiter: &NodeWaypointIdentityWarnLimiter,
 ) -> (
     Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
     Option<String>,
@@ -133,7 +189,7 @@ fn resolve_node_waypoint_stream_scope(
             Some(resolved.identity.spiffe_id.as_str().to_string()),
         ),
         Err(error) => {
-            warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error);
+            warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error, warn_limiter);
             (None, None)
         }
     }
@@ -143,17 +199,15 @@ fn warn_node_waypoint_identity_scope_missing(
     proxy_id: &str,
     client_ip: &str,
     error: &crate::modes::mesh::node_waypoint::NodeWaypointIdentityError,
+    warn_limiter: &NodeWaypointIdentityWarnLimiter,
 ) {
     let error_kind = node_waypoint_identity_error_kind(error);
-    let buckets = NODE_WAYPOINT_IDENTITY_WARN_BUCKETS.get_or_init(dashmap::DashMap::new);
-    let bucket_key = format!("{proxy_id}|{error_kind}");
-    let bucket = buckets
-        .entry(bucket_key)
-        .or_insert_with(NodeWaypointIdentityWarnBucket::new);
-    let bucket = bucket.value();
+    let bucket = warn_limiter.bucket(error_kind);
     let now_ms = crate::socket_opts::monotonic_now_ms();
     let last_ms = bucket.last_ms.load(Ordering::Relaxed);
-    if last_ms != 0 && now_ms.saturating_sub(last_ms) < NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS {
+    if last_ms != NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS
+        && now_ms.saturating_sub(last_ms) < NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS
+    {
         bucket.suppressed.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -168,7 +222,7 @@ fn warn_node_waypoint_identity_scope_missing(
             proxy_id = %proxy_id,
             client = %client_ip,
             error = %error,
-            identity_error_kind = error_kind,
+            identity_error_kind = error_kind.label(),
             policy_scope = "missing",
             mesh_authz_scope_missing = true,
             suppressed,
@@ -182,17 +236,25 @@ fn warn_node_waypoint_identity_scope_missing(
 
 fn node_waypoint_identity_error_kind(
     error: &crate::modes::mesh::node_waypoint::NodeWaypointIdentityError,
-) -> &'static str {
+) -> NodeWaypointIdentityErrorKind {
     use crate::modes::mesh::node_waypoint::NodeWaypointIdentityError;
 
     match error {
-        NodeWaypointIdentityError::SocketCookieUnavailable(_) => "socket_cookie_unavailable",
-        NodeWaypointIdentityError::UnknownCookie(_) => "unknown_cookie",
-        NodeWaypointIdentityError::MissingPodUid(_) => "missing_pod_uid",
-        NodeWaypointIdentityError::MissingWorkloadHash { .. } => "missing_workload_hash",
-        NodeWaypointIdentityError::UnknownPod(_) => "unknown_pod",
-        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => "workload_hash_mismatch",
-        NodeWaypointIdentityError::PodUidMismatch { .. } => "pod_uid_mismatch",
+        NodeWaypointIdentityError::SocketCookieUnavailable(_) => {
+            NodeWaypointIdentityErrorKind::SocketCookieUnavailable
+        }
+        NodeWaypointIdentityError::UnknownCookie(_) => NodeWaypointIdentityErrorKind::UnknownCookie,
+        NodeWaypointIdentityError::MissingPodUid(_) => NodeWaypointIdentityErrorKind::MissingPodUid,
+        NodeWaypointIdentityError::MissingWorkloadHash { .. } => {
+            NodeWaypointIdentityErrorKind::MissingWorkloadHash
+        }
+        NodeWaypointIdentityError::UnknownPod(_) => NodeWaypointIdentityErrorKind::UnknownPod,
+        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
+            NodeWaypointIdentityErrorKind::WorkloadHashMismatch
+        }
+        NodeWaypointIdentityError::PodUidMismatch { .. } => {
+            NodeWaypointIdentityErrorKind::PodUidMismatch
+        }
     }
 }
 
@@ -950,6 +1012,7 @@ struct TcpAcceptLoopState {
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
+    node_waypoint_identity_warn_limiter: Arc<NodeWaypointIdentityWarnLimiter>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -1071,6 +1134,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         record_mesh_mtls_metric,
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
+        node_waypoint_identity_warn_limiter: Arc::new(NodeWaypointIdentityWarnLimiter::new()),
     };
 
     // Bind all extra sockets before spawning any accept loops. If one bind
@@ -1204,6 +1268,8 @@ async fn run_tcp_accept_loop(
                 // everywhere else short-circuits with zero syscalls.
                 let node_waypoint_identity_resolver =
                     state.node_waypoint_identity_resolver.clone();
+                let node_waypoint_identity_warn_limiter =
+                    state.node_waypoint_identity_warn_limiter.clone();
 
                 tokio::spawn(async move {
                     let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
@@ -1233,6 +1299,7 @@ async fn run_tcp_accept_loop(
                             &stream,
                             &proxy_id,
                             &client_ip,
+                            &node_waypoint_identity_warn_limiter,
                         );
                     let epoch = request_epoch.load();
                     let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
@@ -6847,7 +6914,7 @@ mod node_waypoint_stream_scope_tests {
     //! accept-path helper that maps a connection to its source pod's
     //! per-pod authorization scope (parity with the HTTP/HBONE admit path).
 
-    use super::resolve_node_waypoint_stream_scope;
+    use super::{NodeWaypointIdentityWarnLimiter, resolve_node_waypoint_stream_scope};
 
     /// Non-node-waypoint topologies (and non-mesh TCP proxies) pass no resolver,
     /// so the accept path stamps no per-pod scope — behavior is unchanged.
@@ -6864,8 +6931,14 @@ mod node_waypoint_stream_scope_tests {
         let (accepted, _peer) = listener.accept().await.expect("accept");
         let _client = connect.await.expect("join").expect("connect");
 
-        let (scope, principal) =
-            resolve_node_waypoint_stream_scope(None, &accepted, "proxy", "127.0.0.1");
+        let warn_limiter = NodeWaypointIdentityWarnLimiter::new();
+        let (scope, principal) = resolve_node_waypoint_stream_scope(
+            None,
+            &accepted,
+            "proxy",
+            "127.0.0.1",
+            &warn_limiter,
+        );
         assert!(scope.is_none(), "no resolver must yield no per-pod scope");
         assert!(principal.is_none(), "no resolver must yield no principal");
     }
@@ -6949,6 +7022,7 @@ mod node_waypoint_stream_scope_tests {
             &accepted,
             "proxy",
             "127.0.0.1",
+            &NodeWaypointIdentityWarnLimiter::new(),
         );
         assert!(
             scope.is_some(),
