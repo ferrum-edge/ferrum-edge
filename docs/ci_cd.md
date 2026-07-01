@@ -5,6 +5,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 ## Table of Contents
 
 - [Pipeline Overview](#pipeline-overview)
+- [Workflow Inventory](#workflow-inventory)
 - [CI Pipeline (ci.yml)](#ci-pipeline-ciyml)
 - [Release Pipeline (release.yml)](#release-pipeline-releaseyml)
 - [How Releases Work](#how-releases-work)
@@ -14,12 +15,40 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 
 ## Pipeline Overview
 
-Two main workflows handle different aspects of the development lifecycle:
+The publish-critical flows are `ci.yml` and `release.yml`: CI validates PRs and
+`main`, then publishes `latest` artifacts from `main`; Release publishes
+versioned artifacts from `v*` tags. Additional workflows provide coverage,
+scheduled dependency governance, live datapath/conformance labs, manual
+benchmark suites, and repository maintenance automation.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | **CI** (`ci.yml`) | Pull Requests, push to `main` | Required validation for PRs and `main`; latest binaries and Docker images after `main` validation |
 | **Release** (`release.yml`) | Push tag matching `v*` | Validate the tagged SHA, then publish versioned binaries, GitHub release, and Docker tags |
+
+## Workflow Inventory
+
+Workflow files live under `.github/workflows/`. Keep this table in sync when
+adding, removing, or materially changing a workflow.
+
+| Workflow file | Display name | Triggers | Role |
+|---|---|---|---|
+| `ci.yml` | CI | PRs, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. |
+| `coverage.yml` | Coverage | PRs, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement mirrored by CI. |
+| `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
+| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab. |
+| `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
+| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
+| `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
+| `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
+| `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
+| `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
+| `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
+| `payload-size-benchmark.yml` | Payload Size Performance Benchmark | Manual | Payload-size benchmark suite for selected refs. |
+| `comparison-benchmark.yml` | Gateway Comparison Benchmark | Manual | Cross-gateway comparison benchmarks. |
+| `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
+| `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
+| `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 
 ### CI Pipeline Flow
 
