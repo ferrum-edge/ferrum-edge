@@ -23,6 +23,20 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 
 Custom plugins are auto-discovered from the `custom_plugins/` directory at build time. They can also declare database migrations via `plugin_migrations()` for creating private tables. See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md) for the full development guide and [migrations.md](migrations.md#custom-plugin-migrations) for migration details.
 
+## Removed or Renamed Plugin Names
+
+Ferrum Edge intentionally rejects removed built-in plugin names during config
+load when the old plugin protected authentication, authorization, or AI
+guardrails. This prevents an upgrade from silently dropping a security control.
+
+If validation fails on one of these names, update the plugin config before
+starting the new binary:
+
+| Removed name | Current migration path |
+|---|---|
+| `oauth2_auth` | Choose [`oauth2_introspection`](#oauth2_introspection) for OAuth 2.0 opaque/reference-token introspection, or [`oidc_relying_party`](#oidc_relying_party) when Ferrum Edge performs OIDC browser sign-in/session handling. These plugins have different config schemas, so do not migrate with a name-only replacement. |
+| `semantic_ai_firewall` | Rename to [`ai_semantic_firewall`](#ai_semantic_firewall) and verify the config fields against the current plugin reference. |
+
 ## Scope
 
 - **Global** plugins (`scope: "global"`) apply to all proxies automatically. `proxy_id` must be null.

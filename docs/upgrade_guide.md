@@ -89,6 +89,21 @@ Validate:
 - **Admin API**: test CRUD operations against the staging instance
 - **Logs**: check for warnings or errors at `FERRUM_LOG_LEVEL=info`
 
+### Removed Plugin Names
+
+Some historically security-sensitive built-in plugin names are now rejected
+during config load instead of being ignored. This fail-closed behavior prevents
+an upgrade from silently disabling authentication, authorization, or AI
+guardrails.
+
+- Replace `oauth2_auth` with `oauth2_introspection` when Ferrum Edge should
+  introspect OAuth 2.0 opaque/reference tokens, or with `oidc_relying_party`
+  when Ferrum Edge should perform OIDC browser sign-in/session handling. These
+  plugins use different config schemas, so validate the chosen replacement
+  against [plugins.md](plugins.md) instead of doing a name-only rename.
+- Replace `semantic_ai_firewall` with `ai_semantic_firewall` and confirm the
+  config still matches the current [`ai_semantic_firewall` reference](plugins.md#ai_semantic_firewall).
+
 ### Protocol Hardening Checks
 
 Recent proxy-boundary hardening intentionally rejects several malformed request
