@@ -34,8 +34,19 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 
 The Dockerfile uses a **multi-stage build** for optimal size:
 
-1. **Builder Stage**: Compiles the Rust binary with all build dependencies (rust:latest)
-2. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) — no shell, no package manager, no OS-level CVEs
+1. **eBPF Builder Stage**: Compiles `ebpf/ferrum-ebpf` to a BPF ELF with nightly Rust, `rust-src`, `bpf-linker`, and `-Z build-std=core`
+2. **Builder Stage**: Compiles the Ferrum Edge binaries with all build dependencies (`rust:latest`)
+3. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) — no shell, no package manager, no OS-level CVEs
+
+> **Current eBPF build coupling.** The runtime stage unconditionally copies the
+> eBPF ELF from the `ebpf-builder` stage, so every `docker build` runs that
+> stage, including the default image built with `FEATURES=cloud-secrets`.
+> The resulting `/app/bpf/ferrum-ebpf` file is only used when the binary is
+> built with the `ebpf` feature for node-agent or ambient-mesh capture, but the
+> Docker build still depends on the nightly Rust toolchain, `rust-src`,
+> `bpf-linker`, and `-Z build-std=core` inside the build container. If an image
+> build fails before the main Rust binary compiles, inspect the `ebpf-builder`
+> stage first.
 
 **Image Features**:
 - **Distroless**: Zero OS packages beyond glibc, libgcc, and ca-certificates. No shell, no curl, no apt — dramatically reduced attack surface
