@@ -11,7 +11,7 @@
 use crate::config::types::UpstreamTarget;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
 const PATH_SEGMENT_ENCODE: &AsciiSet = &CONTROLS
@@ -199,11 +199,21 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         let body: serde_json::Value = response.json().await?;
         let mut targets = Vec::new();
+        let mut slices = 0usize;
+        let mut missing_port = 0usize;
+        let mut missing_endpoints = 0usize;
+        let mut not_ready = 0usize;
+        let mut missing_addresses = 0usize;
+        let mut non_string_addresses = 0usize;
 
         if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
             for item in items {
+                slices += 1;
                 // Extract ports
                 let port = self.extract_port(item);
+                if port.is_none() {
+                    missing_port += 1;
+                }
 
                 // Extract endpoints
                 if let Some(endpoints) = item.get("endpoints").and_then(|v| v.as_array()) {
@@ -216,29 +226,39 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                             .unwrap_or(true); // default to ready if conditions not set
 
                         if !ready {
+                            not_ready += 1;
                             continue;
                         }
 
                         if let Some(addresses) =
                             endpoint.get("addresses").and_then(|v| v.as_array())
                         {
+                            if addresses.is_empty() {
+                                missing_addresses += 1;
+                            }
                             for addr in addresses {
-                                if let Some(address) = addr.as_str()
-                                    && let Some(port) = port
-                                {
-                                    targets.push(UpstreamTarget {
-                                        host: address.to_string(),
-                                        port,
-                                        service_port_policy_key: None,
-                                        weight: self.default_weight,
-                                        tags: HashMap::new(),
-                                        locality: None,
-                                        path: None,
-                                    });
+                                match (addr.as_str(), port) {
+                                    (Some(address), Some(port)) => {
+                                        targets.push(UpstreamTarget {
+                                            host: address.to_string(),
+                                            port,
+                                            service_port_policy_key: None,
+                                            weight: self.default_weight,
+                                            tags: HashMap::new(),
+                                            locality: None,
+                                            path: None,
+                                        });
+                                    }
+                                    (None, _) => non_string_addresses += 1,
+                                    (Some(_), None) => {}
                                 }
                             }
+                        } else {
+                            missing_addresses += 1;
                         }
                     }
+                } else {
+                    missing_endpoints += 1;
                 }
             }
         }
@@ -249,6 +269,19 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
             self.namespace,
             self.service_name
         );
+        if targets.is_empty() && slices > 0 {
+            warn!(
+                namespace = %self.namespace,
+                service = %self.service_name,
+                slices,
+                missing_port,
+                missing_endpoints,
+                not_ready,
+                missing_addresses,
+                non_string_addresses,
+                "Kubernetes discovery produced zero valid targets from EndpointSlice payload"
+            );
+        }
 
         Ok(targets)
     }

@@ -647,6 +647,41 @@ fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
     }
 }
 
+fn warn_capability_supported_regression(
+    target: &BackendCapabilityProbeTarget,
+    previous: &BackendCapabilityRecord,
+    current: &BackendCapabilityRecord,
+) {
+    let last_probe_error = current.last_probe_error.as_deref().unwrap_or("none");
+    let warn_one = |protocol: &'static str, before: ProtocolSupport, after: ProtocolSupport| {
+        if before == ProtocolSupport::Supported && after != ProtocolSupport::Supported {
+            warn!(
+                proxy_id = %target.proxy.id,
+                backend_host = %target.host(),
+                backend_port = target.port(),
+                protocol,
+                previous = ?before,
+                current = ?after,
+                last_probe_error,
+                "Backend capability probe changed supported protocol to unavailable"
+            );
+        }
+    };
+
+    warn_one(
+        "h2_tls",
+        previous.plain_http.h2_tls,
+        current.plain_http.h2_tls,
+    );
+    warn_one("h3", previous.plain_http.h3, current.plain_http.h3);
+    warn_one(
+        "h2c",
+        previous.grpc_transport.h2c,
+        current.grpc_transport.h2c,
+    );
+    warn_one("hbone", previous.hbone, current.hbone);
+}
+
 /// Boxed future type for pool warmup tasks.
 /// Returns `Ok(description)` on success or `Err(message)` on failure.
 type WarmupTask =
@@ -2077,6 +2112,56 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
         "OPTIONS" => Ok(hyper::Method::OPTIONS),
         other => hyper::Method::from_bytes(other.as_bytes()).map_err(|_| ()),
     }
+}
+
+fn warn_invalid_backend_method(proxy_id: &str, backend_path: &'static str, method: &str) {
+    warn!(
+        proxy_id = %proxy_id,
+        backend_path,
+        method_len = method.len(),
+        "Invalid HTTP method for backend dispatch"
+    );
+}
+
+fn insert_outbound_header_or_warn(
+    headers: &mut hyper::HeaderMap,
+    proxy_id: &str,
+    backend_path: &'static str,
+    source: &'static str,
+    name: &str,
+    value: &str,
+) {
+    let header_name = match hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+        Ok(name) => name,
+        Err(e) => {
+            warn!(
+                proxy_id = %proxy_id,
+                backend_path,
+                source,
+                header_name_len = name.len(),
+                reason = "invalid_name",
+                error = %e,
+                "Dropped invalid outbound header"
+            );
+            return;
+        }
+    };
+    let header_value = match hyper::header::HeaderValue::from_str(value) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(
+                proxy_id = %proxy_id,
+                backend_path,
+                source,
+                header_name = %header_name,
+                reason = "invalid_value",
+                error = %e,
+                "Dropped invalid outbound header"
+            );
+            return;
+        }
+    };
+    headers.insert(header_name, header_value);
 }
 
 /// Build the outbound X-Forwarded-For header value.
@@ -5615,7 +5700,11 @@ impl ProxyState {
                             return;
                         }
                     };
+                    let previous_record = state.backend_capabilities.get_by_key(&target.key);
                     let record = state.probe_backend_capabilities(&target).await;
+                    if let Some(previous) = previous_record.as_deref() {
+                        warn_capability_supported_regression(&target, previous, &record);
+                    }
                     if record.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
                     }
@@ -7537,7 +7626,13 @@ async fn handle_connection(
                 "Client disconnected before response completed"
             );
         } else {
-            debug!(error = %e, "Connection error");
+            error!(
+                remote_addr = %remote_addr,
+                listen_port = frontend_listen_port,
+                tls = false,
+                error = %e,
+                "HTTP connection error"
+            );
         }
     }
 
@@ -7546,6 +7641,7 @@ async fn handle_connection(
 
 /// Check if a hyper connection error indicates a client disconnect.
 fn is_client_disconnect_error(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
     err.contains("connection reset")
         || err.contains("broken pipe")
         || err.contains("connection abort")
@@ -7563,7 +7659,9 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     use std::os::windows::io::AsSocket;
 
     // Disable Nagle's algorithm for lower latency on small responses
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY on accepted HTTP stream: {}", e);
+    }
     #[cfg(unix)]
     let borrowed = stream.as_fd();
     #[cfg(windows)]
@@ -9772,10 +9870,9 @@ where
 /// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
 /// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
 /// REVERSES the masking requirement: client-to-server frames MUST NOT
-/// be masked when the WebSocket runs over HTTP/3. tungstenite does not
-/// have a "reject masked frames" mode, so this knob accepts both shapes
-/// on the H3 path; strict RFC 9220 §5 enforcement (close 1002 on a
-/// masked H3 frame) is a future-work follow-up.
+/// be masked when the WebSocket runs over HTTP/3. The H3 bridge validates
+/// that rule before bytes reach this shared tungstenite framer, then passes
+/// `true` here so compliant unmasked client frames are accepted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     mut client_io: C,
@@ -21186,6 +21283,7 @@ async fn proxy_to_backend_hbone(
     parts.method = match parse_hyper_method(method) {
         Ok(method) => method,
         Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "hbone", method);
             return (
                 retry::BackendResponse {
                     status_code: 405,
@@ -21211,28 +21309,40 @@ async fn proxy_to_backend_hbone(
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
-                if proxy.preserve_host_header
-                    && let Ok(val) = hyper::header::HeaderValue::from_str(v)
-                {
-                    parts.headers.insert(hyper::header::HOST, val);
+                if proxy.preserve_host_header {
+                    insert_outbound_header_or_warn(
+                        &mut parts.headers,
+                        &proxy.id,
+                        "hbone",
+                        "client_host",
+                        "host",
+                        v,
+                    );
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
-                if let (Ok(name), Ok(val)) = (
-                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                    hyper::header::HeaderValue::from_str(v),
-                ) {
-                    parts.headers.insert(name, val);
-                }
+                insert_outbound_header_or_warn(
+                    &mut parts.headers,
+                    &proxy.id,
+                    "hbone",
+                    "client",
+                    k,
+                    v,
+                );
             }
         }
     }
-    if (!proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST))
-        && let Ok(val) = hyper::header::HeaderValue::from_str(&backend_host_header)
-    {
-        parts.headers.insert(hyper::header::HOST, val);
+    if !proxy.preserve_host_header || !parts.headers.contains_key(hyper::header::HOST) {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "hbone",
+            "backend_host",
+            "host",
+            &backend_host_header,
+        );
     }
 
     let xff_val = build_xff_value(
@@ -21241,21 +21351,41 @@ async fn proxy_to_backend_hbone(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
-        parts.headers.insert("x-forwarded-for", val);
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "hbone",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "hbone",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        if is_tls { "https" } else { "http" },
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "hbone",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
     }
-    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
-        parts.headers.insert("x-forwarded-proto", val);
-    }
-    if let Some(host) = headers.get("host")
-        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
-    {
-        parts.headers.insert("x-forwarded-host", val);
-    }
-    if let Some(ref via) = state.via_header_http2
-        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
-    {
-        parts.headers.insert("via", val);
+    if let Some(ref via) = state.via_header_http2 {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "hbone",
+            "configured_via",
+            "via",
+            via,
+        );
     }
     if state.add_forwarded_header {
         let proto_str = if is_tls { "https" } else { "http" };
@@ -21264,9 +21394,14 @@ async fn proxy_to_backend_hbone(
             proto_str,
             headers.get("host").map(|s| s.as_str()),
         );
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
-            parts.headers.insert("forwarded", val);
-        }
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "hbone",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
     }
 
     let backend_req = Request::from_parts(parts, body);
@@ -21823,6 +21958,7 @@ async fn proxy_to_backend_mesh_mtls(
     parts.method = match parse_hyper_method(method) {
         Ok(method) => method,
         Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "mesh_mtls", method);
             return (
                 retry::BackendResponse {
                     status_code: 405,
@@ -21854,12 +21990,14 @@ async fn proxy_to_backend_mesh_mtls(
             n if headers_mod::is_backend_request_strip_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
-                if let (Ok(name), Ok(val)) = (
-                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                    hyper::header::HeaderValue::from_str(v),
-                ) {
-                    parts.headers.insert(name, val);
-                }
+                insert_outbound_header_or_warn(
+                    &mut parts.headers,
+                    &proxy.id,
+                    "mesh_mtls",
+                    "client",
+                    k,
+                    v,
+                );
             }
         }
     }
@@ -21870,21 +22008,41 @@ async fn proxy_to_backend_mesh_mtls(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
-        parts.headers.insert("x-forwarded-for", val);
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "mesh_mtls",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "mesh_mtls",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        if is_tls { "https" } else { "http" },
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "mesh_mtls",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
     }
-    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
-        parts.headers.insert("x-forwarded-proto", val);
-    }
-    if let Some(host) = headers.get("host")
-        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
-    {
-        parts.headers.insert("x-forwarded-host", val);
-    }
-    if let Some(ref via) = state.via_header_http2
-        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
-    {
-        parts.headers.insert("via", val);
+    if let Some(ref via) = state.via_header_http2 {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "mesh_mtls",
+            "configured_via",
+            "via",
+            via,
+        );
     }
     if state.add_forwarded_header {
         let proto_str = if is_tls { "https" } else { "http" };
@@ -21893,9 +22051,14 @@ async fn proxy_to_backend_mesh_mtls(
             proto_str,
             headers.get("host").map(|s| s.as_str()),
         );
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
-            parts.headers.insert("forwarded", val);
-        }
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "mesh_mtls",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
     }
 
     let backend_req = Request::from_parts(parts, body);
@@ -22140,6 +22303,7 @@ async fn proxy_to_backend_http2(
     parts.method = match parse_hyper_method(method) {
         Ok(m) => m,
         Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "direct_h2", method);
             return retry::BackendResponse {
                 status_code: 405,
                 body: ResponseBody::Buffered(
@@ -22161,11 +22325,23 @@ async fn proxy_to_backend_http2(
         match k.as_str() {
             "host" => {
                 if proxy.preserve_host_header {
-                    if let Ok(val) = hyper::header::HeaderValue::from_str(v) {
-                        parts.headers.insert(hyper::header::HOST, val);
-                    }
-                } else if let Ok(val) = hyper::header::HeaderValue::from_str(effective_host) {
-                    parts.headers.insert(hyper::header::HOST, val);
+                    insert_outbound_header_or_warn(
+                        &mut parts.headers,
+                        &proxy.id,
+                        "direct_h2",
+                        "client_host",
+                        "host",
+                        v,
+                    );
+                } else {
+                    insert_outbound_header_or_warn(
+                        &mut parts.headers,
+                        &proxy.id,
+                        "direct_h2",
+                        "backend_host",
+                        "host",
+                        effective_host,
+                    );
                 }
             }
             // Hop-by-hop headers per RFC 9110 §7.6.1 (canonical predicate
@@ -22179,12 +22355,14 @@ async fn proxy_to_backend_http2(
             // request's `Connection` field — see `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
-                if let (Ok(name), Ok(val)) = (
-                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                    hyper::header::HeaderValue::from_str(v),
-                ) {
-                    parts.headers.insert(name, val);
-                }
+                insert_outbound_header_or_warn(
+                    &mut parts.headers,
+                    &proxy.id,
+                    "direct_h2",
+                    "client",
+                    k,
+                    v,
+                );
             }
         }
     }
@@ -22196,21 +22374,41 @@ async fn proxy_to_backend_http2(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
-        parts.headers.insert("x-forwarded-for", val);
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "direct_h2",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut parts.headers,
+        &proxy.id,
+        "direct_h2",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        if is_tls { "https" } else { "http" },
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "direct_h2",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
     }
-    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
-        parts.headers.insert("x-forwarded-proto", val);
-    }
-    if let Some(host) = headers.get("host")
-        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
-    {
-        parts.headers.insert("x-forwarded-host", val);
-    }
-    if let Some(ref via) = state.via_header_http2
-        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
-    {
-        parts.headers.insert("via", val);
+    if let Some(ref via) = state.via_header_http2 {
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "direct_h2",
+            "configured_via",
+            "via",
+            via,
+        );
     }
     if state.add_forwarded_header {
         let proto_str = if is_tls { "https" } else { "http" };
@@ -22219,9 +22417,14 @@ async fn proxy_to_backend_http2(
             proto_str,
             headers.get("host").map(|s| s.as_str()),
         );
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
-            parts.headers.insert("forwarded", val);
-        }
+        insert_outbound_header_or_warn(
+            &mut parts.headers,
+            &proxy.id,
+            "direct_h2",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
     }
 
     let backend_req = Request::from_parts(parts, body);

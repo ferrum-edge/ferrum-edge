@@ -99,7 +99,7 @@ Allow operations teams to monitor the system and perform health checks without r
 FERRUM_MODE=cp \
 FERRUM_ADMIN_READ_ONLY=true \
 FERRUM_DB_URL="postgres://user:pass@localhost/ferrum" \
-FERRUM_ADMIN_JWT_SECRET="admin-secret" \
+FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
 cargo run --release -- run
 ```
 
@@ -108,7 +108,7 @@ cargo run --release -- run
 # Data Plane - Admin API is always read-only
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="http://control-plane:50051" \
-FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-shared-secret" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-to-a-32-character-grpc-secret" \
 cargo run --release -- run
 ```
 
@@ -118,7 +118,7 @@ cargo run --release -- run
 FERRUM_MODE=database \
 FERRUM_ADMIN_READ_ONLY=true \
 FERRUM_DB_URL="sqlite://ferrum.db" \
-FERRUM_ADMIN_JWT_SECRET="admin-secret" \
+FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
 cargo run --release -- run
 ```
 

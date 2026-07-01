@@ -180,7 +180,7 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `FERRUM_MODE` | `database` | Operating mode |
-| `FERRUM_ADMIN_JWT_SECRET` | `test-admin-jwt-secret-key-12345` | JWT signing secret for admin API |
+| `FERRUM_ADMIN_JWT_SECRET` | `change-me-to-a-32-character-admin-secret` | JWT signing secret for admin API |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge-auth-test` | JWT issuer claim |
 | `FERRUM_DB_TYPE` | `sqlite` | Database type |
 | `FERRUM_DB_URL` | `sqlite://<temp>/test.db?mode=rwc` | Database connection string |

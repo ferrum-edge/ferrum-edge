@@ -122,6 +122,40 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
     }
 }
 
+/// Emit a structured bootstrap diagnostic before the tracing subscriber can
+/// safely start. This path is intentionally synchronous: secret resolution
+/// mutates environment variables immediately after it runs, so starting
+/// logging worker threads before that point would weaken the startup safety
+/// invariant around process env mutation.
+fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
+    let mut event = serde_json::Map::new();
+    event.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    event.insert(
+        "level".to_string(),
+        serde_json::Value::String("ERROR".to_string()),
+    );
+    event.insert(
+        "target".to_string(),
+        serde_json::Value::String("ferrum_edge::bootstrap".to_string()),
+    );
+    event.insert(
+        "message".to_string(),
+        serde_json::Value::String(message.to_string()),
+    );
+    for (key, value) in fields {
+        event.insert((*key).to_string(), serde_json::Value::String(value.clone()));
+    }
+
+    let mut stderr = std::io::stderr().lock();
+    if serde_json::to_writer(&mut stderr, &serde_json::Value::Object(event)).is_err() {
+        let _ = std::io::Write::write_all(&mut stderr, message.as_bytes());
+    }
+    let _ = std::io::Write::write_all(&mut stderr, b"\n");
+}
+
 /// Entry point for the Ferrum Edge gateway binary.
 ///
 /// Startup sequence:
@@ -153,7 +187,10 @@ fn main() {
             match cli::execute_reload(args) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    emit_bootstrap_error(
+                        "admin CLI reload failed",
+                        &[("command", "reload".to_string()), ("error", e.to_string())],
+                    );
                     std::process::exit(1);
                 }
             }
@@ -163,7 +200,10 @@ fn main() {
             match cli::execute_health(args) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    emit_bootstrap_error(
+                        "admin CLI health check failed",
+                        &[("command", "health".to_string()), ("error", e.to_string())],
+                    );
                     std::process::exit(1);
                 }
             }
@@ -184,7 +224,7 @@ fn main() {
     if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .is_err()
     {
-        eprintln!("Failed to install crypto provider");
+        emit_bootstrap_error("failed to install rustls crypto provider", &[]);
         std::process::exit(1);
     }
 
@@ -358,15 +398,24 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // Resolve secrets before initializing non-blocking logging so the
     // temporary runtime can shut down completely before env mutation.
     let resolved = {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("Failed to create secret resolution runtime");
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                emit_bootstrap_error(
+                    "failed to create secret resolution runtime",
+                    &[("error", e.to_string())],
+                );
+                return 1;
+            }
+        };
 
         match rt.block_on(secrets::resolve_all_env_secrets()) {
             Ok(resolved) => resolved,
             Err(e) => {
-                eprintln!("Secret resolution error: {}", e);
+                emit_bootstrap_error("secret resolution failed", &[("error", e)]);
                 return 1;
             }
         }
@@ -520,7 +569,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         info!("Tokio max blocking threads: {}", blocking);
         rt_builder.max_blocking_threads(blocking);
     }
-    let rt = rt_builder.build().expect("Failed to create tokio runtime");
+    let rt = match rt_builder.build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to create tokio runtime: {}", e);
+            return 1;
+        }
+    };
 
     let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal

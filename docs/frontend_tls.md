@@ -271,7 +271,7 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 export FERRUM_TLS_NO_VERIFY="true"
 
 # JWT authentication (required)
-export FERRUM_ADMIN_JWT_SECRET="your-secret-key"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
 ```
 
 ### Admin API Configuration Scenarios

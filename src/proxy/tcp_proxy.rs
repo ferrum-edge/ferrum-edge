@@ -48,6 +48,78 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+const NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS: u64 = 60_000;
+const NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS: u64 = u64::MAX;
+
+struct NodeWaypointIdentityWarnBucket {
+    last_ms: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl NodeWaypointIdentityWarnBucket {
+    fn new() -> Self {
+        Self {
+            last_ms: AtomicU64::new(NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NodeWaypointIdentityErrorKind {
+    SocketCookieUnavailable,
+    UnknownCookie,
+    MissingPodUid,
+    MissingWorkloadHash,
+    UnknownPod,
+    WorkloadHashMismatch,
+    PodUidMismatch,
+}
+
+impl NodeWaypointIdentityErrorKind {
+    const COUNT: usize = 7;
+
+    fn index(self) -> usize {
+        match self {
+            Self::SocketCookieUnavailable => 0,
+            Self::UnknownCookie => 1,
+            Self::MissingPodUid => 2,
+            Self::MissingWorkloadHash => 3,
+            Self::UnknownPod => 4,
+            Self::WorkloadHashMismatch => 5,
+            Self::PodUidMismatch => 6,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SocketCookieUnavailable => "socket_cookie_unavailable",
+            Self::UnknownCookie => "unknown_cookie",
+            Self::MissingPodUid => "missing_pod_uid",
+            Self::MissingWorkloadHash => "missing_workload_hash",
+            Self::UnknownPod => "unknown_pod",
+            Self::WorkloadHashMismatch => "workload_hash_mismatch",
+            Self::PodUidMismatch => "pod_uid_mismatch",
+        }
+    }
+}
+
+struct NodeWaypointIdentityWarnLimiter {
+    buckets: [NodeWaypointIdentityWarnBucket; NodeWaypointIdentityErrorKind::COUNT],
+}
+
+impl NodeWaypointIdentityWarnLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| NodeWaypointIdentityWarnBucket::new()),
+        }
+    }
+
+    fn bucket(&self, kind: NodeWaypointIdentityErrorKind) -> &NodeWaypointIdentityWarnBucket {
+        &self.buckets[kind.index()]
+    }
+}
+
 /// Resolve a node-waypoint TCP connection's source pod identity to a per-pod
 /// authorization scope, mirroring the HTTP/HBONE admit path in
 /// `src/proxy/mod.rs`.
@@ -98,6 +170,7 @@ fn resolve_node_waypoint_stream_scope(
     stream: &TcpStream,
     proxy_id: &str,
     client_ip: &str,
+    warn_limiter: &NodeWaypointIdentityWarnLimiter,
 ) -> (
     Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
     Option<String>,
@@ -116,14 +189,71 @@ fn resolve_node_waypoint_stream_scope(
             Some(resolved.identity.spiffe_id.as_str().to_string()),
         ),
         Err(error) => {
-            debug!(
-                proxy_id = %proxy_id,
-                client = %client_ip,
-                error = %error,
-                "Node-waypoint TCP stream: no resolved pod identity; \
-                 falling back to mesh-wide authorization"
-            );
+            warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error, warn_limiter);
             (None, None)
+        }
+    }
+}
+
+fn warn_node_waypoint_identity_scope_missing(
+    proxy_id: &str,
+    client_ip: &str,
+    error: &crate::modes::mesh::node_waypoint::NodeWaypointIdentityError,
+    warn_limiter: &NodeWaypointIdentityWarnLimiter,
+) {
+    let error_kind = node_waypoint_identity_error_kind(error);
+    let bucket = warn_limiter.bucket(error_kind);
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    let last_ms = bucket.last_ms.load(Ordering::Relaxed);
+    if last_ms != NODE_WAYPOINT_IDENTITY_WARN_UNSET_MS
+        && now_ms.saturating_sub(last_ms) < NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS
+    {
+        bucket.suppressed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    if bucket
+        .last_ms
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let suppressed = bucket.suppressed.swap(0, Ordering::Relaxed);
+        warn!(
+            proxy_id = %proxy_id,
+            client = %client_ip,
+            error = %error,
+            identity_error_kind = error_kind.label(),
+            policy_scope = "missing",
+            mesh_authz_scope_missing = true,
+            suppressed,
+            "Node-waypoint TCP stream: no resolved pod identity; \
+             per-pod authorization scope unavailable"
+        );
+    } else {
+        bucket.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn node_waypoint_identity_error_kind(
+    error: &crate::modes::mesh::node_waypoint::NodeWaypointIdentityError,
+) -> NodeWaypointIdentityErrorKind {
+    use crate::modes::mesh::node_waypoint::NodeWaypointIdentityError;
+
+    match error {
+        NodeWaypointIdentityError::SocketCookieUnavailable(_) => {
+            NodeWaypointIdentityErrorKind::SocketCookieUnavailable
+        }
+        NodeWaypointIdentityError::UnknownCookie(_) => NodeWaypointIdentityErrorKind::UnknownCookie,
+        NodeWaypointIdentityError::MissingPodUid(_) => NodeWaypointIdentityErrorKind::MissingPodUid,
+        NodeWaypointIdentityError::MissingWorkloadHash { .. } => {
+            NodeWaypointIdentityErrorKind::MissingWorkloadHash
+        }
+        NodeWaypointIdentityError::UnknownPod(_) => NodeWaypointIdentityErrorKind::UnknownPod,
+        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => {
+            NodeWaypointIdentityErrorKind::WorkloadHashMismatch
+        }
+        NodeWaypointIdentityError::PodUidMismatch { .. } => {
+            NodeWaypointIdentityErrorKind::PodUidMismatch
         }
     }
 }
@@ -882,6 +1012,7 @@ struct TcpAcceptLoopState {
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
     node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
+    node_waypoint_identity_warn_limiter: Arc<NodeWaypointIdentityWarnLimiter>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -1003,6 +1134,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         record_mesh_mtls_metric,
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
+        node_waypoint_identity_warn_limiter: Arc::new(NodeWaypointIdentityWarnLimiter::new()),
     };
 
     // Bind all extra sockets before spawning any accept loops. If one bind
@@ -1136,6 +1268,8 @@ async fn run_tcp_accept_loop(
                 // everywhere else short-circuits with zero syscalls.
                 let node_waypoint_identity_resolver =
                     state.node_waypoint_identity_resolver.clone();
+                let node_waypoint_identity_warn_limiter =
+                    state.node_waypoint_identity_warn_limiter.clone();
 
                 tokio::spawn(async move {
                     let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
@@ -1165,6 +1299,7 @@ async fn run_tcp_accept_loop(
                             &stream,
                             &proxy_id,
                             &client_ip,
+                            &node_waypoint_identity_warn_limiter,
                         );
                     let epoch = request_epoch.load();
                     let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
@@ -1605,7 +1740,14 @@ async fn handle_tcp_connection(
     mesh_outbound_enforcement: Option<&Arc<MeshOutboundEnforcement>>,
 ) -> TcpConnectionResult {
     let start = Instant::now();
-    let _ = client_stream.set_nodelay(true);
+    if let Err(e) = client_stream.set_nodelay(true) {
+        warn!(
+            proxy_id = %proxy_id,
+            client = %remote_addr,
+            "Failed to set TCP_NODELAY on accepted TCP stream: {}",
+            e
+        );
+    }
 
     // Run the core connection logic, tracking backend info for logging.
     // We use a helper closure so that `?` returns from the closure, not the
@@ -3489,9 +3631,19 @@ async fn connect_backend_plain(
     {
         use std::os::unix::io::AsRawFd;
         let fd = socket.as_raw_fd();
-        let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
-        if tcp_fastopen {
-            let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
+        if let Err(e) = crate::socket_opts::set_ip_bind_address_no_port(fd, true) {
+            warn!(
+                backend = %addr,
+                "Failed to enable IP_BIND_ADDRESS_NO_PORT on outbound TCP socket: {}",
+                e
+            );
+        }
+        if tcp_fastopen && let Err(e) = crate::socket_opts::set_tcp_fastopen_client(fd) {
+            warn!(
+                backend = %addr,
+                "Failed to enable TCP_FASTOPEN_CONNECT on outbound TCP socket: {}",
+                e
+            );
         }
     }
     #[cfg(not(unix))]
@@ -3513,7 +3665,13 @@ async fn connect_backend_plain(
             anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
         })?;
 
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!(
+            backend = %addr,
+            "Failed to set TCP_NODELAY on outbound TCP stream: {}",
+            e
+        );
+    }
     Ok(stream)
 }
 
@@ -6779,7 +6937,7 @@ mod node_waypoint_stream_scope_tests {
     //! accept-path helper that maps a connection to its source pod's
     //! per-pod authorization scope (parity with the HTTP/HBONE admit path).
 
-    use super::resolve_node_waypoint_stream_scope;
+    use super::{NodeWaypointIdentityWarnLimiter, resolve_node_waypoint_stream_scope};
 
     /// Non-node-waypoint topologies (and non-mesh TCP proxies) pass no resolver,
     /// so the accept path stamps no per-pod scope — behavior is unchanged.
@@ -6796,8 +6954,14 @@ mod node_waypoint_stream_scope_tests {
         let (accepted, _peer) = listener.accept().await.expect("accept");
         let _client = connect.await.expect("join").expect("connect");
 
-        let (scope, principal) =
-            resolve_node_waypoint_stream_scope(None, &accepted, "proxy", "127.0.0.1");
+        let warn_limiter = NodeWaypointIdentityWarnLimiter::new();
+        let (scope, principal) = resolve_node_waypoint_stream_scope(
+            None,
+            &accepted,
+            "proxy",
+            "127.0.0.1",
+            &warn_limiter,
+        );
         assert!(scope.is_none(), "no resolver must yield no per-pod scope");
         assert!(principal.is_none(), "no resolver must yield no principal");
     }
@@ -6881,6 +7045,7 @@ mod node_waypoint_stream_scope_tests {
             &accepted,
             "proxy",
             "127.0.0.1",
+            &NodeWaypointIdentityWarnLimiter::new(),
         );
         assert!(
             scope.is_some(),

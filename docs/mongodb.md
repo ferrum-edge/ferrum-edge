@@ -23,7 +23,7 @@ FERRUM_MODE=database \
 FERRUM_DB_TYPE=mongodb \
 FERRUM_DB_URL="mongodb://localhost:27017" \
 FERRUM_MONGO_DATABASE=ferrum \
-FERRUM_ADMIN_JWT_SECRET="change-me-in-production" \
+FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
 FERRUM_LOG_LEVEL=info \
 cargo run --release -- run
 ```

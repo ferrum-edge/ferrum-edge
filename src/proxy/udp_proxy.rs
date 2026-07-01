@@ -1062,8 +1062,23 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         let fd = frontend_socket.as_raw_fd();
         // SO_BUSY_POLL: spin in kernel for low-latency recv (Linux 3.11+).
         if so_busy_poll_us > 0 {
-            let _ = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us);
-            let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
+            if let Err(e) = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us) {
+                warn!(
+                    proxy_id = %proxy_id,
+                    listen_port = port,
+                    so_busy_poll_us,
+                    "Failed to enable SO_BUSY_POLL on UDP listener: {}",
+                    e
+                );
+            }
+            if let Err(e) = crate::socket_opts::set_so_prefer_busy_poll(fd, true) {
+                warn!(
+                    proxy_id = %proxy_id,
+                    listen_port = port,
+                    "Failed to enable SO_PREFER_BUSY_POLL on UDP listener: {}",
+                    e
+                );
+            }
         }
         // IP(v6)_PKTINFO: capture the per-datagram local destination address on
         // recv and reuse it as the reply source on send (skips the kernel
@@ -1809,9 +1824,38 @@ fn spawn_new_session_datagram(
         )
         .await;
         if let Err(e) = result {
-            debug!(proxy_id = %proxy_id, client = %client_addr, "UDP session setup/initial forward error: {}", e);
+            if is_client_or_policy_udp_setup_drop(&e) {
+                debug!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    listen_port = listen_port,
+                    error = %e,
+                    "UDP session setup dropped client datagram"
+                );
+            } else {
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    listen_port = listen_port,
+                    error = %e,
+                    "UDP session setup or initial forward failed"
+                );
+            }
         }
     });
+}
+
+fn is_client_or_policy_udp_setup_drop(error: &anyhow::Error) -> bool {
+    if let Some(setup_error) = find_stream_setup_error(error)
+        && setup_error.kind.is_client_side()
+    {
+        return true;
+    }
+
+    let message = error.to_string();
+    message.starts_with("Dropping DTLS continuation fragment")
+        || message.starts_with("No matching passthrough proxy for SNI")
+        || message.starts_with("UDP session limit reached")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1956,9 +2000,8 @@ async fn process_new_session_datagram(
 
     // Drain follow-up datagrams that arrived while setup ran, in arrival
     // order, then atomically remove the pending gate. Each drained datagram
-    // goes through the same per-datagram plugin hooks as the
-    // established-session path. A mid-drain forward failure propagates and
-    // the still-armed gate drops the remainder of the queue wholesale.
+    // goes through the same per-datagram plugin hooks and debug-level
+    // packet-error handling as the established-session path.
     while let Some(batch) = take_pending_datagrams(pending_sessions, client_addr) {
         for dgram in batch {
             if !udp_datagram_allowed(
@@ -1976,7 +2019,16 @@ async fn process_new_session_datagram(
             {
                 continue;
             }
-            forward_client_datagram_to_backend(&session, &dgram).await?;
+            if let Err(e) = forward_client_datagram_to_backend(&session, &dgram).await {
+                debug!(
+                    proxy_id = %session.datagram_proxy_id,
+                    client = %client_addr,
+                    listen_port = session.listen_port,
+                    error = %e,
+                    "UDP pending datagram forward error"
+                );
+                continue;
+            }
             metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
             metrics
                 .bytes_out

@@ -249,14 +249,11 @@ The gateway's H3 path:
 - **Accepts unmasked frames from the client** —
   `accept_unmasked_frames = true` is set on the H3 path's
   WebSocketConfig (it's `false` on the H1/H2 path).
-- **Strict close-on-masked-frame (RFC 9220 §5 SHOULD)** is not
-  implemented today: tungstenite has no "reject masked client frames"
-  mode, only an "accept" mode that is permissive in both directions.
-  Practically, a compliant H3 client sends unmasked frames and works;
-  a non-compliant H3 client sending masked frames is still bridged
-  correctly (data is delivered intact). Strict rejection remains tracked
-  by the `TODO(h3-ws-rfc9220-masked-close)` marker in
-  `src/http3/websocket.rs`.
+- **Rejects masked client frames** — the H3 receive pump pre-validates
+  WebSocket frame headers before bytes reach tungstenite's permissive
+  `accept_unmasked_frames` mode. A non-compliant H3 client that sends a
+  masked frame receives a WebSocket close frame with code `1002`
+  (protocol error), and the frame is not bridged to the backend.
 
 ### Tunnel mode
 
