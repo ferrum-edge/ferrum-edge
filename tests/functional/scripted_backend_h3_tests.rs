@@ -2312,8 +2312,9 @@ async fn h3_native_grpc_unary_preserves_body_and_trailers() {
         ]))
         // Keep the connection open after the trailers + FIN so the gateway reads
         // the complete trailered response before the script-end connection drop
-        // (see `H3Step::RespondTrailers`).
-        .step(H3Step::StallFor(Duration::from_millis(100)))
+        // (see `H3Step::RespondTrailers`). CI can schedule the H3 poll after a
+        // short 100ms grace window under shard load.
+        .step(H3Step::StallFor(Duration::from_secs(1)))
         .spawn()
         .expect("spawn h3 backend");
 
@@ -2424,8 +2425,9 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
         )]))
         // Keep the connection open after the trailers + FIN so the gateway reads
         // the complete trailered response before the script-end connection drop
-        // (see `H3Step::RespondTrailers`).
-        .step(H3Step::StallFor(Duration::from_millis(100)))
+        // (see `H3Step::RespondTrailers`). CI can schedule the H3 poll after a
+        // short 100ms grace window under shard load.
+        .step(H3Step::StallFor(Duration::from_secs(1)))
         .spawn()
         .expect("spawn h3 backend");
 
