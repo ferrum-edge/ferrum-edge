@@ -9870,10 +9870,9 @@ where
 /// HTTP/1.1 and HTTP/2 callers pass `false` (RFC 6455 / RFC 8441 mandate
 /// masked client frames). HTTP/3 callers pass `true` — RFC 9220 §5
 /// REVERSES the masking requirement: client-to-server frames MUST NOT
-/// be masked when the WebSocket runs over HTTP/3. tungstenite does not
-/// have a "reject masked frames" mode, so this knob accepts both shapes
-/// on the H3 path; strict RFC 9220 §5 enforcement (close 1002 on a
-/// masked H3 frame) is a future-work follow-up.
+/// be masked when the WebSocket runs over HTTP/3. The H3 bridge validates
+/// that rule before bytes reach this shared tungstenite framer, then passes
+/// `true` here so compliant unmasked client frames are accepted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     mut client_io: C,

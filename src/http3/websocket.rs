@@ -148,6 +148,95 @@ const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 /// while still batching small frames.
 const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
 const H3_WS_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(30);
+const H3_WS_PROTOCOL_ERROR_CLOSE_CODE: u16 = 1002;
+const H3_WS_MASKED_FRAME_CLOSE_REASON: &str = "masked frame over HTTP/3";
+
+struct H3WsMaskValidator {
+    header: Vec<u8>,
+    remaining_payload: u64,
+}
+
+impl H3WsMaskValidator {
+    fn new() -> Self {
+        Self {
+            header: Vec::with_capacity(10),
+            remaining_payload: 0,
+        }
+    }
+
+    fn validate(&mut self, mut bytes: &[u8]) -> Result<(), ()> {
+        while !bytes.is_empty() {
+            if self.remaining_payload > 0 {
+                let skipped = bytes
+                    .len()
+                    .min(usize::try_from(self.remaining_payload).unwrap_or(usize::MAX));
+                self.remaining_payload -= skipped as u64;
+                bytes = &bytes[skipped..];
+                continue;
+            }
+
+            let needed = self.needed_header_bytes();
+            let take = bytes.len().min(needed);
+            self.header.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+
+            if self.header.len() >= 2 && (self.header[1] & 0x80) != 0 {
+                return Err(());
+            }
+
+            if self.header_complete() {
+                self.remaining_payload = self.payload_len();
+                self.header.clear();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn needed_header_bytes(&self) -> usize {
+        let target: usize = match self.header.get(1).map(|byte| byte & 0x7f) {
+            Some(126) => 4,
+            Some(127) => 10,
+            Some(_) => 2,
+            None => 2,
+        };
+        target.saturating_sub(self.header.len())
+    }
+
+    fn header_complete(&self) -> bool {
+        self.needed_header_bytes() == 0 && self.header.len() >= 2
+    }
+
+    fn payload_len(&self) -> u64 {
+        match self.header[1] & 0x7f {
+            len @ 0..=125 => u64::from(len),
+            126 => u64::from(u16::from_be_bytes([self.header[2], self.header[3]])),
+            127 => u64::from_be_bytes([
+                self.header[2],
+                self.header[3],
+                self.header[4],
+                self.header[5],
+                self.header[6],
+                self.header[7],
+                self.header[8],
+                self.header[9],
+            ]),
+            _ => 0,
+        }
+    }
+}
+
+fn h3_ws_close_frame(code: u16, reason: &str) -> Bytes {
+    let reason_bytes = reason.as_bytes();
+    let reason_len = reason_bytes.len().min(123);
+    let payload_len = 2 + reason_len;
+    let mut frame = Vec::with_capacity(2 + payload_len);
+    frame.push(0x88);
+    frame.push(payload_len as u8);
+    frame.extend_from_slice(&code.to_be_bytes());
+    frame.extend_from_slice(&reason_bytes[..reason_len]);
+    Bytes::from(frame)
+}
 
 struct AbortOnDropJoinHandle {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -1056,17 +1145,31 @@ pub(crate) async fn handle_h3_websocket(
     let (mut h3_send, mut h3_recv) = stream.split();
     let (client_io, pump_io) = tokio::io::duplex(H3_WS_DUPLEX_BUFFER_BYTES);
     let (mut pump_read, mut pump_write) = tokio::io::split(pump_io);
+    let (forced_close_tx, mut forced_close_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
 
     let proxy_id_for_pumps = proxy.id.clone();
 
     // h3_recv → pump_write : client-frame bytes flow to the WS parser
     let recv_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+        let mut mask_validator = H3WsMaskValidator::new();
         loop {
             match h3_recv.recv_data().await {
                 Ok(Some(chunk)) => {
                     let bytes = buf_into_bytes(chunk);
                     if bytes.is_empty() {
                         continue;
+                    }
+                    if mask_validator.validate(&bytes).is_err() {
+                        warn!(
+                            proxy_id = %proxy_id_for_pumps,
+                            close_code = H3_WS_PROTOCOL_ERROR_CLOSE_CODE,
+                            "H3 WS recv pump: rejecting masked client frame"
+                        );
+                        let _ = forced_close_tx.try_send(h3_ws_close_frame(
+                            H3_WS_PROTOCOL_ERROR_CLOSE_CODE,
+                            H3_WS_MASKED_FRAME_CLOSE_REASON,
+                        ));
+                        break;
                     }
                     if let Err(e) = pump_write.write_all(&bytes).await {
                         debug!(
@@ -1103,17 +1206,41 @@ pub(crate) async fn handle_h3_websocket(
     // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC
     let send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         let mut buf = vec![0u8; H3_WS_SEND_PUMP_READ_BUFFER_BYTES];
+        let mut forced_close_open = true;
         loop {
-            let n = match pump_read.read(&mut buf).await {
-                Ok(0) => break, // EOF — WS framer dropped its sink half
-                Ok(n) => n,
-                Err(e) => {
-                    debug!(
-                        proxy_id = %proxy_id_for_send_pump,
-                        "H3 WS send pump: duplex read error: {}",
-                        e
-                    );
-                    break;
+            let n = tokio::select! {
+                biased;
+                forced_close = forced_close_rx.recv(), if forced_close_open => {
+                    match forced_close {
+                        Some(close_frame) => {
+                            if let Err(e) = h3_send.send_data(close_frame).await {
+                                debug!(
+                                    proxy_id = %proxy_id_for_send_pump,
+                                    "H3 WS send pump: h3 forced close send_data error: {}",
+                                    e
+                                );
+                            }
+                            break;
+                        }
+                        None => {
+                            forced_close_open = false;
+                            continue;
+                        }
+                    }
+                }
+                read_result = pump_read.read(&mut buf) => {
+                    match read_result {
+                        Ok(0) => break, // EOF — WS framer dropped its sink half
+                        Ok(n) => n,
+                        Err(e) => {
+                            debug!(
+                                proxy_id = %proxy_id_for_send_pump,
+                                "H3 WS send pump: duplex read error: {}",
+                                e
+                            );
+                            break;
+                        }
+                    }
                 }
             };
             let chunk = Bytes::copy_from_slice(&buf[..n]);
@@ -1187,11 +1314,9 @@ pub(crate) async fn handle_h3_websocket(
         ws_write_buf,
         false, // H3 always frame-parses; tunnel mode is H1-only
         crate::proxy::WS_DRAIN_GRACE,
-        // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked.
-        // TODO(h3-ws-rfc9220-masked-close): strict enforcement (closing
-        // with 1002 on a masked frame) is still a documented compliance
-        // gap because tungstenite only exposes a permissive
-        // accept-unmasked mode. See docs/http3.md#frame-masking--rfc-9220-5-vs-rfc-6455.
+        // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked. The H3
+        // receive pump rejects masked client frames with close code 1002 before
+        // tungstenite's permissive accept-unmasked mode can normalize them.
         true,
         ws_idle_tracker,
         &adaptive_buf,
