@@ -617,8 +617,12 @@ probe_authenticated_positive() {
 
 # Plaintext dial at the svc pod's CAPTURED app port (8080) from the client's
 # curl container: PREROUTING REDIRECTs it to :15006, whose STRICT listener
-# rejects plaintext — the request must never reach the app. Samples a few
-# times and short-circuits SERVED if the app ever answers (a capture or STRICT
+# rejects plaintext — the request must never reach the app. The request
+# carries the SERVICE FQDN Host so that if STRICT ever regressed to ACCEPTING
+# plaintext, the request would match the materialized inbound route and reach
+# the app (SERVED, failing the assertion) instead of route-missing on a
+# pod-IP Host and masquerading as a rejection. Samples a few times and
+# short-circuits SERVED if the app ever answers (a capture or STRICT
 # regression), so a flaky rejection cannot mask a real bypass.
 probe_plaintext_rejected() {
   log "probing plaintext dial to captured app port (STRICT negative)"
@@ -626,13 +630,13 @@ probe_plaintext_rejected() {
   # shellcheck disable=SC2016
   out="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c curl -- \
     sh -c '
-      ip="$1"; marker="$2"
+      ip="$1"; host="$2"; marker="$3"
       out=000
       body=""
       for _ in 1 2 3; do
         : >/tmp/pt 2>/dev/null || true
         out="$(curl -s -m 5 -o /tmp/pt -w "%{http_code}" \
-          "http://$ip:8080/" 2>/dev/null || echo 000)"
+          -H "Host: $host" "http://$ip:8080/" 2>/dev/null || echo 000)"
         body="$(tr -d "\r\n" </tmp/pt 2>/dev/null || true)"
         if [ "$out" = "200" ] || printf "%s" "$body" | grep -q "$marker"; then
           printf "SERVED\t%s\t%s\n" "$out" "$body"
@@ -641,7 +645,7 @@ probe_plaintext_rejected() {
         sleep 1
       done
       printf "REJECTED\t%s\t%s\n" "$out" "$body"
-    ' sh "$SVC_POD_IP" "$APP_BODY" 2>/dev/null || printf 'EXECFAIL\t\t')"
+    ' sh "$SVC_POD_IP" "$SVC_HOST" "$APP_BODY" 2>/dev/null || printf 'EXECFAIL\t\t')"
   verdict="${out%%$'\t'*}"
   rest="${out#*$'\t'}"
   status="${rest%%$'\t'*}"

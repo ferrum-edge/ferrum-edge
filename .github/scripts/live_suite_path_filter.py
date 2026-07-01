@@ -76,7 +76,9 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^tests/k8s/mesh_e2e_sidecar/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
-        r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs)$",
+        # mod.rs is what wires `mod live_contract;` into the conformance test
+        # binary — unwiring it would silently skip the GA artifact gate.
+        r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs|mod\.rs)$",
         r"^Cargo\.(toml|lock)$",
         r"^build\.rs$",
         r"^rust-toolchain\.toml$",
@@ -94,6 +96,12 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/service_discovery/",
         r"^src/plugins/mesh/",
         r"^src/plugins/jwks_auth\.rs$",
+        # The shared JWT-validation core jwks_auth delegates to — the suite's
+        # RequestAuthentication assertions gate real signature/issuer/exp
+        # validation, so regressions in these helpers must re-run it. Kept to
+        # the JWKS/JWT-specific modules (src/plugins/utils/ is otherwise a
+        # broad grab-bag of unrelated plugin helpers).
+        r"^src/plugins/utils/(jwt_verifier|jwks_store|jwks_cache)\.rs$",
         r"^src/capture/",
         r"^src/proxy/",
         r"^docs/(mesh|spire_deployment|configuration)\.md$",
@@ -153,9 +161,13 @@ def self_test() -> int:
         ("mesh-federation", ["docs/spire_deployment.md"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
         ("mesh-e2e-sidecar", ["src/plugins/jwks_auth.rs"], True),
+        ("mesh-e2e-sidecar", ["src/plugins/utils/jwt_verifier.rs"], True),
+        ("mesh-e2e-sidecar", ["src/plugins/utils/jwks_store.rs"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/ga_contract.yaml"], True),
+        ("mesh-e2e-sidecar", ["tests/conformance/mod.rs"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/multicluster-federation/run.sh"], False),
         ("mesh-e2e-sidecar", ["src/grpc/mod.rs"], False),
+        ("mesh-e2e-sidecar", ["src/plugins/utils/ai_providers.rs"], False),
         ("mesh-e2e-sidecar", ["charts/ferrum-mesh/values.yaml"], False),
     ]
     failures: list[str] = []
