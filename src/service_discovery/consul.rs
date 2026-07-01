@@ -185,11 +185,17 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         let body: Vec<serde_json::Value> = response.json().await?;
         let mut targets = Vec::new();
+        let mut missing_service = 0usize;
+        let mut missing_address = 0usize;
+        let mut missing_port = 0usize;
 
         for entry in &body {
             let service = match entry.get("Service") {
                 Some(s) => s,
-                None => continue,
+                None => {
+                    missing_service += 1;
+                    continue;
+                }
             };
 
             let address = service
@@ -209,12 +215,14 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             };
 
             if address.is_empty() {
+                missing_address += 1;
                 continue;
             }
 
             let port = service.get("Port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
 
             if port == 0 {
+                missing_port += 1;
                 continue;
             }
 
@@ -252,6 +260,16 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             targets.len(),
             self.service_name
         );
+        if targets.is_empty() && (!body.is_empty()) {
+            warn!(
+                service = %self.service_name,
+                records = body.len(),
+                missing_service,
+                missing_address,
+                missing_port,
+                "Consul discovery produced zero valid targets from provider payload"
+            );
+        }
 
         Ok(targets)
     }
