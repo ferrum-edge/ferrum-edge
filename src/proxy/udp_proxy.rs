@@ -1809,15 +1809,32 @@ fn spawn_new_session_datagram(
         )
         .await;
         if let Err(e) = result {
-            warn!(
-                proxy_id = %proxy_id,
-                client = %client_addr,
-                listen_port = listen_port,
-                error = %e,
-                "UDP session setup or initial forward failed"
-            );
+            if is_client_or_policy_udp_setup_drop(&e) {
+                debug!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    listen_port = listen_port,
+                    error = %e,
+                    "UDP session setup dropped client datagram"
+                );
+            } else {
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    listen_port = listen_port,
+                    error = %e,
+                    "UDP session setup or initial forward failed"
+                );
+            }
         }
     });
+}
+
+fn is_client_or_policy_udp_setup_drop(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.starts_with("Dropping DTLS continuation fragment")
+        || message.starts_with("No matching passthrough proxy for SNI")
+        || message.starts_with("UDP session limit reached")
 }
 
 #[allow(clippy::too_many_arguments)]
