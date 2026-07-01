@@ -107,7 +107,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Capability | Status | Notes |
 |---|---|---|
 | East-west SNI passthrough + trust federation | **Beta** | See `EastWestGateway` above and [Trust Federation](#trust-federation). |
-| Cross-cluster endpoint discovery (local→remote failover) | **Experimental** | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS>0` dials each `RemoteCluster.control_plane_url`. Aggregation + locality failover are integration-tested with a mockable source; the **live two-control-plane round trip is not yet verified**. Requires source locality to be set for local-first preference. |
+| Cross-cluster endpoint discovery (local→remote failover) | **Experimental** | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS>0` dials each `RemoteCluster.control_plane_url`. Aggregation + locality failover are integration-tested with a mockable source, and the production `MeshSubscribe` dialer has in-process two-CP loopback coverage. A true two-network, poller-driven live fixture remains deferred. Requires source locality to be set for local-first preference. |
 
 ## Limitations and Not Supported
 
