@@ -23586,6 +23586,14 @@ mod tests {
         assert!(denied_literal_backend_ip("169.254.169.\n254", &policy).is_some());
         assert!(denied_literal_backend_ip("169.254.\t169.254", &policy).is_some());
         assert!(denied_literal_backend_ip("2852039166\r", &policy).is_some());
+        // Control chars split into an otherwise-canonical IPv6 literal (the
+        // digit-leading prefilter must not skip it once stripped).
+        assert!(denied_literal_backend_ip("64:ff9b::a9fe:\ta9fe", &policy).is_some());
+        // Userinfo `@`: the URL client dials the post-`@` host, so screen that.
+        assert!(denied_literal_backend_ip("allowed@169.254.169.254", &policy).is_some());
+        // IDNA/UTS-46 fullwidth digits the URL parser maps to the metadata IP;
+        // a non-ASCII host must not be skipped by the digit prefilter.
+        assert!(denied_literal_backend_ip("１６９。２５４。１６９。２５４", &policy).is_some());
         // A digit-leading hostname is still a hostname (the numeric prefilter must
         // not misclassify it) and is screened by the resolver, not here.
         assert!(denied_literal_backend_ip("3com.example.com", &policy).is_none());

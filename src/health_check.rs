@@ -855,12 +855,22 @@ impl HealthChecker {
                 // A target whose literal IP is denied by the egress policy is
                 // never dialed; treat it as a failed probe (unhealthy) instead.
                 let egress_denied = probe_egress_policy.as_ref().and_then(|policy| {
-                    // Active HTTP health probes dial through reqwest, so screen
-                    // with the URL-canonicalizing `egress_literal_ip` (matches the
-                    // request path) — a non-canonical literal such as `2852039166`
-                    // would otherwise be probed straight to the metadata IP.
-                    crate::config::types::egress_literal_ip(&host)
-                        .and_then(|ip| policy.deny_reason(&ip))
+                    // Screen with the parser that matches how THIS probe dials.
+                    // HTTP probes go through reqwest (URL canonicalization), so a
+                    // non-canonical literal like `2852039166` must be screened as
+                    // an IP. TCP/UDP/gRPC probes resolve through `DnsCache::resolve`
+                    // (canonical literals only; everything else is real DNS, then
+                    // the resolved address is policy-checked), so use the
+                    // canonical-only parser — otherwise a numeric service name such
+                    // as `111` is wrongly canonicalized to `0.0.0.111` and the
+                    // target is marked unhealthy without ever resolving.
+                    let literal = match probe_type {
+                        HealthProbeType::Http => crate::config::types::egress_literal_ip(&host),
+                        HealthProbeType::Tcp | HealthProbeType::Udp | HealthProbeType::Grpc => {
+                            crate::config::types::stream_literal_ip(&host)
+                        }
+                    };
+                    literal.and_then(|ip| policy.deny_reason(&ip))
                 });
                 let probe_success = if let Some(reason) = egress_denied {
                     warn!(

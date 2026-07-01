@@ -2316,6 +2316,13 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 /// bracketed denied literal parses as a non-IP here and is admitted, only to be
 /// blocked later at dispatch.
 pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    // The URL/authority parser treats the substring after the LAST '@' as the
+    // host (any userinfo precedes it), so a configured host like
+    // `allowed@169.254.169.254` is dialed as `169.254.169.254`. A real host never
+    // contains '@', so screening only the post-'@' part just narrows malicious
+    // input — otherwise the literal slips through the resolver behind userinfo.
+    let host = host.rsplit('@').next().unwrap_or(host);
+
     // Canonical literal first (also covers bracketed IPv6).
     if let Some(ip) = stream_literal_ip(host) {
         return Some(ip);
@@ -2332,29 +2339,36 @@ pub(crate) fn egress_literal_ip(host: &str) -> Option<std::net::IpAddr> {
     // non-canonical IPv4 literal forms (a 32-bit decimal, hex, or octal-component
     // address) and canonicalize them to an IPv4 address, skipping the
     // DnsCacheResolver. The URL parser also STRIPS ASCII tab/newline/CR from the
-    // authority before parsing, so `169.254.169.\n254` canonicalizes to the
-    // metadata IP; replicate that strip here, or the screen and the dispatcher
-    // disagree and the literal slips through. Stream (`tcp`/`udp`/`dtls`)
-    // backends resolve through `DnsCache::resolve` instead and must use
+    // authority before parsing, so `169.254.169.\n254` (and a control-split IPv6
+    // such as `fd00:ec2::\n254`) canonicalizes to a literal at dispatch; replicate
+    // that strip here, then re-check `IpAddr::parse` so a control-stripped
+    // canonical literal is still caught. Stream (`tcp`/`udp`/`dtls`) backends
+    // resolve through `DnsCache::resolve` instead and must use
     // [`stream_literal_ip`].
     let stripped;
     let cleaned = if bare.contains(['\t', '\n', '\r']) {
         stripped = bare.replace(['\t', '\n', '\r'], "");
+        if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+            return Some(ip);
+        }
         stripped.as_str()
     } else {
         bare
     };
 
-    // Hot-path guard: a URL-style IPv4 literal (decimal/hex/octal) always begins
-    // with an ASCII digit, while an ordinary DNS hostname does not. Every
-    // canonical literal (including IPv6) was already handled by
-    // `stream_literal_ip` above, so skip the allocating URL/IDNA parse for the
-    // common hostname case — this is called on the request path for every
-    // hostname-backed dispatch and must stay allocation-free there.
-    if !cleaned
-        .as_bytes()
-        .first()
-        .is_some_and(|b| b.is_ascii_digit())
+    // Hot-path guard: skip the allocating URL/IDNA parse only for an ordinary
+    // ASCII hostname — all-ASCII AND not beginning with an ASCII digit. Canonical
+    // literals (incl. IPv6) were already handled by `IpAddr::parse` above; a
+    // non-canonical IPv4 spelling (decimal/hex/octal) begins with an ASCII digit;
+    // and a NON-ASCII host may be an IDNA/UTS-46 form (e.g. fullwidth digits
+    // `１６９。２５４。１６９。２５４`) the URL parser maps to an IP, so it must NOT be
+    // skipped. This keeps hostname-backed dispatch on the request path
+    // allocation-free.
+    if cleaned.is_ascii()
+        && !cleaned
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit())
     {
         return None;
     }
