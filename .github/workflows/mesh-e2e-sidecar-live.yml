@@ -133,10 +133,19 @@ jobs:
           FERRUM_LIVE_MAX_AGE_HOURS: "6"
         run: |
           set -euo pipefail
+          # Capture with an explicit status so a FAILING gate still prints the
+          # validator's full error list before the step exits (a bare
+          # command-substitution assignment would abort under `set -e` with
+          # the output swallowed).
+          status=0
           output="$(FERRUM_LIVE_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
             cargo test --profile pr-build --test conformance_tests -- \
-            --exact conformance::live_contract::live_contract_artifact_gate --nocapture 2>&1)"
+            --exact conformance::live_contract::live_contract_artifact_gate --nocapture 2>&1)" || status=$?
           printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::GA-contract live-assertion validation failed (see validator output above)" >&2
+            exit "$status"
+          fi
           if ! printf '%s\n' "$output" | grep -q '^test result: ok\. 1 passed'; then
             echo "::error::live_contract_artifact_gate did not run (module unwired or test renamed) — the GA artifact gate must not be skippable" >&2
             exit 1
