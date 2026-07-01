@@ -434,3 +434,115 @@ async fn h3_streaming_2xx_then_stall_trips_circuit_breaker() {
         "2nd request was not short-circuited (took {second_elapsed:?}) — breaker did not trip"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_complete_content_length_body_keeps_circuit_breaker_closed() {
+    let ca = TestCa::new("h3-complete-content-length-cb").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+    let read_timeout_ms: u64 = 700;
+
+    // TCP+TLS sidecar answers non-H3 capability probes on the same backend port.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls sidecar");
+    Box::leak(Box::new(_tcp_backend));
+
+    let first_body = Bytes::from(vec![b'h'; 4096]);
+    let second_body = Bytes::from_static(b"ok");
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", first_body.len().to_string()),
+                ("content-type", "application/octet-stream".to_string()),
+            ]),
+            H3Step::RespondData(first_body.clone()),
+            H3Step::RespondTrailers(Vec::new()),
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", second_body.len().to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(second_body.clone()),
+            H3Step::RespondTrailers(Vec::new()),
+            H3Step::StallFor(Duration::from_millis(50)),
+        ])
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let yaml = h3_cb_file_config(backend_port, read_timeout_ms, trip_on_first_failure_cb());
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        .capture_output()
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    wait_for_h3_capability_supported(&harness, Duration::from_secs(15)).await;
+    let client = reqwest::Client::new();
+    let base = harness.proxy_base_url();
+    let requests_before = h3_backend.received_requests().await.len();
+
+    // Request 1: a healthy native-H3 body yields exactly the declared
+    // Content-Length. For an HTTP/1.x downstream, hyper can finish sending the
+    // response at that byte boundary and drop the body before polling H3
+    // trailers/FIN. The success-on-drop hint must classify that as success, not
+    // ClientDisconnect, so the breaker stays closed.
+    let first = client
+        .get(format!("{base}/api/complete"))
+        .send()
+        .await
+        .expect("first response headers");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_bytes = first.bytes().await.expect("first body");
+    assert_eq!(first_bytes, first_body);
+    let requests_after_1 = h3_backend.received_requests().await.len();
+    assert_eq!(
+        requests_after_1,
+        requests_before + 1,
+        "the complete fixed-length request must reach the H3 backend"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Request 2: the breaker should still be CLOSED. It must reach the backend;
+    // a 503 here, or an unchanged H3 request count, means the completed first
+    // body was misclassified as a client disconnect.
+    let second = client
+        .get(format!("{base}/api/after-complete"))
+        .send()
+        .await
+        .expect("second response headers");
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "complete H3 content-length body must not trip the breaker"
+    );
+    let _ = second.bytes().await.expect("second body");
+    assert_eq!(
+        h3_backend.received_requests().await.len(),
+        requests_after_1 + 1,
+        "the 2nd request must reach H3; otherwise the first complete body opened the breaker"
+    );
+}
