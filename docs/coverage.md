@@ -2,10 +2,13 @@
 
 Ferrum Edge uses `cargo-llvm-cov` for Rust line coverage. The measured local
 and CI scope is `--lib`, `--test unit_tests`, and `--test integration_tests`.
-Functional tests, conformance tests, custom plugins, eBPF, vendored crates, and
-performance workspaces are excluded from this baseline because they either
+Functional tests, conformance tests, custom plugins, vendored crates, and
+performance workspaces are outside the default baseline because they either
 spawn subprocesses, use separate coverage reporters, or are not actionable for
-the core proxy codebase.
+the core proxy codebase. Build inputs such as `build.rs`, `proto/**`, and
+`ebpf/**` remain report-ignored for the default baseline, but they are coverage
+trigger surfaces in CI: changing them runs the full coverage matrix instead of
+the plugin-only or no-op PR path.
 
 ## Running Locally
 
@@ -82,7 +85,9 @@ dispatch, and Sundays at 06:00 UTC. It publishes an HTML report, LCOV file, JSON
 summary, and terminal summary as a 30-day GitHub Actions artifact named
 `coverage-report` whenever coverage is collected. It also writes the overall
 coverage percentage and lowest/highest-covered files to the workflow step
-summary.
+summary. The main `CI` workflow has a `Coverage (CI mirror)` job that waits for
+the matching Coverage workflow run, so the `Tests` aggregate and `main` publish
+jobs do not pass before coverage has completed for the same SHA.
 
 The full default-branch gate is based on the latest completed `main` coverage
 artifact available when the gate was introduced on 2026-06-20:
@@ -101,18 +106,28 @@ PR coverage is mode-aware:
 
 - Pull requests that touch plugin coverage-relevant files run a single
   plugin-focused coverage job over `--lib` and `--test unit_tests`, then enforce
-  changed-line coverage for coverable `src/plugins/` lines.
-- Pull requests that do not touch plugin coverage-relevant files keep the
-  required `Merge Coverage` check as a fast no-op.
+  changed-line coverage for coverable `src/plugins/` lines. This mode is used
+  only when all coverage-relevant changes are plugin-scoped; mixed plugin and
+  core changes run full coverage.
+- Pull requests that touch core coverage-relevant files run the full coverage
+  shard matrix and enforce the overall and `src/plugins/` thresholds. This
+  includes `src/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `proto/**`,
+  `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`, and coverage workflow/script
+  changes.
+- Pull requests that touch neither plugin nor core coverage-relevant files keep
+  the required `Merge Coverage` check as a fast no-op.
 - Pushes to `main`, manual dispatches, and scheduled runs still execute the full
   coverage shard matrix and enforce the overall and `src/plugins/` thresholds.
 
 Plugin coverage-relevant paths are `src/plugins/**`, `src/plugin_cache.rs`,
 `tests/unit/plugins/**`,
-`tests/functional/functional_redis_rate_limiting_test.rs`,
-`.github/workflows/coverage.yml`, and
-`scripts/check_coverage_thresholds.py`. Generated, ignored, or otherwise
-non-coverable changed lines are ignored consistently with the LCOV report.
+and `tests/functional/functional_redis_rate_limiting_test.rs`.
+The authoritative planner lives in `.github/scripts/coverage_plan.py` so the
+workflow and examples use one path decision table. Generated, ignored, or
+otherwise non-coverable changed lines are ignored consistently with the LCOV
+report. The report ignore regex excludes `vendor/`, `tests/`, `build.rs`,
+`target/`, `custom_plugins/`, `ebpf/`, and `proto/`; those exclusions do not
+hide `build.rs`, `proto/**`, or `ebpf/**` from CI trigger decisions.
 
 To inspect the same remote results without running coverage locally:
 

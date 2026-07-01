@@ -1512,9 +1512,10 @@ mod tests {
 /// Privileged functional tests for the in-netns capture primitive
 /// ([`imp::bind_capture_listener_in_pod_netns`]). They create and enter network
 /// namespaces, which needs `CAP_SYS_ADMIN`/root, so they are `#[ignore]`d and
-/// run only by the dedicated `netns-capture-live` CI job. Each self-skips
-/// (returns, passing) when it lacks root or `unshare` — mirroring
-/// `ebpf::loader::live_kernel_tests`.
+/// run only by the dedicated `netns-capture-live` CI job. CI sets
+/// `FERRUM_LIVE_TESTS_REQUIRED=1`, so missing prerequisites fail there instead
+/// of passing as skips; local ad-hoc runs still self-skip when root or
+/// `unshare` is unavailable.
 ///
 /// No eBPF here: this layer proves the OS mechanism the whole design rests on —
 /// `127.0.0.1:15001` and `[::1]:15001` listeners bound *inside* a pod's netns
@@ -1534,6 +1535,21 @@ mod live_netns_tests {
     fn is_root() -> bool {
         // Safety: `geteuid` is always sound and never fails.
         unsafe { libc::geteuid() == 0 }
+    }
+
+    fn live_tests_required() -> bool {
+        std::env::var("FERRUM_LIVE_TESTS_REQUIRED")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn skip_or_fail(reason: &str) {
+        if live_tests_required() {
+            panic!(
+                "netns capture live test prerequisite missing under FERRUM_LIVE_TESTS_REQUIRED: {reason}"
+            );
+        }
+        eprintln!("SKIP: {reason}");
     }
 
     /// Spawn a child living in a fresh network namespace (loopback brought up),
@@ -1610,11 +1626,11 @@ mod live_netns_tests {
     #[ignore = "requires root + CAP_SYS_ADMIN to create/enter network namespaces"]
     fn in_netns_dual_family_listeners_reachable_inside_pod_and_isolated_from_host() {
         if !is_root() {
-            eprintln!("SKIP: not root; cannot create network namespaces");
+            skip_or_fail("not root; cannot create network namespaces");
             return;
         }
         let Some(child) = spawn_pod_netns_child() else {
-            eprintln!("SKIP: `unshare --net` unavailable");
+            skip_or_fail("`unshare --net` unavailable");
             return;
         };
         let pid = child.id();

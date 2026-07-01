@@ -610,9 +610,9 @@ fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), Stri
 ///
 /// These tests need a real Linux >= 5.7 kernel with cgroup v2 + bpffs and
 /// `CAP_BPF`/root, so they are `#[ignore]`d and only run via the dedicated
-/// `ebpf-live` CI job (`sudo cargo test --features ebpf --lib -- --ignored`).
-/// They self-skip (pass) when the kernel lacks the prerequisites so the job is
-/// green on best-effort runners and only red on a genuine load/attach failure.
+/// `ebpf-live` CI job. CI sets `FERRUM_LIVE_TESTS_REQUIRED=1`, so prerequisite
+/// gaps fail there instead of passing as skips; local ad-hoc runs still
+/// self-skip when the kernel lacks the prerequisites.
 #[cfg(test)]
 mod live_kernel_tests {
     use super::AyaEbpfBackend;
@@ -627,6 +627,22 @@ mod live_kernel_tests {
 
     const CGROUP_ROOT: &str = "/sys/fs/cgroup";
     const BPF_FS: &str = "/sys/fs/bpf";
+
+    fn live_tests_required() -> bool {
+        std::env::var("FERRUM_LIVE_TESTS_REQUIRED")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn skip_or_fail(reason: impl AsRef<str>) {
+        let reason = reason.as_ref();
+        if live_tests_required() {
+            panic!(
+                "live eBPF test prerequisite missing under FERRUM_LIVE_TESTS_REQUIRED: {reason}"
+            );
+        }
+        eprintln!("SKIP: {reason}");
+    }
 
     /// A scratch cgroup v2 node, removed on drop. Attaching the
     /// `cgroup_sock_addr` / `sock_ops` programs here (rather than the cgroup
@@ -683,11 +699,11 @@ mod live_kernel_tests {
 
         let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
         if !probe.supports_ebpf() {
-            eprintln!(
-                "SKIP live-kernel eBPF test: prerequisites unmet (release={}, reason={:?})",
+            skip_or_fail(format!(
+                "live-kernel eBPF test prerequisites unmet (release={}, reason={:?})",
                 probe.kernel_release,
                 probe.degradation_reason()
-            );
+            ));
             return;
         }
 
@@ -729,8 +745,8 @@ mod live_kernel_tests {
     /// — proving the connect-side capture works end to end on a live kernel, not
     /// just that the program loads/attaches. Gated on `--features ebpf` because
     /// it reaches the real backend's map handles (the no-ebpf build has a stub);
-    /// runs via the `ebpf-live` CI job, self-skipping when prerequisites are
-    /// unmet.
+    /// runs via the `ebpf-live` CI job, failing on unmet prerequisites when
+    /// `FERRUM_LIVE_TESTS_REQUIRED=1` and self-skipping for local ad-hoc runs.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     #[test]
     #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
@@ -744,11 +760,11 @@ mod live_kernel_tests {
 
         let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
         if !probe.supports_ebpf() {
-            eprintln!(
-                "SKIP connect4-redirect live test: prerequisites unmet (release={}, reason={:?})",
+            skip_or_fail(format!(
+                "connect4-redirect live test prerequisites unmet (release={}, reason={:?})",
                 probe.kernel_release,
                 probe.degradation_reason()
-            );
+            ));
             return;
         }
 
@@ -803,15 +819,14 @@ mod live_kernel_tests {
 
         // Move this process into the scratch cgroup so its connect() goes through
         // the connect4 program attached there.
-        // On some runners the process can't actually be moved (cgroup
+        // On some local runners the process can't actually be moved (cgroup
         // namespaces / delegation): the write may succeed yet the PID not
-        // appear in the target. Read `cgroup.procs` back and self-skip rather
-        // than hard-fail when the move didn't take effect — this layer can only
-        // run where it does, and a false failure here would be a flaky red.
+        // appear in the target. Read `cgroup.procs` back and self-skip outside
+        // required CI mode, but fail when `FERRUM_LIVE_TESTS_REQUIRED=1`.
         let pid = std::process::id().to_string();
         let procs_path = format!("{}/cgroup.procs", cgroup.path_str());
         if std::fs::write(&procs_path, &pid).is_err() {
-            eprintln!("SKIP connect4-redirect: cannot write scratch cgroup.procs");
+            skip_or_fail("connect4-redirect cannot write scratch cgroup.procs");
             backend.cleanup_all().ok();
             return;
         }
@@ -819,9 +834,9 @@ mod live_kernel_tests {
             .map(|procs| procs.split_whitespace().any(|p| p == pid))
             .unwrap_or(false);
         if !in_cgroup {
-            eprintln!(
-                "SKIP connect4-redirect: process did not move into the scratch cgroup \
-                 (cgroup namespace / delegation on this runner)"
+            skip_or_fail(
+                "connect4-redirect process did not move into the scratch cgroup \
+                 (cgroup namespace / delegation on this runner)",
             );
             let _ = std::fs::write(format!("{CGROUP_ROOT}/cgroup.procs"), &pid);
             backend.cleanup_all().ok();

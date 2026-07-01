@@ -132,6 +132,10 @@ of the vendor copy and must keep passing after retirement:
   run them with
   `cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`.
 
+CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
+job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
+adding, retiring, or changing a vendored patch.
+
 ## Procedures
 
 ### Adding a vendored patch
@@ -143,7 +147,9 @@ of the vendor copy and must keep passing after retirement:
 3. Wire it through `[patch.crates-io]` in `Cargo.toml` with a comment block.
 4. Add `docs/upstream-<crate>-patches/NNN-…/` with `README.md` (status, upstream
    links, retirement plan), the unified `.patch`, and issue/PR drafts.
-5. Add a behavioral regression test for the fixed behavior.
+5. Add a behavioral regression test for the fixed behavior and wire it into the
+   `Vendored Patch Regressions` CI job when it lives outside the normal root
+   test matrix.
 6. Add a row to the inventory table above and to the `PATCHES` array in
    `scripts/check_vendored_patch_status.sh`.
 7. Regenerate the drift manifest: `scripts/update_vendor_integrity.sh`.

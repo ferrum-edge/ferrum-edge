@@ -42,28 +42,27 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate coverage planner examples
+        run: python3 .github/scripts/coverage_plan.py --self-test
+
       - id: plan
         name: Select coverage mode
         run: |
           set -euo pipefail
 
-          mode=full
-          reason="full coverage is required for ${EVENT_NAME}"
           changed_files="changed-files.txt"
           : > "$changed_files"
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            mode=skip
-            reason="no plugin coverage-relevant files changed"
             base_ref="origin/${BASE_REF}"
             git diff --name-only "${base_ref}...HEAD" > "$changed_files"
-
-            plugin_pattern='^(\.github/workflows/coverage\.yml|scripts/check_coverage_thresholds\.py|src/plugin_cache\.rs|tests/functional/functional_redis_rate_limiting_test\.rs)$|^(src/plugins/|tests/unit/plugins/)'
-            if grep -Eq "$plugin_pattern" "$changed_files"; then
-              mode=plugin
-              reason="plugin coverage-relevant files changed"
-            fi
           fi
+
+          plan="$(python3 .github/scripts/coverage_plan.py \
+            --event-name "$EVENT_NAME" \
+            --changed-files "$changed_files")"
+          mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
+          reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p')"
 
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
@@ -266,8 +265,8 @@ jobs:
           {
             echo "## Coverage Gate"
             echo ""
-            echo "No plugin coverage-relevant files changed in this PR."
-            echo "Full coverage still runs on pushes to main, manual dispatch, and schedule."
+            echo "No coverage-relevant files changed in this PR."
+            echo "Full coverage still runs on core source, proto/build-input, pushes to main, manual dispatch, and schedule."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail when full coverage shards fail
