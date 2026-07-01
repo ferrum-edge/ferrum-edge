@@ -622,13 +622,15 @@ async fn default_max_tokens_uses_provider_native_containers_when_detected() {
 }
 
 #[tokio::test]
-async fn default_max_tokens_native_bedrock_converse_gets_no_top_level() {
-    // #1950 round-3 P2: a genuine Bedrock Converse body carries `messages` +
-    // `inferenceConfig` but NO top-level `model` (the model is in the request
-    // URL). It caps via `inferenceConfig.maxTokens`, and the AWS Converse API
-    // rejects an unexpected top-level `max_tokens`, so the fallback must NOT be
-    // added — only the native cap.
-    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+async fn default_max_tokens_provider_native_bedrock_converse_gets_no_top_level() {
+    // #1950: a Bedrock Converse body (`messages` + `inferenceConfig`) caps via
+    // `inferenceConfig.maxTokens`, and AWS Converse rejects an unexpected
+    // top-level `max_tokens`. When the operator has declared a provider-native
+    // backend, suppress the top-level fallback — only the native cap is injected.
+    let plugin = AiRequestGuard::new(
+        &json!({"default_max_tokens": 256, "supported_schema": "provider_native"}),
+    )
+    .unwrap();
     let body = serde_json::to_vec(&json!({
         "messages": [{"role": "user", "content": [{"text": "hi"}]}],
         "inferenceConfig": {}
@@ -647,19 +649,20 @@ async fn default_max_tokens_native_bedrock_converse_gets_no_top_level() {
     );
     assert!(
         modified.get("max_tokens").is_none(),
-        "a native Bedrock Converse body (no top-level model) must not receive a top-level max_tokens"
+        "provider_native Converse must not receive a top-level max_tokens"
     );
 }
 
 #[tokio::test]
-async fn default_max_tokens_model_bearing_inference_config_keeps_top_level() {
-    // A `model`-bearing `inferenceConfig` body is an OpenAI/Anthropic-shaped spoof
-    // (real Converse has no body model), so the top-level fallback still applies
-    // to keep an OpenAI-family upstream capped.
+async fn default_max_tokens_model_less_inference_config_capped_in_auto_mode() {
+    // #1950 round-4 P1: a model-less `{messages, inferenceConfig}` body is also
+    // what an OpenAI-compatible backend that derives the model outside the body
+    // (Azure OpenAI / deployment-in-URL) receives. In the default `auto` mode we
+    // cannot prove it is Bedrock, so keep the top-level cap (fail closed); the
+    // native cap is also injected for a genuine native backend.
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
     let body = serde_json::to_vec(&json!({
-        "model": "gpt-4",
-        "messages": [],
+        "messages": [{"role": "user", "content": "hi"}],
         "inferenceConfig": {}
     }))
     .unwrap();
@@ -672,7 +675,36 @@ async fn default_max_tokens_model_bearing_inference_config_keeps_top_level() {
     .unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
-        "a model-bearing inferenceConfig body must keep the top-level cap"
+        "auto mode must keep the top-level cap for a model-less inferenceConfig body"
+    );
+}
+
+#[tokio::test]
+async fn default_max_tokens_chat_body_with_responses_marker_uses_max_tokens() {
+    // #1950 round-4 P1: a Chat body (`messages`) that also carries a Responses
+    // marker (`input`) must be capped via `max_tokens` — the field the chat
+    // upstream reads — not `max_output_tokens`, which it ignores.
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+        "input": "spoofed responses marker"
+    }))
+    .unwrap();
+    let modified: serde_json::Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body(&body, Some("application/json"), &HashMap::new())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        modified["max_tokens"], 256,
+        "chat body must be capped via max_tokens"
+    );
+    assert!(
+        modified.get("max_output_tokens").is_none(),
+        "must not route the cap to max_output_tokens the chat upstream ignores"
     );
 }
 

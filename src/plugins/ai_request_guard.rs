@@ -953,13 +953,24 @@ fn default_token_target(json: &Value) -> DefaultTokenTarget {
     }
 }
 
-/// The top-level output-cap field for the body's OpenAI-family schema. OpenAI
-/// Responses caps output via `max_output_tokens`; every other top-level-capped
-/// family (Chat Completions, legacy completions, Anthropic Messages, Cohere)
-/// caps via `max_tokens`. Provider-native families cap via their own container
+/// A Responses-shaped body uses `input` / `instructions` / `previous_response_id`
+/// and NO chat `messages` array. A body that carries `messages` is a Chat /
+/// Anthropic / Cohere request (it caps via top-level `max_tokens`) even if a
+/// client also adds a Responses marker — routing such a body to
+/// `max_output_tokens` would let `{messages, input}` divert `default_max_tokens`
+/// into a field the chat upstream ignores, leaving it uncapped.
+fn is_responses_shape(json: &Value) -> bool {
+    looks_like_responses(json) && json.get("messages").is_none()
+}
+
+/// The top-level output-cap field for the body's OpenAI-family schema. A
+/// Responses-shaped body (see [`is_responses_shape`]) caps output via
+/// `max_output_tokens`; every other top-level-capped family (Chat Completions,
+/// legacy completions, Anthropic Messages, Cohere) caps via `max_tokens`.
+/// Provider-native families cap via their own container
 /// (`inject_provider_default_max_tokens`), not this field.
 fn top_level_cap_field(json: &Value) -> &'static str {
-    if looks_like_responses(json) {
+    if is_responses_shape(json) {
         "max_output_tokens"
     } else {
         "max_tokens"
@@ -974,7 +985,7 @@ fn top_level_cap_field(json: &Value) -> &'static str {
 /// suppress the fallback. `max_completion_tokens` is the Chat-Completions alias
 /// for `max_tokens` and counts.
 fn top_level_cap_present(json: &Value) -> bool {
-    if looks_like_responses(json) {
+    if is_responses_shape(json) {
         json.get("max_output_tokens").is_some()
     } else {
         json.get("max_tokens").is_some() || json.get("max_completion_tokens").is_some()
@@ -1047,7 +1058,7 @@ fn inject_provider_default_max_tokens(
     }
 }
 
-fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
+fn inject_default_max_tokens(json: &mut Value, default: u64, schema: SupportedSchema) -> bool {
     let target = default_token_target(json);
     // Use the body's OWN family cap field (`max_output_tokens` for Responses, else
     // `max_tokens`) both to test whether a real cap is present and as the field to
@@ -1071,14 +1082,17 @@ fn inject_default_max_tokens(json: &mut Value, default: u64) -> bool {
     // Bedrock Converse is the one provider-native shape that DOES carry a
     // top-level prompt marker (`messages`) — but it caps via
     // `inferenceConfig.maxTokens`, and the AWS Converse API rejects an unexpected
-    // top-level `max_tokens`. Real Converse bodies put the model in the request
-    // URL, so a body routing to the Bedrock target with NO top-level `model` is
-    // genuine Converse and must stay on the native cap only. A `model`-bearing
-    // `inferenceConfig` body is instead an OpenAI/Anthropic-shaped spoof (a
-    // model-bearing body an OpenAI-family upstream would process), so the
-    // top-level fallback still applies there to keep it capped.
-    let bedrock_converse_native =
-        matches!(target, DefaultTokenTarget::Bedrock) && json.get("model").is_none();
+    // top-level `max_tokens`. A model-less `{messages, inferenceConfig}` body,
+    // however, is ALSO what an OpenAI-compatible backend that derives the model
+    // outside the JSON body receives (Azure OpenAI / deployment-in-URL routes),
+    // so absence of `model` cannot prove Converse. Only suppress the top-level
+    // fallback when the operator has explicitly declared a provider-native
+    // backend (`supported_schema: provider_native`); in `auto` or OpenAI-family
+    // modes, fail closed and keep the top-level cap so an Azure/OpenAI upstream is
+    // not left uncapped. Native backends still get their `inferenceConfig` cap
+    // below either way.
+    let bedrock_converse_native = matches!(target, DefaultTokenTarget::Bedrock)
+        && matches!(schema, SupportedSchema::ProviderNative);
     let wants_top_level_fallback = matches!(target, DefaultTokenTarget::TopLevel)
         || (has_top_level_prompt_marker(json) && !bedrock_converse_native);
     let Some(obj) = json.as_object_mut() else {
@@ -1675,7 +1689,7 @@ impl Plugin for AiRequestGuard {
 
         // Inject default_max_tokens if not present
         if let Some(default) = self.default_max_tokens {
-            body_modified |= inject_default_max_tokens(&mut json, default);
+            body_modified |= inject_default_max_tokens(&mut json, default, self.supported_schema);
         }
 
         if body_modified && let Ok(new_body) = serde_json::to_string(&json) {
@@ -1828,7 +1842,7 @@ impl Plugin for AiRequestGuard {
 
         // Inject default_max_tokens if not present
         if let Some(default) = self.default_max_tokens {
-            modified |= inject_default_max_tokens(&mut json, default);
+            modified |= inject_default_max_tokens(&mut json, default, self.supported_schema);
         }
 
         if modified {
