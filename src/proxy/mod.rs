@@ -647,6 +647,41 @@ fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
     }
 }
 
+fn warn_capability_supported_regression(
+    target: &BackendCapabilityProbeTarget,
+    previous: &BackendCapabilityRecord,
+    current: &BackendCapabilityRecord,
+) {
+    let last_probe_error = current.last_probe_error.as_deref().unwrap_or("none");
+    let warn_one = |protocol: &'static str, before: ProtocolSupport, after: ProtocolSupport| {
+        if before == ProtocolSupport::Supported && after != ProtocolSupport::Supported {
+            warn!(
+                proxy_id = %target.proxy.id,
+                backend_host = %target.host(),
+                backend_port = target.port(),
+                protocol,
+                previous = ?before,
+                current = ?after,
+                last_probe_error,
+                "Backend capability probe changed supported protocol to unavailable"
+            );
+        }
+    };
+
+    warn_one(
+        "h2_tls",
+        previous.plain_http.h2_tls,
+        current.plain_http.h2_tls,
+    );
+    warn_one("h3", previous.plain_http.h3, current.plain_http.h3);
+    warn_one(
+        "h2c",
+        previous.grpc_transport.h2c,
+        current.grpc_transport.h2c,
+    );
+    warn_one("hbone", previous.hbone, current.hbone);
+}
+
 /// Boxed future type for pool warmup tasks.
 /// Returns `Ok(description)` on success or `Err(message)` on failure.
 type WarmupTask =
@@ -5615,7 +5650,11 @@ impl ProxyState {
                             return;
                         }
                     };
+                    let previous_record = state.backend_capabilities.get_by_key(&target.key);
                     let record = state.probe_backend_capabilities(&target).await;
+                    if let Some(previous) = previous_record.as_deref() {
+                        warn_capability_supported_regression(&target, previous, &record);
+                    }
                     if record.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
                     }
