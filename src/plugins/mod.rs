@@ -781,7 +781,18 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
-            metadata: self.metadata.clone(),
+            // Omit `request_body` (the full buffered prompt): no
+            // `on_final_request_body` hook reads it from the context — they all
+            // take the body as a `&[u8]` parameter — so copying it here would burn
+            // memory bandwidth on every buffered request for nothing. The handler
+            // carries the original `request_body` across the metadata swap when it
+            // writes the hook context back.
+            metadata: self
+                .metadata
+                .iter()
+                .filter(|(k, _)| k.as_str() != "request_body")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),

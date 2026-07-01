@@ -434,6 +434,7 @@ pub async fn run(
     }
 
     // HTTP/3 (QUIC) listener.
+    let mut h3_listener_started = false;
     if env_config.enable_http3 {
         if env_config.proxy_https_port == 0 {
             info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
@@ -477,11 +478,11 @@ pub async fn run(
             });
             handles.push(h3_handle);
             startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
+            h3_listener_started = true;
         } else {
             info!("TLS not configured - HTTP/3 proxy listener disabled");
         }
     }
-
     if env_config.proxy_http_port == 0 && proxy_frontend_tls_slot.is_none() {
         warn!(
             "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and HTTPS is disabled or TLS is not configured. Only stream proxies (TCP/UDP) will serve traffic."
@@ -670,6 +671,7 @@ pub async fn run(
             .wait_until_started(Duration::from_secs(10))
             .await?;
     }
+    proxy_state.set_h3_websocket_listener_started(h3_listener_started);
 
     let dp_proxy_state = proxy_state.clone();
     let dp_shutdown = shutdown_tx.subscribe();

@@ -1330,6 +1330,130 @@ fn warn_if_websocket_idle_newly_disabled(
     emit_websocket_idle_disabled_warning(&newly_disabled, global_ws_idle_timeout_seconds);
 }
 
+fn h3_websocket_reachable_from_listener(env_config: &EnvConfig, h3_listener_started: bool) -> bool {
+    h3_listener_started && env_config.enable_http3 && env_config.http3_websocket_enabled
+}
+
+fn h3_websocket_quic_idle_mismatch_proxy_ids(
+    config: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) -> Vec<&str> {
+    if !h3_websocket_reachable || http3_idle_timeout_seconds == 0 {
+        return Vec::new();
+    }
+
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_http_family())
+        .filter(|proxy| {
+            let ws_idle =
+                proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds);
+            ws_idle == 0 || ws_idle > http3_idle_timeout_seconds
+        })
+        .map(|proxy| proxy.id.as_str())
+        .collect()
+}
+
+fn emit_h3_websocket_quic_idle_mismatch_warning(
+    affected_proxy_ids: &[&str],
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let sample = affected_proxy_ids
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        h3_websocket_quic_idle_mismatch_proxy_count = affected_proxy_ids.len(),
+        h3_websocket_quic_idle_mismatch_proxy_sample = %sample,
+        global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+        "One or more HTTP-family proxies have a WebSocket idle timeout longer than the HTTP/3 QUIC connection idle timeout. \
+         On an otherwise-idle H3 connection, QUIC max_idle_timeout (FERRUM_HTTP3_IDLE_TIMEOUT) can close the connection before the WebSocket idle timer; \
+         multiplexed H3 connections with other active streams may stay open. Raise FERRUM_HTTP3_IDLE_TIMEOUT or lower websocket_idle_timeout_seconds / \
+         FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS if isolated H3 WebSockets must honor the longer idle window."
+    );
+}
+
+fn warn_if_h3_websocket_quic_idle_mismatch(
+    config: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let affected = h3_websocket_quic_idle_mismatch_proxy_ids(
+        config,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+    if affected.is_empty() {
+        return;
+    }
+    emit_h3_websocket_quic_idle_mismatch_warning(
+        &affected,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+}
+
+fn h3_websocket_new_quic_idle_mismatch_proxy_ids<'a>(
+    previous: &GatewayConfig,
+    next: &'a GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) -> Vec<&'a str> {
+    let previous_affected: std::collections::HashSet<&str> =
+        h3_websocket_quic_idle_mismatch_proxy_ids(
+            previous,
+            h3_websocket_reachable,
+            global_ws_idle_timeout_seconds,
+            http3_idle_timeout_seconds,
+        )
+        .into_iter()
+        .collect();
+
+    h3_websocket_quic_idle_mismatch_proxy_ids(
+        next,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    )
+    .into_iter()
+    .filter(|id| !previous_affected.contains(id))
+    .collect()
+}
+
+fn warn_if_h3_websocket_new_quic_idle_mismatch(
+    previous: &GatewayConfig,
+    next: &GatewayConfig,
+    h3_websocket_reachable: bool,
+    global_ws_idle_timeout_seconds: u64,
+    http3_idle_timeout_seconds: u64,
+) {
+    let newly_affected = h3_websocket_new_quic_idle_mismatch_proxy_ids(
+        previous,
+        next,
+        h3_websocket_reachable,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+    if newly_affected.is_empty() {
+        return;
+    }
+    emit_h3_websocket_quic_idle_mismatch_warning(
+        &newly_affected,
+        global_ws_idle_timeout_seconds,
+        http3_idle_timeout_seconds,
+    );
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -2923,6 +3047,12 @@ pub struct ProxyState {
     /// Optional dedicated WebSocket admission control.
     /// Enforced only on the upgrade path, never on the frame-forwarding hot path.
     pub websocket_conn_limit: Option<Arc<tokio::sync::Semaphore>>,
+    /// True only after the serving mode actually starts an H3 listener whose
+    /// extended CONNECT/WebSocket support is enabled.
+    ///
+    /// `EnvConfig::enable_http3` alone is not enough: serving modes also gate
+    /// listener startup on HTTPS port and frontend TLS availability.
+    pub h3_websocket_reachable: Arc<AtomicBool>,
     /// Per-IP concurrent request counters. Each IP gets an AtomicU64 tracking
     /// active requests. `None` when `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (disabled).
     pub per_ip_request_counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
@@ -4614,6 +4744,7 @@ impl ProxyState {
             websocket_tunnel_mode,
             trusted_proxies,
             websocket_conn_limit,
+            h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -6380,12 +6511,42 @@ impl ProxyState {
         // reload that makes a proxy's WebSocket idle bound *newly* disabled emits
         // the same resource-hoarding warning, without re-warning on every
         // unrelated reload while a persistent opt-out is in place.
+        let previous_config = self.config.load_full();
         warn_if_websocket_idle_newly_disabled(
-            &self.config.load_full(),
+            &previous_config,
             &published.config,
             self.env_config.websocket_idle_timeout_seconds,
         );
+        warn_if_h3_websocket_new_quic_idle_mismatch(
+            &previous_config,
+            &published.config,
+            self.h3_websocket_reachable.load(Ordering::Acquire),
+            self.env_config.websocket_idle_timeout_seconds,
+            self.env_config.http3_idle_timeout,
+        );
         self.config.store(Arc::clone(&published.config));
+    }
+
+    /// Record whether the serving mode actually started an H3 listener.
+    ///
+    /// This must be set by mode startup after it evaluates the same gates used
+    /// to spawn the listener: H3 enabled, HTTPS port available, and frontend
+    /// TLS material or a dynamic TLS slot. Keeping this as a listener-start
+    /// signal avoids warning about H3 WebSocket behavior in HTTP-only
+    /// deployments where env flags are enabled but no QUIC listener exists.
+    pub(crate) fn set_h3_websocket_listener_started(&self, h3_listener_started: bool) {
+        let reachable = h3_websocket_reachable_from_listener(&self.env_config, h3_listener_started);
+        let was_reachable = self
+            .h3_websocket_reachable
+            .swap(reachable, Ordering::AcqRel);
+        if reachable && !was_reachable {
+            warn_if_h3_websocket_quic_idle_mismatch(
+                &self.config.load_full(),
+                true,
+                self.env_config.websocket_idle_timeout_seconds,
+                self.env_config.http3_idle_timeout,
+            );
+        }
     }
 
     /// Update the proxy configuration.
@@ -14113,7 +14274,14 @@ async fn handle_proxy_request_inner(
             )
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
+                // `clone_for_final_request_body_hooks` omits `request_body`; carry
+                // the original across the metadata swap (no on_final hook touches
+                // it). Disjoint field assignments avoid a whole-`ctx` borrow.
+                let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                if let Some(body) = request_body {
+                    ctx.metadata.insert("request_body".to_string(), body);
+                }
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                 ctx.waf_score = body_hook_ctx.waf_score;
@@ -16144,7 +16312,14 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
+            // original across the metadata swap (no on_final hook touches it).
+            // Disjoint field assignments avoid a whole-`ctx` borrow.
+            let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            if let Some(body) = request_body {
+                ctx.metadata.insert("request_body".to_string(), body);
+            }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
@@ -16426,7 +16601,14 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
+            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
+            // original across the metadata swap (no on_final hook touches it).
+            // Disjoint field assignments avoid a whole-`ctx` borrow.
+            let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            if let Some(body) = request_body {
+                ctx.metadata.insert("request_body".to_string(), body);
+            }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
@@ -25712,18 +25894,49 @@ mod tests {
     }
 
     #[test]
-    fn final_body_hook_context_preserves_waf_owned_log_metadata() {
+    fn final_body_hook_context_omits_then_restores_request_body_and_carries_waf_metadata() {
         let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        // The buffered prompt: it must survive the hook-context round-trip even
+        // though the clone omits it (so the full body is not copied per request).
+        ctx.metadata
+            .insert("request_body".into(), "{\"prompt\":\"hello\"}".into());
+
         let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        assert!(
+            !hook_ctx.metadata.contains_key("request_body"),
+            "final-body hook clone must not copy the request_body prompt"
+        );
+
+        // Simulate an `on_final_request_body` hook writing a marker + WAF metadata.
+        hook_ctx
+            .metadata
+            .insert("ai_ratelimit_request".into(), "true".into());
         hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
         hook_ctx.set_waf_metadata("waf.action", "monitored");
 
+        // Mirror the handler's writeback: take the hook context's metadata + WAF
+        // state, carrying the omitted request_body across the swap.
+        let request_body = ctx.metadata.remove("request_body");
         ctx.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
         ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
         ctx.waf_score = hook_ctx.waf_score;
-        let metadata = clone_log_metadata(&ctx);
 
+        // The hook's metadata write propagated back to the live context.
+        assert_eq!(
+            ctx.metadata.get("ai_ratelimit_request").map(String::as_str),
+            Some("true")
+        );
+        // The omitted request_body was restored across the swap.
+        assert_eq!(
+            ctx.metadata.get("request_body").map(String::as_str),
+            Some("{\"prompt\":\"hello\"}")
+        );
+        // WAF metadata is carried across (and surfaces in log metadata).
+        let metadata = clone_log_metadata(&ctx);
         assert_eq!(
             metadata.get("waf.rule_hits").map(String::as_str),
             Some("FE-XSS-001")
@@ -30037,6 +30250,81 @@ mod tests {
         // Steady state (no new transitions) reports nothing, so a persistent
         // opt-out does not re-warn on every unrelated reload.
         assert!(websocket_idle_newly_disabled_proxy_ids(&next, &next, 300).is_empty());
+    }
+
+    #[test]
+    fn h3_websocket_reachable_requires_listener_and_extended_connect() {
+        let mut env = EnvConfig {
+            enable_http3: true,
+            http3_websocket_enabled: true,
+            ..EnvConfig::default()
+        };
+
+        assert!(h3_websocket_reachable_from_listener(&env, true));
+        assert!(
+            !h3_websocket_reachable_from_listener(&env, false),
+            "env flags alone must not make H3 WebSockets reachable when no listener started"
+        );
+
+        env.http3_websocket_enabled = false;
+        assert!(
+            !h3_websocket_reachable_from_listener(&env, true),
+            "an H3 listener without extended CONNECT/WebSocket support should not warn"
+        );
+    }
+
+    #[test]
+    fn h3_websocket_quic_idle_mismatch_collector_filters_reachable_http_family() {
+        let mut disabled = make_validation_proxy("disabled", "/disabled");
+        disabled.websocket_idle_timeout_seconds = Some(0);
+        let mut long = make_validation_proxy("long", "/long");
+        long.websocket_idle_timeout_seconds = Some(120);
+        let mut equal = make_validation_proxy("equal", "/equal");
+        equal.websocket_idle_timeout_seconds = Some(30);
+        let mut shorter = make_validation_proxy("shorter", "/shorter");
+        shorter.websocket_idle_timeout_seconds = Some(10);
+        let inherit = make_validation_proxy("inherit", "/inherit");
+        let mut stream = make_validation_stream_proxy("stream", 18080);
+        stream.websocket_idle_timeout_seconds = Some(120);
+
+        let mut config =
+            make_validation_config(vec![disabled, long, equal, shorter, inherit, stream]);
+        config.normalize_fields();
+
+        let mut affected = h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 30);
+        affected.sort();
+        assert_eq!(affected, vec!["disabled", "inherit", "long"]);
+
+        assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, false, 300, 30).is_empty());
+        assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 0).is_empty());
+    }
+
+    #[test]
+    fn h3_websocket_new_quic_idle_mismatch_reports_only_transitions() {
+        let mut prev_a = make_validation_proxy("a", "/a");
+        prev_a.websocket_idle_timeout_seconds = Some(120); // already affected
+        let mut prev_b = make_validation_proxy("b", "/b");
+        prev_b.websocket_idle_timeout_seconds = Some(10); // not affected
+        let mut previous = make_validation_config(vec![prev_a, prev_b]);
+        previous.normalize_fields();
+
+        let mut next_a = make_validation_proxy("a", "/a");
+        next_a.websocket_idle_timeout_seconds = Some(120); // still affected
+        let mut next_b = make_validation_proxy("b", "/b");
+        next_b.websocket_idle_timeout_seconds = Some(45); // newly affected
+        let mut next_c = make_validation_proxy("c", "/c");
+        next_c.websocket_idle_timeout_seconds = Some(0); // added and affected
+        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        next.normalize_fields();
+
+        let mut newly =
+            h3_websocket_new_quic_idle_mismatch_proxy_ids(&previous, &next, true, 300, 30);
+        newly.sort();
+        assert_eq!(newly, vec!["b", "c"]);
+
+        assert!(
+            h3_websocket_new_quic_idle_mismatch_proxy_ids(&next, &next, true, 300, 30).is_empty()
+        );
     }
 
     fn test_runtime_trust_bundles(
