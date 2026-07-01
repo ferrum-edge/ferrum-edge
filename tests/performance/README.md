@@ -1,265 +1,110 @@
-# Ferrum Edge Performance Testing Suite
+# Ferrum Edge Performance Tests
 
-This directory contains a comprehensive performance testing setup for measuring the throughput and latency of the Ferrum Edge compared to direct backend access.
+This directory is the index for Ferrum Edge performance harnesses. Results are
+suite-specific: throughput and latency depend on host hardware, operating
+system, kernel/socket features, payload size, protocol, concurrency, duration,
+build profile, enabled features, TLS mode, and load generator.
 
-## � Location
+Do not treat one table as the global benchmark. When publishing or copying
+numbers, cite the suite, date, environment, command shape, payload, concurrency,
+duration, build profile, and comparison baseline.
 
-This performance testing suite is located at `tests/performance/` within the ferrum-edge project, organized alongside the unit and integration tests.
+## Suite Index
 
-## �🚀 Quick Start
+| Suite | Entry point | Measures | Result/provenance docs |
+|---|---|---|---|
+| HTTP wrk smoke | `./run_perf_test.sh` | Local HTTP/1.1 gateway overhead against a direct Hyper backend using `wrk`. Useful for quick development smoke tests. | This README. Raw wrk output and `performance_report.html` are generated per run. |
+| CI HTTP overhead gate | `ci_overhead_bench.py` | Short HTTP overhead regression check used by `ci.yml`. | CI artifacts under `tests/performance/ci_results/`. |
+| Multi-protocol matrix | [`multi_protocol/`](multi_protocol/) | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS through Ferrum and direct backend baselines. Also includes Envoy comparison and connection saturation harnesses. | [`multi_protocol/README.md`](multi_protocol/README.md). |
+| Payload-size matrix | [`payload_size/`](payload_size/) | Content-type and payload-size sweeps across HTTP, gRPC, WebSocket, TCP, UDP, and TLS variants. | [`payload_size/README.md`](payload_size/README.md). |
+| Mesh hot-path microbenches | [`mesh/`](mesh/) | Criterion microbenches for mesh authorization, slice apply, and xDS translation hot/cold paths. | [`mesh/README.md`](mesh/README.md) and `mesh/baseline.md`. |
+| Mesh DNS E2E | [`mesh-dns-e2e/`](mesh-dns-e2e/) | End-to-end transparent mesh DNS proxy latency/throughput over UDP and TCP. | [`mesh-dns-e2e/README.md`](mesh-dns-e2e/README.md). |
+| Mesh HBONE E2E | [`mesh-hbone-e2e/`](mesh-hbone-e2e/) | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS. | [`mesh-hbone-e2e/README.md`](mesh-hbone-e2e/README.md). |
+
+## Result Provenance Checklist
+
+Every checked-in benchmark result should state:
+
+- Date of the run.
+- Host OS, kernel when relevant, CPU/architecture, and whether the run was local or CI.
+- Ferrum commit or release, build profile, and enabled Cargo features.
+- Benchmark command or workflow name.
+- Protocols and comparison path: Ferrum gateway, direct backend, Envoy, or another gateway.
+- Payload size, request shape, concurrency, duration, and warmup.
+- Relevant tuning such as file descriptor limits, socket sysctls, H2/H3 flow control windows, pool warmup, and logging level.
+- Artifact location when the run came from GitHub Actions.
+
+If one of these fields is unknown, mark the result as historical or
+directional instead of presenting it as a current headline number.
+
+## Quick HTTP Smoke Test
+
+The root `run_perf_test.sh` harness is still useful for local HTTP smoke tests:
 
 ```bash
-# Navigate to the performance test directory
 cd tests/performance
 
-# Make the script executable
-chmod +x run_perf_test.sh
-
-# Run the performance test
+# Requires wrk, Python 3, and a Rust toolchain.
 ./run_perf_test.sh
 ```
 
-## 📊 What's Tested
+Environment variables:
 
-### Backend Server
-- **Fast HTTP server** built with hyper
-- **Endpoints:**
-  - `GET /health` - Simple health check
-  - `GET /api/users` - User list with JSON response
-  - `GET /api/users/:id` - Individual user data
-  - `POST /api/users` - User creation
-  - `GET /api/data` - Large dataset for throughput testing
+| Variable | Default | Purpose |
+|---|---|---|
+| `WRK_DURATION` | `30s` | Test duration for each wrk phase. |
+| `WRK_THREADS` | `8` | Number of wrk worker threads. |
+| `WRK_CONNECTIONS` | `100` | Concurrent wrk connections. |
 
-### Gateway Configuration
-- **File mode** operation with optimized settings
-- **Low timeouts** for performance testing
-- **No authentication** or plugins (minimal overhead)
+The harness starts a direct Hyper backend, starts Ferrum Edge in file mode with
+`perf_config.yaml`, runs wrk against gateway health/users endpoints and the
+direct backend, then writes raw wrk output plus an optional
+`performance_report.html`.
 
-### Load Testing
-- **wrk** HTTP benchmarking tool
-- **Multiple test scenarios** with different endpoints
-- **Latency measurement** and throughput analysis
-- **Baseline comparison** against direct backend access
+This smoke test intentionally covers a narrow HTTP/1.1 path. Use
+`multi_protocol/` or `payload_size/` for headline protocol claims.
 
-## 📁 Files Overview
+## Requirements
 
-```
-perftest/
-├── backend_server.rs      # High-performance backend server
-├── perf_config.yaml       # Gateway configuration for testing
-├── run_perf_test.sh       # Main test execution script
-├── health_test.lua        # wrk script for health endpoint
-├── users_test.lua         # wrk script for users API
-├── backend_test.lua       # wrk script for direct backend testing
-├── generate_report.py     # HTML report generator
-└── README.md              # This file
-```
+- `wrk` for `run_perf_test.sh`.
+- Python 3 for report generation and CI overhead scripts.
+- Rust toolchain and `protoc` for Rust benchmark binaries.
+- Docker/kind only for suites that explicitly say they need them.
 
-## ⚙️ Configuration
+Install `wrk`:
 
-### Environment Variables
-- `WRK_DURATION` - Test duration (default: 30s)
-- `WRK_THREADS` - Number of threads (default: 8)
-- `WRK_CONNECTIONS` - Number of connections (default: 100)
-
-Example:
 ```bash
-WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./run_perf_test.sh
+# macOS
+brew install wrk
+
+# Ubuntu/Debian
+sudo apt-get install wrk
+
+# CentOS/RHEL
+sudo yum install wrk
 ```
 
-### Test Scenarios
+## CI and Manual Workflows
 
-1. **Health Check Test** (`/health`)
-   - Lightweight endpoint
-   - Measures basic gateway latency
-   - Baseline performance comparison
+- `ci.yml` runs the short HTTP overhead regression gate when
+  performance-sensitive paths change.
+- `.github/workflows/perf-benchmark.yml` runs the multi-protocol benchmark on
+  demand.
+- `.github/workflows/payload-size-benchmark.yml` runs the payload-size matrix on
+  demand.
+- `.github/workflows/connection-saturation-benchmark.yml` runs the sustained
+  connection-capacity harness with the host-level tuning needed for headline
+  saturation numbers.
+- `.github/workflows/gateways-protocol-benchmark.yml` runs the cross-gateway
+  protocol benchmark on demand.
 
-2. **Users API Test** (`/api/users`)
-   - JSON response payload
-   - Tests routing and response processing
-   - More realistic workload
+## Updating Published Numbers
 
-3. **Direct Backend Test**
-   - Bypasses gateway completely
-   - Establishes performance baseline
-   - Measures pure backend capability
-
-## 📈 Results
-
-### Latest Results (2026-03-28)
-
-Local run on macOS Apple Silicon, release build, 8 threads, 100 connections, 30s duration:
-
-| Test | Requests/sec | Avg Latency | Stdev | Max Latency |
-|------|-------------|-------------|-------|-------------|
-| Health Check (gateway) | 88,489 | 1.10ms | 560.65us | 23.80ms |
-| Users API (gateway) | 77,010 | 1.24ms | 578.98us | 12.69ms |
-| Direct Backend (baseline) | 59,912 | 1.51ms | 284.49us | 3.40ms |
-
-**Gateway overhead**: The gateway actually outperforms direct backend access on throughput (+28.5% RPS) due to connection pooling and keep-alive optimizations. Latency overhead is negligible (-0.27ms avg).
-
-After running the test, you'll get:
-
-### 📊 Visual Performance Report
-![Performance Report](perf_report_example.png)
-
-The HTML report (`performance_report.html`) provides visual analysis with:
-- **Interactive charts** for throughput and latency comparison
-- **Gateway overhead visualization** showing performance impact
-- **Detailed metrics breakdown** by endpoint and test type
-- **Performance recommendations** based on test results
-
-### 📄 Raw Data Files
-- **Raw Data** files with detailed wrk output
-- **Performance Metrics** including:
-  - Requests per second (RPS)
-  - Latency distribution
-  - Gateway overhead analysis
-  - Error rates
-
-## 🔧 Requirements
-
-### System Dependencies
-- **wrk** - HTTP benchmarking tool
-  ```bash
-  # macOS
-  brew install wrk
-  
-  # Ubuntu/Debian
-  sudo apt-get install wrk
-  
-  # CentOS/RHEL
-  sudo yum install wrk
-  ```
-
-- **Python 3** - For report generation
-- **Rust toolchain** - For building components
-
-### Rust Dependencies
-The backend server uses these key dependencies:
-- `hyper` - Fast HTTP server
-- `tokio` - Async runtime
-- `serde` - JSON serialization
-
-## 📊 Understanding the Results
-
-### Key Metrics
-
-- **Throughput (RPS)** - Requests per second the system can handle
-- **Latency** - Time to complete a single request
-- **Gateway Overhead** - Performance difference between gateway and direct backend
-- **Error Rate** - Failed requests during the test
-
-### Connection Pooling Configuration
-
-This test suite uses the **hybrid configuration approach**:
-
-#### Global Defaults (Environment Variables)
-```bash
-FERRUM_POOL_MAX_IDLE_PER_HOST=200
-FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
-FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
-FERRUM_POOL_ENABLE_HTTP2=false
-```
-
-#### Per-Proxy Overrides
-- **Users API**: `pool_idle_timeout_seconds: 180` (high-traffic)
-
-> **Note:** The performance test uses `FERRUM_POOL_MAX_IDLE_PER_HOST=200` because wrk
-> opens 100 concurrent connections. In production, set this value to match your
-> expected peak concurrency per backend host. The gateway default of 64 is
-> suitable for most workloads. See the main README for sizing guidance.
-
-### Performance Analysis
-
-The report calculates:
-- **RPS Overhead**: `((backend_rps - gateway_rps) / backend_rps) * 100`
-- **Latency Impact**: `gateway_latency_ms - backend_latency_ms`
-
-Good targets:
-- **Gateway Overhead**: < 10% RPS reduction
-- **Latency Impact**: < 1ms additional latency
-- **Error Rate**: 0% (or very close)
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **Port conflicts**
-   - Make sure ports 3001 and 8000 are available
-   - Kill existing processes: `lsof -ti:3001 | xargs kill`
-
-2. **Build failures**
-   - Ensure you're in the project root
-   - Run `cargo build --release` first
-
-3. **wrk not found**
-   - Install wrk using your package manager
-   - Verify installation: `wrk --version`
-
-4. **Permission denied**
-   - Make script executable: `chmod +x run_perf_test.sh`
-
-### Debug Mode
-
-For detailed logging:
-```bash
-# Run with debug output
-DEBUG=1 ./run_perf_test.sh
-
-# Check individual components
-./backend_server  # Backend server
-# and in another terminal:
-FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=perf_config.yaml cargo run --bin ferrum-edge -- run
-```
-
-## 🎯 Performance Optimization Tips
-
-Based on the test results, you can:
-
-1. **Reduce Gateway Overhead**
-   - Remove unnecessary plugins
-   - Optimize timeout settings
-   - Enable connection pooling
-
-2. **Improve Backend Performance**
-   - Add response caching
-   - Optimize database queries
-   - Use faster serialization
-
-3. **Scale Testing**
-   - Increase connection count
-   - Test with larger payloads
-   - Add concurrent endpoint testing
-
-## 📝 Customization
-
-### Adding New Tests
-
-1. Create new `.lua` scripts for wrk
-2. Add endpoints to `backend_server.rs`
-3. Update `perf_config.yaml` if needed
-4. Modify `run_perf_test.sh` to include new tests
-
-### Backend Server Customization
-
-The backend server in `backend_server.rs` can be extended with:
-- Database connections
-- Authentication endpoints
-- File upload/download
-- Different response sizes
-
-## 📈 Continuous Integration
-
-You can integrate these tests into CI/CD:
-
-```yaml
-# Example GitHub Actions
-- name: Run Performance Tests
-  run: |
-    cd perftest
-    ./run_perf_test.sh
-    # Upload results as artifacts
-```
-
-This helps track performance regressions over time.
+1. Run the relevant suite from a clean checkout at the commit being reported.
+2. Capture the provenance fields above in the suite-specific README or result
+   artifact.
+3. If copying a summary into the root README, link back to the suite README and
+   include the date, payload size, concurrency, duration, and host class in the
+   sentence immediately before the table.
+4. Keep historical result tables labeled as historical when the current suite
+   README has newer payloads or methodology.

@@ -416,7 +416,9 @@ In-memory async DNS cache with startup warmup, stale-while-revalidate, per-proxy
 
 ## Performance
 
-Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s, 64-byte payload):
+Historical small-payload multi-protocol benchmark results from
+`tests/performance/multi_protocol/` (local macOS Apple Silicon run, 200
+concurrent, 10s, 64-byte payload; run date not recorded in this summary):
 
 | Protocol | Gateway RPS | Gw P50 | Gw P99 | Direct RPS | Direct P50 | Direct P99 | Overhead |
 |----------|------------|--------|--------|------------|------------|------------|----------|
@@ -435,7 +437,9 @@ Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s, 64-b
 
 **Linux socket tuning**: (`TCP_FASTOPEN`, `IP_BIND_ADDRESS_NO_PORT`), TLS handshake offload to dedicated runtimes, thread-local Date header caching, lazy timeout initialization, frequency-aware router cache eviction (Count-Min Sketch), RED-style adaptive load shedding, and a cacheability predictor for the response cache plugin. See [FEATURES.md](FEATURES.md) for details.
 
-See `tests/performance/` for the full benchmark suite.
+For current suite methodology and dated result tables, see
+[`tests/performance/`](tests/performance/) and
+[`tests/performance/multi_protocol/README.md`](tests/performance/multi_protocol/README.md).
 
 ### Production tuning
 
@@ -453,7 +457,10 @@ When the effective soft cap after startup is below 65,536, Ferrum Edge emits one
 
 **Concurrency planning**. Each inbound TCP/TLS connection consumes ~1 FD; HTTP/2 multiplexes many requests onto one. Linux `splice(2)` adds 2 pipe FDs per TCP relay. Plan for ~2–4× the target concurrent-connection count when sizing `nofile`.
 
-### Gateway Comparison (All-Docker, macOS Apple Silicon, 100 concurrent, 30s)
+### Gateway Comparison
+
+Historical local comparison summary (macOS Apple Silicon, 100 concurrent, 30s;
+run date not recorded in this summary):
 
 All gateways run in Docker containers for apples-to-apples comparison:
 
@@ -464,7 +471,7 @@ All gateways run in Docker containers for apples-to-apples comparison:
 | Kong 3.14 | 25,009 | 3.91 ms | Ferrum 12% faster |
 | Tyk v5.12 | 19,186 | 5.08 ms | Ferrum 46% faster |
 
-Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See `comparison/` for the full benchmark suite and methodology.
+Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See [`tests/performance/multi_protocol/README.md`](tests/performance/multi_protocol/README.md) for the maintained comparison harness and methodology, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
 
 ## Troubleshooting
 
