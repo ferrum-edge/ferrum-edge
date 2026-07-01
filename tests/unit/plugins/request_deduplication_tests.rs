@@ -718,7 +718,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
     );
 
     plugin
-        .on_response_stream_end(&ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(32))
         .await;
     assert_eq!(
         plugin.tracked_keys_count(),
@@ -779,7 +779,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 
     plugin
-        .on_response_stream_end(&original_ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&original_ctx, 200, &BodyOutcome::success(32))
         .await;
 
     let mut duplicate_ctx = RequestContext::new(
@@ -804,7 +804,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
     );
 
     plugin
-        .on_response_stream_end(&successor_ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&successor_ctx, 200, &BodyOutcome::success(32))
         .await;
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 }

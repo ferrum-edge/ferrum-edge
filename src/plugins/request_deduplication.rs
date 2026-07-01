@@ -1782,12 +1782,15 @@ impl Plugin for RequestDeduplication {
         PluginResult::Continue
     }
 
-    async fn on_response_stream_end(
+    async fn on_response_stream_terminated(
         &self,
         ctx: &RequestContext,
         _response_status: u16,
         _outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
+        // Release regardless of terminal outcome. Streamed responses have no
+        // replayable body, so success, backend error, and client disconnect all
+        // leave the next matching request to execute normally.
         let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
             return;
         };

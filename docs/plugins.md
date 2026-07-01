@@ -15,8 +15,9 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 7. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
 8. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
 9. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
-10. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-11. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+10. **`on_response_stream_terminated`** — Releases state for streamed, non-buffered responses after terminal success, error, or client disconnect
+11. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
+12. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
 
@@ -2176,7 +2177,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 - Concurrent duplicates with the same fingerprint return `409 Conflict` while the first request is still in-flight
 - Applicable methods with a declared body are buffered before `before_proxy`, even if the idempotency header is not present yet, so earlier header-transform plugins can add the key without making the body unavailable for fingerprinting
 - If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
-- Streamed non-buffered responses, including `text/event-stream`, keep the in-flight marker while the stream is active. When the stream reaches a terminal success/error/disconnect state, the marker is released without retaining a replayable response, so the next matching request re-executes normally
+- Streamed non-buffered responses, including `text/event-stream`, keep the in-flight marker while the stream is active. When the stream reaches a terminal success/error/disconnect state, the marker is released without retaining a replayable response, so the next matching request re-executes normally. This includes interrupted streams: a client disconnect or mid-stream error followed by an immediate retry can re-run the backend operation instead of waiting for `inflight_ttl_seconds`
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` or the streamed terminal hook — e.g., backend timeout, downstream plugin reject, process crash) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
 - Completed response storage is bounded by `max_entry_size_bytes` and `max_total_size_bytes`. Size-skipped responses still return to the original client, but no replayable response is retained. In local mode, skipped responses clear the in-flight marker so a later retry can execute normally; in Redis mode, a local-total-cap skip keeps local and distributed locks until `inflight_ttl_seconds` if Redis publication fails
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap

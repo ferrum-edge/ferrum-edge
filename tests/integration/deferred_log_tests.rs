@@ -64,6 +64,39 @@ impl Plugin for CapturingPlugin {
     }
 }
 
+/// Test plugin that records the order of stream termination and log hooks.
+struct StreamTerminationCapturingPlugin {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    status: Arc<Mutex<Option<u16>>>,
+    outcome: Arc<Mutex<Option<BodyOutcome>>>,
+}
+
+#[async_trait]
+impl Plugin for StreamTerminationCapturingPlugin {
+    fn name(&self) -> &str {
+        "stream-termination-capturing"
+    }
+
+    fn priority(&self) -> u16 {
+        9000
+    }
+
+    async fn on_response_stream_terminated(
+        &self,
+        _ctx: &RequestContext,
+        response_status: u16,
+        outcome: &BodyOutcome,
+    ) {
+        self.events.lock().unwrap().push("stream_terminated");
+        *self.status.lock().unwrap() = Some(response_status);
+        *self.outcome.lock().unwrap() = Some(outcome.clone());
+    }
+
+    async fn log(&self, _summary: &TransactionSummary) {
+        self.events.lock().unwrap().push("log");
+    }
+}
+
 fn make_summary_with_status(status: u16) -> TransactionSummary {
     TransactionSummary {
         namespace: "ferrum".to_string(),
@@ -123,6 +156,20 @@ async fn wait_for_captures(
     captured.lock().unwrap().clone()
 }
 
+async fn wait_for_events(
+    events: &Arc<Mutex<Vec<&'static str>>>,
+    expected: usize,
+) -> Vec<&'static str> {
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let guard = events.lock().unwrap();
+        if guard.len() >= expected {
+            return guard.clone();
+        }
+    }
+    events.lock().unwrap().clone()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn success_outcome_populates_body_fields() {
     let (plugin, captured) = CapturingPlugin::new();
@@ -143,6 +190,37 @@ async fn success_outcome_populates_body_fields() {
         got.response_status_code, 200,
         "status flushed at header time is preserved"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fire_invokes_response_stream_termination_before_log() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(None));
+    let outcome = Arc::new(Mutex::new(None));
+    let plugin: Arc<dyn Plugin> = Arc::new(StreamTerminationCapturingPlugin {
+        events: events.clone(),
+        status: status.clone(),
+        outcome: outcome.clone(),
+    });
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![plugin]);
+    let mut summary = make_summary_with_status(206);
+    summary.response_streamed = true;
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    logger.fire(BodyOutcome::error(ErrorClass::ReadWriteTimeout, 77, false));
+
+    let events = wait_for_events(&events, 2).await;
+    assert_eq!(events.as_slice(), ["stream_terminated", "log"]);
+    assert_eq!(*status.lock().unwrap(), Some(206));
+    let outcome = outcome
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("stream termination hook fired");
+    assert!(!outcome.body_completed);
+    assert_eq!(outcome.body_error_class, Some(ErrorClass::ReadWriteTimeout));
+    assert!(!outcome.client_disconnected);
+    assert_eq!(outcome.bytes_streamed, 77);
 }
 
 #[tokio::test(flavor = "multi_thread")]
