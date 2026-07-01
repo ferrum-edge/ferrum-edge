@@ -265,14 +265,18 @@ fn record_cross_protocol_header_write_disconnect(
 
 fn cross_protocol_header_write_disconnect_outcome(
     response_status: u16,
+    response_streamed: bool,
     bytes_sent: u64,
     backend_start: Instant,
     backend_target: Option<String>,
     backend_resolved_ip: Option<String>,
 ) -> CrossProtocolOutcome {
+    // `response_streamed` describes the selected response path, not whether any
+    // body bytes reached the client. A disconnect before response HEADERS on a
+    // streaming path still needs streamed-response terminal hooks to run.
     CrossProtocolOutcome {
         response_status,
-        response_streamed: false,
+        response_streamed,
         bytes_streamed: 0,
         bytes_sent,
         backend_target,
@@ -2167,6 +2171,7 @@ where
             );
             return Ok(cross_protocol_header_write_disconnect_outcome(
                 response_status,
+                false,
                 bytes_sent,
                 backend_start,
                 Some(strip_query_from_backend_url(&current_url)),
@@ -2281,6 +2286,7 @@ where
         );
         return Ok(cross_protocol_header_write_disconnect_outcome(
             status,
+            true,
             bytes_sent,
             backend_start,
             Some(strip_query_from_backend_url(&current_url)),
@@ -2601,6 +2607,7 @@ where
                 );
                 return Ok(cross_protocol_header_write_disconnect_outcome(
                     reject_status,
+                    true,
                     bytes_sent,
                     backend_start,
                     Some(strip_query_from_backend_url(backend_target_url)),
@@ -2662,6 +2669,7 @@ where
         );
         return Ok(cross_protocol_header_write_disconnect_outcome(
             streaming.status,
+            true,
             bytes_sent,
             backend_start,
             Some(strip_query_from_backend_url(backend_target_url)),
@@ -3212,6 +3220,7 @@ where
                         );
                         return Ok(cross_protocol_header_write_disconnect_outcome(
                             reject_status,
+                            false,
                             bytes_sent,
                             backend_start,
                             Some(strip_query_from_backend_url(&current_url)),
@@ -3434,6 +3443,7 @@ where
                 );
                 return Ok(cross_protocol_header_write_disconnect_outcome(
                     response_status,
+                    false,
                     bytes_sent,
                     backend_start,
                     Some(strip_query_from_backend_url(&current_url)),
@@ -5158,6 +5168,7 @@ mod tests {
     fn header_write_disconnect_outcome_marks_client_disconnect_without_backend_error() {
         let outcome = cross_protocol_header_write_disconnect_outcome(
             200,
+            false,
             42,
             Instant::now(),
             Some("https://backend.example/path".to_string()),
@@ -5177,6 +5188,24 @@ mod tests {
         assert!(outcome.client_disconnected);
         assert!(!outcome.connection_error);
         assert_eq!(outcome.error_class, None);
+        assert_eq!(outcome.body_error_class, Some(ErrorClass::ClientDisconnect));
+    }
+
+    #[test]
+    fn header_write_disconnect_outcome_preserves_streamed_response_path() {
+        let outcome = cross_protocol_header_write_disconnect_outcome(
+            200,
+            true,
+            7,
+            Instant::now(),
+            None,
+            None,
+        );
+
+        assert!(outcome.response_streamed);
+        assert_eq!(outcome.bytes_streamed, 0);
+        assert!(!outcome.body_completed);
+        assert!(outcome.client_disconnected);
         assert_eq!(outcome.body_error_class, Some(ErrorClass::ClientDisconnect));
     }
 

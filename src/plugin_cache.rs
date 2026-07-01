@@ -304,6 +304,16 @@ impl Plugin for PriorityOverridePlugin {
             .on_final_response_body(ctx, response_status, response_headers, body)
             .await
     }
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        self.inner
+            .on_response_stream_terminated(ctx, response_status, outcome)
+            .await;
+    }
     async fn log(&self, summary: &TransactionSummary) {
         self.inner.log(summary).await;
     }

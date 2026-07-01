@@ -7,6 +7,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::collections::HashMap;
@@ -65,6 +66,7 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "request_mirror" => json!({"mirror_host": "mirror.local"}),
         "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
         "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
+        "request_deduplication" => json!({}),
         _ => json!({}),
     }
 }
@@ -2430,6 +2432,68 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[tokio::test]
+async fn test_priority_override_delegates_response_stream_termination_hook() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_priority(
+            "ps1",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(100),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "request_deduplication");
+    assert_eq!(plugins[0].priority(), 100);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "priority-stream-key".to_string(),
+    );
+    let result = plugins[0].before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugins[0].tracked_keys_count(), Some(1));
+
+    plugins[0]
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(
+        plugins[0].tracked_keys_count(),
+        Some(0),
+        "priority override wrapper must forward streamed-response terminal cleanup"
+    );
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "priority-stream-key".to_string(),
+    );
+    let result = plugins[0]
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "stream-end cleanup should let the next keyed request execute, got {result:?}"
+    );
 }
 
 #[test]
