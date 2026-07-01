@@ -1425,6 +1425,106 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Skipped: this PR does not touch mesh federation, discovery, SPIFFE identity, proxy, image, proto, docs, config, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
 
+  mesh-e2e-sidecar:
+    name: Mesh E2E Sidecar
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: build-gateway-binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.3
+      # Deploy-only smoke: SPIRE + sidecar workloads roll out, no traffic
+      # probes. The full datapath run rides the path-filtered
+      # mesh-e2e-sidecar-live workflow.
+      FERRUM_MESH_E2E_DEPLOY_ONLY: "1"
+      FERRUM_SKIP_IMAGE_BUILD: "1"
+      FERRUM_IMAGE_REPOSITORY: ferrum-edge
+      FERRUM_IMAGE_TAG: mesh-e2e-sidecar
+      # This smoke creates and destroys a disposable kind cluster in CI;
+      # acknowledge run.sh's preflight guard (the live workflow sets the same).
+      FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE: "true"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check for mesh e2e sidecar changes
+        id: changes
+        run: |
+          set -euo pipefail
+          changed_files="$RUNNER_TEMP/mesh-e2e-sidecar-changed-files.txt"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only "origin/${{ github.base_ref }}...HEAD" | sort > "$changed_files"
+          else
+            : > "$changed_files"
+          fi
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            python3 .github/scripts/live_suite_path_filter.py \
+              --suite mesh-e2e-sidecar \
+              --changed-files "$changed_files" \
+              --force-run \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "mesh_e2e_sidecar_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          filter_output="$(python3 .github/scripts/live_suite_path_filter.py \
+            --suite mesh-e2e-sidecar \
+            --changed-files "$changed_files")"
+          printf '%s\n' "$filter_output" >> "$GITHUB_STEP_SUMMARY"
+          if printf '%s\n' "$filter_output" | grep -q '^relevant=true$'; then
+            echo "mesh_e2e_sidecar_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mesh_e2e_sidecar_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Kubernetes tools
+        if: steps.changes.outputs.mesh_e2e_sidecar_changed == 'true'
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+
+      - name: Download prebuilt gateway binary
+        if: steps.changes.outputs.mesh_e2e_sidecar_changed == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug
+
+      - name: Package Ferrum image
+        if: steps.changes.outputs.mesh_e2e_sidecar_changed == 'true'
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/debug/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Run sidecar deployment smoke
+        if: steps.changes.outputs.mesh_e2e_sidecar_changed == 'true'
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/ferrum-mesh-e2e-sidecar
+        run: tests/k8s/mesh_e2e_sidecar/run.sh
+
+      - name: Upload mesh e2e sidecar diagnostics
+        if: always() && steps.changes.outputs.mesh_e2e_sidecar_changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferrum-mesh-e2e-sidecar
+          path: ${{ runner.temp }}/ferrum-mesh-e2e-sidecar
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summarize mesh e2e sidecar skip
+        if: steps.changes.outputs.mesh_e2e_sidecar_changed != 'true'
+        run: |
+          echo "## Mesh E2E Sidecar" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch mesh sidecar, identity, proxy, JWT plugin, GA-contract, image, proto, docs, config, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+
   helm-chart:
     name: Helm Chart
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -1804,6 +1904,7 @@ jobs:
       - gateway-api-conformance
       - coverage-gate
       - mesh-multicluster-federation
+      - mesh-e2e-sidecar
       - helm-chart
       - lint
       - detect-ebpf-live-changes
@@ -1878,6 +1979,7 @@ jobs:
           add_row "Gateway API conformance" "${{ needs.gateway-api-conformance.result }}"
           add_row "Coverage" "${{ needs.coverage-gate.result }}"
           add_row "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
+          add_row "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}"
           add_row "Helm chart" "${{ needs.helm-chart.result }}"
           add_row "Lint" "${{ needs.lint.result }}"
           add_row "eBPF/netns live change detector" "${{ needs.detect-ebpf-live-changes.result }}"
@@ -1908,6 +2010,7 @@ jobs:
           require_success "Gateway API conformance" "${{ needs.gateway-api-conformance.result }}"
           require_success "Coverage" "${{ needs.coverage-gate.result }}"
           require_success "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
+          require_success "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}"
           require_success "Helm chart" "${{ needs.helm-chart.result }}"
           require_success "Lint" "${{ needs.lint.result }}"
           require_success "eBPF/netns live change detector" "${{ needs.detect-ebpf-live-changes.result }}"

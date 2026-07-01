@@ -29,6 +29,7 @@ REQUIRED_JOBS = {
     "gateway-api-conformance",
     "coverage-gate",
     "mesh-multicluster-federation",
+    "mesh-e2e-sidecar",
     "helm-chart",
     "lint",
     "detect-ebpf-live-changes",

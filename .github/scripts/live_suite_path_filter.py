@@ -63,6 +63,41 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/proxy/",
         r"^docs/(mesh|mesh_multicluster_federation_runbook|spire_deployment|configuration)\.md$",
     ],
+    # Single-cluster Sidecar mesh live e2e (STRICT mTLS / authz / RequestAuth
+    # JWT / DR connectTimeout) + the GA-contract live-assertion validator.
+    # Deliberately mirrors mesh-federation minus its multicluster-only
+    # surfaces (no src/grpc: the fixture uses the file config source, not the
+    # CP/DP gRPC path), plus the JWT plugin the fixture's RequestAuth probes
+    # exercise and the conformance contract/validator files its workflow's
+    # validator step consumes.
+    "mesh-e2e-sidecar": [
+        r"^\.github/workflows/(ci|mesh-e2e-sidecar-live)\.yml$",
+        r"^\.github/scripts/live_suite_path_filter\.py$",
+        r"^\.github/actions/package-ferrum-runtime-image/",
+        r"^tests/k8s/mesh_e2e_sidecar/",
+        r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
+        r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs)$",
+        r"^Cargo\.(toml|lock)$",
+        r"^build\.rs$",
+        r"^rust-toolchain\.toml$",
+        r"^\.cargo/",
+        r"^vendor/",
+        r"^Dockerfile(\..*)?$",
+        r"^\.dockerignore$",
+        r"^proto/",
+        r"^ferrum\.conf$",
+        r"^src/config/",
+        r"^src/modes/mesh/",
+        r"^src/identity/",
+        r"^src/tls/",
+        r"^src/secrets/",
+        r"^src/service_discovery/",
+        r"^src/plugins/mesh/",
+        r"^src/plugins/jwks_auth\.rs$",
+        r"^src/capture/",
+        r"^src/proxy/",
+        r"^docs/(mesh|spire_deployment|configuration)\.md$",
+    ],
 }
 
 
@@ -116,6 +151,12 @@ def self_test() -> int:
         ("mesh-federation", ["src/service_discovery/kubernetes.rs"], True),
         ("mesh-federation", ["charts/ferrum-mesh/values.yaml"], False),
         ("mesh-federation", ["docs/spire_deployment.md"], True),
+        ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
+        ("mesh-e2e-sidecar", ["src/plugins/jwks_auth.rs"], True),
+        ("mesh-e2e-sidecar", ["tests/conformance/ga_contract.yaml"], True),
+        ("mesh-e2e-sidecar", ["tests/k8s/multicluster-federation/run.sh"], False),
+        ("mesh-e2e-sidecar", ["src/grpc/mod.rs"], False),
+        ("mesh-e2e-sidecar", ["charts/ferrum-mesh/values.yaml"], False),
     ]
     failures: list[str] = []
     for suite, changed, expected in cases:

@@ -29,6 +29,14 @@ pub(crate) struct Capability {
     pub semantic_assertions: Vec<SemanticAssertion>,
     pub live_suite: String,
     pub live_assertions: Vec<String>,
+    /// Present when this capability's declared live assertions cannot yet be
+    /// emitted by its live suite (an architectural or staged gap). The
+    /// live-artifact validator ([`super::live_contract`]) REPORTS these rows
+    /// instead of enforcing them; the semantic assertions above remain fully
+    /// GA-gated. The string must say why and where the work is tracked —
+    /// removing it is the act of enrolling the row in the live gate.
+    #[serde(default)]
+    pub live_deferred: Option<String>,
     pub platform_profile: String,
     pub docs_anchor: String,
     pub owner: String,
@@ -141,6 +149,16 @@ impl Contract {
                         capability.id, live_assertion
                     ));
                 }
+            }
+
+            if let Some(reason) = &capability.live_deferred
+                && reason.trim().is_empty()
+            {
+                return Err(format!(
+                    "capability `{}` sets live_deferred with an empty reason — document why \
+                     the live assertions cannot be emitted and where the work is tracked",
+                    capability.id
+                ));
             }
         }
 

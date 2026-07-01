@@ -78,6 +78,8 @@ struct GaCapabilityReport {
     semantic_assertions: Vec<String>,
     live_suite: String,
     live_assertions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_deferred: Option<String>,
     platform_profile: String,
     docs_anchor: String,
     owner: String,
@@ -259,6 +261,17 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
     )?;
     writeln!(w, "|---|---|---|---|---|---|---|---|")?;
     for capability in &report.ga_contract {
+        // Live assertions marked `live_deferred` are declared but not yet
+        // emitted/enforced by their live suite — say so in the row rather
+        // than presenting them as active gates.
+        let live_assertions = if capability.live_deferred.is_some() {
+            format!(
+                "{} *(live-deferred)*",
+                capability.live_assertions.join("<br>")
+            )
+        } else {
+            capability.live_assertions.join("<br>")
+        };
         writeln!(
             w,
             "| `{}` | {} | `{}` | `{}` | {} | `{}` | {} | `{}` |",
@@ -268,7 +281,7 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
             escape_md(&capability.config_protocol),
             escape_md(&capability.semantic_assertions.join("<br>")),
             escape_md(&capability.live_suite),
-            escape_md(&capability.live_assertions.join("<br>")),
+            escape_md(&live_assertions),
             escape_md(&capability.docs_anchor),
         )?;
     }
@@ -341,6 +354,7 @@ impl From<&Capability> for GaCapabilityReport {
                 .collect(),
             live_suite: capability.live_suite.clone(),
             live_assertions: capability.live_assertions.clone(),
+            live_deferred: capability.live_deferred.clone(),
             platform_profile: capability.platform_profile.clone(),
             docs_anchor: capability.docs_anchor.clone(),
             owner: capability.owner.clone(),

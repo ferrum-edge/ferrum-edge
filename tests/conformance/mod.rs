@@ -16,6 +16,7 @@ mod istio_destination_rule;
 mod istio_peer_authentication;
 mod istio_service_entry_egress;
 mod istio_virtual_service;
+mod live_contract;
 mod mesh_topology_matrix;
 mod xds_type_urls;
 

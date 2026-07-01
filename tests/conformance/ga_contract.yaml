@@ -29,6 +29,15 @@ capabilities:
     live_suite: mesh-e2e-sidecar
     live_assertions:
       - sidecar.destination_rule.tcp_max_connections
+    # maxConnections is enforced on stream-family (TCP) and WebSocket backend
+    # connections only — never on the pooled multiplexed mesh-mTLS HTTP egress
+    # path (docs/mesh.md "DestinationRule maxConnections enforcement scope") —
+    # so the suite's plain-HTTP probes cannot observe it. A WebSocket-based
+    # live probe is the planned backing.
+    live_deferred: >-
+      Not observable via plain-HTTP mesh egress (enforced on stream-family/
+      WebSocket connections only); WebSocket-based live probe tracked in
+      issue #1974.
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#destinationrule
     owner: mesh
@@ -47,6 +56,16 @@ capabilities:
     live_suite: mesh-e2e-sidecar
     live_assertions:
       - sidecar.virtual_service.cors_policy
+    # The VirtualService-derived `cors` plugin lands on GatewayConfig proxies;
+    # MeshSlice::from_gateway_config carries only the `mesh` block, so no
+    # deployment shape (file source or CP->DP) can put VS CORS on a live mesh
+    # sidecar route today. The semantic translation above remains
+    # conformance-pinned; live backing is blocked on carrying route-level
+    # plugins in the mesh slice.
+    live_deferred: >-
+      Mesh slice does not carry VirtualService-derived route plugins, so no
+      live sidecar deployment can exercise VS CORS; feature gap tracked in
+      issue #1973.
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#virtualservice-translation
     owner: mesh

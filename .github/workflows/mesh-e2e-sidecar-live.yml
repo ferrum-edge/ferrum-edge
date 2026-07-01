@@ -1,0 +1,174 @@
+name: Mesh E2E Sidecar Live Datapath
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mesh-e2e-sidecar-live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: mesh-e2e-sidecar
+  CLUSTER: ferrum-sidecar-e2e
+  KIND_VERSION: v0.27.0
+  KUBECTL_VERSION: v1.32.3
+
+jobs:
+  changes:
+    name: Mesh e2e sidecar trigger
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for mesh e2e sidecar changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/live_suite_path_filter.py --self-test
+          changed_files="$RUNNER_TEMP/mesh-e2e-sidecar-changed-files.txt"
+          : > "$changed_files"
+
+          filter_args=(--suite mesh-e2e-sidecar --changed-files "$changed_files")
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags origin "${BASE_REF}"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$changed_files"
+          else
+            filter_args+=(--force-run)
+          fi
+
+          plan="$(python3 .github/scripts/live_suite_path_filter.py "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
+  mesh-e2e-sidecar-live:
+    name: Mesh e2e sidecar live datapath
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-mesh-e2e-sidecar-live"
+
+      - name: Build runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package runtime image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+
+      - name: Create kind cluster
+        run: |
+          set -euo pipefail
+          kind create cluster --name "$CLUSTER" --wait 180s
+          kubectl --context "kind-$CLUSTER" get nodes -o wide
+
+      - name: Load runtime image into the cluster
+        run: |
+          set -euo pipefail
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$CLUSTER"
+
+      - name: Run live sidecar mesh e2e suite
+        env:
+          FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE: "true"
+          FERRUM_SKIP_IMAGE_BUILD: "1"
+          FERRUM_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
+          FERRUM_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
+        run: tests/k8s/mesh_e2e_sidecar/run.sh
+
+      # Stage-4 contract validator: the emitted artifact must satisfy every
+      # enforced (non-`live_deferred`) GA-contract live assertion for this
+      # suite, for this exact commit/profile, with no duplicate or stale
+      # artifacts. Reuses the pr-build cache from the binary build above.
+      - name: Validate GA-contract live assertions artifact
+        env:
+          FERRUM_LIVE_ASSERTIONS_FILE: target/mesh-e2e-sidecar/live-assertions.json
+          FERRUM_LIVE_SUITE: mesh-e2e-sidecar
+          FERRUM_LIVE_MAX_AGE_HOURS: "6"
+        run: |
+          set -euo pipefail
+          FERRUM_LIVE_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+            cargo test --profile pr-build --test conformance_tests live_contract -- --nocapture
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/mesh-e2e-sidecar-results"
+          mkdir -p "$results"
+          ctx="kind-$CLUSTER"
+          kubectl --context "$ctx" get nodes -o wide > "$results/nodes.txt" 2>&1
+          kubectl --context "$ctx" get pods -A -o wide > "$results/pods.txt" 2>&1
+          kubectl --context "$ctx" get events -A --sort-by=.lastTimestamp > "$results/events.txt" 2>&1
+          kubectl --context "$ctx" -n ferrum get all -o wide > "$results/ferrum-all.txt" 2>&1
+          kubectl --context "$ctx" -n ferrum describe pods > "$results/ferrum-pods-describe.txt" 2>&1
+          kubectl --context "$ctx" -n ferrum get configmap -o yaml > "$results/configmaps.yaml" 2>&1
+          kubectl --context "$ctx" -n spire-system get all -o wide > "$results/spire-all.txt" 2>&1
+          kubectl --context "$ctx" -n spire-system logs statefulset/spire-server --all-containers --tail=500 > "$results/spire-server.log" 2>&1
+          kubectl --context "$ctx" -n spire-system logs daemonset/spire-agent --all-containers --tail=500 > "$results/spire-agent.log" 2>&1
+          for deploy in svc client rogue; do
+            kubectl --context "$ctx" -n ferrum logs "deploy/$deploy" --all-containers --tail=500 > "$results/${deploy}.log" 2>&1
+          done
+          kubectl --context "$ctx" -n ferrum logs deploy/svc -c ferrum-edge-init --tail=50 > "$results/svc-iptables.txt" 2>&1
+          kubectl --context "$ctx" -n ferrum logs deploy/client -c ferrum-blackhole-init --tail=50 > "$results/client-blackhole.txt" 2>&1
+          if [ -d "$GITHUB_WORKSPACE/.context/mesh-e2e-sidecar" ]; then
+            cp -R "$GITHUB_WORKSPACE/.context/mesh-e2e-sidecar" "$results/artifacts"
+          fi
+          if [ -f target/mesh-e2e-sidecar/live-assertions.json ]; then
+            cp target/mesh-e2e-sidecar/live-assertions.json "$results/live-assertions.json"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mesh-e2e-sidecar-results
+          path: mesh-e2e-sidecar-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name "$CLUSTER" || true
