@@ -3638,14 +3638,12 @@ async fn connect_backend_plain(
                 e
             );
         }
-        if tcp_fastopen {
-            if let Err(e) = crate::socket_opts::set_tcp_fastopen_client(fd) {
-                warn!(
-                    backend = %addr,
-                    "Failed to enable TCP_FASTOPEN_CONNECT on outbound TCP socket: {}",
-                    e
-                );
-            }
+        if tcp_fastopen && let Err(e) = crate::socket_opts::set_tcp_fastopen_client(fd) {
+            warn!(
+                backend = %addr,
+                "Failed to enable TCP_FASTOPEN_CONNECT on outbound TCP socket: {}",
+                e
+            );
         }
     }
     #[cfg(not(unix))]
