@@ -282,11 +282,17 @@ FERRUM_DB_URL=postgres://user:pass@host/db
 FERRUM_DB_POLL_INTERVAL=30
 
 # Control Plane (for cp mode)
+# Local demo plaintext on a Docker network. Production should use CP gRPC TLS
+# and `https://` DP URLs instead.
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
+FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret
 
 # Data Plane (for dp mode)
+# Local demo plaintext on a Docker network. Production should use `https://`
+# URLs plus CP gRPC TLS/CA settings.
 FERRUM_DP_CP_GRPC_URLS=http://cp:50051
+FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 # For multi-CP failover:
 # FERRUM_DP_CP_GRPC_URLS=https://cp1:50051,https://cp2:50051,https://cp3:50051
 # FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
