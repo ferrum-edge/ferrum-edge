@@ -1067,6 +1067,26 @@ impl ProbeOutcome {
     }
 }
 
+fn sanitized_http_probe_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "http request timed out"
+    } else if error.is_connect() {
+        "http connection failed"
+    } else if error.is_builder() {
+        "http request build failed"
+    } else if error.is_redirect() {
+        "http redirect failed"
+    } else if error.is_body() {
+        "http request body failed"
+    } else if error.is_decode() {
+        "http response decode failed"
+    } else if error.is_request() {
+        "http request failed"
+    } else {
+        "http probe failed"
+    }
+}
+
 /// HTTP health probe — sends a GET request and checks the status code.
 async fn http_probe(
     client: &reqwest::Client,
@@ -1089,16 +1109,13 @@ async fn http_probe(
             }
         }
         Err(e) => {
+            let failure = sanitized_http_probe_failure(&e);
             if crate::retry::is_port_exhaustion(&e) {
-                tracing::error!(
-                    "HTTP health probe: PORT EXHAUSTION connecting to {}: {}",
-                    url,
-                    e
-                );
+                tracing::error!(failure = failure, "HTTP health probe: PORT EXHAUSTION");
             } else {
-                debug!("HTTP health probe failed for {}: {}", url, e);
+                debug!(failure = failure, "HTTP health probe failed");
             }
-            ProbeOutcome::failure(format!("http request failed: {e}"))
+            ProbeOutcome::failure(failure)
         }
     }
 }
@@ -1830,7 +1847,7 @@ mod tests {
             let _ = listener.accept().await.unwrap();
         });
 
-        assert!(tcp_probe("::1", port, Duration::from_secs(2)).await);
+        assert!(tcp_probe("::1", port, Duration::from_secs(2)).await.success);
         accept.await.unwrap();
     }
 
@@ -1846,7 +1863,11 @@ mod tests {
             socket.send_to(b"o", peer).await.unwrap();
         });
 
-        assert!(udp_probe("::1", port, Duration::from_secs(2), b"p").await);
+        assert!(
+            udp_probe("::1", port, Duration::from_secs(2), b"p")
+                .await
+                .success
+        );
         responder.await.unwrap();
     }
 
@@ -1856,7 +1877,11 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format_probe_url("http", "::1", port, "/health");
 
-        assert!(http_probe(&client, &url, Duration::from_secs(2), &[200]).await);
+        assert!(
+            http_probe(&client, &url, Duration::from_secs(2), &[200])
+                .await
+                .success
+        );
     }
 
     /// Default-built health-check client (verify ON) MUST reject a
