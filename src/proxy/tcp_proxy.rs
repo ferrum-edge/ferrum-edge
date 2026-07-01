@@ -9,10 +9,8 @@ use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -49,8 +47,23 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 }
 
 const NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS: u64 = 60_000;
-static NODE_WAYPOINT_IDENTITY_WARN_LAST_MS: AtomicU64 = AtomicU64::new(0);
-static NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static NODE_WAYPOINT_IDENTITY_WARN_BUCKETS: OnceLock<
+    dashmap::DashMap<String, NodeWaypointIdentityWarnBucket>,
+> = OnceLock::new();
+
+struct NodeWaypointIdentityWarnBucket {
+    last_ms: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl NodeWaypointIdentityWarnBucket {
+    fn new() -> Self {
+        Self {
+            last_ms: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Resolve a node-waypoint TCP connection's source pod identity to a per-pod
 /// authorization scope, mirroring the HTTP/HBONE admit path in
@@ -120,36 +133,66 @@ fn resolve_node_waypoint_stream_scope(
             Some(resolved.identity.spiffe_id.as_str().to_string()),
         ),
         Err(error) => {
-            warn_node_waypoint_identity_fallback(proxy_id, client_ip, &error);
+            warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error);
             (None, None)
         }
     }
 }
 
-fn warn_node_waypoint_identity_fallback(proxy_id: &str, client_ip: &str, error: &anyhow::Error) {
+fn warn_node_waypoint_identity_scope_missing(
+    proxy_id: &str,
+    client_ip: &str,
+    error: &crate::modes::mesh::node_waypoint::NodeWaypointIdentityError,
+) {
+    let error_kind = node_waypoint_identity_error_kind(error);
+    let buckets = NODE_WAYPOINT_IDENTITY_WARN_BUCKETS.get_or_init(dashmap::DashMap::new);
+    let bucket_key = format!("{proxy_id}|{error_kind}");
+    let bucket = buckets
+        .entry(bucket_key)
+        .or_insert_with(NodeWaypointIdentityWarnBucket::new);
+    let bucket = bucket.value();
     let now_ms = crate::socket_opts::monotonic_now_ms();
-    let last_ms = NODE_WAYPOINT_IDENTITY_WARN_LAST_MS.load(Ordering::Relaxed);
+    let last_ms = bucket.last_ms.load(Ordering::Relaxed);
     if last_ms != 0 && now_ms.saturating_sub(last_ms) < NODE_WAYPOINT_IDENTITY_WARN_WINDOW_MS {
-        NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        bucket.suppressed.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
-    if NODE_WAYPOINT_IDENTITY_WARN_LAST_MS
+    if bucket
+        .last_ms
         .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
-        let suppressed = NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED.swap(0, Ordering::Relaxed);
+        let suppressed = bucket.suppressed.swap(0, Ordering::Relaxed);
         warn!(
             proxy_id = %proxy_id,
             client = %client_ip,
             error = %error,
-            fallback_scope = "mesh-wide",
+            identity_error_kind = error_kind,
+            policy_scope = "missing",
+            mesh_authz_scope_missing = true,
             suppressed,
             "Node-waypoint TCP stream: no resolved pod identity; \
-             falling back to mesh-wide authorization"
+             per-pod authorization scope unavailable"
         );
     } else {
-        NODE_WAYPOINT_IDENTITY_WARN_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        bucket.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn node_waypoint_identity_error_kind(
+    error: &crate::modes::mesh::node_waypoint::NodeWaypointIdentityError,
+) -> &'static str {
+    use crate::modes::mesh::node_waypoint::NodeWaypointIdentityError;
+
+    match error {
+        NodeWaypointIdentityError::SocketCookieUnavailable(_) => "socket_cookie_unavailable",
+        NodeWaypointIdentityError::UnknownCookie(_) => "unknown_cookie",
+        NodeWaypointIdentityError::MissingPodUid(_) => "missing_pod_uid",
+        NodeWaypointIdentityError::MissingWorkloadHash { .. } => "missing_workload_hash",
+        NodeWaypointIdentityError::UnknownPod(_) => "unknown_pod",
+        NodeWaypointIdentityError::WorkloadHashMismatch { .. } => "workload_hash_mismatch",
+        NodeWaypointIdentityError::PodUidMismatch { .. } => "pod_uid_mismatch",
     }
 }
 
