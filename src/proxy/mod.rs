@@ -2079,6 +2079,15 @@ fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
     }
 }
 
+fn warn_invalid_backend_method(proxy_id: &str, backend_path: &'static str, method: &str) {
+    warn!(
+        proxy_id = %proxy_id,
+        backend_path,
+        method_len = method.len(),
+        "Invalid HTTP method for backend dispatch"
+    );
+}
+
 /// Build the outbound X-Forwarded-For header value.
 ///
 /// Standard `proxy_add_x_forwarded_for` semantics: append the immediate
@@ -21186,6 +21195,7 @@ async fn proxy_to_backend_hbone(
     parts.method = match parse_hyper_method(method) {
         Ok(method) => method,
         Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "hbone", method);
             return (
                 retry::BackendResponse {
                     status_code: 405,
@@ -21823,6 +21833,7 @@ async fn proxy_to_backend_mesh_mtls(
     parts.method = match parse_hyper_method(method) {
         Ok(method) => method,
         Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "mesh_mtls", method);
             return (
                 retry::BackendResponse {
                     status_code: 405,
@@ -22140,6 +22151,7 @@ async fn proxy_to_backend_http2(
     parts.method = match parse_hyper_method(method) {
         Ok(m) => m,
         Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "direct_h2", method);
             return retry::BackendResponse {
                 status_code: 405,
                 body: ResponseBody::Buffered(
