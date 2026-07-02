@@ -218,6 +218,22 @@ metadata:
 spec:
   controllerName: ferrum.io/gateway-controller
 YAML
+
+  # Block until the control plane reconciles the GatewayClass to Accepted before
+  # handing off to the upstream Go suite. The suite has its own 180s wait for this
+  # condition, but on a cold kind cluster the CP's first reconcile (informer sync
+  # + FERRUM_K8S_FULL_SYNC_INTERVAL_SECS) can outlast it, surfacing as
+  # "GatewayClass ... Accepted (generation 0) ... context deadline exceeded" and
+  # flaking the suite before any test runs. A generous script-side wait here
+  # absorbs that cold-start reconcile so the suite starts against an already-
+  # Accepted class; kubectl polls the condition until it flips True or the
+  # timeout elapses, so a slow reconcile is retried rather than fatal on the
+  # first miss.
+  if ! kubectl wait --for=condition=Accepted gatewayclass/ferrum --timeout=240s; then
+    echo "GatewayClass 'ferrum' did not reach Accepted within timeout; current status:" >&2
+    kubectl get gatewayclass ferrum -o yaml >&2 || true
+    return 1
+  fi
 }
 
 setup() {
