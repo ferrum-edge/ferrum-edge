@@ -101,6 +101,7 @@ PHASE2_WINDOW_HI=4.5
 
 # Discovered at runtime.
 SVC_POD_IP=""
+WSSVC_POD_IP=""
 # Minted at startup (mint_jwt_material).
 JWKS_JSON=""
 JWT_VALID=""
@@ -293,7 +294,7 @@ install_spire() {
 }
 
 register_spire_workloads() {
-  log "registering SPIRE workload entries (svc, client, rogue)"
+  log "registering SPIRE workload entries (svc, wssvc, client, rogue)"
   local registered_ok=true
   local -a spire_nodes
   mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
@@ -312,7 +313,7 @@ register_spire_workloads() {
     fi
     # slowsvc has NO entry on purpose: its dial is black-holed and never
     # completes a handshake, so no SVID is ever presented for it.
-    for sa in svc client rogue; do
+    for sa in svc wssvc client rogue; do
       ferrum_spire_register_k8s_workload \
         "$CONTEXT" "$SPIRE_NS" \
         "spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa" \
@@ -326,7 +327,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion sidecar.spire.workload_entries pass \
-      "" "" "svc-client-rogue-entries-registered" "spire-entries.txt"
+      "" "" "svc-wssvc-client-rogue-entries-registered" "spire-entries.txt"
   else
     record_live_assertion sidecar.spire.workload_entries fail \
       "" "" "workload-entry-registration-failed"
@@ -365,13 +366,15 @@ apply_configmap() {
     --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
 }
 
-# Select a Running, Ready, NON-terminating svc pod's IP. `Terminating` is NOT
-# a pod phase — a deleting pod keeps phase=Running with a deletionTimestamp —
-# so a phase filter alone can pick a dying pod's IP during a rollout.
-wait_for_svc_pod_ip() {
+# Select a Running, Ready, NON-terminating pod IP for the given app label.
+# `Terminating` is NOT a pod phase — a deleting pod keeps phase=Running with a
+# deletionTimestamp — so a phase filter alone can pick a dying pod's IP during
+# a rollout.
+wait_for_pod_ip() {
+  local app_label="$1"
   local ip="" _
   for _ in $(seq 1 60); do
-    ip="$(kubectl --context "$CONTEXT" -n "$NS" get pod -l app=svc -o json 2>/dev/null |
+    ip="$(kubectl --context "$CONTEXT" -n "$NS" get pod -l "app=$app_label" -o json 2>/dev/null |
       python3 -c '
 import json, sys
 try:
@@ -399,7 +402,7 @@ for pod in data.get("items", []):
     fi
     sleep 2
   done
-  echo "svc pod never reported a ready non-terminating pod IP" >&2
+  echo "$app_label pod never reported a ready non-terminating pod IP" >&2
   return 1
 }
 
@@ -434,21 +437,6 @@ mesh:
         labels:
           app: svc
         namespace: $NS
-    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
-      service_name: wssvc
-      namespace: $NS
-      trust_domain: $TRUST_DOMAIN
-      service_account: svc
-      addresses:
-        - 127.0.0.1
-      ports:
-        - port: 8081
-          protocol: http
-          name: ws
-      selector:
-        labels:
-          app: svc
-        namespace: $NS
   services:
     - name: svc
       namespace: $NS
@@ -456,14 +444,6 @@ mesh:
         - port: 8080
           protocol: http
           name: http
-      workloads:
-        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
-    - name: wssvc
-      namespace: $NS
-      ports:
-        - port: 8081
-          protocol: http
-          name: ws
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
   peer_authentications:
@@ -511,6 +491,48 @@ YAML
 )"
 }
 
+# WebSocket destination sidecar mesh document: wssvc is its OWN pod +
+# identity (sa/wssvc) because one local pod backs exactly ONE service —
+# declaring wssvc as a second local service_name on sa/svc makes
+# resolve_local_workloads fail closed (ambiguous local workload) and the dest
+# sidecar materializes NO inbound routes (proven live: every probe 404'd).
+# STRICT inbound only; the authz/JWT policies stay on the svc destination.
+render_wsdest_config() {
+  apply_configmap ferrum-mesh-wsdest "$(cat <<YAML
+mesh:
+  workloads:
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
+      service_name: wssvc
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: wssvc
+      addresses:
+        - 127.0.0.1
+      ports:
+        - port: 8080
+          protocol: http
+          name: ws
+      selector:
+        labels:
+          app: wssvc
+        namespace: $NS
+  services:
+    - name: wssvc
+      namespace: $NS
+      ports:
+        - port: 8080
+          protocol: http
+          name: ws
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
+  peer_authentications:
+    - name: mesh-strict
+      namespace: $NS
+      mtls_mode: strict
+YAML
+)"
+}
+
 # Client/rogue sidecar mesh document: the svc workload at its REAL pod IP
 # (sidecar egress dials workload_address:15006 over mesh-mTLS) plus the
 # `slowsvc` workload at the black-holed IP with a DestinationRule
@@ -518,7 +540,7 @@ YAML
 # after the svc pod IP is known; a svc pod replacement would need a re-render
 # + client restart (this fixture never replaces svc).
 render_client_config() {
-  local svc_pod_ip="$1" slow_connect_timeout_ms="$2"
+  local svc_pod_ip="$1" wssvc_pod_ip="$2" slow_connect_timeout_ms="$3"
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   workloads:
@@ -535,15 +557,15 @@ mesh:
           name: http
       selector:
         namespace: $NS
-    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
       service_name: wssvc
       namespace: $NS
       trust_domain: $TRUST_DOMAIN
-      service_account: svc
+      service_account: wssvc
       addresses:
-        - "$svc_pod_ip"
+        - "$wssvc_pod_ip"
       ports:
-        - port: 8081
+        - port: 8080
           protocol: http
           name: ws
       selector:
@@ -573,11 +595,11 @@ mesh:
     - name: wssvc
       namespace: $NS
       ports:
-        - port: 8081
+        - port: 8080
           protocol: http
           name: ws
       workloads:
-        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
     - name: slowsvc
       namespace: $NS
       ports:
@@ -607,7 +629,7 @@ YAML
 
 wait_for_rollouts() {
   local deploy
-  for deploy in svc client rogue; do
+  for deploy in svc wssvc client rogue; do
     kubectl --context "$CONTEXT" -n "$NS" rollout status "deploy/$deploy" --timeout=5m
   done
 }
@@ -946,7 +968,7 @@ probe_connect_timeout_two_phase() {
   log "re-rendering client config with ${CONNECT_TIMEOUT_PHASE2_MS}ms and restarting client"
   # Distroless runtime image: no shell/kill, so config reload is a rollout
   # restart (the new pod reads the updated ConfigMap at startup).
-  render_client_config "$SVC_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
   kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
   kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m
   # Re-settle the positive route first so phase 2 never times a request that
@@ -1007,7 +1029,7 @@ collect_diagnostics() {
   kubectl --context "$CONTEXT" -n "$NS" get configmap -o yaml \
     > "$ARTIFACT_DIR/configmaps.yaml" 2>&1 || true
   local deploy
-  for deploy in svc client rogue; do
+  for deploy in svc wssvc client rogue; do
     kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" \
       --all-containers --tail=500 \
       > "$ARTIFACT_DIR/${deploy}.log" 2>&1 || true
@@ -1049,15 +1071,17 @@ main() {
   ensure_namespace
   mint_jwt_material
   render_dest_config
+  render_wsdest_config
   apply_workloads
   register_spire_workloads
 
   # svc rolls out first (its ConfigMap exists); client/rogue block in
   # ContainerCreating until the client ConfigMap — rendered with the
   # discovered svc pod IP — is applied.
-  SVC_POD_IP="$(wait_for_svc_pod_ip)"
-  log "svc pod IP=$SVC_POD_IP"
-  render_client_config "$SVC_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
+  SVC_POD_IP="$(wait_for_pod_ip svc)"
+  WSSVC_POD_IP="$(wait_for_pod_ip wssvc)"
+  log "svc pod IP=$SVC_POD_IP   wssvc pod IP=$WSSVC_POD_IP"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
   wait_for_rollouts
 
   if [[ "${FERRUM_MESH_E2E_DEPLOY_ONLY:-0}" == "1" ]]; then

@@ -31,6 +31,11 @@
 #
 # Fixed identities:
 #   sa/svc     the destination workload service account
+#   sa/wssvc   the WebSocket destination service account (its OWN pod +
+#              identity: one local pod backs exactly ONE service — a second
+#              local service_name on sa/svc would make
+#              resolve_local_workloads fail closed and materialize NO inbound
+#              routes)
 #   sa/client  the allowed client service account
 #   sa/rogue   a same-domain workload DENIED by a dest-side AuthorizationPolicy
 #   (slowsvc has NO service account / SPIRE entry on purpose: its dial is
@@ -47,6 +52,12 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: svc
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wssvc
   namespace: __NAMESPACE__
 ---
 apiVersion: v1
@@ -135,9 +146,7 @@ spec:
                 iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
               iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
                 iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
-              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8081 -j REDIRECT --to-ports 15006 2>/dev/null || \
-                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8081 -j REDIRECT --to-ports 15006
-              echo "ferrum inbound capture installed (8080,8081 -> 15006)"
+              echo "ferrum inbound capture installed (8080 -> 15006)"
               iptables -t nat -L FERRUM_INBOUND -n
       containers:
         - name: ferrum-edge
@@ -187,10 +196,172 @@ spec:
           image: python:3.12-alpine
           ports:
             - containerPort: 8080
-            - containerPort: 8081
           readinessProbe:
             tcpSocket:
-              port: 8081
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+              import threading
+              import time
+
+              # Content-Length is computed from the ACTUAL body bytes so the
+              # marker stays exact (a hardcoded length truncates the body and
+              # makes curl see a short read on close).
+              BODY = b"__APP_BODY__\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(4096)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: mesh-config
+          configMap:
+            name: ferrum-mesh-dest
+---
+# ── WebSocket destination pod (DR maxConnections probe target) ──────────────
+# Its OWN pod + service account (sa/wssvc): one local pod backs exactly ONE
+# service, so the WS listener must not be modeled as a second local
+# service_name on the svc pod's identity (resolve_local_workloads would fail
+# closed and materialize no inbound routes at all). Same shape as the svc pod
+# — inbound REDIRECT 8080 -> :15006, STRICT sidecar, SPIRE identity — but the
+# app is a minimal RFC 6455 WebSocket server: it answers the upgrade with a
+# correct Sec-WebSocket-Accept (the sidecar's inner H1 upgrade validates it)
+# and HOLDs the connection until the peer closes — a held session is what
+# occupies the maxConnections=1 slot.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wssvc
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: wssvc
+  ports:
+    - name: ws
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wssvc
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wssvc
+  template:
+    metadata:
+      labels:
+        app: wssvc
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: wssvc
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: file
+            - name: FERRUM_MESH_FILE_CONFIG_PATH
+              value: /etc/ferrum/mesh/mesh.yaml
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/wssvc
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: mesh-config
+              mountPath: /etc/ferrum/mesh
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
             initialDelaySeconds: 1
             periodSeconds: 1
             timeoutSeconds: 1
@@ -206,34 +377,8 @@ spec:
               import threading
               import time
 
-              # Content-Length is computed from the ACTUAL body bytes so the
-              # marker stays exact (a hardcoded length truncates the body and
-              # makes curl see a short read on close).
-              BODY = b"__APP_BODY__\n"
-              RESPONSE = (
-                  b"HTTP/1.1 200 OK\r\n"
-                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
-                  b"\r\n" + BODY
-              )
               WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-              def serve():
-                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                  s.bind(("0.0.0.0", 8080))
-                  s.listen(128)
-                  while True:
-                      conn, _ = s.accept()
-                      data = conn.recv(4096)
-                      if data:
-                          conn.sendall(RESPONSE)
-                      conn.close()
-
-              # Minimal RFC 6455 server on 8081 for the DR maxConnections WS
-              # probe: answer the upgrade with a correct Sec-WebSocket-Accept
-              # (the sidecar's inner H1 upgrade validates it), then HOLD the
-              # connection open until the peer closes — a held session is what
-              # occupies the maxConnections=1 slot.
               def ws_hold(conn):
                   try:
                       while conn.recv(4096):
@@ -246,7 +391,7 @@ spec:
               def serve_ws():
                   s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                   s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                  s.bind(("0.0.0.0", 8081))
+                  s.bind(("0.0.0.0", 8080))
                   s.listen(128)
                   while True:
                       conn, _ = s.accept()
@@ -282,7 +427,6 @@ spec:
                       conn.settimeout(None)
                       threading.Thread(target=ws_hold, args=(conn,), daemon=True).start()
 
-              threading.Thread(target=serve, daemon=True).start()
               threading.Thread(target=serve_ws, daemon=True).start()
               while True:
                   time.sleep(3600)
@@ -293,7 +437,7 @@ spec:
             type: DirectoryOrCreate
         - name: mesh-config
           configMap:
-            name: ferrum-mesh-dest
+            name: ferrum-mesh-wsdest
 ---
 # ── Client sidecar pod ──────────────────────────────────────────────────────
 # topology=sidecar with an outbound capture listener on :15001. The curl
