@@ -109,6 +109,10 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         # stay out by design — they are gated on every PR by the in-process
         # unit/integration/functional mesh suites).
         r"^src/plugins/utils/(jwt_verifier|jwks_store|jwks_cache|token_extract)\.rs$",
+        # Owns BackendConnectionGuard — the exact behavior the DR
+        # maxConnections WebSocket live assertion validates (held session
+        # occupies the slot, concurrent upgrade 503s, slot frees on close).
+        r"^src/backend_conn_limit\.rs$",
         r"^src/capture/",
         r"^src/proxy/",
         r"^docs/(mesh|spire_deployment|configuration)\.md$",
@@ -171,6 +175,7 @@ def self_test() -> int:
         ("mesh-e2e-sidecar", ["src/plugins/utils/jwt_verifier.rs"], True),
         ("mesh-e2e-sidecar", ["src/plugins/utils/jwks_store.rs"], True),
         ("mesh-e2e-sidecar", ["src/plugins/utils/token_extract.rs"], True),
+        ("mesh-e2e-sidecar", ["src/backend_conn_limit.rs"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/ga_contract.yaml"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/mod.rs"], True),
         ("mesh-e2e-sidecar", ["tests/conformance_tests.rs"], True),
