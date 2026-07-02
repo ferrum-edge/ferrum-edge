@@ -1427,6 +1427,7 @@ fn reverse_translate(
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
+        virtual_service_cors_policies: recovered.virtual_service_cors_policies,
         // GAP-1a: PeerAuthentication mTLS posture recovered from the PeerAuth
         // carrier. Without this every port fell back to Permissive.
         peer_authentications: recovered.peer_authentications,
@@ -1557,6 +1558,7 @@ struct RecoveredSliceCarriers {
     workloads: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_assertors: Vec<crate::identity::spiffe::SpiffeId>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
+    virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
     peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     request_authentications: Vec<crate::modes::mesh::config::MeshRequestAuthentication>,
     service_entries: Vec<crate::modes::mesh::config::ServiceEntry>,
@@ -1790,6 +1792,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
+        MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
+            recovered.virtual_service_cors_policies = value
+        }
         MeshSliceCarrier::PeerAuthentications(value) => recovered.peer_authentications = value,
         MeshSliceCarrier::RequestAuthentications(value) => {
             recovered.request_authentications = value

@@ -42,17 +42,21 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.request_auth.missing_jwt_rejected` | token-less request on the gated path → 403 (RequestAuth is permissive; the authz `request_principals` ALLOW does not match) |
 | `sidecar.request_auth.invalid_jwt_rejected` | wrong-key signature → 401 `Invalid or unrecognized JWT` (`jwks_auth`) |
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
+| `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → 200 with the origin reflected in `access-control-allow-origin`, `OPTIONS` preflight answered **204 by the sidecar** with `access-control-allow-methods`, disallowed `Origin` → **403** `CORS origin not allowed` (the plugin's own body, never the app marker) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
 
 Every assertion except `sidecar.spire.workload_entries` (fixture
 infrastructure) backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
-allow/deny, RequestAuthentication JWT, DR connectTimeout, and DR
-maxConnections; the artifact is validated against the contract by
+allow/deny, RequestAuthentication JWT, DR connectTimeout, DR maxConnections,
+and VirtualService CORS; the artifact is validated against the contract by
 `tests/conformance/live_contract.rs` (the live workflow runs it right after
-the fixture). The one remaining `live_deferred` contract id is VS CORS
-(issue #1973 — the mesh slice carries no VirtualService-derived route
-plugins).
+the fixture). No contract row remains `live_deferred`: VS CORS (the last,
+issue #1973) is live-backed by the mesh slice's `virtual_service_cors_policies`
+carriage — the client sidecar synthesizes the `cors` plugin onto its
+materialized svc outbound route, and the probe proves allowed-Origin
+reflection, a sidecar-answered 204 preflight, and a disallowed-Origin 403 from
+the plugin itself.
 
 This contract is **PR- and release-blocking**: the dedicated workflow's
 result is mirrored into the required CI aggregate by the

@@ -2104,6 +2104,160 @@ pub struct MeshSubset {
     pub traffic_policy: Option<MeshTrafficPolicy>,
 }
 
+// ── VirtualService-derived CORS policies (issue #1973) ─────────────────────
+
+/// A host-level CORS policy derived from Istio VirtualService
+/// `http[].corsPolicy`, carried on the mesh slice so a sidecar DP can
+/// synthesize a `cors` plugin instance onto its materialized OUTBOUND routes
+/// (Istio applies VirtualService policy on the client sidecar).
+///
+/// This is the narrow route-policy slice carriage that unblocks live VS CORS
+/// on mesh sidecars: the VS-derived `cors` plugin itself lands on
+/// `GatewayConfig` proxies, which never ride the slice. Application is
+/// HOST-LEVEL — match-scoped per-route CORS from multiple `http[]` entries is
+/// intentionally out of scope for mesh routes (materialized routes are
+/// host-routed `/`; the K8s translator carries the first corsPolicy-bearing
+/// `http[]` entry per host).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshVirtualServiceCorsPolicy {
+    /// Source resource name (diagnostics only).
+    pub name: String,
+    /// Source resource namespace; also the namespace `host` short names
+    /// resolve against, exactly like `MeshDestinationRule.namespace`.
+    pub namespace: String,
+    /// Target service host (bare name, `name.namespace`, or FQDN) — matched
+    /// against materialized outbound services with DestinationRule host
+    /// semantics.
+    pub host: String,
+    pub cors: MeshCorsPolicy,
+}
+
+/// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshCorsPolicy {
+    /// Origin matchers (Istio `allowOrigins[]` StringMatch). At least one is
+    /// required — a CORS policy that can never match an origin is a config
+    /// error, not a silent no-op.
+    pub allowed_origins: Vec<MeshCorsOriginMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed_headers: Vec<String>,
+    /// Preflight cache lifetime (Istio `maxAge`, seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_credentials: Option<bool>,
+}
+
+/// One Istio `StringMatch` origin matcher. Hand-written serde keeps the wire
+/// shape a SINGLE-KEY MAP (`{exact: ...}` / `{prefix: ...}` / `{regex: ...}`)
+/// in BOTH YAML and JSON — a derived externally-tagged enum would demand
+/// `!exact` YAML tags on the file source — and enforces the Istio
+/// `StringMatch` contract fail-closed: exactly one recognized key, a string
+/// value, nothing else (`{exact: "a", regex: "b"}` is rejected, never
+/// approximated by dropping a key).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MeshCorsOriginMatch {
+    Exact(String),
+    Prefix(String),
+    Regex(String),
+}
+
+impl Serialize for MeshCorsOriginMatch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let (key, value) = match self {
+            MeshCorsOriginMatch::Exact(value) => ("exact", value),
+            MeshCorsOriginMatch::Prefix(value) => ("prefix", value),
+            MeshCorsOriginMatch::Regex(value) => ("regex", value),
+        };
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(key, value)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let entries = std::collections::BTreeMap::<String, String>::deserialize(deserializer)?;
+        if entries.len() != 1 {
+            return Err(D::Error::custom(
+                "CORS origin matcher must carry exactly one of `exact`, `prefix`, or `regex`",
+            ));
+        }
+        let Some((key, value)) = entries.into_iter().next() else {
+            // Unreachable after the len==1 check; keep the parse fail-closed
+            // rather than panicking on a config path.
+            return Err(D::Error::custom(
+                "CORS origin matcher must carry exactly one of `exact`, `prefix`, or `regex`",
+            ));
+        };
+        match key.as_str() {
+            "exact" => Ok(MeshCorsOriginMatch::Exact(value)),
+            "prefix" => Ok(MeshCorsOriginMatch::Prefix(value)),
+            "regex" => Ok(MeshCorsOriginMatch::Regex(value)),
+            other => Err(D::Error::custom(format!(
+                "unknown CORS origin matcher `{other}` (expected `exact`, `prefix`, or `regex`)"
+            ))),
+        }
+    }
+}
+
+/// Project the typed policy onto the `cors` plugin's config schema
+/// (`src/plugins/cors.rs`): exact origins are plain strings, prefix/regex are
+/// single-key matcher objects — byte-for-byte the shape the K8s translator's
+/// gateway-side `route_cors_plugin` emits, pinned by a unit test so the two
+/// projections can never drift. `preflight_continue` is intentionally never
+/// set: the plugin answers preflights itself (Istio semantics).
+pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_json::Value {
+    let origins: Vec<serde_json::Value> = policy
+        .allowed_origins
+        .iter()
+        .map(|origin| match origin {
+            MeshCorsOriginMatch::Exact(value) => serde_json::Value::String(value.clone()),
+            MeshCorsOriginMatch::Prefix(value) => serde_json::json!({ "prefix": value }),
+            MeshCorsOriginMatch::Regex(value) => serde_json::json!({ "regex": value }),
+        })
+        .collect();
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "allowed_origins".to_string(),
+        serde_json::Value::from(origins),
+    );
+    if !policy.allowed_methods.is_empty() {
+        config.insert(
+            "allowed_methods".to_string(),
+            serde_json::json!(policy.allowed_methods),
+        );
+    }
+    if !policy.allowed_headers.is_empty() {
+        config.insert(
+            "allowed_headers".to_string(),
+            serde_json::json!(policy.allowed_headers),
+        );
+    }
+    if !policy.exposed_headers.is_empty() {
+        config.insert(
+            "exposed_headers".to_string(),
+            serde_json::json!(policy.exposed_headers),
+        );
+    }
+    if let Some(max_age) = policy.max_age_seconds {
+        config.insert("max_age".to_string(), serde_json::json!(max_age));
+    }
+    if let Some(allow_credentials) = policy.allow_credentials {
+        config.insert(
+            "allow_credentials".to_string(),
+            serde_json::Value::Bool(allow_credentials),
+        );
+    }
+    serde_json::Value::Object(config)
+}
+
 // ── Top-level mesh config container ───────────────────────────────────────
 
 /// All mesh-specific configuration, kept in a single container so the
@@ -2136,6 +2290,13 @@ pub struct MeshConfig {
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    /// VirtualService-derived host-level CORS policies (issue #1973). The
+    /// sidecar DP synthesizes per-route `cors` plugin instances onto its
+    /// materialized outbound routes from these. Populated by the K8s
+    /// translator from `http[].corsPolicy` and directly expressible on the
+    /// file source; rides its own xDS ECDS carrier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_configs: Vec<MeshProxyConfig>,
     /// Istio `Sidecar` egress-scoping resources. Used by the slice builder
@@ -2242,6 +2403,7 @@ impl Default for MeshConfig {
             request_authentications: Vec::new(),
             telemetry_resources: Vec::new(),
             destination_rules: Vec::new(),
+            virtual_service_cors_policies: Vec::new(),
             proxy_configs: Vec::new(),
             sidecars: Vec::new(),
             waypoint_bindings: Vec::new(),
@@ -2361,7 +2523,7 @@ pub enum OutboundTrafficPolicy {
 
 impl MeshConfig {
     pub fn validate(&self) -> Vec<String> {
-        validate_mesh_config_internal(
+        let mut errors = validate_mesh_config_internal(
             &self.workloads,
             &self.services,
             &self.mesh_policies,
@@ -2374,7 +2536,9 @@ impl MeshConfig {
             &self.sidecars,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
-        )
+        );
+        validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
+        errors
     }
 
     pub fn normalize(&mut self) {
@@ -2425,6 +2589,52 @@ pub fn validate_mesh_config(
         trust_bundles,
         None,
     )
+}
+
+/// Validate VirtualService-derived CORS policies at the config boundary:
+/// unusable policies (no origins, empty host, un-compilable regex) reject the
+/// slice fail-closed instead of surfacing later as a plugin-construction
+/// failure on the data plane.
+fn validate_virtual_service_cors_policies(
+    policies: &[MeshVirtualServiceCorsPolicy],
+    errors: &mut Vec<String>,
+) {
+    for policy in policies {
+        let context = format!(
+            "MeshVirtualServiceCorsPolicy '{}/{}'",
+            policy.namespace, policy.name
+        );
+        validate_non_empty_string(format!("{context}.name"), &policy.name, errors);
+        validate_non_empty_string(format!("{context}.namespace"), &policy.namespace, errors);
+        validate_non_empty_string(format!("{context}.host"), &policy.host, errors);
+        if policy.cors.allowed_origins.is_empty() {
+            errors.push(format!(
+                "{context}: cors.allowed_origins must declare at least one origin matcher"
+            ));
+        }
+        for (index, origin) in policy.cors.allowed_origins.iter().enumerate() {
+            match origin {
+                MeshCorsOriginMatch::Exact(value) | MeshCorsOriginMatch::Prefix(value) => {
+                    if value.trim().is_empty() {
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] must not be empty"
+                        ));
+                    }
+                }
+                MeshCorsOriginMatch::Regex(pattern) => {
+                    if pattern.trim().is_empty() {
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] must not be empty"
+                        ));
+                    } else if let Err(err) = regex::Regex::new(pattern) {
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] regex does not compile: {err}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

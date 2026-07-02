@@ -8,11 +8,11 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
     MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
-    MtlsMode, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
-    ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet, Workload,
-    WorkloadLabels, is_false, is_zero_usize, policy_scope_applies_to_workload,
-    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
-    workload_selector_matches,
+    MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig, OutboundTrafficPolicy,
+    PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern,
+    TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
+    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
+    service_entry_applies_to_workload, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -279,6 +279,11 @@ pub struct MeshSlice {
     pub telemetry_resources: Vec<MeshTelemetryResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    /// VirtualService-derived host-level CORS policies (issue #1973),
+    /// narrowed like `destination_rules`. The DP synthesizes per-route `cors`
+    /// plugin instances onto materialized outbound routes from these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_configs: Vec<MeshProxyConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,6 +484,7 @@ impl MeshSlice {
             && self.request_authentications == other.request_authentications
             && self.telemetry_resources == other.telemetry_resources
             && self.destination_rules == other.destination_rules
+            && self.virtual_service_cors_policies == other.virtual_service_cors_policies
             && self.proxy_configs == other.proxy_configs
             && self.trust_bundles == other.trust_bundles
             && self.multi_cluster == other.multi_cluster
@@ -1059,6 +1065,47 @@ impl MeshSlice {
             })
             .cloned()
             .collect();
+        // VirtualService-derived CORS policies narrow EXACTLY like
+        // DestinationRules: same namespace-visibility default, same
+        // client-or-target-namespace guard, same Sidecar egress-scope check —
+        // both are host-targeting client-side traffic policy, so a namespace
+        // that cannot override a workload's DRs must not be able to inject
+        // CORS behavior onto its routes either.
+        let virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy> = mesh
+            .virtual_service_cors_policies
+            .iter()
+            .filter(|policy| {
+                let Some(sidecar) = applicable_sidecar else {
+                    return resource_namespace_visible(
+                        &service_waypoint_namespaces,
+                        &policy.namespace,
+                        &namespace,
+                    );
+                };
+                let (resource_namespace, host_candidates) = policy_host_scope(
+                    &policy.host,
+                    &policy.namespace,
+                    &cluster_domain,
+                    &mesh_service_identities,
+                    &service_entry_hosts,
+                );
+                let policy_namespace = policy.namespace.as_str();
+                if policy_namespace != effective_namespace
+                    && policy_namespace != resource_namespace.as_str()
+                {
+                    return false;
+                }
+                let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                sidecar_egress_includes_service(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    &resource_namespace,
+                    &host_refs,
+                    None,
+                )
+            })
+            .cloned()
+            .collect();
         let proxy_configs: Vec<MeshProxyConfig> = mesh
             .proxy_configs
             .iter()
@@ -1153,6 +1200,7 @@ impl MeshSlice {
             request_authentications,
             telemetry_resources,
             destination_rules,
+            virtual_service_cors_policies,
             proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
             multi_cluster: mesh.multi_cluster.as_ref().map(|multi_cluster| {
@@ -1760,9 +1808,31 @@ fn destination_rule_host_scope(
     mesh_service_identities: &BTreeSet<(String, String)>,
     service_entry_hosts: &BTreeSet<String>,
 ) -> (String, Vec<String>) {
-    let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let rule_namespace = rule
-        .namespace
+    policy_host_scope(
+        &rule.host,
+        &rule.namespace,
+        cluster_domain,
+        mesh_service_identities,
+        service_entry_hosts,
+    )
+}
+
+/// Resolve a host-targeting policy's `(host, namespace)` pair to the target
+/// service's namespace plus the host alias set. Shared by DestinationRule
+/// narrowing and VirtualService-CORS narrowing so a policy host is scoped
+/// with ONE set of semantics.
+fn policy_host_scope(
+    policy_host: &str,
+    policy_namespace: &str,
+    cluster_domain: &str,
+    mesh_service_identities: &BTreeSet<(String, String)>,
+    service_entry_hosts: &BTreeSet<String>,
+) -> (String, Vec<String>) {
+    let host = policy_host
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let rule_namespace = policy_namespace
         .trim()
         .trim_end_matches('.')
         .to_ascii_lowercase();
@@ -3049,6 +3119,7 @@ mod tests {
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
+            virtual_service_cors_policies: Vec::new(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],

@@ -5,16 +5,17 @@ use serde_json::Value;
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
-    MeshConsistentHash, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer,
-    MeshLocalityDistribute, MeshLocalityFailover, MeshLocalityLbSetting, MeshMetricsConfig,
-    MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule,
-    MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSimpleLb, MeshSubset,
-    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction,
-    PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort, SourceNegationMatch, TagOverrideOperation, TelemetryTracingMode, TracingProvider,
-    Workload, WorkloadPort, WorkloadSelector, is_mesh_condition_ip_key,
-    is_supported_mesh_condition_key, mesh_condition_has_values, validate_mesh_condition_ip_block,
+    MeshConsistentHash, MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint,
+    MeshJwtRule, MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover,
+    MeshLocalityLbSetting, MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
+    MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
+    MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
+    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
+    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
+    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -2635,6 +2636,32 @@ fn virtual_service_routes(
         .flatten()
         .collect();
 
+    // Issue #1973: ALSO carry a translatable `http[].corsPolicy` on the mesh
+    // block (per VS host) so mesh sidecar DPs can synthesize the `cors` plugin
+    // onto their materialized outbound routes — the gateway-proxy-scoped
+    // plugin emitted below never rides the mesh slice. Host-level application:
+    // the first corsPolicy-bearing `http[]` entry wins (materialized mesh
+    // routes are host-routed `/`, so per-route match scoping does not apply
+    // there); the extraction reuses the SAME `cors_policy_translatable` +
+    // `cors_allowed_origins` gates as `route_cors_plugin`, so slice-carried
+    // and gateway-projected CORS can never disagree on representability.
+    if let Some(mesh_cors) = http_routes
+        .iter()
+        .filter_map(|http| http.get("corsPolicy"))
+        .find_map(mesh_cors_policy_from_value)
+    {
+        for host in &hosts {
+            acc.mesh
+                .virtual_service_cors_policies
+                .push(MeshVirtualServiceCorsPolicy {
+                    name: object.metadata.name.clone(),
+                    namespace: object.metadata.namespace.clone(),
+                    host: host.clone(),
+                    cors: mesh_cors.clone(),
+                });
+        }
+    }
+
     for (index, http) in http_routes.iter().copied().enumerate() {
         let route_candidates = route_candidate_paths(http);
         if route_candidates.is_empty() {
@@ -3626,6 +3653,48 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// `allowOrigin` exact list are all projected. This reuses the existing `cors`
 /// plugin instead of duplicating preflight/header logic, mirroring the
 /// `request_mirror` approach for `http[].mirror`.
+/// Build the mesh-slice-carried CORS policy from a `http[].corsPolicy` value
+/// (issue #1973). Returns `None` for a non-translatable policy — the SAME
+/// verdict `route_cors_plugin` reaches, because both funnel through
+/// `cors_policy_translatable` / `cors_allowed_origins`; a projection-
+/// equivalence unit test pins the two emissions against each other.
+fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
+    if !cors_policy_translatable(cors) {
+        return None;
+    }
+    let mut allowed_origins = Vec::new();
+    for origin in cors_allowed_origins(cors)? {
+        let matcher = match &origin {
+            Value::String(exact) => MeshCorsOriginMatch::Exact(exact.clone()),
+            Value::Object(map) => {
+                if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
+                    MeshCorsOriginMatch::Prefix(prefix.to_string())
+                } else if let Some(regex) = map.get("regex").and_then(Value::as_str) {
+                    MeshCorsOriginMatch::Regex(regex.to_string())
+                } else {
+                    // `cors_allowed_origins` only emits the three shapes
+                    // above; anything else is a translatability bug upstream —
+                    // stay fail-closed rather than approximate.
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        allowed_origins.push(matcher);
+    }
+    Some(MeshCorsPolicy {
+        allowed_origins,
+        allowed_methods: cors_string_array(cors, "allowMethods").unwrap_or_default(),
+        allowed_headers: cors_string_array(cors, "allowHeaders").unwrap_or_default(),
+        exposed_headers: cors_string_array(cors, "exposeHeaders").unwrap_or_default(),
+        max_age_seconds: cors
+            .get("maxAge")
+            .and_then(Value::as_str)
+            .and_then(parse_istio_duration_secs),
+        allow_credentials: cors.get("allowCredentials").and_then(Value::as_bool),
+    })
+}
+
 fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option<PluginConfig> {
     let cors = http.get("corsPolicy")?;
     // `cors_policy_translatable` is the single shared gate; the actual origin

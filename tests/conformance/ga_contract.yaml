@@ -51,18 +51,13 @@ capabilities:
       - category: istio_virtual_service
         feature: http[].corsPolicy
     live_suite: mesh-e2e-sidecar
+    # Live-backed via the mesh slice's `virtual_service_cors_policies`
+    # carriage (issue #1973): the client sidecar synthesizes the `cors`
+    # plugin onto its materialized outbound route, and the suite proves an
+    # allowed Origin reflected, a sidecar-answered 204 preflight, and a
+    # disallowed Origin rejected 403 by the plugin itself.
     live_assertions:
       - sidecar.virtual_service.cors_policy
-    # The VirtualService-derived `cors` plugin lands on GatewayConfig proxies;
-    # MeshSlice::from_gateway_config carries only the `mesh` block, so no
-    # deployment shape (file source or CP->DP) can put VS CORS on a live mesh
-    # sidecar route today. The semantic translation above remains
-    # conformance-pinned; live backing is blocked on carrying route-level
-    # plugins in the mesh slice.
-    live_deferred: >-
-      Mesh slice does not carry VirtualService-derived route plugins, so no
-      live sidecar deployment can exercise VS CORS; feature gap tracked in
-      issue #1973.
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#virtualservice-translation
     owner: mesh

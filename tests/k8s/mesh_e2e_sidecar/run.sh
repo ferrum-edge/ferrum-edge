@@ -35,6 +35,10 @@ set -euo pipefail
 #                                               HELD WebSocket session, rejects
 #                                               a concurrent upgrade 503, and
 #                                               recovers after release
+#   sidecar.virtual_service.cors_policy         VS-derived CORS on the client
+#                                               sidecar: allowed Origin
+#                                               reflected, preflight answered
+#                                               204, disallowed Origin 403
 #
 # The DestinationRule probe is TWO-PHASE on purpose: a black-holed dial (the
 # client pod's own OUTPUT DROP, so SYNs vanish deterministically with no
@@ -118,11 +122,13 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.request_auth.invalid_jwt_rejected
   sidecar.destination_rule.tcp_connect_timeout
   sidecar.destination_rule.tcp_max_connections
+  sidecar.virtual_service.cors_policy
 )
 # NOTE: every id except `sidecar.spire.workload_entries` (fixture
 # infrastructure, suite-local) backs a GA-contract capability row in
-# tests/conformance/ga_contract.yaml — keep the id strings in lock-step. The
-# one remaining `live_deferred` contract id is VS CORS (issue #1973).
+# tests/conformance/ga_contract.yaml — keep the id strings in lock-step. No
+# contract row is live-deferred: VS CORS was the last (issue #1973, closed by
+# the mesh-slice CORS carriage this suite now exercises).
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -608,6 +614,22 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
+  # VirtualService-derived CORS (issue #1973): Istio applies VS policy on the
+  # CLIENT sidecar, so the policy rides the client slice and the sidecar
+  # synthesizes a cors plugin onto its materialized svc outbound route. The
+  # plugin only acts on requests that carry an Origin header, so every other
+  # probe in this suite is unaffected. (No backticks in this heredoc: it
+  # interpolates, so a backticked word would run as command substitution.)
+  virtual_service_cors_policies:
+    - name: svc-cors
+      namespace: $NS
+      host: svc.$NS.svc.cluster.local
+      cors:
+        allowed_origins:
+          - exact: "https://fixture.example"
+        allowed_methods: ["GET", "POST", "OPTIONS"]
+        allowed_headers: ["content-type", "authorization"]
+        max_age_seconds: 600
   destination_rules:
     - name: slowsvc-connect-timeout
       namespace: $NS
@@ -813,6 +835,84 @@ probe_request_auth() {
   else
     record_live_assertion sidecar.request_auth.invalid_jwt_rejected fail \
       client svc "status=$status body=$body"
+    return 1
+  fi
+}
+
+# VirtualService-derived CORS on the client sidecar (issue #1973): the policy
+# rides the mesh slice and the sidecar synthesizes a `cors` plugin onto its
+# materialized svc outbound route. Three observations, one assertion:
+#   a) GET with the ALLOWED Origin -> 200 + the app marker + the origin
+#      reflected in `access-control-allow-origin` (retried until the route
+#      settles);
+#   b) OPTIONS preflight (allowed Origin + Access-Control-Request-Method) ->
+#      204 answered BY THE SIDECAR with `access-control-allow-methods`
+#      containing GET — the preflight never reaches the destination;
+#   c) GET with a DISALLOWED Origin -> 403 "CORS origin not allowed" (the
+#      cors plugin's own body — distinct from mesh_authz's, proving the
+#      client-side plugin rejected it) and never the app marker.
+probe_vs_cors() {
+  log "probing VirtualService-derived CORS on the svc outbound route"
+  local out a_status a_acao b_status b_methods c_status c_body rest
+  # shellcheck disable=SC2016
+  out="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c curl -- \
+    sh -c '
+      host="$1"; good="$2"; evil="$3"; marker="$4"
+      a_status=000
+      a_acao=no
+      a_body=""
+      for _ in $(seq 1 30); do
+        : >/tmp/b 2>/dev/null || true
+        : >/tmp/h 2>/dev/null || true
+        a_status="$(curl -s -m 10 -o /tmp/b -D /tmp/h -w "%{http_code}" \
+          -H "Host: $host" -H "Origin: $good" http://127.0.0.1:15001/ 2>/dev/null || true)"
+        [ -n "$a_status" ] || a_status=000
+        a_body="$(tr -d "\r\n" </tmp/b 2>/dev/null || true)"
+        if [ "$a_status" = "200" ] \
+          && grep -qi "^access-control-allow-origin: $good" /tmp/h \
+          && printf "%s" "$a_body" | grep -q "$marker"; then
+          a_acao=yes
+          break
+        fi
+        sleep 2
+      done
+      : >/tmp/h2 2>/dev/null || true
+      b_status="$(curl -s -m 10 -o /dev/null -D /tmp/h2 -w "%{http_code}" \
+        -X OPTIONS -H "Host: $host" -H "Origin: $good" \
+        -H "Access-Control-Request-Method: GET" http://127.0.0.1:15001/ 2>/dev/null || true)"
+      [ -n "$b_status" ] || b_status=000
+      b_methods=no
+      grep -qi "^access-control-allow-methods:.*GET" /tmp/h2 && b_methods=yes
+      : >/tmp/b3 2>/dev/null || true
+      c_status="$(curl -s -m 10 -o /tmp/b3 -w "%{http_code}" \
+        -H "Host: $host" -H "Origin: $evil" http://127.0.0.1:15001/ 2>/dev/null || true)"
+      [ -n "$c_status" ] || c_status=000
+      c_body="$(tr -d "\r\n" </tmp/b3 2>/dev/null || true)"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$a_status" "$a_acao" "$b_status" "$b_methods" "$c_status" "$c_body"
+    ' sh "$SVC_HOST" "https://fixture.example" "https://evil.example" "$APP_BODY" \
+    2>/dev/null || printf 'EXECFAIL\tno\t000\tno\t000\t')"
+  a_status="${out%%$'\t'*}"
+  rest="${out#*$'\t'}"
+  a_acao="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  b_status="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  b_methods="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  c_status="${rest%%$'\t'*}"
+  c_body="${rest#*$'\t'}"
+  log "VS CORS: allowed=$a_status/acao=$a_acao preflight=$b_status/methods=$b_methods denied=$c_status body=$c_body"
+  if [[ "$a_status" == "200" && "$a_acao" == "yes" && "$b_status" == "204" \
+    && "$b_methods" == "yes" && "$c_status" == "403" \
+    && "$c_body" == *"CORS origin not allowed"* && "$c_body" != *"$APP_BODY"* ]]; then
+    record_live_assertion sidecar.virtual_service.cors_policy pass \
+      client svc \
+      "allowed=200+acao preflight=204+methods denied=403-cors-plugin"
+  else
+    record_live_assertion sidecar.virtual_service.cors_policy fail \
+      client svc \
+      "allowed=$a_status/acao=$a_acao preflight=$b_status/methods=$b_methods denied=$c_status body=$c_body"
     return 1
   fi
 }
@@ -1093,6 +1193,7 @@ main() {
   probe_plaintext_rejected
   probe_rogue_denied
   probe_request_auth
+  probe_vs_cors
   probe_ws_max_connections
   probe_connect_timeout_two_phase
 

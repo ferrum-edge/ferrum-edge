@@ -27,12 +27,12 @@ are prepared to fail CI on its regression. The source of truth is
 `tests/conformance/ga_contract.yaml`. The **Stable sidecar traffic surface is
 now enrolled vertically** (semantic assertion → contract row → required live
 assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
-RequestAuthentication JWT, and DestinationRule
-`connectTimeout`/`maxConnections`, each backed by a `sidecar.*` live assertion
-the `mesh-e2e-sidecar` suite must emit and pass. The one declared-but-deferred
-live assertion is VirtualService CORS (`live_deferred`, issue #1973 — the mesh
-slice does not carry VS-derived route plugins); its semantic translation
-remains GA-gated. Stable rows outside the sidecar *traffic* surface (native
+RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
+and VirtualService CORS, each backed by a `sidecar.*` live assertion the
+`mesh-e2e-sidecar` suite must emit and pass. No row is `live_deferred`: the
+last (VS CORS) closed with issue #1973 — the mesh slice now carries
+`virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
+plugin onto its materialized outbound routes. Stable rows outside the sidecar *traffic* surface (native
 `MeshSubscribe` config transport, SPIFFE identity plumbing) enroll next;
 `coverage.md` lists the currently enrolled rows and required live assertion
 IDs, which are the authoritative answer to "what regression fails CI today."

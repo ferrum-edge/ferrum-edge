@@ -587,9 +587,10 @@ fn live_contract_rejects_stale_and_unparseable_created_at() {
 fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // Pin the real ga_contract.yaml against this validator: the Stable
     // sidecar surface is enrolled vertically (STRICT mTLS, authz ALLOW/DENY,
-    // RequestAuth JWT, DR connectTimeout + maxConnections all ENFORCED and
-    // emitted by tests/k8s/mesh_e2e_sidecar/run.sh), with VS CORS as the one
-    // documented deferral (issue #1973).
+    // RequestAuth JWT, DR connectTimeout + maxConnections, and VS CORS — all
+    // ENFORCED and emitted by tests/k8s/mesh_e2e_sidecar/run.sh; the last
+    // deferral, VS CORS, was closed by the mesh-slice CORS carriage of
+    // issue #1973).
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()
@@ -614,6 +615,7 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.request_auth.invalid_jwt_rejected",
         "sidecar.destination_rule.tcp_connect_timeout",
         "sidecar.destination_rule.tcp_max_connections",
+        "sidecar.virtual_service.cors_policy",
     ] {
         assert!(
             enforced_ids.contains(&required),
@@ -625,10 +627,9 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         .filter(|capability| capability.live_deferred.is_some())
         .map(|capability| capability.id.as_str())
         .collect();
-    assert_eq!(
-        deferred,
-        vec!["mesh.virtual_service.cors_policy"],
-        "VS CORS must be the only live-deferred sidecar row"
+    assert!(
+        deferred.is_empty(),
+        "no sidecar row should remain live-deferred (found: {deferred:?})"
     );
     for capability in sidecar_rows
         .iter()

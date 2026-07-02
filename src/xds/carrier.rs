@@ -45,8 +45,8 @@ use std::collections::BTreeMap;
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, ResolvedIngressListener,
-    ServiceEntry, TrustBundleSet, Workload,
+    MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
+    ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
 };
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 
@@ -112,6 +112,11 @@ pub const FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL: &str =
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
+/// Inner `type_url` for VirtualService-derived host-level CORS policies
+/// (issue #1973); the DP synthesizes per-route `cors` plugin instances onto
+/// materialized outbound routes from these.
+pub const FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceCorsPoliciesCarrier";
 /// Inner `type_url` for the PeerAuthentication carrier.
 pub const FERRUM_ECDS_PEER_AUTH_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.PeerAuthenticationsCarrier";
@@ -171,6 +176,7 @@ pub enum MeshSliceCarrier {
     /// only emits it when set); see [`FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL`].
     LabelsAmbiguous(bool),
     MeshPolicies(Vec<MeshPolicy>),
+    VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
     RequestAuthentications(Vec<MeshRequestAuthentication>),
     ServiceEntries(Vec<ServiceEntry>),
@@ -209,6 +215,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
+            MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
+                FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL
+            }
             MeshSliceCarrier::PeerAuthentications(_) => FERRUM_ECDS_PEER_AUTH_TYPE_URL,
             MeshSliceCarrier::RequestAuthentications(_) => FERRUM_ECDS_REQUEST_AUTH_TYPE_URL,
             MeshSliceCarrier::ServiceEntries(_) => FERRUM_ECDS_SERVICE_ENTRIES_TYPE_URL,
@@ -235,6 +244,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
+            MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
             MeshSliceCarrier::RequestAuthentications(_) => "request-authentications",
             MeshSliceCarrier::ServiceEntries(_) => "service-entries",
@@ -262,6 +272,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
+            MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
             MeshSliceCarrier::PeerAuthentications(value) => encode(value),
             MeshSliceCarrier::RequestAuthentications(value) => encode(value),
             MeshSliceCarrier::ServiceEntries(value) => encode(value),
@@ -315,6 +326,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
+            }
+            FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
+                MeshSliceCarrier::VirtualServiceCorsPolicies(decode_json(value)?)
             }
             FERRUM_ECDS_PEER_AUTH_TYPE_URL => {
                 MeshSliceCarrier::PeerAuthentications(decode_json(value)?)
@@ -378,6 +392,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
             Some("ferrum-mesh-carrier/workload-labels-ambiguous")
         }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
+        FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
+            Some("ferrum-mesh-carrier/virtual-service-cors-policies")
+        }
         FERRUM_ECDS_PEER_AUTH_TYPE_URL => Some("ferrum-mesh-carrier/peer-authentications"),
         FERRUM_ECDS_REQUEST_AUTH_TYPE_URL => Some("ferrum-mesh-carrier/request-authentications"),
         FERRUM_ECDS_SERVICE_ENTRIES_TYPE_URL => Some("ferrum-mesh-carrier/service-entries"),
@@ -487,6 +504,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
+    if !slice.virtual_service_cors_policies.is_empty() {
+        carriers.push(MeshSliceCarrier::VirtualServiceCorsPolicies(
+            slice.virtual_service_cors_policies.clone(),
+        ));
+    }
     if !slice.peer_authentications.is_empty() {
         carriers.push(MeshSliceCarrier::PeerAuthentications(
             slice.peer_authentications.clone(),
@@ -549,6 +571,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
+        MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
+            slice.virtual_service_cors_policies = value
+        }
         MeshSliceCarrier::PeerAuthentications(value) => slice.peer_authentications = value,
         MeshSliceCarrier::RequestAuthentications(value) => slice.request_authentications = value,
         MeshSliceCarrier::ServiceEntries(value) => slice.service_entries = value,
@@ -659,6 +684,7 @@ mod tests {
             )])),
             MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
+            MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
             MeshSliceCarrier::ServiceEntries(Vec::new()),
@@ -747,6 +773,7 @@ mod tests {
             )])),
             MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
+            MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
             MeshSliceCarrier::ServiceEntries(Vec::new()),

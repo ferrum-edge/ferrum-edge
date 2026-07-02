@@ -10,7 +10,7 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb,
-    MeshTrafficPolicy,
+    MeshTrafficPolicy, cors_plugin_config_from_mesh_policy,
 };
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
@@ -950,3 +950,153 @@ fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_poli
 // `resolve_effective_proxy_for_target` is `pub(crate)`, so the per-field
 // projection and Cow::Borrowed/Owned branches are tested inline in
 // `src/proxy/mod.rs` (see the `resolve_effective_proxy_*` tests block).
+
+// ── VirtualService-derived CORS on materialized mesh outbound routes ────────
+//
+// Issue #1973 coverage. These live here (rather than mesh_l7_routing_tests)
+// to reuse this file's `runtime()` + `prepare_gateway_config_for_mesh`
+// harness — the property under test is route-policy application at mesh
+// prepare time, the same layer the DR tests above exercise.
+
+#[test]
+fn virtual_service_cors_policy_synthesizes_cors_plugin_on_mesh_outbound_route() {
+    // The mesh document shape is exactly what the file source accepts —
+    // doubling as a schema pin for the live fixture's client config. The
+    // bare-name `host: svc` must resolve with DestinationRule host semantics.
+    let mesh: MeshConfig = serde_yaml::from_str(
+        r#"
+workloads:
+  - spiffe_id: spiffe://cluster.local/ns/default/sa/svc
+    service_name: svc
+    namespace: default
+    trust_domain: cluster.local
+    service_account: svc
+    addresses: ["10.0.0.9"]
+    ports:
+      - port: 8080
+        protocol: http
+        name: http
+    selector:
+      namespace: default
+services:
+  - name: svc
+    namespace: default
+    ports:
+      - port: 8080
+        protocol: http
+        name: http
+    workloads:
+      - spiffe_id: spiffe://cluster.local/ns/default/sa/svc
+virtual_service_cors_policies:
+  - name: svc-cors
+    namespace: default
+    host: svc
+    cors:
+      allowed_origins:
+        - exact: "https://fixture.example"
+      allowed_methods: ["GET", "OPTIONS"]
+      max_age_seconds: 600
+"#,
+    )
+    .expect("mesh yaml parses");
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "__mesh-outbound-default-svc-8080")
+        .expect("materialized outbound route");
+    let plugin = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == "__mesh-cors-default-svc-8080")
+        .expect("synthesized cors plugin config");
+    assert_eq!(plugin.plugin_name, "cors");
+    assert_eq!(plugin.proxy_id.as_deref(), Some(proxy.id.as_str()));
+    assert!(plugin.enabled);
+    assert_eq!(
+        plugin.config["allowed_origins"],
+        serde_json::json!(["https://fixture.example"])
+    );
+    assert_eq!(
+        plugin.config["allowed_methods"],
+        serde_json::json!(["GET", "OPTIONS"])
+    );
+    assert_eq!(plugin.config["max_age"], serde_json::json!(600));
+    assert!(
+        plugin.config.get("preflight_continue").is_none(),
+        "the plugin must answer preflights itself (Istio semantics)"
+    );
+    assert!(
+        proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == plugin.id),
+        "route must carry the plugin association"
+    );
+}
+
+#[test]
+fn virtual_service_cors_policy_rides_the_mesh_block_and_matches_gateway_projection() {
+    let translated = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-cors",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local", "svc"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/"}}],
+                    "route": [{"destination": {
+                        "host": "svc.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }}],
+                    "corsPolicy": {
+                        "allowOrigins": [
+                            {"exact": "https://fixture.example"},
+                            {"prefix": "https://app."},
+                            {"regex": "https://.*\\.example\\.com"}
+                        ],
+                        "allowMethods": ["GET", "POST"],
+                        "allowHeaders": ["x-fixture"],
+                        "exposeHeaders": ["x-out"],
+                        "maxAge": "10m",
+                        "allowCredentials": true
+                    }
+                }]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+
+    let mesh = translated.config.mesh.as_ref().expect("mesh block");
+    assert_eq!(
+        mesh.virtual_service_cors_policies.len(),
+        2,
+        "one carried policy per VS host"
+    );
+    let policy = &mesh.virtual_service_cors_policies[0];
+    assert_eq!(policy.name, "vs-cors");
+    assert_eq!(policy.namespace, "default");
+    assert_eq!(policy.host, "svc.default.svc.cluster.local");
+
+    // Single-source-of-truth pin: the slice-carried typed policy must project
+    // to EXACTLY the plugin config the gateway-side translation emits for the
+    // same corsPolicy — if either projection drifts, this fails.
+    let gateway_cors = translated
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "cors")
+        .expect("gateway-side cors plugin emitted");
+    assert_eq!(
+        cors_plugin_config_from_mesh_policy(&policy.cors),
+        gateway_cors.config,
+        "slice-carried and gateway-projected CORS configs must be identical"
+    );
+}
