@@ -1184,7 +1184,7 @@ fn virtual_service_cors_policy_respects_gateways_and_first_bearing_route() {
                 "hosts": ["svc.default.svc.cluster.local"],
                 "http": [
                     {
-                        "match": [{"uri": {"prefix": "/a"}}],
+                        "match": [{"uri": {"prefix": "/"}}],
                         "route": [{"destination": {
                             "host": "svc.default.svc.cluster.local",
                             "port": {"number": 8080}
@@ -1357,7 +1357,7 @@ fn virtual_service_cors_policy_skips_gateway_scoped_matches() {
                         "corsPolicy": {"allowOrigins": [{"exact": "https://ingress-only.example"}]}
                     },
                     {
-                        "match": [{"uri": {"prefix": "/mesh"}, "gateways": ["mesh"]}],
+                        "match": [{"uri": {"prefix": "/"}, "gateways": ["mesh"]}],
                         "route": [{"destination": {
                             "host": "svc.default.svc.cluster.local",
                             "port": {"number": 8080}
@@ -1440,5 +1440,125 @@ virtual_service_cors_policies:
             .iter()
             .any(|plugin| plugin.id.starts_with("__mesh-cors-")),
         "no cors plugin may be synthesized for a sidecarless topology"
+    );
+}
+
+#[test]
+fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
+    // Whitespace-padded wildcard exacts must defer like their unpadded forms:
+    // the cors plugin TRIMS plain-string origins before interpreting wildcard
+    // syntax, so " *" would otherwise become allow-all.
+    for padded in [" *", " *.example.com", "*.example.com "] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-padded-wildcard",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": padded}]}
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("VirtualService translates");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "padded wildcard exact `{padded}` must not ride the mesh slice"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "padded wildcard exact `{padded}` must not project a gateway cors plugin"
+        );
+    }
+
+    // A predicate-scoped corsPolicy-bearing entry (narrow uri here; headers/
+    // port/sourceLabels behave identically via the fail-closed default arm)
+    // is NOT host-wide-representable: it neither donates its policy to the
+    // slice nor suppresses a later host-wide entry.
+    let predicate_scoped = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-predicate-scoped",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://api-only.example"}]}
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://host-wide.example"}]}
+                    }
+                ]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+    let mesh = predicate_scoped.config.mesh.as_ref().expect("mesh block");
+    assert_eq!(mesh.virtual_service_cors_policies.len(), 1);
+    assert_eq!(
+        cors_plugin_config_from_mesh_policy(&mesh.virtual_service_cors_policies[0].cors)["allowed_origins"],
+        serde_json::json!(["https://host-wide.example"]),
+        "the host-wide entry's policy must be carried, never the route-scoped one's"
+    );
+
+    // A VS whose ONLY corsPolicy-bearing entries are predicate-scoped carries
+    // nothing (header-predicate variant exercises the fail-closed default arm).
+    let scoped_only = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-scoped-only",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{
+                        "uri": {"prefix": "/"},
+                        "headers": {"x-canary": {"exact": "true"}}
+                    }],
+                    "route": [{"destination": {
+                        "host": "svc.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }}],
+                    "corsPolicy": {"allowOrigins": [{"exact": "https://canary.example"}]}
+                }]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+    assert!(
+        scoped_only
+            .config
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+            .unwrap_or(true),
+        "a header-scoped corsPolicy must not be promoted host-wide"
     );
 }

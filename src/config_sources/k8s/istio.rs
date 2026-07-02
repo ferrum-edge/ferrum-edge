@@ -2644,10 +2644,12 @@ fn virtual_service_routes(
     //   gateways (no reserved `mesh` entry) never applies to sidecars in
     //   Istio, so it is not carried; an omitted `gateways` defaults to mesh.
     // - Host-level application takes the FIRST corsPolicy-BEARING `http[]`
-    //   entry (materialized mesh routes are host-routed `/`); if THAT entry's
-    //   policy is not translatable, NOTHING is carried — promoting a later
-    //   route's policy host-wide would enforce the wrong CORS on paths whose
-    //   own policy was deferred.
+    //   entry AMONG the host-wide-representable candidates (no match, or a
+    //   catch-all `/` prefix on a mesh gateway — see
+    //   `http_entry_cors_applies_host_wide`; predicate-scoped entries neither
+    //   donate nor suppress). If that candidate's policy is not translatable,
+    //   NOTHING is carried — promoting a later route's policy host-wide
+    //   would enforce the wrong CORS on paths whose own policy was deferred.
     // - `spec.exportTo` visibility is carried for slice narrowing; an omitted
     //   exportTo becomes an explicit `["*"]` so Istio's public default is
     //   preserved (the mesh model's EMPTY export_to is namespace-local by
@@ -2661,7 +2663,7 @@ fn virtual_service_routes(
     if applies_to_sidecars
         && let Some(mesh_cors) = http_routes
             .iter()
-            .filter(|http| http_entry_applies_to_mesh(http))
+            .filter(|http| http_entry_cors_applies_host_wide(http))
             .find(|http| http.get("corsPolicy").is_some())
             .and_then(|http| http.get("corsPolicy"))
             .and_then(mesh_cors_policy_from_value)
@@ -3597,7 +3599,8 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
             let s = entry.as_str()?;
-            if s.is_empty() || s.starts_with('*') {
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.starts_with('*') {
                 return None;
             }
             origins.push(Value::String(s.to_string()));
@@ -3634,7 +3637,11 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 
     match (exact, prefix, regex) {
         (Some(exact), None, None) => {
-            if exact.is_empty() || exact.starts_with('*') {
+            // Match the plugin's own parsing posture: `CorsPlugin` TRIMS
+            // plain-string origins before interpreting `*`/`*.` wildcard
+            // syntax, so a whitespace-padded `" *"` must hit this guard too.
+            let trimmed = exact.trim();
+            if trimmed.is_empty() || trimmed.starts_with('*') {
                 // A wildcard-shaped `exact` (`*`, `*.example.com`) can never
                 // match a real Origin under Istio's literal-exact semantics,
                 // but the cors plugin's PLAIN-STRING form would interpret it
@@ -3691,27 +3698,62 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// `allowOrigin` exact list are all projected. This reuses the existing `cors`
 /// plugin instead of duplicating preflight/header logic, mirroring the
 /// `request_mirror` approach for `http[].mirror`.
-/// Whether a VirtualService `http[]` entry applies to sidecars: its `match[]`
-/// is omitted/empty, or ANY match's `gateways` is omitted or names the
-/// reserved `mesh` gateway. Istio scopes a match-level `gateways` list to the
-/// named gateways only, so an ingress-scoped entry must neither donate its
-/// CORS policy to the mesh slice nor suppress a later mesh-bound one.
-fn http_entry_applies_to_mesh(http: &Value) -> bool {
+/// Whether a VirtualService `http[]` entry's CORS policy can honestly be
+/// applied HOST-WIDE on materialized mesh routes (which are host-routed `/`):
+/// its `match[]` is omitted/empty, or SOME match both applies to the mesh
+/// (`gateways` omitted or naming the reserved `mesh` gateway) and constrains
+/// nothing beyond a catch-all `/` uri prefix. An entry scoped by any other
+/// predicate — a narrower uri, `headers`, `port`, `sourceLabels`, `method`,
+/// `queryParams`, `withoutHeaders`, … — is route-scoped, and promoting its
+/// CORS host-wide would enforce it (including disallowed-Origin 403s) on
+/// traffic the predicates never matched. Route-scoped and non-mesh-gateway
+/// entries neither donate their policy nor suppress a later host-wide one.
+fn http_entry_cors_applies_host_wide(http: &Value) -> bool {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
         return true;
     };
     if matches.is_empty() {
         return true;
     }
-    matches.iter().any(
-        |entry| match entry.get("gateways").and_then(Value::as_array) {
-            None => true,
-            Some(gateways) => gateways
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|gateway| gateway == "mesh"),
-        },
-    )
+    matches.iter().any(|entry| {
+        let Some(predicates) = entry.as_object() else {
+            return false;
+        };
+        for (key, value) in predicates {
+            match key.as_str() {
+                "gateways" => {
+                    let names_mesh = value
+                        .as_array()
+                        .map(|gateways| {
+                            gateways
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .any(|gateway| gateway == "mesh")
+                        })
+                        .unwrap_or(false);
+                    if !names_mesh {
+                        return false;
+                    }
+                }
+                "uri" => {
+                    let catch_all = value
+                        .get("prefix")
+                        .and_then(Value::as_str)
+                        .map(|prefix| prefix == "/" || prefix.is_empty())
+                        .unwrap_or(false);
+                    if !catch_all {
+                        return false;
+                    }
+                }
+                // Route-name metadata, not a routing predicate.
+                "name" => {}
+                // Any other predicate is route scoping — fail closed to
+                // "not host-wide" for unknown/future predicates too.
+                _ => return false,
+            }
+        }
+        true
+    })
 }
 
 /// Build the mesh-slice-carried CORS policy from a `http[].corsPolicy` value
