@@ -38,8 +38,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 .github/scripts/live_suite_path_filter.py --self-test
           changed_files="$RUNNER_TEMP/mesh-e2e-sidecar-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/live_suite_path_filter.py"
           : > "$changed_files"
 
           filter_args=(--suite mesh-e2e-sidecar --changed-files "$changed_files")
@@ -57,12 +57,15 @@ jobs:
               echo "git fetch of ${BASE_REF} failed after 3 attempts" >&2
               exit 1
             fi
+            git show "origin/${BASE_REF}:.github/scripts/live_suite_path_filter.py" > "$trusted_filter"
             git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$changed_files"
           else
+            cp .github/scripts/live_suite_path_filter.py "$trusted_filter"
             filter_args+=(--force-run)
           fi
 
-          plan="$(python3 .github/scripts/live_suite_path_filter.py "${filter_args[@]}")"
+          python3 "$trusted_filter" --self-test
+          plan="$(python3 "$trusted_filter" "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"

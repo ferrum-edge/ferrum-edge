@@ -1454,14 +1454,19 @@ jobs:
         run: |
           set -euo pipefail
           changed_files="$RUNNER_TEMP/mesh-e2e-sidecar-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/live_suite_path_filter.py"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            git show "origin/${{ github.base_ref }}:.github/scripts/live_suite_path_filter.py" > "$trusted_filter"
             git diff --name-only "origin/${{ github.base_ref }}...HEAD" | sort > "$changed_files"
           else
+            cp .github/scripts/live_suite_path_filter.py "$trusted_filter"
             : > "$changed_files"
           fi
 
+          python3 "$trusted_filter" --self-test
           if [ "${{ github.event_name }}" != "pull_request" ]; then
-            python3 .github/scripts/live_suite_path_filter.py \
+            python3 "$trusted_filter" \
               --suite mesh-e2e-sidecar \
               --changed-files "$changed_files" \
               --force-run \
@@ -1470,7 +1475,7 @@ jobs:
             exit 0
           fi
 
-          filter_output="$(python3 .github/scripts/live_suite_path_filter.py \
+          filter_output="$(python3 "$trusted_filter" \
             --suite mesh-e2e-sidecar \
             --changed-files "$changed_files")"
           printf '%s\n' "$filter_output" >> "$GITHUB_STEP_SUMMARY"
