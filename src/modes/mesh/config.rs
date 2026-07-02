@@ -2709,7 +2709,8 @@ fn validate_virtual_service_cors_policies(
         // `plugins::cors::{validate_method,validate_header_name}`, not a
         // fork) here so a bad token rejects the slice at the config boundary
         // instead of failing plugin-cache construction on the data plane.
-        let string_lists: [(&str, &[String], fn(&str, &str) -> Result<(), String>); 3] = [
+        type TokenValidator = fn(&str, &str) -> Result<(), String>;
+        let string_lists: [(&str, &[String], TokenValidator); 3] = [
             (
                 "allowed_methods",
                 &policy.cors.allowed_methods,
