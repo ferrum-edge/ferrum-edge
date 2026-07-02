@@ -17,7 +17,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamLocalityLbSetting, UpstreamTarget,
+    GatewayConfig, LoadBalancerAlgorithm, MeshSdTopology, Upstream, UpstreamLocalityLbSetting,
+    UpstreamTarget,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -190,6 +191,7 @@ async fn mesh_multicluster_discoverer_resolves_local_and_remote_targets() {
         "default".to_string(),
         None,
         1,
+        MeshSdTopology::Ambient,
     );
 
     let targets = discoverer.discover().await.expect("discover succeeds");

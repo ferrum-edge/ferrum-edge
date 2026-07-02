@@ -1050,6 +1050,7 @@ fn test_mesh_sd_namespace_must_match_upstream_namespace() {
             namespace: Some("staging".to_string()),
             port: None,
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });
@@ -1076,6 +1077,7 @@ fn test_mesh_sd_namespace_matching_upstream_passes() {
             namespace: Some("prod".to_string()),
             port: None,
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });
@@ -1095,6 +1097,7 @@ fn test_mesh_sd_namespace_omitted_passes() {
             namespace: None,
             port: None,
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });
@@ -1915,6 +1918,7 @@ fn test_mesh_service_name_required() {
             namespace: None,
             port: Some(8080),
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });
@@ -1938,6 +1942,7 @@ fn test_mesh_port_zero_rejected() {
             namespace: Some("default".into()),
             port: Some(0),
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });
@@ -1959,6 +1964,7 @@ fn test_mesh_valid_optional_fields() {
             namespace: Some("production".into()),
             port: Some(8080),
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });

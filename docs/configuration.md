@@ -988,9 +988,10 @@ upstreams:
         namespace: "backend"   # optional; defaults to the upstream namespace
         port: 8080             # optional; defaults to the first mesh service port
         poll_interval_seconds: 5
+        topology: sidecar      # optional; `ambient` (default, HBONE) or `sidecar` (SVID-mTLS)
 ```
 
-The mesh provider reads the CP-delivered `mesh.services` and `mesh.workloads` snapshot already present in gateway DP config. It converts matching workload addresses into upstream targets tagged with `mesh.spiffe_id`, `mesh.namespace`, and `mesh.hbone=true`, allowing later gateway-to-mesh transport features to select mesh-aware backends without a separate registry.
+The mesh provider reads the CP-delivered `mesh.services` and `mesh.workloads` snapshot already present in gateway DP config. It converts matching workload addresses into upstream targets tagged with `mesh.spiffe_id`, `mesh.namespace`, and the destination topology's mesh transport tag — `mesh.hbone=true` for `topology: ambient` (HBONE HTTP/2 CONNECT to the peer's `:15008` listener) or `mesh.mtls=true` for `topology: sidecar` (plain SVID-mTLS HTTP/2 to the peer sidecar's `:15006` inbound listener) — so the gateway-to-mesh bridge dispatches over the transport the destination actually serves (see `docs/mesh.md` → Gateway Mesh Service Discovery). Set `topology` to match the destination mesh; a mismatch fails closed at dispatch rather than silently downgrading.
 
 Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 

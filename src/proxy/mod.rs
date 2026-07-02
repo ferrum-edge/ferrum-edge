@@ -1918,10 +1918,10 @@ fn can_attempt_hbone_backend(
 
 /// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
 /// (`mesh.mtls=true` tag). Unlike HBONE there is no capability-registry gate:
-/// `mesh.mtls` targets are produced only by the mesh outbound materializer for
-/// slice-declared sidecar peers, so the peer's transport is known by
-/// construction — a failed dial is a connection error, not a capability
-/// classification signal.
+/// `mesh.mtls` targets are produced only by the mesh outbound materializer and
+/// by `sidecar`-topology mesh service discovery, both for slice-declared
+/// sidecar peers, so the peer's transport is known by construction — a failed
+/// dial is a connection error, not a capability classification signal.
 fn supports_mesh_mtls_backend(
     state: &ProxyState,
     proxy: &Proxy,

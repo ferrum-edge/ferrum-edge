@@ -1383,7 +1383,7 @@ To surface the conflict instead of 502-ing every matched request, `GatewayConfig
 - A retry policy counts as **effective** using the same gates the runtime applies: `max_retries > 0`, and either `retry_on_connect_failure` (method-agnostic) or status-code retries whose `retryable_methods` actually overlap the proxy's `allowed_methods` (status retries scoped to methods the proxy cannot serve can never fire, so they do **not** trigger rejection).
 - A target's `mesh.hbone` / `mesh.mtls` requirement is detected with the **runtime tag predicates** (`target_hbone_enabled` / `target_mesh_mtls_enabled`), so the boolish truthy values the dispatch path honors (`true` / `yes` / `on` / `1`) are matched, not just the literal `"true"`.
 - **Subset-aware:** when the proxy selects an `upstream_subset`, only targets in that subset are considered — a retry policy is allowed when the selected subset excludes all mesh-only targets.
-- **Mesh service-discovery upstreams** (`service_discovery.provider = mesh`) are treated as HBONE-requiring even with no static targets, because discovered targets are stamped `mesh.hbone=true` once the discoverer populates them.
+- **Mesh service-discovery upstreams** (`service_discovery.provider = mesh`) are treated as mesh-transport-requiring even with no static targets, because discovered targets are stamped with the configured `topology`'s transport tag once the discoverer populates them (`mesh.hbone=true` for `ambient`, `mesh.mtls=true` for `sidecar`).
 - **Route overrides:** `mesh_route_dispatch` rules that override `route_override_upstream_id` to a different (mesh-tagged) upstream are included in the conflict check, so a plain default upstream with a mesh-routed override is rejected rather than 502-ing the matched traffic.
 
 The fix is admission-only (issue #1669, option (a)) — it does not change the runtime dispatch behavior; it converts a silent 502 into an actionable config error. Operators who need retry on a mesh destination must drop the conflicting `Proxy.retry` (or scope it to a non-mesh subset).
@@ -2051,7 +2051,25 @@ The CP tracks connected mesh nodes in `MeshNodeRegistry` (DashMap, `src/grpc/mes
 
 Gateway database/file/DP modes can resolve mesh services through an upstream `service_discovery` block with `provider: mesh`. The provider reads the current CP-delivered `GatewayConfig.mesh` snapshot, finds a `MeshService` by `service_name` and namespace, resolves its workload SPIFFE references to workload addresses, and publishes ordinary `UpstreamTarget` entries into the existing load balancer cache.
 
-Generated targets are tagged with `mesh.spiffe_id`, `mesh.namespace`, `mesh.service`, `mesh.trust_domain`, and `mesh.hbone=true`. This keeps the north-south gateway on the same discovery model as mesh mode while giving later gateway-to-mesh transport phases enough metadata to prefer HBONE/mTLS paths.
+Generated targets are tagged with `mesh.spiffe_id`, `mesh.namespace`, `mesh.service`, `mesh.trust_domain`, plus the **destination topology's transport tag** selected by `service_discovery.mesh.topology`:
+
+- `topology: ambient` (default) — targets carry `mesh.hbone=true` and dispatch through the HBONE outbound pool (HTTP/2 CONNECT over SVID mTLS to the peer's `:15008` listener). This is the right choice when the destination mesh runs the Ambient/waypoint topology.
+- `topology: sidecar` — targets carry `mesh.mtls=true` and dispatch through the Sidecar SVID-mTLS pool (plain HTTP/2 over mutual TLS to the peer sidecar's `:15006` inbound listener). When the destination service declares **more than one** HTTP-family port, each target also carries `mesh.mtls_authority_port` (the owning Service port) so dispatch rewrites the request `:authority` and the destination sidecar's per-port inbound siblings can disambiguate the direct `:15006` dial — the same contract mesh-mode Sidecar egress applies.
+
+The two transports are **not interchangeable**: mesh transports are per-topology (see [Datapath Layering](#gateway-to-mesh-bridge)), and a Sidecar peer has no HBONE listener — an `ambient`-topology upstream pointed at sidecar workloads fails closed with a `502` at dispatch rather than silently downgrading. Configure `topology` to match the destination mesh.
+
+```yaml
+upstreams:
+  - id: reviews-mesh
+    service_discovery:
+      provider: mesh
+      mesh:
+        service_name: reviews
+        port: 9080
+        topology: sidecar   # destination mesh runs the Sidecar topology
+```
+
+This keeps the north-south gateway on the same discovery model as mesh mode while dispatching over the same per-topology transport contract the mesh-mode materializer emits.
 
 ### Auto-Injected Plugins
 
@@ -2069,7 +2087,7 @@ Reserved mesh-managed plugin IDs are updated in place on each slice apply. If a 
 
 ## Gateway-to-Mesh Bridge
 
-Non-mesh gateway modes (`database`, `file`, `cp`, `dp`) can route traffic into the mesh via the gateway-to-mesh bridge. This enables a Ferrum gateway operating as an ingress or API gateway to forward requests to mesh workloads over HBONE with full SPIFFE mTLS.
+Non-mesh gateway modes (`database`, `file`, `cp`, `dp`) can route traffic into the mesh via the gateway-to-mesh bridge. This enables a Ferrum gateway operating as an ingress or API gateway to forward requests to mesh workloads over the destination topology's secured transport with full SPIFFE mTLS: **HBONE** (`:15008`) for Ambient/waypoint destinations, **plain SVID-mTLS HTTP/2** (`:15006`) for Sidecar destinations. The transport is selected per upstream by `service_discovery.mesh.topology` (or by which `mesh.*` transport tag statically configured targets carry); it must match the destination mesh's topology — the transports are not interchangeable, and a mismatch fails closed at dispatch.
 
 ### Trust Bundle Distribution
 
@@ -2081,9 +2099,13 @@ When an upstream target is tagged with `mesh.hbone=true` metadata, the gateway r
 
 On HBONE connect failure or malformed HBONE target metadata, tagged dispatch fails closed with an HBONE error response instead of falling back to plain HTTP.
 
+### Sidecar SVID-mTLS Outbound Pool
+
+When an upstream target is tagged with `mesh.mtls=true` metadata (a Sidecar-topology destination), the gateway routes requests through the Sidecar mesh-mTLS pool (`MeshMtlsConnectionPool`) — plain HTTP/2 over mutual TLS to the peer sidecar's `:15006` inbound listener — using the same gateway SPIFFE identity and SVID-fingerprint pool keying as HBONE. The target's `mesh.spiffe_id` pins the expected peer identity: the destination sidecar's server SVID URI SAN must equal it, so trust-domain membership alone is not enough. A `mesh.mtls`-tagged target that cannot dispatch over the secured transport (missing gateway SVID, missing pinned peer) fails closed with a `502` instead of falling back to plain HTTP.
+
 ### Mesh Service Discovery
 
-A `service_discovery.provider: mesh` option resolves upstream targets from CP-delivered mesh service and workload snapshots. The provider maps workload addresses and ports into upstream targets with SPIFFE/HBONE metadata tags, enabling the HBONE outbound pool to route transparently. Target lists are refreshed on every mesh slice update.
+A `service_discovery.provider: mesh` option resolves upstream targets from CP-delivered mesh service and workload snapshots. The provider maps workload addresses and ports into upstream targets with SPIFFE identity tags plus the configured topology's transport tag (`mesh.hbone` for `ambient`, `mesh.mtls` for `sidecar` — see [Gateway Mesh Service Discovery](#gateway-mesh-service-discovery)), enabling the matching outbound pool to route transparently. Target lists are refreshed on every mesh slice update.
 
 Identity baggage from the client request is stripped from tunneled inner HBONE requests to prevent identity spoofing across the gateway boundary.
 

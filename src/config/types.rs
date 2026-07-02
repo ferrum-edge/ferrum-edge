@@ -1388,6 +1388,37 @@ pub struct MeshSdConfig {
     /// Poll interval in seconds for checking the local mesh snapshot. Default: 30.
     #[serde(default = "default_sd_poll_interval")]
     pub poll_interval_seconds: u64,
+    /// Destination mesh topology. Selects which mesh transport discovered
+    /// targets are tagged for: `ambient` (default) tags targets `mesh.hbone`
+    /// (HTTP/2 CONNECT over SVID mTLS to the peer's `:15008` HBONE listener);
+    /// `sidecar` tags targets `mesh.mtls` (plain SVID-mTLS HTTP/2 to the peer
+    /// sidecar's `:15006` inbound listener — sidecars have no HBONE listener,
+    /// so `ambient` targets pointed at sidecar workloads fail closed with 502).
+    #[serde(default, skip_serializing_if = "MeshSdTopology::is_default")]
+    pub topology: MeshSdTopology,
+}
+
+/// Destination mesh topology for gateway-to-mesh service discovery
+/// ([`MeshSdConfig`]). Mesh transports are per-topology: Ambient/waypoint
+/// peers accept HBONE on `:15008`, Sidecar peers accept plain SVID-mTLS HTTP/2
+/// on `:15006` — a target must carry the transport tag its destination
+/// actually serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshSdTopology {
+    /// Ambient/waypoint destinations: discovered targets are tagged
+    /// `mesh.hbone=true` and dispatch through the HBONE outbound pool.
+    #[default]
+    Ambient,
+    /// Sidecar destinations: discovered targets are tagged `mesh.mtls=true`
+    /// and dispatch through the Sidecar SVID-mTLS pool.
+    Sidecar,
+}
+
+impl MeshSdTopology {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Service discovery configuration for an upstream.
@@ -2647,23 +2678,34 @@ fn mesh_sd_policy_port(
 /// [`retry_is_effective_for_mesh_target`] per entry.
 ///
 /// Mesh service-discovery upstreams (`service_discovery.provider = Mesh`) are
-/// treated as HBONE-requiring even with no static targets, because discovered
-/// targets are stamped `mesh.hbone=true` by the mesh discoverer.
+/// treated as mesh-transport-requiring even with no static targets, because
+/// discovered targets are stamped with the configured topology's transport tag
+/// by the mesh discoverer (`mesh.hbone` for `ambient`, `mesh.mtls` for
+/// `sidecar`).
 fn upstream_required_mesh_transports(
     upstream: &Upstream,
     selected_subset: Option<&str>,
     mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> Vec<MeshTransportConflict> {
-    // Mesh service-discovery upstreams publish HBONE-required targets
+    // Mesh service-discovery upstreams publish mesh-transport-required targets
     // dynamically; their static `targets` list is typically empty at admission.
-    if upstream
+    if let Some(sd) = upstream
         .service_discovery
         .as_ref()
-        .is_some_and(|sd| sd.provider == SdProvider::Mesh)
+        .filter(|sd| sd.provider == SdProvider::Mesh)
     {
+        let topology = sd
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.topology)
+            .unwrap_or_default();
+        let transport = match topology {
+            MeshSdTopology::Ambient => "mesh.hbone",
+            MeshSdTopology::Sidecar => "mesh.mtls",
+        };
         let policy_port = mesh_sd_policy_port(upstream, mesh_model);
         return vec![MeshTransportConflict {
-            transport: "mesh.hbone",
+            transport,
             detail: "mesh service discovery".to_string(),
             // Mirror mesh service discovery: explicit `mesh.port` wins, otherwise
             // the first declared Service port owns the discovered targets. If no

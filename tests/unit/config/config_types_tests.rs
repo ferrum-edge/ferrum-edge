@@ -1825,6 +1825,7 @@ fn retry_proxy_rejects_mesh_service_discovery_upstream() {
             namespace: None,
             port: None,
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });
@@ -1840,6 +1841,41 @@ fn retry_proxy_rejects_mesh_service_discovery_upstream() {
         err.iter()
             .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
         "expected retry/mesh service-discovery conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_sidecar_topology_mesh_service_discovery_upstream() {
+    // Sidecar-topology mesh SD publishes `mesh.mtls`-required targets, so the
+    // admission conflict must name the mTLS transport, not HBONE.
+    let mut upstream = make_upstream("mesh-sd-upstream");
+    upstream.targets.clear();
+    upstream.service_discovery = Some(ferrum_edge::config::types::ServiceDiscoveryConfig {
+        provider: ferrum_edge::config::types::SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(ferrum_edge::config::types::MeshSdConfig {
+            service_name: "reviews".to_string(),
+            namespace: None,
+            port: None,
+            poll_interval_seconds: 30,
+            topology: ferrum_edge::config::types::MeshSdTopology::Sidecar,
+        }),
+        default_weight: 1,
+    });
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-sd-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.mtls")),
+        "expected retry/mesh.mtls service-discovery conflict, got {err:?}"
     );
 }
 
@@ -2058,6 +2094,7 @@ fn retry_proxy_allows_mesh_service_discovery_when_selected_policy_port_caps_retr
             namespace: None,
             port: None,
             poll_interval_seconds: 30,
+            topology: Default::default(),
         }),
         default_weight: 1,
     });

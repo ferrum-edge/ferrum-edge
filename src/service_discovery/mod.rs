@@ -304,6 +304,7 @@ impl ServiceDiscoveryManager {
                                 .unwrap_or_else(|| upstream_namespace.to_string()),
                             mesh_config.port,
                             sd_config.default_weight,
+                            mesh_config.topology,
                         ))
                     } else {
                         warn!(

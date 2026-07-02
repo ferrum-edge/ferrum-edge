@@ -2255,7 +2255,7 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
 /// `Udp` is a distinct L4 transport whose capture/egress arrives in a later
 /// stage. Neither is HTTP-family — only `Udp` is also excluded from the
 /// raw-TCP stream lane (see [`service_udp_stream_ports`]).
-fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
+pub(crate) fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
@@ -17780,6 +17780,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
@@ -17832,6 +17833,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
@@ -26639,6 +26641,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
@@ -26712,6 +26715,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });

@@ -4,8 +4,15 @@
 //! resources into gateway upstream targets. This lets a north-south gateway use
 //! the same service names the east-west mesh already understands while keeping
 //! the request hot path on the existing load-balancer snapshot.
+//!
+//! Targets are tagged for the destination's PER-TOPOLOGY mesh transport
+//! (`MeshSdConfig.topology`): `ambient` destinations get `mesh.hbone` (HTTP/2
+//! CONNECT over SVID mTLS to `:15008`), `sidecar` destinations get `mesh.mtls`
+//! (plain SVID-mTLS HTTP/2 to `:15006`). The two are not interchangeable — a
+//! sidecar peer has no HBONE listener, so an HBONE-tagged target pointed at it
+//! fails closed at dispatch.
 
-use crate::config::types::UpstreamTarget;
+use crate::config::types::{MeshSdTopology, UpstreamTarget};
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, ServiceTargetPort, Workload, resolve_target_port,
 };
@@ -22,6 +29,12 @@ pub struct MeshServiceDiscoverer {
     namespace: String,
     port: Option<u16>,
     default_weight: u32,
+    /// Destination mesh topology from `MeshSdConfig.topology`. Mesh transports
+    /// are per-topology (Ambient = HBONE `:15008`, Sidecar = SVID-mTLS
+    /// `:15006`), so the discoverer must stamp the transport tag the
+    /// destination actually serves — a sidecar peer cannot accept an HBONE
+    /// dial and would fail the request closed.
+    topology: MeshSdTopology,
 }
 
 impl MeshServiceDiscoverer {
@@ -31,6 +44,7 @@ impl MeshServiceDiscoverer {
         namespace: String,
         port: Option<u16>,
         default_weight: u32,
+        topology: MeshSdTopology,
     ) -> Self {
         Self {
             request_epoch,
@@ -38,6 +52,7 @@ impl MeshServiceDiscoverer {
             namespace,
             port,
             default_weight,
+            topology,
         }
     }
 
@@ -168,17 +183,46 @@ impl MeshServiceDiscoverer {
         })
     }
 
+    /// Build the transport tags for one discovered target, per the configured
+    /// destination topology. Mirrors the mesh-mode outbound materializer's
+    /// per-topology tag selection (`modes::mesh::build_outbound_mesh_targets`):
+    /// Ambient destinations get `mesh.hbone`, Sidecar destinations get
+    /// `mesh.mtls`. For a MULTI-port Sidecar destination the owning SERVICE
+    /// port is additionally stamped as the `:authority` rewrite port
+    /// (`mesh.mtls_authority_port`) so the destination sidecar's per-port
+    /// inbound siblings can disambiguate the direct `:15006` dial — the same
+    /// contract the materializer applies. Never stamped for single-port
+    /// services (their authority stays untouched).
     fn tags_for_target(
+        &self,
         service: &MeshService,
         workload: &Workload,
         selected_port: &SelectedPort,
+        multi_port_service: bool,
     ) -> HashMap<String, String> {
-        mesh_hbone_target_tags(
-            service,
-            workload,
-            selected_port.protocol,
-            selected_port.name.as_deref(),
-        )
+        match self.topology {
+            MeshSdTopology::Ambient => mesh_hbone_target_tags(
+                service,
+                workload,
+                selected_port.protocol,
+                selected_port.name.as_deref(),
+            ),
+            MeshSdTopology::Sidecar => {
+                let mut tags = mesh_sidecar_mtls_target_tags(
+                    service,
+                    workload,
+                    selected_port.protocol,
+                    selected_port.name.as_deref(),
+                );
+                if multi_port_service && let Some(service_port) = selected_port.service_port {
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+                        service_port.to_string(),
+                    );
+                }
+                tags
+            }
+        }
     }
 }
 
@@ -200,6 +244,18 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
         if self.port.is_some() && selected_service_port.is_none() {
             return Ok(Vec::new());
         }
+
+        // Sidecar `:authority` disambiguation trigger — mirrors the mesh-mode
+        // materializer: a service DECLARING more than one HTTP-family port
+        // needs the owning service port stamped on each target so the
+        // destination's per-port inbound siblings can tell the ports apart.
+        // Uses the shared HTTP-family classifier (do not invent a new one).
+        let multi_port_service = service
+            .ports
+            .iter()
+            .filter(|port| crate::modes::mesh::is_http_family_mesh_protocol(port.protocol))
+            .count()
+            > 1;
 
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
@@ -269,7 +325,8 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                     continue;
                 }
 
-                let mut tags = Self::tags_for_target(service, workload, &selected_port);
+                let mut tags =
+                    self.tags_for_target(service, workload, &selected_port, multi_port_service);
                 if is_remote {
                     tags.insert(
                         crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
@@ -338,10 +395,11 @@ fn protocol_tag(protocol: AppProtocol) -> &'static str {
 /// the mTLS handshake PINS (`mesh.spiffe_id` / `mesh.trust_domain`).
 ///
 /// Shared by runtime mesh service discovery
-/// ([`MeshServiceDiscoverer::tags_for_target`]) and by Ambient outbound route
-/// materialization (`modes::mesh::build_outbound_mesh_targets`) so the two paths
-/// cannot drift on the tag contract that `proxy::hbone_pool` and
-/// `can_attempt_hbone_backend` consume.
+/// ([`MeshServiceDiscoverer::tags_for_target`], `ambient` topology) and by
+/// Ambient outbound route materialization
+/// (`modes::mesh::build_outbound_mesh_targets`) so the two paths cannot drift
+/// on the tag contract that `proxy::hbone_pool` and `can_attempt_hbone_backend`
+/// consume.
 pub(crate) fn mesh_hbone_target_tags(
     service: &MeshService,
     workload: &Workload,
@@ -415,6 +473,13 @@ pub(crate) fn mesh_node_waypoint_target_tags(
 /// inbound listener). Same shared identity tags as the HBONE builder, but with
 /// `mesh.mtls=true` instead of `mesh.hbone` — the transports are per-topology
 /// and a target carries exactly one.
+///
+/// Shared by runtime mesh service discovery
+/// ([`MeshServiceDiscoverer::tags_for_target`], `sidecar` topology) and by
+/// Sidecar outbound route materialization
+/// (`modes::mesh::build_outbound_mesh_targets`) so the two paths cannot drift
+/// on the tag contract that `proxy::mesh_mtls_pool` and
+/// `supports_mesh_mtls_backend` consume.
 pub(crate) fn mesh_sidecar_mtls_target_tags(
     service: &MeshService,
     workload: &Workload,
@@ -572,6 +637,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -603,6 +669,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -630,6 +697,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -657,6 +725,7 @@ mod tests {
             default_namespace(),
             Some(80),
             1,
+            MeshSdTopology::Ambient,
         )
         .discover()
         .await
@@ -667,6 +736,7 @@ mod tests {
             default_namespace(),
             Some(81),
             1,
+            MeshSdTopology::Ambient,
         )
         .discover()
         .await
@@ -700,6 +770,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let mut targets = discoverer.discover().await.expect("discover succeeds");
@@ -740,6 +811,7 @@ mod tests {
                 default_namespace(),
                 None,
                 1,
+                MeshSdTopology::Ambient,
             )
         };
 
@@ -771,6 +843,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -802,6 +875,7 @@ mod tests {
             default_namespace(),
             None,
             7,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -825,6 +899,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidecar_topology_emits_mtls_tags_not_hbone() {
+        // A sidecar peer serves SVID-mTLS HTTP/2 on :15006 and has NO HBONE
+        // listener — sidecar-topology discovery must stamp `mesh.mtls`, never
+        // `mesh.hbone` (an HBONE-tagged target pointed at a sidecar 502s).
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mesh = MeshConfig {
+            services: vec![service("api", vec![api_id], vec![8080])],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+            MeshSdTopology::Sidecar,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].tags.get("mesh.mtls").map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            !targets[0].tags.contains_key("mesh.hbone"),
+            "a sidecar destination must never carry the HBONE transport tag"
+        );
+        assert_eq!(
+            targets[0].tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(api_id),
+            "peer identity pinning metadata must be preserved on the mTLS transport"
+        );
+        assert!(
+            !targets[0]
+                .tags
+                .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+            "single-port services must not stamp the :authority rewrite port"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidecar_topology_multi_port_service_stamps_authority_port() {
+        // A multi-HTTP-port sidecar destination disambiguates its per-port
+        // inbound siblings by the request `:authority` port, so each
+        // discovered target must carry the owning SERVICE port as the
+        // authority rewrite tag — mirroring the mesh-mode materializer.
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80, 81]);
+        svc.ports[1].name = Some("admin".to_string());
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![80, 81])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            Some(81),
+            1,
+            MeshSdTopology::Sidecar,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0]
+                .tags
+                .get(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG)
+                .map(String::as_str),
+            Some("81"),
+            "multi-port sidecar destinations carry the owning service port for :authority rewrite"
+        );
+        assert_eq!(
+            targets[0].tags.get("mesh.mtls").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_topology_never_stamps_mtls_authority_port() {
+        // The authority-rewrite tag is a Sidecar mesh-mTLS contract; HBONE
+        // carries the app port in the CONNECT authority already.
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80, 81]);
+        svc.ports[1].name = Some("admin".to_string());
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![80, 81])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            Some(81),
+            1,
+            MeshSdTopology::Ambient,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].tags.get("mesh.hbone").map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            !targets[0]
+                .tags
+                .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+            "HBONE targets must not carry the sidecar :authority rewrite tag"
+        );
+    }
+
+    #[tokio::test]
     async fn honors_service_target_port_for_workload_address() {
         // Service port 80 with targetPort 8080; the pod listens on container
         // port 8080. The discovered target must dial 8080 (the container port),
@@ -843,6 +1037,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -872,6 +1067,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -897,6 +1093,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -924,6 +1121,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -948,6 +1146,7 @@ mod tests {
             default_namespace(),
             Some(9090),
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -974,6 +1173,7 @@ mod tests {
             default_namespace(),
             Some(8080),
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");
@@ -997,6 +1197,7 @@ mod tests {
             default_namespace(),
             None,
             1,
+            MeshSdTopology::Ambient,
         );
 
         let targets = discoverer.discover().await.expect("discover succeeds");

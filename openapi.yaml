@@ -7979,6 +7979,19 @@ components:
               type: integer
               format: uint64
               default: 30
+            topology:
+              type: string
+              enum: [ambient, sidecar]
+              default: ambient
+              description: |
+                Destination mesh topology; selects the mesh transport
+                discovered targets are tagged for. `ambient` tags targets for
+                HBONE dispatch (HTTP/2 CONNECT over SVID mTLS to the peer's
+                `:15008` listener); `sidecar` tags targets for plain SVID-mTLS
+                HTTP/2 dispatch to the peer sidecar's `:15006` inbound
+                listener. Sidecar peers have no HBONE listener, so the
+                topology must match the destination mesh or dispatch fails
+                closed.
         default_weight:
           type: integer
           format: uint32
