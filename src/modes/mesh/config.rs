@@ -2580,6 +2580,7 @@ impl MeshConfig {
             &mut self.mesh_policies,
             &mut self.destination_rules,
             &mut self.sidecars,
+            &mut self.virtual_service_cors_policies,
             self.multi_cluster.as_mut(),
         );
     }
@@ -2698,6 +2699,42 @@ fn validate_virtual_service_cors_policies(
                             "{context}: cors.allowed_origins[{index}] regex does not compile: {err}"
                         ));
                     }
+                }
+            }
+        }
+        // Method/header lists are copied verbatim into the synthesized `cors`
+        // plugin config, whose construction trims each entry and rejects
+        // empty-after-trim values, invalid HTTP methods, and invalid header
+        // names — run the plugin's own admission (shared
+        // `plugins::cors::{validate_method,validate_header_name}`, not a
+        // fork) here so a bad token rejects the slice at the config boundary
+        // instead of failing plugin-cache construction on the data plane.
+        let string_lists: [(&str, &[String], fn(&str, &str) -> Result<(), String>); 3] = [
+            (
+                "allowed_methods",
+                &policy.cors.allowed_methods,
+                crate::plugins::cors::validate_method,
+            ),
+            (
+                "allowed_headers",
+                &policy.cors.allowed_headers,
+                crate::plugins::cors::validate_header_name,
+            ),
+            (
+                "exposed_headers",
+                &policy.cors.exposed_headers,
+                crate::plugins::cors::validate_header_name,
+            ),
+        ];
+        for (field, values, validate) in string_lists {
+            for (index, value) in values.iter().enumerate() {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    errors.push(format!(
+                        "{context}: cors.{field}[{index}] must not be empty"
+                    ));
+                } else if let Err(err) = validate(field, trimmed) {
+                    errors.push(format!("{context}: {err}"));
                 }
             }
         }
@@ -3723,7 +3760,15 @@ fn validate_multi_cluster(
 /// the existing `normalize_fields()` pattern used elsewhere in
 /// [`crate::config::types`]. Idempotent.
 pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
-    normalize_mesh_fields_internal(service_entries, workloads, &mut [], &mut [], &mut [], None);
+    normalize_mesh_fields_internal(
+        service_entries,
+        workloads,
+        &mut [],
+        &mut [],
+        &mut [],
+        &mut [],
+        None,
+    );
 }
 
 fn normalize_mesh_fields_internal(
@@ -3732,6 +3777,7 @@ fn normalize_mesh_fields_internal(
     policies: &mut [MeshPolicy],
     destination_rules: &mut [MeshDestinationRule],
     sidecars: &mut [MeshSidecar],
+    virtual_service_cors_policies: &mut [MeshVirtualServiceCorsPolicy],
     multi_cluster: Option<&mut MultiClusterConfig>,
 ) {
     for se in service_entries {
@@ -3750,6 +3796,13 @@ fn normalize_mesh_fields_internal(
     normalize_mesh_policy_fields(policies);
     for dr in destination_rules {
         dr.host = normalize_mesh_hostname_like(&dr.host);
+    }
+    // Same treatment as DestinationRule hosts: synthesis matches
+    // `policy.host` against service FQDNs via `destination_rule_host_matches`
+    // (no trimming/lowercasing there), so an un-normalized native/file host
+    // like `" Svc.Default "` would silently attach no CORS plugin.
+    for policy in virtual_service_cors_policies {
+        policy.host = normalize_mesh_hostname_like(&policy.host);
     }
     for sidecar in sidecars {
         for egress in &mut sidecar.egress {

@@ -2640,9 +2640,15 @@ fn virtual_service_routes(
     // block (per VS host) so mesh sidecar DPs can synthesize the `cors` plugin
     // onto their materialized outbound routes — the gateway-proxy-scoped
     // plugin emitted below never rides the mesh slice. Rules (codex round 1):
-    // - SIDECAR-BOUND ONLY: a VS whose `spec.gateways` names only ingress
-    //   gateways (no reserved `mesh` entry) never applies to sidecars in
-    //   Istio, so it is not carried; an omitted `gateways` defaults to mesh.
+    // - SIDECAR-BOUND ONLY, resolved PER `http[]` ENTRY: `spec.gateways`
+    //   naming only ingress gateways (no reserved `mesh` entry) means the VS
+    //   as a whole does not apply to sidecars (an omitted `gateways` defaults
+    //   to mesh) — but Istio's `HTTPMatchRequest.gateways` OVERRIDES the
+    //   top-level list per match, so an entry whose match names `mesh` still
+    //   applies to sidecars (and, conversely, a mesh-bound VS's
+    //   ingress-scoped matches do not). The VS-level default is therefore
+    //   threaded into the per-entry predicate rather than short-circuiting
+    //   the whole VS.
     // - Host-level application takes the FIRST host-wide-representable
     //   `http[]` entry (no match, or a catch-all `/` prefix on a mesh
     //   gateway — see `http_entry_cors_applies_host_wide`; predicate-scoped
@@ -2660,14 +2666,13 @@ fn virtual_service_routes(
     // `cors_allowed_origins` gates as `route_cors_plugin`, so slice-carried
     // and gateway-projected CORS can never disagree on representability.
     let vs_gateways = string_array(&object.spec, "gateways");
-    let applies_to_sidecars =
+    let vs_applies_to_sidecars =
         vs_gateways.is_empty() || vs_gateways.iter().any(|gateway| gateway == "mesh");
-    if applies_to_sidecars
-        && let Some(mesh_cors) = http_routes
-            .iter()
-            .find(|http| http_entry_cors_applies_host_wide(http))
-            .and_then(|http| http.get("corsPolicy"))
-            .and_then(mesh_cors_policy_from_value)
+    if let Some(mesh_cors) = http_routes
+        .iter()
+        .find(|http| http_entry_cors_applies_host_wide(http, vs_applies_to_sidecars))
+        .and_then(|http| http.get("corsPolicy"))
+        .and_then(mesh_cors_policy_from_value)
     {
         let export_to = {
             let declared = string_array(&object.spec, "exportTo");
@@ -3595,13 +3600,12 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
         (!origins.is_empty()).then_some(origins)
     } else if let Some(arr) = cors.get("allowOrigin").and_then(Value::as_array) {
         // Deprecated Istio field: a plain list of exact origin strings. The
-        // same wildcard guard as the StringMatch `exact` arm applies — a
-        // `*`-shaped entry would flip the plugin into its wildcard syntax.
+        // SAME exact-origin gate as the StringMatch `exact` arm applies — the
+        // two forms project into the identical plugin plain-string shape.
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
             let s = entry.as_str()?;
-            let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed.starts_with('*') {
+            if !plain_exact_origin_translatable(s) {
                 return None;
             }
             origins.push(Value::String(s.to_string()));
@@ -3610,6 +3614,31 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
     } else {
         None
     }
+}
+
+/// Whether an Istio exact origin (`allowOrigins[].exact` or a legacy
+/// `allowOrigin` list entry) can be faithfully projected as the `cors`
+/// plugin's PLAIN-STRING `allowed_origins` form. Fails (policy stays
+/// deferred) when:
+/// - empty/whitespace-only, or wildcard-shaped after trimming (`*`,
+///   `*.example.com`): the plugin trims plain-string origins before
+///   interpreting `*`/`*.` wildcard syntax, so Istio's literal-exact
+///   semantics would silently WIDEN to allow-all / subdomain matching;
+/// - whitespace-padded: the plugin's trim would match the TRIMMED origin
+///   while Istio's literal exact only matches the padded value (i.e. no real
+///   Origin header) — the same silent widening;
+/// - not an origin the plugin accepts (`scheme://host[:port]` only — no
+///   path/query/fragment/credentials, http(s) scheme; the shared
+///   `plugins::cors::validate_exact_origin` admission): projecting it would
+///   fail `CorsPlugin` construction AFTER translation instead of deferring
+///   here, breaking the always-projectable contract documented on
+///   `cors_allowed_origins`.
+fn plain_exact_origin_translatable(exact: &str) -> bool {
+    let trimmed = exact.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('*')
+        && trimmed.len() == exact.len()
+        && crate::plugins::cors::validate_exact_origin(exact).is_ok()
 }
 
 /// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's
@@ -3641,37 +3670,11 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 
     match (exact, prefix, regex) {
         (Some(exact), None, None) => {
-            // Match the plugin's own parsing posture: `CorsPlugin` TRIMS
-            // plain-string origins before interpreting `*`/`*.` wildcard
-            // syntax, so a whitespace-padded `" *"` must hit this guard too.
-            let trimmed = exact.trim();
-            if trimmed.is_empty() || trimmed.starts_with('*') {
-                // A wildcard-shaped `exact` (`*`, `*.example.com`) can never
-                // match a real Origin under Istio's literal-exact semantics,
-                // but the cors plugin's PLAIN-STRING form would interpret it
-                // as its own wildcard syntax (allow-all / subdomain match) —
-                // a silent policy WIDENING. Non-translatable: the policy
-                // stays deferred instead of projecting either meaning.
-                return None;
-            }
-            if trimmed.len() != exact.len() {
-                // Whitespace-padded exact: the plugin trims plain-string
-                // origins, so the projection would allow the TRIMMED origin
-                // while Istio's literal `StringMatch.exact` only matches the
-                // padded value (i.e. no real Origin header) — the same silent
-                // widening as the wildcard case. Non-translatable.
-                return None;
-            }
-            if crate::plugins::cors::validate_exact_origin(exact).is_err() {
-                // Not an origin the cors plugin accepts (`scheme://host[:port]`
-                // only — no path/query/fragment/credentials, http(s) scheme).
-                // Projecting it would fail `CorsPlugin` construction AFTER
-                // translation instead of deferring here, breaking the
-                // always-projectable contract documented on
-                // `cors_allowed_origins`. Non-translatable.
-                return None;
-            }
-            Some(Value::String(exact.to_string()))
+            // Wildcard-shaped / padded / non-origin exacts are all silent
+            // policy changes when projected as the plugin's plain-string
+            // form — see `plain_exact_origin_translatable` (shared with the
+            // legacy `allowOrigin` list, which projects identically).
+            plain_exact_origin_translatable(exact).then(|| Value::String(exact.to_string()))
         }
         (None, Some(prefix), None) => {
             (!prefix.is_empty()).then(|| serde_json::json!({ "prefix": prefix }))
@@ -3691,14 +3694,18 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 }
 
 /// Whether a VirtualService `http[].corsPolicy` can be faithfully translated to
-/// a `cors` plugin. Shared by the translator (emit vs. warn-and-skip) and the
-/// Istio status writer (deferred-field reporting) so the two never disagree on
-/// whether a given policy is projected. A policy is translatable when it has at
-/// least one representable origin (`allowOrigins[]` `exact`/`prefix`/`regex`
-/// `StringMatch` — `regex` must compile — or the legacy `allowOrigin` exact
-/// list) and any `maxAge` parses as a duration. A malformed/unknown origin
-/// matcher (or an un-compilable `regex`) makes the policy non-translatable so it
-/// is left unprojected (deferred) rather than silently approximated.
+/// a `cors` plugin. Shared by the translator (emit vs. warn-and-skip), the
+/// mesh-slice carry, and the Istio status writer (deferred-field reporting) so
+/// they never disagree on whether a given policy is projected. A policy is
+/// translatable when it has at least one representable origin
+/// (`allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` — `regex` must
+/// compile — or the legacy `allowOrigin` exact list), any `maxAge` parses as a
+/// duration, and every `allowMethods`/`allowHeaders`/`exposeHeaders` entry
+/// passes the plugin's own method/header-name admission. A malformed/unknown
+/// origin matcher, an un-compilable `regex`, or an invalid method/header token
+/// makes the policy non-translatable so it is left unprojected (deferred)
+/// rather than silently approximated or failing `CorsPlugin` construction
+/// after translation.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
     let origins_ok = cors_allowed_origins(cors).is_some();
     let max_age_ok = match cors.get("maxAge") {
@@ -3706,7 +3713,37 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         Some(Value::String(s)) => parse_istio_duration_secs(s).is_some(),
         _ => false,
     };
-    origins_ok && max_age_ok
+    origins_ok && max_age_ok && cors_string_arrays_plugin_valid(cors)
+}
+
+/// Whether the projected `allowMethods`/`allowHeaders`/`exposeHeaders` lists
+/// would be accepted by `CorsPlugin` construction: the plugin trims each entry
+/// and rejects empty-after-trim values, invalid HTTP methods, and invalid
+/// header names (shared `plugins::cors::{validate_method,validate_header_name}`
+/// admission — do not fork). `cors_string_array` emits the collected strings
+/// verbatim, so a bad token would otherwise fail plugin construction AFTER
+/// translation instead of deferring the policy here. An absent list is fine
+/// (the plugin applies its defaults).
+fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
+    fn list_ok(cors: &Value, key: &str, validate: fn(&str, &str) -> Result<(), String>) -> bool {
+        cors_string_array(cors, key).is_none_or(|values| {
+            values.iter().all(|value| {
+                let trimmed = value.trim();
+                !trimmed.is_empty() && validate(key, trimmed).is_ok()
+            })
+        })
+    }
+    list_ok(cors, "allowMethods", crate::plugins::cors::validate_method)
+        && list_ok(
+            cors,
+            "allowHeaders",
+            crate::plugins::cors::validate_header_name,
+        )
+        && list_ok(
+            cors,
+            "exposeHeaders",
+            crate::plugins::cors::validate_header_name,
+        )
 }
 
 /// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
@@ -3721,26 +3758,36 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// `request_mirror` approach for `http[].mirror`.
 /// Whether a VirtualService `http[]` entry's CORS policy can honestly be
 /// applied HOST-WIDE on materialized mesh routes (which are host-routed `/`):
-/// its `match[]` is omitted/empty, or SOME match both applies to the mesh
-/// (`gateways` omitted or naming the reserved `mesh` gateway) and constrains
-/// nothing beyond a catch-all `/` uri prefix (`name` and `ignoreUriCase` are
-/// non-scoping metadata). An entry scoped by any other
+/// its `match[]` is omitted/empty (inheriting `vs_applies_to_sidecars`, the
+/// VS-level `spec.gateways` sidecar scope), or SOME match both applies to the
+/// mesh and constrains nothing beyond a catch-all `/` uri prefix (`name` and
+/// `ignoreUriCase` are non-scoping metadata). Istio's
+/// `HTTPMatchRequest.gateways` OVERRIDES the top-level `spec.gateways` list:
+/// a match carrying `gateways` applies to sidecars iff it names the reserved
+/// `mesh` gateway, regardless of the VS-level scope; a match without them
+/// inherits `vs_applies_to_sidecars`. An entry scoped by any other
 /// predicate — a narrower uri, `headers`, `port`, `sourceLabels`, `method`,
 /// `queryParams`, `withoutHeaders`, … — is route-scoped, and promoting its
 /// CORS host-wide would enforce it (including disallowed-Origin 403s) on
-/// traffic the predicates never matched. Route-scoped and non-mesh-gateway
+/// traffic the predicates never matched. Route-scoped and non-sidecar
 /// entries neither donate their policy nor suppress a later host-wide one.
-fn http_entry_cors_applies_host_wide(http: &Value) -> bool {
+fn http_entry_cors_applies_host_wide(http: &Value, vs_applies_to_sidecars: bool) -> bool {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
-        return true;
+        return vs_applies_to_sidecars;
     };
     if matches.is_empty() {
-        return true;
+        return vs_applies_to_sidecars;
     }
     matches.iter().any(|entry| {
         let Some(predicates) = entry.as_object() else {
             return false;
         };
+        // Match-level `gateways` override the VS-level list (Istio
+        // `HTTPMatchRequest.gateways`); a match without them inherits the
+        // VS-level sidecar scope.
+        if !predicates.contains_key("gateways") && !vs_applies_to_sidecars {
+            return false;
+        }
         for (key, value) in predicates {
             match key.as_str() {
                 "gateways" => {

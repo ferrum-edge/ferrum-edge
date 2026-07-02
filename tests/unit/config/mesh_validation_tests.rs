@@ -1969,6 +1969,81 @@ mod virtual_service_cors {
     }
 
     #[test]
+    fn invalid_methods_and_headers_rejected() {
+        // Method/header lists are copied verbatim into the synthesized cors
+        // plugin, whose construction rejects invalid tokens — the boundary
+        // must reject them too, not fail plugin-cache construction on the DP.
+        let mut bad_method = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        bad_method.cors.allowed_methods = vec!["GET".into(), "not a method".into()];
+        let errors = validate(vec![bad_method]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("invalid HTTP method")),
+            "{errors:?}"
+        );
+
+        let mut bad_header = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        bad_header.cors.allowed_headers = vec!["bad header".into()];
+        let errors = validate(vec![bad_header]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("invalid HTTP header name")),
+            "{errors:?}"
+        );
+
+        let mut bad_exposed = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        bad_exposed.cors.exposed_headers = vec!["bad header".into()];
+        let errors = validate(vec![bad_exposed]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("invalid HTTP header name")),
+            "{errors:?}"
+        );
+
+        let mut empty_method = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        empty_method.cors.allowed_methods = vec![" ".into()];
+        let errors = validate(vec![empty_method]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("allowed_methods[0] must not be empty")),
+            "{errors:?}"
+        );
+
+        // Valid lists pass (padding is fine — the plugin trims reflected
+        // values; unlike origin MATCHERS this is not a semantic change).
+        let mut ok = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        ok.cors.allowed_methods = vec!["GET".into(), " POST ".into()];
+        ok.cors.allowed_headers = vec!["x-requested-with".into()];
+        ok.cors.exposed_headers = vec!["x-trace-id".into()];
+        let errors = validate(vec![ok]);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn normalize_trims_and_lowercases_carried_host() {
+        // Synthesis matches `policy.host` against service FQDNs with
+        // `destination_rule_host_matches` (no trimming there); a padded or
+        // mixed-case native/file host must be normalized like DR hosts or the
+        // policy silently attaches no plugin.
+        let mut config = MeshConfig {
+            virtual_service_cors_policies: vec![policy(vec![MeshCorsOriginMatch::Exact(
+                "https://a.example".into(),
+            )])],
+            ..MeshConfig::default()
+        };
+        config.virtual_service_cors_policies[0].host = " Svc.Default.SVC.Cluster.Local. ".into();
+        config.normalize();
+        assert_eq!(
+            config.virtual_service_cors_policies[0].host,
+            "svc.default.svc.cluster.local"
+        );
+    }
+
+    #[test]
     fn plugin_incompatible_exact_origin_rejected() {
         // Synthesis projects exacts into the cors plugin's plain-string
         // `allowed_origins` form; values the plugin rejects at construction
