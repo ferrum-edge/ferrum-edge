@@ -30,6 +30,11 @@ set -euo pipefail
 #                                               DR connectTimeout provably
 #                                               bounds the mesh-mTLS dial
 #                                               (two-phase timing, see below)
+#   sidecar.destination_rule.tcp_max_connections
+#                                               DR maxConnections=1 admits one
+#                                               HELD WebSocket session, rejects
+#                                               a concurrent upgrade 503, and
+#                                               recovers after release
 #
 # The DestinationRule probe is TWO-PHASE on purpose: a black-holed dial (the
 # client pod's own OUTPUT DROP, so SYNs vanish deterministically with no
@@ -78,6 +83,7 @@ LIVE_SUITE_NAME="mesh-e2e-sidecar"
 
 SVC_HOST="svc.$NS.svc.cluster.local"
 SLOW_HOST="slowsvc.$NS.svc.cluster.local"
+WS_HOST="wssvc.$NS.svc.cluster.local"
 JWT_ISSUER="mesh-e2e-issuer"
 JWT_KID="fixture-key"
 # Two-phase DR connectTimeout values + accepted observation windows (seconds).
@@ -110,12 +116,12 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.request_auth.missing_jwt_rejected
   sidecar.request_auth.invalid_jwt_rejected
   sidecar.destination_rule.tcp_connect_timeout
+  sidecar.destination_rule.tcp_max_connections
 )
-# NOTE: only `sidecar.destination_rule.tcp_connect_timeout` is a GA-contract
-# live assertion today; the rest are suite-required here (run.sh-local gate,
-# like the multicluster fixture's `multicluster.*` ids) pending the
-# Stable-surface contract enrollment stage. The contract's other two seeded
-# live ids are `live_deferred` in ga_contract.yaml (issues #1973, #1974).
+# NOTE: every id except `sidecar.spire.workload_entries` (fixture
+# infrastructure, suite-local) backs a GA-contract capability row in
+# tests/conformance/ga_contract.yaml — keep the id strings in lock-step. The
+# one remaining `live_deferred` contract id is VS CORS (issue #1973).
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -428,6 +434,21 @@ mesh:
         labels:
           app: svc
         namespace: $NS
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+      service_name: wssvc
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: svc
+      addresses:
+        - 127.0.0.1
+      ports:
+        - port: 8081
+          protocol: http
+          name: ws
+      selector:
+        labels:
+          app: svc
+        namespace: $NS
   services:
     - name: svc
       namespace: $NS
@@ -435,6 +456,14 @@ mesh:
         - port: 8080
           protocol: http
           name: http
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+    - name: wssvc
+      namespace: $NS
+      ports:
+        - port: 8081
+          protocol: http
+          name: ws
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
   peer_authentications:
@@ -506,6 +535,19 @@ mesh:
           name: http
       selector:
         namespace: $NS
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+      service_name: wssvc
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: svc
+      addresses:
+        - "$svc_pod_ip"
+      ports:
+        - port: 8081
+          protocol: http
+          name: ws
+      selector:
+        namespace: $NS
     - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
       service_name: slowsvc
       namespace: $NS
@@ -528,6 +570,14 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+    - name: wssvc
+      namespace: $NS
+      ports:
+        - port: 8081
+          protocol: http
+          name: ws
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
     - name: slowsvc
       namespace: $NS
       ports:
@@ -542,6 +592,15 @@ mesh:
       host: slowsvc.$NS.svc.cluster.local
       traffic_policy:
         connect_timeout_ms: $slow_connect_timeout_ms
+    # maxConnections=1 on the WS service: one held WebSocket session occupies
+    # the sole slot (BackendConnectionGuard held for the session in the WS
+    # connect loop), a concurrent second upgrade is rejected 503 before
+    # dialing, and the slot frees on session close.
+    - name: wssvc-max-connections
+      namespace: $NS
+      host: wssvc.$NS.svc.cluster.local
+      traffic_policy:
+        max_connections: 1
 YAML
 )"
 }
@@ -736,6 +795,103 @@ probe_request_auth() {
   fi
 }
 
+# DR maxConnections over a WebSocket flow: maxConnections is enforced on
+# stream-family and WebSocket backend connections only (a WS session holds one
+# dedicated backend connection for its lifetime), so the probe drives
+# hand-rolled RFC 6455 upgrades from the client pod's python container at the
+# outbound capture listener:
+#   1. upgrade #1 -> 101 (retried until the wssvc route settles) and HELD;
+#   2. upgrade #2 while #1 is held -> the client sidecar rejects it 503
+#      (backend_max_connections) before dialing — the cap observation;
+#   3. close #1 -> the slot frees on session teardown -> upgrade #3 -> 101
+#      (retried briefly), proving the cap releases rather than leaking.
+# Echoes "<first>\t<second>\t<third>" status codes.
+probe_ws_max_connections() {
+  log "probing DR maxConnections=1 over WebSocket (wssvc)"
+  local out first second third rest
+  # shellcheck disable=SC2016
+  out="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c probe -- \
+    python3 -c '
+import base64
+import os
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+
+
+def upgrade(timeout=10):
+    s = socket.create_connection(("127.0.0.1", 15001), timeout=timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = (
+        "GET /ws HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
+    s.sendall(req)
+    s.settimeout(timeout)
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
+    code = "000"
+    if data.startswith(b"HTTP/"):
+        parts = data.split(b" ", 2)
+        if len(parts) >= 2:
+            code = parts[1][:3].decode(errors="replace")
+    return s, code
+
+
+first_sock = None
+first = "000"
+for _ in range(30):
+    first_sock, first = upgrade()
+    if first == "101":
+        break
+    first_sock.close()
+    time.sleep(2)
+
+second = "000"
+third = "000"
+if first == "101":
+    s2, second = upgrade()
+    s2.close()
+    first_sock.close()
+    for _ in range(15):
+        s3, third = upgrade()
+        s3.close()
+        if third == "101":
+            break
+        time.sleep(2)
+print(f"{first}\t{second}\t{third}")
+' "$WS_HOST" 2>/dev/null | tail -1 || printf 'EXECFAIL\tEXECFAIL\tEXECFAIL')"
+  first="${out%%$'\t'*}"
+  rest="${out#*$'\t'}"
+  second="${rest%%$'\t'*}"
+  third="${rest#*$'\t'}"
+  log "WS maxConnections: first=$first second=$second third=$third"
+  # The cap proof is EXACTLY: held session admitted (101), concurrent second
+  # upgrade rejected with the WS backend_max_connections 503 (a real sidecar
+  # response — 000/EXECFAIL never satisfies it), and recovery after release.
+  if [[ "$first" == "101" && "$second" == "503" && "$third" == "101" ]]; then
+    record_live_assertion sidecar.destination_rule.tcp_max_connections pass \
+      client wssvc "held=101 concurrent=$second released=$third (maxConnections=1)"
+  else
+    record_live_assertion sidecar.destination_rule.tcp_max_connections fail \
+      client wssvc "unexpected-sequence first=$first second=$second third=$third"
+    return 1
+  fi
+}
+
 # One timed probe at the black-holed slowsvc. Retries only while the response
 # is a NON-5xx (a route-materialization blip); settles on the first 5xx and
 # echoes "<status>\t<time_total>\t<body>". curl's own -m must sit ABOVE the
@@ -913,6 +1069,7 @@ main() {
   probe_plaintext_rejected
   probe_rogue_denied
   probe_request_auth
+  probe_ws_max_connections
   probe_connect_timeout_two_phase
 
   require_live_assertions

@@ -135,7 +135,9 @@ spec:
                 iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
               iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
                 iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
-              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8081 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8081 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080,8081 -> 15006)"
               iptables -t nat -L FERRUM_INBOUND -n
       containers:
         - name: ferrum-edge
@@ -185,9 +187,10 @@ spec:
           image: python:3.12-alpine
           ports:
             - containerPort: 8080
+            - containerPort: 8081
           readinessProbe:
             tcpSocket:
-              port: 8080
+              port: 8081
             initialDelaySeconds: 1
             periodSeconds: 1
             timeoutSeconds: 1
@@ -197,6 +200,8 @@ spec:
             - -u
             - -c
             - |
+              import base64
+              import hashlib
               import socket
               import threading
               import time
@@ -210,6 +215,7 @@ spec:
                   b"content-length: " + str(len(BODY)).encode() + b"\r\n"
                   b"\r\n" + BODY
               )
+              WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
               def serve():
                   s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -223,7 +229,61 @@ spec:
                           conn.sendall(RESPONSE)
                       conn.close()
 
+              # Minimal RFC 6455 server on 8081 for the DR maxConnections WS
+              # probe: answer the upgrade with a correct Sec-WebSocket-Accept
+              # (the sidecar's inner H1 upgrade validates it), then HOLD the
+              # connection open until the peer closes — a held session is what
+              # occupies the maxConnections=1 slot.
+              def ws_hold(conn):
+                  try:
+                      while conn.recv(4096):
+                          pass
+                  except OSError:
+                      pass
+                  finally:
+                      conn.close()
+
+              def serve_ws():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8081))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = b""
+                      try:
+                          conn.settimeout(5)
+                          while b"\r\n\r\n" not in data:
+                              chunk = conn.recv(4096)
+                              if not chunk:
+                                  break
+                              data += chunk
+                      except OSError:
+                          conn.close()
+                          continue
+                      key = ""
+                      for line in data.split(b"\r\n"):
+                          if line.lower().startswith(b"sec-websocket-key:"):
+                              key = line.split(b":", 1)[1].strip().decode()
+                      if not key:
+                          conn.close()
+                          continue
+                      accept = base64.b64encode(
+                          hashlib.sha1((key + WS_GUID).encode()).digest()
+                      ).decode()
+                      conn.sendall(
+                          (
+                              "HTTP/1.1 101 Switching Protocols\r\n"
+                              "Upgrade: websocket\r\n"
+                              "Connection: Upgrade\r\n"
+                              "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+                          ).encode()
+                      )
+                      conn.settimeout(None)
+                      threading.Thread(target=ws_hold, args=(conn,), daemon=True).start()
+
               threading.Thread(target=serve, daemon=True).start()
+              threading.Thread(target=serve_ws, daemon=True).start()
               while True:
                   time.sleep(3600)
       volumes:
@@ -328,6 +388,13 @@ spec:
               readOnly: true
         - name: curl
           image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+        # Raw-socket probe runner for the WebSocket maxConnections assertion:
+        # curl cannot hold a WS upgrade open as a session, so the probe drives
+        # hand-rolled HTTP/1.1 upgrades over python3 stdlib sockets (same image
+        # the svc app already uses, so no extra pulls on the node).
+        - name: probe
+          image: python:3.12-alpine
           command: ["sh", "-c", "sleep 365d"]
       volumes:
         - name: spire-agent-socket

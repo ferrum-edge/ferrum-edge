@@ -15,7 +15,7 @@ use ferrum_edge::modes::mesh::config::{MtlsMode, PolicyScope};
 use ferrum_edge::modes::mesh::slice::resolve_effective_mtls_mode;
 use serde_json::{Value, json};
 
-use crate::conformance::registry::Status;
+use crate::conformance::registry::{Maturity, Status};
 
 const CATEGORY: &str = "istio_peer_authentication";
 
@@ -57,7 +57,10 @@ fn peer_auth_strict_mode() {
         category = CATEGORY,
         feature = "mtls.mode = STRICT",
         status = Status::Supported,
-        notes = "Maps to MtlsMode::Strict; frontend client cert verification required.",
+        maturity = Maturity::Ga,
+        notes = "Maps to MtlsMode::Strict; frontend client cert verification required. Live-gated \
+                 by sidecar.peer_auth.{strict_mtls_authenticated,strict_mtls_plaintext_rejected} \
+                 in the mesh-e2e-sidecar suite.",
     );
     let pa = translate_one(json!({"mtls": {"mode": "STRICT"}}));
     assert_eq!(pa.mtls_mode, MtlsMode::Strict);

@@ -14,6 +14,7 @@ mod ga_scope;
 mod istio_authorization_policy;
 mod istio_destination_rule;
 mod istio_peer_authentication;
+mod istio_request_authentication;
 mod istio_service_entry_egress;
 mod istio_virtual_service;
 mod live_contract;

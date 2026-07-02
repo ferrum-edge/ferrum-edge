@@ -24,7 +24,7 @@ use ferrum_edge::modes::mesh::policy::{
 };
 use serde_json::{Value, json};
 
-use crate::conformance::registry::Status;
+use crate::conformance::registry::{Maturity, Status};
 
 const CATEGORY: &str = "istio_authorization_policy";
 
@@ -125,7 +125,10 @@ fn authz_deny_wins_when_both_match() {
         category = CATEGORY,
         feature = "DENY beats ALLOW on overlap",
         status = Status::Supported,
-        notes = "Per CLAUDE.md: DENY rules are evaluated first; any DENY match short-circuits the engine.",
+        maturity = Maturity::Ga,
+        notes = "Per CLAUDE.md: DENY rules are evaluated first; any DENY match short-circuits the \
+                 engine. Live-gated by sidecar.authz.denied_principal_rejected (a valid-mTLS peer \
+                 denied by an identity-scoped DENY at the destination) in the mesh-e2e-sidecar suite.",
     );
     let allow = MeshPolicy {
         name: "allow-all".to_string(),
@@ -210,7 +213,12 @@ fn authz_allow_with_rules_admits_matching_request() {
         category = CATEGORY,
         feature = "ALLOW + rule admits matching request",
         status = Status::Supported,
-        notes = "Operator-built allow-list of method+path admits the matching request and implicit-denies the rest.",
+        maturity = Maturity::Ga,
+        notes = "Operator-built allow-list of method+path admits the matching request and \
+                 implicit-denies the rest. Live-gated in the mesh-e2e-sidecar suite: the \
+                 authenticated positive traverses an ALLOW rule \
+                 (sidecar.peer_auth.strict_mtls_authenticated) and the token-less gated-path \
+                 probe proves the implicit deny (sidecar.request_auth.missing_jwt_rejected).",
     );
     let policy = translated(json!({
         "action": "ALLOW",

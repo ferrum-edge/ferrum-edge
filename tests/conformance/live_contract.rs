@@ -585,9 +585,11 @@ fn live_contract_rejects_stale_and_unparseable_created_at() {
 
 #[test]
 fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
-    // Pin the real ga_contract.yaml against this validator: the sidecar suite
-    // must have exactly one ENFORCED row today (connect_timeout, emitted by
-    // tests/k8s/mesh_e2e_sidecar/run.sh) and the two documented deferrals.
+    // Pin the real ga_contract.yaml against this validator: the Stable
+    // sidecar surface is enrolled vertically (STRICT mTLS, authz ALLOW/DENY,
+    // RequestAuth JWT, DR connectTimeout + maxConnections all ENFORCED and
+    // emitted by tests/k8s/mesh_e2e_sidecar/run.sh), with VS CORS as the one
+    // documented deferral (issue #1973).
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()
@@ -598,20 +600,40 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         !sidecar_rows.is_empty(),
         "the mesh-e2e-sidecar suite must have GA contract rows"
     );
-    let enforced: Vec<_> = sidecar_rows
+    let enforced_ids: Vec<&str> = sidecar_rows
         .iter()
         .filter(|capability| capability.live_deferred.is_none())
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
         .collect();
-    assert!(
-        enforced.iter().any(|capability| {
-            capability
-                .live_assertions
-                .iter()
-                .any(|id| id == "sidecar.destination_rule.tcp_connect_timeout")
-        }),
-        "connect_timeout must be an enforced live assertion"
+    for required in [
+        "sidecar.peer_auth.strict_mtls_authenticated",
+        "sidecar.peer_auth.strict_mtls_plaintext_rejected",
+        "sidecar.authz.denied_principal_rejected",
+        "sidecar.request_auth.valid_jwt_admitted",
+        "sidecar.request_auth.missing_jwt_rejected",
+        "sidecar.request_auth.invalid_jwt_rejected",
+        "sidecar.destination_rule.tcp_connect_timeout",
+        "sidecar.destination_rule.tcp_max_connections",
+    ] {
+        assert!(
+            enforced_ids.contains(&required),
+            "`{required}` must be an enforced GA live assertion"
+        );
+    }
+    let deferred: Vec<&str> = sidecar_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_some())
+        .map(|capability| capability.id.as_str())
+        .collect();
+    assert_eq!(
+        deferred,
+        vec!["mesh.virtual_service.cors_policy"],
+        "VS CORS must be the only live-deferred sidecar row"
     );
-    for capability in &enforced {
+    for capability in sidecar_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_none())
+    {
         assert_eq!(
             capability.platform_profile, "kind-spire-sidecar",
             "enforced sidecar rows must pin the fixture's platform profile"

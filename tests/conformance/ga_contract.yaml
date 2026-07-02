@@ -27,17 +27,14 @@ capabilities:
       - category: istio_destination_rule
         feature: trafficPolicy.connectionPool.tcp.maxConnections
     live_suite: mesh-e2e-sidecar
-    live_assertions:
-      - sidecar.destination_rule.tcp_max_connections
     # maxConnections is enforced on stream-family (TCP) and WebSocket backend
     # connections only — never on the pooled multiplexed mesh-mTLS HTTP egress
     # path (docs/mesh.md "DestinationRule maxConnections enforcement scope") —
-    # so the suite's plain-HTTP probes cannot observe it. A WebSocket-based
-    # live probe is the planned backing.
-    live_deferred: >-
-      Not observable via plain-HTTP mesh egress (enforced on stream-family/
-      WebSocket connections only); WebSocket-based live probe tracked in
-      issue #1974.
+    # so the live backing is a WebSocket flow: one held WS session at
+    # maxConnections=1, a second upgrade rejected 503, recovery after release
+    # (issue #1974).
+    live_assertions:
+      - sidecar.destination_rule.tcp_max_connections
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#destinationrule
     owner: mesh
@@ -68,6 +65,69 @@ capabilities:
       issue #1973.
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#virtualservice-translation
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.peer_authentication.strict_mtls
+    display_name: PeerAuthentication STRICT inbound mTLS
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_peer_authentication
+        feature: mtls.mode = STRICT
+    live_suite: mesh-e2e-sidecar
+    live_assertions:
+      - sidecar.peer_auth.strict_mtls_authenticated
+      - sidecar.peer_auth.strict_mtls_plaintext_rejected
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#peerauthentication
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.authorization_policy.allow_deny_enforcement
+    display_name: AuthorizationPolicy ALLOW/DENY enforcement
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_authorization_policy
+        feature: DENY beats ALLOW on overlap
+      - category: istio_authorization_policy
+        feature: ALLOW + rule admits matching request
+    live_suite: mesh-e2e-sidecar
+    # The identity-scoped DENY is the distinctive observation; the ALLOW half
+    # is proven by the authenticated positive traversing an ALLOW rule
+    # (sidecar.peer_auth.strict_mtls_authenticated) and its implicit-deny
+    # complement (sidecar.request_auth.missing_jwt_rejected).
+    live_assertions:
+      - sidecar.authz.denied_principal_rejected
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#authorization
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.request_authentication.jwt_validation
+    display_name: RequestAuthentication JWT validation
+    maturity: ga
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_request_authentication
+        feature: jwtRules[].issuer + inline jwks
+    live_suite: mesh-e2e-sidecar
+    live_assertions:
+      - sidecar.request_auth.valid_jwt_admitted
+      - sidecar.request_auth.missing_jwt_rejected
+      - sidecar.request_auth.invalid_jwt_rejected
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#requestauthentication
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
