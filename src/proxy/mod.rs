@@ -9354,9 +9354,24 @@ async fn connect_mesh_websocket_backend(
             //     any explicit port, and NO port when the client sent none —
             //     matching the HTTP single-port path exactly);
             //   * otherwise → the dial authority (`<target.host>:<target.port>`).
+            // When the service-authority tag REPLACES the client Host outright,
+            // the original Host would otherwise be lost on the WS path
+            // (`collect_forwardable_websocket_headers` strips `Host`, unlike
+            // the HTTP path which stamps `x-forwarded-host` unconditionally) —
+            // so forward it as `x-forwarded-host` alongside the other client
+            // headers, matching the HTTP dispatch's `client_host_forwarded`
+            // behavior. The other authority branches keep the client Host as
+            // (part of) the `:authority`, so nothing is lost there.
+            let mut forwarded_headers_owned: Option<Vec<(String, String)>> = None;
             let authority = if let Some(service_host) =
                 mesh_mtls_pool::target_mesh_mtls_authority_host(target)
             {
+                if let Some(host) = client_host.filter(|host| !host.is_empty()) {
+                    let mut augmented = client_headers.to_vec();
+                    augmented.retain(|(name, _)| !name.eq_ignore_ascii_case("x-forwarded-host"));
+                    augmented.push(("x-forwarded-host".to_string(), host.to_string()));
+                    forwarded_headers_owned = Some(augmented);
+                }
                 match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
                     Some(service_port) => format!("{service_host}:{service_port}"),
                     None => service_host.to_string(),
@@ -9372,6 +9387,8 @@ async fn connect_mesh_websocket_backend(
                     _ => hbone_pool::authority_for_host_port(&target.host, target.port),
                 }
             };
+            let forwarded_headers: &[(String, String)] =
+                forwarded_headers_owned.as_deref().unwrap_or(client_headers);
             // Cross-cluster WebSocket egress is NOT yet supported (HTTP-first;
             // tracked as a follow-up with Ambient HBONE cross-cluster). A
             // cross-cluster target carries NO `mesh.spiffe_id`, so
@@ -9400,7 +9417,7 @@ async fn connect_mesh_websocket_backend(
                     &authority,
                     path_and_query,
                     &expected_peer,
-                    client_headers,
+                    forwarded_headers,
                 )
                 .await?;
 

@@ -2105,7 +2105,7 @@ When an upstream target is tagged with `mesh.mtls=true` metadata (a Sidecar-topo
 
 ### Mesh Service Discovery
 
-A `service_discovery.provider: mesh` option resolves upstream targets from CP-delivered mesh service and workload snapshots. The provider maps workload addresses and ports into upstream targets with SPIFFE identity tags plus the configured topology's transport tag (`mesh.hbone` for `ambient`, `mesh.mtls` for `sidecar` — see [Gateway Mesh Service Discovery](#gateway-mesh-service-discovery)), enabling the matching outbound pool to route transparently. Target lists are refreshed on every mesh slice update.
+A `service_discovery.provider: mesh` option resolves upstream targets from CP-delivered mesh service and workload snapshots. The provider maps workload addresses and ports into upstream targets with SPIFFE identity tags plus the configured topology's transport tag (`mesh.hbone` for `ambient`, `mesh.mtls` for `sidecar` — see [Gateway Mesh Service Discovery](#gateway-mesh-service-discovery)), enabling the matching outbound pool to route transparently. Target lists refresh on the provider's **poll interval** (`poll_interval_seconds`, default 30s): each poll reads the *current* CP-delivered snapshot, so a mesh update is picked up within one poll interval — a CP push does not refresh targets immediately. Lower the interval for tighter failover/scale-up latency.
 
 Identity baggage from the client request is stripped from tunneled inner HBONE requests to prevent identity spoofing across the gateway boundary.
 
