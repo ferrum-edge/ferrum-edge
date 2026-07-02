@@ -2129,7 +2129,33 @@ pub struct MeshVirtualServiceCorsPolicy {
     /// against materialized outbound services with DestinationRule host
     /// semantics.
     pub host: String,
+    /// VirtualService `exportTo` visibility, honored by slice narrowing with
+    /// the SAME semantics as [`ServiceEntry.export_to`]: `*` = every
+    /// namespace, `.` = the policy's own namespace, otherwise an explicit
+    /// namespace list. EMPTY is namespace-local (Ferrum's conservative
+    /// convention for hand-written sources — no cross-tenant exposure by
+    /// omission); the K8s translator writes `["*"]` for an omitted
+    /// `spec.exportTo` so Istio's public default is preserved explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
     pub cors: MeshCorsPolicy,
+}
+
+/// Returns true when a VirtualService-derived CORS policy is visible to a
+/// workload namespace — the [`service_entry_exported_to_namespace`] rules
+/// applied to the carried `export_to` field.
+pub fn virtual_service_cors_policy_exported_to_namespace(
+    policy: &MeshVirtualServiceCorsPolicy,
+    workload_namespace: &str,
+) -> bool {
+    if policy.export_to.is_empty() {
+        return policy.namespace == workload_namespace;
+    }
+    policy.export_to.iter().any(|target| {
+        target == "*"
+            || target == workload_namespace
+            || (target == "." && policy.namespace == workload_namespace)
+    })
 }
 
 /// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.

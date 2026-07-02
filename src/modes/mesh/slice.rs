@@ -12,7 +12,8 @@ use crate::modes::mesh::config::{
     PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern,
     TrustBundleSet, Workload, WorkloadLabels, is_false, is_zero_usize,
     policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, workload_selector_matches,
+    service_entry_applies_to_workload, virtual_service_cors_policy_exported_to_namespace,
+    workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -1075,12 +1076,18 @@ impl MeshSlice {
             .virtual_service_cors_policies
             .iter()
             .filter(|policy| {
+                // `exportTo` IS the visibility mechanism for VirtualService
+                // policy (ServiceEntry semantics — NOT the plain
+                // namespace-visibility rule DRs use, which would hide a public
+                // `exportTo: ['*']` policy declared in the target service's
+                // namespace): a namespace-local `exportTo: ['.']` never leaks
+                // onto another namespace's outbound routes, and `*` /
+                // explicit-namespace grants cross namespaces.
+                if !virtual_service_cors_policy_exported_to_namespace(policy, effective_namespace) {
+                    return false;
+                }
                 let Some(sidecar) = applicable_sidecar else {
-                    return resource_namespace_visible(
-                        &service_waypoint_namespaces,
-                        &policy.namespace,
-                        &namespace,
-                    );
+                    return true;
                 };
                 let (resource_namespace, host_candidates) = policy_host_scope(
                     &policy.host,

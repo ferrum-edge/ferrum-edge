@@ -2639,17 +2639,40 @@ fn virtual_service_routes(
     // Issue #1973: ALSO carry a translatable `http[].corsPolicy` on the mesh
     // block (per VS host) so mesh sidecar DPs can synthesize the `cors` plugin
     // onto their materialized outbound routes — the gateway-proxy-scoped
-    // plugin emitted below never rides the mesh slice. Host-level application:
-    // the first corsPolicy-bearing `http[]` entry wins (materialized mesh
-    // routes are host-routed `/`, so per-route match scoping does not apply
-    // there); the extraction reuses the SAME `cors_policy_translatable` +
+    // plugin emitted below never rides the mesh slice. Rules (codex round 1):
+    // - SIDECAR-BOUND ONLY: a VS whose `spec.gateways` names only ingress
+    //   gateways (no reserved `mesh` entry) never applies to sidecars in
+    //   Istio, so it is not carried; an omitted `gateways` defaults to mesh.
+    // - Host-level application takes the FIRST corsPolicy-BEARING `http[]`
+    //   entry (materialized mesh routes are host-routed `/`); if THAT entry's
+    //   policy is not translatable, NOTHING is carried — promoting a later
+    //   route's policy host-wide would enforce the wrong CORS on paths whose
+    //   own policy was deferred.
+    // - `spec.exportTo` visibility is carried for slice narrowing; an omitted
+    //   exportTo becomes an explicit `["*"]` so Istio's public default is
+    //   preserved (the mesh model's EMPTY export_to is namespace-local by
+    //   Ferrum convention, matching ServiceEntry).
+    // The extraction reuses the SAME `cors_policy_translatable` +
     // `cors_allowed_origins` gates as `route_cors_plugin`, so slice-carried
     // and gateway-projected CORS can never disagree on representability.
-    if let Some(mesh_cors) = http_routes
-        .iter()
-        .filter_map(|http| http.get("corsPolicy"))
-        .find_map(mesh_cors_policy_from_value)
+    let vs_gateways = string_array(&object.spec, "gateways");
+    let applies_to_sidecars =
+        vs_gateways.is_empty() || vs_gateways.iter().any(|gateway| gateway == "mesh");
+    if applies_to_sidecars
+        && let Some(mesh_cors) = http_routes
+            .iter()
+            .find(|http| http.get("corsPolicy").is_some())
+            .and_then(|http| http.get("corsPolicy"))
+            .and_then(mesh_cors_policy_from_value)
     {
+        let export_to = {
+            let declared = string_array(&object.spec, "exportTo");
+            if declared.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                declared
+            }
+        };
         for host in &hosts {
             acc.mesh
                 .virtual_service_cors_policies
@@ -2657,6 +2680,7 @@ fn virtual_service_routes(
                     name: object.metadata.name.clone(),
                     namespace: object.metadata.namespace.clone(),
                     host: host.clone(),
+                    export_to: export_to.clone(),
                     cors: mesh_cors.clone(),
                 });
         }
