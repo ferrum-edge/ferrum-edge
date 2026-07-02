@@ -1951,6 +1951,49 @@ mod virtual_service_cors {
     }
 
     #[test]
+    fn padded_exact_origin_rejected() {
+        // The cors plugin TRIMS plain-string origins, so a padded literal —
+        // which Istio's exact semantics match against no real Origin — would
+        // silently widen to its trimmed form on the sidecar.
+        for padded in [" https://a.example", "https://a.example "] {
+            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+                padded.into(),
+            )])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("leading/trailing whitespace")),
+                "exact `{padded}` must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_incompatible_exact_origin_rejected() {
+        // Synthesis projects exacts into the cors plugin's plain-string
+        // `allowed_origins` form; values the plugin rejects at construction
+        // must fail slice validation at the config boundary instead of
+        // plugin-cache construction on the data plane.
+        for invalid in [
+            "https://a.example/",
+            "https://a.example/path",
+            "https://user:pw@a.example",
+            "ftp://a.example",
+            "not a url",
+        ] {
+            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+                invalid.into(),
+            )])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("not a valid origin")),
+                "exact `{invalid}` must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn uncompilable_regex_rejected() {
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Regex("(".into())])]);
         assert!(

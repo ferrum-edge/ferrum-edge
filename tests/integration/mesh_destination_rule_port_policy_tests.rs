@@ -1217,6 +1217,83 @@ fn virtual_service_cors_policy_respects_gateways_and_first_bearing_route() {
 }
 
 #[test]
+fn virtual_service_cors_policy_earlier_corsless_catch_all_suppresses_later_policy() {
+    // Istio evaluates http[] in order: an earlier host-wide catch-all WITHOUT
+    // corsPolicy wins all host traffic, so a later route's CORS never applies
+    // in Istio — carrying it host-wide would answer preflights and reject
+    // disallowed Origins on traffic whose winning route has no CORS at all.
+    let translated = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-corsless-catch-all-first",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}]
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://later.example"}]}
+                    }
+                ]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+    assert!(
+        translated
+            .config
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+            .unwrap_or(true),
+        "a later route's CORS must not override an earlier corsless host-wide catch-all"
+    );
+
+    // `ignoreUriCase` is URI-comparison metadata, not a scoping predicate: a
+    // catch-all `/` prefix carrying it is still host-wide-representable.
+    let ignore_uri_case = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-ignore-uri-case",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/"}, "ignoreUriCase": true}],
+                    "route": [{"destination": {
+                        "host": "svc.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }}],
+                    "corsPolicy": {"allowOrigins": [{"exact": "https://a.example"}]}
+                }]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+    assert_eq!(
+        ignore_uri_case
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh block")
+            .virtual_service_cors_policies
+            .len(),
+        1,
+        "ignoreUriCase on a catch-all match must not make host-wide CORS disappear"
+    );
+}
+
+#[test]
 fn virtual_service_cors_policy_export_to_gates_slice_visibility() {
     use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
@@ -1484,6 +1561,58 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
                 .iter()
                 .any(|plugin| plugin.plugin_name == "cors"),
             "padded wildcard exact `{padded}` must not project a gateway cors plugin"
+        );
+    }
+
+    // Padded PLAIN exacts and non-origin exacts are equally non-translatable:
+    // the plugin trims plain-string origins (a padded literal, which Istio
+    // matches against no real Origin, would widen to its trimmed form) and
+    // rejects non-`scheme://host[:port]` values at construction (a
+    // translate-then-fail on the data plane instead of a deferral here).
+    for invalid in [
+        " https://app.example",
+        "https://app.example ",
+        "https://app.example/",
+        "https://app.example/path",
+        "https://user:pw@app.example",
+        "ftp://app.example",
+        "not a url",
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-invalid-exact",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": invalid}]}
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("VirtualService translates");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "non-plugin-valid exact `{invalid}` must not ride the mesh slice"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "non-plugin-valid exact `{invalid}` must not project a gateway cors plugin"
         );
     }
 

@@ -2643,13 +2643,15 @@ fn virtual_service_routes(
     // - SIDECAR-BOUND ONLY: a VS whose `spec.gateways` names only ingress
     //   gateways (no reserved `mesh` entry) never applies to sidecars in
     //   Istio, so it is not carried; an omitted `gateways` defaults to mesh.
-    // - Host-level application takes the FIRST corsPolicy-BEARING `http[]`
-    //   entry AMONG the host-wide-representable candidates (no match, or a
-    //   catch-all `/` prefix on a mesh gateway — see
-    //   `http_entry_cors_applies_host_wide`; predicate-scoped entries neither
-    //   donate nor suppress). If that candidate's policy is not translatable,
-    //   NOTHING is carried — promoting a later route's policy host-wide
-    //   would enforce the wrong CORS on paths whose own policy was deferred.
+    // - Host-level application takes the FIRST host-wide-representable
+    //   `http[]` entry (no match, or a catch-all `/` prefix on a mesh
+    //   gateway — see `http_entry_cors_applies_host_wide`; predicate-scoped
+    //   entries neither donate nor suppress). Istio evaluates `http[]` in
+    //   order, so an earlier host-wide catch-all wins ALL host traffic: if
+    //   that entry carries no corsPolicy, or its policy is not translatable,
+    //   NOTHING is carried — promoting a LATER route's policy host-wide
+    //   would enforce CORS (preflight answering, disallowed-Origin rejects)
+    //   on traffic whose winning route has none.
     // - `spec.exportTo` visibility is carried for slice narrowing; an omitted
     //   exportTo becomes an explicit `["*"]` so Istio's public default is
     //   preserved (the mesh model's EMPTY export_to is namespace-local by
@@ -2663,8 +2665,7 @@ fn virtual_service_routes(
     if applies_to_sidecars
         && let Some(mesh_cors) = http_routes
             .iter()
-            .filter(|http| http_entry_cors_applies_host_wide(http))
-            .find(|http| http.get("corsPolicy").is_some())
+            .find(|http| http_entry_cors_applies_host_wide(http))
             .and_then(|http| http.get("corsPolicy"))
             .and_then(mesh_cors_policy_from_value)
     {
@@ -3614,7 +3615,10 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
 /// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's
 /// `allowed_origins` entry form. Returns `None` (unrepresentable → policy stays
 /// deferred) when the entry is not an object carrying EXACTLY ONE non-empty
-/// `exact` / `prefix` / `regex` string, or when a `regex` fails to compile.
+/// `exact` / `prefix` / `regex` string, when a `regex` fails to compile, or
+/// when an `exact` is wildcard-shaped, whitespace-padded, or not a valid
+/// `scheme://host[:port]` origin (the plugin's own exact-origin admission —
+/// see `plugins::cors::validate_exact_origin`).
 /// `regex` is compiled here (cold path) purely to gate translatability — the
 /// plugin re-compiles it at config time as the runtime matcher; an invalid
 /// pattern is never reflected into a header.
@@ -3648,6 +3652,23 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
                 // as its own wildcard syntax (allow-all / subdomain match) —
                 // a silent policy WIDENING. Non-translatable: the policy
                 // stays deferred instead of projecting either meaning.
+                return None;
+            }
+            if trimmed.len() != exact.len() {
+                // Whitespace-padded exact: the plugin trims plain-string
+                // origins, so the projection would allow the TRIMMED origin
+                // while Istio's literal `StringMatch.exact` only matches the
+                // padded value (i.e. no real Origin header) — the same silent
+                // widening as the wildcard case. Non-translatable.
+                return None;
+            }
+            if crate::plugins::cors::validate_exact_origin(exact).is_err() {
+                // Not an origin the cors plugin accepts (`scheme://host[:port]`
+                // only — no path/query/fragment/credentials, http(s) scheme).
+                // Projecting it would fail `CorsPlugin` construction AFTER
+                // translation instead of deferring here, breaking the
+                // always-projectable contract documented on
+                // `cors_allowed_origins`. Non-translatable.
                 return None;
             }
             Some(Value::String(exact.to_string()))
@@ -3702,7 +3723,8 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// applied HOST-WIDE on materialized mesh routes (which are host-routed `/`):
 /// its `match[]` is omitted/empty, or SOME match both applies to the mesh
 /// (`gateways` omitted or naming the reserved `mesh` gateway) and constrains
-/// nothing beyond a catch-all `/` uri prefix. An entry scoped by any other
+/// nothing beyond a catch-all `/` uri prefix (`name` and `ignoreUriCase` are
+/// non-scoping metadata). An entry scoped by any other
 /// predicate — a narrower uri, `headers`, `port`, `sourceLabels`, `method`,
 /// `queryParams`, `withoutHeaders`, … — is route-scoped, and promoting its
 /// CORS host-wide would enforce it (including disallowed-Origin 403s) on
@@ -3747,6 +3769,10 @@ fn http_entry_cors_applies_host_wide(http: &Value) -> bool {
                 }
                 // Route-name metadata, not a routing predicate.
                 "name" => {}
+                // URI-comparison semantics, not a routing predicate: with a
+                // catch-all `/` prefix (the only uri this predicate accepts),
+                // case-insensitive comparison narrows nothing.
+                "ignoreUriCase" => {}
                 // Any other predicate is route scoping — fail closed to
                 // "not host-wide" for unknown/future predicates too.
                 _ => return false,

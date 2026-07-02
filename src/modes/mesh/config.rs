@@ -2641,11 +2641,12 @@ fn validate_virtual_service_cors_policies(
         for (index, origin) in policy.cors.allowed_origins.iter().enumerate() {
             match origin {
                 MeshCorsOriginMatch::Exact(value) => {
-                    if value.trim().is_empty() {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] must not be empty"
                         ));
-                    } else if value.trim_start().starts_with('*') {
+                    } else if trimmed.starts_with('*') {
                         // A wildcard-shaped `exact` (`*`, `*.example.com`) can
                         // never match a real Origin under Istio's
                         // literal-exact semantics, but projected as the cors
@@ -2657,6 +2658,26 @@ fn validate_virtual_service_cors_policies(
                         // rejecting the slice fail-closed.
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] exact matcher must not be wildcard-shaped — Istio exact semantics match the literal string only; use a prefix or regex matcher for wildcard intent"
+                        ));
+                    } else if trimmed.len() != value.len() {
+                        // The cors plugin TRIMS plain-string origins, so a
+                        // whitespace-padded exact would silently widen from
+                        // Istio's literal semantics (the padded value matches
+                        // no real Origin) to the trimmed origin.
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] exact matcher must not have leading/trailing whitespace — Istio exact semantics match the literal string only"
+                        ));
+                    } else if let Err(err) = crate::plugins::cors::validate_exact_origin(value) {
+                        // Synthesis projects exacts into the cors plugin's
+                        // plain `allowed_origins` form, whose construction
+                        // rejects non-origin values (paths, query/fragment,
+                        // credentials, trailing slash, non-http(s) schemes,
+                        // non-URL strings). Reject at the config boundary
+                        // instead of failing later during plugin-cache
+                        // construction on the data plane — same shared gate
+                        // the K8s translator uses to defer such policies.
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] exact matcher is not a valid origin: {err}"
                         ));
                     }
                 }
