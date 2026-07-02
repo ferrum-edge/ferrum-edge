@@ -666,10 +666,11 @@ async fn test_response_buffering_releases_event_stream_content_type() {
 /// A keyed request whose response is streamed as `text/event-stream` is handed
 /// to the client incrementally, so `on_final_response_body` (which transitions
 /// the `InFlight` marker to a cached `Completed` entry) never runs. The marker
-/// stays in-flight for the lifetime of the stream, then the streamed-terminal
-/// hook releases it without storing a replay body.
+/// stays in-flight for the lifetime of the stream and then until
+/// `inflight_ttl_seconds` expires, because the streamed-terminal hook cannot
+/// store a replay body or tombstone.
 #[tokio::test]
-async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
+async fn test_streamed_event_stream_keeps_inflight_marker_on_stream_end() {
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -718,12 +719,12 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
     );
 
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::client_disconnect(32))
         .await;
     assert_eq!(
         plugin.tracked_keys_count(),
-        Some(0),
-        "finite streamed SSE completion must release the in-flight marker instead of waiting for TTL"
+        Some(1),
+        "streamed SSE disconnect must keep the in-flight marker until TTL because no replay body is stored"
     );
 
     let mut after_ctx = RequestContext::new(
@@ -737,8 +738,14 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
         .before_proxy(&mut after_ctx, &mut after_headers)
         .await;
     assert!(
-        matches!(result, PluginResult::Continue),
-        "duplicate after streamed SSE completion should re-execute, not get stale 409 or cached replay; got {result:?}"
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "duplicate after streamed SSE disconnect should remain blocked until TTL, got {result:?}"
     );
 }
 
@@ -806,7 +813,11 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
     plugin
         .on_response_stream_terminated(&successor_ctx, 200, &BodyOutcome::success(32))
         .await;
-    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(1),
+        "current streamed owner should also remain protected until TTL"
+    );
 }
 
 /// A buffered (non-SSE) keyed response keeps the marker in-flight through the

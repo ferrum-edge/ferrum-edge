@@ -74,7 +74,7 @@ For gateway-generated rejection responses, a small set of header-only `after_pro
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
-`on_response_stream_terminated` is streaming-only. It receives the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup and accounting after the stream ends. Plugins that hold per-request state across streamed responses, such as `request_deduplication`, use this hook to release state without forcing event streams or other long-lived responses onto the buffered path.
+`on_response_stream_terminated` is streaming-only. It receives the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup and accounting after the stream ends. Plugins that hold per-request state across streamed responses may use this hook for cleanup when doing so does not weaken correctness guarantees; for example, `request_deduplication` intentionally keeps non-buffered streamed responses in-flight until `inflight_ttl_seconds` because no replayable response or tombstone is available.
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 

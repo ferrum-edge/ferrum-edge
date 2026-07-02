@@ -1564,9 +1564,9 @@ impl Plugin for RequestDeduplication {
         // on the buffered path with no benefit. Streaming it instead keeps the
         // `InFlight` marker active for the lifetime of the still-in-flight
         // stream — which is exactly the concurrent-duplicate protection this
-        // plugin promises. The streamed-body terminal hook releases the marker
-        // once the stream ends; `inflight_ttl` remains only the crash/leak
-        // backstop for streams that never deliver a terminal signal.
+        // plugin promises. Because no replayable response or tombstone is
+        // stored for this path, the in-flight marker remains until
+        // `inflight_ttl` instead of being released at stream termination.
         self.should_buffer_response_body(ctx)
             && !content_type.is_some_and(is_event_stream_content_type)
     }
@@ -1788,22 +1788,18 @@ impl Plugin for RequestDeduplication {
         _response_status: u16,
         _outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
-        // Release regardless of terminal outcome. Streamed responses have no
-        // replayable body, so success, backend error, and client disconnect all
-        // leave the next matching request to execute normally.
-        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+        // Streamed responses have no replayable body, and this hook also runs
+        // for client disconnects and mid-stream errors. Releasing here would
+        // let an immediate retry with the same idempotency key re-execute a
+        // side-effecting backend operation with no replay/tombstone
+        // protection, so keep the local marker and Redis lock until
+        // `inflight_ttl`.
+        let Some(_key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
             return;
         };
-        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
+        let Some(_fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
             return;
         };
-
-        if let Some(owner_token) = ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA) {
-            self.remove_matching_local_inflight(key, fingerprint, owner_token);
-        }
-        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-            self.redis_release_inflight(key, fingerprint, token).await;
-        }
     }
 
     async fn on_final_response_body(
