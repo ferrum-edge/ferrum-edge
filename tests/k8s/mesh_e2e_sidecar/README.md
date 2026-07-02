@@ -54,6 +54,12 @@ the fixture). The one remaining `live_deferred` contract id is VS CORS
 (issue #1973 — the mesh slice carries no VirtualService-derived route
 plugins).
 
+This contract is **PR- and release-blocking**: the dedicated workflow's
+result is mirrored into the required CI aggregate by the
+`Mesh E2E Sidecar Live (CI mirror)` job in `ci.yml`, the suite force-runs on
+every main push, and `release.yml`'s `validate-release-sha` requires a green
+push run for the tag target before anything ships.
+
 ## JWT material
 
 RS256 keys are generated fresh per run with `openssl`; python3 stdlib

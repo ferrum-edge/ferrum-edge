@@ -100,6 +100,11 @@ jobs:
 
           wait_for_success "ci.yml" "CI"
           wait_for_success "coverage.yml" "Coverage"
+          # The M2 sidecar GA contract is release-blocking: the dedicated live
+          # suite runs the fixture AND validates the emitted live-assertions
+          # artifact against ga_contract.yaml on every main push, so a release
+          # SHA without a green, contract-validated live run cannot ship.
+          wait_for_success "mesh-e2e-sidecar-live.yml" "Mesh E2E Sidecar Live Datapath"
 
   build-release-binaries:
     name: Build (${{ matrix.asset_name }})

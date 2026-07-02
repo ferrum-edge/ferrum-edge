@@ -30,6 +30,7 @@ REQUIRED_JOBS = {
     "coverage-gate",
     "mesh-multicluster-federation",
     "mesh-e2e-sidecar",
+    "mesh-e2e-sidecar-live",
     "helm-chart",
     "lint",
     "detect-ebpf-live-changes",

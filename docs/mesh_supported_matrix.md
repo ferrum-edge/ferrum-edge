@@ -11,7 +11,7 @@ matrix is emitted by the conformance suite to `target/conformance/coverage.md`
 
 | Tier | Meaning | Enforcement |
 |---|---|---|
-| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a regression to anything but `Supported` fails CI (`tests/conformance/`). Full GA additionally requires the live-datapath e2e gate (`mesh-e2e-sidecar`, in build-out). |
+| **GA** (equivalent to `docs/mesh.md` "Stable") | Production-suitable; exercised end-to-end against a live data path. A product promise. | **Prescriptive, at both layers.** Listed in `tests/conformance/ga_contract.yaml` and tagged `Maturity::Ga`; a semantic regression to anything but `Supported` fails CI (`tests/conformance/ga_scope.rs`). The **live** half is equally blocking: the `mesh-e2e-sidecar` suite runs on every relevant PR and every main push, its emitted `live-assertions.json` is validated against the contract (`tests/conformance/live_contract.rs` — required IDs present + passed for the exact suite/profile/commit, no duplicate or stale artifacts), the result is mirrored into the required CI aggregate (`Mesh E2E Sidecar Live (CI mirror)`), and `release.yml` refuses to ship a tag whose SHA lacks a green live run. |
 | **Beta** | Feature-complete and tested, with a documented sharp edge or an owed verification step. | Observational — may be `Deferred` without failing CI. |
 | **Experimental** | Usable with a safety-relevant caveat (plaintext, partial enforcement) or live-datapath-unverified. Opt-in; not recommended without compensating controls. | Observational. |
 | **Dev-only** | Gated behind a build feature or dev opt-in; not in the default published image. | Observational. |
@@ -22,20 +22,34 @@ conformance suite was observational ("all-green by design") and a promised
 feature could be silently downgraded. Now a GA feature that regresses breaks its
 own test. See `tests/conformance/ga_scope.rs` for the gate.
 
-The GA contract is **seeded and grows incrementally** — a feature is enrolled
-only once we are prepared to fail CI on its regression. The source of truth is
-`tests/conformance/ga_contract.yaml`. So the contract does not yet enroll every
-row the maturity tables label *Stable*; `coverage.md` lists the currently
-enrolled semantic rows and required live assertion IDs, which are the
-authoritative answer to "what regression fails CI today."
+The GA contract **grows incrementally** — a feature is enrolled only once we
+are prepared to fail CI on its regression. The source of truth is
+`tests/conformance/ga_contract.yaml`. The **Stable sidecar traffic surface is
+now enrolled vertically** (semantic assertion → contract row → required live
+assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
+RequestAuthentication JWT, and DestinationRule
+`connectTimeout`/`maxConnections`, each backed by a `sidecar.*` live assertion
+the `mesh-e2e-sidecar` suite must emit and pass. The one declared-but-deferred
+live assertion is VirtualService CORS (`live_deferred`, issue #1973 — the mesh
+slice does not carry VS-derived route plugins); its semantic translation
+remains GA-gated. Stable rows outside the sidecar *traffic* surface (native
+`MeshSubscribe` config transport, SPIFFE identity plumbing) enroll next;
+`coverage.md` lists the currently enrolled rows and required live assertion
+IDs, which are the authoritative answer to "what regression fails CI today."
 
 ## Current headline state
 
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
   + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
-  `DestinationRule` LB/timeout/outlier. This is the path being driven to GA
-  first (semantics are pinned; live-datapath e2e verification is in build-out).
+  `DestinationRule` LB/timeout/outlier. Semantics are pinned, and the sidecar
+  traffic surface is now **live-verified and blocking**: the `mesh-e2e-sidecar`
+  kind+SPIRE suite drives the real captured datapath (STRICT mTLS positive +
+  plaintext-rejected negative, destination-side authz 403, JWT
+  valid/missing/invalid, DR connectTimeout two-phase timing, DR
+  maxConnections=1 WebSocket hold/reject/release) on every relevant PR and
+  every main push, the artifact is contract-validated, and both the required
+  CI aggregate and `release.yml` gate on it.
   An identity-less mesh — no file-based gateway SVID material **and** no CA
   backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) supplying a runtime SVID — **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
   unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
