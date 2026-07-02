@@ -1287,3 +1287,158 @@ virtual_service_cors_policies:
     let omitted = MeshSlice::from_gateway_config(&config_for(""), request("consumer"));
     assert!(omitted.virtual_service_cors_policies.is_empty());
 }
+
+#[test]
+fn virtual_service_cors_policy_wildcard_exact_origin_defers_everywhere() {
+    // A wildcard-shaped StringMatch `exact` can never match a real Origin
+    // under Istio's literal semantics, but the cors plugin's plain-string
+    // form would read it as wildcard allow-all — a silent policy WIDENING.
+    // The shared extractor treats it as non-translatable, so BOTH the
+    // gateway-side plugin and the mesh-slice carriage defer.
+    for wildcard in ["*", "*.example.com"] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-wildcard-exact",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": wildcard}]}
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("VirtualService translates");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "wildcard-shaped exact `{wildcard}` must not ride the mesh slice"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "wildcard-shaped exact `{wildcard}` must not project a gateway cors plugin either"
+        );
+    }
+}
+
+#[test]
+fn virtual_service_cors_policy_skips_gateway_scoped_matches() {
+    // http[0]'s CORS is scoped to an ingress gateway via match[].gateways —
+    // it must neither donate its policy to the mesh slice nor suppress the
+    // later mesh-bound http[1] policy.
+    let translated = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-match-gateways",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "gateways": ["mesh", "ingress-gw"],
+                "http": [
+                    {
+                        "match": [{"uri": {"prefix": "/ingress"}, "gateways": ["ingress-gw"]}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://ingress-only.example"}]}
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/mesh"}, "gateways": ["mesh"]}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://mesh.example"}]}
+                    }
+                ]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+    let mesh = translated.config.mesh.as_ref().expect("mesh block");
+    assert_eq!(mesh.virtual_service_cors_policies.len(), 1);
+    assert_eq!(
+        cors_plugin_config_from_mesh_policy(&mesh.virtual_service_cors_policies[0].cors)["allowed_origins"],
+        serde_json::json!(["https://mesh.example"]),
+        "the mesh-bound entry's policy must be carried, not the ingress-scoped first entry's"
+    );
+}
+
+#[test]
+fn virtual_service_cors_synthesis_is_sidecar_topology_only() {
+    // Ambient also materializes __mesh-outbound-* routes, but VS CORS is a
+    // client-SIDECAR behavior (the GA row's scope) — no plugin may be
+    // synthesized for sidecarless topologies.
+    let mesh: MeshConfig = serde_yaml::from_str(
+        r#"
+workloads:
+  - spiffe_id: spiffe://cluster.local/ns/default/sa/svc
+    service_name: svc
+    namespace: default
+    trust_domain: cluster.local
+    service_account: svc
+    addresses: ["10.0.0.9"]
+    ports:
+      - port: 8080
+        protocol: http
+        name: http
+    selector:
+      namespace: default
+services:
+  - name: svc
+    namespace: default
+    ports:
+      - port: 8080
+        protocol: http
+        name: http
+    workloads:
+      - spiffe_id: spiffe://cluster.local/ns/default/sa/svc
+virtual_service_cors_policies:
+  - name: svc-cors
+    namespace: default
+    host: svc
+    cors:
+      allowed_origins:
+        - exact: "https://fixture.example"
+"#,
+    )
+    .expect("mesh yaml parses");
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let ambient_runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Ambient,
+        ..runtime()
+    };
+    let prepared = prepare_gateway_config_for_mesh(config, &ambient_runtime).expect("mesh config");
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.starts_with("__mesh-outbound-")),
+        "ambient still materializes outbound routes"
+    );
+    assert!(
+        !prepared
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.id.starts_with("__mesh-cors-")),
+        "no cors plugin may be synthesized for a sidecarless topology"
+    );
+}

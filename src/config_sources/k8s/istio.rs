@@ -2661,6 +2661,7 @@ fn virtual_service_routes(
     if applies_to_sidecars
         && let Some(mesh_cors) = http_routes
             .iter()
+            .filter(|http| http_entry_applies_to_mesh(http))
             .find(|http| http.get("corsPolicy").is_some())
             .and_then(|http| http.get("corsPolicy"))
             .and_then(mesh_cors_policy_from_value)
@@ -3590,11 +3591,13 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
         }
         (!origins.is_empty()).then_some(origins)
     } else if let Some(arr) = cors.get("allowOrigin").and_then(Value::as_array) {
-        // Deprecated Istio field: a plain list of exact origin strings.
+        // Deprecated Istio field: a plain list of exact origin strings. The
+        // same wildcard guard as the StringMatch `exact` arm applies — a
+        // `*`-shaped entry would flip the plugin into its wildcard syntax.
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
             let s = entry.as_str()?;
-            if s.is_empty() {
+            if s.is_empty() || s.starts_with('*') {
                 return None;
             }
             origins.push(Value::String(s.to_string()));
@@ -3630,7 +3633,18 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
     let regex = obj.get("regex").and_then(Value::as_str);
 
     match (exact, prefix, regex) {
-        (Some(exact), None, None) => (!exact.is_empty()).then(|| Value::String(exact.to_string())),
+        (Some(exact), None, None) => {
+            if exact.is_empty() || exact.starts_with('*') {
+                // A wildcard-shaped `exact` (`*`, `*.example.com`) can never
+                // match a real Origin under Istio's literal-exact semantics,
+                // but the cors plugin's PLAIN-STRING form would interpret it
+                // as its own wildcard syntax (allow-all / subdomain match) —
+                // a silent policy WIDENING. Non-translatable: the policy
+                // stays deferred instead of projecting either meaning.
+                return None;
+            }
+            Some(Value::String(exact.to_string()))
+        }
         (None, Some(prefix), None) => {
             (!prefix.is_empty()).then(|| serde_json::json!({ "prefix": prefix }))
         }
@@ -3677,6 +3691,29 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// `allowOrigin` exact list are all projected. This reuses the existing `cors`
 /// plugin instead of duplicating preflight/header logic, mirroring the
 /// `request_mirror` approach for `http[].mirror`.
+/// Whether a VirtualService `http[]` entry applies to sidecars: its `match[]`
+/// is omitted/empty, or ANY match's `gateways` is omitted or names the
+/// reserved `mesh` gateway. Istio scopes a match-level `gateways` list to the
+/// named gateways only, so an ingress-scoped entry must neither donate its
+/// CORS policy to the mesh slice nor suppress a later mesh-bound one.
+fn http_entry_applies_to_mesh(http: &Value) -> bool {
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return true;
+    };
+    if matches.is_empty() {
+        return true;
+    }
+    matches.iter().any(
+        |entry| match entry.get("gateways").and_then(Value::as_array) {
+            None => true,
+            Some(gateways) => gateways
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|gateway| gateway == "mesh"),
+        },
+    )
+}
+
 /// Build the mesh-slice-carried CORS policy from a `http[].corsPolicy` value
 /// (issue #1973). Returns `None` for a non-translatable policy — the SAME
 /// verdict `route_cors_plugin` reaches, because both funnel through

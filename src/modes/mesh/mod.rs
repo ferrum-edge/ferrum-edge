@@ -5723,6 +5723,13 @@ fn synthesize_mesh_outbound_cors_plugins(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
+    // Client-SIDECAR scope only (the GA row and docs promise exactly that):
+    // Ambient/waypoint topologies also materialize `__mesh-outbound-*` routes,
+    // but VS policy application for them is a waypoint concern — do not hand
+    // sidecar-style CORS behavior to sidecarless clients.
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
     if mesh_slice.virtual_service_cors_policies.is_empty() {
         return;
     }

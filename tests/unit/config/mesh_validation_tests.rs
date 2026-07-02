@@ -1854,3 +1854,215 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
         "expected ProxyConfig sampling range error, got: {errors:?}"
     );
 }
+
+// ── VirtualService-derived CORS policies (issue #1973) ─────────────────────
+
+mod virtual_service_cors {
+    use ferrum_edge::modes::mesh::config::{
+        MeshConfig, MeshCorsOriginMatch, MeshCorsPolicy, MeshVirtualServiceCorsPolicy,
+        cors_plugin_config_from_mesh_policy, virtual_service_cors_policy_exported_to_namespace,
+    };
+
+    fn policy(origins: Vec<MeshCorsOriginMatch>) -> MeshVirtualServiceCorsPolicy {
+        MeshVirtualServiceCorsPolicy {
+            name: "vs-cors".into(),
+            namespace: "default".into(),
+            host: "svc.default.svc.cluster.local".into(),
+            export_to: Vec::new(),
+            cors: MeshCorsPolicy {
+                allowed_origins: origins,
+                allowed_methods: Vec::new(),
+                allowed_headers: Vec::new(),
+                exposed_headers: Vec::new(),
+                max_age_seconds: None,
+                allow_credentials: None,
+            },
+        }
+    }
+
+    fn validate(policies: Vec<MeshVirtualServiceCorsPolicy>) -> Vec<String> {
+        MeshConfig {
+            virtual_service_cors_policies: policies,
+            ..MeshConfig::default()
+        }
+        .validate()
+    }
+
+    #[test]
+    fn valid_policy_passes() {
+        let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+            "https://a.example".into(),
+        )])]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn originless_policy_rejected() {
+        let errors = validate(vec![policy(Vec::new())]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("at least one origin matcher")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn empty_matcher_values_rejected() {
+        for matcher in [
+            MeshCorsOriginMatch::Exact("  ".into()),
+            MeshCorsOriginMatch::Prefix(String::new()),
+            MeshCorsOriginMatch::Regex(String::new()),
+        ] {
+            let errors = validate(vec![policy(vec![matcher.clone()])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("must not be empty")),
+                "matcher {matcher:?} must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncompilable_regex_rejected() {
+        let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Regex("(".into())])]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("regex does not compile")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn empty_host_and_name_rejected() {
+        let mut bad = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        bad.host = String::new();
+        bad.name = " ".into();
+        let errors = validate(vec![bad]);
+        assert!(
+            errors.iter().any(|error| error.contains(".host")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| error.contains(".name")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn origin_matcher_serde_is_single_key_map_and_fail_closed() {
+        // YAML single-key maps parse to the right variants…
+        let parsed: Vec<MeshCorsOriginMatch> = serde_yaml::from_str(
+            "- exact: \"https://a.example\"\n- prefix: \"https://app.\"\n- regex: \"https://.*\"\n",
+        )
+        .expect("single-key maps parse");
+        assert_eq!(
+            parsed,
+            vec![
+                MeshCorsOriginMatch::Exact("https://a.example".into()),
+                MeshCorsOriginMatch::Prefix("https://app.".into()),
+                MeshCorsOriginMatch::Regex("https://.*".into()),
+            ]
+        );
+        // …serialization round-trips through the same shape…
+        let json = serde_json::to_value(&parsed).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"exact": "https://a.example"},
+                {"prefix": "https://app."},
+                {"regex": "https://.*"}
+            ])
+        );
+        // …and malformed matchers fail closed instead of dropping a key.
+        assert!(
+            serde_yaml::from_str::<MeshCorsOriginMatch>("exact: a\nregex: b\n").is_err(),
+            "two keys must be rejected"
+        );
+        assert!(
+            serde_yaml::from_str::<MeshCorsOriginMatch>("suffix: a\n").is_err(),
+            "unknown key must be rejected"
+        );
+        assert!(
+            serde_yaml::from_str::<MeshCorsOriginMatch>("{}").is_err(),
+            "empty map must be rejected"
+        );
+    }
+
+    #[test]
+    fn plugin_projection_covers_all_fields() {
+        let full = MeshCorsPolicy {
+            allowed_origins: vec![
+                MeshCorsOriginMatch::Exact("https://a.example".into()),
+                MeshCorsOriginMatch::Prefix("https://app.".into()),
+                MeshCorsOriginMatch::Regex("https://.*".into()),
+            ],
+            allowed_methods: vec!["GET".into()],
+            allowed_headers: vec!["x-a".into()],
+            exposed_headers: vec!["x-b".into()],
+            max_age_seconds: Some(600),
+            allow_credentials: Some(true),
+        };
+        let config = cors_plugin_config_from_mesh_policy(&full);
+        assert_eq!(
+            config["allowed_origins"],
+            serde_json::json!([
+                "https://a.example",
+                {"prefix": "https://app."},
+                {"regex": "https://.*"}
+            ])
+        );
+        assert_eq!(config["allowed_methods"], serde_json::json!(["GET"]));
+        assert_eq!(config["allowed_headers"], serde_json::json!(["x-a"]));
+        assert_eq!(config["exposed_headers"], serde_json::json!(["x-b"]));
+        assert_eq!(config["max_age"], serde_json::json!(600));
+        assert_eq!(config["allow_credentials"], serde_json::json!(true));
+        // Sparse policies omit the optional keys entirely.
+        let sparse = cors_plugin_config_from_mesh_policy(&MeshCorsPolicy {
+            allowed_origins: vec![MeshCorsOriginMatch::Exact("https://a.example".into())],
+            allowed_methods: Vec::new(),
+            allowed_headers: Vec::new(),
+            exposed_headers: Vec::new(),
+            max_age_seconds: None,
+            allow_credentials: None,
+        });
+        assert!(sparse.get("allowed_methods").is_none());
+        assert!(sparse.get("max_age").is_none());
+        assert!(sparse.get("allow_credentials").is_none());
+        assert!(sparse.get("preflight_continue").is_none());
+    }
+
+    #[test]
+    fn export_visibility_follows_service_entry_semantics() {
+        let mut p = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        // Empty export_to is namespace-local.
+        assert!(virtual_service_cors_policy_exported_to_namespace(
+            &p, "default"
+        ));
+        assert!(!virtual_service_cors_policy_exported_to_namespace(
+            &p, "other"
+        ));
+        // "." is the policy's own namespace.
+        p.export_to = vec![".".into()];
+        assert!(virtual_service_cors_policy_exported_to_namespace(
+            &p, "default"
+        ));
+        assert!(!virtual_service_cors_policy_exported_to_namespace(
+            &p, "other"
+        ));
+        // "*" is public; explicit namespaces grant exactly themselves.
+        p.export_to = vec!["*".into()];
+        assert!(virtual_service_cors_policy_exported_to_namespace(
+            &p, "other"
+        ));
+        p.export_to = vec!["team-a".into()];
+        assert!(virtual_service_cors_policy_exported_to_namespace(
+            &p, "team-a"
+        ));
+        assert!(!virtual_service_cors_policy_exported_to_namespace(
+            &p, "team-b"
+        ));
+    }
+}
