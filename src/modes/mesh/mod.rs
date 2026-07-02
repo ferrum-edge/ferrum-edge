@@ -5733,9 +5733,17 @@ fn synthesize_mesh_outbound_cors_plugins(
     if mesh_slice.virtual_service_cors_policies.is_empty() {
         return;
     }
-    let mut sorted_policies: Vec<&config::MeshVirtualServiceCorsPolicy> =
-        mesh_slice.virtual_service_cors_policies.iter().collect();
-    sorted_policies.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    // Normalize the host MATCH KEY here, not just in `MeshConfig::normalize()`:
+    // a slice arriving over the native/xDS carriers never passes config-source
+    // normalization on this DP, and `destination_rule_host_matches` lowercases
+    // and strips trailing dots but does NOT trim whitespace — a padded carried
+    // host would silently match no service and synthesize no plugin.
+    let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
+        .virtual_service_cors_policies
+        .iter()
+        .map(|policy| (config::normalize_mesh_hostname_like(&policy.host), policy))
+        .collect();
+    sorted_policies.sort_by(|a, b| (&a.1.namespace, &a.1.name).cmp(&(&b.1.namespace, &b.1.name)));
     let cluster_domain = runtime.cluster_domain.trim_matches('.');
 
     let mut synthesized: Vec<PluginConfig> = Vec::new();
@@ -5744,13 +5752,13 @@ fn synthesize_mesh_outbound_cors_plugins(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
         );
-        let matching: Vec<&&config::MeshVirtualServiceCorsPolicy> = sorted_policies
+        let matching: Vec<&(String, &config::MeshVirtualServiceCorsPolicy)> = sorted_policies
             .iter()
-            .filter(|policy| {
-                destination_rule_host_matches(&policy.host, &policy.namespace, &service_fqdn)
+            .filter(|(host, policy)| {
+                destination_rule_host_matches(host, &policy.namespace, &service_fqdn)
             })
             .collect();
-        let Some(policy) = matching.first() else {
+        let Some((_, policy)) = matching.first() else {
             continue;
         };
         if matching.len() > 1 {
@@ -13851,6 +13859,50 @@ mod tests {
                 .tags
                 .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
             "single-port Sidecar targets must not rewrite the authority"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_cors_synthesis_normalizes_carried_host() {
+        // A slice arriving over the native/xDS carriers never passes
+        // MeshConfig::normalize() on this DP, so the synthesis match key must
+        // be normalized locally — a padded/mixed-case carried host would
+        // otherwise silently match no service and attach no plugin.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            virtual_service_cors_policies: vec![config::MeshVirtualServiceCorsPolicy {
+                name: "reviews-cors".to_string(),
+                namespace: "default".to_string(),
+                host: " Reviews.Default.SVC.Cluster.Local. ".to_string(),
+                export_to: Vec::new(),
+                cors: config::MeshCorsPolicy {
+                    allowed_origins: vec![config::MeshCorsOriginMatch::Exact(
+                        "https://a.example".to_string(),
+                    )],
+                    allowed_methods: Vec::new(),
+                    allowed_headers: Vec::new(),
+                    exposed_headers: Vec::new(),
+                    max_age_seconds: None,
+                    allow_credentials: None,
+                },
+            }],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
+        synthesize_mesh_outbound_cors_plugins(&mut config, &runtime, &slice);
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "__mesh-cors-default-reviews-80"
+                    && plugin.plugin_name == "cors"),
+            "padded/mixed-case carried host must still synthesize the cors plugin"
         );
     }
 

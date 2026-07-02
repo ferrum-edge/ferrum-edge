@@ -1787,10 +1787,11 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
         );
     }
 
-    // A predicate-scoped corsPolicy-bearing entry (narrow uri here; headers/
-    // port/sourceLabels behave identically via the fail-closed default arm)
-    // is NOT host-wide-representable: it neither donates its policy to the
-    // slice nor suppresses a later host-wide entry.
+    // An EARLIER sidecar-applicable predicate-scoped entry SUPPRESSES the
+    // carry (codex round 7): Istio routes `/api` through the scoped entry
+    // (its own CORS), so promoting the later catch-all's policy host-wide
+    // would enforce the wrong CORS on `/api` traffic — the materialized mesh
+    // route has no path predicates to keep the two apart.
     let predicate_scoped = translate_k8s_objects(
         &[k8s_object(
             "VirtualService",
@@ -1820,12 +1821,54 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
         k8s_options(),
     )
     .expect("VirtualService translates");
-    let mesh = predicate_scoped.config.mesh.as_ref().expect("mesh block");
+    assert!(
+        predicate_scoped
+            .config
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+            .unwrap_or(true),
+        "an earlier scoped entry must suppress a later host-wide carry"
+    );
+
+    // Reversed order: the catch-all comes FIRST, so it wins all host traffic
+    // in Istio's in-order evaluation and its policy carries — the later
+    // scoped entry can never win traffic and is irrelevant.
+    let host_wide_first = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-host-wide-first",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://host-wide.example"}]}
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [{"exact": "https://api-only.example"}]}
+                    }
+                ]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("VirtualService translates");
+    let mesh = host_wide_first.config.mesh.as_ref().expect("mesh block");
     assert_eq!(mesh.virtual_service_cors_policies.len(), 1);
     assert_eq!(
         cors_plugin_config_from_mesh_policy(&mesh.virtual_service_cors_policies[0].cors)["allowed_origins"],
         serde_json::json!(["https://host-wide.example"]),
-        "the host-wide entry's policy must be carried, never the route-scoped one's"
+        "a first host-wide entry's policy carries; later scoped entries are unreachable"
     );
 
     // A VS whose ONLY corsPolicy-bearing entries are predicate-scoped carries

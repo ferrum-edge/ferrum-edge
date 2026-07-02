@@ -3822,7 +3822,11 @@ fn normalize_mesh_fields_internal(
     }
 }
 
-fn normalize_mesh_hostname_like(value: &str) -> String {
+/// `pub(crate)` because the CORS synthesis path (`modes::mesh::mod`) also
+/// normalizes carried policy hosts with it when matching against service
+/// FQDNs — a slice arriving over the native/xDS carriers never passes
+/// `MeshConfig::normalize()`, so the consumer must normalize its own key.
+pub(crate) fn normalize_mesh_hostname_like(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 

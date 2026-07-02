@@ -2649,15 +2649,19 @@ fn virtual_service_routes(
     //   ingress-scoped matches do not). The VS-level default is therefore
     //   threaded into the per-entry predicate rather than short-circuiting
     //   the whole VS.
-    // - Host-level application takes the FIRST host-wide-representable
-    //   `http[]` entry (no match, or a catch-all `/` prefix on a mesh
-    //   gateway — see `http_entry_cors_applies_host_wide`; predicate-scoped
-    //   entries neither donate nor suppress). Istio evaluates `http[]` in
-    //   order, so an earlier host-wide catch-all wins ALL host traffic: if
-    //   that entry carries no corsPolicy, or its policy is not translatable,
-    //   NOTHING is carried — promoting a LATER route's policy host-wide
-    //   would enforce CORS (preflight answering, disallowed-Origin rejects)
-    //   on traffic whose winning route has none.
+    // - Host-level application: the FIRST SIDECAR-APPLICABLE `http[]` entry
+    //   decides everything (Istio evaluates `http[]` in order, first match
+    //   wins). If it is host-wide-representable (no match, or a catch-all
+    //   `/` prefix — see `http_entry_cors_applies_host_wide`) its
+    //   translatable corsPolicy is carried; if it carries no corsPolicy, its
+    //   policy is untranslatable, or it is PREDICATE-SCOPED (narrower uri,
+    //   headers, …), NOTHING is carried — a scoped entry wins part of the
+    //   host's traffic with its own (possibly absent) CORS, so promoting a
+    //   LATER host-wide policy would enforce CORS (preflight answering,
+    //   disallowed-Origin rejects) on traffic whose winning route has none.
+    //   Entries invisible to sidecars (non-mesh match gateways under a
+    //   mesh-bound VS, or no mesh override under an ingress-only VS)
+    //   neither donate nor suppress.
     // - `spec.exportTo` visibility is carried for slice narrowing; an omitted
     //   exportTo becomes an explicit `["*"]` so Istio's public default is
     //   preserved (the mesh model's EMPTY export_to is namespace-local by
@@ -2670,7 +2674,8 @@ fn virtual_service_routes(
         vs_gateways.is_empty() || vs_gateways.iter().any(|gateway| gateway == "mesh");
     if let Some(mesh_cors) = http_routes
         .iter()
-        .find(|http| http_entry_cors_applies_host_wide(http, vs_applies_to_sidecars))
+        .find(|http| http_entry_applies_to_sidecars(http, vs_applies_to_sidecars))
+        .filter(|http| http_entry_cors_applies_host_wide(http, vs_applies_to_sidecars))
         .and_then(|http| http.get("corsPolicy"))
         .and_then(mesh_cors_policy_from_value)
     {
@@ -3756,21 +3761,58 @@ fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
 /// `allowOrigin` exact list are all projected. This reuses the existing `cors`
 /// plugin instead of duplicating preflight/header logic, mirroring the
 /// `request_mirror` approach for `http[].mirror`.
-/// Whether a VirtualService `http[]` entry's CORS policy can honestly be
-/// applied HOST-WIDE on materialized mesh routes (which are host-routed `/`):
-/// its `match[]` is omitted/empty (inheriting `vs_applies_to_sidecars`, the
-/// VS-level `spec.gateways` sidecar scope), or SOME match both applies to the
-/// mesh and constrains nothing beyond a catch-all `/` uri prefix (`name` and
-/// `ignoreUriCase` are non-scoping metadata). Istio's
+/// Whether ONE `match[]` block applies to sidecars. Istio's
 /// `HTTPMatchRequest.gateways` OVERRIDES the top-level `spec.gateways` list:
 /// a match carrying `gateways` applies to sidecars iff it names the reserved
 /// `mesh` gateway, regardless of the VS-level scope; a match without them
-/// inherits `vs_applies_to_sidecars`. An entry scoped by any other
+/// inherits `vs_applies_to_sidecars` (the VS-level `spec.gateways` scope).
+fn match_entry_applies_to_sidecars(
+    predicates: &serde_json::Map<String, Value>,
+    vs_applies_to_sidecars: bool,
+) -> bool {
+    match predicates.get("gateways") {
+        None => vs_applies_to_sidecars,
+        Some(value) => value
+            .as_array()
+            .map(|gateways| {
+                gateways
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|gateway| gateway == "mesh")
+            })
+            .unwrap_or(false),
+    }
+}
+
+/// Whether a VirtualService `http[]` entry is part of the SIDECAR's route
+/// table at all: its `match[]` is omitted/empty (inheriting the VS-level
+/// scope), or SOME match block applies to sidecars per
+/// `match_entry_applies_to_sidecars`. Entries this rejects are invisible to
+/// sidecars — they neither donate a CORS policy nor suppress a later one.
+fn http_entry_applies_to_sidecars(http: &Value, vs_applies_to_sidecars: bool) -> bool {
+    let Some(matches) = http.get("match").and_then(Value::as_array) else {
+        return vs_applies_to_sidecars;
+    };
+    if matches.is_empty() {
+        return vs_applies_to_sidecars;
+    }
+    matches.iter().any(|entry| {
+        entry.as_object().is_some_and(|predicates| {
+            match_entry_applies_to_sidecars(predicates, vs_applies_to_sidecars)
+        })
+    })
+}
+
+/// Whether a VirtualService `http[]` entry's CORS policy can honestly be
+/// applied HOST-WIDE on materialized mesh routes (which are host-routed `/`):
+/// its `match[]` is omitted/empty (inheriting `vs_applies_to_sidecars`), or
+/// SOME match both applies to sidecars (`match_entry_applies_to_sidecars`)
+/// and constrains nothing beyond a catch-all `/` uri prefix (`name` and
+/// `ignoreUriCase` are non-scoping metadata). An entry scoped by any other
 /// predicate — a narrower uri, `headers`, `port`, `sourceLabels`, `method`,
-/// `queryParams`, `withoutHeaders`, … — is route-scoped, and promoting its
-/// CORS host-wide would enforce it (including disallowed-Origin 403s) on
-/// traffic the predicates never matched. Route-scoped and non-sidecar
-/// entries neither donate their policy nor suppress a later host-wide one.
+/// `queryParams`, `withoutHeaders`, … — is route-scoped: promoting its CORS
+/// host-wide would enforce it (including disallowed-Origin 403s) on traffic
+/// the predicates never matched. Implies `http_entry_applies_to_sidecars`.
 fn http_entry_cors_applies_host_wide(http: &Value, vs_applies_to_sidecars: bool) -> bool {
     let Some(matches) = http.get("match").and_then(Value::as_array) else {
         return vs_applies_to_sidecars;
@@ -3782,28 +3824,13 @@ fn http_entry_cors_applies_host_wide(http: &Value, vs_applies_to_sidecars: bool)
         let Some(predicates) = entry.as_object() else {
             return false;
         };
-        // Match-level `gateways` override the VS-level list (Istio
-        // `HTTPMatchRequest.gateways`); a match without them inherits the
-        // VS-level sidecar scope.
-        if !predicates.contains_key("gateways") && !vs_applies_to_sidecars {
+        if !match_entry_applies_to_sidecars(predicates, vs_applies_to_sidecars) {
             return false;
         }
         for (key, value) in predicates {
             match key.as_str() {
-                "gateways" => {
-                    let names_mesh = value
-                        .as_array()
-                        .map(|gateways| {
-                            gateways
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .any(|gateway| gateway == "mesh")
-                        })
-                        .unwrap_or(false);
-                    if !names_mesh {
-                        return false;
-                    }
-                }
+                // Sidecar applicability already established above.
+                "gateways" => {}
                 "uri" => {
                     let catch_all = value
                         .get("prefix")
