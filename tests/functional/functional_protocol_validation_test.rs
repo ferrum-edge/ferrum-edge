@@ -554,7 +554,7 @@ async fn h3_get_with_startup_retry(
     options: GetOptions,
 ) -> Http3Response {
     let mut last_err = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
     loop {
         match client.get_with_options(url, options.clone()).await {
             Ok(resp) => return resp,
@@ -1454,7 +1454,7 @@ async fn functional_protocol_validation_trace_rejected_http3() {
     let options = GetOptions::default().method(Method::TRACE);
     let mut last_err = None;
     let resp = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
         loop {
             match client.get_with_options(&url, options.clone()).await {
                 Ok(resp) => break resp,
@@ -1848,7 +1848,7 @@ async fn functional_protocol_validation_h3_connect_udp_rejected() {
     let url = format!("https://localhost:{https_port}/");
     let mut last_err = None;
     let resp = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
         loop {
             match client
                 .extended_connect(&url, h3::ext::Protocol::CONNECT_UDP)
@@ -1897,7 +1897,7 @@ async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env()
     let url = format!("https://localhost:{https_port}/");
     let mut last_err = None;
     let resp = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
         loop {
             match client
                 .post_bytes(&url, Bytes::from_static(b"0123456789abcdef"))

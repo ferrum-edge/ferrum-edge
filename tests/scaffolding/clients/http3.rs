@@ -101,7 +101,12 @@ impl Http3Client {
         };
         // Timeout the whole request so a hung backend doesn't wedge the test.
         let conn = tokio::time::timeout(
-            Duration::from_secs(15),
+            // Per-attempt QUIC handshake budget. Kept well under the callers'
+            // outer retry deadlines so a handshake that races the gateway's UDP
+            // listener coming up fails fast and is retried, instead of consuming
+            // the entire outer deadline in one attempt (the old 15s exceeded the
+            // 10s retry loops, so they never actually retried -> CI flakes).
+            Duration::from_secs(8),
             self.endpoint.connect(addr, &server_name)?,
         )
         .await
@@ -218,7 +223,12 @@ impl Http3Client {
 
         let server_name = parsed.host().unwrap_or("localhost").to_string();
         let conn = tokio::time::timeout(
-            Duration::from_secs(15),
+            // Per-attempt QUIC handshake budget. Kept well under the callers'
+            // outer retry deadlines so a handshake that races the gateway's UDP
+            // listener coming up fails fast and is retried, instead of consuming
+            // the entire outer deadline in one attempt (the old 15s exceeded the
+            // 10s retry loops, so they never actually retried -> CI flakes).
+            Duration::from_secs(8),
             self.endpoint.connect(addr, &server_name)?,
         )
         .await
@@ -294,7 +304,12 @@ impl Http3Client {
         let addr = resolve_loopback(&host, port)?;
         let server_name = parsed.host().unwrap_or("localhost").to_string();
         let conn = tokio::time::timeout(
-            Duration::from_secs(15),
+            // Per-attempt QUIC handshake budget. Kept well under the callers'
+            // outer retry deadlines so a handshake that races the gateway's UDP
+            // listener coming up fails fast and is retried, instead of consuming
+            // the entire outer deadline in one attempt (the old 15s exceeded the
+            // 10s retry loops, so they never actually retried -> CI flakes).
+            Duration::from_secs(8),
             self.endpoint.connect(addr, &server_name)?,
         )
         .await
@@ -343,7 +358,12 @@ impl Http3Client {
 
         let server_name = parsed.host().unwrap_or("localhost").to_string();
         let conn = tokio::time::timeout(
-            Duration::from_secs(15),
+            // Per-attempt QUIC handshake budget. Kept well under the callers'
+            // outer retry deadlines so a handshake that races the gateway's UDP
+            // listener coming up fails fast and is retried, instead of consuming
+            // the entire outer deadline in one attempt (the old 15s exceeded the
+            // 10s retry loops, so they never actually retried -> CI flakes).
+            Duration::from_secs(8),
             self.endpoint.connect(addr, &server_name)?,
         )
         .await

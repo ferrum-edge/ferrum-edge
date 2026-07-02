@@ -20,12 +20,22 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # From the latest completed default-branch coverage artifact available when
-  # this gate was introduced: overall 210900/269397 lines (78.29%) and
-  # src/plugins 54957/64665 lines (84.99%). Floors are rounded down to avoid
-  # failing on floating-point presentation noise while still catching real drops.
-  MIN_OVERALL_LINE_COVERAGE: "78.28"
-  MIN_PLUGINS_LINE_COVERAGE: "84.98"
+  # Absolute line-coverage FLOORS (regression backstops), not targets. They sit
+  # deliberately BELOW measured coverage so ordinary drift does not flap main red.
+  # Every PR is measured against its own base, but many PRs land independently and
+  # the merged total on main can dip a fraction of a point below any single PR's
+  # figure — a floor pinned to the peak then fails ~half of merges for a sub-0.1pt
+  # miss. The real protection for NEW code is the diff-scoped
+  # MIN_CHANGED_PLUGIN_LINE_COVERAGE gate that runs on pull_request events.
+  #
+  # Sizing: when this gate was introduced main measured ~78.29% overall / ~84.99%
+  # plugins; it has since oscillated 78.20%–78.42% overall (a ~0.2pt band that
+  # straddled the old 78.28 floor, so merges flapped red/green on identical code).
+  # Give ~0.9pt of headroom below the low-water mark. A genuine >~1pt regression
+  # still trips the floor. Re-ratchet these upward deliberately once coverage
+  # stabilizes materially higher — do not pin them back to the current peak.
+  MIN_OVERALL_LINE_COVERAGE: "77.50"
+  MIN_PLUGINS_LINE_COVERAGE: "84.50"
   MIN_CHANGED_PLUGIN_LINE_COVERAGE: "84.98"
   # cargo-llvm-cov applies this during report generation; v0.8.7 warns if it
   # is passed to --no-report collection commands.
@@ -306,7 +316,21 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Download coverage data
+        id: download-coverage-data
         if: needs.coverage-plan.outputs.mode == 'full'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: coverage-data-*
+          path: coverage-data
+          merge-multiple: true
+
+      # The GitHub artifact service intermittently 5xx's under load; a single
+      # transient download failure otherwise sinks a green coverage run and, via
+      # the "Coverage (CI mirror)" job, fails the required CI aggregate on main.
+      # Retry once before giving up (re-download overwrites any partial fetch).
+      - name: Download coverage data (retry)
+        if: needs.coverage-plan.outputs.mode == 'full' && steps.download-coverage-data.outcome == 'failure'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: coverage-data-*
