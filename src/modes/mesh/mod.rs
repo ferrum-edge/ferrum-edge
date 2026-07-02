@@ -2255,7 +2255,7 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
 /// `Udp` is a distinct L4 transport whose capture/egress arrives in a later
 /// stage. Neither is HTTP-family — only `Udp` is also excluded from the
 /// raw-TCP stream lane (see [`service_udp_stream_ports`]).
-pub(crate) fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
+fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown

@@ -1748,3 +1748,298 @@ async fn test_manager_mesh_discovery_populates_load_balancer() {
         Some(api_id)
     );
 }
+
+// ── Mesh SD destination-topology transport tags (gateway-to-mesh bridge) ──
+//
+// Mesh transports are per-topology: Sidecar peers serve SVID-mTLS HTTP/2 on
+// :15006 (no HBONE listener), Ambient peers serve HBONE on :15008. The
+// discoverer must stamp the transport the configured destination topology
+// actually serves, plus — for Sidecar — the `:authority` routing metadata the
+// peer's materialized inbound routes match on.
+
+fn mesh_sd_discoverer(
+    mesh: MeshConfig,
+    port: Option<u16>,
+    topology: MeshSdTopology,
+) -> ferrum_edge::service_discovery::mesh::MeshServiceDiscoverer {
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    ferrum_edge::service_discovery::mesh::MeshServiceDiscoverer::new(
+        request_epoch_store(config),
+        "api".to_string(),
+        default_namespace(),
+        port,
+        1,
+        topology,
+    )
+}
+
+fn mesh_service_with_ports(spiffe_id: &str, ports: Vec<ServicePort>) -> MeshService {
+    MeshService {
+        cluster_ips: Vec::new(),
+        name: "api".to_string(),
+        namespace: default_namespace(),
+        ports,
+        workloads: vec![WorkloadRef {
+            spiffe_id: mesh_spiffe(spiffe_id),
+        }],
+        protocol_overrides: HashMap::new(),
+    }
+}
+
+fn http_service_port(port: u16, name: &str) -> ServicePort {
+    ServicePort {
+        port,
+        protocol: AppProtocol::Http,
+        name: Some(name.to_string()),
+        target_port: None,
+    }
+}
+
+fn mesh_workload_with_ports(spiffe_id: &str, address: &str, ports: Vec<u16>) -> Workload {
+    let mut workload = mesh_workload(spiffe_id, "api", address, 0);
+    workload.ports = ports
+        .into_iter()
+        .map(|port| WorkloadPort {
+            port,
+            protocol: AppProtocol::Http,
+            name: Some(format!("p{port}")),
+        })
+        .collect();
+    workload
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_topology_emits_mtls_tags_not_hbone() {
+    // A sidecar peer has NO HBONE listener — sidecar-topology discovery must
+    // stamp `mesh.mtls` (never `mesh.hbone`) plus the destination service
+    // authority host the peer's inbound routes match; a single-HTTP-port
+    // service must NOT carry the `:authority` rewrite port.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let mesh = MeshConfig {
+        services: vec![mesh_service("api", api_id, 8080)],
+        workloads: vec![mesh_workload(api_id, "api", "10.0.0.1", 8080)],
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(targets.len(), 1);
+    let tags = &targets[0].tags;
+    assert_eq!(tags.get("mesh.mtls").map(String::as_str), Some("true"));
+    assert!(
+        !tags.contains_key("mesh.hbone"),
+        "a sidecar destination must never carry the HBONE transport tag"
+    );
+    assert_eq!(
+        tags.get("mesh.spiffe_id").map(String::as_str),
+        Some(api_id),
+        "peer identity pinning metadata must be preserved on the mTLS transport"
+    );
+    assert_eq!(
+        tags.get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("api.ferrum.svc"),
+        "sidecar SD targets carry the destination service authority host — the \
+         gateway's client Host is not a mesh service host the peer routes"
+    );
+    assert!(
+        !tags.contains_key(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+        "single-port services must not stamp the :authority rewrite port"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_topology_multi_port_service_stamps_authority_port() {
+    // A multi-HTTP-port sidecar destination disambiguates its per-port inbound
+    // siblings by the request `:authority` port, so each discovered target
+    // must carry the owning SERVICE port — mirroring the mesh-mode
+    // materializer's contract.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let mesh = MeshConfig {
+        services: vec![mesh_service_with_ports(
+            api_id,
+            vec![
+                http_service_port(80, "http"),
+                http_service_port(81, "admin"),
+            ],
+        )],
+        workloads: vec![mesh_workload_with_ports(api_id, "10.0.0.1", vec![80, 81])],
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, Some(81), MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(targets.len(), 1);
+    let tags = &targets[0].tags;
+    assert_eq!(
+        tags.get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG)
+            .map(String::as_str),
+        Some("81"),
+        "multi-port sidecar destinations carry the owning service port for :authority rewrite"
+    );
+    assert_eq!(
+        tags.get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("api.ferrum.svc")
+    );
+    assert_eq!(tags.get("mesh.mtls").map(String::as_str), Some("true"));
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_topology_counts_http_ports_via_protocol_overrides() {
+    // `protocol_overrides` can promote a raw-protocol declared port to
+    // HTTP-family. The multi-port trigger must count EFFECTIVE protocols (the
+    // shared `service_http_family_ports` predicate the materializer uses), so
+    // an override-promoted second HTTP port still stamps the authority port.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service_with_ports(
+        api_id,
+        vec![
+            http_service_port(80, "http"),
+            ServicePort {
+                port: 81,
+                protocol: AppProtocol::Tcp,
+                name: Some("admin".to_string()),
+                target_port: None,
+            },
+        ],
+    );
+    svc.protocol_overrides.insert(81, AppProtocol::Http);
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![mesh_workload_with_ports(api_id, "10.0.0.1", vec![80, 81])],
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, Some(80), MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(
+        targets[0]
+            .tags
+            .get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG)
+            .map(String::as_str),
+        Some("80"),
+        "an override-promoted second HTTP port makes the service multi-port; \
+         counting raw declared protocols would silently skip the authority port"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_topology_never_stamps_mtls_authority_tags() {
+    // The authority host/port rewrite tags are a Sidecar mesh-mTLS contract;
+    // HBONE carries the app addr:port in the CONNECT authority already.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let mesh = MeshConfig {
+        services: vec![mesh_service_with_ports(
+            api_id,
+            vec![
+                http_service_port(80, "http"),
+                http_service_port(81, "admin"),
+            ],
+        )],
+        workloads: vec![mesh_workload_with_ports(api_id, "10.0.0.1", vec![80, 81])],
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, Some(81), MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(targets.len(), 1);
+    let tags = &targets[0].tags;
+    assert_eq!(tags.get("mesh.hbone").map(String::as_str), Some("true"));
+    assert!(
+        !tags.contains_key(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+        "HBONE targets must not carry the sidecar :authority rewrite port tag"
+    );
+    assert!(
+        !tags.contains_key(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG),
+        "HBONE targets must not carry the sidecar :authority host tag"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_topology_skips_remote_workloads_fail_closed() {
+    // Cross-cluster Sidecar dispatch requires east-west GATEWAY targets
+    // (`mesh.cross_cluster` + `mesh.eastwest_sni`), which the SD bridge does
+    // not materialize yet — a direct `remote-pod:15006` dial with a pinned pod
+    // SPIFFE would fail in any multi-network mesh while looking routable, so
+    // remote-provenance workloads are skipped fail-closed on the sidecar path.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://cluster.local/ns/ferrum/sa/api-remote";
+    let mut remote = mesh_workload(remote_id, "api", "10.9.0.1", 8080);
+    remote.remote_provenance = true;
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![mesh_workload(api_id, "api", "10.0.0.1", 8080), remote],
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "the remote-provenance workload must be skipped on the sidecar SD path"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_topology_keeps_remote_workloads_marked_remote() {
+    // Pre-existing Ambient SD behavior (the Experimental cross-cluster
+    // endpoint-discovery surface): remote workloads stay discoverable, marked
+    // with the `mesh.remote` provenance tag so strict local-first LB can key
+    // on it. Pinned here so the sidecar fail-closed skip cannot leak into the
+    // Ambient path.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://cluster.local/ns/ferrum/sa/api-remote";
+    let mut remote = mesh_workload(remote_id, "api", "10.9.0.1", 8080);
+    remote.remote_provenance = true;
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![mesh_workload(api_id, "api", "10.0.0.1", 8080), remote],
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert_eq!(targets[1].host, "10.9.0.1");
+    assert_eq!(
+        targets[1].tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+}

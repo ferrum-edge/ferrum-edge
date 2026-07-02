@@ -9342,6 +9342,10 @@ async fn connect_mesh_websocket_backend(
             // on, mirroring `proxy_to_backend_mesh_mtls`'s inner `:authority`
             // BYTE-FOR-BYTE so the WS path and HTTP path are interchangeable on
             // the peer:
+            //   * a `mesh.mtls_authority_host` tag (sidecar-topology mesh SD /
+            //     gateway-to-mesh bridge) wins outright → `<service_host>` or
+            //     `<service_host>:<service_port>` — the gateway's client Host
+            //     is not a mesh service host the peer routes;
             //   * preserve-host + multi-port Sidecar → `<client_host>:<service_port>`
             //     (`mesh_mtls_request_authority`, the rewrite tag the peer's
             //     per-port inbound siblings disambiguate by — `:15006` dials are
@@ -9350,14 +9354,23 @@ async fn connect_mesh_websocket_backend(
             //     any explicit port, and NO port when the client sent none —
             //     matching the HTTP single-port path exactly);
             //   * otherwise → the dial authority (`<target.host>:<target.port>`).
-            let authority = match client_host {
-                Some(host) if proxy.preserve_host_header && !host.is_empty() => {
-                    match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-                        Some(service_port) => mesh_mtls_request_authority(host, service_port),
-                        None => host.to_string(),
-                    }
+            let authority = if let Some(service_host) =
+                mesh_mtls_pool::target_mesh_mtls_authority_host(target)
+            {
+                match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+                    Some(service_port) => format!("{service_host}:{service_port}"),
+                    None => service_host.to_string(),
                 }
-                _ => hbone_pool::authority_for_host_port(&target.host, target.port),
+            } else {
+                match client_host {
+                    Some(host) if proxy.preserve_host_header && !host.is_empty() => {
+                        match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+                            Some(service_port) => mesh_mtls_request_authority(host, service_port),
+                            None => host.to_string(),
+                        }
+                    }
+                    _ => hbone_pool::authority_for_host_port(&target.host, target.port),
+                }
             };
             // Cross-cluster WebSocket egress is NOT yet supported (HTTP-first;
             // tracked as a follow-up with Ambient HBONE cross-cluster). A
@@ -21885,7 +21898,12 @@ async fn proxy_to_backend_mesh_mtls(
         .cloned()
         .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
     // `:authority` is the routing key on the peer: its materialized inbound
-    // route matches the SERVICE host, so a preserved client Host wins; without
+    // route matches the SERVICE host. A `sidecar`-topology mesh-SD target
+    // (gateway-to-mesh bridge) carries that service host as a tag
+    // (`mesh.mtls_authority_host`) and it takes precedence over BOTH branches
+    // below — a north-south gateway's client Host is a public hostname the
+    // peer would 404, and the no-preserve fallback is the pod dial address
+    // (same 404). Otherwise a preserved client Host wins; without
     // preservation fall back to the dial authority (peer pod + app port),
     // matching the HBONE inner request's Host fallback. For a MULTI-PORT
     // destination the materializer stamped the owning service port on the
@@ -21893,23 +21911,32 @@ async fn proxy_to_backend_mesh_mtls(
     // the peer's inbound `:15006` dials are direct (never NATed, no
     // orig-dst), so the authority port is the only channel that tells its
     // per-port inbound siblings apart. The original client Host still rides
-    // `x-forwarded-host` below. Single-port destinations carry no tag and
-    // keep the client authority byte-for-byte.
+    // `x-forwarded-host` below. Single-port destinations carry no port tag
+    // and keep the host-only / client authority byte-for-byte.
     let authority_owned;
-    let authority = if proxy.preserve_host_header
-        && let Some(host) = headers.get("host")
-        && !host.is_empty()
-    {
-        if let Some(service_port) = mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
-            authority_owned = mesh_mtls_request_authority(host, service_port);
-            authority_owned.as_str()
+    let authority =
+        if let Some(service_host) = mesh_mtls_pool::target_mesh_mtls_authority_host(target) {
+            match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+                Some(service_port) => {
+                    authority_owned = format!("{service_host}:{service_port}");
+                    authority_owned.as_str()
+                }
+                None => service_host,
+            }
+        } else if proxy.preserve_host_header
+            && let Some(host) = headers.get("host")
+            && !host.is_empty()
+        {
+            if let Some(service_port) = mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+                authority_owned = mesh_mtls_request_authority(host, service_port);
+                authority_owned.as_str()
+            } else {
+                host.as_str()
+            }
         } else {
-            host.as_str()
-        }
-    } else {
-        authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
-        authority_owned.as_str()
-    };
+            authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
+            authority_owned.as_str()
+        };
     let tunneled_uri = match hyper::Uri::builder()
         .scheme("https")
         .authority(authority)

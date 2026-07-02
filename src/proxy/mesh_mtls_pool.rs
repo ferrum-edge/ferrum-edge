@@ -67,6 +67,18 @@ pub const ISTIO_SIDECAR_INBOUND_PORT: u16 = 15006;
 /// Single-port destinations are never stamped and keep the client authority
 /// byte-for-byte.
 pub const MESH_MTLS_AUTHORITY_PORT_TAG: &str = "mesh.mtls_authority_port";
+/// Tag carrying the destination MESH SERVICE host a Sidecar target's request
+/// `:authority` must name. Stamped ONLY by `sidecar`-topology mesh service
+/// discovery (the gateway-to-mesh bridge): a north-south gateway's client
+/// `Host` is typically a public hostname (and without `preserve_host_header`
+/// the authority falls back to the pod dial address), neither of which the
+/// destination sidecar's materialized inbound routes match — so dispatch
+/// forces this service host (`<service>.<namespace>.svc`, one of the
+/// destination's registered host variants) as the `:authority` instead. The
+/// original client `Host` still rides `x-forwarded-host`. Mesh-mode egress
+/// never stamps this tag: its outbound routes are host-routed by the service
+/// name, so the client authority is already the routing key the peer matches.
+pub const MESH_MTLS_AUTHORITY_HOST_TAG: &str = "mesh.mtls_authority_host";
 /// Tag overriding the ClientHello SNI of a Sidecar mesh-mTLS dial. Value = the
 /// DESTINATION service FQDN. Stamped ONLY on cross-cluster east-west targets
 /// (see [`MESH_CROSS_CLUSTER_TAG`]): the dial host is the remote east-west
@@ -134,6 +146,18 @@ pub fn target_mesh_mtls_authority_port(target: &UpstreamTarget) -> Option<u16> {
         .get(MESH_MTLS_AUTHORITY_PORT_TAG)
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port > 0)
+}
+
+/// The destination mesh SERVICE host a Sidecar target's `:authority` must
+/// name, when `sidecar`-topology mesh service discovery stamped one — see
+/// [`MESH_MTLS_AUTHORITY_HOST_TAG`]. An empty tag yields `None` (treated as
+/// absent rather than producing an unroutable empty authority).
+pub fn target_mesh_mtls_authority_host(target: &UpstreamTarget) -> Option<&str> {
+    target
+        .tags
+        .get(MESH_MTLS_AUTHORITY_HOST_TAG)
+        .map(String::as_str)
+        .filter(|host| !host.is_empty())
 }
 
 /// Whether a target is a CROSS-CLUSTER east-west mesh-mTLS target (carries
