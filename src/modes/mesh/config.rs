@@ -2640,7 +2640,27 @@ fn validate_virtual_service_cors_policies(
         }
         for (index, origin) in policy.cors.allowed_origins.iter().enumerate() {
             match origin {
-                MeshCorsOriginMatch::Exact(value) | MeshCorsOriginMatch::Prefix(value) => {
+                MeshCorsOriginMatch::Exact(value) => {
+                    if value.trim().is_empty() {
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] must not be empty"
+                        ));
+                    } else if value.trim_start().starts_with('*') {
+                        // A wildcard-shaped `exact` (`*`, `*.example.com`) can
+                        // never match a real Origin under Istio's
+                        // literal-exact semantics, but projected as the cors
+                        // plugin's plain-string form it would flip into the
+                        // plugin's OWN wildcard syntax (allow-all / subdomain
+                        // match) — a silent policy WIDENING. The K8s
+                        // translator already defers such policies; this
+                        // boundary check closes the native/file source too,
+                        // rejecting the slice fail-closed.
+                        errors.push(format!(
+                            "{context}: cors.allowed_origins[{index}] exact matcher must not be wildcard-shaped — Istio exact semantics match the literal string only; use a prefix or regex matcher for wildcard intent"
+                        ));
+                    }
+                }
+                MeshCorsOriginMatch::Prefix(value) => {
                     if value.trim().is_empty() {
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] must not be empty"

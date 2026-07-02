@@ -1925,6 +1925,32 @@ mod virtual_service_cors {
     }
 
     #[test]
+    fn wildcard_shaped_exact_origin_rejected() {
+        // The K8s translator defers wildcard-shaped exacts; the native/file
+        // source has no translator, so mesh validation must reject them —
+        // projected as the cors plugin's plain-string form they would flip
+        // into the plugin's own wildcard syntax (silent allow-all/subdomain
+        // widening of Istio's literal-exact semantics).
+        for wildcard in ["*", "*.example.com"] {
+            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+                wildcard.into(),
+            )])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("must not be wildcard-shaped")),
+                "exact `{wildcard}` must be rejected: {errors:?}"
+            );
+        }
+        // Wildcard-looking PREFIX matchers are fine — prefix is a literal
+        // byte-prefix in both Istio and the plugin object form.
+        let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Prefix(
+            "https://app.".into(),
+        )])]);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn uncompilable_regex_rejected() {
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Regex("(".into())])]);
         assert!(

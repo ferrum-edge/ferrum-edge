@@ -2641,6 +2641,7 @@ paths:
                           - service_entries
                           - request_authentications
                           - destination_rules
+                          - virtual_service_cors_policies
                           - mesh_telemetry
                           - mesh_proxy_configs
                           - extension_configs
@@ -2652,6 +2653,7 @@ paths:
                           service_entries: { type: integer, minimum: 0 }
                           request_authentications: { type: integer, minimum: 0 }
                           destination_rules: { type: integer, minimum: 0 }
+                          virtual_service_cors_policies: { type: integer, minimum: 0 }
                           mesh_telemetry: { type: integer, minimum: 0 }
                           mesh_proxy_configs: { type: integer, minimum: 0 }
                           extension_configs: { type: integer, minimum: 0 }
@@ -2763,6 +2765,7 @@ paths:
                         service_entries: 12
                         request_authentications: 4
                         destination_rules: 12
+                        virtual_service_cors_policies: 2
                         mesh_telemetry: 2
                         mesh_proxy_configs: 1
                         extension_configs: 0
@@ -2797,6 +2800,7 @@ paths:
                         service_entries: 0
                         request_authentications: 0
                         destination_rules: 0
+                        virtual_service_cors_policies: 0
                         mesh_telemetry: 0
                         mesh_proxy_configs: 0
                         extension_configs: 0
