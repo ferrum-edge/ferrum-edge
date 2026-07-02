@@ -1564,9 +1564,11 @@ impl Plugin for RequestDeduplication {
         // on the buffered path with no benefit. Streaming it instead keeps the
         // `InFlight` marker active for the lifetime of the still-in-flight
         // stream — which is exactly the concurrent-duplicate protection this
-        // plugin promises. Because no replayable response or tombstone is
-        // stored for this path, the in-flight marker remains until
-        // `inflight_ttl` instead of being released at stream termination.
+        // plugin promises. `on_response_stream_terminated` then releases the
+        // marker on clean completion (no replay body is stored), while an
+        // interrupted stream (client disconnect or backend error) retains it
+        // until `inflight_ttl` so a same-key retry cannot re-execute a
+        // side-effecting operation that has no replay value.
         self.should_buffer_response_body(ctx)
             && !content_type.is_some_and(is_event_stream_content_type)
     }
@@ -1786,20 +1788,42 @@ impl Plugin for RequestDeduplication {
         &self,
         ctx: &RequestContext,
         _response_status: u16,
-        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+        outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
-        // Streamed responses have no replayable body, and this hook also runs
-        // for client disconnects and mid-stream errors. Releasing here would
-        // let an immediate retry with the same idempotency key re-execute a
-        // side-effecting backend operation with no replay/tombstone
-        // protection, so keep the local marker and Redis lock until
-        // `inflight_ttl`.
-        let Some(_key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+        // A streamed response has no whole body to cache, so this hook cannot
+        // transition the marker to a replayable `Completed` entry the way
+        // `on_final_response_body` does on the buffered path. What it does with
+        // the in-flight lock depends on how the stream ended:
+        //
+        // - Clean completion (`body_completed`): the full response reached the
+        //   client, so there is nothing left to protect. Release the marker
+        //   (local map + Redis lock) so the next matching key executes normally
+        //   instead of eating a stale 409 for the rest of `inflight_ttl`, and
+        //   so finished streams don't pile up non-evictable `InFlight` markers
+        //   above `max_entries`.
+        // - Client disconnect or mid-stream error (`!body_completed`): the
+        //   client did NOT receive the full response and is the case most
+        //   likely to be retried with the same idempotency key. Releasing here
+        //   would let that retry re-execute a side-effecting backend operation
+        //   with no replay/tombstone protection, so keep the local marker and
+        //   Redis lock until `inflight_ttl` expires as the backstop.
+        if !outcome.body_completed {
+            return;
+        }
+
+        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
             return;
         };
-        let Some(_fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
+        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
             return;
         };
+
+        if let Some(owner_token) = ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA) {
+            self.remove_matching_local_inflight(key, fingerprint, owner_token);
+        }
+        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+            self.redis_release_inflight(key, fingerprint, token).await;
+        }
     }
 
     async fn on_final_response_body(
