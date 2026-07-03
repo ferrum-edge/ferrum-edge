@@ -64,13 +64,15 @@ CI today."
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
   + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
   `DestinationRule` LB/timeout/outlier. Semantics are pinned, and the sidecar
-  traffic surface is now **live-verified and blocking**: the `mesh-e2e-sidecar`
-  kind+SPIRE suite drives the real captured datapath (STRICT mTLS positive +
-  plaintext-rejected negative, destination-side authz 403, JWT
-  valid/missing/invalid, DR connectTimeout two-phase timing, DR
-  maxConnections=1 WebSocket hold/reject/release) on every relevant PR and
-  every main push, the artifact is contract-validated, and both the required
-  CI aggregate and `release.yml` gate on it.
+  traffic surface **and the native config transport** are now **live-verified
+  and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
+  captured datapath (STRICT mTLS positive + plaintext-rejected negative,
+  destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
+  two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
+  CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
+  end) on every relevant PR and every main push, the artifact is
+  contract-validated, and both the required CI aggregate and `release.yml`
+  gate on it.
   An identity-less mesh — no file-based gateway SVID material **and** no CA
   backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) supplying a runtime SVID — **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
   unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
