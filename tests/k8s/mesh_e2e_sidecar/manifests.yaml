@@ -21,6 +21,31 @@
 # run.sh renders at runtime (the client document needs the discovered svc pod
 # IP), so this manifest mounts the ConfigMaps but does not define them.
 #
+# The native MeshSubscribe leg (issue #2002) adds two more deployments:
+#
+#   - `ferrum-cp` — a Ferrum CONTROL PLANE (FERRUM_MODE=cp, sqlite on an
+#     emptyDir) whose K8s controller (pod discovery: Pods/Services/
+#     EndpointSlices in this namespace only; Istio + Gateway API CRD watching
+#     disabled) builds the mesh model from the cluster's REAL Services and
+#     pods — the only path that populates `GatewayConfig.mesh` on a CP
+#     (src/config_sources/k8s/mod.rs) — and serves it over the native
+#     `MeshConfigSync.MeshSubscribe` gRPC stream (src/grpc/mesh_server.rs) on
+#     :50051. In-cluster plaintext h2c with JWT auth
+#     (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true): CP-DP gRPC TLS is an
+#     orthogonal, documented knob this fixture does not exercise.
+#   - `capp` — a destination workload shaped exactly like `svc` (inbound
+#     iptables REDIRECT 8080 -> :15006, SPIRE identity, python echo) whose
+#     sidecar runs FERRUM_MESH_CONFIG_PROTOCOL=native subscribing to the CP.
+#     Its inbound routes exist ONLY if the CP-delivered native slice
+#     materialized, so client traffic reaching its app is the live
+#     MeshSubscribe proof (`sidecar.config.native_subscribe_delivered`).
+#     Config-drift diagnostics ride the sidecar's JWT-authenticated
+#     `GET /mesh/config-drift` (FERRUM_ADMIN_JWT_SECRET from the shared
+#     Secret; run.sh mints the HS256 token).
+#
+# JWT secrets come from the `ferrum-mesh-e2e-secrets` Secret run.sh mints per
+# run (openssl rand), so this manifest references but does not define it.
+#
 # Substituted placeholders:
 #   __NAMESPACE__       workload namespace (ferrum)
 #   __TRUST_DOMAIN__    the cluster trust domain (mesh-e2e.test)
@@ -38,6 +63,13 @@
 #              routes)
 #   sa/client  the allowed client service account
 #   sa/rogue   a same-domain workload DENIED by a dest-side AuthorizationPolicy
+#   sa/capp    the native-MeshSubscribe destination (its OWN pod + identity,
+#              same one-pod-one-service rule as wssvc; the CP's K8s-built
+#              workload SPIFFE ID spiffe://<td>/ns/<ns>/sa/capp must equal the
+#              sidecar's FERRUM_MESH_WORKLOAD_SPIFFE_ID for
+#              resolve_local_workloads to anchor inbound routes)
+#   sa/ferrum-cp the control plane (K8s API access via the namespaced Role
+#              below; NOT a mesh workload — no SPIRE entry)
 #   (slowsvc has NO service account / SPIRE entry on purpose: its dial is
 #    black-holed and never completes a handshake.)
 ---
@@ -548,6 +580,356 @@ spec:
         - name: mesh-config
           configMap:
             name: ferrum-mesh-client
+---
+# ── Ferrum control plane (native MeshSubscribe source) ──────────────────────
+# FERRUM_MODE=cp with sqlite on an emptyDir. The mesh model a CP serves over
+# MeshSubscribe comes exclusively from its K8s controller translating the
+# cluster's real Services/Pods/EndpointSlices into MeshService/Workload
+# entries (src/config_sources/k8s/core.rs); there is no DB table or admin API
+# write path for the mesh block. The controller here is scoped to pod
+# discovery in THIS namespace only (CpScope::Single derives the watch scope
+# when FERRUM_K8S_WATCH_NAMESPACES is unset), with Istio-CRD, Gateway-API and
+# istio-root-namespace meshConfig watching explicitly disabled so the Role
+# below is the complete RBAC surface. FERRUM_K8S_TRUST_DOMAIN must equal the
+# fixture trust domain so derived workload SPIFFE IDs
+# (spiffe://<td>/ns/<ns>/sa/<sa>) match the sidecars' SPIRE identities.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+rules:
+  # Pod-discovery watch set (FERRUM_K8S_POD_DISCOVERY_ENABLED): mirrors the
+  # `podDiscovery` block of charts/ferrum-mesh/templates/control-plane-rbac.yaml,
+  # namespaced because the watch scope is this single namespace.
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp
+    namespace: __NAMESPACE__
+---
+# The FQDN the native DP dials: ferrum-cp.<ns>.svc.cluster.local:50051.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: ferrum-cp
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ferrum-cp
+  template:
+    metadata:
+      labels:
+        app: ferrum-cp
+    spec:
+      serviceAccountName: ferrum-cp
+      # emptyDir volumes are root-owned; fsGroup makes /data group-writable
+      # for the non-root runtime user so sqlite can create its DB file.
+      securityContext:
+        fsGroup: 1337
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: grpc
+              containerPort: 50051
+          # Ready == the gRPC listener is up (admin binds loopback by default,
+          # so it cannot back a kubelet probe). MeshSubscribe snapshots served
+          # before the first K8s reconcile may lack the mesh block; the
+          # reconcile broadcast converges subscribers, so readiness here only
+          # needs to mean "subscribable".
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 60
+          env:
+            - name: FERRUM_MODE
+              value: cp
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_DB_TYPE
+              value: sqlite
+            - name: FERRUM_DB_URL
+              value: sqlite:/data/ferrum.db?mode=rwc
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: admin-jwt-secret
+            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: cp-dp-grpc-jwt-secret
+            - name: FERRUM_CP_GRPC_LISTEN_ADDR
+              value: 0.0.0.0:50051
+            # In-cluster plaintext h2c, explicitly acknowledged (EnvConfig
+            # validation refuses a non-loopback plaintext CP bind otherwise).
+            # The MeshSubscribe stream is still JWT-authenticated.
+            - name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT
+              value: "true"
+            # Explicit (defaults are in-cluster-on anyway) so the fixture does
+            # not depend on the KUBERNETES_SERVICE_HOST heuristic.
+            - name: FERRUM_K8S_CONTROLLER_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_POD_DISCOVERY_ENABLED
+              value: "true"
+            # No Istio/Gateway-API CRDs in this kind cluster and no
+            # istio-system namespace: disable those watches so the namespaced
+            # Role above is sufficient and reconcile startup never waits on a
+            # forbidden watcher.
+            - name: FERRUM_K8S_WATCH_ISTIO_CRDS
+              value: "false"
+            - name: FERRUM_K8S_WATCH_GATEWAY_API_CRDS
+              value: "false"
+            - name: FERRUM_K8S_WATCH_MESH_CONFIG
+              value: "false"
+            - name: FERRUM_K8S_TRUST_DOMAIN
+              value: __TRUST_DOMAIN__
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: cp-data
+              mountPath: /data
+      volumes:
+        - name: cp-data
+          emptyDir: {}
+---
+# ── Native-MeshSubscribe destination pod (capp) ─────────────────────────────
+# Shaped exactly like `svc` (inbound iptables REDIRECT 8080 -> :15006, SPIRE
+# identity, python echo answering a DISTINCT marker) except the sidecar's mesh
+# config arrives via FERRUM_MESH_CONFIG_PROTOCOL=native from the ferrum-cp
+# MeshSubscribe stream — no ConfigMap mount. Mesh-mode startup BLOCKS in
+# wait_for_initial_mesh_config until a valid slice arrives (reconnecting with
+# jittered backoff while the CP rolls out), and the sidecar materializes its
+# :15006 inbound routes only from a slice whose K8s-built capp workload
+# SPIFFE ID matches FERRUM_MESH_WORKLOAD_SPIFFE_ID — client traffic reaching
+# the app therefore proves CP-delivered native config end to end. The
+# CP-built slice carries no PeerAuthentication (no Istio CRDs installed), so
+# inbound is PERMISSIVE; the client's egress still dials mesh-mTLS with its
+# SPIRE SVID, and STRICT posture remains proven by the svc/wssvc legs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: capp
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: capp
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: capp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capp
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: capp
+  template:
+    metadata:
+      labels:
+        app: capp
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: capp
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: http://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: cp-dp-grpc-jwt-secret
+            # Subscribe-request namespace + self-minted JWT `ns` claim; must
+            # sit inside the CP's scope (CpScope::Single(FERRUM_NAMESPACE)).
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/capp
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            # Enables the JWT-authenticated GET /mesh/config-drift diagnostics
+            # probe (run.sh mints the HS256 token; without this env mesh mode
+            # generates a random unknowable secret).
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: admin-jwt-secret
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket
+              import threading
+              import time
+
+              # Distinct marker ("<app body>-native") so a native-subscribe
+              # probe answer can never be confused with the file-config svc.
+              BODY = b"__APP_BODY__-native\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(4096)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+        # Loopback admin prober: the sidecar's admin API binds 127.0.0.1, so
+        # the config-drift diagnostics curl must run INSIDE the pod netns.
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
 ---
 # ── Rogue client pod (dest-side authz negative) ─────────────────────────────
 # Identical to the client but running as sa/rogue: it completes valid

@@ -163,3 +163,38 @@ capabilities:
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
       - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+
+  - id: mesh.config_transport.native_subscribe
+    display_name: Native MeshSubscribe config transport
+    maturity: ga
+    topology: sidecar
+    # Config arrives over the Ferrum-native MeshConfigSync.MeshSubscribe gRPC
+    # stream (a Ferrum CP serving a Ferrum DP), not an Istio CRD translation
+    # or third-party xDS feed.
+    config_protocol: native_mesh_subscribe
+    semantic_assertions:
+      - category: mesh_config_transport
+        feature: namespace-scoped MeshSlice snapshot build
+      - category: mesh_config_transport
+        feature: MeshSubscribe update dedupe via content_eq
+      - category: mesh_config_transport
+        feature: native slice apply + malformed-update fail-closed
+    live_suite: mesh-e2e-sidecar
+    # Live backing (issue #2002): the fixture deploys a Ferrum CP (cp mode,
+    # sqlite, K8s pod discovery building the mesh model from the cluster's
+    # real Services/pods) and a sidecar DP on
+    # FERRUM_MESH_CONFIG_PROTOCOL=native. Captured client traffic reaching
+    # the capp app proves the CP-delivered slice materialized the inbound
+    # datapath (those routes exist ONLY via MeshSubscribe delivery), and the
+    # DP's JWT-authenticated /mesh/config-drift must attribute the slice to
+    # source_protocol=native from the ferrum-cp URL.
+    live_assertions:
+      - sidecar.config.native_subscribe_delivered
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#native-meshsubscribe-default
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - The xDS ADS transport is a separate surface and is not covered by this row.
+      - The live fixture exercises the transport over in-cluster plaintext h2c with JWT auth (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true); CP-DP gRPC TLS is an orthogonal, documented deployment knob not exercised by this row.

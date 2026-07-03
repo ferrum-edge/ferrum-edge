@@ -41,14 +41,22 @@ semantics pinned by the `mesh_spiffe_identity` conformance module (SPIFFE ID
 parse + Istio `ns/sa` convention, URI-SAN SVID extraction, the inbound
 peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
 backend selection), live-gated by the required `sidecar.spire.workload_entries`
-and `sidecar.peer_auth.strict_mtls_authenticated` assertions. The remaining
-Stable row outside the sidecar traffic surface — native `MeshSubscribe` config
-transport — enrolls next, but it first needs a live signal: the
-`mesh-e2e-sidecar` fixture delivers mesh config via
-`FERRUM_MESH_CONFIG_PROTOCOL=file` ConfigMaps and deploys no Ferrum CP, so no
-suite today can honestly back a `MeshSubscribe` live assertion.
-`coverage.md` lists the currently enrolled rows and required live assertion
-IDs, which are the authoritative answer to "what regression fails CI today."
+and `sidecar.peer_auth.strict_mtls_authenticated` assertions. **Native
+`MeshSubscribe` config transport is now enrolled as well**
+(`mesh.config_transport.native_subscribe`, issue #2002): semantics pinned by
+the `mesh_config_transport` conformance module (the namespace-scoped
+`MeshSlice` snapshot build MeshSubscribe serves from, `content_eq`
+update dedupe that ignores the transport version stamp, and the DP-side
+slice apply that fails closed on malformed payloads), live-gated by the
+required `sidecar.config.native_subscribe_delivered` assertion — the
+`mesh-e2e-sidecar` fixture now deploys a Ferrum CP (`cp` mode, sqlite, K8s
+pod discovery building the mesh model from the cluster's real Services and
+pods) and a sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` whose captured
+inbound datapath only serves traffic if the CP-delivered slice materialized,
+with the DP's `GET /mesh/config-drift` attributing the slice to the native
+transport. `coverage.md` lists the currently enrolled rows and required live
+assertion IDs, which are the authoritative answer to "what regression fails
+CI today."
 
 ## Current headline state
 
