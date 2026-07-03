@@ -78,11 +78,16 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
 
 /// Generate a valid JWT token for testing
 fn generate_test_token(config: &TestConfig, subject: &str) -> String {
+    generate_test_token_with_role(config, subject, "admin")
+}
+
+/// Generate a valid JWT token for testing with a specific role.
+fn generate_test_token_with_role(config: &TestConfig, subject: &str, role: &str) -> String {
     let now = Utc::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": subject,
-        "role": "admin",
+        "role": role,
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
@@ -93,6 +98,52 @@ fn generate_test_token(config: &TestConfig, subject: &str) -> String {
     let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
 
     encode(&header, &claims, &key).unwrap()
+}
+
+async fn send_raw_admin_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write admin request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read admin response");
+    String::from_utf8(response).expect("admin response should be utf-8")
+}
+
+fn raw_http_status(response: &str) -> u16 {
+    response
+        .lines()
+        .next()
+        .expect("response status line")
+        .split_whitespace()
+        .nth(1)
+        .expect("response status code")
+        .parse()
+        .expect("numeric response status")
 }
 
 /// Generate an invalid JWT token (wrong secret)
@@ -195,6 +246,69 @@ async fn test_admin_api_integration() {
     let token = generate_test_token(&config, "test-user");
     let result = admin_state.jwt_manager.verify_token(&token);
     assert!(result.is_ok(), "Generated token should be valid");
+}
+
+#[tokio::test]
+async fn test_tls_mutation_routes_require_admin_jwt_role() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let operator_token = generate_test_token_with_role(&config, "operator-user", "operator");
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+
+    let operator_response = send_raw_admin_request(
+        addr,
+        "POST",
+        "/admin/tls/certificates",
+        &operator_token,
+        "{}",
+    )
+    .await;
+    assert_eq!(
+        raw_http_status(&operator_response),
+        403,
+        "operator token must not reach persisted TLS mutation handler: {operator_response}"
+    );
+
+    let admin_response =
+        send_raw_admin_request(addr, "POST", "/admin/tls/certificates", &admin_token, "{}").await;
+    assert_eq!(
+        raw_http_status(&admin_response),
+        400,
+        "admin token should pass role gate and fail only request validation: {admin_response}"
+    );
+
+    let validate_response =
+        send_raw_admin_request(addr, "POST", "/admin/tls/validate", &operator_token, "{}").await;
+    assert_ne!(
+        raw_http_status(&validate_response),
+        403,
+        "operator token should remain allowed on TLS validation route: {validate_response}"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("admin listener task should stop")
+        .expect("admin listener task join")
+        .expect("admin listener should exit cleanly");
 }
 
 #[tokio::test]
