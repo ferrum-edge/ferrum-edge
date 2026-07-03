@@ -429,8 +429,10 @@ pub fn increment_xds_stream_rejected() {
 /// listener enforces mTLS. Deliberately label-free: the downgrade reason
 /// (PeerAuthentication DISABLE vs no usable server identity) stays in the
 /// `warn!` logs at the enforcement sites — security detail goes to logs, not
-/// `/metrics`. Updated at startup enforcement and on PeerAuthentication live
-/// reload so a reload that heals or degrades the posture moves the gauge.
+/// `/metrics`. Updated at startup enforcement and on *accepted*
+/// PeerAuthentication live reloads (`apply_mesh_inbound_tls_reload`), never at
+/// plan time, so a candidate slice the proxy rejects leaves the gauge at its
+/// pre-reload value.
 pub fn set_mesh_inbound_plaintext_allowed(allowed: bool) {
     MESH_INBOUND_PLAINTEXT_ALLOWED.store(u64::from(allowed), Ordering::Relaxed);
 }

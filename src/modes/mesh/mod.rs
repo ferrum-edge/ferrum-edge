@@ -11429,9 +11429,12 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                         return None;
                     }
                     MeshInboundFailClosed::AllowWithWarning => {
-                        // Degrade the coarse posture gauge alongside the warn
-                        // (same site: this plan is what the apply task swaps in).
-                        crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(true);
+                        // Warn here at the decision site, but do NOT touch the
+                        // coarse posture gauge yet: this is still plan time, and
+                        // `proxy_state.update_config()` may reject the candidate
+                        // slice. The gauge is written only on the accepted-apply
+                        // path in `apply_mesh_inbound_tls_reload`, derived from
+                        // the swapped `tls_config`.
                         warn!(
                             mesh_slice_version = %slice.version,
                             ?mtls_mode,
@@ -11443,11 +11446,6 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                     }
                     MeshInboundFailClosed::Ok => {}
                 }
-            } else if has_termination_listener {
-                // A reload that resolves the termination listener back to an
-                // mTLS-capable ServerConfig heals the dev plaintext posture;
-                // reflect that so operators can alert on the gauge clearing.
-                crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
             }
             Some(MeshInboundTlsReloadPlan::Swap {
                 snapshot: next_snapshot,
@@ -11517,6 +11515,22 @@ async fn apply_mesh_inbound_tls_reload(
                 ),
                 Ordering::Release,
             );
+            // Coarse posture gauge, written only here on the accepted-apply
+            // path so a candidate slice that `update_config()` rejects leaves
+            // the gauge at its pre-reload value (fail-closed by retention,
+            // matching the rest of this reload contract). Derived from the
+            // swapped config rather than carried on the plan: a Swap that
+            // clears the termination listener's ServerConfig is exactly the
+            // dev plaintext posture (production planning rejects that swap as
+            // a whole-slice `None`, which never reaches this function), and a
+            // Swap that restores one heals it. Topologies without a
+            // TLS-terminating inbound listener (EastWestGateway SNI
+            // passthrough) never move the gauge.
+            if has_termination_listener {
+                crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(
+                    tls_config.is_none(),
+                );
+            }
             // Extend the live carve-out to mesh-shared TCP+TLS stream
             // listeners: swap the shared `rustls::ServerConfig` slot that
             // every TCP+TLS accept loop snapshots per accept. Existing
@@ -22431,7 +22445,12 @@ mod tests {
         );
 
         // Dev (non-production) tolerates the downgrade (warns + swaps to None) —
-        // an explicit DISABLE reload is an intentional operator choice.
+        // an explicit DISABLE reload is an intentional operator choice. Planning
+        // is side-effect-free: the `ferrum_mesh_inbound_plaintext_allowed`
+        // posture gauge is written only when this plan is applied after slice
+        // acceptance (`apply_mesh_inbound_tls_reload`), never here. Not asserted
+        // in this test: the gauge is a process-global static that the parallel
+        // apply-task tests legitimately write, so reading it here would race.
         let plan = plan_mesh_inbound_tls_reload(
             &proxy_state,
             &runtime,
