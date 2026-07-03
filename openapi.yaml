@@ -4,30 +4,35 @@ info:
   description: |
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
-    All endpoints except `/health`, `/status`, exact `/metrics`, and `/overload`
-    require JWT bearer token authentication via the
+    All endpoints except `/live`, `/health`, `/status`, exact `/metrics`, and
+    `/overload` require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
-    Admin JWTs must include a string `role` claim. `viewer` can call read-only
-    endpoints, `operator` can also mutate proxies, upstreams, plugin configs,
-    and operational refresh/test endpoints, and `admin` has full access
-    including consumers, credentials, API specs, batch/restore, and audit logs.
-    Tokens without a valid `role` claim are rejected.
+    Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
+    string `role` claim. `viewer` can call read-only endpoints, `operator` can
+    also mutate proxies, upstreams, plugin configs, and operational refresh/test
+    endpoints, and `admin` has full access including consumers, credentials, API
+    specs, TLS material management, batch/restore, and audit logs. Tokens
+    without a valid `role` claim are rejected.
 
     ## Namespaces
 
-    Every authenticated endpoint is scoped by the `X-Ferrum-Namespace` request
-    header. Resources (proxies, consumers, plugin configs, upstreams) are
+    Resource endpoints that include the `X-Ferrum-Namespace` parameter are
+    scoped by that request header. Resources (proxies, consumers, plugin configs,
+    upstreams, API specs, audit log entries, and backup/restore payloads) are
     isolated per namespace — uniqueness constraints (listen_path, proxy/upstream
-    name, consumer username, listen_port) apply per namespace, and a request
-    only sees resources whose `namespace` field matches the header. The header
+    name, consumer username, listen_port) apply per namespace, and a request only
+    sees resources whose `namespace` field matches the header. The header
     defaults to `ferrum` when omitted, must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
     (start with an alphanumeric character; alphanumerics, dots, underscores, or
     hyphens after that; max 254 chars — same rules as resource IDs), and is
-    enforced even on write operations: any `namespace` field in the request
+    enforced on scoped write operations: any `namespace` field in the request
     body is overwritten with the header value (the field is therefore
-    effectively read-only on the wire). Discover all known namespaces via
-    `GET /namespaces`.
+    effectively read-only on the wire). Process/runtime surfaces such as
+    observability, cluster state, backend capabilities, TLS management, and mesh
+    topology reflect the current node or control-plane state and are not
+    namespace-filtered unless their operation explicitly declares the namespace
+    header. Discover all known resource namespaces via `GET /namespaces`.
 
     ## Caching and read-only mode
 
@@ -100,7 +105,7 @@ tags:
   - name: API Specs
     description: Submit, retrieve, replace, and delete OpenAPI/Swagger spec bundles that create proxy + upstream + plugin resources atomically
   - name: TLS
-    description: Validate and inspect TLS certificate material
+    description: TLS inventory/events/validation/forced reload require operator; persisted certificate, key, trust, JWKS, and ACME state mutations require admin
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -1312,14 +1317,14 @@ paths:
       tags: [Metrics]
       security:
         - bearerAuth: []
-        - {}
+        - metricsBearerAuth: []
       responses:
         "200":
           description: Prometheus text exposition
           content:
             text/plain:
               schema:
-                type: [string, "null"]
+                type: string
               example: |
                 # HELP ferrum_requests_total Total number of requests processed
                 # TYPE ferrum_requests_total counter
@@ -1396,7 +1401,7 @@ paths:
           content:
             text/plain:
               schema:
-                type: [string, "null"]
+                type: string
               example: |
                 # HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer.
                 # TYPE ferrum_api_chargeable_calls_total counter
@@ -1418,6 +1423,8 @@ paths:
                 $ref: "#/components/schemas/ChargebackResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /charges/sink/status:
     get:
@@ -3261,26 +3268,29 @@ paths:
       description: |
         Falls back to cached config when the database is unavailable.
 
-        When `limit` or `offset` query parameters are provided, the response
-        is wrapped in a paginated envelope with `data` and `pagination` fields.
-        Without pagination parameters, a plain JSON array is returned for
-        backward compatibility.
+        Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Proxies]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
-          description: Array of proxy objects
+          description: Paginated proxy objects
           headers:
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Proxy"
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Proxy"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3407,25 +3417,29 @@ paths:
       operationId: listConsumers
       summary: List all consumers
       description: |
-        When `limit` or `offset` query parameters are provided, the response
-        is wrapped in a paginated envelope. Without them, a plain JSON array
-        is returned for backward compatibility.
+        Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Consumers]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
-          description: Array of consumer objects
+          description: Paginated consumer objects
           headers:
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Consumer"
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Consumer"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3536,7 +3550,7 @@ paths:
         in: path
         required: true
         schema:
-          type: [string, "null"]
+          type: string
         description: Consumer ID
       - name: cred_type
         in: path
@@ -3561,7 +3575,11 @@ paths:
         content:
           application/json:
             schema:
-              type: object
+              oneOf:
+                - type: object
+                - type: array
+                  items:
+                    type: object
               description: Credential payload (schema varies by credential type)
               examples:
                 - username: alice
@@ -3712,7 +3730,7 @@ paths:
               schema:
                 type: array
                 items:
-                  type: [string, "null"]
+                  type: string
               example:
                 - transaction_log_schema
                 - stdout_logging
@@ -3801,25 +3819,29 @@ paths:
       operationId: listPluginConfigs
       summary: List all plugin configurations
       description: |
-        When `limit` or `offset` query parameters are provided, the response
-        is wrapped in a paginated envelope. Without them, a plain JSON array
-        is returned for backward compatibility.
+        Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
-          description: Array of plugin configurations
+          description: Paginated plugin configurations
           headers:
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/PluginConfig"
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PluginConfig"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3927,25 +3949,29 @@ paths:
       operationId: listUpstreams
       summary: List all upstreams
       description: |
-        When `limit` or `offset` query parameters are provided, the response
-        is wrapped in a paginated envelope. Without them, a plain JSON array
-        is returned for backward compatibility.
+        Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Upstreams]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
-          description: Array of upstream objects
+          description: Paginated upstream objects
           headers:
             X-Data-Source:
               $ref: "#/components/headers/X-Data-Source"
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Upstream"
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Upstream"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -4233,7 +4259,7 @@ paths:
         `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`).
 
         **Content-Type detection**: `application/json` → JSON parser;
-        `application/yaml` / `application/x-yaml` / `text/yaml` → YAML parser;
+        `application/yaml` / `application/x-yaml` / `text/yaml` / `text/x-yaml` → YAML parser;
         other or missing Content-Type → autodetect by first non-whitespace byte
         (`{` → JSON, else YAML).
 
@@ -4296,11 +4322,14 @@ paths:
               description: |
                 Raw OpenAPI or Swagger document in YAML format. Must contain
                 `x-ferrum-proxy` at the root. Also accepted as
-                `application/x-yaml` or `text/yaml`.
+                `application/x-yaml`, `text/yaml`, or `text/x-yaml`.
           application/x-yaml:
             schema:
               type: string
           text/yaml:
+            schema:
+              type: string
+          text/x-yaml:
             schema:
               type: string
       responses:
@@ -4389,10 +4418,13 @@ paths:
           the stored format is JSON → converts to YAML before responding.
         - `Accept: */*` or matching stored format → responds in stored format.
 
-        **Conditional GET** (`If-None-Match`): the response includes an `ETag`
-        header set to the SHA-256 hex content hash of the uncompressed spec.
-        Clients that send `If-None-Match: "<hash>"` receive `304 Not Modified`
-        when the spec is unchanged, saving bandwidth on polling integrations.
+        **Conditional GET** (`If-None-Match`): the response includes a
+        representation-specific `ETag` based on the uncompressed spec content
+        plus the selected response format (`"<hash>-json"` or `"<hash>-yaml"`).
+        Clients that send the matching `If-None-Match` value receive
+        `304 Not Modified`, saving bandwidth on polling integrations. Responses
+        include `Vary: Accept` because content negotiation affects the selected
+        representation and ETag.
 
         The spec content is served as-is — the gateway does not rewrite any
         Ferrum extension fields in the response.
@@ -4421,7 +4453,12 @@ paths:
             ETag:
               schema:
                 type: string
-              description: Quoted SHA-256 hex hash of the uncompressed spec content
+              description: Quoted representation-specific ETag, for example `"<sha256>-json"` or `"<sha256>-yaml"`.
+            Vary:
+              schema:
+                type: string
+                enum: [Accept]
+              description: Response varies by the `Accept` request header.
             Cache-Control:
               schema:
                 type: string
@@ -4445,6 +4482,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "406":
+          description: Requested `Accept` header does not allow JSON or YAML.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4504,6 +4549,9 @@ paths:
             schema:
               type: string
           text/yaml:
+            schema:
+              type: string
+          text/x-yaml:
             schema:
               type: string
       responses:
@@ -4645,11 +4693,20 @@ paths:
             ETag:
               schema:
                 type: string
-              description: Quoted SHA-256 hex content hash
+              description: Quoted representation-specific ETag, for example `"<sha256>-json"` or `"<sha256>-yaml"`.
+            Vary:
+              schema:
+                type: string
+                enum: [Accept]
+              description: Response varies by the `Accept` request header.
             Cache-Control:
               schema:
                 type: string
                 enum: ["no-store"]
+            X-Content-Type-Options:
+              schema:
+                type: string
+                enum: [nosniff]
           content:
             application/json:
               schema:
@@ -4665,6 +4722,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "406":
+          description: Requested `Accept` header does not allow JSON or YAML.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4677,7 +4742,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        HS256-signed JWT. Configure the secret, issuer, and max TTL via
+        HS256-signed admin JWT. Configure the secret, issuer, and max TTL via
         environment variables:
 
         | Variable | Default | Description |
@@ -4686,8 +4751,22 @@ components:
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
 
-        Required `role` claim values are `viewer`, `operator`, and `admin`.
-        Tokens without a valid `role` claim are rejected.
+        Tokens must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
+        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `exp -
+        iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL`; `nbf` and `exp` are
+        validated. Required `role` claim values are `viewer`, `operator`, and
+        `admin`. Tokens without a valid `role` claim are rejected.
+
+    metricsBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: |
+        Dedicated `FERRUM_METRICS_BEARER_TOKEN` accepted only by observability
+        scrape/detail surfaces such as exact `/metrics` and detailed
+        `/health`/`/status`/`/overload`. CIDR-based metrics access is configured
+        separately with `FERRUM_METRICS_ALLOWED_CIDRS` and cannot be represented
+        as an OpenAPI security scheme.
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
@@ -4729,9 +4808,9 @@ components:
         minimum: 0
         default: 0
       description: |
-        Number of items to skip. When provided (along with or without `limit`),
-        the response switches from a plain JSON array to a paginated envelope
-        containing `data` and `pagination` fields.
+        Number of items to skip. Invalid values are treated as `0`. List
+        endpoints return a paginated envelope containing `data` and
+        `pagination` fields even when this parameter is omitted.
 
     PaginationLimit:
       name: limit
@@ -4743,9 +4822,10 @@ components:
         maximum: 1000
         default: 100
       description: |
-        Maximum number of items to return (max 1000). When provided (along with
-        or without `offset`), the response switches from a plain JSON array to
-        a paginated envelope containing `data` and `pagination` fields.
+        Maximum number of items to return (max 1000). Invalid values and `0`
+        are coerced to the server default; values above the maximum are capped.
+        List endpoints return a paginated envelope containing `data` and
+        `pagination` fields even when this parameter is omitted.
 
   # ── Reusable headers ───────────────────────────────────────────────
   headers:
@@ -4800,6 +4880,12 @@ components:
             $ref: "#/components/schemas/Error"
     BadGateway:
       description: Upstream ACME directory or provider operation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalServerError:
+      description: Internal server error
       content:
         application/json:
           schema:
@@ -8855,9 +8941,8 @@ components:
     Pagination:
       type: object
       description: |
-        Pagination metadata returned when `limit` or `offset` query parameters
-        are provided on a list endpoint. Without these parameters, list endpoints
-        return a plain JSON array for backward compatibility.
+        Pagination metadata returned on list endpoints. Resource list endpoints
+        return this envelope even when `limit` and `offset` are omitted.
       required: [offset, limit, total]
       properties:
         offset:
@@ -16271,7 +16356,7 @@ components:
           description: OpenAPI/Swagger version string from the document
         content_hash:
           type: string
-          description: Lowercase hex SHA-256 of the uncompressed spec bytes. Suitable for use as an ETag.
+          description: Lowercase hex SHA-256 of the uncompressed spec bytes. Fetch responses derive representation-specific ETags from this hash and the selected format.
 
     ApiSpecValidationError:
       type: object

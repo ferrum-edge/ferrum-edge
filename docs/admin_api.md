@@ -24,21 +24,21 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
-Admin JWTs must include a string `role` claim:
+Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), `exp - iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL` (default `3600` seconds), and `nbf`/`exp` are validated.
 
 | Role | Access |
 | --- | --- |
 | `viewer` | Read-only endpoints |
-| `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, and mesh egress-scope test operations |
-| `admin` | Full access, including consumers, credentials, API specs, batch/restore, and audit logs |
+| `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, TLS inventory/events/validation/forced reload, and mesh egress-scope test operations |
+| `admin` | Full access, including consumers, credentials, API specs, TLS material and ACME state management, batch/restore, and audit logs |
 
 Tokens without a valid `role` claim are rejected.
 
 Generate a token:
 ```bash
-# Using any JWT library; include an explicit role
+# Using any JWT library; include the required claims and an explicit role.
 # Example using Node.js jsonwebtoken:
-node -e "console.log(require('jsonwebtoken').sign({sub:'admin', role:'admin'}, 'my-super-secret-jwt-key'))"
+node -e "const jwt=require('jsonwebtoken'); const now=Math.floor(Date.now()/1000); console.log(jwt.sign({iss:'ferrum-edge', sub:'admin', role:'admin', iat:now, nbf:now, exp:now+3600, jti:require('crypto').randomUUID()}, 'my-super-secret-jwt-key-at-least-32-chars'))"
 ```
 
 ## Liveness and Health Checks
@@ -81,6 +81,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 The response is paginated and includes each source's non-secret provenance, material kind, load state, certificate subject/issuer/SANs, validity window, SHA-256 certificate fingerprint, and the runtime/config surfaces using it. Inline PEM values and private key bytes are redacted. Unsupported URI providers are listed with `state: "unsupported"` until their runtime loader is enabled.
 
 Exact `/metrics` also refreshes this inventory at scrape time and emits `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` gauges for loaded certificate entries.
+
+TLS inventory, event listing, inline validation, and forced reload endpoints require an `operator` or `admin` token. Endpoints that create, replace, delete, import, finalize, or renew persisted TLS/ACME material require an `admin` token because they can alter private keys, certificate chains, trust bundles, revocation data, JWKS records, or ACME account-backed state.
 
 ## TLS Events
 

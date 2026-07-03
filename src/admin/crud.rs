@@ -366,7 +366,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
                 super::log_audit_enqueue_failure(&error);
             }
-            Ok(super::json_response(StatusCode::NO_CONTENT, &json!({})))
+            Ok(super::empty_response(StatusCode::NO_CONTENT))
         }
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
