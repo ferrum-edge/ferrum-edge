@@ -109,10 +109,11 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         # nodes the reconcile broadcasts converge through, auth.rs is the
         # DP<->CP JWT verification the fixture's plaintext-h2c stream still
         # relies on, and cp_server.rs owns the shared CP scope/namespace
-        # filtering helpers mesh_server.rs calls when serving native slices.
-        # dp_client.rs (gateway ConfigSync) and mod.rs (pure module wiring,
-        # compile-gated on every PR) stay out.
-        r"^src/grpc/(mesh_server|mesh_registry|auth|cp_server)\.rs$",
+        # filtering helpers mesh_server.rs calls when serving native slices;
+        # dp_client.rs owns shared DP gRPC JWT/TLS/version helpers imported by
+        # the native MeshSubscribe client. mod.rs (pure module wiring,
+        # compile-gated on every PR) stays out.
+        r"^src/grpc/(mesh_server|mesh_registry|auth|cp_server|dp_client)\.rs$",
         # The watch->reconcile->broadcast pipeline that is the ONLY source of
         # the mesh model the CP serves over MeshSubscribe (there is no DB or
         # admin write path for the mesh block).
@@ -221,6 +222,7 @@ def self_test() -> int:
         ("mesh-e2e-sidecar", ["src/grpc/mesh_registry.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/auth.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/cp_server.rs"], True),
+        ("mesh-e2e-sidecar", ["src/grpc/dp_client.rs"], True),
         ("mesh-e2e-sidecar", ["src/k8s_controller/reconciler.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/core.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/mod.rs"], True),
@@ -231,7 +233,6 @@ def self_test() -> int:
         ("mesh-e2e-sidecar", ["src/admin/audit.rs"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/multicluster-federation/run.sh"], False),
         ("mesh-e2e-sidecar", ["src/grpc/mod.rs"], False),
-        ("mesh-e2e-sidecar", ["src/grpc/dp_client.rs"], False),
         ("mesh-e2e-sidecar", ["src/modes/data_plane.rs"], False),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/istio.rs"], False),
         ("mesh-e2e-sidecar", ["src/admin/backup.rs"], False),
