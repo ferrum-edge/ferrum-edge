@@ -39,6 +39,18 @@ set -euo pipefail
 #                                               sidecar: allowed Origin
 #                                               reflected, preflight answered
 #                                               204, disallowed Origin 403
+#   sidecar.config.native_subscribe_delivered   a Ferrum CP (cp mode, sqlite,
+#                                               K8s pod discovery) serves the
+#                                               mesh model over native
+#                                               MeshSubscribe to the capp
+#                                               sidecar (CONFIG_PROTOCOL=
+#                                               native); client traffic
+#                                               reaches capp's app (routes
+#                                               exist ONLY if the CP-delivered
+#                                               slice materialized) AND the
+#                                               sidecar's JWT-authenticated
+#                                               /mesh/config-drift reports a
+#                                               received native slice
 #
 # The DestinationRule probe is TWO-PHASE on purpose: a black-holed dial (the
 # client pod's own OUTPUT DROP, so SYNs vanish deterministically with no
@@ -88,8 +100,12 @@ LIVE_SUITE_NAME="mesh-e2e-sidecar"
 SVC_HOST="svc.$NS.svc.cluster.local"
 SLOW_HOST="slowsvc.$NS.svc.cluster.local"
 WS_HOST="wssvc.$NS.svc.cluster.local"
+CAPP_HOST="capp.$NS.svc.cluster.local"
 JWT_ISSUER="mesh-e2e-issuer"
 JWT_KID="fixture-key"
+# The capp echo answers "<APP_BODY>-native" (manifests.yaml) so a native-leg
+# probe answer can never be confused with the file-config svc echo.
+NATIVE_APP_MARKER="$APP_BODY-native"
 # Two-phase DR connectTimeout values + accepted observation windows (seconds).
 # Both windows exclude the built-in 5000ms default (types.rs
 # default_connect_timeout), so a DR that silently fails to apply cannot pass
@@ -106,10 +122,16 @@ PHASE2_WINDOW_HI=4.5
 # Discovered at runtime.
 SVC_POD_IP=""
 WSSVC_POD_IP=""
+CAPP_POD_IP=""
 # Minted at startup (mint_jwt_material).
 JWKS_JSON=""
 JWT_VALID=""
 JWT_WRONG_KEY=""
+# Minted at startup (render_shared_secrets): HS256 secrets for the CP<->DP
+# gRPC JWT and for the sidecar/CP admin APIs (the admin API validates but
+# never mints, so run.sh signs the /mesh/config-drift bearer itself).
+CP_DP_JWT_SECRET=""
+ADMIN_JWT_SECRET=""
 
 LIVE_ASSERTIONS_INITIALIZED=false
 REQUIRED_LIVE_ASSERTIONS=(
@@ -123,15 +145,18 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.destination_rule.tcp_connect_timeout
   sidecar.destination_rule.tcp_max_connections
   sidecar.virtual_service.cors_policy
+  sidecar.config.native_subscribe_delivered
 )
 # NOTE: every id backs a GA-contract capability row in
 # tests/conformance/ga_contract.yaml — keep the id strings in lock-step.
 # `sidecar.spire.workload_entries` (with the strict-mTLS positive) backs the
 # SPIFFE identity row `mesh.identity.spire_svid_issuance`;
 # `sidecar.peer_auth.strict_mtls_authenticated` is deliberately shared by the
-# PeerAuthentication and identity rows. No contract row is live-deferred: VS
-# CORS was the last (issue #1973, closed by the mesh-slice CORS carriage this
-# suite now exercises).
+# PeerAuthentication and identity rows;
+# `sidecar.config.native_subscribe_delivered` backs the config-transport row
+# `mesh.config_transport.native_subscribe` (issue #2002). No contract row is
+# live-deferred: VS CORS was the last (issue #1973, closed by the mesh-slice
+# CORS carriage this suite now exercises).
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -294,6 +319,59 @@ mint_jwt_material() {
   printf '%s\n' "$JWKS_JSON" > "$RESULTS_DIR/jwks.json"
 }
 
+# ── shared HS256 secrets (CP<->DP gRPC + admin APIs) ────────────────────────
+#
+# Fresh per run (throwaway fixture material, >=32 chars as the CP/DP secret
+# validation requires). Pods read them via secretKeyRef, so on a REUSED
+# cluster a re-run re-mints values that already-running pods do not see — the
+# disposable-cluster CI flow always starts fresh; local re-runs against a kept
+# cluster should `kubectl rollout restart` the ferrum-cp/capp deployments.
+render_shared_secrets() {
+  CP_DP_JWT_SECRET="$(openssl rand -hex 32)"
+  ADMIN_JWT_SECRET="$(openssl rand -hex 32)"
+  kubectl --context "$CONTEXT" -n "$NS" create secret generic ferrum-mesh-e2e-secrets \
+    --from-literal=cp-dp-grpc-jwt-secret="$CP_DP_JWT_SECRET" \
+    --from-literal=admin-jwt-secret="$ADMIN_JWT_SECRET" \
+    --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+}
+
+# HS256 admin bearer for the capp sidecar's read-only admin API (the admin API
+# validates but never mints; same shape as node_waypoint_ebpf_live's helper —
+# all six required claims plus the required `role`). Default issuer
+# "ferrum-edge" matches the sidecar's unset FERRUM_ADMIN_JWT_ISSUER.
+mint_admin_jwt() {
+  python3 - "$ADMIN_JWT_SECRET" "ferrum-edge" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import sys
+import time
+import uuid
+
+secret, issuer = sys.argv[1], sys.argv[2]
+now = int(time.time())
+
+def b64url(value):
+    raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+header = {"alg": "HS256", "typ": "JWT"}
+claims = {
+    "iss": issuer,
+    "sub": "mesh-e2e-sidecar",
+    "iat": now,
+    "nbf": now - 1,
+    "exp": now + 600,
+    "jti": str(uuid.uuid4()),
+    "role": "admin",
+}
+signing_input = f"{b64url(header)}.{b64url(claims)}"
+signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+print(f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}")
+PY
+}
+
 # ── SPIRE ───────────────────────────────────────────────────────────────────
 
 install_spire() {
@@ -303,7 +381,7 @@ install_spire() {
 }
 
 register_spire_workloads() {
-  log "registering SPIRE workload entries (svc, wssvc, client, rogue)"
+  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp)"
   local registered_ok=true
   local -a spire_nodes
   mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
@@ -321,8 +399,11 @@ register_spire_workloads() {
       continue
     fi
     # slowsvc has NO entry on purpose: its dial is black-holed and never
-    # completes a handshake, so no SVID is ever presented for it.
-    for sa in svc wssvc client rogue; do
+    # completes a handshake, so no SVID is ever presented for it. capp (the
+    # native-MeshSubscribe destination) needs one: its inbound terminates the
+    # client's mesh-mTLS with a SPIRE SVID like every other destination. The
+    # ferrum-cp pod is NOT a mesh workload and gets no entry.
+    for sa in svc wssvc client rogue capp; do
       ferrum_spire_register_k8s_workload \
         "$CONTEXT" "$SPIRE_NS" \
         "spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa" \
@@ -336,7 +417,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion sidecar.spire.workload_entries pass \
-      "" "" "svc-wssvc-client-rogue-entries-registered" "spire-entries.txt"
+      "" "" "svc-wssvc-client-rogue-capp-entries-registered" "spire-entries.txt"
   else
     record_live_assertion sidecar.spire.workload_entries fail \
       "" "" "workload-entry-registration-failed"
@@ -545,11 +626,15 @@ YAML
 # Client/rogue sidecar mesh document: the svc workload at its REAL pod IP
 # (sidecar egress dials workload_address:15006 over mesh-mTLS) plus the
 # `slowsvc` workload at the black-holed IP with a DestinationRule
-# connectTimeout — the parameter the two-phase probe flips. Rendered only
+# connectTimeout — the parameter the two-phase probe flips. The capp workload
+# (the native-MeshSubscribe destination) rides here too so the client's
+# CAPTURED egress can reach it — this leg's file config is deliberately
+# ordinary; the native-transport proof lives on capp's INBOUND side, whose
+# routes only exist if the CP-delivered slice materialized. Rendered only
 # after the svc pod IP is known; a svc pod replacement would need a re-render
 # + client restart (this fixture never replaces svc).
 render_client_config() {
-  local svc_pod_ip="$1" wssvc_pod_ip="$2" slow_connect_timeout_ms="$3"
+  local svc_pod_ip="$1" wssvc_pod_ip="$2" capp_pod_ip="$3" slow_connect_timeout_ms="$4"
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   workloads:
@@ -560,6 +645,19 @@ mesh:
       service_account: svc
       addresses:
         - "$svc_pod_ip"
+      ports:
+        - port: 8080
+          protocol: http
+          name: http
+      selector:
+        namespace: $NS
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/capp
+      service_name: capp
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: capp
+      addresses:
+        - "$capp_pod_ip"
       ports:
         - port: 8080
           protocol: http
@@ -601,6 +699,14 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+    - name: capp
+      namespace: $NS
+      ports:
+        - port: 8080
+          protocol: http
+          name: http
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/capp
     - name: wssvc
       namespace: $NS
       ports:
@@ -654,7 +760,11 @@ YAML
 
 wait_for_rollouts() {
   local deploy
-  for deploy in svc wssvc client rogue; do
+  # ferrum-cp first: its readiness (gRPC :50051 bound) unblocks capp's
+  # native-subscribe convergence; capp's POD readiness itself only requires
+  # the app container (the sidecar container has no probe and counts as
+  # ready while it waits for its first slice).
+  for deploy in ferrum-cp svc wssvc capp client rogue; do
     kubectl --context "$CONTEXT" -n "$NS" rollout status "deploy/$deploy" --timeout=5m
   done
 }
@@ -671,9 +781,11 @@ wait_for_rollouts() {
 # failures can never masquerade as datapath outcomes.
 
 # Retry until the response settles on (want_status [+ body grep]); echoes the
-# final "<status>\t<body>".
+# final "<status>\t<body>". Optional 6th arg selects the destination Host
+# (defaults to the svc FQDN).
 drive_settle() {
   local deploy="$1" path="$2" bearer="$3" want_status="$4" want_body_grep="$5"
+  local host="${6:-$SVC_HOST}"
   # shellcheck disable=SC2016
   kubectl --context "$CONTEXT" -n "$NS" exec "deploy/$deploy" -c curl -- \
     sh -c '
@@ -700,7 +812,7 @@ drive_settle() {
         sleep 2
       done
       printf "%s\t%s\n" "$out" "$body"
-    ' sh "$SVC_HOST" "$path" "$bearer" "$want_status" "$want_body_grep" \
+    ' sh "$host" "$path" "$bearer" "$want_status" "$want_body_grep" \
     2>/dev/null || printf 'EXECFAIL\t'
 }
 
@@ -920,6 +1032,93 @@ probe_vs_cors() {
   fi
 }
 
+# Native MeshSubscribe delivery (issue #2002). Two observations, one
+# assertion:
+#   a) TRAFFIC (the load-bearing proof): a captured client request to the
+#      capp FQDN answers 200 with capp's DISTINCT app marker. capp's sidecar
+#      runs FERRUM_MESH_CONFIG_PROTOCOL=native with NO ConfigMap — its :15006
+#      inbound routes exist ONLY if the ferrum-cp MeshSubscribe stream
+#      delivered a slice whose K8s-built capp workload resolved as the local
+#      workload. If delivery failed, mesh startup is still blocked in
+#      wait_for_initial_mesh_config (nothing listens) or no inbound route
+#      matches (404) — either way this probe cannot settle on 200+marker.
+#   b) DIAGNOSTICS (also required — it attributes the transport): the capp
+#      sidecar's JWT-authenticated GET /mesh/config-drift must report a
+#      received slice (slice.last_received_at set), source_protocol=native, a
+#      ferrum-cp source_cp_url, and at least one service in the slice. The
+#      admin API binds loopback, so the curl runs inside the capp pod; the
+#      bearer is HS256-minted by run.sh against the shared Secret.
+probe_native_subscribe() {
+  log "probing native MeshSubscribe delivery (client -> capp via CP-served slice)"
+  local out status body
+  out="$(drive_settle client / "" 200 "$NATIVE_APP_MARKER" "$CAPP_HOST")"
+  status="${out%%$'\t'*}"
+  body="${out#*$'\t'}"
+  log "client -> capp: status=$status body=$body"
+  local traffic_ok=false
+  if [[ "$status" == "200" && "$body" == *"$NATIVE_APP_MARKER"* ]]; then
+    traffic_ok=true
+  fi
+
+  local admin_token drift_json
+  admin_token="$(mint_admin_jwt)"
+  # shellcheck disable=SC2016
+  drift_json="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/capp -c curl -- \
+    sh -c '
+      token="$1"
+      out=""
+      for _ in $(seq 1 15); do
+        out="$(curl -s -m 10 -H "Authorization: Bearer $token" \
+          http://127.0.0.1:15020/mesh/config-drift 2>/dev/null || true)"
+        if [ -n "$out" ]; then
+          printf "%s\n" "$out"
+          exit 0
+        fi
+        sleep 2
+      done
+      printf "%s\n" "$out"
+    ' sh "$admin_token" 2>/dev/null || printf '')"
+  printf '%s\n' "$drift_json" > "$RESULTS_DIR/native-config-drift.txt"
+
+  local drift_verdict
+  drift_verdict="$(printf '%s' "$drift_json" | python3 -c '
+import json
+import sys
+
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    print("drift-unparseable")
+    sys.exit(0)
+sl = doc.get("slice") or {}
+received = bool(sl.get("last_received_at"))
+protocol = sl.get("source_protocol")
+cp_url = sl.get("source_cp_url") or ""
+services = (sl.get("resources") or {}).get("services") or 0
+if received and protocol == "native" and "ferrum-cp" in cp_url and services >= 1:
+    print(f"native-slice-received services={services} cp={cp_url}")
+else:
+    print(
+        "drift-unexpected "
+        f"received={received} protocol={protocol} cp={cp_url} services={services}"
+    )
+')"
+  log "capp config-drift: $drift_verdict"
+
+  if [[ "$traffic_ok" == "true" && "$drift_verdict" == native-slice-received* ]]; then
+    record_live_assertion sidecar.config.native_subscribe_delivered pass \
+      client capp \
+      "status=$status body=$body $drift_verdict" \
+      "native-config-drift.txt"
+  else
+    record_live_assertion sidecar.config.native_subscribe_delivered fail \
+      client capp \
+      "traffic status=$status body=$body drift=$drift_verdict" \
+      "native-config-drift.txt"
+    return 1
+  fi
+}
+
 # DR maxConnections over a WebSocket flow: maxConnections is enforced on
 # stream-family and WebSocket backend connections only (a WS session holds one
 # dedicated backend connection for its lifetime), so the probe drives
@@ -1071,7 +1270,7 @@ probe_connect_timeout_two_phase() {
   log "re-rendering client config with ${CONNECT_TIMEOUT_PHASE2_MS}ms and restarting client"
   # Distroless runtime image: no shell/kill, so config reload is a rollout
   # restart (the new pod reads the updated ConfigMap at startup).
-  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CAPP_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
   kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
   kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m
   # Re-settle the positive route first so phase 2 never times a request that
@@ -1132,7 +1331,7 @@ collect_diagnostics() {
   kubectl --context "$CONTEXT" -n "$NS" get configmap -o yaml \
     > "$ARTIFACT_DIR/configmaps.yaml" 2>&1 || true
   local deploy
-  for deploy in svc wssvc client rogue; do
+  for deploy in svc wssvc client rogue capp ferrum-cp; do
     kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" \
       --all-containers --tail=500 \
       > "$ARTIFACT_DIR/${deploy}.log" 2>&1 || true
@@ -1173,18 +1372,22 @@ main() {
 
   ensure_namespace
   mint_jwt_material
+  render_shared_secrets
   render_dest_config
   render_wsdest_config
   apply_workloads
   register_spire_workloads
 
-  # svc rolls out first (its ConfigMap exists); client/rogue block in
-  # ContainerCreating until the client ConfigMap — rendered with the
-  # discovered svc pod IP — is applied.
+  # svc rolls out first (its ConfigMap exists); capp needs no ConfigMap (its
+  # sidecar subscribes to the CP) and its pod Ready only requires the app
+  # container; client/rogue block in ContainerCreating until the client
+  # ConfigMap — rendered with the discovered svc/wssvc/capp pod IPs — is
+  # applied.
   SVC_POD_IP="$(wait_for_pod_ip svc)"
   WSSVC_POD_IP="$(wait_for_pod_ip wssvc)"
-  log "svc pod IP=$SVC_POD_IP   wssvc pod IP=$WSSVC_POD_IP"
-  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
+  CAPP_POD_IP="$(wait_for_pod_ip capp)"
+  log "svc pod IP=$SVC_POD_IP   wssvc pod IP=$WSSVC_POD_IP   capp pod IP=$CAPP_POD_IP"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CAPP_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
   wait_for_rollouts
 
   if [[ "${FERRUM_MESH_E2E_DEPLOY_ONLY:-0}" == "1" ]]; then
@@ -1197,6 +1400,7 @@ main() {
   probe_rogue_denied
   probe_request_auth
   probe_vs_cors
+  probe_native_subscribe
   probe_ws_max_connections
   probe_connect_timeout_two_phase
 

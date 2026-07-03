@@ -587,10 +587,12 @@ fn live_contract_rejects_stale_and_unparseable_created_at() {
 fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // Pin the real ga_contract.yaml against this validator: the Stable
     // sidecar surface is enrolled vertically (STRICT mTLS, authz ALLOW/DENY,
-    // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, and
-    // SPIFFE identity plumbing — all ENFORCED and emitted by
-    // tests/k8s/mesh_e2e_sidecar/run.sh; the last deferral, VS CORS, was
-    // closed by the mesh-slice CORS carriage of issue #1973).
+    // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, SPIFFE
+    // identity plumbing, and the native MeshSubscribe config transport — all
+    // ENFORCED and emitted by tests/k8s/mesh_e2e_sidecar/run.sh; the last
+    // deferral, VS CORS, was closed by the mesh-slice CORS carriage of issue
+    // #1973, and the config-transport row was live-backed by the in-fixture
+    // Ferrum CP of issue #2002).
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()
@@ -617,6 +619,7 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.destination_rule.tcp_connect_timeout",
         "sidecar.destination_rule.tcp_max_connections",
         "sidecar.virtual_service.cors_policy",
+        "sidecar.config.native_subscribe_delivered",
     ] {
         assert!(
             enforced_ids.contains(&required),

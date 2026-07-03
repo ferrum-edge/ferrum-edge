@@ -3,7 +3,8 @@
 Live single-cluster validation of the **Stable Sidecar traffic surface** on a
 real kind cluster with real SPIRE-issued SVIDs — the datapath the in-process
 functional tests collapse (no iptables capture, loopback dials). One kind
-cluster runs SPIRE plus three hand-crafted sidecar workloads:
+cluster runs SPIRE plus the hand-crafted sidecar workloads (and, since issue
+#2002, a Ferrum control plane):
 
 - **svc** — the destination: an inbound iptables init container REDIRECTs app
   port `8080 -> :15006`, a Ferrum sidecar (`FERRUM_MESH_TOPOLOGY=sidecar`,
@@ -25,6 +26,21 @@ cluster runs SPIRE plus three hand-crafted sidecar workloads:
   minimal RFC 6455 echo that answers upgrades with a correct
   `Sec-WebSocket-Accept` and **holds** the session — the target of the DR
   `maxConnections=1` probe.
+- **ferrum-cp** — a Ferrum **control plane** (`FERRUM_MODE=cp`, sqlite on an
+  emptyDir, namespaced pod-discovery RBAC only, Istio/Gateway-API CRD
+  watching disabled) whose K8s controller builds the mesh model from the
+  cluster's **real** Services/Pods/EndpointSlices — the only path that
+  populates a CP's mesh block — and serves it over the native
+  `MeshConfigSync.MeshSubscribe` gRPC stream on `:50051` (in-cluster
+  plaintext h2c, JWT-authenticated via the per-run `ferrum-mesh-e2e-secrets`
+  Secret run.sh mints).
+- **capp** — a third destination pod shaped like `svc` (inbound REDIRECT
+  `8080 -> :15006`, SPIRE identity `sa/capp`, python echo answering a
+  distinct `-native` marker) whose sidecar runs
+  `FERRUM_MESH_CONFIG_PROTOCOL=native` subscribing to `ferrum-cp` — **no
+  ConfigMap**: its inbound routes exist only if the CP-delivered
+  MeshSubscribe slice materialized, which is the live proof for the native
+  config-transport GA row (issue #2002).
 
 ## What it asserts
 
@@ -34,7 +50,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 
 | Assertion | Proof |
 |---|---|
-| `sidecar.spire.workload_entries` | svc/client/rogue SPIRE entries registered |
+| `sidecar.spire.workload_entries` | svc/wssvc/client/rogue/capp SPIRE entries registered |
 | `sidecar.peer_auth.strict_mtls_authenticated` | captured client request → mesh-mTLS → STRICT inbound → 200 with the app marker |
 | `sidecar.peer_auth.strict_mtls_plaintext_rejected` | plaintext dial at the **captured** app port never reaches the app (REDIRECT → STRICT rejects) |
 | `sidecar.authz.denied_principal_rejected` | rogue → 403 with `Mesh authorization denied` (dest-side `mesh_authz`) |
@@ -44,22 +60,23 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → 200 with the origin reflected in `access-control-allow-origin`, `OPTIONS` preflight answered **204 by the sidecar** with `access-control-allow-methods`, disallowed `Origin` → **403** `CORS origin not allowed` (the plugin's own body, never the app marker) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
+| `sidecar.config.native_subscribe_delivered` | native MeshSubscribe delivery (issue #2002): a captured client request to `capp` answers 200 with the `-native` marker — capp's inbound routes exist **only** if the ferrum-cp MeshSubscribe stream delivered a slice whose K8s-built `sa/capp` workload resolved locally — **and** capp's JWT-authenticated `GET /mesh/config-drift` reports a received slice with `source_protocol=native` from the ferrum-cp URL and ≥1 service |
 
 Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
 allow/deny, RequestAuthentication JWT, DR connectTimeout, DR maxConnections,
-VirtualService CORS, and SPIFFE identity plumbing
+VirtualService CORS, SPIFFE identity plumbing
 (`mesh.identity.spire_svid_issuance`, backed by
 `sidecar.spire.workload_entries` plus the SVID-carried
 `sidecar.peer_auth.strict_mtls_authenticated` positive, which that row shares
-with the PeerAuthentication row); the artifact is validated against the
-contract by `tests/conformance/live_contract.rs` (the live workflow runs it
-right after the fixture). No contract row remains `live_deferred`: VS CORS (the last,
-issue #1973) is live-backed by the mesh slice's `virtual_service_cors_policies`
-carriage — the client sidecar synthesizes the `cors` plugin onto its
-materialized svc outbound route, and the probe proves allowed-Origin
-reflection, a sidecar-answered 204 preflight, and a disallowed-Origin 403 from
-the plugin itself.
+with the PeerAuthentication row), and the native MeshSubscribe config
+transport (`mesh.config_transport.native_subscribe`, backed by
+`sidecar.config.native_subscribe_delivered`); the artifact is validated
+against the contract by `tests/conformance/live_contract.rs` (the live
+workflow runs it right after the fixture). No contract row remains
+`live_deferred`: VS CORS closed with issue #1973 (the mesh slice's
+`virtual_service_cors_policies` carriage) and the config-transport row closed
+with issue #2002 (the in-fixture Ferrum CP above).
 
 This contract is **PR- and release-blocking**: the dedicated workflow's
 result is mirrored into the required CI aggregate by the
@@ -73,6 +90,15 @@ RS256 keys are generated fresh per run with `openssl`; python3 stdlib
 assembles the base64url JWKS/tokens (no pip installs). The invalid-token
 probe signs with a second key under the **same kid/issuer**, so it selects
 the published JWKS key and fails precisely on signature verification.
+
+Separately, run.sh mints two per-run HS256 secrets into the
+`ferrum-mesh-e2e-secrets` Secret: the CP↔DP gRPC JWT secret
+(`FERRUM_CP_DP_GRPC_JWT_SECRET`, the DP self-mints its bearer from it) and a
+shared admin-API secret (`FERRUM_ADMIN_JWT_SECRET` on ferrum-cp and the capp
+sidecar). The admin API validates but never mints, so run.sh signs the
+`/mesh/config-drift` bearer itself (python3 stdlib HMAC, all six required
+claims + `role`); the curl runs inside the capp pod because the admin API
+binds loopback.
 
 ## Reload model
 

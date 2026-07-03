@@ -686,6 +686,42 @@ fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
     PaginationParams { offset, limit }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChargebackFormat {
+    Prometheus,
+    Json,
+}
+
+fn parse_chargeback_format(
+    query: Option<&str>,
+) -> Result<ChargebackFormat, Box<Response<Full<Bytes>>>> {
+    let mut format = ChargebackFormat::Prometheus;
+    let Some(query) = query else {
+        return Ok(format);
+    };
+
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "format" {
+            continue;
+        }
+        format = match value.as_ref() {
+            "prometheus" => ChargebackFormat::Prometheus,
+            "json" => ChargebackFormat::Json,
+            other => {
+                return Err(Box::new(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!(
+                        "Unsupported charges format '{}'; expected 'prometheus' or 'json'",
+                        other
+                    )}),
+                )));
+            }
+        };
+    }
+
+    Ok(format)
+}
+
 fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Response<Full<Bytes>>> {
     if actor.role.allows(required) {
         return None;
@@ -700,6 +736,72 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
             )
         }),
     ))
+}
+
+fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
+    match (method, segments) {
+        (
+            method,
+            ["admin", "tls", "inventory"]
+            | ["admin", "tls", "events"]
+            | ["admin", "tls", "acme", "certificates"]
+            | ["admin", "tls", "acme", "certificates", _]
+            | ["admin", "tls", "acme", "accounts"]
+            | ["admin", "tls", "acme", "orders"]
+            | ["admin", "tls", "acme", "orders", _]
+            | ["admin", "tls", "certificates"]
+            | ["admin", "tls", "certificates", _]
+            | ["admin", "tls", "ca-bundles"]
+            | ["admin", "tls", "ca-bundles", _]
+            | ["admin", "tls", "crls"]
+            | ["admin", "tls", "crls", _]
+            | ["admin", "tls", "ocsp-responses"]
+            | ["admin", "tls", "ocsp-responses", _]
+            | ["admin", "tls", "jwks"]
+            | ["admin", "tls", "jwks", _],
+        ) if method == Method::GET => Some(AdminRole::Operator),
+        (method, ["admin", "tls", "rotate", _] | ["admin", "tls", "validate"])
+            if method == Method::POST =>
+        {
+            Some(AdminRole::Operator)
+        }
+        (
+            method,
+            ["admin", "tls", "acme", "certificates"]
+            | ["admin", "tls", "acme", "orders"]
+            | ["admin", "tls", "certificates"]
+            | ["admin", "tls", "ca-bundles"]
+            | ["admin", "tls", "crls"]
+            | ["admin", "tls", "ocsp-responses"]
+            | ["admin", "tls", "jwks"],
+        ) if method == Method::POST => Some(AdminRole::Admin),
+        (
+            method,
+            ["admin", "tls", "acme", "certificates", _]
+            | ["admin", "tls", "certificates", _]
+            | ["admin", "tls", "ca-bundles", _]
+            | ["admin", "tls", "crls", _]
+            | ["admin", "tls", "ocsp-responses", _]
+            | ["admin", "tls", "jwks", _],
+        ) if method == Method::PUT => Some(AdminRole::Admin),
+        (
+            method,
+            ["admin", "tls", "acme", "certificates", _]
+            | ["admin", "tls", "acme", "orders", _]
+            | ["admin", "tls", "certificates", _]
+            | ["admin", "tls", "ca-bundles", _]
+            | ["admin", "tls", "crls", _]
+            | ["admin", "tls", "ocsp-responses", _]
+            | ["admin", "tls", "jwks", _],
+        ) if method == Method::DELETE => Some(AdminRole::Admin),
+        (method, ["admin", "tls", "acme", "renew", _]) if method == Method::POST => {
+            Some(AdminRole::Admin)
+        }
+        (method, ["admin", "tls", "acme", "orders", _, "finalize"]) if method == Method::POST => {
+            Some(AdminRole::Admin)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn log_audit_enqueue_failure(error: &anyhow::Error) {
@@ -1081,31 +1183,32 @@ pub async fn handle_admin_request(
     // so it stays behind the standard admin JWT gate even though it is scrapeable.
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::global_registry();
-        // Support ?format=json for JSON output, default to Prometheus text format
-        let query = req.uri().query().unwrap_or("");
-        let use_json = query.contains("format=json");
-        if use_json {
-            let json_output = registry.render_json();
-            let resp = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json")
-                .header("X-Content-Type-Options", "nosniff")
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::from(json_output)))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
-            return Ok(resp);
-        } else {
-            let prom_output = registry.render_prometheus();
-            let resp = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                .header("X-Content-Type-Options", "nosniff")
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::from(prom_output)))
-                .unwrap_or_else(|_| {
-                    Response::new(Full::new(Bytes::from("# error rendering charges\n")))
-                });
-            return Ok(resp);
+        match parse_chargeback_format(req.uri().query()) {
+            Ok(ChargebackFormat::Json) => {
+                let json_output = registry.render_json();
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .header("X-Content-Type-Options", "nosniff")
+                    .header("Cache-Control", "no-store")
+                    .body(Full::new(Bytes::from(json_output)))
+                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+                return Ok(resp);
+            }
+            Ok(ChargebackFormat::Prometheus) => {
+                let prom_output = registry.render_prometheus();
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    .header("X-Content-Type-Options", "nosniff")
+                    .header("Cache-Control", "no-store")
+                    .body(Full::new(Bytes::from(prom_output)))
+                    .unwrap_or_else(|_| {
+                        Response::new(Full::new(Bytes::from("# error rendering charges\n")))
+                    });
+                return Ok(resp);
+            }
+            Err(resp) => return Ok(*resp),
         }
     }
 
@@ -1227,6 +1330,11 @@ pub async fn handle_admin_request(
 
     // Route
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if let Some(required) = tls_route_required_role(&method, segments.as_slice())
+        && let Some(resp) = require_admin_role(&auth, required)
+    {
+        return Ok(resp);
+    }
 
     match (method, segments.as_slice()) {
         // Proxies CRUD
@@ -1438,7 +1546,7 @@ pub async fn handle_admin_request(
             tls_management::handle_list_acme_certificates(&pagination).await
         }
         (Method::POST, ["admin", "tls", "acme", "certificates"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_acme_certificate(&state, &body_bytes).await
@@ -1450,13 +1558,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_acme_certificate(id).await
         }
         (Method::PUT, ["admin", "tls", "acme", "certificates", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_update_acme_certificate(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "acme", "certificates", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_acme_certificate(&state, id).await
@@ -1468,7 +1576,7 @@ pub async fn handle_admin_request(
             tls_management::handle_list_acme_accounts(&pagination).await
         }
         (Method::POST, ["admin", "tls", "acme", "renew", certificate_id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_renew_acme_certificate(&state, certificate_id, &body_bytes).await
@@ -1480,7 +1588,7 @@ pub async fn handle_admin_request(
             tls_management::handle_list_acme_orders(&pagination).await
         }
         (Method::POST, ["admin", "tls", "acme", "orders"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_acme_order(&state, &body_bytes).await
@@ -1492,13 +1600,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_acme_order(id).await
         }
         (Method::POST, ["admin", "tls", "acme", "orders", id, "finalize"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_finalize_acme_order(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "acme", "orders", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_acme_order(&state, id).await
@@ -1511,7 +1619,7 @@ pub async fn handle_admin_request(
                 .await
         }
         (Method::POST, ["admin", "tls", "certificates"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_certificate(&state, &body_bytes).await
@@ -1523,13 +1631,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_managed(ManagedTlsMaterialKind::Certificate, id).await
         }
         (Method::PUT, ["admin", "tls", "certificates", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_update_certificate(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "certificates", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Certificate, id)
@@ -1542,7 +1650,7 @@ pub async fn handle_admin_request(
             tls_management::handle_list_managed(ManagedTlsMaterialKind::CaBundle, &pagination).await
         }
         (Method::POST, ["admin", "tls", "ca-bundles"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_ca_bundle(&state, &body_bytes).await
@@ -1554,13 +1662,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_managed(ManagedTlsMaterialKind::CaBundle, id).await
         }
         (Method::PUT, ["admin", "tls", "ca-bundles", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_update_ca_bundle(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "ca-bundles", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::CaBundle, id)
@@ -1573,7 +1681,7 @@ pub async fn handle_admin_request(
             tls_management::handle_list_managed(ManagedTlsMaterialKind::Crl, &pagination).await
         }
         (Method::POST, ["admin", "tls", "crls"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_crl(&state, &body_bytes).await
@@ -1585,13 +1693,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_managed(ManagedTlsMaterialKind::Crl, id).await
         }
         (Method::PUT, ["admin", "tls", "crls", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_update_crl(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "crls", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Crl, id).await
@@ -1604,7 +1712,7 @@ pub async fn handle_admin_request(
                 .await
         }
         (Method::POST, ["admin", "tls", "ocsp-responses"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_ocsp_response(&state, &body_bytes).await
@@ -1616,13 +1724,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_managed(ManagedTlsMaterialKind::OcspResponse, id).await
         }
         (Method::PUT, ["admin", "tls", "ocsp-responses", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_update_ocsp_response(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "ocsp-responses", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::OcspResponse, id)
@@ -1635,7 +1743,7 @@ pub async fn handle_admin_request(
             tls_management::handle_list_managed(ManagedTlsMaterialKind::Jwks, &pagination).await
         }
         (Method::POST, ["admin", "tls", "jwks"]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_create_jwks(&state, &body_bytes).await
@@ -1647,13 +1755,13 @@ pub async fn handle_admin_request(
             tls_management::handle_get_managed(ManagedTlsMaterialKind::Jwks, id).await
         }
         (Method::PUT, ["admin", "tls", "jwks", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_update_jwks(&state, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "jwks", id]) => {
-            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
             tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Jwks, id).await
@@ -2426,9 +2534,7 @@ async fn persist_consumer_update(
 ) -> Response<Full<Bytes>> {
     consumer.updated_at = Utc::now();
     match db.update_consumer(&consumer).await {
-        Ok(_) if success_status == StatusCode::NO_CONTENT => {
-            json_response(StatusCode::NO_CONTENT, &json!({}))
-        }
+        Ok(_) if success_status == StatusCode::NO_CONTENT => empty_response(StatusCode::NO_CONTENT),
         Ok(_) => {
             let body = crud::consumer_response_body(&consumer);
             json_response(success_status, &body)
@@ -2701,6 +2807,25 @@ async fn persist_payload_resources(
 pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
     &["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
 
+fn normalize_credential_set(cred_value: Value) -> Result<Value, Box<Response<Full<Bytes>>>> {
+    match cred_value {
+        Value::Object(_) => Ok(Value::Array(vec![cred_value])),
+        Value::Array(entries) if entries.is_empty() => Err(Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential set must contain at least one entry"}),
+        ))),
+        Value::Array(entries) if entries.iter().all(Value::is_object) => Ok(Value::Array(entries)),
+        Value::Array(_) => Err(Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential set entries must be JSON objects"}),
+        ))),
+        _ => Err(Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential set must be a JSON object or array of JSON objects"}),
+        ))),
+    }
+}
+
 async fn handle_update_credentials(
     state: &AdminState,
     actor: &AuditActor,
@@ -2726,12 +2851,10 @@ async fn handle_update_credentials(
         Ok(value) => value,
         Err(resp) => return Ok(*resp),
     };
-    if !cred_value.is_array() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Credential set must be an array of JSON objects"}),
-        ));
-    }
+    cred_value = match normalize_credential_set(cred_value) {
+        Ok(value) => value,
+        Err(resp) => return Ok(*resp),
+    };
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
@@ -4293,6 +4416,16 @@ pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Respo
         })
 }
 
+pub(in crate::admin) fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("X-Frame-Options", "DENY")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
 /// JSON response with X-Data-Source: cached header to indicate stale/cached data.
 fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
@@ -4662,6 +4795,146 @@ mod tests {
         assert_eq!(response["pagination"]["offset"], 10);
         assert_eq!(response["pagination"]["limit"], 25);
         assert_eq!(pagination.query_limit_i64(), 25);
+    }
+
+    #[test]
+    fn parse_chargeback_format_requires_exact_format_parameter() {
+        assert_eq!(
+            parse_chargeback_format(Some("xformat=json")).expect("xformat must be ignored"),
+            ChargebackFormat::Prometheus
+        );
+        assert_eq!(
+            parse_chargeback_format(Some("format=json")).expect("json accepted"),
+            ChargebackFormat::Json
+        );
+        assert!(
+            parse_chargeback_format(Some("format=jsonish")).is_err(),
+            "unsupported format values must be rejected"
+        );
+    }
+
+    #[test]
+    fn normalize_credential_set_accepts_object_or_object_array() {
+        assert_eq!(
+            normalize_credential_set(json!({"key": "one"})).unwrap(),
+            json!([{"key": "one"}])
+        );
+        assert_eq!(
+            normalize_credential_set(json!([{"key": "one"}, {"key": "two"}])).unwrap(),
+            json!([{"key": "one"}, {"key": "two"}])
+        );
+        assert!(normalize_credential_set(json!([])).is_err());
+        assert!(normalize_credential_set(json!(["not-object"])).is_err());
+        assert!(normalize_credential_set(json!("not-object")).is_err());
+    }
+
+    #[test]
+    fn tls_route_required_role_preserves_tls_security_boundary() {
+        let operator_allowed = [
+            (Method::GET, vec!["admin", "tls", "inventory"]),
+            (Method::GET, vec!["admin", "tls", "events"]),
+            (Method::GET, vec!["admin", "tls", "certificates"]),
+            (
+                Method::GET,
+                vec!["admin", "tls", "certificates", "edge-cert"],
+            ),
+            (Method::POST, vec!["admin", "tls", "validate"]),
+            (Method::POST, vec!["admin", "tls", "rotate", "backend_tls"]),
+        ];
+        for (method, route) in operator_allowed {
+            assert_eq!(
+                tls_route_required_role(&method, &route),
+                Some(AdminRole::Operator),
+                "{method} /{} should allow operator role",
+                route.join("/")
+            );
+        }
+
+        let admin_only = [
+            (Method::POST, vec!["admin", "tls", "certificates"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "certificates", "edge-cert"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "certificates", "edge-cert"],
+            ),
+            (Method::POST, vec!["admin", "tls", "ca-bundles"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "ca-bundles", "internal-ca"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "ca-bundles", "internal-ca"],
+            ),
+            (Method::POST, vec!["admin", "tls", "crls"]),
+            (Method::PUT, vec!["admin", "tls", "crls", "edge-crl"]),
+            (Method::DELETE, vec!["admin", "tls", "crls", "edge-crl"]),
+            (Method::POST, vec!["admin", "tls", "ocsp-responses"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "ocsp-responses", "edge-ocsp"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "ocsp-responses", "edge-ocsp"],
+            ),
+            (Method::POST, vec!["admin", "tls", "jwks"]),
+            (Method::PUT, vec!["admin", "tls", "jwks", "edge-jwks"]),
+            (Method::DELETE, vec!["admin", "tls", "jwks", "edge-jwks"]),
+            (Method::POST, vec!["admin", "tls", "acme", "certificates"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "acme", "certificates", "edge-cert"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "acme", "certificates", "edge-cert"],
+            ),
+            (Method::POST, vec!["admin", "tls", "acme", "orders"]),
+            (
+                Method::POST,
+                vec!["admin", "tls", "acme", "orders", "edge-order", "finalize"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "acme", "orders", "edge-order"],
+            ),
+            (
+                Method::POST,
+                vec!["admin", "tls", "acme", "renew", "edge-cert"],
+            ),
+        ];
+        let operator = AuditActor {
+            sub: "operator".to_string(),
+            role: AdminRole::Operator,
+        };
+        let admin = AuditActor {
+            sub: "admin".to_string(),
+            role: AdminRole::Admin,
+        };
+        for (method, route) in admin_only {
+            let required = tls_route_required_role(&method, &route);
+            assert_eq!(
+                required,
+                Some(AdminRole::Admin),
+                "{method} /{} should require admin role",
+                route.join("/")
+            );
+            assert_eq!(
+                require_admin_role(&operator, required.unwrap()).map(|response| response.status()),
+                Some(StatusCode::FORBIDDEN),
+                "operator must be forbidden for {method} /{}",
+                route.join("/")
+            );
+            assert!(
+                require_admin_role(&admin, required.unwrap()).is_none(),
+                "admin must pass the role gate for {method} /{}",
+                route.join("/")
+            );
+        }
     }
 
     #[test]

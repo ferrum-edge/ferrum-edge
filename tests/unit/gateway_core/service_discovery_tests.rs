@@ -5,8 +5,8 @@ use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    AppProtocol, EastWestGateway, MeshConfig, MeshService, MultiClusterConfig, ServicePort,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -1973,24 +1973,237 @@ async fn mesh_sd_ambient_topology_never_stamps_mtls_authority_tags() {
     );
 }
 
-#[tokio::test]
-async fn mesh_sd_sidecar_topology_skips_remote_workloads_fail_closed() {
-    // Cross-cluster Sidecar dispatch requires east-west GATEWAY targets
-    // (`mesh.cross_cluster` + `mesh.eastwest_sni`), which the SD bridge does
-    // not materialize yet — a direct `remote-pod:15006` dial with a pinned pod
-    // SPIFFE would fail in any multi-network mesh while looking routable, so
-    // remote-provenance workloads are skipped fail-closed on the sidecar path.
-    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
-    let remote_id = "spiffe://cluster.local/ns/ferrum/sa/api-remote";
-    let mut remote = mesh_workload(remote_id, "api", "10.9.0.1", 8080);
+/// Remote-provenance workload in the `west-network` / `west.local` remote
+/// cluster, ref'd by the service alongside the local workload.
+fn mesh_remote_west_workload(remote_id: &str, port: u16) -> Workload {
+    let mut remote = mesh_workload(remote_id, "api", "10.9.0.1", port);
     remote.remote_provenance = true;
+    remote.network = Some("west-network".to_string());
+    remote.trust_domain = TrustDomain::new("west.local").expect("trust domain");
+    remote.locality = Some("west-region/west-zone".to_string());
+    remote
+}
+
+/// `MultiClusterConfig` whose east-west gateway fronts `west-network` for the
+/// `west.local` trust domain and claims the `api` service FQDN.
+fn mesh_west_multi_cluster() -> MultiClusterConfig {
+    MultiClusterConfig {
+        east_west_gateways: vec![EastWestGateway {
+            name: "west-ew".to_string(),
+            namespace: "istio-system".to_string(),
+            host: "west-gw.example.com".to_string(),
+            port: 15443,
+            sni_hosts: vec!["api.ferrum.svc.cluster.local".to_string()],
+            trust_domain: Some(TrustDomain::new("west.local").expect("trust domain")),
+            network: Some("west-network".to_string()),
+        }],
+        ..MultiClusterConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_topology_bridges_remote_workloads_via_east_west_gateway() {
+    // Sidecar remote workloads must NEVER be published as direct
+    // `remote-pod:15006` dials (unreachable in a multi-network mesh). With
+    // `mesh.multi_cluster` carrying a matching east-west gateway, the SD
+    // bridge emits ONE gateway failover target per (network, trust_domain)
+    // group — the same shape mesh-mode egress materializes via the shared
+    // `append_cross_cluster_mesh_targets` core — appended after the locals.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
     let mut svc = mesh_service("api", api_id, 8080);
     svc.workloads.push(WorkloadRef {
         spiffe_id: mesh_spiffe(remote_id),
     });
     let mesh = MeshConfig {
         services: vec![svc],
-        workloads: vec![mesh_workload(api_id, "api", "10.0.0.1", 8080), remote],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "one local target plus ONE east-west gateway target (never a direct remote-pod dial)"
+    );
+
+    // Local target first (unchanged by the bridge): direct pod dial with the
+    // pinned pod SPIFFE.
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 8080);
+    assert_eq!(
+        targets[0].tags.get("mesh.spiffe_id").map(String::as_str),
+        Some(api_id)
+    );
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+
+    // Gateway failover target: identity = the gateway DIAL endpoint.
+    let gateway = &targets[1];
+    assert_eq!(gateway.host, "west-gw.example.com");
+    assert_eq!(gateway.port, 15443);
+    assert_eq!(
+        gateway.service_port_policy_key,
+        Some(8080),
+        "DR policy stays keyed by the declared SERVICE port, not the gateway port"
+    );
+    assert_eq!(
+        gateway.locality.as_deref(),
+        Some("west-region/west-zone"),
+        "remote-tier locality so locality-LB ranks the gateway after locals"
+    );
+    let tags = &gateway.tags;
+    assert_eq!(
+        tags.get("mesh.cross_cluster").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        tags.get("mesh.eastwest_sni").map(String::as_str),
+        Some("api.ferrum.svc.cluster.local"),
+        "SNI the remote east-west gateway passthrough routes on"
+    );
+    assert_eq!(
+        tags.get("mesh.mtls_port").map(String::as_str),
+        Some("15443"),
+        "dial port is the east-west gateway port, not :15006"
+    );
+    assert_eq!(tags.get("mesh.mtls").map(String::as_str), Some("true"));
+    assert_eq!(
+        tags.get("mesh.remote").map(String::as_str),
+        Some("true"),
+        "gateway targets are remote provenance for strict local-first LB"
+    );
+    assert!(
+        !tags.contains_key("mesh.spiffe_id"),
+        "no pod pinning across the SNI-passthrough gateway (trust-domain-only verification)"
+    );
+    assert_eq!(
+        tags.get("mesh.trust_domain").map(String::as_str),
+        Some("west.local"),
+        "verification is scoped to the REMOTE trust domain"
+    );
+    assert_eq!(
+        tags.get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("api.ferrum.svc"),
+        "SD-bridge gateway targets carry the destination service authority host — the \
+         gateway's client Host is a public hostname the destination sidecar would 404"
+    );
+    assert!(
+        !tags.contains_key(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+        "cross-cluster never stamps the :authority rewrite port (destination \
+         disambiguates captured traffic by orig-dst)"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_bridges_service_name_matched_remote_workloads_without_refs() {
+    // A MeshService with NO `workloads` refs matches workloads by
+    // `workload.service_name` (the supported mesh-SD shape pinned by the
+    // inline `service_without_workload_refs_matches_service_name` test). The
+    // east-west bridge must honor those SAME matching semantics: a
+    // remote-provenance sidecar workload matched only by service_name still
+    // yields the gateway failover target. (Codex round 1: the bridge
+    // previously re-matched through the materializer's ref-only matcher,
+    // which sees an empty ref list and silently bridged nothing.)
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.clear(); // no refs — service_name fallback matching only
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "service_name-matched shape bridges like the ref'd shape: one local \
+         target plus ONE east-west gateway target"
+    );
+
+    // Local half of the no-refs shape is unchanged by the bridge.
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 8080);
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+
+    // Gateway failover target — same shape the ref-based bridge test pins.
+    let gateway = &targets[1];
+    assert_eq!(gateway.host, "west-gw.example.com");
+    assert_eq!(gateway.port, 15443);
+    assert_eq!(gateway.service_port_policy_key, Some(8080));
+    let tags = &gateway.tags;
+    assert_eq!(
+        tags.get("mesh.cross_cluster").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        tags.get("mesh.eastwest_sni").map(String::as_str),
+        Some("api.ferrum.svc.cluster.local")
+    );
+    assert_eq!(
+        tags.get("mesh.mtls_port").map(String::as_str),
+        Some("15443")
+    );
+    assert_eq!(tags.get("mesh.mtls").map(String::as_str), Some("true"));
+    assert_eq!(tags.get("mesh.remote").map(String::as_str), Some("true"));
+    assert!(
+        !tags.contains_key("mesh.spiffe_id"),
+        "no pod pinning across the SNI-passthrough gateway"
+    );
+    assert_eq!(
+        tags.get("mesh.trust_domain").map(String::as_str),
+        Some("west.local")
+    );
+    assert_eq!(
+        tags.get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("api.ferrum.svc")
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_remote_workloads_without_matching_gateway_skip_fail_closed() {
+    // A remote group whose network has no east-west gateway (and no catch-all)
+    // must be skipped fail-closed by the shared core: never a direct
+    // remote-pod dial, never a dial to an unresolved gateway address.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut multi_cluster = mesh_west_multi_cluster();
+    // The only gateway fronts a DIFFERENT network; per the shared core's
+    // fail-closed selection there is no catch-all fall-through.
+    multi_cluster.east_west_gateways[0].network = Some("east-network".to_string());
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(multi_cluster),
         ..MeshConfig::default()
     };
 
@@ -2002,9 +2215,68 @@ async fn mesh_sd_sidecar_topology_skips_remote_workloads_fail_closed() {
     assert_eq!(
         targets.len(),
         1,
-        "the remote-provenance workload must be skipped on the sidecar SD path"
+        "no gateway target without a matching east-west gateway (fail closed)"
     );
     assert_eq!(targets[0].host, "10.0.0.1");
+}
+
+#[tokio::test]
+async fn mesh_sd_sidecar_remote_workloads_on_non_first_port_skip_fail_closed() {
+    // The east-west model routes a service-FQDN SNI to only the FIRST declared
+    // service port on the destination gateway (SNI carries no port). An
+    // upstream that selected a NON-first port cannot be bridged — the gateway
+    // would forward its SNI to the first port's backend, silently misrouting —
+    // so remote workloads stay skipped fail-closed for that upstream.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service_with_ports(
+        api_id,
+        vec![
+            http_service_port(80, "http"),
+            http_service_port(81, "admin"),
+        ],
+    );
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut remote = mesh_remote_west_workload(remote_id, 80);
+    remote.ports = vec![
+        WorkloadPort {
+            port: 80,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        },
+        WorkloadPort {
+            port: 81,
+            protocol: AppProtocol::Http,
+            name: Some("admin".to_string()),
+        },
+    ];
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].sni_hosts.clear(); // wildcard gateway
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload_with_ports(api_id, "10.0.0.1", vec![80, 81]),
+            remote,
+        ],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, Some(81), MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "a non-first selected port must not emit a cross-cluster gateway target"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 81);
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
 }
 
 #[tokio::test]

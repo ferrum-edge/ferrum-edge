@@ -41,14 +41,22 @@ semantics pinned by the `mesh_spiffe_identity` conformance module (SPIFFE ID
 parse + Istio `ns/sa` convention, URI-SAN SVID extraction, the inbound
 peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
 backend selection), live-gated by the required `sidecar.spire.workload_entries`
-and `sidecar.peer_auth.strict_mtls_authenticated` assertions. The remaining
-Stable row outside the sidecar traffic surface — native `MeshSubscribe` config
-transport — enrolls next, but it first needs a live signal: the
-`mesh-e2e-sidecar` fixture delivers mesh config via
-`FERRUM_MESH_CONFIG_PROTOCOL=file` ConfigMaps and deploys no Ferrum CP, so no
-suite today can honestly back a `MeshSubscribe` live assertion.
-`coverage.md` lists the currently enrolled rows and required live assertion
-IDs, which are the authoritative answer to "what regression fails CI today."
+and `sidecar.peer_auth.strict_mtls_authenticated` assertions. **Native
+`MeshSubscribe` config transport is now enrolled as well**
+(`mesh.config_transport.native_subscribe`, issue #2002): semantics pinned by
+the `mesh_config_transport` conformance module (the namespace-scoped
+`MeshSlice` snapshot build MeshSubscribe serves from, `content_eq`
+update dedupe that ignores the transport version stamp, and the DP-side
+slice apply that fails closed on malformed payloads), live-gated by the
+required `sidecar.config.native_subscribe_delivered` assertion — the
+`mesh-e2e-sidecar` fixture now deploys a Ferrum CP (`cp` mode, sqlite, K8s
+pod discovery building the mesh model from the cluster's real Services and
+pods) and a sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` whose captured
+inbound datapath only serves traffic if the CP-delivered slice materialized,
+with the DP's `GET /mesh/config-drift` attributing the slice to the native
+transport. `coverage.md` lists the currently enrolled rows and required live
+assertion IDs, which are the authoritative answer to "what regression fails
+CI today."
 
 ## Current headline state
 
@@ -56,13 +64,15 @@ IDs, which are the authoritative answer to "what regression fails CI today."
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
   + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
   `DestinationRule` LB/timeout/outlier. Semantics are pinned, and the sidecar
-  traffic surface is now **live-verified and blocking**: the `mesh-e2e-sidecar`
-  kind+SPIRE suite drives the real captured datapath (STRICT mTLS positive +
-  plaintext-rejected negative, destination-side authz 403, JWT
-  valid/missing/invalid, DR connectTimeout two-phase timing, DR
-  maxConnections=1 WebSocket hold/reject/release) on every relevant PR and
-  every main push, the artifact is contract-validated, and both the required
-  CI aggregate and `release.yml` gate on it.
+  traffic surface **and the native config transport** are now **live-verified
+  and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
+  captured datapath (STRICT mTLS positive + plaintext-rejected negative,
+  destination-side authz 403, JWT valid/missing/invalid, DR connectTimeout
+  two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
+  CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config end to
+  end) on every relevant PR and every main push, the artifact is
+  contract-validated, and both the required CI aggregate and `release.yml`
+  gate on it.
   An identity-less mesh — no file-based gateway SVID material **and** no CA
   backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) supplying a runtime SVID — **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
   unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
