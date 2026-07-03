@@ -5,8 +5,8 @@ progress, and what is an explicit non-goal. It is intentionally short. The
 detailed per-capability tables live in [`docs/mesh.md` → Maturity and Support
 Status](mesh.md#maturity-and-support-status); the per-protocol × per-transport
 answer (which protocol rides which mesh transport, same-cluster / cross-cluster /
-SD bridge) is [`docs/mesh.md` → Protocol × Topology Support
-Matrix](mesh.md#protocol--topology-support-matrix); the live, auto-generated
+SD bridge) is [`docs/mesh.md` → Protocol x Topology Support
+Matrix](mesh.md#protocol-x-topology-support-matrix); the live, auto-generated
 coverage matrix is emitted by the conformance suite to
 `target/conformance/coverage.md` (and `coverage.json`).
 

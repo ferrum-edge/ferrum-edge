@@ -33,7 +33,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 - [Multi-Cluster](#multi-cluster)
   - [Trust Federation](#trust-federation)
   - [Cross-Cluster Endpoint Discovery](#cross-cluster-endpoint-discovery)
-- [Protocol × Topology Support Matrix](#protocol--topology-support-matrix)
+- [Protocol x Topology Support Matrix](#protocol-x-topology-support-matrix)
 - [Egress Gateway](#egress-gateway)
 - [Sidecar Egress Scoping](#sidecar-egress-scoping)
 - [Config Drift Introspection](#config-drift-introspection)
@@ -1137,7 +1137,7 @@ Merge rules: exact duplicate workload endpoints are skipped, but workloads with 
 
 **Live-verification status:** the aggregation + failover path is covered by tests with a mockable remote source, and the production `MeshSubscribe` gRPC dialer is covered by an **in-process two-CP round trip** — tests stand up a real `MeshSubscribe` gRPC server on a loopback port and drive the production dialer against it (channel dial, DP↔CP JWT mint + server-side verification, heartbeat skipping, slice decode, endpoint extraction, and a full discovery-loop install). The remaining live-verification step is a **true cross-cluster deployment** (two mesh control planes on separate networks) exercising the dialer under real network churn / loss / latency.
 
-## Protocol × Topology Support Matrix
+## Protocol x Topology Support Matrix
 
 One table answering "does protocol X ride mesh transport Y?" across the two same-cluster topology transports, the two client-side cross-cluster east-west paths, and the gateway-to-mesh service-discovery bridge. Statuses use this document's own failure-mode language; each cell is anchored to the authoritative section via the numbered notes below. **NodeWaypoint is deliberately out of scope for this table** — it is **Experimental** with its own sections ([Node Waypoint](#node-waypoint), [Node Agent Mode](#node-agent-mode)); its UDP/DTLS limits (mesh-wide UDP/DTLS policy only, per-pod UDP/DTLS authorization scoping architecturally out of scope) are pinned in [docs/mesh_supported_matrix.md](mesh_supported_matrix.md) and in the NodeWaypoint UDP/DTLS limitation above.
 
