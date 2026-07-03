@@ -1081,3 +1081,180 @@ fn grpc_request_body_too_large_backend_response_is_trailers_only_resource_exhaus
         _ => panic!("expected a buffered (empty, trailers-only) refusal body"),
     }
 }
+
+// ── gRPC mesh fall-through classifier (issue #2003 codex r2 finding 1) ──────
+//
+// Only PASS-THROUGH gRPC-Web may fall through the gRPC branch onto a
+// refuse-classified mesh transport: gRPC-Web the `grpc_web` plugin TRANSLATED
+// is wire-native gRPC by dispatch time, so riding the HBONE HTTP/1.1 inner
+// tunnel (or the cross-cluster paths) would silently drop its trailers — it
+// must fail closed inside the branch exactly like native gRPC.
+
+#[test]
+fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transports() {
+    use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
+    for refused in [
+        GrpcMeshDispatch::RefuseHbone,
+        GrpcMeshDispatch::RefuseCrossCluster,
+    ] {
+        // Pass-through gRPC-Web (no native content-type, no translation
+        // marker): body-framed trailers ride the HTTP-family transport.
+        assert!(
+            grpc_mesh_dispatch_falls_through(refused, false, false),
+            "pass-through gRPC-Web must keep riding {refused:?} like plain HTTP"
+        );
+        // Native gRPC: refuse in-branch (Trailers-Only UNAVAILABLE).
+        assert!(
+            !grpc_mesh_dispatch_falls_through(refused, true, false),
+            "native gRPC must fail closed for {refused:?}"
+        );
+        // Translated gRPC-Web: outbound is wire-native gRPC — refuse
+        // in-branch, never tunnel it as trailerless native gRPC.
+        assert!(
+            !grpc_mesh_dispatch_falls_through(refused, false, true),
+            "grpc_web-translated requests must fail closed for {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn grpc_mesh_fall_through_mesh_mtls_carries_every_flavor_and_direct_none() {
+    use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
+    // Same-cluster Sidecar mesh-mTLS carries native gRPC (streaming trailer
+    // relay) AND translated gRPC-Web (buffered trailer re-encode) down the
+    // generic mesh path.
+    for (native_ct, translated) in [(true, false), (false, true), (false, false)] {
+        assert!(
+            grpc_mesh_dispatch_falls_through(GrpcMeshDispatch::MeshMtls, native_ct, translated),
+            "MeshMtls must fall through for native_ct={native_ct} translated={translated}"
+        );
+        assert!(
+            !grpc_mesh_dispatch_falls_through(GrpcMeshDispatch::Direct, native_ct, translated),
+            "Direct targets stay on the direct gRPC pool"
+        );
+    }
+}
+
+// ── Streaming gRPC response timeout regime (codex r2 finding 6) ─────────────
+//
+// `grpc_streaming_response_deadline` is shared by the direct gRPC pool's
+// streaming arm and the mesh-mTLS StreamingH2 relay: a client `grpc-timeout`
+// becomes an ABSOLUTE deadline anchored at request receipt with the per-frame
+// idle guard disabled; without one the operator read timeout applies per
+// frame.
+
+#[test]
+fn grpc_streaming_response_deadline_client_budget_is_absolute_and_disables_per_frame() {
+    use std::time::Duration;
+    let before = tokio::time::Instant::now();
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
+        Some(5_000),
+        Duration::from_millis(1_000),
+        30_000,
+    );
+    assert_eq!(
+        per_frame_ms, 0,
+        "a client deadline replaces the per-frame idle regime"
+    );
+    let deadline = deadline.expect("a sane client budget must arm a deadline");
+    let remaining = deadline.saturating_duration_since(before);
+    // 5s budget minus 1s already elapsed => ~4s remaining. Small slack for
+    // the helper's own `Instant::now()` anchor being taken after `before`.
+    assert!(
+        remaining <= Duration::from_millis(4_100),
+        "deadline must subtract the elapsed request time: {remaining:?}"
+    );
+    assert!(
+        remaining >= Duration::from_millis(3_500),
+        "deadline must preserve the remaining client budget: {remaining:?}"
+    );
+}
+
+#[test]
+fn grpc_streaming_response_deadline_exhausted_budget_is_immediate_not_negative() {
+    use std::time::Duration;
+    // Elapsed time exceeding the budget saturates to zero remaining — the
+    // deadline is "now" (fires on first poll), never a panic or underflow.
+    let before = tokio::time::Instant::now();
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(Some(100), Duration::from_secs(60), 30_000);
+    assert_eq!(per_frame_ms, 0);
+    let deadline = deadline.expect("an exhausted budget still arms a deadline");
+    assert!(
+        deadline.saturating_duration_since(before) <= Duration::from_millis(50),
+        "an exhausted budget must produce an already-due deadline"
+    );
+}
+
+#[test]
+fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 30_000);
+    assert_eq!(
+        per_frame_ms, 30_000,
+        "without a client deadline the operator read timeout applies per frame"
+    );
+    assert!(deadline.is_none());
+    // 0 + None (no client deadline, no operator fallback) = unbounded, for
+    // long-lived server/bidi streams that legitimately idle.
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 0);
+    assert_eq!(per_frame_ms, 0);
+    assert!(deadline.is_none());
+}
+
+#[test]
+fn grpc_streaming_response_deadline_pathological_budget_is_unbounded_not_panic() {
+    // A multi-year client grpc-timeout must NEVER panic the proxy path
+    // (`checked_add`, not `+`). Whether the platform's `Instant` range
+    // absorbs ~584M years is platform-dependent: `None` = degraded to
+    // unbounded; `Some` must be so far in the future it is functionally
+    // unbounded.
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
+        Some(u64::MAX),
+        std::time::Duration::ZERO,
+        30_000,
+    );
+    assert_eq!(per_frame_ms, 0);
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > std::time::Duration::from_secs(365 * 24 * 60 * 60),
+            "a non-overflowing pathological budget must still be functionally unbounded: {remaining:?}"
+        );
+    }
+}
+
+// ── Mesh gRPC limit ordering (codex r2 finding 4) ───────────────────────────
+//
+// The dispatch-branch declared-Content-Length check must select the gRPC
+// receive limit for gRPC-flavored requests BEFORE the generic HTTP check can
+// fire, in BOTH orderings of the two knobs — the direct gRPC pool never
+// applies `max_request_body_size_bytes` to a gRPC body.
+
+#[test]
+fn mesh_request_body_limit_grpc_flavor_wins_in_both_knob_orderings() {
+    let two_mib = 2 * 1024 * 1024;
+    let six_mib = 6 * 1024 * 1024;
+
+    // HTTP limit (1 MiB) < gRPC limit (4 MiB): a 2 MiB gRPC body is IN
+    // budget — the generic 413 must not fire early with the smaller limit.
+    let http_limit = 1024 * 1024;
+    let grpc_limit = 4 * 1024 * 1024;
+    let selected = grpc_proxy::mesh_request_body_limit(true, http_limit, grpc_limit);
+    assert_eq!(selected, grpc_limit);
+    assert!(two_mib <= selected, "in-budget gRPC body must be admitted");
+    assert!(six_mib > selected, "over-budget gRPC body must be rejected");
+
+    // gRPC limit (4 MiB) < HTTP limit (10 MiB): a 6 MiB gRPC body must trip
+    // the gRPC limit even though the HTTP limit would admit it.
+    let http_limit = 10 * 1024 * 1024;
+    let selected = grpc_proxy::mesh_request_body_limit(true, http_limit, grpc_limit);
+    assert_eq!(selected, grpc_limit);
+    assert!(six_mib > selected);
+    // Plain HTTP keeps the general limit in both orderings.
+    assert_eq!(
+        grpc_proxy::mesh_request_body_limit(false, http_limit, grpc_limit),
+        http_limit
+    );
+}

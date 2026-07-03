@@ -14156,25 +14156,40 @@ async fn handle_proxy_request_inner(
     //     semantics as `GrpcConnectionPool`. When that path cannot dispatch
     //     (retry configured, body buffering required, no gateway SVID) the
     //     mesh-mTLS gate below fails closed with a gRPC UNAVAILABLE.
-    //   * NATIVE-gRPC requests to Ambient `mesh.hbone` and cross-cluster
-    //     targets FAIL CLOSED inside this branch (see
-    //     `classify_grpc_mesh_dispatch`), never direct-dial.
-    //   * gRPC-Web (protocol-classified gRPC for plugin routing, but NOT the
-    //     native `application/grpc` content-type) frames its trailers inside
+    //   * NATIVE-gRPC requests (and gRPC-Web the `grpc_web` plugin
+    //     TRANSLATED — wire-native gRPC by dispatch time) to Ambient
+    //     `mesh.hbone` and cross-cluster targets FAIL CLOSED inside this
+    //     branch (see `grpc_mesh_dispatch_falls_through`), never direct-dial.
+    //   * PASS-THROUGH gRPC-Web (protocol-classified gRPC for plugin routing,
+    //     but NOT the native `application/grpc` content-type, and NOT
+    //     translated by the `grpc_web` plugin) frames its trailers inside
     //     the response BODY, so it needs no HTTP/2 trailer relay: it falls
     //     through for EVERY mesh-tagged target and rides the topology's
     //     HTTP-family transport like plain HTTP (including HBONE and the
     //     cross-cluster east-west paths). Non-mesh gRPC-Web keeps its
     //     existing direct gRPC-pool dispatch unchanged.
+    //   * TRANSLATED gRPC-Web (codex r2-2 finding 1): the `grpc_web` plugin
+    //     rewrote the outbound request to wire-native gRPC in `before_proxy`,
+    //     so the ORIGINAL content-type check alone would let it ride the
+    //     HBONE HTTP/1.1 inner tunnel (or the cross-cluster paths) as native
+    //     gRPC — the exact no-trailer corruption the refusal prevents. It is
+    //     detected via the plugin's spoof-proof context marker and FAILS
+    //     CLOSED inside this branch like native gRPC (the Trailers-Only
+    //     refusal is also what the direct path returns a translated request
+    //     on a terminal gRPC-dispatch error — `build_grpc_error_response`
+    //     with `grpc-status` in the response HEADERS, which gRPC-Web clients
+    //     accept as a Trailers-Only response). `MeshMtls` still falls
+    //     through: the mesh-mTLS buffered arm re-encodes translated trailers.
+    let grpc_request_is_web_translated =
+        crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
     let grpc_mesh_fall_through = is_grpc_request
         && proxy.dispatch_kind.is_http_family()
         && upstream_target.as_deref().is_some_and(|target| {
-            match grpc_proxy::classify_grpc_mesh_dispatch(target) {
-                grpc_proxy::GrpcMeshDispatch::Direct => false,
-                grpc_proxy::GrpcMeshDispatch::MeshMtls => true,
-                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster
-                | grpc_proxy::GrpcMeshDispatch::RefuseHbone => !request_uses_grpc_content_type,
-            }
+            grpc_proxy::grpc_mesh_dispatch_falls_through(
+                grpc_proxy::classify_grpc_mesh_dispatch(target),
+                request_uses_grpc_content_type,
+                grpc_request_is_web_translated,
+            )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
@@ -15536,31 +15551,19 @@ async fn handle_proxy_request_inner(
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
-                // gRPC streaming body deadline (issue #1649). A client
-                // `grpc-timeout` is an end-to-end RPC deadline, so honor it as an
+                // gRPC streaming body deadline (issue #1649): a client
+                // `grpc-timeout` is an end-to-end RPC deadline, honored as an
                 // ABSOLUTE deadline (`grpc_total_deadline`) anchored at request
-                // receipt (`start_time`) plus the client budget: a backend that
-                // sends headers just before the deadline then trickles body
-                // frames is still cut at the client's deadline, instead of
-                // treating `grpc-timeout` as a per-frame idle interval the
-                // backend can reset forever. When the client set NO deadline,
-                // fall back to `backend_read_timeout_ms` as a PER-FRAME idle
-                // timeout (`grpc_read_timeout_ms`) so a stalled backend still
-                // cannot pin the streaming guards. `0` + `None` (no client
-                // deadline, no operator fallback) leaves long-lived server/bidi
-                // streams that legitimately idle between messages unbounded. A
-                // pathologically large client deadline that overflows Tokio's
-                // `Instant` range yields `None` and is treated as unbounded
-                // rather than panicking the proxy path.
+                // receipt (`start_time`); without one, `response_read_timeout_ms`
+                // applies per frame. See `grpc_streaming_response_deadline` —
+                // shared with the mesh-mTLS `StreamingH2` relay so the two
+                // regimes cannot drift.
                 let (grpc_read_timeout_ms, grpc_total_deadline) =
-                    match grpc_streaming.client_grpc_deadline_ms {
-                        Some(budget_ms) => {
-                            let remaining = std::time::Duration::from_millis(budget_ms)
-                                .saturating_sub(start_time.elapsed());
-                            (0u64, tokio::time::Instant::now().checked_add(remaining))
-                        }
-                        None => (grpc_streaming.response_read_timeout_ms, None),
-                    };
+                    grpc_proxy::grpc_streaming_response_deadline(
+                        grpc_streaming.client_grpc_deadline_ms,
+                        start_time.elapsed(),
+                        grpc_streaming.response_read_timeout_ms,
+                    );
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
@@ -16531,11 +16534,33 @@ async fn handle_proxy_request_inner(
     }
     let mut current_dispatch_h3 = !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    // Client end-to-end gRPC deadline for a native-gRPC request riding the
+    // generic path (the mesh-mTLS relay; codex r2-2 finding 6). Parsed from
+    // the POST-PLUGIN outbound headers — the same view
+    // `proxy_grpc_request_streaming` parses after its proxy-header merge, so
+    // `before_proxy` plugins that add/replace/remove `grpc-timeout` are
+    // reflected. Captured HERE (pre-dispatch) because `proxy_headers` borrows
+    // `ctx.headers` and cannot outlive the `&mut ctx` plugin hooks below; the
+    // `StreamingH2` response arm anchors the absolute deadline at request
+    // receipt via `grpc_streaming_response_deadline`, exactly like the direct
+    // gRPC pool's streaming arm.
+    let grpc_client_deadline_ms = if request_uses_grpc_content_type {
+        proxy_headers
+            .get("grpc-timeout")
+            .and_then(|v| grpc_proxy::parse_grpc_timeout_value(v))
+    } else {
+        None
+    };
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
-    let mut hbone_request_body_exceeded = None;
+    // Mesh-transport (HBONE and mesh-mTLS) client-upload overflow flag,
+    // returned by `proxy_to_backend` for streaming dispatches and threaded
+    // into the deferred admission/dispatch outcomes below so a late upload
+    // overflow records neutral `RequestBodyTooLarge` instead of a backend
+    // failure (codex r2-2 finding 5 extended it beyond HBONE).
+    let mut mesh_request_body_exceeded = None;
     let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -16606,6 +16631,11 @@ async fn handle_proxy_request_inner(
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
+                // Codex r2-2 finding 3: gRPC-flavored requests on the generic
+                // path (mesh fall-through) keep the gRPC rejection shape — the
+                // direct gRPC branch passes `true` unconditionally to
+                // `normalize_reject_response`, which renders a Trailers-Only
+                // gRPC reject instead of HTTP/JSON.
                 return Ok(handle_backend_admission_rejection(
                     rejection,
                     &plugins,
@@ -16614,7 +16644,7 @@ async fn handle_proxy_request_inner(
                     start_time,
                     plugin_execution_ns,
                     Some(&original_request_path),
-                    false,
+                    is_grpc_request,
                 )
                 .await);
             }
@@ -16747,6 +16777,8 @@ async fn handle_proxy_request_inner(
                         current_cb_target_key.as_deref(),
                         cb_retry_probe_slot_available,
                     );
+                    // Codex r2-2 finding 3: keep the gRPC rejection shape for
+                    // gRPC-flavored requests (see the initial-dispatch arm).
                     return Ok(handle_backend_admission_rejection(
                         rejection,
                         &plugins,
@@ -16755,7 +16787,7 @@ async fn handle_proxy_request_inner(
                         start_time,
                         plugin_execution_ns,
                         Some(&original_request_path),
-                        false,
+                        is_grpc_request,
                     )
                     .await);
                 }
@@ -16886,7 +16918,7 @@ async fn handle_proxy_request_inner(
                 ..
             } => {
                 backend_admission_permits = permits;
-                hbone_request_body_exceeded = request_body_exceeded;
+                mesh_request_body_exceeded = request_body_exceeded;
                 response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -16896,6 +16928,8 @@ async fn handle_proxy_request_inner(
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
+                // Codex r2-2 finding 3: keep the gRPC rejection shape for
+                // gRPC-flavored requests (see the initial-dispatch arm).
                 return Ok(handle_backend_admission_rejection(
                     rejection,
                     &plugins,
@@ -16904,7 +16938,7 @@ async fn handle_proxy_request_inner(
                     start_time,
                     plugin_execution_ns,
                     Some(&original_request_path),
-                    false,
+                    is_grpc_request,
                 )
                 .await);
             }
@@ -16960,8 +16994,9 @@ async fn handle_proxy_request_inner(
     // *outcome* is deferred — so a long-lived stream never pins the slot, and the
     // deferred record runs as a non-probe (`is_half_open_probe = false`).
     //
-    // HBONE (`current_dispatch_hbone`) flows through the same `StreamingH2` arm.
-    // It can also carry a request-body size limit, so thread the HBONE upload
+    // HBONE (`current_dispatch_hbone`) and mesh-mTLS
+    // (`current_dispatch_mesh_mtls`) flow through the same `StreamingH2` arm.
+    // Both carry a request-body size limit, so thread the mesh upload
     // overflow flag into the deferred dispatch outcome. That lets genuine
     // streamable-status-then-stall/reset response-body failures trip backend
     // health while a late client-upload overflow remains neutral instead of being
@@ -17032,7 +17067,24 @@ async fn handle_proxy_request_inner(
     // response status is deliberately NOT rewritten.
     let streaming_h2_native_grpc =
         request_uses_grpc_content_type && matches!(&response_body, ResponseBody::StreamingH2(_));
-    let recorded_backend_status = if streaming_h2_native_grpc {
+    // Codex r2-2 finding 2: the BUFFERED arm needs the same seeding. A
+    // gRPC-flavored buffered response on this path is the mesh-mTLS
+    // translated-gRPC-Web arm, whose backend H2 trailers were already folded
+    // into `response_headers` (`collect_buffered_grpc_trailers` +
+    // `build_grpc_plugin_header_view` in `proxy_to_backend_mesh_mtls`) — so a
+    // 200 + trailer `grpc-status: 14` must map to the 503 the direct pool's
+    // buffered arm records (`grpc_admission_status_from_maps` over
+    // headers+trailers feeding `record_grpc_backend_dispatch_outcome` and the
+    // admission permits), not bank a healthy success. Pass-through gRPC-Web
+    // keeps its trailers inside the BODY, so the map lookup is a no-op and
+    // the HTTP status stands — same as the direct pool, which cannot see
+    // body-framed trailers either. Trailers-Only refusals synthesized by the
+    // mesh path (e.g. RESOURCE_EXHAUSTED / DEADLINE_EXCEEDED) carry
+    // `grpc-status` in the headers and an `error_class` that keeps
+    // client-side outcomes neutral downstream.
+    let buffered_grpc_flavored = (request_uses_grpc_content_type || grpc_request_is_web_translated)
+        && matches!(&response_body, ResponseBody::Buffered(_));
+    let recorded_backend_status = if streaming_h2_native_grpc || buffered_grpc_flavored {
         grpc_proxy::grpc_admission_status_from_maps(
             &HashMap::new(),
             &response_headers,
@@ -17695,17 +17747,34 @@ async fn handle_proxy_request_inner(
                 state.max_response_body_size_bytes,
             );
 
+            // Timeout regime for this streaming H2 body (codex r2-2 finding
+            // 6). Plain HTTP/2 (and HBONE) streaming uses only the per-frame
+            // idle (`backend_read_timeout_ms`) regime — no client end-to-end
+            // gRPC deadline applies (issue #1649). A NATIVE-gRPC response
+            // (the mesh-mTLS relay — the only native-gRPC route into this
+            // arm) instead honors the client's post-plugin `grpc-timeout` as
+            // an ABSOLUTE deadline anchored at request receipt, per-frame
+            // idle disabled — `grpc_streaming_response_deadline` is the same
+            // helper the direct gRPC pool's streaming arm uses, falling back
+            // to the per-frame `backend_read_timeout_ms` when the client set
+            // no deadline.
+            let (h2_read_timeout_ms, h2_total_deadline) = if streaming_h2_native_grpc {
+                grpc_proxy::grpc_streaming_response_deadline(
+                    grpc_client_deadline_ms,
+                    start_time.elapsed(),
+                    proxy.backend_read_timeout_ms,
+                )
+            } else {
+                (proxy.backend_read_timeout_ms, None)
+            };
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
-                    proxy.backend_read_timeout_ms,
-                    // Plain HTTP/2 streaming uses only the per-frame idle
-                    // (`backend_read_timeout_ms`) regime — no client end-to-end
-                    // gRPC deadline applies here (issue #1649).
-                    None,
+                    h2_read_timeout_ms,
+                    h2_total_deadline,
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -17716,11 +17785,8 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                     cl,
                     state.h2_coalesce_target_bytes,
-                    proxy.backend_read_timeout_ms,
-                    // Plain HTTP/2 streaming uses only the per-frame idle
-                    // (`backend_read_timeout_ms`) regime — no client end-to-end
-                    // gRPC deadline applies here (issue #1649).
-                    None,
+                    h2_read_timeout_ms,
+                    h2_total_deadline,
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -17731,22 +17797,16 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
-                    proxy.backend_read_timeout_ms,
-                    // Plain HTTP/2 streaming uses only the per-frame idle
-                    // (`backend_read_timeout_ms`) regime — no client end-to-end
-                    // gRPC deadline applies here (issue #1649).
-                    None,
+                    h2_read_timeout_ms,
+                    h2_total_deadline,
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
                     state.h2_coalesce_target_bytes,
-                    proxy.backend_read_timeout_ms,
-                    // Plain HTTP/2 streaming uses only the per-frame idle
-                    // (`backend_read_timeout_ms`) regime — no client end-to-end
-                    // gRPC deadline applies here (issue #1649).
-                    None,
+                    h2_read_timeout_ms,
+                    h2_total_deadline,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -17762,13 +17822,14 @@ async fn handle_proxy_request_inner(
                 // shrinks the adaptive-concurrency limit instead of recording a
                 // healthy success. A late client-upload overflow (which RSTs the
                 // response stream) is tagged so the limiter ignores it as
-                // client-side RequestBodyTooLarge. Both mirror the direct gRPC
-                // streaming path's admission wiring exactly.
+                // client-side RequestBodyTooLarge (the flag is populated by
+                // both mesh transports — codex r2-2 finding 5). Both mirror
+                // the direct gRPC streaming path's admission wiring exactly.
                 if streaming_h2_native_grpc {
                     body = body
                         .with_grpc_trailer_admission_classification()
                         .with_deferred_admission_request_body_exceeded_flag(
-                            hbone_request_body_exceeded.clone(),
+                            mesh_request_body_exceeded.clone(),
                         );
                 }
             }
@@ -17801,7 +17862,7 @@ async fn handle_proxy_request_inner(
                     // heal/reopen a later HALF_OPEN cycle).
                     .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch)
                     .with_deferred_dispatch_request_body_exceeded_flag(
-                        hbone_request_body_exceeded.clone(),
+                        mesh_request_body_exceeded.clone(),
                     );
                 // Issue #2003 codex r1-1: map a native-gRPC grpc-status trailer
                 // into the deferred dispatch outcome (circuit breaker / passive
@@ -19288,7 +19349,46 @@ async fn proxy_to_backend(
     // Sidecar egress: plain HTTP/2 over SVID-mTLS to the peer sidecar's
     // inbound listener. Same admission ordering as the HBONE path.
     if dispatch_mesh_mtls {
-        if let Some(reject) =
+        // Flavor-aware declared-Content-Length check BEFORE admission (same
+        // ordering rationale as the HBONE branch above), codex r2-2 finding
+        // 4: a gRPC-flavored request — native `application/grpc` or
+        // `grpc_web`-translated; both are wire-native gRPC in the OUTBOUND
+        // headers by dispatch time — is bounded ONLY by the gRPC receive
+        // limit (`max_grpc_recv_size_bytes`), exactly like the direct gRPC
+        // pool, which never applies `max_request_body_size_bytes`. Running
+        // the generic HTTP check first would, when the HTTP limit is the
+        // smaller of the two, reject an in-budget gRPC body early as an
+        // HTTP/JSON 413 instead of admitting it (and an over-budget one with
+        // the wrong shape). The gRPC reject shape is the direct pool's
+        // Trailers-Only RESOURCE_EXHAUSTED with neutral
+        // `ErrorClass::RequestBodyTooLarge`.
+        let mesh_grpc_flavored = headers
+            .get("content-type")
+            .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+        if mesh_grpc_flavored {
+            let grpc_limit = grpc_proxy::mesh_request_body_limit(
+                true,
+                state.max_request_body_size_bytes,
+                state.max_grpc_recv_size_bytes,
+            );
+            if grpc_limit > 0
+                && request_may_have_body(method, headers)
+                && let Some(content_length) = headers.get("content-length")
+                && let Ok(len) = content_length.parse::<usize>()
+                && len > grpc_limit
+            {
+                return backend_dispatch_response(
+                    grpc_proxy::grpc_request_body_too_large_backend_response(
+                        &proxy.id,
+                        resolved_ip.clone(),
+                        Some(len),
+                        grpc_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        } else if let Some(reject) =
             oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
         {
             return reject;
@@ -19304,7 +19404,7 @@ async fn proxy_to_backend(
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
         *backend_admission_started_at = Instant::now();
-        let (backend_resp, body_bytes) = proxy_to_backend_mesh_mtls(
+        let (backend_resp, body_bytes, request_body_exceeded) = proxy_to_backend_mesh_mtls(
             state,
             proxy,
             backend_url,
@@ -19322,7 +19422,12 @@ async fn proxy_to_backend(
             ctx_bytes_sent_observed,
         )
         .await;
-        return backend_dispatch_response(backend_resp, body_bytes, backend_admission_permits);
+        return BackendDispatchResult::Response {
+            response: backend_resp,
+            retained_body: body_bytes,
+            backend_admission_permits,
+            request_body_exceeded,
+        };
     }
 
     // Plain HTTPS requests attempt the native H3 pool only when startup
@@ -21185,6 +21290,36 @@ fn mesh_mtls_request_body_too_large_response(
     }
 }
 
+/// Timeout refusal for a gRPC-flavored request on the sidecar mesh-mTLS path
+/// (codex r2-2 finding 6): the direct gRPC pool maps a dispatch timeout
+/// (`GrpcProxyError::BackendTimeout`) to a Trailers-Only DEADLINE_EXCEEDED
+/// with the generic "Backend deadline exceeded" message — mirror that shape
+/// instead of the plain-HTTP JSON 504. Rides HTTP 200 (gRPC errors carry the
+/// outcome in `grpc-status`); backend-health accounting still sees the
+/// failure through the gRPC status seeding (`grpc_admission_status_from_maps`
+/// maps 4 -> 504) plus `ErrorClass::ReadWriteTimeout` — the same class the
+/// direct pool derives via `classify_grpc_proxy_error` for a Read timeout.
+fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        "Backend deadline exceeded".to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::Buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_hbone(
     state: &ProxyState,
@@ -21871,6 +22006,13 @@ async fn proxy_to_backend_hbone(
 /// peer identity — but speaks h2 directly to the peer (no CONNECT tunnel):
 /// the request `:authority` carries the service host the peer's inbound route
 /// matches on, and the Host header is left to hyper's `:authority` mapping.
+///
+/// The third return element is the client-upload overflow flag
+/// (`SizeLimitedIncoming`'s `body_size_exceeded`), returned — like the HBONE
+/// path — only alongside a `StreamingH2` response so the caller's deferred
+/// admission/dispatch outcomes can reclassify a post-header upload overflow as
+/// neutral `RequestBodyTooLarge` instead of a backend failure (codex r2-2
+/// finding 5).
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_mesh_mtls(
     state: &ProxyState,
@@ -21888,7 +22030,11 @@ async fn proxy_to_backend_mesh_mtls(
     is_tls: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Bytes>) {
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     let Some(target) = upstream_target else {
         return (
             retry::BackendResponse {
@@ -21901,6 +22047,7 @@ async fn proxy_to_backend_mesh_mtls(
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionPoolError),
             },
+            None,
             None,
         );
     };
@@ -21936,6 +22083,7 @@ async fn proxy_to_backend_mesh_mtls(
                 return (
                     hbone_pool_error_response(state, proxy, &err, resolved_ip),
                     None,
+                    None,
                 );
             }
         }
@@ -21963,6 +22111,7 @@ async fn proxy_to_backend_mesh_mtls(
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ConnectionPoolError),
                     },
+                    None,
                     None,
                 );
             }
@@ -22001,6 +22150,7 @@ async fn proxy_to_backend_mesh_mtls(
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ConnectionPoolError),
                     },
+                    None,
                     None,
                 );
             }
@@ -22047,6 +22197,7 @@ async fn proxy_to_backend_mesh_mtls(
                     error_class: None,
                 },
                 None,
+                None,
             );
         }
     };
@@ -22077,6 +22228,49 @@ async fn proxy_to_backend_mesh_mtls(
         && ctx.is_some_and(crate::plugins::grpc_web::request_is_grpc_web_translated);
     let is_native_grpc = is_grpc_flavored && !is_grpc_web_translated;
 
+    // Client end-to-end RPC deadline (`grpc-timeout`, post-plugin outbound
+    // headers — the same view the direct gRPC pool parses after its
+    // proxy-header merge; codex r2-2 finding 6). Timeout regimes mirror the
+    // direct pool exactly:
+    //  * NATIVE gRPC (streams) — `streaming_effective_timeout_ms` semantics
+    //    for `send_request` (upload + response-header wait): the client
+    //    deadline UNCAPPED (it is the end-to-end budget, explicitly covering
+    //    large uploads), falling back to `backend_read_timeout_ms` when the
+    //    client set none. The response-BODY absolute deadline is applied by
+    //    the caller's `StreamingH2` arm via `grpc_streaming_response_deadline`.
+    //  * TRANSLATED gRPC-Web (buffers) — the buffered-path regime (F11): the
+    //    client deadline CAPPED by `backend_read_timeout_ms`, as ONE absolute
+    //    deadline shared by `send_request` and body collection below (the
+    //    deadline is end-to-end, so the phases share a single budget).
+    //  * Plain HTTP — the per-phase `backend_read_timeout_ms`, unchanged.
+    // Timing out a gRPC-flavored request returns the direct pool's
+    // Trailers-Only DEADLINE_EXCEEDED instead of a JSON 504.
+    let client_grpc_deadline_ms = if is_grpc_flavored {
+        headers
+            .get("grpc-timeout")
+            .and_then(|v| grpc_proxy::parse_grpc_timeout_value(v))
+    } else {
+        None
+    };
+    let send_timeout_ms = match client_grpc_deadline_ms {
+        Some(ms) if is_native_grpc => Some(ms),
+        Some(ms) if proxy.backend_read_timeout_ms > 0 => {
+            Some(ms.min(proxy.backend_read_timeout_ms))
+        }
+        Some(ms) => Some(ms),
+        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
+        None => None,
+    };
+    // Shared absolute deadline for the translated-gRPC-Web buffered regime.
+    // `None` for the other flavors (per-phase timeouts) and on `checked_add`
+    // overflow from a pathologically large client deadline (treated as
+    // unbounded rather than panicking, like the streaming regime).
+    let buffered_grpc_shared_deadline = match (is_grpc_web_translated, client_grpc_deadline_ms) {
+        (true, Some(_)) => send_timeout_ms
+            .and_then(|ms| tokio::time::Instant::now().checked_add(Duration::from_millis(ms))),
+        _ => None,
+    };
+
     let request_body_limit = grpc_proxy::mesh_request_body_limit(
         is_grpc_flavored,
         state.max_request_body_size_bytes,
@@ -22101,6 +22295,7 @@ async fn proxy_to_backend_mesh_mtls(
                     request_body_limit,
                 ),
                 None,
+                None,
             );
         }
         return (
@@ -22110,6 +22305,7 @@ async fn proxy_to_backend_mesh_mtls(
                 Some(len),
                 request_body_limit,
             ),
+            None,
             None,
         );
     }
@@ -22134,6 +22330,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 hbone_pool_error_response(state, proxy, &err, resolved_ip),
                 None,
+                None,
             );
         }
     };
@@ -22146,7 +22343,13 @@ async fn proxy_to_backend_mesh_mtls(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => return (hbone_hyper_error_response(proxy, err, resolved_ip), None),
+        Ok(Err(err)) => {
+            return (
+                hbone_hyper_error_response(proxy, err, resolved_ip),
+                None,
+                None,
+            );
+        }
         Err(_) => {
             warn!(
                 proxy_id = %proxy.id,
@@ -22164,6 +22367,7 @@ async fn proxy_to_backend_mesh_mtls(
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionTimeout),
                 },
+                None,
                 None,
             );
         }
@@ -22184,6 +22388,7 @@ async fn proxy_to_backend_mesh_mtls(
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
                 },
+                None,
                 None,
             );
         }
@@ -22258,6 +22463,7 @@ async fn proxy_to_backend_mesh_mtls(
                     error_class: None,
                 },
                 None,
+                None,
             );
         }
     };
@@ -22296,6 +22502,7 @@ async fn proxy_to_backend_mesh_mtls(
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
                 },
+                None,
                 None,
             );
         }
@@ -22401,24 +22608,21 @@ async fn proxy_to_backend_mesh_mtls(
 
     let backend_req = Request::from_parts(parts, body);
     let send_fut = sender.send_request(backend_req);
-    let response = if proxy.backend_read_timeout_ms > 0 {
-        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        match tokio::time::timeout(timeout, send_fut).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(err)) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        mesh_mtls_request_body_too_large_response(
-                            proxy,
-                            resolved_ip,
-                            is_grpc_flavored,
-                            request_body_limit,
-                        ),
-                        None,
-                    );
-                }
-                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
-            }
+    // `send_request` deadline (upload + response-header wait). One absolute
+    // instant serves every regime: the translated-gRPC-Web shared deadline
+    // when armed, else `send_timeout_ms` (client grpc-timeout for gRPC
+    // flavors, `backend_read_timeout_ms` fallback/plain-HTTP; `None` =
+    // unbounded, including `checked_add` overflow of a pathological client
+    // deadline — same unbounded-rather-than-panic posture as the direct
+    // pool's streaming regime).
+    let send_deadline = match buffered_grpc_shared_deadline {
+        Some(deadline) => Some(deadline),
+        None => send_timeout_ms
+            .and_then(|ms| tokio::time::Instant::now().checked_add(Duration::from_millis(ms))),
+    };
+    let send_result = if let Some(deadline) = send_deadline {
+        match tokio::time::timeout_at(deadline, send_fut).await {
+            Ok(result) => result,
             Err(_) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
@@ -22429,13 +22633,25 @@ async fn proxy_to_backend_mesh_mtls(
                             request_body_limit,
                         ),
                         None,
+                        None,
                     );
                 }
                 warn!(
                     proxy_id = %proxy.id,
-                    "sidecar mTLS HTTP read timeout ({}ms) waiting for backend response",
-                    proxy.backend_read_timeout_ms
+                    timeout_ms = send_timeout_ms.unwrap_or(0),
+                    is_grpc_flavored,
+                    "sidecar mTLS timeout waiting for backend response"
                 );
+                // gRPC-flavored requests get the direct gRPC pool's timeout
+                // shape (`GrpcProxyError::BackendTimeout` -> Trailers-Only
+                // DEADLINE_EXCEEDED); plain HTTP keeps the JSON 504.
+                if is_grpc_flavored {
+                    return (
+                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        None,
+                        None,
+                    );
+                }
                 return (
                     retry::BackendResponse {
                         status_code: 504,
@@ -22448,26 +22664,33 @@ async fn proxy_to_backend_mesh_mtls(
                         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                     },
                     None,
+                    None,
                 );
             }
         }
     } else {
-        match send_fut.await {
-            Ok(response) => response,
-            Err(err) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        mesh_mtls_request_body_too_large_response(
-                            proxy,
-                            resolved_ip,
-                            is_grpc_flavored,
-                            request_body_limit,
-                        ),
-                        None,
-                    );
-                }
-                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+        send_fut.await
+    };
+    let response = match send_result {
+        Ok(response) => response,
+        Err(err) => {
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return (
+                    mesh_mtls_request_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        is_grpc_flavored,
+                        request_body_limit,
+                    ),
+                    None,
+                    None,
+                );
             }
+            return (
+                hbone_hyper_error_response(proxy, err, resolved_ip),
+                None,
+                None,
+            );
         }
     };
 
@@ -22488,6 +22711,7 @@ async fn proxy_to_backend_mesh_mtls(
                 Some(len),
                 state.max_response_body_size_bytes,
             ),
+            None,
             None,
         );
     }
@@ -22551,6 +22775,7 @@ async fn proxy_to_backend_mesh_mtls(
                 error_class: None,
             },
             None,
+            None,
         );
     }
 
@@ -22565,15 +22790,47 @@ async fn proxy_to_backend_mesh_mtls(
                 error_class: None,
             },
             None,
+            // Post-header client-upload overflow flag for the caller's
+            // deferred admission/dispatch outcomes (codex r2-2 finding 5) —
+            // mirrors `proxy_to_backend_hbone`'s streaming return.
+            Some(body_size_exceeded),
         )
     } else {
-        let (body_bytes, backend_trailers) = match collect_hyper_body_and_trailers_with_limit(
+        // Body-collection timeout regime: with the translated-gRPC-Web
+        // shared deadline armed, the SAME absolute deadline that bounded
+        // `send_request` bounds the collection (the client `grpc-timeout` is
+        // end-to-end — one budget across both phases, per-read guard off),
+        // mirroring the direct buffered gRPC path's `timeout_at` reuse.
+        // Otherwise the per-read `backend_read_timeout_ms` stall guard
+        // applies as before.
+        let collect_fut = collect_hyper_body_and_trailers_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
-            proxy.backend_read_timeout_ms,
-        )
-        .await
-        {
+            if buffered_grpc_shared_deadline.is_some() {
+                0
+            } else {
+                proxy.backend_read_timeout_ms
+            },
+        );
+        let collect_result = if let Some(deadline) = buffered_grpc_shared_deadline {
+            match tokio::time::timeout_at(deadline, collect_fut).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "sidecar mTLS gRPC-Web response body collection exceeded the client grpc-timeout deadline"
+                    );
+                    return (
+                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        None,
+                        None,
+                    );
+                }
+            }
+        } else {
+            collect_fut.await
+        };
+        let (body_bytes, backend_trailers) = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
@@ -22584,10 +22841,15 @@ async fn proxy_to_backend_mesh_mtls(
                         state.max_response_body_size_bytes,
                     ),
                     None,
+                    None,
                 );
             }
             Err(HyperBodyCollectError::Read(err)) => {
-                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+                return (
+                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    None,
+                    None,
+                );
             }
             Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
                 warn!(
@@ -22606,6 +22868,7 @@ async fn proxy_to_backend_mesh_mtls(
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                     },
+                    None,
                     None,
                 );
             }
@@ -22643,6 +22906,7 @@ async fn proxy_to_backend_mesh_mtls(
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
             },
+            None,
             None,
         )
     }

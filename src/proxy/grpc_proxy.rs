@@ -1639,6 +1639,69 @@ pub fn classify_grpc_mesh_dispatch(
     GrpcMeshDispatch::Direct
 }
 
+/// Whether a protocol-classified gRPC request may fall through the direct-dial
+/// gRPC branch onto the generic HTTP-family dispatch path for a mesh-tagged
+/// target (issue #2003).
+///
+/// * `Direct` never falls through — the direct `GrpcConnectionPool` serves it.
+/// * `MeshMtls` always falls through — the generic mesh-mTLS path carries
+///   every gRPC flavor (native streams with wire trailers; translated
+///   gRPC-Web buffers and re-encodes the captured trailers).
+/// * `RefuseCrossCluster` / `RefuseHbone` fall through ONLY for PASS-THROUGH
+///   gRPC-Web (body-framed trailers, rides the HTTP-family transport like
+///   plain HTTP). Native gRPC must be refused inside the branch, and so must
+///   gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1): by dispatch time
+///   the outbound request is wire-native gRPC (`content-type:
+///   application/grpc`), so letting it ride the HBONE HTTP/1.1 inner tunnel
+///   or the cross-cluster paths would hit the exact no-trailer corruption the
+///   refusal exists to prevent. The original request content-type
+///   (`request_uses_grpc_content_type`) alone cannot see the translation —
+///   pair it with the plugin's spoof-proof context marker
+///   (`grpc_web::request_is_grpc_web_translated`).
+pub fn grpc_mesh_dispatch_falls_through(
+    dispatch: GrpcMeshDispatch,
+    request_uses_grpc_content_type: bool,
+    grpc_web_translated: bool,
+) -> bool {
+    match dispatch {
+        GrpcMeshDispatch::Direct => false,
+        GrpcMeshDispatch::MeshMtls => true,
+        GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
+            !request_uses_grpc_content_type && !grpc_web_translated
+        }
+    }
+}
+
+/// Timeout regime for a STREAMING gRPC response body:
+/// `(per_frame_read_timeout_ms, absolute_total_deadline)`.
+///
+/// A client `grpc-timeout` is an end-to-end RPC deadline (issue #1649), so it
+/// is honored as an ABSOLUTE deadline anchored at request receipt — the
+/// remaining budget is `client_deadline_ms` minus `elapsed_since_receipt` — and
+/// the per-frame idle timeout is disabled (`0`): a backend that sends headers
+/// just before the deadline then trickles body frames is cut at the client's
+/// deadline instead of resetting a per-frame window forever. Without a client
+/// deadline, the operator `fallback_read_timeout_ms` applies PER FRAME (`0` =
+/// unbounded, for long-lived server/bidi streams that legitimately idle). A
+/// pathologically large client deadline that overflows Tokio's `Instant` range
+/// yields `None` and is treated as unbounded rather than panicking the proxy
+/// path. Shared by the direct gRPC pool's streaming arm and the mesh-mTLS
+/// `StreamingH2` relay so the two regimes cannot drift.
+pub fn grpc_streaming_response_deadline(
+    client_deadline_ms: Option<u64>,
+    elapsed_since_receipt: std::time::Duration,
+    fallback_read_timeout_ms: u64,
+) -> (u64, Option<tokio::time::Instant>) {
+    match client_deadline_ms {
+        Some(budget_ms) => {
+            let remaining =
+                std::time::Duration::from_millis(budget_ms).saturating_sub(elapsed_since_receipt);
+            (0u64, tokio::time::Instant::now().checked_add(remaining))
+        }
+        None => (fallback_read_timeout_ms, None),
+    }
+}
+
 /// Build a gRPC error response with proper Trailers-Only encoding.
 ///
 /// gRPC errors use HTTP 200 with `grpc-status` and `grpc-message` as headers
