@@ -106,11 +106,13 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         # CP-side MeshSubscribe surface only: mesh_server.rs serves the
         # MeshConfigSync.MeshSubscribe stream (namespace-scoped snapshot
         # build + content_eq dedupe), mesh_registry.rs tracks the subscribed
-        # nodes the reconcile broadcasts converge through, and auth.rs is the
+        # nodes the reconcile broadcasts converge through, auth.rs is the
         # DP<->CP JWT verification the fixture's plaintext-h2c stream still
-        # relies on. cp_server.rs/dp_client.rs (gateway ConfigSync) and
-        # mod.rs (pure module wiring, compile-gated on every PR) stay out.
-        r"^src/grpc/(mesh_server|mesh_registry|auth)\.rs$",
+        # relies on, and cp_server.rs owns the shared CP scope/namespace
+        # filtering helpers mesh_server.rs calls when serving native slices.
+        # dp_client.rs (gateway ConfigSync) and mod.rs (pure module wiring,
+        # compile-gated on every PR) stay out.
+        r"^src/grpc/(mesh_server|mesh_registry|auth|cp_server)\.rs$",
         # The watch->reconcile->broadcast pipeline that is the ONLY source of
         # the mesh model the CP serves over MeshSubscribe (there is no DB or
         # admin write path for the mesh block).
@@ -124,10 +126,11 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         # = false), so their translations cannot affect this suite — and so
         # does src/config_sources/mod.rs (pure module wiring).
         r"^src/config_sources/k8s/(mod|core)\.rs$",
-        # Serves GET /mesh/config-drift — the native_subscribe_delivered
-        # check requires it to attribute the applied slice to
-        # source_protocol=native from the ferrum-cp URL.
-        r"^src/admin/mesh_config_drift\.rs$",
+        # Serves authenticated GET /mesh/config-drift — the
+        # native_subscribe_delivered check requires the route, JWT extraction
+        # and role parsing, plus the response builder, to attribute the applied
+        # slice to source_protocol=native from the ferrum-cp URL.
+        r"^src/admin/(mod|mesh_config_drift|jwt_auth|audit)\.rs$",
         r"^src/identity/",
         r"^src/tls/",
         r"^src/secrets/",
@@ -217,17 +220,21 @@ def self_test() -> int:
         ("mesh-e2e-sidecar", ["src/grpc/mesh_server.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/mesh_registry.rs"], True),
         ("mesh-e2e-sidecar", ["src/grpc/auth.rs"], True),
+        ("mesh-e2e-sidecar", ["src/grpc/cp_server.rs"], True),
         ("mesh-e2e-sidecar", ["src/k8s_controller/reconciler.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/core.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/mod.rs"], True),
         ("mesh-e2e-sidecar", ["src/config_sources/mod.rs"], False),
         ("mesh-e2e-sidecar", ["src/admin/mesh_config_drift.rs"], True),
+        ("mesh-e2e-sidecar", ["src/admin/mod.rs"], True),
+        ("mesh-e2e-sidecar", ["src/admin/jwt_auth.rs"], True),
+        ("mesh-e2e-sidecar", ["src/admin/audit.rs"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/multicluster-federation/run.sh"], False),
         ("mesh-e2e-sidecar", ["src/grpc/mod.rs"], False),
-        ("mesh-e2e-sidecar", ["src/grpc/cp_server.rs"], False),
+        ("mesh-e2e-sidecar", ["src/grpc/dp_client.rs"], False),
         ("mesh-e2e-sidecar", ["src/modes/data_plane.rs"], False),
         ("mesh-e2e-sidecar", ["src/config_sources/k8s/istio.rs"], False),
-        ("mesh-e2e-sidecar", ["src/admin/mod.rs"], False),
+        ("mesh-e2e-sidecar", ["src/admin/backup.rs"], False),
         ("mesh-e2e-sidecar", ["src/plugins/utils/ai_providers.rs"], False),
         ("mesh-e2e-sidecar", ["charts/ferrum-mesh/values.yaml"], False),
     ]
